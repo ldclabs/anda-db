@@ -24,11 +24,16 @@
  * something happened.
  */
 
-import { KipError, errors, KIP_ERROR_CODES, KIP_ERROR_REGISTRY } from '../errors.js'
+import { KipError, detailed, errors, KIP_ERROR_CODES, KIP_ERROR_REGISTRY } from '../errors.js'
 import {
   EffectiveAuthority,
+  authority as authorityLadder,
+  authorityCeiling,
+  bindingId,
   familyOf,
   describePermission,
+  isPermitted,
+  spaceResource,
   type AuthContext,
 } from '../governance/index.js'
 import {
@@ -42,6 +47,7 @@ import {
 } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
+  AsOf,
   ChangesCommand,
   DescribeTarget,
   HistoryCommand,
@@ -62,6 +68,8 @@ import {
   conceptTypeDef,
   facetDef,
   formatSymbolRef,
+  lineageOfSymbol,
+  lineageText,
   predicateDef,
   structuralFieldDef,
   symbols,
@@ -74,13 +82,14 @@ import {
   pageCursorFromToken,
   pageToken,
   searchIndex,
-  snapshotJson,
+  snapshotToken,
   type ChangeEntry,
   type CursorFamily,
   type PageCursor,
   type Store,
   type TransactionRow,
 } from '../store/index.js'
+import { normalizeTime } from '../time.js'
 import {
   capabilities,
   KIP_VERSION,
@@ -102,10 +111,10 @@ export interface MetaContext {
   /**
    * What the caller may do here, resolved once for the whole command.
    *
-   * Required rather than optional: `DESCRIBE ACCESS` and `DESCRIBE EXECUTION
-   * CONTEXT` answer *about the caller*, and a context that could arrive without
-   * one would have to invent a fallback — which is how "no control plane" and
-   * "no authority" become the same answer.
+   * Required rather than optional: `DESCRIBE ACCESS` and the Primer's
+   * `execution_context` answer *about the caller*, and a context that could
+   * arrive without one would have to invent a fallback — which is how "no
+   * control plane" and "no authority" become the same answer.
    */
   authority: EffectiveAuthority
   /** Who the caller is. */
@@ -113,9 +122,9 @@ export interface MetaContext {
   /**
    * The Schema Environment of a past coordinate (§20.9).
    *
-   * `SNAPSHOT AS OF` and `DESCRIBE SCHEMA ENVIRONMENT AS OF` both answer about
-   * a coordinate, and both have to answer about the schema that was in force at
-   * it rather than today's.
+   * `DESCRIBE SNAPSHOT AS OF` and `DESCRIBE SCHEMA ENVIRONMENT AS OF` both
+   * answer about a coordinate, and both have to answer about the schema that
+   * was in force at it rather than today's.
    */
   environmentAt: (version: number) => SchemaEnvironment
   /**
@@ -128,7 +137,7 @@ export interface MetaContext {
    * awkward. `SEARCH` carries its own inside its object body and does not use
    * this.
    */
-  page?: { next_cursor?: string }
+  page?: { next_cursor?: string; truncated?: boolean }
 }
 
 /** Runs one META command. */
@@ -166,17 +175,6 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
     }
     return verifyCapsule(scalarValue(command.Verify.value, b))
   }
-  if ('Snapshot' in command) {
-    // A SNAPSHOT token promises that a coordinate can be read back, so issuing
-    // one is only honest once the engine can honour it. It can now.
-    const seq = bindCoordinate(command.Snapshot, readContext(cx), b) ??
-      cx.store.currentSeq(cx.space)
-    return snapshotJson(
-      cx.space,
-      { seq },
-      cx.store.schemaVersionAt(cx.space, seq),
-    )
-  }
   return search(command.Search, cx, b)
 }
 
@@ -189,56 +187,6 @@ function describe(
 ): Json {
   if (target === 'Protocol') return protocol()
   if (target === 'Capabilities') return capabilities()
-  if (target === 'ExecutionContext') {
-    return {
-      space_id: cx.space,
-      schema_environment_version: cx.env.version,
-      space_seq: cx.store.currentSeq(cx.space),
-      principal: {
-        principal_id: cx.authority.principal.principal_id,
-        principal_class: cx.authority.principal.principal_class,
-        status: cx.authority.principal.status,
-        groups: cx.authority.groups,
-        is_space_owner: cx.authority.isOwner,
-        auth_strength: cx.auth.auth_strength,
-        purpose: cx.auth.purpose,
-        purpose_assurance: cx.auth.purpose_assurance,
-      },
-      // §67.2: an Agent that does not know when its Delegation expires plans
-      // work it will not be allowed to finish.
-      authority_expires_at: cx.authority.earliestExpiry(),
-      governance: {
-        enforced:
-          'commands, reads and writes; see DESCRIBE CAPABILITIES for what is ' +
-          'covered',
-        default_classification: cx.authority.defaultClassification(),
-        policy:
-          cx.authority.policy === null
-            ? null
-            : `${cx.authority.policy.policy_id}@${cx.authority.policy.version}`,
-      },
-    } as Json
-  }
-  if (target === 'ProjectionCapability') {
-    return {
-      policies: [baseline().id, forecast().id],
-      statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
-      score_semantics: 'normalized_support_not_probability',
-      explanation: true,
-      missing_stages: [
-        {
-          stage: 'trust_evaluation',
-          reason: 'no trust model; every eligible corroboration group counts equally',
-        },
-        {
-          stage: 'evidence_quality',
-          reason:
-            'a cited Evidence record is counted for its independence, never ' +
-            'for how good it is',
-        },
-      ],
-    } as Json
-  }
 
   if ('Primer' in target) {
     return primer(
@@ -255,7 +203,13 @@ function describe(
     if (row === null) {
       throw errors.notFoundOrNotVisible(`no MemorySpace ${name}`)
     }
-    return { ...row, id: undefined } as unknown as Json
+    // §68 folded the old EXECUTION CONTEXT answer into the Space and Primer
+    // descriptions: a caller learns where it is and who it is in one read.
+    return {
+      ...row,
+      id: undefined,
+      execution_context: executionContext(cx),
+    } as unknown as Json
   }
   if ('SchemaEnvironment' in target) {
     // §20.9: at a coordinate, the environment that was in force *then*. A
@@ -388,25 +342,17 @@ function describe(
       groups: cx.authority.groups,
       permissions: held,
       families: byFamily,
+      // §31.3: the influence-authority classes this caller may elevate an
+      // element to — up to the ceiling its `elevate_authority` standing
+      // carries, and none at all without that permission.
+      elevatable_authority_classes: elevatableClasses(cx),
       granularity:
         'per element, on reads and writes alike; this report is per Space, ' +
         'because a per-element access report is an existence oracle',
       expires_at: cx.authority.earliestExpiry(),
     } as Json
   }
-  if ('Snapshot' in target) {
-    // The same answer `SNAPSHOT` gives, because it is the same question asked
-    // through the DESCRIBE family (§68). Falling through to the COMPATIBILITY
-    // refusal below would have named the wrong command in the error.
-    const seq =
-      bindCoordinate(target.Snapshot, readContext(cx), b) ??
-      cx.store.currentSeq(cx.space)
-    return snapshotJson(
-      cx.space,
-      { seq },
-      cx.store.schemaVersionAt(cx.space, seq),
-    )
-  }
+  if ('Snapshot' in target) return snapshot(target.Snapshot, cx, b)
   if ('Capsule' in target) {
     const source = scalarValue(target.Capsule, b)
     if (typeof source !== 'string') {
@@ -418,6 +364,128 @@ function describe(
     'DESCRIBE COMPATIBILITY needs a package compatibility model this engine ' +
       'has not built',
   )
+}
+
+/**
+ * What the old `DESCRIBE EXECUTION CONTEXT` reported, now a member of the
+ * Primer and of `DESCRIBE SPACE` (§64, §68): who is asking, in which Space,
+ * under which policy, and until when.
+ *
+ * §64.2 is a MUST: the Primer distinguishes the authenticated Principal from
+ * the semantic `$self`. They answer different questions — who is asking, and
+ * who this Brain is — and an Agent that conflates them will sign the Brain's
+ * memories with the caller's name.
+ */
+function executionContext(cx: MetaContext): Json {
+  return {
+    space_id: cx.space,
+    space_seq: cx.store.currentSeq(cx.space),
+    schema_environment_version: cx.env.version,
+    principal: {
+      id: cx.authority.principal.principal_id,
+      principal_id: cx.authority.principal.principal_id,
+      principal_class: cx.authority.principal.principal_class,
+      status: cx.authority.principal.status,
+      authenticated: cx.authority.principal.principal_class !== 'anonymous',
+      authentication_strength: cx.auth.auth_strength,
+      auth_strength: cx.auth.auth_strength,
+      groups: cx.authority.groups,
+      is_space_owner: cx.authority.isOwner,
+      purpose: cx.auth.purpose,
+      purpose_assurance: cx.auth.purpose_assurance,
+    },
+    // §28.3: the ActorBindings this Principal may speak through, so an Agent
+    // knows which actors it can assert as before it tries.
+    actor_bindings: cx.authority.bindings.map((binding) => ({
+      id: bindingId(binding.id),
+      actor: binding.actor_ref,
+      binding_class: binding.binding_class,
+      assurance: binding.assurance,
+    })),
+    delegation_chain: [...cx.auth.delegation_chain],
+    // §67.2: an Agent that does not know when its Delegation expires plans
+    // work it will not be allowed to finish.
+    authority_expires_at: cx.authority.earliestExpiry(),
+    governance: {
+      enforced:
+        'commands, reads and writes; see DESCRIBE CAPABILITIES for what is ' +
+        'covered',
+      default_classification: cx.authority.defaultClassification(),
+      policy:
+        cx.authority.policy === null
+          ? null
+          : `${cx.authority.policy.policy_id}@${cx.authority.policy.version}`,
+    },
+    note:
+      'the Principal is the authenticated caller, never the semantic actor ' +
+      'a claim is attributed to (§13.3)',
+  } as Json
+}
+
+/**
+ * The influence-authority classes this caller may elevate an element to
+ * (§31.3), in ladder order up to the ceiling its standing carries.
+ *
+ * Empty without `elevate_authority`: `DESCRIBE ACCESS` says what could ever
+ * be allowed, and a caller who cannot elevate at all has no class to reach.
+ */
+function elevatableClasses(cx: MetaContext): string[] {
+  const decision = cx.authority.authorize('elevate_authority', spaceResource(), cx.auth)
+  if (!isPermitted(decision.decision)) return []
+  const ceiling = authorityLadder.rank(authorityCeiling(decision.constraints))
+  return [
+    authorityLadder.DESCRIPTIVE,
+    authorityLadder.ADVISORY,
+    authorityLadder.BEHAVIORAL,
+    authorityLadder.EXECUTABLE,
+  ].filter((cls) => authorityLadder.rank(cls) <= ceiling)
+}
+
+/**
+ * `DESCRIBE SNAPSHOT [AS OF SEQ :s | AT TIME :t]` — a snapshot coordinate
+ * (§68).
+ *
+ * Without an operand it describes the current head; `AS OF SEQ` a past
+ * coordinate; `AT TIME` resolves an instant to the last sequence committed at
+ * or before it, which is how wall-clock time enters `AS OF SEQ` (§48.1) — the
+ * engine never guesses which of several sequences an instant means. A
+ * sequence beyond the head is refused rather than rounded to the present,
+ * and coordinate 0 — before the first commit — is an empty Space rather than
+ * an error. This engine keeps every version, so no instant is before its
+ * retention floor.
+ *
+ * The coordinate is a description: `space_seq`, the transaction that
+ * committed it, its commit time and the schema environment version in force.
+ * The `snapshot_token` beside it is what `read.snapshot_token` binds a later
+ * read to, so a caller can make several requests answer at one coordinate.
+ */
+function snapshot(
+  target: { as_of: AsOf | null; at_time: Scalar | null },
+  cx: MetaContext,
+  b: ReadBindings,
+): Json {
+  // The grammar takes one operand or the other, never both. A tree that
+  // arrived off the text path (§73) can still carry two, and the sequence a
+  // coordinate names is the more exact of the answers — so it wins, as it does
+  // on the other reference engine, rather than the two disagreeing silently.
+  let seq: number
+  if (target.as_of === null && target.at_time !== null) {
+    const at = normalizeTime(text(target.at_time, b, 'DESCRIBE SNAPSHOT AT TIME'), 'AT TIME')
+    seq = cx.store.seqAtTime(cx.space, at)
+  } else {
+    seq =
+      bindCoordinate({ as_of: target.as_of }, readContext(cx), b) ??
+      cx.store.currentSeq(cx.space)
+  }
+  const committed = seq === 0 ? null : cx.store.transactionAtSeq(cx.space, seq)
+  return {
+    space_id: cx.space,
+    space_seq: seq,
+    tx_id: committed?.tx_id ?? null,
+    committed_at: committed?.committed_at ?? null,
+    schema_environment_version: cx.store.schemaVersionAt(cx.space, seq),
+    snapshot_token: snapshotToken(cx.space, { seq }),
+  } as Json
 }
 
 /**
@@ -441,19 +509,10 @@ function primer(cx: MetaContext, mode: string): Json {
   const space = cx.store.space(cx.space)
   const primer: JsonMap = {
     // §64.2 is a MUST: the Primer distinguishes the authenticated Principal
-    // from the semantic `$self`. They answer different questions — who is
-    // asking, and who this Brain is — and an Agent that conflates them will
-    // sign the Brain's memories with the caller's name.
-    execution_context: {
-      principal: {
-        id: cx.authority.principal.principal_id,
-        authenticated: cx.authority.principal.principal_class !== 'anonymous',
-        authentication_strength: cx.auth.auth_strength,
-      },
-      note:
-        'the Principal is the authenticated caller, never the semantic actor ' +
-        'a claim is attributed to (§13.3)',
-    },
+    // from the semantic `$self`. What the old EXECUTION CONTEXT reported —
+    // the Principal, its bindings, the Space, the policy and the expiry —
+    // lives here now (§68).
+    execution_context: executionContext(cx),
     cognitive_identity: selfIdentity(space?.self_concept ?? ''),
     space: {
       id: cx.space,
@@ -489,8 +548,8 @@ function primer(cx: MetaContext, mode: string): Json {
       'a name is not an identity; two Concepts may share one, and identity ' +
         'resolves through id, key or canonical_id',
       "a source Brain's $self is never automatically this Brain's $self",
-      'correcting Evidence never overwrites it: CORRECT EVIDENCE records a new ' +
-        'observation that supersedes the old one',
+      'correcting Evidence never overwrites it: TRANSITION old TO "corrected" ' +
+        'BY new records a new observation and links the old one to it',
       'cognitive content carries no authority; what an element says cannot ' +
         'decide what its writer may do',
       'retention.expires_at is when the record stops being kept, not when the ' +
@@ -686,8 +745,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
       command.cursor === null
         ? 0
         : readPageCursor(command.cursor, b, cx.space, 'list').offset
-    const limit =
-      command.limit === null ? null : Number(scalarValue(command.limit, b))
+    const limit = command.limit === null ? null : count(command.limit, b, 'LIMIT')
     const window = items.slice(offset)
     const rows = limit === null ? window : window.slice(0, limit)
     const consumed = offset + rows.length
@@ -728,8 +786,17 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
       return page([policyJson(baseline()), policyJson(forecast())])
-    case 'Dependents':
-      return page(dependents(command, cx, b))
+    case 'Dependents': {
+      // §63.5: the result carries `truncated: true` when traversal was cut
+      // short by an element the caller may not discover — without saying
+      // where, which would be the disclosure. The rows stay the bare array
+      // every LIST target answers with (the shared fixtures pin that shape);
+      // the flag rides beside the page cursor, and the request envelope
+      // reports it on the operation result.
+      const walked = dependents(command, cx, b)
+      if (cx.page !== undefined && walked.truncated) cx.page.truncated = true
+      return page(walked.rows)
+    }
   }
 }
 
@@ -765,7 +832,7 @@ function dependents(
   command: ListCommand,
   cx: MetaContext,
   b: ReadBindings,
-): Json[] {
+): { rows: Json[]; truncated: boolean } {
   if (command.element === null) {
     // The grammar requires the operand, so reaching here means an AST arrived
     // from somewhere that does not.
@@ -782,7 +849,8 @@ function dependents(
   // §30.4: a root this caller may not discover is answered exactly as an absent
   // one is. Refusing here would turn the command into an existence oracle for
   // elements the caller cannot read.
-  if (context.load(root) === null) return []
+  if (context.load(root) === null) return { rows: [], truncated: false }
+  let truncated = false
 
   // Everything below is walked in sorted id order, and each level's frontier is
   // sorted before the next one runs. Two engines answering the same question
@@ -799,9 +867,13 @@ function dependents(
       for (const activity of cx.store.activitiesWithInput(cx.space, source)) {
         // An Activity the caller may not read is not a route: naming it in
         // `via` would disclose it, and walking through it would disclose that
-        // it exists (§30.4).
+        // it exists (§30.4). The cut is reported as `truncated`, without
+        // saying where.
         const element = context.load(activity)
-        if (element === null || element.kind !== 'Activity') continue
+        if (element === null || element.kind !== 'Activity') {
+          truncated = true
+          continue
+        }
         for (const output of element.row.outputs) {
           let id: ElementId | null = null
           try {
@@ -815,7 +887,10 @@ function dependents(
           // distance and a DAG that converges does not report it twice.
           if (seen.has(key)) continue
           seen.add(key)
-          if (context.load(id) === null) continue
+          if (context.load(id) === null) {
+            truncated = true
+            continue
+          }
           next.push(id)
           rows.push({
             id: key,
@@ -829,7 +904,7 @@ function dependents(
     if (next.length === 0) break
     frontier = next.sort(compareElementId)
   }
-  return rows
+  return { rows, truncated }
 }
 
 /**
@@ -991,14 +1066,33 @@ function history(
     from_seq: Scalar | null
     to_seq: Scalar | null
     limit: Scalar | null
+    cursor: Scalar | null
   }) => ({
-    from: paging.from_seq === null ? 0 : Number(scalarValue(paging.from_seq, b)),
+    from: paging.from_seq === null ? 0 : count(paging.from_seq, b, 'FROM SEQ'),
     to:
       paging.to_seq === null
         ? Number.MAX_SAFE_INTEGER
-        : Number(scalarValue(paging.to_seq, b)),
-    limit: paging.limit === null ? 100 : Number(scalarValue(paging.limit, b)),
+        : count(paging.to_seq, b, 'TO SEQ'),
+    limit: paging.limit === null ? 100 : count(paging.limit, b, 'LIMIT'),
+    // A history cursor is a page token of its own family (§87.7): one issued
+    // by a FIND or a LIST must not continue a chronology.
+    offset:
+      paging.cursor === null
+        ? 0
+        : readPageCursor(paging.cursor, b, cx.space, 'history').offset,
   })
+  // The continuation a page hands back, when more of the chronology remains.
+  const paged = <T>(rows: T[], offset: number, limit: number): T[] => {
+    const window = rows.slice(offset, offset + limit)
+    if (cx.page !== undefined && offset + window.length < rows.length) {
+      cx.page.next_cursor = pageToken(cx.space, {
+        family: 'history',
+        snapshotSeq: cx.store.currentSeq(cx.space),
+        offset: offset + window.length,
+      })
+    }
+    return window
+  }
 
   if ('Element' in command) {
     const id: ElementId = parseElementId(
@@ -1011,28 +1105,39 @@ function history(
     if (reader(cx).load(id) === null) {
       throw errors.notFoundOrNotVisible(`no element ${formatElementId(id)}`)
     }
-    const { from, to, limit } = range(command.Element)
+    const { from, to, limit, offset } = range(command.Element)
     // The version log answers *which transitions touched this element* with an
     // index seek; the journal then supplies the transition itself. Going
     // through both is what makes an element's chronology the same grain as a
     // Space's — §68.1 calls HISTORY a transition chronology, and §36.2 makes a
     // transition one envelope, not one row per element per commit.
-    const touched = cx.store.versionsOf(cx.space, id, from, to, limit)
+    // One past the page, and the extra row is the whole point: `paged` issues
+    // a continuation only when it can see that something follows the window,
+    // and a fetch stopping exactly at `offset + limit` never can — every page
+    // would look like the last one.
+    const touched = cx.store.versionsOf(cx.space, id, from, to, offset + limit + 1)
     const named = formatElementId(id)
     const envelopes: TransactionRow[] = []
     for (const version of touched) {
       const row = cx.store.transaction(version.tx_id)
       if (row !== null) envelopes.push(row)
     }
-    return visibleChanges(cx, envelopes).map((row) =>
-      changeEnvelope(row, named),
+    return paged(
+      visibleChanges(cx, envelopes).map((row) => changeEnvelope(row, named)),
+      offset,
+      limit,
     ) as unknown as Json
   }
-  const { from, to, limit } = range(command.Space)
-  return visibleChanges(
-    cx,
-    cx.store.transactionsInSpace(cx.space, from, to, limit),
-  ).map((row) => changeEnvelope(row, null)) as unknown as Json
+  const { from, to, limit, offset } = range(command.Space)
+  return paged(
+    visibleChanges(
+      cx,
+      // Again one past the page, so the continuation is issued (see above).
+      cx.store.transactionsInSpace(cx.space, from, to, offset + limit + 1),
+    ).map((row) => changeEnvelope(row, null)),
+    offset,
+    limit,
+  ) as unknown as Json
 }
 
 /**
@@ -1078,9 +1183,9 @@ function reader(cx: MetaContext): Context {
 /**
  * The KQL context a META command borrows to resolve a coordinate.
  *
- * `SNAPSHOT AS OF …` names a coordinate exactly as a query does, and it has to
- * resolve to the same number: two spellings of "which coordinate is this" would
- * eventually disagree about a transaction id or a future sequence.
+ * `DESCRIBE SNAPSHOT AS OF …` names a coordinate exactly as a query does, and
+ * it has to resolve to the same number: two spellings of "which coordinate is
+ * this" would eventually disagree about a future sequence.
  */
 function readContext(cx: MetaContext): KqlContext {
   return {
@@ -1139,9 +1244,13 @@ function changes(
       ? Number(scalarValue(command.Since.cursor, b))
       : Number(scalarValue(command.AfterSeq.seq, b))
   const limitScalar = 'Since' in command ? command.Since.limit : command.AfterSeq.limit
-  const limit = limitScalar === null ? 100 : Number(scalarValue(limitScalar, b))
+  const limit = limitScalar === null ? 100 : count(limitScalar, b, 'LIMIT')
   if (!Number.isInteger(after) || after < 0) {
-    throw errors.changeCursorInvalid(
+    // §87.7: a change cursor is a Space sequence the consumer durably recorded;
+    // anything else is `CursorInvalid` with `family: changes`.
+    throw detailed.cursorInvalid(
+      'changes',
+      'malformed',
       'a CHANGES cursor from this engine is a Space sequence coordinate',
     )
   }
@@ -1218,16 +1327,18 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     command.cursor === null
       ? 0
       : readPageCursor(command.cursor, b, cx.space, 'search').offset
+  // §20.14: a symbol in a search narrows to its lineage, so a hit written
+  // under an earlier package version is still a hit.
   const withType =
     command.with_type === null
       ? null
-      : formatSymbolRef(
+      : lineageOfSymbol(
           cx.env.resolveSymbol('ConceptType', text(command.with_type, b, 'WITH TYPE'), 'read'),
         )
   const withPredicate =
     command.with_predicate === null
       ? null
-      : formatSymbolRef(
+      : lineageOfSymbol(
           cx.env.resolveSymbol(
             'PredicateType',
             text(command.with_predicate, b, 'WITH PREDICATE'),
@@ -1280,8 +1391,13 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
       // masked out of a query must not come back through a search hit (§88.5).
       const view = context.view(id)
       if (view === null) continue
-      if (withType !== null && view.schema_ref !== withType) continue
-      if (withPredicate !== null && view.predicate_ref !== withPredicate) continue
+      if (withType !== null && lineageText(String(view.schema_ref ?? '')) !== withType) continue
+      if (
+        withPredicate !== null &&
+        lineageText(String(view.predicate_ref ?? '')) !== withPredicate
+      ) {
+        continue
+      }
       scored.push({
         score: row.score,
         hit: {
@@ -1343,6 +1459,26 @@ function numberOf(scalar: Scalar, b: ReadBindings, what: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw errors.typeMismatch(
       `${what} takes a number, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
+}
+
+/**
+ * A paging count: `LIMIT`, and the `FROM SEQ` / `TO SEQ` bounds of a
+ * chronology.
+ *
+ * Separate from {@link numberOf} because these are *counts*, and a `LIMIT "x"`
+ * coerced with `Number` becomes `NaN` and then silently pages nothing — a
+ * mistyped command that answers rather than refuses. §102.28 puts a scalar of
+ * the wrong type on `TypeMismatch`, which is also what the KQL side of the
+ * engine already does for the same clause.
+ */
+function count(scalar: Scalar, b: ReadBindings, what: string): number {
+  const value = scalarValue(scalar, b)
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw errors.typeMismatch(
+      `${what} must be a non-negative integer, got ${JSON.stringify(value)}`,
     )
   }
   return value

@@ -157,6 +157,13 @@ async fn set_fields(
                     "retention is storage lifecycle, not content: use SET RETENTION",
                 ));
             }
+            // §31.3, §28.1: the authority class and the classification are
+            // Governance state. Ordinary KML cannot write them, and a field
+            // spelled as if it could is refused as protected rather than as
+            // unknown.
+            ("authority_class", _) | ("classification", _) | ("governance", _) => {
+                return Err(protected_governance(&field));
+            }
             (field, value) => {
                 return Err(KipError::type_mismatch(format!(
                     "a Concept has no mutable Core field `{field}` accepting {value}; \
@@ -672,6 +679,14 @@ async fn structural_mut(
     }
 }
 
+/// The refusal for a Governance member spelled as a Core field (§31.3).
+pub(crate) fn protected_governance(field: &str) -> KipError {
+    KipError::protected_governance_field(format!(
+        "`{field}` is Governance state: it is assigned by Governance and read as \
+         `governance.{field}`, and no KML clause writes it (§28.1, §31.3)"
+    ))
+}
+
 /// The refusal for an element whose state this action may not reach.
 ///
 /// The code names the ritual that *is* legal, so an agent reading it knows
@@ -689,14 +704,15 @@ fn immutable_target(kind: ElementKind, id: ElementId, what: &str) -> KipError {
             KipErrorCode::EvidenceCorrectionRequired,
             format!(
                 "{what} would rewrite what {id} observed; wrong Evidence is corrected with \
-                 CORRECT EVIDENCE :old BY :new, never edited in place"
+                 TRANSITION :old TO \"corrected\" BY :new, never edited in place"
             ),
         ),
         ElementKind::Activity => KipError::new(
             KipErrorCode::InvalidLifecycleTransition,
             format!(
                 "{what} does not reach an Activity: a pending one finalizes its fields and \
-                 topology through TRANSITION ACTIVITY, and a terminal one is immutable"
+                 topology through TRANSITION ... TO a terminal state, and a terminal one is \
+                 immutable"
             ),
         ),
         ElementKind::Proposition => KipError::new(

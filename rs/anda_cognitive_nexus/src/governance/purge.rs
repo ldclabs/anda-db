@@ -277,7 +277,7 @@ pub async fn stage_payload(
     if let Element::Evidence(row) = tx.load(id).await? {
         crate::store::rows::erase_payload(row);
     }
-    tx.mark_changed(id, "purge_payload");
+    tx.mark_changed(id, anda_kip::ChangeOp::PayloadPurge);
 
     tx.defer_governance_audit(MutationEntry {
         operation: "purge_payload",

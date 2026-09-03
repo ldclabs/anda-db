@@ -83,7 +83,8 @@ src/
 ├── view.rs        the raw Core view (§53.1) — what a KQL dot path reads
 ├── profiles.rs    the bundled cognitive-memory profile, vendored from the spec
 ├── store/         ten anda_db collections: rows, the write path, Spaces,
-│   └── history.rs   the journal, and the element version log AS OF reads
+│   ├── history.rs   the journal, and the element version log AS OF reads
+│   └── planes.rs    the per-plane version counters, derived from the row diff
 ├── schema/        symbol identity, package artifacts, per-Space environment
 ├── governance/    the protected control plane — see §10
 ├── tx.rs          transactions: staging, handles, one version per transaction
@@ -202,8 +203,13 @@ A query is a `WHERE` block joined into one set of solutions, then projected.
 Supported: element, tuple and structural patterns, hop-quantified path
 traversal, `FILTER` (all 11 functions), `NOT` / `OPTIONAL` / `UNION`, dot-path
 projection, aggregates, `ORDER BY`, paging, and both time axes — `FOR TIME`
-(what was applicable then) and `AS OF SEQ | TX | TIME` (what this Brain held
-then).
+(what was applicable then) and `AS OF SEQ` (what this Brain held then).
+
+`AS OF SEQ` is now the *only* history axis a query carries. A coordinate is a
+sequence number, and a caller holding a wall-clock time asks
+`DESCRIBE SNAPSHOT AT TIME "…"` for the coordinate that time resolves to, then
+reads at it. Two spellings of one axis meant a caller could write a read whose
+answer depended on which spelling the engine believed.
 
 Two rules a caller will otherwise get wrong:
 
@@ -258,11 +264,54 @@ that coordinate as `snapshot_seq` in its result context (§50).
 
 `CREATE CONCEPT` / `UPSERT CONCEPT` / `ENSURE PROPOSITION` /
 `CREATE EVIDENCE|ASSERTION|ACTIVITY` / `ASSERT` (desugared) / `UPDATE` /
-`RETRACT ASSERTION` / `SUPERSEDE ASSERTION` / `CORRECT EVIDENCE` /
-`TRANSITION ACTIVITY` / `SET RETENTION` / `ARCHIVE` / `TOMBSTONE` / `PURGE` /
-`PURGE PAYLOAD` / `MERGE CONCEPT`, each with an optional `WHERE` selection block
-and `LIMIT`, plus
-handles, `EXPECT VERSION` / `EXPECT STATE`, receipts and dry runs.
+`TRANSITION` / `SET RETENTION` / `PURGE` / `PURGE PAYLOAD` / `MERGE CONCEPT`,
+each with an optional `WHERE` selection block and `LIMIT`, plus handles,
+`EXPECT VERSION`, receipts and dry runs.
+
+### One `TRANSITION`
+
+Every lifecycle move is one statement (§52.5):
+
+```text
+TRANSITION <target> TO "<state>" [BY <ref>]
+    [SET FIELDS {…}] [SET STRUCTURAL {…}] [WHERE {…}] [LIMIT n]
+    [EXPECT VERSION …]
+```
+
+`retracted`, `superseded`, `corrected`, `running`, `completed`, `failed`,
+`cancelled`, `archived`, `tombstoned` — nine states under one grammar, where
+earlier drafts had six statements that each re-derived selection, guards and
+receipts. `BY` is required exactly where the move names a replacement
+(`superseded`, `corrected`) and refused everywhere else; `SET FIELDS` and
+`SET STRUCTURAL` are accepted only on the Activity states, because finalizing an
+Activity is the one move that also writes content.
+
+There is no `EXPECT STATE`. A guard that restates the state the caller expects is
+a guard the engine has to check anyway: `TRANSITION` reads the current state, and
+a move that is not legal from it fails as `InvalidLifecycleTransition` carrying
+`details.from` and `details.to`. The caller who wrote the guard and the caller
+who did not now get the same answer.
+
+### Version planes
+
+`EXPECT VERSION` is always the trailing clause, and it may name a plane:
+
+```text
+EXPECT VERSION 7                          the whole element
+EXPECT VERSION 7 OF ATTRIBUTES            Core fields and attributes
+EXPECT VERSION 3 OF STRUCTURAL            Structural References
+EXPECT VERSION 2 OF RETENTION             the retention record
+EXPECT VERSION 5 OF FACET "MnemonicState" one Facet, by symbol
+```
+
+Each plane keeps its own counter under `_system.plane_versions`, and the counters
+are derived at commit from a diff of the row loaded against the row written — not
+from the clause that ran. A clause that writes the same value back touches no
+plane, and a `TRANSITION` that finalized an Activity's outputs touches the
+structural plane whatever its name says. That is what lets a `MnemonicState`
+decay sweep and a status verdict on the same element run without spoiling each
+other's guard: they contend for different counters. A mismatch is a
+`VersionConflict` naming the plane in `details.plane`.
 
 An idempotency key is **replayed** (§26, §33): a timeout is not an abort, so a
 resend under a key this Space already committed hands back that transaction's
@@ -454,10 +503,14 @@ representing it needs `assert_as_actor`, no binding needs
 `record_attributed_assertion`. Recording someone else's claim is not
 impersonation and must stay ordinary.
 
-`RETRACT` and `SUPERSEDE` record that the *source* withdrew or replaced its
-claim. Two ways to hold that standing — you wrote it, or a binding says you
-represent its actor — and `ARCHIVE`/`TOMBSTONE` for everyone else, which say
-what they mean.
+One statement now spells every lifecycle move, but the permission still follows
+the state, not the keyword. A move to `retracted` or `superseded` records that
+the *source* withdrew or replaced its claim, and there are two ways to hold that
+standing: you wrote it, or a binding says you represent its actor. Everyone else
+moves it to `archived` or `tombstoned`, which say what they mean. So
+`retract_own` and `supersede_own` gate the first pair, `archive` and `tombstone`
+the second, and a moderator who reaches for the source's words is refused rather
+than quietly granted them.
 
 ### Classification, authority, quarantine
 

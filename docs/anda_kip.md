@@ -159,17 +159,31 @@ MUTATE {
     }
     UPSERT CONCEPT ?drug {
         MATCH {key: "drug:aspirin"}
-        EXPECT VERSION 3
         SET ATTRIBUTES { risk_level: 2 }
-    }
+    } EXPECT VERSION 3
+    TRANSITION :old_claim TO "superseded" BY ?claim
 }
 ```
 
 Families: `CREATE CONCEPT` / `EVIDENCE` / `ASSERTION` / `ACTIVITY`,
-`UPSERT CONCEPT`, `ENSURE PROPOSITION`, `ASSERT`, `UPDATE`, `RETRACT ASSERTION`,
-`SUPERSEDE ASSERTION`, `CORRECT EVIDENCE`, `TRANSITION ACTIVITY`,
-`SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE`, `PURGE PAYLOAD`,
-`MERGE CONCEPT`.
+`UPSERT CONCEPT`, `ENSURE PROPOSITION`, `ASSERT`, `UPDATE`, `TRANSITION`,
+`SET RETENTION`, `PURGE`, `PURGE PAYLOAD`, `MERGE CONCEPT`.
+
+`TRANSITION <target> TO "<state>" [BY <ref>] [SET FIELDS] [SET STRUCTURAL]
+[WHERE] [LIMIT] {EXPECT VERSION}` is the one lifecycle statement (Spec §52.5):
+the quoted state names the move — `retracted` / `superseded BY` for an
+Assertion, `corrected BY` for Evidence, `running` / `completed` / `failed` /
+`cancelled` for an Activity (finalizing fields and topology in the same
+statement), `archived` / `tombstoned` for any element — and the engine
+validates it against the target's kind and current state
+(`InvalidLifecycleTransition`). There is no `EXPECT STATE`.
+
+Every mutation ends the same way (§52.8): `[WHERE] [LIMIT] {EXPECT VERSION}`,
+the guard after `UPSERT`'s closing brace and after `ENSURE PROPOSITION`'s
+tuple. `EXPECT VERSION :v [OF ATTRIBUTES | STRUCTURAL | RETENTION | FACET "X"]`
+guards one **version plane** (§35.1) and may repeat, one guard per plane, so a
+Facet sweep and an attribute write on the same element do not spoil each
+other's guard; the parser rejects a duplicated plane.
 
 A statement written on its own is still a one-clause transaction;
 `explicit_transaction` only records which spelling the source used.
@@ -254,8 +268,8 @@ use anda_kip::{parse_kip, parse_kql, parse_kml, parse_meta, parse_json};
 
 let command = parse_kip(r#"DESCRIBE PRIMER"#)?;          // any surface
 let query   = parse_kql(r#"FIND(?x) WHERE { ?x {a: 1} }"#)?;
-let mutation = parse_kml(r#"ARCHIVE :old"#)?;
-let meta    = parse_meta(r#"SNAPSHOT"#)?;
+let mutation = parse_kml(r#"TRANSITION :old TO "archived""#)?;
+let meta    = parse_meta(r#"DESCRIBE SNAPSHOT AT TIME "2026-01-01T00:00:00Z""#)?;
 let value   = parse_json(r#"{ a: 1, /* not JSON5 */ }"#).is_err();
 # Ok::<(), anda_kip::KipError>(())
 ```
@@ -306,9 +320,14 @@ corruption of the epistemic record.
 | --- | --- |
 | `UPSERT CONCEPT ?c { MATCH {name: "Alice"} }` | `name` is mutable and duplicable; "the Concept named X" can silently address a different node over time. Match on `id` or `key`. |
 | `UPDATE ?a SET FIELDS {confidence: …}` where `?a` is an Assertion | Epistemic payload is immutable. Record a new Assertion with `SUPERSEDING`. |
-| `UPDATE ?e SET FIELDS {payload: …}` where `?e` is Evidence | Use `CORRECT EVIDENCE :old BY :new`. |
+| `UPDATE ?e SET FIELDS {payload: …}` where `?e` is Evidence | Use `TRANSITION :old TO "corrected" BY :new`. |
 | `UPDATE ?p SET FIELDS {subject: …}` where `?p` is a Proposition | A different tuple is a different Proposition. |
-| `SET STRUCTURAL` on an Assertion / Evidence / Activity | Record topology is immutable payload; a pending Activity finalizes through `TRANSITION ACTIVITY`. |
+| `SET STRUCTURAL` on an Assertion / Evidence / Activity | Record topology is immutable payload; a pending Activity finalizes through `TRANSITION … TO "completed" SET STRUCTURAL`. |
+| `TRANSITION :a TO "superseded"` without `BY`, `TRANSITION :x TO "archived" BY :y` | `BY` names the replacing element exactly for `superseded` / `corrected` (§52.5). |
+| `TRANSITION :a TO "retracted" SET FIELDS {…}` | Only a move to an Activity state finalizes fields or topology. |
+| `TRANSITION :a TO "retracted" EXPECT STATE "active"` | There is no `EXPECT STATE`: the transition validates the current state itself (§35.3). |
+| `UPDATE :x EXPECT VERSION :v SET …`, `EXPECT VERSION 1 OF ATTRIBUTES EXPECT VERSION 2 OF ATTRIBUTES` | A guard is the trailing clause, one per plane (§52.8, §35.1). |
+| `FIND … AS OF TX "tx-1"`, `AS OF TIME :t` | `AS OF SEQ` is the only historical axis (§48.1); resolve an id or an instant through `DESCRIBE TRANSACTION` / `DESCRIBE SNAPSHOT AT TIME`. |
 | Any assignment naming `_system`, `governance`, `space_id`, `space_seq` | Engine-owned state; external cognition cannot self-escalate authority. |
 | `ENSURE PROPOSITION (id: "P-1")` | `(id: …)` is match-only — no structure can be created from an id. |
 | `ASSERT` without `by` or without `mode` | Guessing the actor forges attribution; guessing the mode turns hearsay into observation. |
@@ -333,7 +352,7 @@ enforces them:
 | `stance: "maybe"` | `support \| reject \| uncertain` (§13.4) |
 | `mode: "guessed"` | `observed \| stated \| inferred \| predicted \| hypothetical \| imported` (§13.5) |
 | `("evidence", :e) {role: "bogus"}` | `support \| challenge \| context` (§56.2) |
-| `RETRACT ASSERTION … EXPECT STATE "banana"` | `active \| retracted \| superseded \| expired` (§14) |
+| `TRANSITION … TO "succeeded"` | `retracted \| superseded \| corrected \| running \| completed \| failed \| cancelled \| archived \| tombstoned` (§52.5) |
 | `SEARCH … MODE "fuzzy"` | `keyword \| semantic \| hybrid` (§66.3) |
 | `DESCRIBE PRIMER MODE "verbose"` | `compact \| full` (§64) |
 | `WITH EPISTEMIC { explanation: "verbose" }` | `none \| summary \| ledger` (§49.1) |
@@ -349,8 +368,10 @@ Two boundaries this layer holds to:
   belong to a *package*: a Space running a different Profile may legitimately
   mean something else by them. They stay with the engine, which is the only
   party that knows the active Schema Environment. For the same reason
-  `TRANSITION ACTIVITY … TO` is not checked — §20.13 registers the Activity
-  *terminal* states, not its whole lifecycle vocabulary.
+  which `TRANSITION` state fits which target kind, and which current state a
+  move is legal from, is not checked here — §52.5 makes that the engine's
+  `InvalidLifecycleTransition`; only the state vocabulary is fixed by the
+  language.
 
 `analyze` returns warnings as well, for a tool that reports rather than
 rejects — an unbounded `PURGE`, a `FIND` with no `LIMIT`, a `mode: "observed"`
@@ -380,7 +401,7 @@ becomes three clauses:
 1. `EnsureProposition { handle: "a#proposition", … }`
 2. `CreateAssertion { handle: "a", set_fields: [proposition, asserted_by, mode,
    stance, confidence], set_structural: [("evidence", e1){role}, ("evidence", e2){role}] }`
-3. `SupersedeAssertion { target: :old, by: Handle("a") }`
+3. `Transition { target: :old, to: "superseded", by: Handle("a") }`
 
 Details that matter:
 
@@ -453,7 +474,7 @@ let request = Request {
         idempotency_key: Some("logical-write-key".into()),
         ..Execution::new(ExecutionMode::Atomic)
     }),
-    operations: vec![Operation::new(r#"ARCHIVE :old"#).with_op_id("op-1")],
+    operations: vec![Operation::new(r#"TRANSITION :old TO "archived""#).with_op_id("op-1")],
     ..Default::default()
 };
 request.validate()?;
@@ -662,7 +683,7 @@ for you because each needs state.
 **Epistemics**
 - Proposition tuples immutable; one canonical Proposition per semantic tuple
 - Assertion payload immutable; revision is a new Assertion + supersession
-- `RETRACT` only by the assertor or an authorized representative
+- `TRANSITION … TO "retracted"` only by the assertor or an authorized representative
 - never produce `rejected` merely because support is absent
 - N copies of one message are one evidential basis, not N
 
@@ -674,7 +695,9 @@ for you because each needs state.
 
 **Transactions**
 - `atomic` means one `tx_id`, one snapshot, one state-changing `space_seq`
-- honour `EXPECT VERSION` / `EXPECT STATE` at commit, not just at plan time
+- honour every `EXPECT VERSION` guard — bare, or `OF` one version plane — at
+  commit, not just at plan time; a mismatch names the plane in
+  `VersionConflict.details.plane`
 - idempotency keys scoped by Space and authority; same key + different request
   → `IdempotencyConflict`
 - when the outcome cannot be established, answer `outcome_unknown`
@@ -687,9 +710,8 @@ for you because each needs state.
 - report SEARCH index lag instead of implying snapshot consistency
 
 **Bounded mutation**
-- `UPDATE`, `RETRACT`, `SET RETENTION`, `ARCHIVE`, `TOMBSTONE`, `PURGE` and
-  `PURGE PAYLOAD` accept a `LIMIT`; an unbounded selection should be refused,
-  not guessed at
+- `UPDATE`, `TRANSITION`, `SET RETENTION`, `PURGE` and `PURGE PAYLOAD` accept
+  a `LIMIT`; an unbounded selection should be refused, not guessed at
 - no destructive cascade by default
 
 ---
@@ -714,7 +736,7 @@ the semantics behind it are gone.
 | 0.11 (KIP 1.x) | 0.12+ (KIP 2.0) |
 | --- | --- |
 | `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
-| `DELETE` | `ARCHIVE` / `TOMBSTONE` / `PURGE` / `RETRACT` — classify the intent |
+| `DELETE` | `TRANSITION … TO "archived"` / `TO "tombstoned"` / `PURGE` / `TO "retracted"` — classify the intent |
 | `metadata.confidence` on a Proposition | `Assertion.confidence`; a Proposition has no confidence |
 | `metadata.author` | `Assertion.asserted_by` (semantic actor) and `_system.origin` (engine truth) — different things |
 | `access_level` | Governance classification and policy |

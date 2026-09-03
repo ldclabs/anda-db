@@ -337,8 +337,14 @@ describe('review regressions', () => {
       const changes = nexus.describe('CHANGES AFTER SEQ 1') as unknown as {
         changes: { id: string; op: string }[]
       }[]
+      // §36.1: a relabel is an `update` whose `touched` names the Governance
+      // member, so a Watch sees a classification move without reading payload.
       expect(changes.flatMap((envelope) => envelope.changes)).toContainEqual(
-        expect.objectContaining({ id: 'C-1', op: 'classify' }),
+        expect.objectContaining({
+          id: 'C-1',
+          op: 'update',
+          touched: ['governance.classification'],
+        }),
       )
       return nexus.store.governance.setPrincipalStatus(
         SYSTEM_PRINCIPAL,
@@ -1167,7 +1173,7 @@ describe('the command gate', () => {
       }`)
       // …and it administers nothing. Authorization reads Grants, and a
       // Proposition is a claim.
-      expect(() => session.execute('ARCHIVE "C-1"')).toThrowError(
+      expect(() => session.execute('TRANSITION "C-1" TO "archived"')).toThrowError(
         /requires the archive permission/,
       )
       expect(session.effectiveAuthority().isOwner).toBe(false)
@@ -1535,7 +1541,7 @@ describe('the write path', () => {
       // defect shape this project keeps finding — and would let the caller
       // learn what it may not touch by counting what changed.
       expect(() =>
-        session.execute('ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }'),
+        session.execute('TRANSITION ?c TO "archived" WHERE { ?c CONCEPT {type: "Person"} }'),
       ).toThrowError(/requires the archive permission/)
       // Nothing was archived: the statement unwound whole.
       expect(
@@ -1544,7 +1550,7 @@ describe('the write path', () => {
 
       // Naming the one it may touch works, which is what makes the refusal a
       // narrowing rather than a lockout.
-      expect(session.execute('ARCHIVE "C-1"').status).toBe('committed')
+      expect(session.execute('TRANSITION "C-1" TO "archived"').status).toBe('committed')
     })
   })
 
@@ -1561,7 +1567,7 @@ describe('the write path', () => {
         // query universe — the block cannot select what a read cannot see, and
         // the sweep succeeds over exactly what it could.
         expect(
-          session.execute('ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }').status,
+          session.execute('TRANSITION ?c TO "archived" WHERE { ?c CONCEPT {type: "Person"} }').status,
         ).toBe('committed')
         expect(
           nexus.query(
@@ -1667,11 +1673,11 @@ describe('the write path', () => {
         // §68: RETRACT states that the *source* took its claim back. Saying so
         // on somebody else's behalf would be the engine asserting something
         // that never happened.
-        expect(() => session.execute('RETRACT ASSERTION "A-1"')).toThrowError(
+        expect(() => session.execute('TRANSITION "A-1" TO "retracted"')).toThrowError(
           /neither wrote it nor is bound to the actor/,
         )
         // The honest alternative is available and needs no impersonation.
-        expect(session.execute('ARCHIVE "A-1"').status).toBe('committed')
+        expect(session.execute('TRANSITION "A-1" TO "archived"').status).toBe('committed')
       },
     )
   })
@@ -1693,22 +1699,22 @@ describe('the write path', () => {
           }
         }`)
 
-        expect(() => session.execute('ARCHIVE "A-1"')).toThrowError(
+        expect(() => session.execute('TRANSITION "A-1" TO "archived"')).toThrowError(
           /requires the moderate_assertion permission/,
         )
-        expect(() => session.execute('TOMBSTONE "A-1"')).toThrowError(
+        expect(() => session.execute('TRANSITION "A-1" TO "tombstoned"')).toThrowError(
           /requires the moderate_assertion permission/,
         )
 
         // The Concepts are not Assertions, so nothing about them is moderation
         // — the gate narrows what it asks for rather than taxing every sweep.
-        expect(session.execute('ARCHIVE "C-2"').status).toBe('committed')
+        expect(session.execute('TRANSITION "C-2" TO "archived"').status).toBe('committed')
 
         // And an Assertion this Principal wrote itself is its own to archive.
         session.execute(`CREATE ASSERTION ?a {
-          SET FIELDS { proposition: "P-1", stance: "support", mode: "inferred", confidence: 0.5 }
+          SET FIELDS { proposition: "P-1", asserted_by: {id: "C-1"}, stance: "support", mode: "inferred", confidence: 0.5 }
         }`)
-        expect(session.execute('ARCHIVE "A-2"').status).toBe('committed')
+        expect(session.execute('TRANSITION "A-2" TO "archived"').status).toBe('committed')
       },
     )
   })
@@ -1771,7 +1777,7 @@ describe('the write path', () => {
         }`)
         // Withdrawing one's own record is not impersonation, so it needs no
         // ActorBinding — which is what keeps the ordinary case ordinary.
-        expect(session.execute('RETRACT ASSERTION "A-1"').status).toBe('committed')
+        expect(session.execute('TRANSITION "A-1" TO "retracted"').status).toBe('committed')
       },
     )
   })
@@ -1962,7 +1968,7 @@ describe('classification and influence authority', () => {
     await withNexus('release-guard', (nexus) => {
       const session = nexus.systemSession()
       session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
-      session.execute('ARCHIVE "C-1"')
+      session.execute('TRANSITION "C-1" TO "archived"')
       expect(() => session.releaseQuarantine(parseElementId('C-1'))).toThrowError(
         /not quarantined/,
       )
@@ -1980,9 +1986,11 @@ describe('classification and influence authority', () => {
       const versions = nexus.describe('HISTORY ELEMENT "C-1"') as unknown as {
         changes: { op: string }[]
       }[]
+      // §36.1: on the wire a relabel is an `update` naming the Governance
+      // member in `touched`; the version log keeps the verb for the audit.
       expect(versions.flatMap((e) => e.changes.map((c) => c.op))).toEqual([
         'create',
-        'classify',
+        'update',
       ])
 
       const entries = session.readAudit()
@@ -2174,7 +2182,7 @@ describe('erasure', () => {
           TYPE "Person" NAME "Carol"
           SET FIELDS { retention: {legal_hold: true} }
         }`),
-      ).toThrowError(/requires the legal_hold permission/)
+      ).toThrowError(/requires the manage_legal_hold permission/)
     })
   })
 
@@ -2200,21 +2208,21 @@ describe('erasure', () => {
       // Not naming the member is not a way around the gate on it.
       expect(() =>
         session.execute('SET RETENTION "C-2" {retention_class: "standard"}'),
-      ).toThrowError(/requires the legal_hold permission/)
+      ).toThrowError(/requires the manage_legal_hold permission/)
       // Neither is naming it as false.
       expect(() =>
         session.execute(
           'SET RETENTION "C-2" {retention_class: "standard", legal_hold: false}',
         ),
-      ).toThrowError(/requires the legal_hold permission/)
+      ).toThrowError(/requires the manage_legal_hold permission/)
 
       // The hold is still there, and still blocks the erasure it was placed for.
       expect(() =>
         nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
       ).toThrowError(/under a legal hold/)
 
-      // A caller who holds `legal_hold` lifts it, which is the point of gating
-      // rather than forbidding.
+      // A caller who holds `manage_legal_hold` lifts it, which is the point of
+      // gating rather than forbidding (§29.9).
       nexus.execute('SET RETENTION "C-2" {retention_class: "standard"}')
       expect(() =>
         nexus.execute('PURGE "C-2" REFERENCE POLICY "tombstone_reference" CONFIRM "PURGE"'),
@@ -2511,7 +2519,7 @@ describe('the threat model', () => {
         'executable',
       )
       expect(ceilingOf(element)).toBe('descriptive')
-      expect(element.row.governance.max_influence_authority).toBeUndefined()
+      expect(element.row.governance.authority_class).toBeUndefined()
     })
   })
 

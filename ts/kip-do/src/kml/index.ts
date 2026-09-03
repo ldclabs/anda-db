@@ -132,6 +132,7 @@ export {
 export {
   checkIngest,
   mintIngestedEvidence,
+  type ElementReference,
   type IngestContext,
   type IngestEvidence,
 } from './ingest.js'
@@ -153,4 +154,9 @@ export {
   type Bindings,
 } from './value.js'
 
-export { Transaction, type Outcome, type WriteContext } from '../tx.js'
+export {
+  Transaction,
+  type Outcome,
+  type VersionGuard,
+  type WriteContext,
+} from '../tx.js'

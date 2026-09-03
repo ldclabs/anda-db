@@ -139,7 +139,7 @@ describe('KQL', () => {
   it('leaves an archived element out of ordinary recall', async () => {
     await withNexus('archived', (nexus) => {
       const ids = nexus.query('FIND(?c.id) WHERE { ?c CONCEPT {name: "Bob"} }')
-      nexus.execute(`ARCHIVE "${ids[0] as string}"`)
+      nexus.execute(`TRANSITION "${ids[0] as string}" TO "archived"`)
       expect(
         nexus.query('FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person"} }'),
       ).toEqual([1])
@@ -184,7 +184,7 @@ describe('KQL', () => {
       ) as string[]
       nexus.execute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: 0.9 }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "stated", confidence: 0.9 }
          }`,
         { p: pid! },
       )

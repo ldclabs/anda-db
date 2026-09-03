@@ -293,7 +293,13 @@ impl Nexus {
             request: &logged_request,
             response: json!({
                 "status": response.status,
-                "tx_id": response.receipt.as_ref().and_then(|r| r.tx_id.as_deref()),
+                // §75: a state-changing operation's Receipt sits on its result;
+                // the top-level slot is reserved for atomic execution.
+                "tx_id": response
+                    .receipt
+                    .as_ref()
+                    .or_else(|| response.results.iter().find_map(|r| r.receipt.as_ref()))
+                    .and_then(|r| r.tx_id.as_deref()),
                 "errors": errors,
             }),
             period: timestamp / 3600 / 1000,
@@ -560,7 +566,7 @@ mod tests {
             "{:#?}",
             response.results
         );
-        let version = response
+        let version = response.results[0]
             .receipt
             .as_ref()
             .and_then(|receipt| receipt.schema_environment_version);
@@ -571,7 +577,7 @@ mod tests {
         let nexus = Nexus::connect(db, &[], 8 * 1024).await.unwrap();
         let response = run(&nexus, r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Bob" }"#).await;
         assert_eq!(
-            response
+            response.results[0]
                 .receipt
                 .as_ref()
                 .and_then(|receipt| receipt.schema_environment_version),
@@ -680,9 +686,9 @@ mod tests {
 
         let mixed = Request {
             operations: vec![
-                Operation::new(r#"TOMBSTONE :x"#),
+                Operation::new(r#"TRANSITION :x TO "tombstoned""#),
                 Operation::new(r#"FIND(?x) WHERE { ?x {type: "Person"} }"#),
-                Operation::new(r#"TOMBSTONE :y"#),
+                Operation::new(r#"TRANSITION :y TO "tombstoned""#),
             ],
             execution: Some(Execution::new(ExecutionMode::Sequence)),
             ..Default::default()

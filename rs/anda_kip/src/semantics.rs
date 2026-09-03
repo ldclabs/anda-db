@@ -9,10 +9,14 @@
 //! ```text
 //! stance                support | reject | uncertain
 //! mode                  observed | stated | inferred | predicted | hypothetical | imported
-//! Assertion lifecycle   active | retracted | superseded | expired
+//! Assertion lifecycle   active | retracted | superseded | expired (computed, §14.3)
+//! Evidence lifecycle    active | corrected
 //! Evidence role         support | challenge | context
+//! Activity status       pending | running | completed | failed | cancelled
 //! Activity terminal     completed | failed | cancelled
 //! belief status         accepted | rejected | contested | uncertain | insufficient
+//! TRANSITION states     retracted | superseded | corrected | running | completed |
+//!                       failed | cancelled | archived | tombstoned          (§52.5)
 //! ```
 //!
 //! Two boundaries this module holds to, because crossing either turns a
@@ -30,12 +34,12 @@
 //!   Specification admits. Those stay with the engine, which is the only party
 //!   that knows the active Schema Environment.
 //!
-//! Two things are deliberately *not* checked, both because the Specification
-//! declines to fix them:
+//! Two things are deliberately *not* checked here:
 //!
-//! - `TRANSITION ACTIVITY ... TO`. §20.13 registers the Activity **terminal**
-//!   states, not the whole lifecycle vocabulary, and an Activity may
-//!   legitimately move to a non-terminal state the Core registry does not name.
+//! - which `TRANSITION` state fits which target kind, and which current state
+//!   a move is legal from. §52.5 makes that the engine's check
+//!   (`InvalidLifecycleTransition`); only the state *vocabulary* is fixed by
+//!   the language, and only that is checked.
 //! - `SEARCH ... THRESHOLD`. A threshold is compared against a retrieval
 //!   score, and §66.5 makes an engine *declare* its score semantics rather
 //!   than adopt one — §27.3 lists `log_odds` among them, which is not bounded
@@ -64,13 +68,25 @@ pub const ASSERTION_MODES: &[&str] = &[
 ];
 
 /// The Assertion lifecycle states (§14).
+///
+/// `expired` is computed, never stored (§14.3): no statement produces it, and
+/// the stored status stays `active`, `retracted` or `superseded`.
 pub const ASSERTION_LIFECYCLE: &[&str] = &["active", "retracted", "superseded", "expired"];
+
+/// The Evidence lifecycle states (§57.2).
+pub const EVIDENCE_LIFECYCLE: &[&str] = &["active", "corrected"];
 
 /// What an Evidence citation does for a claim (§56.2).
 pub const EVIDENCE_ROLES: &[&str] = &["support", "challenge", "context"];
 
+/// The Activity statuses (§16).
+pub const ACTIVITY_STATUS: &[&str] = &["pending", "running", "completed", "failed", "cancelled"];
+
 /// The Activity terminal states (§16.6).
 pub const ACTIVITY_TERMINAL: &[&str] = &["completed", "failed", "cancelled"];
+
+/// The states `TRANSITION ... TO` may name (§52.5).
+pub const TRANSITION_STATES: &[&str] = crate::ast::transition_state::ALL;
 
 /// The belief statuses an Epistemic Projection can return (§21.3).
 pub const BELIEF_STATUSES: &[&str] = &[
@@ -365,36 +381,26 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
                 out,
             );
         }
-        // The target of these two is an Assertion by construction, so the
-        // Assertion lifecycle registry is the right vocabulary. `ARCHIVE`,
-        // `TOMBSTONE` and `CORRECT EVIDENCE` take other kinds, for which Core
-        // registers no lifecycle vocabulary — checking them would reject
-        // states the Specification admits.
-        MutationClause::RetractAssertion(retract) => {
+        // §52.5 fixes the state vocabulary the statement may name; which
+        // states fit which target kind, and which current state a move is
+        // legal from, is the engine's check (`InvalidLifecycleTransition`).
+        MutationClause::Transition(transition) => {
             check_enum(
-                retract.expect_state.as_ref().and_then(scalar_str),
-                ASSERTION_LIFECYCLE,
-                "EXPECT STATE on an Assertion",
+                transition.state(),
+                TRANSITION_STATES,
+                "TRANSITION ... TO",
                 out,
             );
-            warn_unbounded(
-                "RETRACT ASSERTION",
-                retract.where_clauses.is_some(),
-                retract.limit.is_some(),
-                out,
-            );
-        }
-        MutationClause::SupersedeAssertion(supersede) => check_enum(
-            supersede.expect_state.as_ref().and_then(scalar_str),
-            ASSERTION_LIFECYCLE,
-            "EXPECT STATE on an Assertion",
-            out,
-        ),
-        MutationClause::TransitionActivity(transition) => {
             if let Some(fields) = &transition.set_fields {
                 analyze_assignments(fields, out);
             }
             analyze_structural(transition.set_structural.as_deref(), out);
+            warn_unbounded(
+                "TRANSITION",
+                transition.where_clauses.is_some(),
+                transition.limit.is_some(),
+                out,
+            );
         }
         MutationClause::SetRetention(retention) => {
             analyze_assignments(&retention.values, out);
@@ -405,18 +411,6 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
                 out,
             );
         }
-        MutationClause::Archive(removal) => warn_unbounded(
-            "ARCHIVE",
-            removal.where_clauses.is_some(),
-            removal.limit.is_some(),
-            out,
-        ),
-        MutationClause::Tombstone(removal) => warn_unbounded(
-            "TOMBSTONE",
-            removal.where_clauses.is_some(),
-            removal.limit.is_some(),
-            out,
-        ),
         MutationClause::Purge(purge) => warn_unbounded(
             "PURGE",
             purge.where_clauses.is_some(),
@@ -429,8 +423,7 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
             purge.limit.is_some(),
             out,
         ),
-        MutationClause::EnsureProposition(_) | MutationClause::CorrectEvidence(_) => {}
-        MutationClause::MergeConcept(_) => {}
+        MutationClause::EnsureProposition(_) | MutationClause::MergeConcept(_) => {}
     }
 }
 
@@ -627,7 +620,7 @@ mod tests {
             r#"ASSERT (:a, "p", :b) { by: :me, mode: :mode, stance: :stance, confidence: :c }"#,
             r#"SEARCH CONCEPT "x" MODE :mode THRESHOLD :threshold"#,
             r#"DESCRIBE PRIMER MODE :mode"#,
-            r#"RETRACT ASSERTION :a EXPECT STATE :state"#,
+            r#"TRANSITION :a TO :state"#,
         ] {
             assert!(parse_kip(input).is_ok(), "a parameter must pass: {input}");
         }
@@ -644,21 +637,24 @@ mod tests {
     }
 
     #[test]
-    fn a_transition_target_is_not_restricted_to_the_terminal_states() {
-        // §20.13 registers the Activity *terminal* states, not its whole
-        // lifecycle vocabulary; an Activity may move to a non-terminal state.
-        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "running""#).is_ok());
-        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "succeeded""#).is_ok());
-        assert!(parse_kip(r#"TRANSITION ACTIVITY :a TO "completed""#).is_ok());
-    }
-
-    #[test]
-    fn lifecycle_states_are_only_checked_where_the_kind_is_fixed() {
-        // ARCHIVE and TOMBSTONE take any element, and Core registers no
-        // element-lifecycle vocabulary.
-        assert!(parse_kip(r#"ARCHIVE :x EXPECT STATE "quarantined""#).is_ok());
-        assert!(parse_kip(r#"TOMBSTONE :x EXPECT STATE "whatever""#).is_ok());
-        assert!(parse_kip(r#"CORRECT EVIDENCE :a BY :b EXPECT STATE "anything""#).is_ok());
+    fn a_transition_names_a_state_from_the_registry() {
+        // §52.5 fixes the vocabulary; which state fits which kind, and which
+        // current state the move is legal from, is the engine's check.
+        for state in TRANSITION_STATES {
+            let by = if crate::ast::transition_state::WITH_BY.contains(state) {
+                " BY :b"
+            } else {
+                ""
+            };
+            assert!(
+                parse_kip(&format!(r#"TRANSITION :a TO "{state}"{by}"#)).is_ok(),
+                "{state}"
+            );
+        }
+        let err = parse_kip(r#"TRANSITION :a TO "succeeded""#).expect_err("not a state");
+        assert_eq!(err.code, KipErrorCode::ConstraintViolation);
+        assert!(parse_kip(r#"TRANSITION :a TO "active""#).is_err());
+        assert!(parse_kip(r#"TRANSITION :a TO "quarantined""#).is_err());
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Two things happen here that a plain grammar would not do:
 //!
 //! - `ASSERT` is desugared into exactly what §55.1 defines it as — `ENSURE
-//!   PROPOSITION` + `CREATE ASSERTION` (+ `SUPERSEDE`) — and nothing beyond
-//!   those parts is fabricated;
+//!   PROPOSITION` + `CREATE ASSERTION` (+ `TRANSITION ... TO "superseded"`) —
+//!   and nothing beyond those parts is fabricated;
 //! - the mutation guards run, so a command that would ask an engine to rewrite
 //!   immutable epistemic payload is rejected before it reaches one.
 
@@ -12,7 +12,7 @@ use nom::{
     Parser,
     branch::alt,
     character::complete::char,
-    combinator::{cut, map, opt},
+    combinator::{cut, map, opt, value},
     multi::many0,
     sequence::preceded,
 };
@@ -26,12 +26,12 @@ use super::common::{
     word, words, ws,
 };
 use crate::ast::{
-    Assignments, BoundValue, ConceptCreate, ConceptUpsert, CorrectEvidence, DotPathVar, ElementRef,
-    EnsureProposition, FacetAssignment, FacetUnset, KipValue, KmlStatement, MatchValue,
-    MergeConcept, MutationClause, MutationValue, ObjectMatcher, PredAtom, PropositionMatcher,
-    PropositionTriple, RecordCreate, RemovalStatement, RetractAssertion, Scalar, SetRetention,
-    StructuralEdge, StructuralRemoval, SupersedeAssertion, SymbolRef, Term, TransitionActivity,
-    UpdateAction, UpdateExpr, UpdateStatement, WhereClause,
+    Assignments, BoundValue, ConceptCreate, ConceptUpsert, DotPathVar, ElementRef,
+    EnsureProposition, ExpectVersion, FacetAssignment, FacetUnset, KipValue, KmlStatement,
+    MatchValue, MergeConcept, MutationClause, MutationValue, ObjectMatcher, PredAtom,
+    PropositionMatcher, PropositionTriple, RecordCreate, Scalar, SetRetention, StructuralEdge,
+    StructuralRemoval, SymbolRef, Term, Transition, UpdateAction, UpdateExpr, UpdateStatement,
+    VersionPlane, WhereClause, transition_state,
 };
 use crate::error::KipError;
 
@@ -147,27 +147,10 @@ fn mutation_clause(input: &str) -> VResult<'_, ClauseGroup> {
             })
         }),
         map(update_statement, |c| single(MutationClause::Update(c))),
-        map(retract_assertion, |c| {
-            single(MutationClause::RetractAssertion(c))
-        }),
-        map(supersede_assertion, |c| {
-            single(MutationClause::SupersedeAssertion(c))
-        }),
-        map(correct_evidence, |c| {
-            single(MutationClause::CorrectEvidence(c))
-        }),
-        map(transition_activity, |c| {
-            single(MutationClause::TransitionActivity(c))
+        map(transition_statement, |c| {
+            single(MutationClause::Transition(c))
         }),
         map(set_retention, |c| single(MutationClause::SetRetention(c))),
-        map(
-            |i| removal("ARCHIVE", i),
-            |c| single(MutationClause::Archive(c)),
-        ),
-        map(
-            |i| removal("TOMBSTONE", i),
-            |c| single(MutationClause::Tombstone(c)),
-        ),
         // Before `purge_statement`, which cuts after its verb: `PURGE PAYLOAD`
         // would otherwise reach `cut(element_ref)` on the word `PAYLOAD` and
         // abort the whole alternation instead of falling through.
@@ -190,7 +173,6 @@ enum BodyClause {
     ClientKey(Scalar),
     Name(Scalar),
     Match(crate::ast::ObjectMatcher),
-    ExpectVersion(Scalar),
     SetFields(Assignments),
     SetAttributes(Assignments),
     SetFacet(FacetAssignment),
@@ -247,10 +229,6 @@ fn body_clause(input: &str) -> VResult<'_, BodyClause> {
             BodyClause::UnsetStructural,
         ),
         map(
-            preceded(ws(words(&["EXPECT", "VERSION"])), cut(ws(scalar))),
-            BodyClause::ExpectVersion,
-        ),
-        map(
             preceded(ws(word("TYPE")), cut(ws(symbol_ref))),
             BodyClause::Type,
         ),
@@ -305,13 +283,66 @@ fn structural_removals(input: &str) -> VResult<'_, Vec<StructuralRemoval>> {
     Ok((rest, removals))
 }
 
+/// `EXPECT VERSION n [OF ATTRIBUTES | STRUCTURAL | RETENTION | FACET "X"]`
+fn expect_version_clause(input: &str) -> VResult<'_, ExpectVersion> {
+    let (input, _) = ws(words(&["EXPECT", "VERSION"])).parse(input)?;
+    let (input, version) = cut(ws(scalar)).parse(input)?;
+    let (input, plane) = opt_after(&["OF"], ws(version_plane)).parse(input)?;
+    Ok((input, ExpectVersion { version, plane }))
+}
+
+fn version_plane(input: &str) -> VResult<'_, VersionPlane> {
+    alt((
+        value(VersionPlane::Attributes, word("ATTRIBUTES")),
+        value(VersionPlane::Structural, word("STRUCTURAL")),
+        value(VersionPlane::Retention, word("RETENTION")),
+        map(
+            preceded(ws(word("FACET")), cut(ws(symbol_ref))),
+            VersionPlane::Facet,
+        ),
+    ))
+    .parse(input)
+}
+
+/// `{ expect_version_clause }` — the trailing guards every mutation ends with
+/// (Spec §52.8), at most one per plane (§35.1).
+fn expect_version_clauses(input: &str) -> VResult<'_, Vec<ExpectVersion>> {
+    let (rest, guards) = many0(ws(spanned(expect_version_clause))).parse(input)?;
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(guards.len());
+    for (position, guard) in guards {
+        if !seen.insert(guard.plane_key()) {
+            return fail(
+                position,
+                "one EXPECT VERSION guard per plane: two guards on one plane cannot both be meant",
+            );
+        }
+        out.push(guard);
+    }
+    Ok((rest, out))
+}
+
+/// Re-checks the one-guard-per-plane rule on a tree that did not come through
+/// [`expect_version_clauses`].
+fn check_guards(guards: &[ExpectVersion]) -> Result<(), KipError> {
+    let mut seen = BTreeSet::new();
+    for guard in guards {
+        if !seen.insert(guard.plane_key()) {
+            return Err(KipError::invalid_syntax(format!(
+                "EXPECT VERSION guards the {} plane twice; one guard per plane",
+                guard.plane_key()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Folds a body into typed slots, rejecting a second clause for a single slot.
 struct Body {
     r#type: Option<SymbolRef>,
     client_key: Option<Scalar>,
     name: Option<Scalar>,
     r#match: Option<crate::ast::ObjectMatcher>,
-    expect_version: Option<Scalar>,
     set_fields: Option<Assignments>,
     set_attributes: Option<Assignments>,
     set_facets: Vec<FacetAssignment>,
@@ -329,7 +360,6 @@ fn parse_body<'a>(input: &'a str, allowed: &'static [&'static str]) -> VResult<'
         client_key: None,
         name: None,
         r#match: None,
-        expect_version: None,
         set_fields: None,
         set_attributes: None,
         set_facets: Vec::new(),
@@ -345,9 +375,6 @@ fn parse_body<'a>(input: &'a str, allowed: &'static [&'static str]) -> VResult<'
             BodyClause::ClientKey(v) => ("CLIENT KEY", body.client_key.replace(v).is_some()),
             BodyClause::Name(v) => ("NAME", body.name.replace(v).is_some()),
             BodyClause::Match(v) => ("MATCH", body.r#match.replace(v).is_some()),
-            BodyClause::ExpectVersion(v) => {
-                ("EXPECT VERSION", body.expect_version.replace(v).is_some())
-            }
             BodyClause::SetFields(v) => ("SET FIELDS", body.set_fields.replace(v).is_some()),
             BodyClause::SetAttributes(v) => {
                 ("SET ATTRIBUTES", body.set_attributes.replace(v).is_some())
@@ -403,7 +430,6 @@ const CONCEPT_CREATE_CLAUSES: &[&str] = &[
 
 const CONCEPT_UPSERT_CLAUSES: &[&str] = &[
     "MATCH",
-    "EXPECT VERSION",
     "SET FIELDS",
     "SET ATTRIBUTES",
     "SET FACET",
@@ -439,6 +465,9 @@ fn upsert_concept(input: &str) -> VResult<'_, ConceptUpsert> {
     let (input, _) = ws(words(&["UPSERT", "CONCEPT"])).parse(input)?;
     let (start, handle) = cut(ws(handle)).parse(input)?;
     let (rest, body) = cut(|i| parse_body(i, CONCEPT_UPSERT_CLAUSES)).parse(start)?;
+    // §52.8: the guard follows the closing brace, where every other mutation
+    // keeps its preconditions.
+    let (rest, expect_versions) = expect_version_clauses(rest)?;
 
     // Identity for an upsert is `id` or `key`. A name-only match is forbidden
     // because names are mutable grounding state with duplicates allowed, so
@@ -461,7 +490,7 @@ fn upsert_concept(input: &str) -> VResult<'_, ConceptUpsert> {
         ConceptUpsert {
             handle,
             r#match: body.r#match,
-            expect_version: body.expect_version,
+            expect_versions,
             set_fields: body.set_fields,
             set_attributes: body.set_attributes,
             set_facets: body.set_facets,
@@ -522,7 +551,7 @@ fn ensure_proposition(input: &str) -> VResult<'_, EnsureProposition> {
         Ok(triple) => triple,
         Err(ctx) => return fail(input, ctx),
     };
-    let (rest, expect_version) = opt_after(&["EXPECT", "VERSION"], ws(scalar)).parse(tuple_at)?;
+    let (rest, expect_versions) = expect_version_clauses(tuple_at)?;
 
     Ok((
         rest,
@@ -531,7 +560,7 @@ fn ensure_proposition(input: &str) -> VResult<'_, EnsureProposition> {
             subject: triple.0,
             predicate: triple.1,
             object: triple.2,
-            expect_version,
+            expect_versions,
         },
     ))
 }
@@ -703,7 +732,7 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
                     subject: triple.0.clone(),
                     predicate: triple.1.clone(),
                     object: triple.2.clone(),
-                    expect_version: None,
+                    expect_versions: Vec::new(),
                 }),
                 MutationClause::CreateAssertion(RecordCreate {
                     handle: assertion_handle.clone(),
@@ -714,11 +743,19 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
                 }),
             ];
 
+            // `SUPERSEDING :old` is revision (§14.2): the old claim was wrong.
+            // It desugars to the one lifecycle statement, `BY` the new
+            // Assertion (§55.1).
             if let Some(target) = &superseding {
-                clauses.push(MutationClause::SupersedeAssertion(SupersedeAssertion {
+                clauses.push(MutationClause::Transition(Transition {
                     target: target.clone(),
-                    by: ElementRef::Handle(assertion_handle),
-                    expect_state: None,
+                    to: Scalar::Literal(KipValue::String(transition_state::SUPERSEDED.into())),
+                    by: Some(ElementRef::Handle(assertion_handle)),
+                    set_fields: None,
+                    set_structural: None,
+                    where_clauses: None,
+                    limit: None,
+                    expect_versions: Vec::new(),
                 }));
             }
             clauses
@@ -746,21 +783,31 @@ fn evidence_refs(value: &MutationValue) -> Vec<MutationValue> {
 fn update_statement(input: &str) -> VResult<'_, UpdateStatement> {
     let (input, _) = ws(word("UPDATE")).parse(input)?;
     let (start, target) = cut(ws(element_ref)).parse(input)?;
-    let (rest, expect_version) = opt_after(&["EXPECT", "VERSION"], ws(scalar)).parse(start)?;
-    let (rest, actions) = many0(ws(update_action)).parse(rest)?;
+    let (rest, actions) = many0(ws(update_action)).parse(start)?;
     if actions.is_empty() {
+        // §52.8: a guard never sits between the target and the actions, so
+        // `UPDATE :x EXPECT VERSION :v SET ...` lands here, with no action
+        // read — and is refused for the reason it is wrong.
+        if ws(words(&["EXPECT", "VERSION"])).parse(start).is_ok() {
+            return fail(
+                start,
+                "the SET / UNSET actions before EXPECT VERSION: a guard is the trailing clause of a \
+                 mutation, after WHERE and LIMIT",
+            );
+        }
         return fail(start, "at least one SET or UNSET action");
     }
     let (rest, where_clauses) =
         opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(rest)?;
     let (rest, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(rest)?;
+    let (rest, expect_versions) = expect_version_clauses(rest)?;
 
     let statement = UpdateStatement {
         target,
-        expect_version,
         actions,
         where_clauses,
         limit,
+        expect_versions,
     };
     if let Err(ctx) = guard_update(&statement) {
         return fail(start, ctx);
@@ -890,15 +937,16 @@ fn guard_structural_mutation(kind: Option<BoundKind>) -> Result<(), &'static str
             "a mutable target: an Assertion's citations are immutable payload — record a new \
              Assertion with SUPERSEDING",
         ),
-        Some(BoundKind::Evidence) => {
-            Err("a mutable target: correct Evidence topology with CORRECT EVIDENCE :old BY :new")
-        }
+        Some(BoundKind::Evidence) => Err(
+            "a mutable target: correct Evidence topology with TRANSITION :old TO \"corrected\" \
+             BY :new",
+        ),
         Some(BoundKind::Proposition) => {
             Err("a target with structural fields: a Proposition is its tuple and carries none")
         }
         Some(BoundKind::Activity) => Err(
-            "a mutable target: finalize a pending Activity with TRANSITION ACTIVITY ... SET \
-             STRUCTURAL; a terminal Activity is immutable",
+            "a mutable target: finalize a pending Activity with TRANSITION ... TO \"completed\" \
+             SET STRUCTURAL; a terminal Activity is immutable",
         ),
         _ => Ok(()),
     }
@@ -911,8 +959,8 @@ fn guard_immutable_field(field: &str, kind: Option<BoundKind>) -> Result<(), &'s
              with SUPERSEDING, never by rewriting the old one",
         ),
         Some(BoundKind::Evidence) if EVIDENCE_IMMUTABLE.contains(&field) => Err(
-            "a mutable field: immutable Evidence payload is corrected with CORRECT EVIDENCE \
-             :old BY :new",
+            "a mutable field: immutable Evidence payload is corrected with TRANSITION :old TO \
+             \"corrected\" BY :new",
         ),
         Some(BoundKind::Proposition) if PROPOSITION_IMMUTABLE.contains(&field) => Err(
             "a mutable field: the Proposition tuple is immutable — a different tuple is a \
@@ -922,61 +970,20 @@ fn guard_immutable_field(field: &str, kind: Option<BoundKind>) -> Result<(), &'s
     }
 }
 
-fn retract_assertion(input: &str) -> VResult<'_, RetractAssertion> {
-    let (input, _) = ws(words(&["RETRACT", "ASSERTION"])).parse(input)?;
-    let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    let (input, expect_state) = opt_after(&["EXPECT", "STATE"], ws(scalar)).parse(input)?;
-    Ok((
-        input,
-        RetractAssertion {
-            target,
-            where_clauses,
-            limit,
-            expect_state,
-        },
-    ))
-}
-
-fn supersede_assertion(input: &str) -> VResult<'_, SupersedeAssertion> {
-    let (input, _) = ws(words(&["SUPERSEDE", "ASSERTION"])).parse(input)?;
-    let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, _) = cut(ws(word("BY"))).parse(input)?;
-    let (input, by) = cut(ws(element_ref)).parse(input)?;
-    let (input, expect_state) = opt_after(&["EXPECT", "STATE"], ws(scalar)).parse(input)?;
-    Ok((
-        input,
-        SupersedeAssertion {
-            target,
-            by,
-            expect_state,
-        },
-    ))
-}
-
-fn correct_evidence(input: &str) -> VResult<'_, CorrectEvidence> {
-    let (input, _) = ws(words(&["CORRECT", "EVIDENCE"])).parse(input)?;
-    let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, _) = cut(ws(word("BY"))).parse(input)?;
-    let (input, by) = cut(ws(element_ref)).parse(input)?;
-    let (input, expect_state) = opt_after(&["EXPECT", "STATE"], ws(scalar)).parse(input)?;
-    Ok((
-        input,
-        CorrectEvidence {
-            target,
-            by,
-            expect_state,
-        },
-    ))
-}
-
-fn transition_activity(input: &str) -> VResult<'_, TransitionActivity> {
-    let (input, _) = ws(words(&["TRANSITION", "ACTIVITY"])).parse(input)?;
+/// `TRANSITION target TO "state" [BY ref] {SET FIELDS | SET STRUCTURAL}
+/// [WHERE] [LIMIT] {EXPECT VERSION}` — the one lifecycle statement (Spec §52.5).
+///
+/// The state names the move; which states fit which target kind, and which
+/// current state a move is legal from, is the engine's check. What the grammar
+/// fixes is the shape: `BY` exactly for `superseded` / `corrected`, and a
+/// finalizing `SET` only on an Activity state. There is no `EXPECT STATE` —
+/// the transition validates the current state itself (§35.3).
+fn transition_statement(input: &str) -> VResult<'_, Transition> {
+    let (input, _) = ws(word("TRANSITION")).parse(input)?;
     let (input, target) = cut(ws(element_ref)).parse(input)?;
     let (input, _) = cut(ws(word("TO"))).parse(input)?;
     let (start, to) = cut(ws(scalar)).parse(input)?;
+    let (rest, by) = opt_after(&["BY"], ws(element_ref)).parse(start)?;
 
     let (rest, finalize) = many0(ws(spanned(alt((
         map(
@@ -988,7 +995,7 @@ fn transition_activity(input: &str) -> VResult<'_, TransitionActivity> {
             |edges| (false, None, Some(edges)),
         ),
     )))))
-    .parse(start)?;
+    .parse(rest)?;
 
     let mut set_fields = None;
     let mut set_structural = None;
@@ -1005,17 +1012,61 @@ fn transition_activity(input: &str) -> VResult<'_, TransitionActivity> {
         }
     }
 
-    let (rest, expect_state) = opt_after(&["EXPECT", "STATE"], ws(scalar)).parse(rest)?;
-    Ok((
-        rest,
-        TransitionActivity {
-            target,
-            to,
-            set_fields,
-            set_structural,
-            expect_state,
-        },
-    ))
+    if ws(words(&["EXPECT", "STATE"])).parse(rest).is_ok() {
+        return fail(
+            rest,
+            "no EXPECT STATE: TRANSITION validates the current lifecycle state itself and fails \
+             InvalidLifecycleTransition from the wrong one; guard the version instead",
+        );
+    }
+    let (rest, where_clauses) =
+        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(rest)?;
+    let (rest, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(rest)?;
+    let (rest, expect_versions) = expect_version_clauses(rest)?;
+
+    let statement = Transition {
+        target,
+        to,
+        by,
+        set_fields,
+        set_structural,
+        where_clauses,
+        limit,
+        expect_versions,
+    };
+    if let Err(ctx) = check_transition_shape(&statement) {
+        return fail(start, ctx);
+    }
+    Ok((rest, statement))
+}
+
+/// The shape rules §52.5 calls syntax errors, decidable from the literal state.
+///
+/// A `:parameter` state is bound at execution time, so nothing here can judge
+/// it; the engine applies the same rules once it knows the state.
+fn check_transition_shape(statement: &Transition) -> Result<(), &'static str> {
+    let Some(state) = statement.state() else {
+        return Ok(());
+    };
+    let with_by = transition_state::WITH_BY.contains(&state);
+    if with_by && statement.by.is_none() {
+        return Err(
+            "BY <the replacing element>: TRANSITION TO \"superseded\" names the newer Assertion \
+             and TO \"corrected\" the new Evidence",
+        );
+    }
+    if !with_by && statement.by.is_some() {
+        return Err(
+            "no BY: only TRANSITION TO \"superseded\" / \"corrected\" names a replacing element",
+        );
+    }
+    if statement.finalizes() && !transition_state::ACTIVITY.contains(&state) {
+        return Err(
+            "no SET FIELDS / SET STRUCTURAL: only a move to an Activity state (running, \
+             completed, failed, cancelled) finalizes fields or topology",
+        );
+    }
+    Ok(())
 }
 
 fn set_retention(input: &str) -> VResult<'_, SetRetention> {
@@ -1025,7 +1076,7 @@ fn set_retention(input: &str) -> VResult<'_, SetRetention> {
     let (input, where_clauses) =
         opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
     let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    let (input, expect_version) = opt_after(&["EXPECT", "VERSION"], ws(scalar)).parse(input)?;
+    let (input, expect_versions) = expect_version_clauses(input)?;
     Ok((
         input,
         SetRetention {
@@ -1033,26 +1084,7 @@ fn set_retention(input: &str) -> VResult<'_, SetRetention> {
             values,
             where_clauses,
             limit,
-            expect_version,
-        },
-    ))
-}
-
-/// `ARCHIVE` and `TOMBSTONE` differ only in their verb.
-fn removal<'a>(verb: &'static str, input: &'a str) -> VResult<'a, RemovalStatement> {
-    let (input, _) = ws(word(verb)).parse(input)?;
-    let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    let (input, expect_state) = opt_after(&["EXPECT", "STATE"], ws(scalar)).parse(input)?;
-    Ok((
-        input,
-        RemovalStatement {
-            target,
-            where_clauses,
-            limit,
-            expect_state,
+            expect_versions,
         },
     ))
 }
@@ -1063,6 +1095,8 @@ fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
     let (input, where_clauses) =
         opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
     let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    // §52.8: the guards, then the statement's own trailing words.
+    let (input, expect_versions) = expect_version_clauses(input)?;
     let (input, reference_policy) = opt_after(&["REFERENCE", "POLICY"], ws(scalar)).parse(input)?;
     let (input, _) = cut(ws(word("CONFIRM"))).parse(input)?;
     let (rest, confirm) = cut(ws(quoted_string)).parse(input)?;
@@ -1076,6 +1110,7 @@ fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
             target,
             where_clauses,
             limit,
+            expect_versions,
             reference_policy,
             confirm,
         },
@@ -1092,6 +1127,7 @@ fn purge_payload_statement(input: &str) -> VResult<'_, crate::ast::PurgePayloadS
     let (input, where_clauses) =
         opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
     let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    let (input, expect_versions) = expect_version_clauses(input)?;
     let (input, _) = cut(ws(word("CONFIRM"))).parse(input)?;
     let (rest, confirm) = cut(ws(quoted_string)).parse(input)?;
     if confirm != "PURGE" {
@@ -1104,6 +1140,7 @@ fn purge_payload_statement(input: &str) -> VResult<'_, crate::ast::PurgePayloadS
             target,
             where_clauses,
             limit,
+            expect_versions,
             confirm,
         },
     ))
@@ -1116,14 +1153,14 @@ fn merge_concept(input: &str) -> VResult<'_, MergeConcept> {
     let (input, into) = cut(ws(element_ref)).parse(input)?;
     let (input, where_clauses) =
         opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, expect_version) = opt_after(&["EXPECT", "VERSION"], ws(scalar)).parse(input)?;
+    let (input, expect_versions) = expect_version_clauses(input)?;
     Ok((
         input,
         MergeConcept {
             source,
             into,
             where_clauses,
-            expect_version,
+            expect_versions,
         },
     ))
 }
@@ -1230,6 +1267,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                 .map_or(Ok(()), validate_structural_edges)?;
         }
         MutationClause::UpsertConcept(c) => {
+            check_guards(&c.expect_versions)?;
             c.set_fields.as_ref().map_or(Ok(()), &check_assignments)?;
             c.set_attributes
                 .as_ref()
@@ -1268,6 +1306,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                 .map_or(Ok(()), validate_structural_edges)?;
         }
         MutationClause::EnsureProposition(c) => {
+            check_guards(&c.expect_versions)?;
             if matches!(c.predicate, PredAtom::Variable(_)) {
                 return bad(
                     "ENSURE PROPOSITION needs an exact quoted predicate or :parameter; \
@@ -1278,6 +1317,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
             validate_exact_term(&c.object)?;
         }
         MutationClause::Update(c) => {
+            check_guards(&c.expect_versions)?;
             for action in &c.actions {
                 match action {
                     UpdateAction::SetFields(a) | UpdateAction::SetAttributes(a) => {
@@ -1304,22 +1344,37 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                 return bad(ctx);
             }
         }
-        MutationClause::TransitionActivity(c) => {
+        MutationClause::Transition(c) => {
+            check_guards(&c.expect_versions)?;
+            if let Err(ctx) = check_transition_shape(c) {
+                return Err(KipError::invalid_syntax(format!(
+                    "TRANSITION expects {ctx}"
+                )));
+            }
             c.set_fields.as_ref().map_or(Ok(()), &check_assignments)?;
             c.set_structural
                 .as_deref()
                 .map_or(Ok(()), validate_structural_edges)?;
         }
-        MutationClause::SetRetention(c) => check_assignments(&c.values)?,
+        MutationClause::SetRetention(c) => {
+            check_guards(&c.expect_versions)?;
+            check_assignments(&c.values)?
+        }
         // The grammar freezes the spelling so a purge is never the result of a
         // near-miss confirmation.
-        MutationClause::Purge(c) if c.confirm != "PURGE" => {
-            return bad("PURGE must be confirmed with the exact literal \"PURGE\"");
+        MutationClause::Purge(c) => {
+            check_guards(&c.expect_versions)?;
+            if c.confirm != "PURGE" {
+                return bad("PURGE must be confirmed with the exact literal \"PURGE\"");
+            }
         }
-        MutationClause::PurgePayload(c) if c.confirm != "PURGE" => {
-            return bad("PURGE PAYLOAD must be confirmed with the exact literal \"PURGE\"");
+        MutationClause::PurgePayload(c) => {
+            check_guards(&c.expect_versions)?;
+            if c.confirm != "PURGE" {
+                return bad("PURGE PAYLOAD must be confirmed with the exact literal \"PURGE\"");
+            }
         }
-        _ => {}
+        MutationClause::MergeConcept(c) => check_guards(&c.expect_versions)?,
     }
     Ok(())
 }
@@ -1459,9 +1514,8 @@ pub fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
 fn clause_where(clause: &MutationClause) -> Option<&Vec<WhereClause>> {
     match clause {
         MutationClause::Update(c) => c.where_clauses.as_ref(),
-        MutationClause::RetractAssertion(c) => c.where_clauses.as_ref(),
+        MutationClause::Transition(c) => c.where_clauses.as_ref(),
         MutationClause::SetRetention(c) => c.where_clauses.as_ref(),
-        MutationClause::Archive(c) | MutationClause::Tombstone(c) => c.where_clauses.as_ref(),
         MutationClause::Purge(c) => c.where_clauses.as_ref(),
         MutationClause::PurgePayload(c) => c.where_clauses.as_ref(),
         MutationClause::MergeConcept(c) => c.where_clauses.as_ref(),
@@ -1520,17 +1574,11 @@ fn collect_clause_handles(clause: &MutationClause, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        MutationClause::RetractAssertion(c) => element(&c.target),
-        MutationClause::SupersedeAssertion(c) => {
+        MutationClause::Transition(c) => {
             element(&c.target);
-            element(&c.by);
-        }
-        MutationClause::CorrectEvidence(c) => {
-            element(&c.target);
-            element(&c.by);
-        }
-        MutationClause::TransitionActivity(c) => {
-            element(&c.target);
+            if let Some(by) = &c.by {
+                element(by);
+            }
             collect_assignments_handles(c.set_fields.as_ref(), out);
             collect_edges_handles(c.set_structural.as_ref(), out);
         }
@@ -1538,7 +1586,6 @@ fn collect_clause_handles(clause: &MutationClause, out: &mut BTreeSet<String>) {
             element(&c.target);
             collect_assignments_handles(Some(&c.values), out);
         }
-        MutationClause::Archive(c) | MutationClause::Tombstone(c) => element(&c.target),
         MutationClause::Purge(c) => element(&c.target),
         MutationClause::PurgePayload(c) => element(&c.target),
         MutationClause::MergeConcept(c) => {
@@ -1583,12 +1630,173 @@ mod tests {
 
     #[test]
     fn a_lone_mutation_is_still_a_transaction() {
-        let statement = kml(r#"ARCHIVE :old"#);
+        let statement = kml(r#"TRANSITION :old TO "archived""#);
         assert!(!statement.explicit_transaction);
         assert_eq!(statement.clauses.len(), 1);
 
-        let explicit = kml(r#"MUTATE { ARCHIVE :old }"#);
+        let explicit = kml(r#"MUTATE { TRANSITION :old TO "archived" }"#);
         assert!(explicit.explicit_transaction);
+    }
+
+    #[test]
+    fn one_transition_statement_names_every_lifecycle_move() {
+        // §52.5: the quoted state names the move. The old per-move verbs are
+        // ordinary identifiers now and no longer start a statement.
+        for source in [
+            r#"TRANSITION :a TO "retracted""#,
+            r#"TRANSITION :old TO "superseded" BY ?new"#,
+            r#"TRANSITION :e TO "corrected" BY :fixed"#,
+            r#"TRANSITION :act TO "running""#,
+            r#"TRANSITION :act TO "completed" SET FIELDS { ended_at: :t } SET STRUCTURAL { ("outputs", :o) }"#,
+            r#"TRANSITION :x TO "archived" WHERE { ?x CONCEPT {type: "Event"} } LIMIT 10"#,
+            r#"TRANSITION ?x TO "tombstoned" WHERE { ?x CONCEPT {type: "Event"} } LIMIT 10 EXPECT VERSION 3"#,
+            r#"TRANSITION :a TO :state"#,
+        ] {
+            assert!(parse_kml_statement(source).is_ok(), "{source}");
+        }
+        for source in [
+            r#"RETRACT ASSERTION :a"#,
+            r#"SUPERSEDE ASSERTION :old BY :new"#,
+            r#"CORRECT EVIDENCE :old BY :new"#,
+            r#"TRANSITION ACTIVITY :act TO "completed""#,
+            r#"ARCHIVE :x"#,
+            r#"TOMBSTONE :x"#,
+        ] {
+            assert!(parse_kml_statement(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_transition_carries_by_exactly_where_the_spec_says() {
+        // §52.5: BY for superseded / corrected, and only there.
+        assert!(parse_kml_statement(r#"TRANSITION :a TO "superseded""#).is_err());
+        assert!(parse_kml_statement(r#"TRANSITION :e TO "corrected""#).is_err());
+        assert!(parse_kml_statement(r#"TRANSITION :a TO "retracted" BY :b"#).is_err());
+        assert!(parse_kml_statement(r#"TRANSITION :x TO "archived" BY :b"#).is_err());
+        // SET clauses finalize an Activity; nothing else has terminal fields.
+        assert!(
+            parse_kml_statement(r#"TRANSITION :a TO "retracted" SET FIELDS { ended_at: :t }"#)
+                .is_err()
+        );
+        assert!(
+            parse_kml_statement(
+                r#"TRANSITION :x TO "archived" SET STRUCTURAL { ("outputs", :o) }"#
+            )
+            .is_err()
+        );
+        // A parameter state is bound at execution time; the engine applies the
+        // same rules once it knows it.
+        assert!(parse_kml_statement(r#"TRANSITION :a TO :state BY :b"#).is_ok());
+    }
+
+    #[test]
+    fn there_is_no_expect_state_guard() {
+        // §35.3: the transition validates the current state itself.
+        let err = crate::parse_kml(r#"TRANSITION :a TO "retracted" EXPECT STATE "active""#)
+            .expect_err("EXPECT STATE is gone");
+        assert!(err.message.contains("EXPECT STATE"), "{err}");
+        assert!(
+            crate::parse_kml(r#"TRANSITION :x TO "archived" WHERE { ?x CONCEPT {id: "C-1"} } EXPECT STATE "active""#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expect_version_is_always_the_trailing_clause() {
+        // §52.8: after WHERE and LIMIT, after UPSERT's brace, after ENSURE
+        // PROPOSITION's tuple — and never between the target and the actions.
+        let update = kml(
+            r#"UPDATE ?m SET FACET "MnemonicState" {salience: 0.5} WHERE { ?m CONCEPT {id: "C-1"} } LIMIT 1 EXPECT VERSION :v"#,
+        );
+        let MutationClause::Update(update) = &update.clauses[0] else {
+            panic!("expected UPDATE");
+        };
+        assert_eq!(update.expect_versions.len(), 1);
+        assert!(update.expect_versions[0].plane.is_none());
+
+        let err = crate::parse_kml(r#"UPDATE :m EXPECT VERSION :v SET ATTRIBUTES {status: "x"}"#)
+            .expect_err("a guard before the actions");
+        assert!(err.message.contains("EXPECT VERSION"), "{err}");
+
+        let upsert = kml(
+            r#"UPSERT CONCEPT ?c { MATCH {key: "k"} SET FIELDS {name: "n"} } EXPECT VERSION 0"#,
+        );
+        let MutationClause::UpsertConcept(upsert) = &upsert.clauses[0] else {
+            panic!("expected UPSERT");
+        };
+        assert_eq!(upsert.expect_versions.len(), 1);
+        assert!(
+            parse_kml_statement(r#"UPSERT CONCEPT ?c { MATCH {key: "k"} EXPECT VERSION 0 }"#)
+                .is_err()
+        );
+
+        let ensure = kml(r#"ENSURE PROPOSITION ?p (:a, "p", :b) EXPECT VERSION 0"#);
+        let MutationClause::EnsureProposition(ensure) = &ensure.clauses[0] else {
+            panic!("expected ENSURE");
+        };
+        assert_eq!(ensure.expect_versions.len(), 1);
+
+        // PURGE keeps its own trailing words after the guards.
+        assert!(
+            parse_kml_statement(
+                r#"PURGE :e WHERE { ?e EVIDENCE {id: "E-1"} } LIMIT 1 EXPECT VERSION 2 REFERENCE POLICY "deny_if_referenced" CONFIRM "PURGE""#
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_kml_statement(r#"PURGE PAYLOAD :e EXPECT VERSION 2 CONFIRM "PURGE""#).is_ok()
+        );
+        assert!(
+            parse_kml_statement(
+                r#"SET RETENTION :e {retention_class: "standard"} EXPECT VERSION 2"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_guard_may_name_a_version_plane_once() {
+        // §35.1: one guard per plane; the bare guard is the element's version.
+        let statement = kml(
+            r#"UPDATE :skill SET ATTRIBUTES {status: "adopted"} SET FACET "GradingState" {graded_count: 12}
+               EXPECT VERSION :va OF ATTRIBUTES EXPECT VERSION 0 OF FACET "GradingState" EXPECT VERSION :vs OF STRUCTURAL EXPECT VERSION :vr OF RETENTION EXPECT VERSION :v"#,
+        );
+        let MutationClause::Update(update) = &statement.clauses[0] else {
+            panic!("expected UPDATE");
+        };
+        let planes: Vec<Option<VersionPlane>> = update
+            .expect_versions
+            .iter()
+            .map(|g| g.plane.clone())
+            .collect();
+        assert_eq!(
+            planes,
+            vec![
+                Some(VersionPlane::Attributes),
+                Some(VersionPlane::Facet(SymbolRef::Name("GradingState".into()))),
+                Some(VersionPlane::Structural),
+                Some(VersionPlane::Retention),
+                None,
+            ]
+        );
+
+        for source in [
+            r#"UPDATE :e SET ATTRIBUTES {a: 1} EXPECT VERSION :a OF ATTRIBUTES EXPECT VERSION :b OF ATTRIBUTES"#,
+            r#"UPDATE :e SET ATTRIBUTES {a: 1} EXPECT VERSION 1 EXPECT VERSION 2"#,
+            r#"UPDATE :e SET FACET "F" {a: 1} EXPECT VERSION 1 OF FACET "F" EXPECT VERSION 2 OF FACET "F""#,
+            r#"UPDATE :e SET ATTRIBUTES {a: 1} EXPECT VERSION 1 OF NOWHERE"#,
+        ] {
+            assert!(parse_kml_statement(source).is_err(), "{source}");
+        }
+
+        // The same rule holds for a pre-parsed tree (§73).
+        let mut duplicated = kml(r#"UPDATE :e SET ATTRIBUTES {a: 1} EXPECT VERSION 1"#);
+        let MutationClause::Update(update) = &mut duplicated.clauses[0] else {
+            unreachable!()
+        };
+        let guard = update.expect_versions[0].clone();
+        update.expect_versions.push(guard);
+        assert!(validate_plan(&duplicated).is_err());
     }
 
     #[test]
@@ -1753,14 +1961,19 @@ mod tests {
 
     #[test]
     fn assert_superseding_points_at_the_new_assertion() {
+        // §55.1: `SUPERSEDING :old` desugars to the one lifecycle statement,
+        // `TRANSITION :old TO "superseded" BY <the new Assertion>`.
         let statement =
             kml(r#"ASSERT ?new (:a, "p", :b) { by: :me, mode: "stated" } SUPERSEDING :old"#);
         assert_eq!(statement.clauses.len(), 3);
-        let MutationClause::SupersedeAssertion(supersede) = &statement.clauses[2] else {
-            panic!("expected SUPERSEDE");
+        let MutationClause::Transition(supersede) = &statement.clauses[2] else {
+            panic!("expected TRANSITION");
         };
-        assert_eq!(supersede.by, ElementRef::Handle("new".into()));
+        assert_eq!(supersede.state(), Some("superseded"));
+        assert_eq!(supersede.by, Some(ElementRef::Handle("new".into())));
         assert_eq!(supersede.target, ElementRef::Param("old".into()));
+        assert!(supersede.where_clauses.is_none());
+        assert!(supersede.expect_versions.is_empty());
     }
 
     #[test]
@@ -1817,13 +2030,29 @@ mod tests {
         .unwrap() else {
             unreachable!()
         };
-        let mut archive =
-            kml(r#"ARCHIVE ?p WHERE { ?p PROPOSITION (:a, "related_to", :b) } LIMIT 1"#);
-        let MutationClause::Archive(archive_clause) = &mut archive.clauses[0] else {
+        let mut archive = kml(
+            r#"TRANSITION ?p TO "archived" WHERE { ?p PROPOSITION (:a, "related_to", :b) } LIMIT 1"#,
+        );
+        let MutationClause::Transition(archive_clause) = &mut archive.clauses[0] else {
             unreachable!()
         };
         archive_clause.where_clauses = Some(query.where_clauses);
         assert!(validate_plan(&archive).is_err(), "raw predicate path");
+
+        // §52.5's shape rules hold for a transported tree too: a BY on a
+        // state that takes none, or a finalizing SET on a non-Activity state.
+        let mut retract = kml(r#"TRANSITION :a TO "retracted""#);
+        let MutationClause::Transition(clause) = &mut retract.clauses[0] else {
+            unreachable!()
+        };
+        clause.by = Some(ElementRef::Param("b".into()));
+        assert!(validate_plan(&retract).is_err(), "BY on retracted");
+        let mut archive = kml(r#"TRANSITION :x TO "archived""#);
+        let MutationClause::Transition(clause) = &mut archive.clauses[0] else {
+            unreachable!()
+        };
+        clause.set_fields = Some(vec![("ended_at".into(), MutationValue::Param("t".into()))]);
+        assert!(validate_plan(&archive).is_err(), "SET on archived");
     }
 
     #[test]
@@ -1938,14 +2167,12 @@ mod tests {
     #[test]
     fn transition_finalizes_at_most_once_per_clause_kind() {
         assert!(
-            parse_kml_statement(
-                r#"TRANSITION ACTIVITY :act TO "succeeded" SET FIELDS { ended_at: :now }"#
-            )
-            .is_ok()
+            parse_kml_statement(r#"TRANSITION :act TO "completed" SET FIELDS { ended_at: :now }"#)
+                .is_ok()
         );
         assert!(
             parse_kml_statement(
-                r#"TRANSITION ACTIVITY :act TO "succeeded" SET FIELDS { a: 1 } SET FIELDS { b: 2 }"#
+                r#"TRANSITION :act TO "completed" SET FIELDS { a: 1 } SET FIELDS { b: 2 }"#
             )
             .is_err()
         );
@@ -1966,7 +2193,7 @@ mod tests {
             panic!("expected MERGE");
         };
         assert_eq!(merge.source, ElementRef::Param("js".into()));
-        assert!(merge.expect_version.is_some());
+        assert_eq!(merge.expect_versions.len(), 1);
         // MERGE takes no LIMIT: both operands are already named, and its WHERE
         // only guards. The trailing clause is simply not part of the statement.
         assert!(crate::parser::parse_kml(r#"MERGE CONCEPT :a INTO :b LIMIT 1"#).is_err());

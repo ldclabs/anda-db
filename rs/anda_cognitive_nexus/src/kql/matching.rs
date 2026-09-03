@@ -133,11 +133,29 @@ impl Context<'_> {
         let mut constrains_state = false;
         let mut by_id: Option<ElementId> = None;
 
+        // §20.14, §43.1: `type:` names a lineage, and a Concept written under
+        // any readable version of it is a match. The index is ranged over the
+        // package and the symbol checked afterwards.
+        let mut type_lineages: Vec<String> = Vec::new();
+
         let historical = self.is_historical();
         for (key, value) in matcher {
             let slot = self.classify(value)?;
             if key == "state" {
                 constrains_state = true;
+            }
+            if is_symbol_key(kind, key)
+                && let Slot::Value(value) = &slot
+            {
+                let symbol = self.matcher_text(kind, key, value)?;
+                if !historical && let Some((low, high)) = crate::schema::lineage_range(&symbol) {
+                    filters.push(Filter::Field((
+                        "schema_ref".to_string(),
+                        RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+                    )));
+                }
+                type_lineages.push(symbol);
+                continue;
             }
             // At a past coordinate the indexes describe the present, so every
             // constraint is decided against the historical element instead —
@@ -208,6 +226,15 @@ impl Context<'_> {
                     continue;
                 }
                 if !constrains_state && !element.is_active() {
+                    continue;
+                }
+            }
+            if !type_lineages.is_empty() {
+                let schema_ref = element.schema_ref();
+                if !type_lineages
+                    .iter()
+                    .all(|symbol| crate::schema::same_lineage(schema_ref, symbol))
+                {
                     continue;
                 }
             }
@@ -286,21 +313,31 @@ impl Context<'_> {
 
         let predicates = self.predicate_slot(&triple.predicate)?;
 
+        // §12.3, §43.2: matching is canonical. A fixed Concept endpoint
+        // matches every stored endpoint in its merge class, so a term naming
+        // the surviving identity finds the tuples recorded on what was merged
+        // into it, and a term naming the merged-away Concept still finds them.
+        let subject_keys = match &subject {
+            EndpointSlot::Fixed(endpoint) => Some(self.endpoint_keys(endpoint).await?),
+            EndpointSlot::Bind(_) => None,
+        };
+        let object_keys = match &object {
+            EndpointSlot::Fixed(endpoint) => Some(self.endpoint_keys(endpoint).await?),
+            EndpointSlot::Bind(_) => None,
+        };
+
         let mut filters = vec![
             eq_field("space", Fv::Text(self.space.clone())),
             eq_field("state", Fv::Text("active".to_string())),
         ];
-        if let EndpointSlot::Fixed(endpoint) = &subject {
-            filters.push(eq_field("subject_key", Fv::Text(endpoint.key())));
+        if let Some(keys) = &subject_keys {
+            filters.push(key_filter("subject_key", keys));
         }
-        if let EndpointSlot::Fixed(endpoint) = &object {
-            filters.push(eq_field("object_key", Fv::Text(endpoint.key())));
+        if let Some(keys) = &object_keys {
+            filters.push(key_filter("object_key", keys));
         }
         if let PredicateSlot::Fixed(symbols) = &predicates {
-            filters.push(Filter::Field((
-                "predicate_ref".to_string(),
-                RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
-            )));
+            filters.push(predicate_filter(symbols));
         }
 
         let historical = self.is_historical();
@@ -334,9 +371,16 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
-            // At a coordinate the filters could not be pushed down, so the
-            // tuple is matched here against the historical row.
-            if historical && !tuple_matches(&row, &subject, &object, &predicates) {
+            // The predicate index was ranged over a lineage, so the symbol is
+            // checked here; at a past coordinate no filter could be pushed
+            // down at all, so the whole tuple is.
+            if !tuple_matches(
+                &row,
+                subject_keys.as_deref(),
+                object_keys.as_deref(),
+                &predicates,
+                historical,
+            ) {
                 continue;
             }
             let mut solution = vec![Binding::Null; vars.len()];
@@ -871,18 +915,17 @@ impl Context<'_> {
         } else {
             ("object_key", "subject")
         };
-        let anchor_key = from.key();
+        // A walk anchors canonically too (§43.2): the hop out of B leaves
+        // from every tuple recorded on a Concept merged into B.
+        let anchor_keys = self.endpoint_keys(from).await?;
         let ids = self
             .candidates(
                 ElementKind::Proposition,
                 Some(Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
                     Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                    Box::new(eq_field(anchor, Fv::Text(anchor_key.clone()))),
-                    Box::new(Filter::Field((
-                        "predicate_ref".to_string(),
-                        RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
-                    ))),
+                    Box::new(key_filter(anchor, &anchor_keys)),
+                    Box::new(predicate_filter(symbols)),
                 ])),
             )
             .await?;
@@ -894,14 +937,16 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if !predicate_matches(&row.predicate_ref, symbols) {
+                continue;
+            }
             if historical {
                 let matches_anchor = if forward {
-                    row.subject_key == anchor_key
+                    anchor_keys.contains(&row.subject_key)
                 } else {
-                    row.object_key == anchor_key
+                    anchor_keys.contains(&row.object_key)
                 };
-                if !matches_anchor || row.state != "active" || !symbols.contains(&row.predicate_ref)
-                {
+                if !matches_anchor || row.state != "active" {
                     continue;
                 }
             }
@@ -926,10 +971,7 @@ impl Context<'_> {
                 Some(Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
                     Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                    Box::new(Filter::Field((
-                        "predicate_ref".to_string(),
-                        RangeQuery::Include(symbols.iter().map(|s| Fv::Text(s.clone())).collect()),
-                    ))),
+                    Box::new(predicate_filter(symbols)),
                 ])),
             )
             .await?;
@@ -941,7 +983,9 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
-            if historical && (row.state != "active" || !symbols.contains(&row.predicate_ref)) {
+            if !predicate_matches(&row.predicate_ref, symbols)
+                || (historical && row.state != "active")
+            {
                 continue;
             }
             if let Ok(endpoint) = Endpoint::from_json(&row.subject)
@@ -1033,33 +1077,73 @@ enum EndpointSlot {
 
 /// Whether a Proposition row satisfies a tuple pattern.
 ///
-/// Only the historical path needs this: a present-day read pushes the same
-/// three constraints into the index.
+/// The predicate is always checked here, because the index was ranged over
+/// its lineage rather than its exact symbol; the endpoints and the state only
+/// at a past coordinate, where nothing could be pushed into the index.
 fn tuple_matches(
     row: &crate::store::rows::PropositionRow,
-    subject: &EndpointSlot,
-    object: &EndpointSlot,
+    subject_keys: Option<&[String]>,
+    object_keys: Option<&[String]>,
     predicates: &PredicateSlot,
+    historical: bool,
 ) -> bool {
+    if let PredicateSlot::Fixed(symbols) = predicates
+        && !predicate_matches(&row.predicate_ref, symbols)
+    {
+        return false;
+    }
+    if !historical {
+        return true;
+    }
     if row.state != "active" {
         return false;
     }
-    if let EndpointSlot::Fixed(endpoint) = subject
-        && row.subject_key != endpoint.key()
+    if let Some(keys) = subject_keys
+        && !keys.contains(&row.subject_key)
     {
         return false;
     }
-    if let EndpointSlot::Fixed(endpoint) = object
-        && row.object_key != endpoint.key()
-    {
-        return false;
-    }
-    if let PredicateSlot::Fixed(symbols) = predicates
-        && !symbols.contains(&row.predicate_ref)
+    if let Some(keys) = object_keys
+        && !keys.contains(&row.object_key)
     {
         return false;
     }
     true
+}
+
+/// An index filter over one endpoint key column for a merge class.
+fn key_filter(column: &str, keys: &[String]) -> Filter {
+    Filter::Field((
+        column.to_string(),
+        RangeQuery::Include(keys.iter().map(|key| Fv::Text(key.clone())).collect()),
+    ))
+}
+
+/// An index filter over `predicate_ref` for every version of each lineage
+/// (§20.14): the package is ranged over, and [`predicate_matches`] settles
+/// the symbol afterwards.
+fn predicate_filter(symbols: &[String]) -> Filter {
+    let mut ranges: Vec<Box<Filter>> = Vec::with_capacity(symbols.len());
+    for symbol in symbols {
+        ranges.push(Box::new(match crate::schema::lineage_range(symbol) {
+            Some((low, high)) => Filter::Field((
+                "predicate_ref".to_string(),
+                RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+            )),
+            None => eq_field("predicate_ref", Fv::Text(symbol.clone())),
+        }));
+    }
+    match ranges.len() {
+        1 => *ranges.pop().expect("one range"),
+        _ => Filter::Or(ranges),
+    }
+}
+
+/// Whether a stored predicate belongs to one of the lineages a pattern named.
+fn predicate_matches(stored: &str, symbols: &[String]) -> bool {
+    symbols
+        .iter()
+        .any(|symbol| crate::schema::same_lineage(stored, symbol))
 }
 
 /// One quantified alternative of a raw predicate path.
@@ -1367,7 +1451,7 @@ impl Context<'_> {
         let mut rows = Vec::with_capacity(subjects.len());
         for (endpoint, binding) in subjects {
             let slot = self
-                .project_slot(&endpoint.key(), &predicate_ref, &policy, &at)
+                .project_slot(&endpoint, &predicate_ref, &policy, &at)
                 .await?;
             let rendered = crate::projection::slot_to_json(&endpoint, &predicate_ref, &slot);
             let mut row = vec![Binding::Literal(rendered)];

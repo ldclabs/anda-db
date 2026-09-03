@@ -105,7 +105,7 @@ describe('KML', () => {
   it('starts every new element at version 1', async () => {
     await withNexus('version', (nexus) => {
       const outcome = nexus.execute(SETUP)
-      for (const change of outcome.changes) expect(change.version).toBe(1)
+      for (const change of outcome.changes) expect(change.new_version).toBe(1)
       expect(concept(nexus, outcome.handles.alice!).version).toBe(1)
     })
   })
@@ -257,7 +257,7 @@ describe('KML', () => {
       const first = nexus.execute(SETUP)
       const result = nexus.tryExecute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "stated", nonsense: 1 }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "stated", nonsense: 1 }
          }`,
         { p: first.handles.p! },
       )
@@ -287,7 +287,7 @@ describe('KML', () => {
       // 1.5 is wrong. `ConstraintViolation` names the rule it broke.
       const written = nexus.tryExecute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: 1.5 }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "stated", confidence: 1.5 }
          }`,
         { p: first.handles.p! },
       )
@@ -301,7 +301,7 @@ describe('KML', () => {
       // have to switch error handlers too.
       const bound = nexus.tryExecute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: :c }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "stated", confidence: :c }
          }`,
         { p: first.handles.p!, c: 1.5 },
       )
@@ -312,7 +312,7 @@ describe('KML', () => {
       // would not be stored wrong — it would be stored as silence.
       const negative = nexus.tryExecute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "stated", confidence: :c }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "stated", confidence: :c }
          }`,
         { p: first.handles.p!, c: -0.5 },
       )
@@ -345,12 +345,12 @@ describe('KML', () => {
   it('retracts a claim without touching the record', async () => {
     await withNexus('retract', (nexus) => {
       const first = nexus.execute(SETUP)
-      const outcome = nexus.execute(`RETRACT ASSERTION "${first.handles.a}"`)
+      const outcome = nexus.execute(`TRANSITION "${first.handles.a}" TO "retracted"`)
       expect(outcome.status).toBe('committed')
       const assertion = nexus.store.load(parseElementId(first.handles.a!))
         ?.row as AssertionRow
       // Retraction is an epistemic status, not a deletion: the record stays
-      // active and citable, and only the claim is withdrawn (§80).
+      // active and citable, and only the claim is withdrawn (§57.3).
       expect(assertion.status).toBe('retracted')
       expect(assertion.state).toBe('active')
       expect(assertion.retracted_at).not.toBe('')
@@ -368,7 +368,7 @@ describe('KML', () => {
         { p: first.handles.p!, who: { id: first.handles.alice! } },
       )
       nexus.execute(
-        `SUPERSEDE ASSERTION "${first.handles.a}" BY "${second.handles.a}"`,
+        `TRANSITION "${first.handles.a}" TO "superseded" BY "${second.handles.a}"`,
       )
       const older = nexus.store.load(parseElementId(first.handles.a!))
         ?.row as AssertionRow
@@ -384,11 +384,11 @@ describe('KML', () => {
         CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
         ENSURE PROPOSITION ?q ({id: "${first.handles.alice}"}, "prefers", ?light)
         CREATE ASSERTION ?b {
-          SET FIELDS { proposition: ?q, stance: "support", mode: "stated" }
+          SET FIELDS { proposition: ?q, asserted_by: {id: "${first.handles.alice}"}, stance: "support", mode: "stated" }
         }
       }`)
       const mismatch = nexus.tryExecute(
-        `SUPERSEDE ASSERTION "${second.handles.a}" BY "${other.handles.b}"`,
+        `TRANSITION "${second.handles.a}" TO "superseded" BY "${other.handles.b}"`,
       )
       expect('error' in mismatch && mismatch.error.code).toBe('SupersessionMismatch')
     })
@@ -400,14 +400,14 @@ describe('KML', () => {
         'CREATE ACTIVITY ?x { SET FIELDS { activity_class: "extraction" } }',
       )
       const id = created.handles.x!
-      expect(nexus.execute(`TRANSITION ACTIVITY "${id}" TO "running"`).status).toBe(
+      expect(nexus.execute(`TRANSITION "${id}" TO "running"`).status).toBe(
         'committed',
       )
-      nexus.execute(`TRANSITION ACTIVITY "${id}" TO "completed"`)
-      // Terminal topology freezes with the Activity (§22.3): re-opening a
+      nexus.execute(`TRANSITION "${id}" TO "completed"`)
+      // Terminal topology freezes with the Activity (§16.6): re-opening a
       // finished process would let its provenance be rewritten after the fact.
       const reopened = nexus.tryExecute(
-        `TRANSITION ACTIVITY "${id}" TO "running"`,
+        `TRANSITION "${id}" TO "running"`,
       )
       expect('error' in reopened && reopened.error.code).toBe('ActivityTerminal')
       expect(
@@ -419,11 +419,11 @@ describe('KML', () => {
   it('archives without claiming the author took anything back', async () => {
     await withNexus('archive', (nexus) => {
       const first = nexus.execute(SETUP)
-      nexus.execute(`ARCHIVE "${first.handles.a}"`)
+      nexus.execute(`TRANSITION "${first.handles.a}" TO "archived"`)
       const assertion = nexus.store.load(parseElementId(first.handles.a!))
         ?.row as AssertionRow
       expect(assertion.state).toBe('archived')
-      // Archiving the record does not retract the claim (§80).
+      // Archiving the record does not retract the claim (§60.1).
       expect(assertion.status).toBe('active')
     })
   })
@@ -823,18 +823,15 @@ describe('KML', () => {
       const found = nexus.describe('SEARCH EVIDENCE "Elm"') as { hits: unknown[] }
       expect(found.hits).toHaveLength(0)
 
-      // The change stream names it `purge_payload`, not `purge`: a follower
-      // that could not tell the two apart would read a data-minimization
-      // decision as the loss of the record (§36).
-      // The change stream names it `purge_payload`, not `purge`: a follower
-      // that could not tell the two apart would read a data-minimization
-      // decision as the loss of the record (§36).
+      // The change stream names it `payload_purge`, not `purge` (§36.1): a
+      // follower that could not tell the two apart would read a
+      // data-minimization decision as the loss of the record.
       const history = nexus.describe('HISTORY ELEMENT "E-1"') as unknown as {
         changes: { op: string }[]
       }[]
       expect(history.flatMap((e) => e.changes.map((c) => c.op))).toEqual([
         'create',
-        'purge_payload',
+        'payload_purge',
       ])
       // Kept: everything §60.6 lists, so corroboration grouping and
       // independence counting keep operating on the surviving digest and
@@ -925,7 +922,7 @@ describe('KML', () => {
       // What the record itself says is still corrected, never edited.
       expect(() =>
         nexus.execute('UPDATE "E-1" SET FIELDS {payload: "something else"}'),
-      ).toThrowError(/CORRECT/)
+      ).toThrowError(/corrected/)
     })
   })
 

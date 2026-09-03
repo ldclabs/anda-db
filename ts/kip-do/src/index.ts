@@ -15,7 +15,10 @@ export {
   KipError,
   KIP_ERROR_CODES,
   KIP_ERROR_REGISTRY,
+  detailed,
   errors,
+  type CursorFamily,
+  type CursorReason,
   type ErrorFactories,
   type KipErrorCategory,
   type KipErrorCode,
@@ -77,7 +80,10 @@ export {
 
 export {
   KipDatabase,
+  receiptOf,
   type KipDatabaseEnv,
+  type KipReceipt,
+  type KipReceiptOrigin,
   type KipResponse,
   type KipResult,
   type KipResultContext,
@@ -99,8 +105,12 @@ export {
   Transaction,
   executeKml,
   tryExecuteKml,
+  type ElementReference,
+  type IngestContext,
+  type IngestEvidence,
   type KmlContext,
   type Outcome,
+  type VersionGuard,
   type WriteContext,
 } from './kml/index.js'
 

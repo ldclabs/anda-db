@@ -99,6 +99,10 @@ cargo run -p anda_kip --bin kip_cli -- path/to/commands
 
 - [docs/anda_kip.md](../../docs/anda_kip.md)
 - [`SPECIFICATION.md`](./SPECIFICATION.md) — the normative KIP 2.0 specification
+- [`Capsule-Specification.md`](./Capsule-Specification.md) — its §37–§41 and §95, the Cognitive Capsule, carried in a companion under the same numbering
+- [`Optional-Profiles-and-Migration.md`](./Optional-Profiles-and-Migration.md) — its §100, §101, §103 and Appendix I: the optional Historical and High-Assurance profiles, and KIP 1.x migration
+- [`Invariants.md`](./Invariants.md) — the invariant registry: the 38 Core invariants and the Cognitive Memory Profile's 35, one list
+- [`grammar/`](./grammar) and [`schemas/`](./schemas) — the normative EBNF grammars and the request / response / change-envelope wire schemas
 - [`KIPSyntax.md`](./KIPSyntax.md) — the LLM-facing syntax reference
 - [`SelfInstructions.md`](./SelfInstructions.md) — how an Agent should use its memory
 - [`SystemInstructions.md`](./SystemInstructions.md) — what a runtime owes its callers

@@ -106,8 +106,20 @@
       "expect": {
         "result": [
           {
+            "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+            "local_name": "DecisionRecord",
+            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "status": "active"
+          },
+          {
             "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
             "local_name": "DerivationState",
+            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+            "local_name": "GradingState",
             "package_ref": "kip://profiles/cognitive-memory@2.0.0",
             "status": "active"
           },
@@ -124,8 +136,8 @@
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/SkillUtility",
-            "local_name": "SkillUtility",
+            "ref": "kip://profiles/cognitive-memory@2.0.0/TrialState",
+            "local_name": "TrialState",
             "package_ref": "kip://profiles/cognitive-memory@2.0.0",
             "status": "active"
           },

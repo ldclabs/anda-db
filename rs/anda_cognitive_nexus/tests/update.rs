@@ -66,6 +66,15 @@ async fn ok(nexus: &CognitiveNexus, command: &str) -> Json {
     response.first_result().cloned().unwrap_or(Json::Null)
 }
 
+/// The Receipt of a single-operation write.
+///
+/// §75 puts it on the operation's own result in `sequence` and `independent`
+/// execution; the top-level slot is reserved for an `atomic` transaction,
+/// which this engine does not run.
+fn receipt(response: &anda_kip::Response) -> Option<&anda_kip::Receipt> {
+    response.results.first().and_then(|r| r.receipt.as_ref())
+}
+
 async fn err(nexus: &CognitiveNexus, command: &str) -> anda_kip::ErrorObject {
     let response = run(nexus, command).await;
     response
@@ -229,7 +238,7 @@ async fn a_selection_that_matches_nothing_changes_nothing() {
     .await;
     assert_eq!(response.status, TopLevelStatus::Succeeded);
     assert_eq!(
-        response.receipt.as_ref().map(|receipt| receipt.status),
+        receipt(&response).map(|receipt| receipt.status),
         Some(ReceiptStatus::NoEffect)
     );
 
@@ -243,7 +252,7 @@ async fn a_selection_that_matches_nothing_changes_nothing() {
     )
     .await;
     assert_eq!(
-        response.receipt.as_ref().map(|receipt| receipt.status),
+        receipt(&response).map(|receipt| receipt.status),
         Some(ReceiptStatus::NoEffect)
     );
 }
@@ -456,13 +465,16 @@ async fn update_edits_concept_topology_only() {
 // Selection blocks on the lifecycle families
 // ---------------------------------------------------------------------------
 
+/// §52.5 collapsed the six removal and lifecycle statements into one
+/// `TRANSITION`, and the selection block survived the collapse: a sweep still
+/// says which elements it moves, whichever state it moves them to.
 #[tokio::test]
-async fn archive_and_retract_accept_selection_blocks() {
+async fn a_transition_accepts_a_selection_block_whatever_state_it_names() {
     let (nexus, _) = seeded("selection_lifecycle").await;
 
     ok(
         &nexus,
-        r#"ARCHIVE ?m WHERE {
+        r#"TRANSITION ?m TO "archived" WHERE {
              ?m CONCEPT {type: "Experience"}
              FILTER(?m.attributes.outcome_status == "failure")
            }"#,
@@ -477,7 +489,7 @@ async fn archive_and_retract_accept_selection_blocks() {
 
     ok(
         &nexus,
-        r#"RETRACT ASSERTION ?a WHERE { ?a ASSERTION {stance: "support"} } LIMIT 10"#,
+        r#"TRANSITION ?a TO "retracted" WHERE { ?a ASSERTION {stance: "support"} } LIMIT 10"#,
     )
     .await;
     let status = ok(
@@ -529,7 +541,7 @@ async fn a_selection_block_does_not_see_the_transactions_own_writes() {
         r#"MUTATE {
             CREATE CONCEPT ?fresh { TYPE "Experience" NAME "Fourth"
               SET ATTRIBUTES {goal: "learn", outcome_status: "success"} }
-            ARCHIVE ?m WHERE { ?m CONCEPT {type: "Experience"} }
+            TRANSITION ?m TO "archived" WHERE { ?m CONCEPT {type: "Experience"} }
         }"#,
     )
     .await;
@@ -556,7 +568,7 @@ async fn a_handle_and_a_selection_variable_may_not_share_a_name() {
         r#"MUTATE {
             CREATE CONCEPT ?m { TYPE "Experience" NAME "Fifth"
               SET ATTRIBUTES {goal: "learn", outcome_status: "success"} }
-            ARCHIVE ?m WHERE { ?m CONCEPT {type: "Experience"} }
+            TRANSITION ?m TO "archived" WHERE { ?m CONCEPT {type: "Experience"} }
         }"#,
     )
     .await;
@@ -564,9 +576,10 @@ async fn a_handle_and_a_selection_variable_may_not_share_a_name() {
 
     // A target the block never binds does not even parse: the grammar knows
     // that much without an engine.
-    let unbound =
-        anda_kip::parse_kip(r#"ARCHIVE ?missing WHERE { ?m CONCEPT {type: "Experience"} }"#)
-            .expect_err("an unbound target is refused");
+    let unbound = anda_kip::parse_kip(
+        r#"TRANSITION ?missing TO "archived" WHERE { ?m CONCEPT {type: "Experience"} }"#,
+    )
+    .expect_err("an unbound target is refused");
     assert_eq!(unbound.code, anda_kip::KipErrorCode::ReferenceError);
 }
 
@@ -696,7 +709,7 @@ async fn a_merge_that_would_cycle_or_re_point_an_identity_is_refused() {
     // nothing rather than conflicting with itself.
     let response = merge(b, alice).await;
     assert_eq!(
-        response.receipt.as_ref().map(|receipt| receipt.status),
+        receipt(&response).map(|receipt| receipt.status),
         Some(ReceiptStatus::NoEffect)
     );
 
@@ -717,7 +730,7 @@ async fn a_merge_that_would_cycle_or_re_point_an_identity_is_refused() {
         .await;
     assert_eq!(response.status, TopLevelStatus::Succeeded);
     assert_eq!(
-        response.receipt.as_ref().map(|receipt| receipt.status),
+        receipt(&response).map(|receipt| receipt.status),
         Some(ReceiptStatus::NoEffect),
         "a guard that cannot name a merged Concept merges nothing"
     );

@@ -11,10 +11,12 @@
 //! impossible. Planning therefore happens in two phases — declare every handle,
 //! then interpret every clause with all handles known.
 //!
-//! **An element's version increments once per transaction** (§44), no matter
-//! how many clauses touched it. A transaction is one externally visible state
-//! transition, and `EXPECT VERSION`, audit and the change stream all read that
-//! counter. So versions are assigned here, at commit, not by each write.
+//! **An element's version increments once per transaction** (§35.5), no matter
+//! how many clauses touched it, and each version plane advances once when the
+//! transaction changed that plane (§6.3). A transaction is one externally
+//! visible state transition, and `EXPECT VERSION`, audit and the change stream
+//! all read those counters. So versions are assigned here, at commit, from a
+//! diff of what was loaded against what is written — not by each clause.
 //!
 //! **A no-effect final state changes nothing.** Writing the same value back
 //! would burn a version and emit a change record for a transition that did not
@@ -29,7 +31,10 @@
 //! journalled transaction, so [`Store::sweep_pending`] removes them on open —
 //! recovery by construction rather than by replay.
 
-use anda_kip::{ElementKind, Json, KipError, KipErrorCode, Map, Receipt, ReceiptStatus};
+use anda_kip::{
+    ChangeEntry, ChangeOp, ChangeRefs, ChangeState, ElementKind, Json, KipError, KipErrorCode, Map,
+    PlaneVersions, Receipt, ReceiptOrigin, ReceiptStatus,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::db_error;
@@ -38,6 +43,7 @@ use crate::governance::store::MutationEntry;
 use crate::governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
+use crate::store::planes::{self, PlaneKey, Touched};
 use crate::store::rows::*;
 use crate::store::space::JournalEntry;
 use crate::store::write::{Row, WriteContext};
@@ -83,22 +89,40 @@ pub struct Transaction {
     /// explicit positions in one mutation plan* and a plan is free to spread
     /// them across clauses.
     structural_positions: BTreeMap<(ElementId, String), BTreeSet<usize>>,
+    /// The ActorBinding this transaction exercised, when an Assertion was
+    /// written under one (§28.3); reported in the Receipt's `origin` (§33.2).
+    exercised_binding: Option<String>,
 }
 
 /// One element this transaction will write.
 struct Staged {
     row: Element,
+    /// The row as the transaction loaded it, for an element that existed.
+    ///
+    /// This is what every guard compares against and what the change entry is
+    /// diffed from: a guard is a statement about what the caller believed, and
+    /// the caller could not have seen a version this transaction produced.
+    before: Option<Element>,
     is_new: bool,
     /// Whether the final state differs from what was there before.
     changed: bool,
-    /// What the change record calls this.
-    op: &'static str,
+    /// What the change entry calls this (§36.1).
+    op: ChangeOp,
     /// Whether the row carries its own envelope through the write.
     ///
     /// Ordinarily the writer stamps who the runtime observed (§26). A purge
     /// stub is the exception, and says so here rather than having the generic
     /// writer recognize it by the name of its operation.
     keep_origin: bool,
+}
+
+/// One `EXPECT VERSION` guard, resolved (§35.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guard {
+    /// The counter the caller believes the plane is at.
+    pub version: u64,
+    /// The plane the guard names; the whole element when it names none.
+    pub plane: PlaneKey,
 }
 
 impl Transaction {
@@ -129,6 +153,7 @@ impl Transaction {
             approval_decisions: Vec::new(),
             governance_audit: Vec::new(),
             structural_positions: BTreeMap::new(),
+            exercised_binding: None,
         })
     }
 
@@ -142,6 +167,18 @@ impl Transaction {
         self.warnings.push(message.into());
     }
 
+    /// Records that an Assertion was written under one of the caller's
+    /// ActorBindings, for the Receipt's `origin` (§33.2).
+    ///
+    /// The first binding exercised is the one reported: a Receipt has one
+    /// `actor_binding_id` slot, and a statement that spoke as two actors is
+    /// still one commit attributed to one Principal.
+    pub fn note_binding(&mut self, binding_id: String) {
+        if self.exercised_binding.is_none() {
+            self.exercised_binding = Some(binding_id);
+        }
+    }
+
     /// Declares a handle and mints the element it will name.
     ///
     /// The id has to exist before any clause is interpreted, because a clause
@@ -149,7 +186,7 @@ impl Transaction {
     /// insert time and offers no way to reserve one, so the element is inserted
     /// now as a `pending` shell and filled in at commit.
     ///
-    /// A handle may be declared exactly once (§25): two clauses binding `?x`
+    /// A handle may be declared exactly once (§53.2): two clauses binding `?x`
     /// leave every reference to it ambiguous, and picking either one would be
     /// a guess.
     pub async fn declare(
@@ -251,39 +288,13 @@ impl Transaction {
         }
     }
 
-    /// Checks an `EXPECT STATE` guard against an Assertion's lifecycle status.
-    ///
-    /// Distinct from [`Self::expect_state`], which reads the *engine* state:
-    /// an Assertion can be epistemically retracted while its record is
-    /// perfectly active, and confusing the two would let a guard pass on the
-    /// wrong question.
-    pub async fn expect_assertion_status(
-        &mut self,
-        id: ElementId,
-        expected: &str,
-    ) -> Result<(), KipError> {
-        let actual = match self.load(id).await? {
-            Element::Assertion(row) => row.status.clone(),
-            _ => {
-                return Err(KipError::structural_reference_invalid(format!(
-                    "{id} is not an Assertion"
-                )));
-            }
-        };
-        if actual != expected {
-            return Err(KipError::precondition_failed(format!(
-                "{id} is {actual:?}, not the expected {expected:?}"
-            )));
-        }
-        Ok(())
-    }
-
     /// Stages a newly created element's final row.
-    pub fn stage_new(&mut self, id: ElementId, row: Element, op: &'static str) {
+    pub fn stage_new(&mut self, id: ElementId, row: Element, op: ChangeOp) {
         self.staged.insert(
             id,
             Staged {
                 row,
+                before: None,
                 is_new: true,
                 changed: true,
                 op,
@@ -303,7 +314,7 @@ impl Transaction {
         let staged = self.staged.get_mut(&id).expect("loaded above");
         staged.row = row;
         staged.changed = true;
-        staged.op = "purge";
+        staged.op = ChangeOp::Purge;
         staged.keep_origin = true;
         let destroyed = versions.len();
         self.purges.insert(id, versions);
@@ -341,7 +352,7 @@ impl Transaction {
         self.governance_audit.push(entry);
     }
 
-    /// Rejects any staged reference that leaves this transaction's Space (§7).
+    /// Rejects any staged reference that leaves this transaction's Space (§5.3).
     ///
     /// Checked here, once over the staged rows, rather than by each clause that
     /// happens to write a reference. [`Element::references`] is the complete
@@ -377,13 +388,14 @@ impl Transaction {
     /// mint Concepts, and a rule each of them has to remember is a rule one of
     /// them will forget.
     ///
-    /// The scope is `(space_id, schema_ref, key)`, so a Person and a Preference
-    /// may both be keyed `"alice"` — which is what lets a 1.x database whose
-    /// identity was `(type, name)` migrate those names into keys without
-    /// merging unrelated Concepts. An empty key stores "no logical key" and
-    /// claims nothing.
+    /// The scope is `(space_id, type lineage, key)` (§7.3, §20.14): a Person
+    /// and a Preference may both be keyed `"alice"` — which is what lets a 1.x
+    /// database whose identity was `(type, name)` migrate those names into keys
+    /// without merging unrelated Concepts — while a Person written under an
+    /// earlier version of the same package is the same population. An empty
+    /// key stores "no logical key" and claims nothing.
     async fn check_concept_key_identity(&self) -> Result<(), KipError> {
-        let mut claimed: Vec<(&str, &str)> = Vec::new();
+        let mut claimed: Vec<(String, &str)> = Vec::new();
         for (id, staged) in &self.staged {
             let Element::Concept(row) = &staged.row else {
                 continue;
@@ -391,7 +403,7 @@ impl Transaction {
             if !staged.changed || row.key.is_empty() {
                 continue;
             }
-            let claim = (row.schema_ref.as_str(), row.key.as_str());
+            let claim = (crate::schema::lineage_of(&row.schema_ref), row.key.as_str());
             let conflict = |holder: &str| {
                 KipError::new(
                     KipErrorCode::IdentityConflict,
@@ -422,7 +434,7 @@ impl Transaction {
 
     /// Loads an existing element for modification, or returns the staged copy.
     ///
-    /// Read-your-writes inside the transaction (§27): a clause that reads an
+    /// Read-your-writes inside the transaction (§32.6): a clause that reads an
     /// element another clause already changed sees the change, because both are
     /// the same staged row.
     pub async fn load(&mut self, id: ElementId) -> Result<&mut Element, KipError> {
@@ -436,10 +448,11 @@ impl Transaction {
             self.staged.insert(
                 id,
                 Staged {
+                    before: Some(row.clone()),
                     row,
                     is_new: false,
                     changed: false,
-                    op: "update",
+                    op: ChangeOp::Update,
                     keep_origin: false,
                 },
             );
@@ -526,7 +539,8 @@ impl Transaction {
             .map(|_| ())
     }
 
-    /// Whether this caller may withdraw or supersede one Assertion (§67, §68).
+    /// Whether this caller may withdraw or supersede one Assertion (§57.3,
+    /// §57.4).
     ///
     /// Two ways to hold that authority, and administrative dislike is neither:
     ///
@@ -538,7 +552,7 @@ impl Transaction {
     /// A moderator who holds neither may exclude the Assertion from recall, but
     /// must not record it as *the source having retracted* — that would be the
     /// engine stating something about the source that never happened, which is
-    /// the dishonesty §68 exists to forbid.
+    /// the dishonesty §14.1 exists to forbid.
     pub fn may_represent_assertion(&self, row: &AssertionRow) -> bool {
         let wrote_it = row
             .origin
@@ -612,12 +626,12 @@ impl Transaction {
         Ok(())
     }
 
-    /// The material inputs of every new element this transaction stages (§99).
+    /// The material inputs of every new element this transaction stages (§31.2).
     ///
     /// Deliberately conservative about what counts: an Assertion's cited
     /// Evidence and context, an Evidence record's sources, an Activity's
     /// inputs, and — walking the other way — the inputs of any Activity that
-    /// lists the element as an output. §99 allows a policy to distinguish a
+    /// lists the element as an output. §31.2 allows a policy to distinguish a
     /// material content dependency from a control input, and says that when it
     /// is uncertain the restrictive reading wins. This engine has no such
     /// policy, so it takes the restrictive reading throughout.
@@ -683,7 +697,7 @@ impl Transaction {
     /// is the ordinary case.
     ///
     /// An input that is not there at all is read as the Space default rather
-    /// than as unclassified: §95 forbids letting absence mean `public`.
+    /// than as unclassified: §31.1 forbids letting absence mean `public`.
     async fn join_classification(&self, inputs: &[ElementId]) -> Result<String, KipError> {
         let default = self.authority.default_classification().to_string();
         let mut joined = default.clone();
@@ -709,7 +723,7 @@ impl Transaction {
     ///
     /// Separate from [`Self::load`] because loading is not modifying: a clause
     /// that reads an element and decides to do nothing must not burn a version.
-    pub fn mark_changed(&mut self, id: ElementId, op: &'static str) {
+    pub fn mark_changed(&mut self, id: ElementId, op: ChangeOp) {
         if let Some(staged) = self.staged.get_mut(&id) {
             staged.changed = true;
             if !staged.is_new {
@@ -718,29 +732,50 @@ impl Transaction {
         }
     }
 
-    /// The version an element is at right now, for `EXPECT VERSION`.
-    pub async fn current_version(&mut self, id: ElementId) -> Result<u64, KipError> {
-        Ok(self.load(id).await?.version())
-    }
-
-    /// Checks an `EXPECT VERSION` guard against the pre-transaction version.
+    /// Checks every `EXPECT VERSION` guard of one statement against the
+    /// pre-transaction counters (§35.1).
     ///
     /// The comparison is against the version the element had when the
     /// transaction started, not a value this transaction produced: a guard is
     /// a statement about what the caller believed, and the caller could not
-    /// have seen a version that does not exist yet.
-    pub async fn expect_version(&mut self, id: ElementId, expected: u64) -> Result<(), KipError> {
-        let actual = self.current_version(id).await?;
-        Store::expect_version(id, actual, expected)
-    }
-
-    /// Checks an `EXPECT STATE` guard.
-    pub async fn expect_state(&mut self, id: ElementId, expected: &str) -> Result<(), KipError> {
-        let actual = self.load(id).await?.state().to_string();
-        if actual != expected {
-            return Err(KipError::precondition_failed(format!(
-                "{id} is in state {actual:?}, not the expected {expected:?}"
-            )));
+    /// have seen a version that does not exist yet. A plane guard reads that
+    /// plane's own counter, so a write to another plane of the same element
+    /// does not spoil it; `EXPECT VERSION 0 OF <plane>` therefore passes
+    /// exactly when the plane has never been written (§35.2). A mismatch names
+    /// the plane in `details.plane`.
+    pub async fn expect_versions(
+        &mut self,
+        id: ElementId,
+        guards: &[Guard],
+    ) -> Result<(), KipError> {
+        if guards.is_empty() {
+            return Ok(());
+        }
+        self.load(id).await?;
+        let staged = self.staged.get(&id).expect("loaded above");
+        let (version, planes) = match &staged.before {
+            Some(before) => (before.version(), before.plane_versions()),
+            None => (0, PlaneVersions::default()),
+        };
+        for guard in guards {
+            let actual = guard.plane.counter(version, &planes);
+            if actual == guard.version {
+                continue;
+            }
+            return Err(match &guard.plane {
+                PlaneKey::Element => KipError::version_conflict(format!(
+                    "{id} is at version {actual}, not the expected {}",
+                    guard.version
+                )),
+                plane => KipError::version_conflict_on_plane(
+                    &plane.name(),
+                    format!(
+                        "{id}'s {} plane is at version {actual}, not the expected {}",
+                        plane.name(),
+                        guard.version
+                    ),
+                ),
+            });
         }
         Ok(())
     }
@@ -751,26 +786,33 @@ impl Transaction {
     /// removes its own shells and journals nothing.
     pub async fn commit(mut self, entry: JournalEntry) -> Result<Outcome, KipError> {
         if self.dry_run {
-            let changes = self.change_records();
+            let changes: Vec<Json> = self
+                .prepared_changes()
+                .into_iter()
+                .map(|(_, prepared)| entry_json(&prepared.entry))
+                .collect();
             let change_summary = summarize(&changes);
             self.discard_shells().await;
+            let receipt = Receipt {
+                status: ReceiptStatus::NoEffect,
+                tx_id: Some(self.cx.tx_id.clone()),
+                space_id: Some(self.cx.space.clone()),
+                snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
+                space_seq: None,
+                committed_at: None,
+                transaction_class: Some("cognitive".into()),
+                request_digest: None,
+                semantic_plan_digest: None,
+                result_digest: None,
+                schema_environment_version: Some(self.env.version),
+                change_summary: Some(change_summary),
+                proofs: vec![],
+                receipt_digest: None,
+                origin: Some(self.receipt_origin()),
+                extensions: None,
+            };
             return Ok(Outcome {
-                receipt: Receipt {
-                    status: ReceiptStatus::NoEffect,
-                    tx_id: Some(self.cx.tx_id.clone()),
-                    space_id: Some(self.cx.space.clone()),
-                    snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
-                    space_seq: None,
-                    committed_at: None,
-                    transaction_class: Some("cognitive".into()),
-                    request_digest: None,
-                    semantic_plan_digest: None,
-                    result_digest: None,
-                    schema_environment_version: Some(self.env.version),
-                    change_summary: Some(change_summary),
-                    proofs: vec![],
-                    extensions: None,
-                },
+                receipt,
                 handles: self.handles,
                 changes,
                 warnings: self.warnings,
@@ -784,17 +826,13 @@ impl Transaction {
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element
         // five times still produces one increment.
-        let mut changes = Vec::new();
+        let prepared = self.prepared_changes();
+        let mut changes = Vec::with_capacity(prepared.len());
         let mut written = 0usize;
-        for (id, staged) in std::mem::take(&mut self.staged) {
-            if !staged.changed {
-                continue;
-            }
-            let version = if staged.is_new {
-                1
-            } else {
-                staged.row.version().saturating_add(1)
-            };
+        for (id, prepared) in prepared {
+            let staged = self.staged.remove(&id).expect("prepared from staged");
+            let mut row = staged.row;
+            row.set_plane_versions(&prepared.planes);
             if let Some(versions) = self.purges.get(&id) {
                 self.store.remove_versions(versions).await?;
             }
@@ -803,16 +841,17 @@ impl Transaction {
             }
             self.write(
                 id,
-                staged.row,
-                version,
-                staged.op,
+                row,
+                prepared.entry.new_version,
+                prepared.entry.op,
                 staged.is_new,
                 staged.keep_origin,
             )
             .await?;
-            changes.push(change_record(id, staged.op, version));
+            changes.push(entry_json(&prepared.entry));
             written += 1;
         }
+        self.staged.clear();
 
         // A shell nobody staged is a handle that was declared and never
         // filled in — a planning bug rather than data, so it is removed
@@ -827,7 +866,7 @@ impl Transaction {
         // The response body, journalled rather than only returned: it is what
         // a resend under the same idempotency key replays, and a journal that
         // recorded the key but not the answer would let a caller find its
-        // transaction and still not learn what it bound (§26, §33).
+        // transaction and still not learn what it bound (§34, §33).
         let result = result_body(&self.handles, &changes);
         let journalled = self
             .store
@@ -839,6 +878,10 @@ impl Transaction {
                     schema_environment_version: self.env.version,
                     changes: changes.clone(),
                     result,
+                    // §33.2, §80.4: journalled so a resend replays the Receipt
+                    // the first attempt produced rather than one rebuilt from
+                    // whoever resent it.
+                    origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
                     ..entry
                 },
             )
@@ -851,27 +894,43 @@ impl Transaction {
         }
         self.store.flush(now_ms()).await?;
 
+        // §32.8: a transaction that changed nothing reports no cognitive
+        // sequence, however the journal records that it ran.
+        let committed = status == ReceiptStatus::Committed;
+        let receipt = Receipt {
+            status,
+            tx_id: Some(journalled.tx_id),
+            space_id: Some(self.cx.space.clone()),
+            snapshot_seq: Some(journalled.snapshot_seq),
+            space_seq: committed.then_some(journalled.seq),
+            committed_at: Some(journalled.committed_at),
+            transaction_class: Some(journalled.transaction_class),
+            request_digest: none_if_empty(journalled.request_digest),
+            semantic_plan_digest: none_if_empty(journalled.semantic_plan_digest),
+            result_digest: none_if_empty(journalled.result_digest),
+            schema_environment_version: Some(self.env.version),
+            change_summary: Some(summarize(&changes)),
+            proofs: vec![],
+            receipt_digest: None,
+            origin: Some(self.receipt_origin()),
+            extensions: None,
+        };
+
         Ok(Outcome {
-            receipt: Receipt {
-                status,
-                tx_id: Some(journalled.tx_id),
-                space_id: Some(self.cx.space.clone()),
-                snapshot_seq: Some(journalled.snapshot_seq),
-                space_seq: Some(journalled.seq),
-                committed_at: Some(journalled.committed_at),
-                transaction_class: Some(journalled.transaction_class),
-                request_digest: none_if_empty(journalled.request_digest),
-                semantic_plan_digest: none_if_empty(journalled.semantic_plan_digest),
-                result_digest: none_if_empty(journalled.result_digest),
-                schema_environment_version: Some(self.env.version),
-                change_summary: Some(summarize(&changes)),
-                proofs: vec![],
-                extensions: None,
-            },
+            receipt,
             handles: self.handles,
             changes,
             warnings: self.warnings,
         })
+    }
+
+    /// Who this commit is attributed to (§33.2).
+    fn receipt_origin(&self) -> ReceiptOrigin {
+        ReceiptOrigin {
+            principal_id: self.auth.principal_id.clone(),
+            actor_binding_id: self.exercised_binding.clone(),
+            delegation_digest: delegation_digest(&self.auth.delegation_chain),
+        }
     }
 
     /// Abandons everything staged, removing the shells this run minted.
@@ -895,10 +954,11 @@ impl Transaction {
         id: ElementId,
         row: Element,
         version: u64,
-        op: &str,
+        op: ChangeOp,
         is_new: bool,
         keep_origin: bool,
     ) -> Result<(), KipError> {
+        let op = op_name(op);
         macro_rules! put {
             ($row:expr) => {{
                 let mut row = *$row;
@@ -909,7 +969,7 @@ impl Transaction {
                 row.updated_at = self.cx.at.clone();
                 row.updated_tx = self.cx.tx_id.clone();
                 // A purge keeps the origin it had. Every other write records
-                // who the runtime observed (§26), but the whole point of an
+                // who the runtime observed (§2.5), but the whole point of an
                 // identity stub is that an auditor can still say something was
                 // here and who wrote it — and the version log that would
                 // otherwise answer that has just been destroyed.
@@ -963,20 +1023,170 @@ impl Transaction {
         }
     }
 
-    fn change_records(&self) -> Vec<Json> {
+    /// The change entry and counters each changed element will commit with.
+    ///
+    /// One place computes both, from the same diff, so the counter a later
+    /// guard compares against and the `planes` a Watch reads off the envelope
+    /// cannot disagree.
+    fn prepared_changes(&self) -> Vec<(ElementId, Prepared)> {
         self.staged
             .iter()
             .filter(|(_, staged)| staged.changed)
-            .map(|(id, staged)| {
-                let version = if staged.is_new {
-                    1
-                } else {
-                    staged.row.version().saturating_add(1)
-                };
-                change_record(*id, staged.op, version)
-            })
+            .map(|(id, staged)| (*id, prepare(*id, staged)))
             .collect()
     }
+}
+
+/// One element's change, ready to commit.
+struct Prepared {
+    entry: ChangeEntry,
+    planes: PlaneVersions,
+}
+
+/// Diffs one staged element into its Change Envelope entry and its counters
+/// after the commit (§6.3, §36.1).
+fn prepare(id: ElementId, staged: &Staged) -> Prepared {
+    let (old_version, touched, planes) = match (&staged.before, staged.is_new) {
+        (Some(before), false) => {
+            let touched = planes::diff(before, &staged.row);
+            let planes = touched.advance(before.plane_versions());
+            (Some(before.version()), touched, planes)
+        }
+        _ => (None, Touched::default(), planes::initial(&staged.row)),
+    };
+    let new_version = old_version.map_or(1, |version| version.saturating_add(1));
+
+    let state = match staged.op {
+        ChangeOp::Lifecycle => Some(ChangeState {
+            from: staged
+                .before
+                .as_ref()
+                .map(planes::lifecycle_state)
+                .unwrap_or_else(|| state::ACTIVE.to_string()),
+            to: planes::lifecycle_state(&staged.row),
+        }),
+        _ => None,
+    };
+
+    let mut refs = ChangeRefs::default();
+    let mut schema_ref = None;
+    match &staged.row {
+        Element::Concept(row) => {
+            if !row.schema_ref.is_empty() {
+                schema_ref = Some(row.schema_ref.clone());
+            }
+            if staged.op == ChangeOp::Merge && !row.merged_into.is_empty() {
+                refs.merged_into = Some(row.merged_into.clone());
+            }
+        }
+        Element::Proposition(row) => {
+            refs.subject = row
+                .subject
+                .get("id")
+                .and_then(Json::as_str)
+                .map(str::to_string);
+            if !row.predicate_ref.is_empty() {
+                refs.predicate_ref = Some(row.predicate_ref.clone());
+            }
+        }
+        Element::Assertion(row) => {
+            if !row.proposition_id.is_empty() {
+                refs.proposition = Some(row.proposition_id.clone());
+            }
+        }
+        Element::Evidence(_) | Element::Activity(_) => {}
+    }
+    let has_refs = refs.proposition.is_some()
+        || refs.subject.is_some()
+        || refs.predicate_ref.is_some()
+        || refs.merged_into.is_some();
+
+    // §36.1 asks for the counters of each plane the entry touched. The wire
+    // type carries the three named planes unconditionally, so the entry
+    // reports the element's complete counters after the commit whenever any
+    // plane moved, and `touched` says which; a creation reports none, its
+    // counters being implied by the content it was created with.
+    let report_planes = staged.op != ChangeOp::Create && touched.any_plane();
+    let entry = ChangeEntry {
+        op: staged.op,
+        kind: id.kind,
+        id: id.to_string(),
+        schema_ref,
+        old_version,
+        new_version,
+        state,
+        refs: has_refs.then_some(refs),
+        touched: touched.paths.clone(),
+        planes: report_planes.then(|| planes::to_wire(&planes)),
+        extensions: None,
+    };
+    Prepared { entry, planes }
+}
+
+/// A change entry as the journal and the result body carry it.
+pub(crate) fn entry_json(entry: &ChangeEntry) -> Json {
+    serde_json::to_value(entry).unwrap_or(Json::Null)
+}
+
+/// The version-log spelling of an operation.
+pub(crate) fn op_name(op: ChangeOp) -> &'static str {
+    match op {
+        ChangeOp::Create => "create",
+        ChangeOp::Update => "update",
+        ChangeOp::Lifecycle => "lifecycle",
+        ChangeOp::Retention => "retention",
+        ChangeOp::Merge => "merge",
+        ChangeOp::Purge => "purge",
+        ChangeOp::PayloadPurge => "payload_purge",
+    }
+}
+
+/// Seals a Receipt with its canonical digest (§33.2).
+///
+/// The digest covers the members §33.2 names — the Receipt without
+/// `receipt_digest`, `proofs` and the namespaced `extensions` — over the same
+/// RFC 8785 canonical JSON and sha3-256 a Capsule digests under (§37.7), so a
+/// signed Receipt (§33.3) has one thing to sign.
+///
+/// `extensions` is outside the digest on purpose, and it is what makes sealing
+/// order-independent: the governance provenance this engine attaches to an
+/// audited commit is not journalled, so a replay under the same idempotency
+/// key cannot rebuild it (§80.4). A digest that covered it would make the
+/// recovered Receipt differ from the sealed one for exactly the transactions
+/// — purge, tombstone, every always-audited permission — where an auditor
+/// most needs the two to agree.
+pub fn seal_receipt(mut receipt: Receipt) -> Receipt {
+    let mut bare = receipt.clone();
+    bare.receipt_digest = None;
+    bare.proofs.clear();
+    bare.extensions = None;
+    let value = serde_json::to_value(&bare).unwrap_or(Json::Null);
+    receipt.receipt_digest = Some(digest_of(&value));
+    receipt
+}
+
+/// The digest of a delegation chain, when the request ran under one (§28.5).
+fn delegation_digest(chain: &[String]) -> Option<String> {
+    if chain.is_empty() {
+        return None;
+    }
+    Some(digest_of(&Json::Array(
+        chain
+            .iter()
+            .map(|link| Json::String(link.clone()))
+            .collect(),
+    )))
+}
+
+/// sha3-256 over RFC 8785 canonical JSON, spelled as the Capsule digest is.
+fn digest_of(value: &Json) -> String {
+    use sha3::{Digest, Sha3_256};
+    let canonical = anda_kip::canonical_json(value);
+    format!(
+        "{}:{}",
+        crate::capsule::DIGEST_PROFILE,
+        hex::encode(Sha3_256::digest(canonical.as_bytes()))
+    )
 }
 
 /// What a committed (or previewed) transaction produced.
@@ -985,7 +1195,7 @@ pub struct Outcome {
     pub receipt: Receipt,
     /// Every handle this mutation bound, mapped to the element it named.
     pub handles: BTreeMap<String, ElementId>,
-    /// One record per changed element.
+    /// One Change Envelope entry per changed element (§36.1).
     pub changes: Vec<Json>,
     /// Non-fatal caveats.
     pub warnings: Vec<String>,
@@ -1010,15 +1220,6 @@ fn result_body(handles: &BTreeMap<String, ElementId>, changes: &[Json]) -> Json 
     serde_json::json!({
         "handles": bound,
         "changes": changes,
-    })
-}
-
-fn change_record(id: ElementId, op: &str, version: u64) -> Json {
-    serde_json::json!({
-        "id": id.to_string(),
-        "kind": id.kind.to_string(),
-        "op": op,
-        "version": version,
     })
 }
 
@@ -1092,5 +1293,67 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_receipt_digest_ignores_its_own_slot_and_the_proofs() {
+        let receipt = Receipt {
+            status: ReceiptStatus::Committed,
+            tx_id: Some("kip:space:default#3".into()),
+            space_id: Some("kip:space:default".into()),
+            snapshot_seq: Some(2),
+            space_seq: Some(3),
+            committed_at: Some("2026-09-03T00:00:00.000Z".into()),
+            transaction_class: Some("cognitive".into()),
+            request_digest: None,
+            semantic_plan_digest: None,
+            result_digest: None,
+            schema_environment_version: Some(1),
+            change_summary: None,
+            proofs: vec![],
+            receipt_digest: None,
+            origin: Some(ReceiptOrigin {
+                principal_id: "kip:principal:system".into(),
+                actor_binding_id: None,
+                delegation_digest: None,
+            }),
+            extensions: None,
+        };
+        let sealed = seal_receipt(receipt.clone());
+        let digest = sealed.receipt_digest.clone().expect("a digest");
+        assert!(digest.starts_with("sha3-256:"));
+        // Sealing twice, or adding a proof, does not move the digest.
+        let mut signed = sealed.clone();
+        signed
+            .proofs
+            .push(serde_json::json!({"proof_type": "signature"}));
+        assert_eq!(seal_receipt(signed).receipt_digest, Some(digest.clone()));
+        assert_eq!(
+            seal_receipt(sealed.clone()).receipt_digest,
+            Some(digest.clone())
+        );
+        // Nor does the governance provenance an audited commit carries: a
+        // replay cannot rebuild it, and a digest that moved with it would make
+        // the recovered Receipt differ from the one that was sealed.
+        let mut audited = sealed;
+        audited.extensions.get_or_insert_with(Map::new).insert(
+            "governance".to_string(),
+            serde_json::json!({"principal_id": "kip:principal:system"}),
+        );
+        assert_eq!(seal_receipt(audited).receipt_digest, Some(digest));
+    }
+
+    #[test]
+    fn a_delegation_chain_digests_only_when_there_is_one() {
+        assert_eq!(delegation_digest(&[]), None);
+        let one = delegation_digest(&["kip:delegation:1".into()]).unwrap();
+        let two =
+            delegation_digest(&["kip:delegation:1".into(), "kip:delegation:2".into()]).unwrap();
+        assert_ne!(one, two);
     }
 }

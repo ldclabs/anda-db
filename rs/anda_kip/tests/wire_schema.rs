@@ -19,10 +19,11 @@
 mod json_schema;
 
 use anda_kip::{
-    Execution, ExecutionMode, IngestContext, IngestEvidence, OnError, Operation, OperationResult,
-    OperationStatus, PolicyIdentity, Preconditions, ReadBinding, Receipt, ReceiptStatus, Request,
-    RequestContext, RequestOptions, Response, ResponseContext, ResponseExecution, ResultContext,
-    SearchContext, SearchMode, SnapshotContext, SpaceSelector, TopLevelStatus, Warning,
+    ElementReference, Execution, ExecutionMode, IngestContext, IngestEvidence, OnError, Operation,
+    OperationResult, OperationStatus, PolicyIdentity, Preconditions, ReadBinding, Receipt,
+    ReceiptStatus, Request, RequestContext, RequestOptions, Response, ResponseContext,
+    ResponseExecution, ResultContext, SearchContext, SearchMode, SnapshotContext, SpaceSelector,
+    TopLevelStatus, Warning,
 };
 use json_schema::Schema;
 use serde_json::{Value, json};
@@ -52,7 +53,12 @@ fn every_request_this_crate_builds_matches_the_wire_schema() {
         &encode(&Request::single("DESCRIBE PROTOCOL")),
     );
 
-    let mut batch = Request::single("FIND(?x) WHERE { ?x {type: \"T\"} }");
+    // The first operation is KML because the envelope carries an `ingest`
+    // block, and §71.1 mints that Evidence inside the request's transaction:
+    // an all-read request has no transaction to mint into.
+    let mut batch = Request::single(
+        "ASSERT (:alice, \"prefers\", :dark_mode) { by: :alice, mode: \"stated\", evidence: :msg }",
+    );
     batch
         .operations
         .push(Operation::new("DESCRIBE PRIMER").with_op_id("primer"));
@@ -110,7 +116,8 @@ fn every_request_this_crate_builds_matches_the_wire_schema() {
             payload_artifact: None,
             media_type: Some("application/json".into()),
             observed_at: Some("2026-01-01T00:00:00Z".into()),
-            source_actor: Some("C-alice".into()),
+            source_actor: Some(ElementReference::by_id("C-alice")),
+            facets: Default::default(),
             client_key: Some("msg-1".into()),
             extensions: None,
         }],
@@ -227,6 +234,7 @@ fn exhaustive_response() -> Value {
         "mode": "sequence",
         "on_error": "stop",
         "isolation": "serializable",
+        "idempotency_key": "intent-1",
         "extensions": { "vendor/trace": { "critical": false, "id": "t-1" } }
       },
       "results": [
@@ -234,6 +242,16 @@ fn exhaustive_response() -> Value {
           "op_id": "op-1",
           "status": "succeeded",
           "result": { "rows": [1, 2] },
+          "receipt": {
+            "tx_id": "tx-899",
+            "space_id": "space-1",
+            "snapshot_seq": 1498,
+            "space_seq": 1499,
+            "committed_at": "2026-01-01T00:00:00Z",
+            "status": "committed",
+            "transaction_class": "cognitive",
+            "schema_environment_version": 3
+          },
           "context": {
             "space_id": "space-1",
             "snapshot_seq": 1500,
@@ -291,6 +309,12 @@ fn exhaustive_response() -> Value {
         "schema_environment_version": 3,
         "change_summary": { "created": 2 },
         "proofs": [{ "type": "signature" }],
+        "receipt_digest": "sha256:dd",
+        "origin": {
+          "principal_id": "principal-1",
+          "actor_binding_id": "binding-1",
+          "delegation_digest": "sha256:ee"
+        },
         "extensions": { "vendor/receipt": { "critical": false } }
       },
       "warnings": ["a request-level caveat"],
@@ -325,8 +349,9 @@ fn exhaustive_request() -> Value {
             "payload": { "text": "hi" },
             "media_type": "application/json",
             "observed_at": "2026-01-01T00:00:00Z",
-            "source_actor": "C-alice",
+            "source_actor": { "id": "C-alice" },
             "client_key": "msg-1",
+            "facets": { "OutcomeRecord": { "task_family": "deploy/rollback", "outcome_status": "success" } },
             "extensions": { "vendor/ingest": { "critical": false } }
           }
         ],
@@ -453,7 +478,7 @@ fn the_schema_rejects_what_the_envelope_validator_rejects() {
     );
 
     // Atomic execution cannot continue past an error.
-    let mut atomic = Request::single("TOMBSTONE :x");
+    let mut atomic = Request::single(r#"TRANSITION :x TO "tombstoned""#);
     atomic.execution = Some(Execution {
         mode: ExecutionMode::Atomic,
         on_error: Some(OnError::Continue),
@@ -529,6 +554,7 @@ fn every_status_and_mode_spells_itself_the_way_the_schema_does() {
             mode: ExecutionMode::Independent,
             on_error: Some(OnError::Continue),
             isolation: None,
+            idempotency_key: None,
             extensions: None,
         }),
         results: vec![
@@ -559,6 +585,8 @@ fn every_status_and_mode_spells_itself_the_way_the_schema_does() {
             schema_environment_version: None,
             change_summary: None,
             proofs: Vec::new(),
+            receipt_digest: None,
+            origin: None,
             extensions: None,
         }),
         warnings: vec![Warning::from("a caveat")],

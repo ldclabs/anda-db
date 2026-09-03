@@ -622,6 +622,18 @@ export class EffectiveAuthority {
     return found?.binding_class ?? null
   }
 
+  /**
+   * The ActorBinding this Principal holds to an actor, if any (§28.3).
+   *
+   * For the Receipt's `origin.actor_binding_id` (§33.2): a statement that
+   * spoke as an actor names the binding it exercised, so an auditor can tie
+   * the commit to the Governance record without reading the audit log.
+   */
+  bindingTo(actorKey: string): ActorBindingRow | null {
+    if (actorKey === '') return null
+    return this.bindings.find((binding) => binding.actor_key === actorKey) ?? null
+  }
+
   /** How well a claim attributed to this actor is attributable (§16). */
   attributionAssurance(actorKey: string): string {
     const found = this.bindings.find((binding) => binding.actor_key === actorKey)

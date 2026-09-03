@@ -12,10 +12,14 @@
  * Planning therefore happens in two phases — declare every handle, then
  * interpret every clause with all handles known.
  *
- * **An element's version increments once per transaction** (§44), no matter how
- * many clauses touched it. A transaction is one externally visible state
+ * **An element's version increments once per transaction** (§35.5), no matter
+ * how many clauses touched it. A transaction is one externally visible state
  * transition, and `EXPECT VERSION`, audit and the change stream all read that
- * counter. So versions are assigned here, at commit, not by each write.
+ * counter. So versions are assigned here, at commit, not by each write — and
+ * so are the **plane counters** (§6.3): each of `attributes`, `structural`,
+ * `retention` and `facets[X]` advances only when the committed row differs
+ * from the loaded one on that plane, which is what lets a guard `OF
+ * ATTRIBUTES` survive a concurrent Facet sweep (§35.1).
  *
  * **A no-effect final state changes nothing.** Writing the same value back
  * would burn a version and emit a change record for a transition that did not
@@ -35,7 +39,7 @@
  * observe a half-applied transaction and no lock to hold against one.
  */
 
-import { errors } from './errors.js'
+import { detailed, errors } from './errors.js'
 import {
   classification,
   requirePermitted,
@@ -51,26 +55,29 @@ import {
   type ElementId,
   type ElementKind,
 } from './id.js'
-import type { Json, JsonMap } from './json.js'
+import { jsonEquals, type Json, type JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
+  bumpPlane,
+  changeEntryOf,
   classificationOf,
+  emptyPlanes,
+  planeCounter,
+  planesToJson,
+  symbolLocalName,
+  wireOp,
   type AssertionRow,
   type ChangeEntry,
-  type ChangeOp,
+  type ChangeVerb,
   type Element,
+  type ElementRow,
+  type PlaneKey,
+  type PlaneVersions,
   type Store,
 } from './store/index.js'
 import { nowTime } from './time.js'
 
-/**
- * What an element was derived from, for the authority lineage.
- *
- * The *material* inputs — the ones whose content shaped this element — rather
- * than every reference it happens to carry. An Assertion's Proposition is what
- * it is *about*, not what it was derived from; its Evidence is.
- */
 /**
  * The element id a stored reference names, or `''` when it names none.
  *
@@ -87,6 +94,13 @@ function referenceText(value: unknown): string {
   return ''
 }
 
+/**
+ * What an element was derived from, for the authority lineage.
+ *
+ * The *material* inputs — the ones whose content shaped this element — rather
+ * than every reference it happens to carry. An Assertion's Proposition is what
+ * it is *about*, not what it was derived from; its Evidence is.
+ */
 function materialInputs(element: Element): string[] {
   const ids: string[] = []
   const push = (value: unknown) => {
@@ -123,10 +137,25 @@ interface Staged {
   isNew: boolean
   /** Whether the final state differs from what was there before. */
   changed: boolean
-  /** What the change record calls this. */
-  op: ChangeOp
+  /** What the version log calls this. */
+  verb: ChangeVerb
   /** The version the element had when this transaction first loaded it. */
   baseVersion: number
+  /** The plane counters it had then (§35.1). */
+  basePlanes: PlaneVersions
+  /**
+   * The row as this transaction first saw it, for the plane diff at commit.
+   *
+   * `null` for an element this transaction created: there is no before.
+   */
+  baseRow: JsonMap | null
+}
+
+/** One `EXPECT VERSION` guard, resolved (§35.1). */
+export interface VersionGuard {
+  version: number
+  /** `null` guards the element's whole `_system.version`. */
+  plane: PlaneKey | null
 }
 
 /** What a committed (or previewed) transaction produced. */
@@ -140,9 +169,17 @@ export interface Outcome {
   schema_environment_version: number
   /** Every handle this mutation bound, mapped to the element it named. */
   handles: Record<string, string>
-  /** One record per changed element. */
+  /** One record per changed element, in the normative shape (§36.1). */
   changes: ChangeEntry[]
   warnings: string[]
+  /**
+   * The ActorBinding this statement exercised, if it exercised one (§33.2).
+   *
+   * Set when the statement recorded an Assertion attributed to an actor the
+   * caller is bound to — the one case where a Receipt's `origin` has a
+   * binding to name; `null` otherwise.
+   */
+  actor_binding_id: string | null
   /**
    * The access decision that authorized this statement (§33.1).
    *
@@ -168,6 +205,21 @@ export interface WriteContext {
   origin: JsonMap
 }
 
+/**
+ * The precedence between verbs when one element is touched by several clauses
+ * of one transaction.
+ *
+ * A lifecycle move outranks an ordinary update: an Activity completed and
+ * finalized in one statement is one `lifecycle` entry whose `touched` names
+ * the finalized fields, not an `update` that happens to also change status.
+ */
+function outranks(next: ChangeVerb, current: ChangeVerb): boolean {
+  if (current === 'create') return false
+  if (current === 'update') return true
+  if (current === 'set_retention') return wireOp(next) !== 'update'
+  return next === 'purge' || next === 'purge_payload' || next === 'merge'
+}
+
 /** The engine state one KML statement runs against. */
 export class Transaction {
   readonly store: Store
@@ -189,6 +241,7 @@ export class Transaction {
   private readonly staged = new Map<string, Staged>()
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
+  private actorBinding: string | null = null
 
   /**
    * What the caller may do here, resolved once for the whole transaction.
@@ -293,7 +346,7 @@ export class Transaction {
   }
 
   /**
-   * Whether this caller may withdraw or supersede one Assertion (§67, §68).
+   * Whether this caller may withdraw or supersede one Assertion (§57.3, §57.4).
    *
    * Two ways to hold that authority, and administrative dislike is neither:
    *
@@ -303,13 +356,24 @@ export class Transaction {
    * ```
    *
    * A moderator who holds neither may exclude the Assertion from recall with
-   * `ARCHIVE` or `TOMBSTONE`, but must not record it as *the source having
-   * retracted* — that would be the engine stating something about the source
-   * that never happened, which is the dishonesty §68 exists to forbid.
+   * `TRANSITION … TO "archived"` or `"tombstoned"`, but must not record it as
+   * *the source having retracted* — that would be the engine stating something
+   * about the source that never happened, which is the dishonesty §14.1 exists
+   * to forbid.
    */
   mayRepresentAssertion(row: AssertionRow): boolean {
     const wroteIt = row.origin.principal_id === this.auth.principal_id
     return wroteIt || this.authority.isBoundToActor(row.asserted_by_key)
+  }
+
+  /**
+   * Records that this statement exercised an ActorBinding (§33.2).
+   *
+   * First one wins: a Receipt names one binding, and a statement that spoke
+   * as two actors is attributed to the first it spoke as.
+   */
+  exerciseBinding(bindingId: string): void {
+    if (this.actorBinding === null) this.actorBinding = bindingId
   }
 
   /** Records a non-fatal caveat. */
@@ -356,7 +420,7 @@ export class Transaction {
    * across clauses.
    */
   claimPosition(elementId: number, field: string, index: number): boolean {
-    const key = `${elementId}\u001f${field}`
+    const key = `${elementId}${field}`
     const claimed = this.structuralPositions.get(key) ?? new Set<number>()
     if (claimed.has(index)) return false
     claimed.add(index)
@@ -406,13 +470,15 @@ export class Transaction {
   }
 
   /** Stages a newly created element's final row. */
-  stageNew(id: ElementId, element: Element, op: ChangeOp = 'create'): void {
+  stageNew(id: ElementId, element: Element, verb: ChangeVerb = 'create'): void {
     this.staged.set(formatElementId(id), {
       element,
       isNew: true,
       changed: true,
-      op,
+      verb,
       baseVersion: 0,
+      basePlanes: emptyPlanes(),
+      baseRow: null,
     })
   }
 
@@ -439,8 +505,10 @@ export class Transaction {
       element,
       isNew: false,
       changed: false,
-      op: 'update',
+      verb: 'update',
       baseVersion: element.row.version,
+      basePlanes: structuredClone(element.row.plane_versions),
+      baseRow: structuredClone(element.row) as unknown as JsonMap,
     })
     return element
   }
@@ -482,63 +550,59 @@ export class Transaction {
    * Separate from {@link load} because loading is not modifying: a clause that
    * reads an element and decides to do nothing must not burn a version.
    */
-  markChanged(id: ElementId, op: ChangeOp): void {
+  markChanged(id: ElementId, verb: ChangeVerb): void {
     const staged = this.staged.get(formatElementId(id))
     if (staged === undefined) return
-    staged.changed = true
-    if (!staged.isNew) staged.op = op
+    if (!staged.changed) {
+      staged.changed = true
+      if (!staged.isNew) staged.verb = verb
+      return
+    }
+    if (!staged.isNew && outranks(verb, staged.verb)) staged.verb = verb
   }
 
   /**
-   * Checks an `EXPECT VERSION` guard against the pre-transaction version.
+   * Checks the trailing `EXPECT VERSION` guards against the pre-transaction
+   * counters (§35.1, §35.2).
    *
-   * The comparison is against the version the element had when the transaction
+   * The comparison is against what the element had when the transaction
    * started, not a value this transaction produced: a guard is a statement
    * about what the caller believed, and the caller could not have seen a
    * version that does not exist yet.
+   *
+   * A bare guard compares `_system.version`; one naming a plane compares that
+   * plane's own counter, so a concurrent write to another plane of the same
+   * element does not spoil it. An element this transaction is creating is at
+   * version 0 on every plane, which is what makes the bare `EXPECT VERSION 0`
+   * the create-only form (§35.2) and `EXPECT VERSION 0 OF <plane>` an
+   * ordinary "never written" guard. Every guard is checked, in the order
+   * written, and the first mismatch names its plane in `details.plane`.
    */
-  expectVersion(id: ElementId, expected: number): void {
+  expectVersions(id: ElementId, guards: readonly VersionGuard[]): void {
+    if (guards.length === 0) return
     this.load(id)
     const staged = this.staged.get(formatElementId(id))
-    const actual = staged?.isNew === true ? 0 : (staged?.baseVersion ?? 0)
-    if (actual !== expected) {
-      throw errors.versionConflict(
-        `${formatElementId(id)} is at version ${actual}, not the expected ` +
-          `${expected}; re-read it and decide again`,
-      )
-    }
-  }
-
-  /** Checks an `EXPECT STATE` guard against the engine state. */
-  expectState(id: ElementId, expected: string): void {
-    const actual = this.load(id).row.state
-    if (actual !== expected) {
-      throw errors.preconditionFailed(
-        `${formatElementId(id)} is in state ${JSON.stringify(actual)}, not ` +
-          `the expected ${JSON.stringify(expected)}`,
-      )
-    }
-  }
-
-  /**
-   * Checks an `EXPECT STATE` guard against an Assertion's lifecycle status.
-   *
-   * Distinct from {@link expectState}, which reads the *engine* state: an
-   * Assertion can be epistemically retracted while its record is perfectly
-   * active, and confusing the two would let a guard pass on the wrong question.
-   */
-  expectAssertionStatus(id: ElementId, expected: string): void {
-    const element = this.load(id)
-    if (element.kind !== 'Assertion') {
-      throw errors.structuralReferenceInvalid(
-        `${formatElementId(id)} is not an Assertion`,
-      )
-    }
-    if (element.row.status !== expected) {
-      throw errors.preconditionFailed(
-        `${formatElementId(id)} is ${JSON.stringify(element.row.status)}, ` +
-          `not the expected ${JSON.stringify(expected)}`,
-      )
+    const isNew = staged?.isNew === true
+    const named = formatElementId(id)
+    for (const guard of guards) {
+      if (guard.plane === null) {
+        const actual = isNew ? 0 : (staged?.baseVersion ?? 0)
+        if (actual !== guard.version) {
+          throw errors.versionConflict(
+            `${named} is at version ${actual}, not the expected ` +
+              `${guard.version}; re-read it and decide again`,
+          )
+        }
+        continue
+      }
+      const actual = isNew ? 0 : planeCounter(staged?.basePlanes ?? emptyPlanes(), guard.plane)
+      if (actual !== guard.version) {
+        throw detailed.versionConflictOnPlane(
+          guard.plane,
+          `${named} is at version ${actual} of its ${guard.plane} plane, not ` +
+            `the expected ${guard.version}; re-read it and decide again`,
+        )
+      }
     }
   }
 
@@ -548,36 +612,32 @@ export class Transaction {
    * A dry run never establishes a durable cognitive commit (§69.3): it takes no
    * Space sequence and journals nothing. The caller runs it inside a
    * transaction it rolls back, so the shells go with it.
+   *
+   * A `no_effect` outcome under an idempotency key is journaled without a
+   * sequence (§34.3): a client that lost the response to a write that changed
+   * nothing must still be able to learn that it changed nothing, rather than
+   * being told its key was never seen.
    */
   commit(idempotencyKey: string): Outcome {
     const pending = [...this.staged.entries()].filter(
       ([, staged]) => staged.changed,
     )
-    const versionOf = (staged: Staged) =>
-      staged.isNew ? 1 : staged.baseVersion + 1
 
     if (this.dryRun) {
       // A dry run leaves nothing behind. The caller usually wraps this in a
       // transaction it rolls back, but PREVIEW does not — and a shell that
       // survives is an id nobody can reach and nothing will reuse.
+      const previewed = pending.map(([, staged]) => this.entryFor(staged, true))
       this.discardShells()
-      return this.outcome(
-        'no_effect',
-        null,
-        null,
-        pending.map(([id, staged]) => ({
-          id,
-          kind: staged.element.kind,
-          op: staged.op,
-          version: versionOf(staged),
-        })),
-      )
+      return this.outcome('no_effect', null, null, previewed)
     }
 
     if (pending.length === 0) {
       // No sequence is taken, because nothing happened: a Space clock that
       // ticks for a no-op makes every `CHANGES SINCE` cursor report a change
       // that is not there.
+      this.discardShells()
+      if (idempotencyKey !== '') this.journal(null, null, idempotencyKey, [])
       return this.outcome('no_effect', null, null, [])
     }
 
@@ -589,10 +649,12 @@ export class Transaction {
     const written = new Set<string>()
 
     for (const [id, staged] of pending) {
-      const version = versionOf(staged)
       const row = staged.element.row
+      // The plane diff reads the row before the envelope is stamped, so the
+      // stamp itself — `updated_at`, `updated_tx` — never counts as a change
+      // to any plane.
+      const entry = this.entryFor(staged, false)
       row.space = this.cx.space
-      row.version = version
       row.seq = seq
       row.updated_at = committedAt
       row.updated_tx = this.cx.tx_id
@@ -601,7 +663,7 @@ export class Transaction {
       // but the whole point of an identity stub is that an auditor can still
       // say something was here and who wrote it — and the version log that
       // would otherwise answer that has just been destroyed.
-      if (staged.op !== 'purge') {
+      if (staged.verb !== 'purge') {
         row.origin = this.cx.origin
       }
       if (staged.isNew) {
@@ -611,7 +673,8 @@ export class Transaction {
       if (row.state === '' || row.state === State.PENDING) {
         row.state = State.ACTIVE
       }
-      changes.push(this.store.put(staged.element, staged.op, this.cx.tx_id))
+      this.store.put(staged.element, staged.verb, this.cx.tx_id)
+      changes.push(entry)
       written.add(id)
     }
 
@@ -620,24 +683,81 @@ export class Transaction {
     // half-formed.
     this.discardUnwritten(written)
 
+    this.journal(seq, committedAt, idempotencyKey, changes)
+    return this.outcome('committed', seq, committedAt, changes)
+  }
+
+  /**
+   * Assigns the version and plane counters one staged element will commit
+   * with, and builds its Change Envelope entry (§35.5, §6.3, §36.1).
+   *
+   * The counters are advanced on the row itself, so the row the store writes
+   * and the entry the stream reports agree by construction. A preview
+   * computes the same entry without keeping the advance: the row is discarded
+   * with the transaction.
+   */
+  private entryFor(staged: Staged, preview: boolean): ChangeEntry {
+    const row = staged.element.row
+    const diff = diffPlanes(staged.element, staged.baseRow)
+    const planes = structuredClone(staged.basePlanes)
+    for (const plane of diff.planes) bumpPlane(planes, plane)
+    const version = staged.isNew ? 1 : staged.baseVersion + 1
+    if (!preview) {
+      row.version = version
+      row.plane_versions = planes
+    }
+    const op = wireOp(staged.verb)
+    const state = lifecycleMove(staged.element, staged.baseRow)
+    // A lifecycle entry with no visible move is the one shape §36.1 forbids:
+    // every lifecycle verb this engine writes changes `state` or the record's
+    // own status, so reaching here without one is a bug, not a wire choice.
+    const entryElement: Element = preview
+      ? ({ kind: staged.element.kind, row: { ...row, version } } as Element)
+      : staged.element
+    return changeEntryOf(entryElement, op, {
+      ...(staged.isNew ? {} : { old_version: staged.baseVersion }),
+      ...(op === 'lifecycle' && state !== null ? { state } : {}),
+      touched: staged.isNew ? [] : diff.touched,
+      // §36.1 asks for the counters of each plane the entry touched. The wire
+      // shape carries the three named planes together, so an entry that moved
+      // any plane reports the element's complete counters after the commit and
+      // `touched` says which moved; a create reports none, its counters being
+      // implied by the content it was created with.
+      //
+      // Through `planesToJson`, so `facets` is absent when the element carries
+      // no Facet counter — the same bytes the Rust engine writes, and the same
+      // spelling `_system.plane_versions` already uses.
+      ...(!staged.isNew && diff.planes.size > 0 ? { planes: planesToJson(planes) } : {}),
+    })
+  }
+
+  private journal(
+    seq: number | null,
+    committedAt: string | null,
+    idempotencyKey: string,
+    changes: ChangeEntry[],
+  ): void {
     this.store.putTransaction({
       tx_id: this.cx.tx_id,
       space: this.cx.space,
-      seq,
+      // A `no_effect` outcome took no sequence; it is journaled at the one it
+      // started from, and `transactionsInSpace` reads committed rows only.
+      seq: seq ?? this.snapshotSeq,
       snapshot_seq: this.snapshotSeq,
-      committed_at: committedAt,
-      status: 'committed',
+      committed_at: committedAt ?? this.cx.at,
+      status: seq === null ? 'no_effect' : 'committed',
       transaction_class: 'cognitive',
       idempotency_key: idempotencyKey,
       request_digest: '',
       semantic_plan_digest: '',
       result_digest: '',
       schema_environment_version: this.env.version,
-      result: { handles: this.handles() } as Json,
+      result: {
+        handles: this.handles(),
+        actor_binding_id: this.actorBinding,
+      } as Json,
       changes,
     })
-
-    return this.outcome('committed', seq, committedAt, changes)
   }
 
   /**
@@ -773,6 +893,231 @@ export class Transaction {
       handles: this.handles(),
       changes,
       warnings: this.warnings,
+      actor_binding_id: this.actorBinding,
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Version planes (§6.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The row columns that belong to the `attributes` plane, by kind: fields and
+ * attributes, as §6.3 puts it. Core record fields are reported as
+ * `fields.<name>` and a Concept's attribute members as `attributes.<name>`.
+ *
+ * Lifecycle columns live in {@link LIFECYCLE_COLUMNS} instead: they are named
+ * in `touched` like everything else, and they advance no plane.
+ */
+const FIELD_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+  Concept: [
+    ['key', 'fields.key'],
+    ['name', 'fields.name'],
+    ['canonical_id', 'fields.canonical_id'],
+    ['aliases', 'fields.aliases'],
+  ],
+  Proposition: [],
+  Assertion: [
+    ['proposition_id', 'fields.proposition'],
+    ['asserted_by', 'fields.asserted_by'],
+    ['stance', 'fields.stance'],
+    ['mode', 'fields.mode'],
+    ['confidence', 'fields.confidence'],
+    ['asserted_at', 'fields.asserted_at'],
+    ['valid_from', 'fields.valid_time'],
+    ['valid_until', 'fields.valid_time'],
+  ],
+  Evidence: [
+    ['evidence_class', 'fields.evidence_class'],
+    ['payload_mode', 'fields.payload'],
+    ['payload_inline', 'fields.payload'],
+    ['content_ref', 'fields.payload'],
+    ['content_digest', 'fields.content_digest'],
+    ['media_type', 'fields.media_type'],
+    ['observed_at', 'fields.observed_at'],
+  ],
+  Activity: [
+    ['activity_class', 'fields.activity_class'],
+    ['started_at', 'fields.started_at'],
+    ['ended_at', 'fields.ended_at'],
+    ['parameters_digest', 'fields.parameters_digest'],
+  ],
+}
+
+/**
+ * The lifecycle columns, by kind: named in `touched` and belonging to no plane.
+ *
+ * `_system.state`, a record's own `status`, the supersession and correction
+ * links, `retracted_at`, `merged_into` — a lifecycle move advances `version`
+ * and nothing else, unless the same statement also finalized content (§6.3).
+ * They are still named so a Watch can see what moved without reading payload
+ * (§36.1).
+ */
+const LIFECYCLE_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+  Concept: [['merged_into', 'fields.merged_into']],
+  Proposition: [],
+  Assertion: [
+    ['status', 'fields.status'],
+    ['retracted_at', 'fields.retracted_at'],
+    ['supersedes', 'fields.supersedes'],
+    ['superseded_by', 'fields.superseded_by'],
+  ],
+  Evidence: [
+    ['status', 'fields.status'],
+    ['corrects', 'fields.corrects'],
+    ['corrected_by', 'fields.corrected_by'],
+  ],
+  Activity: [['status', 'fields.status']],
+}
+
+/** The Core structural columns, by kind (§8.2), for the `structural` plane. */
+const CORE_STRUCTURAL_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+  Concept: [],
+  Proposition: [],
+  Assertion: [
+    ['evidence_refs', 'structural.evidence'],
+    ['context_refs', 'structural.context'],
+  ],
+  Evidence: [
+    ['source_refs', 'structural.source'],
+    ['generated_by', 'structural.generated_by'],
+  ],
+  Activity: [
+    ['inputs', 'structural.inputs'],
+    ['outputs', 'structural.outputs'],
+    ['associated_actors', 'structural.associated_actors'],
+  ],
+}
+
+/** What one commit changed on an element: the paths, and the planes they sit on. */
+export interface PlaneDiff {
+  touched: string[]
+  planes: Set<PlaneKey>
+}
+
+/**
+ * Diffs an element against the row it was loaded as (§6.3, §36.1).
+ *
+ * A created element has no before, so every populated plane counts as written
+ * once: a Concept created with a name and a Facet starts at `attributes: 1,
+ * facets: {X: 1}`, and `EXPECT VERSION 0 OF ATTRIBUTES` on it afterwards is a
+ * stale guard rather than a true statement. `touched` is empty for a create —
+ * the entry says `create`, and listing every path would only repeat the row.
+ */
+export function diffPlanes(element: Element, before: JsonMap | null): PlaneDiff {
+  const after = element.row as unknown as Record<string, Json>
+  const touched: string[] = []
+  const planes = new Set<PlaneKey>()
+  const differs = (column: string): boolean =>
+    before === null
+      ? populated(after[column])
+      : !jsonEquals((before[column] ?? null) as Json, (after[column] ?? null) as Json)
+
+  const seen = new Set<string>()
+  /** Names a path, and — where one is given — the plane it advances. */
+  const touch = (path: string, plane?: PlaneKey): void => {
+    if (plane !== undefined) planes.add(plane)
+    if (before !== null && !seen.has(path)) {
+      seen.add(path)
+      touched.push(path)
+    }
+  }
+
+  for (const [column, path] of FIELD_COLUMNS[element.kind]) {
+    if (differs(column)) touch(path, 'attributes')
+  }
+  for (const [column, path] of LIFECYCLE_COLUMNS[element.kind]) {
+    if (differs(column)) touch(path)
+  }
+  if (element.kind === 'Concept') {
+    const was = before === null ? {} : asMap(before.attributes)
+    const now = asMap(after.attributes)
+    for (const name of memberDiff(was, now)) touch(`attributes.${name}`, 'attributes')
+  }
+  for (const [column, path] of CORE_STRUCTURAL_COLUMNS[element.kind]) {
+    if (differs(column)) touch(path, 'structural')
+  }
+  {
+    const was = before === null ? {} : asMap(before.structural)
+    const now = asMap(after.structural)
+    for (const symbol of memberDiff(was, now)) {
+      touch(`structural.${symbolLocalName(symbol)}`, 'structural')
+    }
+  }
+  if (differs('retention') || differs('expires_at')) touch('retention', 'retention')
+  {
+    const was = before === null ? {} : asMap(before.facets)
+    const now = asMap(after.facets)
+    for (const symbol of memberDiff(was, now)) {
+      const local = symbolLocalName(symbol)
+      touch(`facets.${local}`, `facets.${local}`)
+    }
+  }
+  // The engine state, and the Governance block: both move under a lifecycle or
+  // a Governance decision rather than a content write, so both are named and
+  // neither advances a plane. Reported so a Watch sees an archive or a relabel
+  // without reading payload (§36.1).
+  if (differs('state')) touch('state')
+  if (before !== null) {
+    const was = asMap(before.governance)
+    const now = asMap(after.governance)
+    for (const member of memberDiff(was, now)) touch(`governance.${member}`)
+  }
+  // Sorted, so the same commit reports the same list whichever order the
+  // clauses that made it ran in — the two engines then agree entry for entry.
+  touched.sort()
+  return { touched, planes }
+}
+
+/**
+ * The stored status before and after, for a `lifecycle` entry (§36.1).
+ *
+ * `_system.state` when the engine state moved — archived, tombstoned,
+ * quarantined, merged, purged — and otherwise the record's own lifecycle
+ * status: an Assertion's retraction, an Evidence correction, an Activity
+ * status. `null` when neither moved.
+ */
+export function lifecycleMove(
+  element: Element,
+  before: JsonMap | null,
+): { from: string; to: string } | null {
+  if (before === null) return null
+  const row = element.row as ElementRow
+  const stateBefore = typeof before.state === 'string' ? before.state : ''
+  if (stateBefore !== row.state) return { from: stateBefore, to: row.state }
+  if ('status' in row) {
+    const statusBefore = typeof before.status === 'string' ? before.status : ''
+    if (statusBefore !== row.status) return { from: statusBefore, to: row.status }
+  }
+  return null
+}
+
+function asMap(value: unknown): JsonMap {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as JsonMap)
+    : {}
+}
+
+/** The members whose value differs between two maps, in `after`-then-`before` order. */
+function memberDiff(before: JsonMap, after: JsonMap): string[] {
+  const out: string[] = []
+  for (const name of Object.keys(after)) {
+    if (!Object.hasOwn(before, name) || !jsonEquals(before[name] as Json, after[name] as Json)) {
+      out.push(name)
+    }
+  }
+  for (const name of Object.keys(before)) {
+    if (!Object.hasOwn(after, name)) out.push(name)
+  }
+  return out
+}
+
+/** Whether a freshly created element carries anything on one column. */
+function populated(value: Json | undefined): boolean {
+  if (value === undefined || value === null || value === '') return false
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value).length > 0
+  if (typeof value === 'number') return value !== 0 && value !== -1
+  return true
 }

@@ -281,6 +281,7 @@ impl Store {
             result: entry.result,
             changed_ids: entry.changes.iter().filter_map(changed_id).collect(),
             changes: entry.changes,
+            origin: entry.origin,
         };
         let id = self.transactions().add_from(&row).await.map_err(db_error)?;
         Ok(TransactionRow { _id: id, ..row })
@@ -348,6 +349,8 @@ pub struct JournalEntry {
     pub result: Json,
     /// One entry per changed element: `{id, kind, op, version}`.
     pub changes: Vec<Json>,
+    /// The Receipt `origin` this commit is attributed to (§33.2).
+    pub origin: Json,
 }
 
 fn changed_id(change: &Json) -> Option<String> {

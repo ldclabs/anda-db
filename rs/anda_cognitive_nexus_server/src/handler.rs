@@ -222,8 +222,7 @@ fn kip_error_status(error: &ErrorObject) -> StatusCode {
         HistoricalSnapshotUnavailable
         | HistoricalSchemaUnavailable
         | CursorExpired
-        | CursorInvalidated
-        | ChangeCursorExpired => StatusCode::GONE,
+        | CursorInvalid => StatusCode::GONE,
         TransactionTooLarge | ArtifactTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         ExecutionTimeout => StatusCode::REQUEST_TIMEOUT,
@@ -407,10 +406,7 @@ pub async fn post_kip(
                 // Client input error: an undecodable cursor.
                 ListLogsError::InvalidCursor(e) => (
                     StatusCode::BAD_REQUEST,
-                    error_response(
-                        KipErrorCode::CursorInvalidated,
-                        format!("invalid cursor: {e}"),
-                    ),
+                    error_response(KipErrorCode::CursorInvalid, format!("invalid cursor: {e}")),
                 ),
                 // Internal failure: log the details, return a generic
                 // message to the client.

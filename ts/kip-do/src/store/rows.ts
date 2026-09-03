@@ -11,8 +11,9 @@
  * commented at the point it happens.
  */
 
-import type { ElementKind } from '../id.js'
-import type { Json, JsonMap } from '../json.js'
+import { formatElementId, type ElementKind } from '../id.js'
+import { isJsonMap, type Json, type JsonMap } from '../json.js'
+import { parseSymbolRef } from '../schema/symbol.js'
 
 /** The engine-level state of an element (`_system.state`, Spec §6.3). */
 export const State = {
@@ -61,6 +62,73 @@ export const State = {
 
 export type ElementState = (typeof State)[keyof typeof State]
 
+/**
+ * One counter per version plane (Spec §6.3, §35.1).
+ *
+ * `_system.version` advances on every committed change; each of these
+ * advances only when its plane changes, so a guard `OF ATTRIBUTES` is not
+ * spoiled by a concurrent Facet sweep on the same element. `facets` is keyed
+ * by the Facet's local symbol name — the spelling §36.1's example uses and
+ * the one `?x._system.plane_versions.facets["MnemonicState"]` reads — so two
+ * versions of one Facet lineage (§20.14) share one counter.
+ */
+export interface PlaneVersions {
+  attributes: number
+  structural: number
+  retention: number
+  facets: Record<string, number>
+}
+
+/** The counters a plane has before anything wrote to it. */
+export function emptyPlanes(): PlaneVersions {
+  return { attributes: 0, structural: 0, retention: 0, facets: {} }
+}
+
+/**
+ * Reads a stored `plane_versions` column, filling in what an older row may
+ * not carry.
+ */
+export function planesFromJson(value: unknown): PlaneVersions {
+  const out = emptyPlanes()
+  if (!isJsonMap(value)) return out
+  for (const plane of ['attributes', 'structural', 'retention'] as const) {
+    const n = value[plane]
+    if (typeof n === 'number' && Number.isInteger(n) && n >= 0) out[plane] = n
+  }
+  if (isJsonMap(value.facets)) {
+    for (const [name, n] of Object.entries(value.facets)) {
+      if (typeof n === 'number' && Number.isInteger(n) && n >= 0) out.facets[name] = n
+    }
+  }
+  return out
+}
+
+/**
+ * A version plane, as a guard or a change entry names it.
+ *
+ * `facets.<Symbol>` carries the Facet's local symbol name, matching the key
+ * of {@link PlaneVersions.facets}.
+ */
+export type PlaneKey = 'attributes' | 'structural' | 'retention' | `facets.${string}`
+
+/** The counter one plane key selects. */
+export function planeCounter(planes: PlaneVersions, key: PlaneKey): number {
+  if (key === 'attributes' || key === 'structural' || key === 'retention') {
+    return planes[key]
+  }
+  return planes.facets[key.slice('facets.'.length)] ?? 0
+}
+
+/** Advances one plane's counter, in place. */
+export function bumpPlane(planes: PlaneVersions, key: PlaneKey): void {
+  if (key === 'attributes' || key === 'structural' || key === 'retention') {
+    planes[key] += 1
+    return
+  }
+  const facet = key.slice('facets.'.length)
+  planes.facets[facet] = (planes.facets[facet] ?? 0) + 1
+}
+
 /** The `_system` envelope every element carries. */
 export interface Envelope {
   /** The row id; the element's KIP id is `<tag>-{id}`. */
@@ -68,8 +136,10 @@ export interface Envelope {
   /** The home MemorySpace (§29). */
   space: string
   state: string
-  /** `_system.version` — the target of `EXPECT VERSION`. */
+  /** `_system.version` — the target of a bare `EXPECT VERSION`. */
   version: number
+  /** `_system.plane_versions` — the targets of `EXPECT VERSION ... OF` (§35.1). */
+  plane_versions: PlaneVersions
   /** `_system.space_seq` of the last state change; the `CHANGES` cursor. */
   seq: number
   created_at: string
@@ -103,6 +173,12 @@ export interface ConceptRow extends Envelope {
   client_key: string
   /** The exact Schema symbol identity this Concept is typed by (§10.3). */
   schema_ref: string
+  /**
+   * The lineage of `schema_ref` — `kip://<package-path>/<Symbol>`, no version
+   * (§20.14). What identity and matching compare, so a package upgrade never
+   * splits one type's population into two; `schema_ref` stays exact.
+   */
+  lineage: string
   /** The immutable Space-local logical key (§5.3). */
   key: string
   /** Mutable grounding state; duplicates are allowed, so this is not identity (§5.2). */
@@ -136,6 +212,8 @@ export interface PropositionRow extends Envelope {
   subject_key: string
   /** The exact predicate symbol identity. */
   predicate_ref: string
+  /** The lineage of `predicate_ref` (§20.14), which tuple identity compares. */
+  predicate_lineage: string
   /** The object endpoint: an element reference or a Literal. */
   object: JsonMap
   /** The object's deterministic equality key. */
@@ -461,12 +539,156 @@ export interface ElementVersionRow {
   row: JsonMap
 }
 
-/** One entry of a transaction's change list. */
+/** What one commit did to an element, on the wire (§36.1). */
+export type ChangeOp =
+  | 'create'
+  | 'update'
+  | 'lifecycle'
+  | 'retention'
+  | 'merge'
+  | 'purge'
+  | 'payload_purge'
+
+/**
+ * One entry of a Change Envelope, in the normative shape of
+ * `schemas/kip-change-envelope.schema.json` (§36.1).
+ *
+ * Names and versions, never values: `touched` lists the paths that changed
+ * and `planes` the counters after the commit, which is what a Watch needs to
+ * decide whether a slot, an element or a type moved without reading payload.
+ * The same shape `anda_kip::ChangeEntry` serializes to, member for member.
+ */
 export interface ChangeEntry {
-  id: string
+  op: ChangeOp
+  /** The Core kind, lowercase, as `?x.kind` spells it. */
   kind: string
-  op: string
-  version: number
+  id: string
+  /** The exact Concept Type reference; present for Concept entries. */
+  schema_ref?: string
+  /** The version before this commit, when the element existed. */
+  old_version?: number
+  new_version: number
+  /** The stored status before and after; present for `lifecycle` entries. */
+  state?: { from: string; to: string }
+  /** The references that place the entry. */
+  refs?: {
+    /** Assertion entries: the Proposition the Assertion is about. */
+    proposition?: string
+    /** Proposition entries: the subject element id. */
+    subject?: string
+    /** Proposition entries: the exact Predicate reference. */
+    predicate_ref?: string
+    /** Merge entries on the source Concept: the canonical target. */
+    merged_into?: string
+  }
+  /** The paths changed — names only, never values. */
+  touched?: string[]
+  /**
+   * The plane counters after this commit, on entries that touched a plane.
+   *
+   * The wire shape, not the in-memory one: `facets` is present only when a
+   * Facet counter exists, exactly as {@link planesToJson} writes it and as the
+   * Rust engine serializes `PlaneVersions`. An entry that always carried an
+   * empty `facets` object would differ from the other reference engine byte
+   * for byte on the commonest entry there is.
+   */
+  planes?: WirePlaneVersions
+}
+
+/** The plane counters as the wire carries them; see {@link planesToJson}. */
+export interface WirePlaneVersions {
+  attributes: number
+  structural: number
+  retention: number
+  facets?: Record<string, number>
+}
+
+/**
+ * Builds one Change Envelope entry for an element as it stands after a commit.
+ *
+ * The references are read off the element itself, so the entry cannot name a
+ * Proposition the Assertion is not about. `old_version`, `state`, `touched`
+ * and `planes` are what only the transaction knows and are passed in.
+ */
+export function changeEntryOf(
+  element: Element,
+  op: ChangeOp,
+  extras: {
+    old_version?: number
+    state?: { from: string; to: string }
+    touched?: readonly string[]
+    planes?: WirePlaneVersions
+  } = {},
+): ChangeEntry {
+  const { row } = element
+  const entry: ChangeEntry = {
+    op,
+    // Lowercase, as every other wire tag: `?c.kind` answers "concept", and a
+    // change record that said "Concept" would be the one place the stream
+    // spelled a Core kind differently from the elements it describes.
+    kind: element.kind.toLowerCase(),
+    id: formatElementId({ kind: element.kind, seq: row.id }),
+    new_version: row.version,
+  }
+  if (extras.old_version !== undefined) entry.old_version = extras.old_version
+  if (element.kind === 'Concept' && element.row.schema_ref !== '') {
+    entry.schema_ref = element.row.schema_ref
+  }
+  if (extras.state !== undefined) entry.state = extras.state
+  const refs: NonNullable<ChangeEntry['refs']> = {}
+  switch (element.kind) {
+    case 'Assertion':
+      if (element.row.proposition_id !== '') refs.proposition = element.row.proposition_id
+      break
+    case 'Proposition': {
+      const subject = element.row.subject.id
+      if (typeof subject === 'string') refs.subject = subject
+      if (element.row.predicate_ref !== '') refs.predicate_ref = element.row.predicate_ref
+      break
+    }
+    case 'Concept':
+      if (op === 'merge' && element.row.merged_into !== '') {
+        refs.merged_into = element.row.merged_into
+      }
+      break
+    default:
+      break
+  }
+  if (Object.keys(refs).length > 0) entry.refs = refs
+  if (extras.touched !== undefined && extras.touched.length > 0) {
+    entry.touched = [...extras.touched]
+  }
+  if (extras.planes !== undefined) entry.planes = extras.planes
+  return entry
+}
+
+/**
+ * The plane counters as the wire carries them: `facets` only when it holds
+ * something, matching `anda_kip::PlaneVersions`' serialization.
+ */
+export function planesToJson(planes: PlaneVersions): WirePlaneVersions & JsonMap {
+  const out: WirePlaneVersions & JsonMap = {
+    attributes: planes.attributes,
+    structural: planes.structural,
+    retention: planes.retention,
+  }
+  if (Object.keys(planes.facets).length > 0) out.facets = { ...planes.facets }
+  return out
+}
+
+/**
+ * The local symbol name a Facet or Structural Field key carries.
+ *
+ * Stored keys are exact symbols (`kip://…@2.0.0/MnemonicState`); the plane
+ * counters and the `touched` paths name the symbol the way §36.1's example
+ * does, by its local name, so two versions of one lineage share a counter.
+ */
+export function symbolLocalName(key: string): string {
+  try {
+    return parseSymbolRef(key).name
+  } catch {
+    return key
+  }
 }
 
 /** One committed transaction (Spec §82). */

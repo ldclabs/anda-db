@@ -44,11 +44,12 @@ import { elementReferences } from './references.js'
 import { indexElement } from './search.js'
 import {
   erasePayload,
+  planesFromJson,
   State,
   TABLES,
   type ActivityRow,
   type AssertionRow,
-  type ChangeEntry,
+  type ChangeOp,
   type ConceptRow,
   type Element,
   type ElementRow,
@@ -61,8 +62,16 @@ import {
   type TransactionRow,
 } from './rows.js'
 
-/** What a change to an element is called in the version log and the journal. */
-export type ChangeOp =
+/**
+ * What a change to an element is called in the version log.
+ *
+ * Finer than the wire `op` (§36.1): the log keeps the verb — `retract`,
+ * `archive`, `classify` — because an auditor reading `HISTORY` through the
+ * store wants to know *which* lifecycle move it was, while a Watch consuming
+ * the change stream only needs to know that one happened. {@link wireOp}
+ * folds these onto the normative seven.
+ */
+export type ChangeVerb =
   | 'create'
   | 'update'
   | 'archive'
@@ -77,6 +86,43 @@ export type ChangeOp =
   | 'correct'
   | 'transition'
   | 'set_retention'
+  | 'classify'
+  | 'declassify'
+  | 'elevate'
+  | 'downgrade'
+  | 'retention_expiry'
+  | 'expire'
+
+/**
+ * The normative `op` one verb reports on the wire (§36.1).
+ *
+ * Every lifecycle verb — the TRANSITION states, quarantine and its release,
+ * a retention expiry, an Assertion's own window lapsing — is `lifecycle`,
+ * with the entry's `state {from, to}` saying which move it was. A Governance
+ * relabel is an `update`: the element's content moved, under `governance.*`.
+ */
+export function wireOp(verb: ChangeVerb): ChangeOp {
+  switch (verb) {
+    case 'create':
+      return 'create'
+    case 'update':
+    case 'classify':
+    case 'declassify':
+    case 'elevate':
+    case 'downgrade':
+      return 'update'
+    case 'set_retention':
+      return 'retention'
+    case 'merge':
+      return 'merge'
+    case 'purge':
+      return 'purge'
+    case 'purge_payload':
+      return 'payload_purge'
+    default:
+      return 'lifecycle'
+  }
+}
 
 export class Store {
   readonly sql: SqlStorage
@@ -282,6 +328,9 @@ export class Store {
     if (!row) return null
     const decoded = decodeRow<ElementRow>(table, row)
     if (decoded.state === State.PENDING) return null
+    // A row written before the planes existed carries `{}`; every reader
+    // wants the full counter set, so it is filled in here rather than in each.
+    decoded.plane_versions = planesFromJson(decoded.plane_versions)
     return { kind: id.kind, row: decoded } as Element
   }
 
@@ -303,17 +352,22 @@ export class Store {
         State.PENDING,
       )
       .toArray()
-      .map((row) => ({ kind, row: decodeRow<ElementRow>(table, row) }) as Element)
+      .map((row) => {
+        const decoded = decodeRow<ElementRow>(table, row)
+        decoded.plane_versions = planesFromJson(decoded.plane_versions)
+        return { kind, row: decoded } as Element
+      })
   }
 
   /**
    * The Concept holding a Space-local logical key, if one does.
    *
-   * `schemaRef` narrows the lookup rather than filtering its result, because
-   * §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a Person and a
-   * Preference both keyed `"alice"` are two identities, not a collision — which
-   * is also what makes the 1.x migration of `(type, name)` identity into a key
-   * collision-free.
+   * `lineage` narrows the lookup rather than filtering its result, because
+   * §7.3 scopes key uniqueness to `(space_id, lineage of schema_ref, key)`: a
+   * Person and a Preference both keyed `"alice"` are two identities, not a
+   * collision, while a Person written under `Person@1.0.0` and one upserted
+   * after the package moved to `1.1.0` are one (§20.14) — which is what keeps
+   * a package upgrade from minting a second `"alice"`.
    *
    * Without a declared type the key alone must still land on one Concept.
    * Returning the first of several would be the arbitrary winner §51 forbids
@@ -321,7 +375,7 @@ export class Store {
    */
   conceptByKey(
     space: string,
-    schemaRef: string | null,
+    lineage: string | null,
     key: string,
   ): ConceptRow | null {
     // The empty string stores "no logical key", so it must never match —
@@ -329,7 +383,7 @@ export class Store {
     // meant for one of them.
     if (key === '') return null
     const rows =
-      schemaRef === null
+      lineage === null
         ? this.sql
             .exec<SqlRow>(
               'SELECT * FROM concepts WHERE space = ? AND "key" = ?',
@@ -339,9 +393,9 @@ export class Store {
             .toArray()
         : this.sql
             .exec<SqlRow>(
-              'SELECT * FROM concepts WHERE space = ? AND schema_ref = ? AND "key" = ?',
+              'SELECT * FROM concepts WHERE space = ? AND lineage = ? AND "key" = ?',
               space,
-              schemaRef,
+              lineage,
               key,
             )
             .toArray()
@@ -405,7 +459,7 @@ export class Store {
    * the row lets a purge conclude nothing points at an element that something
    * does.
    */
-  put(element: Element, op: ChangeOp, txId: string): ChangeEntry {
+  put(element: Element, verb: ChangeVerb, txId: string): void {
     const table = TABLES[element.kind]
     const { row } = element
     const { sql, values } = updateStatement(table, row, row.id)
@@ -419,7 +473,7 @@ export class Store {
       version: row.version,
       seq: row.seq,
       tx_id: txId,
-      op,
+      op: verb,
       row: rowToJson(row) as JsonMap,
     })
     this.reindexReferences(element)
@@ -427,11 +481,6 @@ export class Store {
     // may report `index_seq` equal to `current_space_seq` (§66.5): a write that
     // rolled back rolled its index entry back with it.
     indexElement(this.sql, element)
-
-    // Lowercase, as every other wire tag: `?c.kind` answers "concept", and a
-    // change record that said "Concept" would be the one place the stream
-    // spelled a Core kind differently from the elements it describes.
-    return { id, kind: element.kind.toLowerCase(), op, version: row.version }
   }
 
   /** Replaces the reverse-index entries for one element. */
@@ -557,14 +606,31 @@ export class Store {
     return elementsAt(this.sql, space, kind, seq)
   }
 
-  /** Resolves `AS OF TX :tx` to the Space sequence that transaction produced. */
+  /** The Space sequence one transaction produced (`DESCRIBE TRANSACTION`, §68). */
   seqOfTransaction(space: string, txId: string): number {
     return seqOfTransaction(this.sql, space, txId)
   }
 
-  /** Resolves `AS OF TIME :t` to the last coordinate committed at or before it. */
+  /**
+   * The last coordinate committed at or before an instant
+   * (`DESCRIBE SNAPSHOT AT TIME`, §68).
+   */
   seqAtTime(space: string, at: string): number {
     return seqAtTime(this.sql, space, at)
+  }
+
+  /** The committed transaction that produced one Space coordinate, if any. */
+  transactionAtSeq(space: string, seq: number): TransactionRow | null {
+    const row = this.sql
+      .exec<SqlRow>(
+        `SELECT * FROM transactions
+           WHERE space = ? AND seq = ? AND status = 'committed'
+           ORDER BY id DESC LIMIT 1`,
+        space,
+        seq,
+      )
+      .toArray()[0]
+    return row ? decodeRow<TransactionRow>('transactions', row) : null
   }
 
   /** The Schema Environment version that was in force at a coordinate (§20.9). */
@@ -710,10 +776,13 @@ export class Store {
     toSeq: number,
     limit: number,
   ): TransactionRow[] {
+    // Committed only: a `no_effect` outcome is retained so an idempotent
+    // resend can replay it (§34.3), but it took no sequence and is not a
+    // state-changing commit, so it is not a Change Envelope (§36.1).
     return this.sql
       .exec<SqlRow>(
         `SELECT * FROM transactions
-           WHERE space = ? AND seq >= ? AND seq <= ?
+           WHERE space = ? AND seq >= ? AND seq <= ? AND status = 'committed'
            ORDER BY seq LIMIT ?`,
         space,
         fromSeq,

@@ -60,9 +60,27 @@ export interface EndpointSpec {
   concept_types?: string[]
   /** Permitted Core element kinds, e.g. `Concept`, `Assertion`. */
   kinds?: string[]
-  /** Permitted Literal datatypes, when a Literal is allowed (§44). */
+  /**
+   * Permitted Literal datatypes, when a Literal is allowed (§20.15).
+   *
+   * §20.15 spells the member `literal_types` and draws its values from §9.2's
+   * four names; `datatypes` is the older spelling, read the same way.
+   */
+  literal_types?: string[]
   datatypes?: string[]
+  /** Whether `null` is a permitted object (§9.5, §20.15). */
+  nullable?: boolean
+  /**
+   * The shape a string Literal must have — `timestamp`, `uri`, or a
+   * package-defined name (§20.15). Validated on write, never part of identity.
+   */
+  format?: string
   [extra: string]: Json | undefined
+}
+
+/** The Literal datatypes an endpoint admits, whichever member spells them. */
+export function literalTypesOf(spec: EndpointSpec | undefined): string[] {
+  return spec?.literal_types ?? spec?.datatypes ?? []
 }
 
 /** Whether an endpoint declares no restriction at all. */
@@ -70,7 +88,7 @@ export function isUnconstrained(spec: EndpointSpec | undefined): boolean {
   return (
     (spec?.concept_types?.length ?? 0) === 0 &&
     (spec?.kinds?.length ?? 0) === 0 &&
-    (spec?.datatypes?.length ?? 0) === 0
+    literalTypesOf(spec).length === 0
   )
 }
 
@@ -104,16 +122,34 @@ export interface PredicateDef {
   subject?: EndpointSpec
   object?: EndpointSpec
   /**
-   * Whether one subject has at most one true object (§45).
+   * Whether one subject has at most one accepted object at one valid time
+   * (§20.15, §25.1).
    *
    * This is an *epistemic* statement, not a storage constraint: a functional
-   * predicate with two competing objects is a contested belief, which the
-   * engine must be able to store in order to report it (§46, §95).
+   * predicate with two competing objects is a conflict set, which the engine
+   * must be able to store in order to report it (§25, §95).
    */
   functional?: boolean
-  /** Whether absence of a claim means unknown rather than false (§51). */
+  /**
+   * Whether absence of a Proposition means insufficient (§24) rather than a
+   * closed-world absence (§24.2). Defaults to `true`.
+   */
   open_world?: boolean
+  /**
+   * Whether the candidate objects of a functional slot are exclusive:
+   * accepting one rejects the others (§20.15, §25). Defaults to `false`.
+   */
   complete?: boolean
+  /**
+   * Whether, for a boolean-valued Predicate, object `false` is the negation
+   * of object `true` (§12.7, §20.15). Defaults to `false`.
+   */
+  boolean_completeness?: boolean
+  /**
+   * When two accepted values of a functional slot conflict (§25.2):
+   * `overlapping_valid_time` (the default) or `none`.
+   */
+  temporal_conflict?: string
   /**
    * Anything a later format revision added.
    *
@@ -358,6 +394,32 @@ export const predicateDef = (
   artifact: SchemaPackage,
   name: string,
 ): PredicateDef | undefined => artifact.definitions?.predicates?.[name]
+
+/**
+ * A Predicate definition's declarations with §20.15's defaults filled in.
+ *
+ * `functional: false`, `open_world: true`, `complete: false`,
+ * `boolean_completeness: false`, `temporal_conflict: "overlapping_valid_time"`.
+ * An absent definition — a predicate this environment cannot resolve —
+ * declares nothing, and reads as the defaults too.
+ */
+export interface PredicateRules {
+  functional: boolean
+  open_world: boolean
+  complete: boolean
+  boolean_completeness: boolean
+  temporal_conflict: 'overlapping_valid_time' | 'none'
+}
+
+export function predicateRules(def: PredicateDef | undefined): PredicateRules {
+  return {
+    functional: def?.functional === true,
+    open_world: def?.open_world !== false,
+    complete: def?.complete === true,
+    boolean_completeness: def?.boolean_completeness === true,
+    temporal_conflict: def?.temporal_conflict === 'none' ? 'none' : 'overlapping_valid_time',
+  }
+}
 
 export const facetDef = (
   artifact: SchemaPackage,

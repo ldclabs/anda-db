@@ -21,8 +21,10 @@
 //!
 //! ## A name is here only when a gate asks for it
 //!
-//! The maintenance contract, and the reason `derive`, `share` and `manage_trust`
-//! are absent: this engine distinguishes no derived write, exposes no controlled
+//! The maintenance contract, and the reason `derive`, `share`, `manage_trust`
+//! and `approve` are absent (`record_outcome` is here because §29.8's gate on
+//! outcome-class Evidence asks for it, and `manage_legal_hold` because §29.9's
+//! gate on `retention.legal_hold` does): this engine distinguishes no derived write, exposes no controlled
 //! cross-Space view, and versions no trust policy, so nothing would ever ask for
 //! them. Registering them anyway would fail in exactly the way an unrecognized
 //! name is rejected to prevent — a Grant that looks like authority and is not —
@@ -171,6 +173,8 @@ permissions! {
         "supersede an Assertion one is authorized to represent";
     ModerateAssertion => "moderate_assertion", EpistemicMutation,
         "administratively exclude a third party's Assertion without claiming they retracted it";
+    RecordOutcome => "record_outcome", EpistemicMutation,
+        "write outcome-class Evidence and the observation Activity that links it to a decision (§29.8)";
 
     // Identity (§71–§74)
     ManageActorBinding => "manage_actor_binding", Identity,
@@ -199,8 +203,8 @@ permissions! {
     // Lifecycle (§80–§82, §88, §100)
     ManageRetention => "manage_retention", Lifecycle,
         "set or change how long an element is retained";
-    LegalHold => "legal_hold", Lifecycle,
-        "place or lift a hold that blocks erasure";
+    LegalHold => "manage_legal_hold", Lifecycle,
+        "place or lift a hold that blocks erasure (§29.9)";
     Purge => "purge", Lifecycle,
         "physically erase an element and its retained history";
     Declassify => "declassify", Lifecycle,

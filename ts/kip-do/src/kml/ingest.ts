@@ -26,11 +26,26 @@
  */
 
 import { errors } from '../errors.js'
-import { formatElementId, tryParseElementId } from '../id.js'
-import type { Json, JsonMap } from '../json.js'
-import { State, type EvidenceRow } from '../store/index.js'
+import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
+import { isJsonMap, type Json, type JsonMap } from '../json.js'
+import {
+  facetDef,
+  formatSymbolRef,
+  lineageOfSymbol,
+  validateFacet,
+  validateFacetCarrier,
+} from '../schema/index.js'
+import { State, emptyPlanes, type EvidenceRow } from '../store/index.js'
 import { normalizeTime } from '../time.js'
 import type { Transaction } from '../tx.js'
+import { recordsOutcome } from './clauses.js'
+
+/**
+ * An element reference as the envelope spells one (§71.1): by exact id, or by
+ * Concept Type lineage plus logical key — the same two shapes a bound
+ * parameter takes. Never a name (§7.2), and never a Principal (§88.1).
+ */
+export type ElementReference = { id: string } | { type: string; key: string }
 
 /** One Evidence record to mint inside the request's transaction scope. */
 export interface IngestEvidence {
@@ -48,12 +63,18 @@ export interface IngestEvidence {
   /**
    * The semantic source actor, recorded as Evidence source.
    *
-   * Never a Principal (§88.1): who authenticated is engine origin, and who
-   * said it is cognition.
+   * An element reference, never a name and never a Principal (§88.1): who
+   * authenticated is engine origin, and who said it is cognition.
    */
-  source_actor?: string
+  source_actor?: ElementReference
   /** A retry-safe logical identity for the minted Evidence. */
   client_key?: string
+  /**
+   * Facet name to value object, validated exactly as `SET FACET` on
+   * `CREATE EVIDENCE` would be (§71.1). This is how instrumentation attaches
+   * `OutcomeRecord` to an ingested `outcome` without re-typing anything.
+   */
+  facets?: Record<string, JsonMap>
   extensions?: JsonMap
 }
 
@@ -68,6 +89,7 @@ const LIMITS = {
   SHORT_LABEL: 256,
   OPAQUE_TOKEN: 8192,
   SOURCE_ACTOR: 512,
+  ELEMENT_REFERENCE_KEY: 1024,
   CLIENT_KEY: 1024,
 } as const
 
@@ -109,8 +131,24 @@ function checkEntry(entry: IngestEvidence): void {
   optional(entry.payload_artifact, 'ingest payload_artifact', LIMITS.OPAQUE_TOKEN)
   optional(entry.media_type, 'ingest media_type', LIMITS.SHORT_LABEL)
   optional(entry.observed_at, 'ingest observed_at', LIMITS.SHORT_LABEL)
-  optional(entry.source_actor, 'ingest source_actor', LIMITS.SOURCE_ACTOR)
   optional(entry.client_key, 'ingest client_key', LIMITS.CLIENT_KEY)
+  if (entry.source_actor !== undefined) {
+    checkElementReference(entry.source_actor, 'ingest source_actor')
+  }
+  if (entry.facets !== undefined) {
+    if (!isJsonMap(entry.facets)) {
+      throw errors.invalidRequestEnvelope(
+        'ingest facets is a map from Facet name to value object',
+      )
+    }
+    for (const [name, values] of Object.entries(entry.facets)) {
+      if (name.trim() === '' || !isJsonMap(values)) {
+        throw errors.invalidRequestEnvelope(
+          `ingest facets[${JSON.stringify(name)}] must be a value object`,
+        )
+      }
+    }
+  }
   // Exactly one, because the two answer the same question differently: an
   // entry carrying both leaves the runtime choosing which observation the
   // record is of.
@@ -122,6 +160,33 @@ function checkEntry(entry: IngestEvidence): void {
         `payload / payload_artifact`,
     )
   }
+}
+
+/**
+ * Checks that a reference takes exactly one of its two shapes (§71.1).
+ *
+ * A bare string is refused at the envelope: it could only be a name, and a
+ * source recorded by name is a citation nothing resolves (§7.2).
+ */
+function checkElementReference(value: unknown, what: string): void {
+  const shape = () =>
+    errors.invalidRequestEnvelope(
+      `${what} is an element reference: {id} or {type, key}, never a name`,
+    )
+  if (!isJsonMap(value)) throw shape()
+  const keys = Object.keys(value).sort()
+  if (keys.length === 1 && keys[0] === 'id') {
+    if (typeof value.id !== 'string') throw shape()
+    bounded(value.id, what, LIMITS.SOURCE_ACTOR)
+    return
+  }
+  if (keys.length === 2 && keys[0] === 'key' && keys[1] === 'type') {
+    if (typeof value.type !== 'string' || typeof value.key !== 'string') throw shape()
+    bounded(value.type, what, LIMITS.ELEMENT_REFERENCE_KEY)
+    bounded(value.key, what, LIMITS.ELEMENT_REFERENCE_KEY)
+    return
+  }
+  throw shape()
 }
 
 function bindingName(name: string, what: string): void {
@@ -210,13 +275,14 @@ export function mintIngestedEvidence(
       space: '',
       state: State.ACTIVE,
       version: 0,
+      plane_versions: emptyPlanes(),
       seq: 0,
       created_at: '',
       updated_at: '',
       created_tx: '',
       updated_tx: '',
       origin: {},
-      facets: {},
+      facets: ingestedFacets(tx, entry.facets),
       structural: {},
       governance: {},
       retention: {},
@@ -235,7 +301,7 @@ export function mintIngestedEvidence(
       source_refs:
         entry.source_actor === undefined
           ? []
-          : [sourceActor(tx, entry.source_actor)],
+          : [{ id: formatElementId(sourceActor(tx, entry.source_actor)) }],
       generated_by: '',
       status: 'active',
       corrects: [],
@@ -243,6 +309,10 @@ export function mintIngestedEvidence(
     }
     const element = { kind: 'Evidence' as const, row }
     tx.authorizeCreated(element, 'create')
+    // §71.1, §29.8: an ingested `outcome` needs `record_outcome` exactly as a
+    // `CREATE EVIDENCE` of that class does — the envelope is not a way around
+    // the consequence channel's gate.
+    if (recordsOutcome(element)) tx.authorizeCreated(element, 'record_outcome')
     tx.stageNew(id, element)
     bound[entry.key] = { id: formatElementId(id) }
   }
@@ -250,36 +320,62 @@ export function mintIngestedEvidence(
 }
 
 /**
- * Resolves an ingest entry's `source_actor` to a reference in this Space.
+ * Resolves and validates an entry's `facets` map exactly as `SET FACET` on
+ * `CREATE EVIDENCE` would (§71.1).
  *
- * Refused rather than stored as a bare name. §71.1 records the actor as
- * Evidence *source*, and a source slot holding a string nothing resolves is a
- * citation a reader cannot follow — indistinguishable, later, from one that was
- * checked. The actor is a semantic actor and never a Principal (§88.1), so this
- * looks it up among Concepts and never in the control plane.
+ * The same resolution — a local name through the environment, an exact
+ * reference checked against it — and the same validation: the Facet must be
+ * applicable to Evidence, its members must fit the definition, and a closed
+ * Facet refuses a member it does not declare. An entry that fails takes the
+ * whole request's transaction with it.
  */
-function sourceActor(tx: Transaction, actor: string): Json {
-  const asId = tryParseElementId(actor)
-  if (asId !== null && tx.store.load(asId) !== null) {
-    return { id: formatElementId(asId) }
+function ingestedFacets(
+  tx: Transaction,
+  facets: Record<string, JsonMap> | undefined,
+): JsonMap {
+  const out: JsonMap = {}
+  if (facets === undefined) return out
+  for (const [name, values] of Object.entries(facets)) {
+    const symbol = tx.env.resolveSymbol('Facet', name, 'write')
+    const text = formatSymbolRef(symbol)
+    const definition = tx.env.definitionPackage(symbol)
+    const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+    if (def !== undefined) {
+      validateFacetCarrier(text, def, { kind: 'element', elementKind: 'Evidence' })
+        .extend(validateFacet(text, def, values))
+        .throwIfInvalid()
+    }
+    out[text] = { ...(out[text] as JsonMap | undefined), ...values }
   }
-  const row = tx.store.sql
-    .exec<{ id: number }>(
-      // Lowest id wins, deterministically: the unique index makes a second one
-      // impossible going forward, and a retry that resolved differently each
-      // time would be worse than not resolving at all.
-      `SELECT id FROM concepts WHERE space = ? AND canonical_id = ?
-         ORDER BY id LIMIT 1`,
-      tx.cx.space,
-      actor,
+  return out
+}
+
+/**
+ * Resolves an ingest entry's `source_actor` to a Concept in this Space.
+ *
+ * By exact id, or by Concept Type lineage plus logical key — resolved through
+ * the Schema Environment the way `UPSERT CONCEPT ... MATCH {type, key}` is
+ * (§54.4, §20.14). Refused rather than stored as a bare name: §71.1 records
+ * the actor as Evidence *source*, and a source slot holding a string nothing
+ * resolves is a citation a reader cannot follow. The actor is a semantic actor
+ * and never a Principal (§88.1), so this looks among Concepts and never in the
+ * control plane.
+ */
+function sourceActor(tx: Transaction, actor: ElementReference): ElementId {
+  if ('id' in actor) {
+    const id = tryParseElementId(actor.id)
+    if (id !== null && tx.peek(id) !== null) return id
+    throw errors.notFoundOrNotVisible(
+      `the ingest source actor ${JSON.stringify(actor.id)} names no element in ` +
+        `this Space; an Evidence source must resolve to something a reader can ` +
+        `follow`,
     )
-    .toArray()[0]
-  if (row !== undefined) {
-    return { id: formatElementId({ kind: 'Concept', seq: row.id }) }
   }
+  const symbol = tx.env.resolveSymbol('ConceptType', actor.type, 'read')
+  const found = tx.store.conceptByKey(tx.cx.space, lineageOfSymbol(symbol), actor.key)
+  if (found !== null) return { kind: 'Concept', seq: found.id }
   throw errors.notFoundOrNotVisible(
-    `the ingest source actor ${JSON.stringify(actor)} names no Concept in ` +
-      `this Space; an Evidence source must resolve to something a reader can ` +
-      `follow`,
+    `no ${actor.type} keyed ${JSON.stringify(actor.key)} exists in this Space; ` +
+      `an Evidence source must resolve to something a reader can follow`,
   )
 }

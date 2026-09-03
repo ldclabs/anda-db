@@ -2,11 +2,267 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — the proactivity gap, and the consequence channel that closes the loop
+## [Unreleased] — tracking the KIP 2.0 draft, `40e655f` → `793af73`
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
 unpublished, so this accumulates into the same version).
+
+Two syncs accumulate here. The later one first.
+
+## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
+
+Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the
+consolidation of the 2.0 draft that closed its 2026-09-02 review, in the
+protocol crate and both engines. KIP 2.0 is unreleased and so is every engine
+that tracks it, so nothing below keeps a compatibility path for earlier
+2.0-draft storage or wire shapes; the KIP 1.x → 2.0 migration in
+`anda_cognitive_nexus` is the one path that stays.
+
+### Changed — breaking: the language (`anda_kip`, `@ldclabs/kip-lang` 2.2.0)
+
+- **One lifecycle statement.** `TRANSITION <target> TO "<state>" [BY <ref>]
+  [SET FIELDS] [SET STRUCTURAL] [WHERE] [LIMIT] {EXPECT VERSION}` replaces
+  `RETRACT ASSERTION`, `SUPERSEDE ASSERTION`, `CORRECT EVIDENCE`,
+  `TRANSITION ACTIVITY`, `ARCHIVE` and `TOMBSTONE` (§52.5). The quoted state
+  names the move — `retracted`, `superseded BY`, `corrected BY`, `running`,
+  `completed`, `failed`, `cancelled`, `archived`, `tombstoned` — and the
+  engine validates it against the target's kind and current state
+  (`InvalidLifecycleTransition`, `details {from, to}`); a move to the state
+  already held is `no_effect`. `BY` exactly for `superseded` / `corrected`
+  and a finalizing `SET` only on an Activity state are parse-time
+  `InvalidSyntax`; a state outside the registry is `ConstraintViolation`.
+  `ASSERT … SUPERSEDING :old` desugars to `TRANSITION :old TO "superseded" BY
+  <the new Assertion>`. AST: `MutationClause::Transition(Transition)` and
+  `anda_kip::transition_state::*` replace the six removed clause types.
+- **`EXPECT STATE` is gone** (§35.3): the transition checks the current state
+  itself, so the guard carried no information.
+- **`EXPECT VERSION` is always the trailing clause and gains version planes**
+  (§35.1, §52.8): after `WHERE` and `LIMIT`, after `UPSERT`'s closing brace,
+  after `ENSURE PROPOSITION`'s tuple, before `PURGE`'s own `REFERENCE POLICY`
+  / `CONFIRM`; `EXPECT VERSION :v [OF ATTRIBUTES | STRUCTURAL | RETENTION |
+  FACET "X"]` may repeat, one guard per plane, and the parser rejects a
+  repeated plane and a guard between an `UPDATE` target and its actions.
+  `EXPECT VERSION 0 OF <plane>` says the plane was never written; only the bare
+  `EXPECT VERSION 0` is create-only (§35.2). AST: every `expect_version:
+  Option<Scalar>` became `expect_versions: Vec<ExpectVersion>` with
+  `ExpectVersion { version, plane: Option<VersionPlane> }`.
+- **`AS OF SEQ` is the only history axis** (§48.1): `AS OF TX` and `AS OF
+  TIME` are removed from KQL, META and `EXPORT CAPSULE`; a transaction id
+  resolves through `DESCRIBE TRANSACTION`, an instant through `DESCRIBE
+  SNAPSHOT AT TIME :t` (§68). The `SNAPSHOT` token statement, `DESCRIBE
+  EXECUTION CONTEXT` and `DESCRIBE PROJECTION CAPABILITY` are removed —
+  `DESCRIBE PRIMER` / `DESCRIBE SPACE` and `DESCRIBE CAPABILITIES` carry that
+  information. AST: `AsOf::Seq` only, `DescribeTarget::Snapshot { as_of,
+  at_time }`, no `MetaCommand::Snapshot`.
+- **Cursor codes merge** (§87.7): `CursorExpired` and the new `CursorInvalid`
+  cover every cursor family; `CursorInvalidated`, `ChangeCursorExpired` and
+  `ChangeCursorInvalid` are gone, and `details.family` / `details.reason`
+  (`expired | malformed | access_revoked | schema_changed`) say what happened.
+  `KipError::cursor_expired`, `cursor_invalid`,
+  `invalid_lifecycle_transition_from` and `version_conflict_on_plane` build the
+  detail-carrying errors. The registry is 77 codes.
+- **Semantics registries** gain `EVIDENCE_LIFECYCLE` (`active | corrected`),
+  `ACTIVITY_STATUS` (`pending | running | completed | failed | cancelled`) and
+  `TRANSITION_STATES`.
+
+### Changed — breaking: the wire (`anda_kip`)
+
+- `_system.plane_versions { attributes, structural, retention, facets{} }`
+  beside `version` (§6.3) — `SystemState.plane_versions`, `PlaneVersions`.
+- `governance.authority_class` (`descriptive | advisory | behavioral |
+  executable`, §31.3) replaces the engine-named `max_influence_authority`;
+  an element without the field is `descriptive`.
+- The Change Envelope has a normative entry shape
+  (`schemas/kip-change-envelope.schema.json`, §36.1): `ChangeEnvelope.changes`
+  is `Vec<ChangeEntry>` — `op` ∈ `create | update | lifecycle | retention |
+  merge | purge | payload_purge`, `kind`, `id`, `new_version`, `old_version`,
+  `state {from, to}`, `schema_ref`, `refs {proposition | subject +
+  predicate_ref | merged_into}`, `touched` (names, never values) and `planes`.
+- `ingest.evidence[].source_actor` is an element reference — `{id}` or
+  `{type, key}`, never a name (§71.1) — and an entry may carry `facets`,
+  validated exactly as `SET FACET` on `CREATE EVIDENCE` would be; an
+  `outcome`-class entry needs `record_outcome` (§29.8). `ElementReference`,
+  `IngestEvidence.facets`.
+- `execution.on_error` defaults to `stop` (§75.2); `results[].receipt` carries
+  each operation's own Receipt in `sequence` / `independent` mode (§75) and
+  `execution.idempotency_key` is echoed (§81); a Receipt carries
+  `receipt_digest` and `origin { principal_id, actor_binding_id,
+  delegation_digest }` (§33.2).
+
+### Changed — vendored artifacts (`793af73`)
+
+- `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,
+  `grammar/*.ebnf`, `profiles/CognitiveMemoryProfile-2.0.md`, `brain/*.md`,
+  `schemas/kip-{request,response}.schema.json` re-synced through `793af73`;
+  new `schemas/kip-change-envelope.schema.json`; the three normative
+  companions the Specification now delegates to ship beside it:
+  `Capsule-Specification.md` (§37–§41, §95),
+  `Optional-Profiles-and-Migration.md` (§100, §101, §103, Appendix I) and
+  `Invariants.md` (the 38 Core and 35 Profile invariants). The two prompts are
+  now deltas over `brain/` — `SelfInstructions.md` loads with `BrainFormation`
+  / `BrainRecall`, `SystemInstructions.md` with `BrainMaintenance`.
+- `rs/anda_cognitive_nexus/profiles/cognitive-memory-2.0.0.json` re-copied
+  verbatim; its `content_digest` moves to
+  `sha256:c851d4e3638f1996c4caa3bb573b9dd33cd2a6b59945a0cc70b42f44a310840a`.
+  `SkillUtility` is now `GradingState` (no `utility` member; applicable to
+  Skill and Insight — a Skill's admission bet is `MnemonicState.utility`),
+  `TrialState` and `DecisionRecord` are new Facets, `Commitment.conditions` is
+  gone (a condition is a Watch), `Insight` gains an optional `task_family`, and
+  `Watch.condition` has a baseline structured form. A development Space that
+  installed the previous `@2.0.0` bytes has to be recreated.
+- `@ldclabs/kip-lang` moves to `^2.2.0`. The WASM parser oracle, the generated
+  error registry, profile module, fixtures and corpus are rebuilt with it, and
+  the 89-case AST parity fixture is regenerated from its `lower()`.
+- `fixtures/kip-conformance-2.0/` rewritten to the new syntax and vocabulary:
+  `TRANSITION` legality, trailing and plane guards, `DESCRIBE SNAPSHOT AS OF
+  SEQ`, `DESCRIBE TRANSACTION` of an unknown id, the normative `changes[]`
+  entry shape in `HISTORY` / `CHANGES` results, `authority_class` reading
+  `descriptive` by default, `source_actor` as an element reference, and the
+  six Profile Facets `LIST FACETS` now reports.
+
+### Changed — breaking: the engines execute one `TRANSITION`
+
+Both engines drop the six lifecycle statements and execute the single one.
+`retracted` and `superseded` still ask for `retract_own` / `supersede_own`,
+`archived` and `tombstoned` for `archive` / `tombstone`, so a moderator who
+reaches for the source's own words is still refused — the permission follows
+the state, not the keyword. A move to the state already held is a `no_effect`
+receipt, an illegal one is `InvalidLifecycleTransition` with `details.from` and
+`details.to`, and `EXPECT STATE` is gone because the engine validates the
+current state whether the caller restated it or not.
+
+`AS OF SEQ` is the only history axis either engine accepts. A caller holding a
+wall-clock time resolves it through `DESCRIBE SNAPSHOT AT TIME`, which replaces
+the removed `SNAPSHOT` statement; `DESCRIBE EXECUTION CONTEXT` and
+`DESCRIBE PROJECTION CAPABILITY` are gone, the latter's answer folded into
+`DESCRIBE CAPABILITIES`.
+
+### Added — version planes, and one spelling of what a commit touched
+
+Every element carries `_system.plane_versions` beside `_system.version`: one
+counter for `attributes`, one for `structural`, one for `retention` and one per
+Facet. `EXPECT VERSION n OF ATTRIBUTES | STRUCTURAL | RETENTION | FACET "X"`
+guards a single plane, so a `MnemonicState` decay sweep and a status verdict on
+the same element stop knocking each other's guard over. A plane may be named
+once per statement; a mismatch is `VersionConflict` with `details.plane`, and a
+bare guard carries no `details.plane` because it guarded the whole element.
+
+The counters are derived at commit from a diff of the row loaded against the row
+written, not from the clause that ran — so a clause that writes the same value
+back advances nothing, and a `TRANSITION` that finalized an Activity's outputs
+advances the structural plane whatever its name says.
+
+Both engines report the same `touched` vocabulary on a Change Envelope entry,
+sorted and deduplicated: `fields.<column>`, `attributes.<name>`,
+`structural.<LocalName>`, `facets.<LocalName>`, bare `retention`, bare `state`,
+and `governance.<member>`. Lifecycle columns and Governance members are named in
+`touched` but advance no plane, so a lifecycle entry carries `state {from, to}`
+and `touched` and reports no `planes`. Profile fields and Facets are named by
+local name rather than by resolved symbol.
+
+### Fixed — a recovered receipt was not the receipt that was sealed
+
+`anda_cognitive_nexus` journalled a transaction without `Receipt.origin`, so a
+client recovering a lost response under §80.4 got a replayed receipt whose
+`receipt_digest` no longer matched the sealed one. The origin is now a column on
+the transaction row and is replayed verbatim, never rebuilt from the resending
+caller. `TransactionRow` and `JournalEntry` gained a column; a development Space
+has to be recreated.
+
+Four more, all in `anda_cognitive_nexus`:
+
+- re-importing a Capsule looked a Proposition up under the exact
+  `predicate_ref` while the write path stores `tuple_key` under its lineage
+  (§12.3, §20.14), so the second import missed the existing tuple and died on
+  the unique index with `IdentityConflict`;
+- `Session::put` on the Governance plane read the before-image *after* applying
+  the patch, so `touched` was always empty and every control-plane move was
+  journalled `op: update` even when it moved the lifecycle state;
+- `PREVIEW KML` read the atomic-only top-level receipt slot, so every preview
+  reported `"receipt": null`;
+- superseding an already-retracted Assertion answered `SupersessionMismatch`,
+  because the self-supersession check ran before the lifecycle check. §52.5
+  makes current-state validation the engine's first job.
+
+### Fixed — a batch after the first operation committed nothing
+
+`@ldclabs/kip-do` handed the envelope's `execution.idempotency_key` verbatim to
+every operation of a batch, so operations after the first replayed the first
+one's outcome and wrote nothing while reporting success. An operation's own key
+still wins (§73); otherwise the envelope key is narrowed by the operation's
+position, which keeps a single-operation request on the bare key and lets an
+identical retry still replay (§34.3).
+
+Three more, all in `@ldclabs/kip-do`:
+
+- `HISTORY` fetched exactly one page, so paging could never tell that more
+  remained and never issued a continuation cursor — every page looked like the
+  last;
+- `LIST`, `HISTORY` and `CHANGES` turned a non-numeric `LIMIT` into `NaN` and
+  silently paged nothing, where the KQL side already answered `TypeMismatch`;
+- an Assertion written without `by:` was reported as a Schema failure; §55.1
+  makes it required, and the shared grammar refuses it as `InvalidSyntax`.
+
+### Changed — the §67.4 capability registry reads the same on both engines
+
+The 24 registry names are fixed by the Specification, but the two engines
+reported them from different places: `anda_cognitive_nexus` under
+`supported.registry` with each entry's detail on the entry, `@ldclabs/kip-do`
+from a top-level `registry` with the details split into a sibling `limits` map
+and a top-level `available` that listed the entries answering `true` — which is
+not what §67.2 means by available. `@ldclabs/kip-do` now reports the registry
+from `supported.registry` too, with `idempotency_retention` and
+`search_index_freshness` carrying their values inline as §67.4 shows them, and
+`limits` holding only real ceilings. A registry a client has to look for in a
+different place on each engine is not a negotiation surface.
+
+`fixtures/kip-conformance-2.0/request-envelope.json` now pins the semantics
+rather than the response body: a supported name lets a request through, an entry
+whose value is a detail object still answers as supported, an unsupported name
+is refused before the command runs, and a name no registry knows fails the same
+way instead of passing unrecognized.
+
+### Fixed — the two conformance harnesses read the same suite differently
+
+The Rust harness renumbers a fixture's own `C:<1>` placeholders through the same
+aliasing it applies to real ids, so it tolerates an ordinal an author guessed
+wrong; the TypeScript one compares them literally. A `history.json` entry that
+named the Assertion and its Proposition both `<1>` therefore passed one engine
+and failed the other, where it was an authoring slip in a fixture rather than a
+divergence between engines. The ordinals are corrected and the rule — one global
+counter, sorted-key walk order, write what the walk produces — is now stated in
+`fixtures/kip-conformance-2.0/README.md`.
+
+### Fixed — an `ingest` block on a read-only request was silently dropped
+
+Both engines minted ingested Evidence on the KML path only, so a request that
+paired an `ingest` block with a `FIND` or a `DESCRIBE` minted nothing and still
+answered `succeeded`. The caller went on believing the observation was recorded
+— the fidelity failure §88.12 has ingestion exist to prevent, arriving through
+the mechanism meant to prevent it.
+
+§71.1 mints each entry "inside the request's transaction scope" and makes
+ingestion transactional, so a request carrying only reads opens no scope to mint
+into. Such an envelope is now `InvalidRequestEnvelope`, refused before anything
+runs. It is refused only once every operation parsed, so a command that does not
+parse still reports its own syntax error rather than being recast as an envelope
+fault. The rule lives in `anda_kip`'s `Request::validate`, which is the
+structural gate `execute_request` already runs, and is mirrored in
+`@ldclabs/kip-do`'s envelope check.
+
+`tests/conformance.rs` now runs that gate too. It dispatches one operation
+directly rather than through `execute_request`, so every envelope invariant was
+enforced in production and invisible to the shared suite;
+`fixtures/kip-conformance-2.0/request-envelope.json` pins the refusal for both
+engines.
+
+`derive_permission` stays `false` in both registries, and that is the compliant
+answer rather than a gap: neither engine distinguishes a derived write, and
+§29.6 makes rejecting `derive` where a Grant names it a MUST for exactly that
+case. Both engines have a test on the rejection.
+
+## Sync: KIP 2.0 `40e655f` — the proactivity gap, and the consequence channel
 
 Syncs upstream [KIP 2.0 `40e655f`](https://github.com/ldclabs/kip) and
 implements the two statements it adds, in both engines — and, following the

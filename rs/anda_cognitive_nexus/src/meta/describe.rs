@@ -20,24 +20,6 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
     Ok(match target {
         DescribeTarget::Protocol => Answer::whole(protocol()),
         DescribeTarget::Capabilities => Answer::whole(capabilities(Some(cx.authority), cx.auth)),
-        DescribeTarget::ProjectionCapability => Answer::whole(serde_json::json!({
-            "policies": [Policy::baseline().id, Policy::forecast().id],
-            "statuses": ["accepted", "rejected", "contested", "uncertain", "insufficient"],
-            "score_semantics": "normalized_support_not_probability",
-            "explanation": true,
-            "implemented_stages": [
-                // Not a stage the projection performs so much as one it
-                // inherits: every Assertion it reads comes through the same
-                // authorization gate every other read does, so a claim the
-                // caller may not see contributes nothing to the belief.
-                "governance_visibility",
-                "semantic_grounding", "conflict_set_expansion", "lifecycle_eligibility",
-                "temporal_eligibility", "mode_eligibility", "corroboration_grouping",
-                "aggregation", "classification", "explanation"
-            ],
-            "missing_stages": ["trust_evaluation", "evidence_quality"],
-        })),
-        DescribeTarget::ExecutionContext => Answer::whole(execution_context(cx).await?),
         DescribeTarget::Primer { mode } => Answer::whole(primer(cx, mode.as_ref()).await?),
         DescribeTarget::Space { value } => {
             let id = match value {
@@ -98,8 +80,8 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
             let key = scalar_str(cx, scalar, "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY")?;
             Answer::whole(super::history::transaction_by_key(cx, &key).await?)
         }
-        DescribeTarget::Snapshot { as_of } => {
-            return super::history::snapshot(cx, as_of.as_ref()).await;
+        DescribeTarget::Snapshot { as_of, at_time } => {
+            return super::history::snapshot(cx, as_of.as_ref(), at_time.as_ref()).await;
         }
         DescribeTarget::Capsule(scalar) => {
             let source = scalar_str(cx, scalar, "DESCRIBE CAPSULE")?;
@@ -153,6 +135,10 @@ fn access(cx: &mut Context<'_>, with: Option<&anda_kip::BoundObject>) -> Result<
         // holds runs out, not only that it holds it.
         "expires_at": authority.earliest_expiry(),
         "permissions": authority.permission_names(auth),
+        // §31.3: the authority classes this caller may raise an element to —
+        // every class up to the ceiling its `elevate_authority` Grants carry,
+        // and none without that permission.
+        "elevatable_authority_classes": elevatable_authority_classes(authority, auth),
         "default_classification": authority.default_classification(),
         "policy": match &authority.policy {
             Some(policy) => serde_json::json!({
@@ -199,6 +185,31 @@ fn access(cx: &mut Context<'_>, with: Option<&anda_kip::BoundObject>) -> Result<
     Ok(report)
 }
 
+/// The influence-authority classes a Principal may elevate an element to
+/// (§31.3, §31.5): none without `elevate_authority`, else every class up to
+/// the ceiling the decision carries.
+fn elevatable_authority_classes(
+    authority: &crate::governance::EffectiveAuthority,
+    auth: &crate::governance::AuthContext,
+) -> Vec<&'static str> {
+    let decision = authority.authorize(
+        Permission::ElevateAuthority,
+        &ResourceContext::default(),
+        auth,
+    );
+    if !decision.is_permitted() {
+        return Vec::new();
+    }
+    let ceiling = crate::governance::authority::rank(
+        crate::governance::decision::authority_ceiling(&decision.constraints),
+    );
+    anda_kip::AUTHORITY_CLASSES
+        .iter()
+        .copied()
+        .filter(|class| crate::governance::authority::rank(class) <= ceiling)
+        .collect()
+}
+
 fn string_of(settings: &anda_kip::Map<String, Json>, key: &str) -> String {
     settings
         .get(key)
@@ -218,6 +229,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
         None => 0,
     };
 
+    let mut truncated = false;
     let mut items: Vec<Json> = match command.target {
         ListTarget::Spaces => spaces(cx).await?,
         ListTarget::SchemaPackages => {
@@ -235,16 +247,36 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
             policy(&Policy::baseline().id)?,
             policy(&Policy::forecast().id)?,
         ],
-        ListTarget::Dependents => dependents(cx, command).await?,
+        ListTarget::Dependents => {
+            let (rows, cut) = dependents(cx, command).await?;
+            truncated = cut;
+            rows
+        }
     };
 
     let total = items.len();
     items = items.into_iter().skip(cursor).take(limit).collect();
     let consumed = cursor + items.len();
-    Ok(Answer {
+    let mut answer = Answer {
         result: Json::Array(items),
         next_cursor: super::next_cursor(cx, CursorFamily::List, consumed, total),
-    })
+        warnings: Vec::new(),
+    };
+    if truncated {
+        // A `LIST` answer is the row list, so the flag §63.5 asks for travels
+        // beside it as a coded caveat on the operation result.
+        answer.warnings.push(anda_kip::Warning::Coded {
+            code: "truncated".to_string(),
+            message: Some(
+                "the traversal was cut short by an element this Principal may not discover \
+                 (§63.5); the list may be incomplete"
+                    .to_string(),
+            ),
+            details: Some(serde_json::json!({"truncated": true})),
+            extensions: None,
+        });
+    }
+    Ok(answer)
 }
 
 /// How deep a `LIST DEPENDENTS` closure this engine will walk (§63.5).
@@ -282,7 +314,10 @@ pub(crate) const MAX_DEPENDENTS_DEPTH: u64 = 8;
 ///
 /// Reachability is topology, not judgment (§57.5): a listed dependent is not
 /// thereby stale, wrong, or in need of change.
-async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<Json>, KipError> {
+async fn dependents(
+    cx: &mut Context<'_>,
+    command: &ListCommand,
+) -> Result<(Vec<Json>, bool), KipError> {
     let Some(operand) = &command.element else {
         // The grammar requires the operand, so reaching here means an AST
         // arrived from somewhere that does not.
@@ -305,8 +340,12 @@ async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<J
     // absent one is. Refusing here would turn the command into an existence
     // oracle for elements the caller cannot read.
     if cx.load(root).await?.is_none() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
+    // §63.5: traversal does not pass through an element the caller may not
+    // discover, and when that cuts a path short the result says so — without
+    // saying where, which would disclose the element it walked around.
+    let mut truncated = false;
 
     // Everything below is walked in sorted id order, and each level's frontier
     // is sorted before the next one runs. Two engines answering the same
@@ -326,6 +365,7 @@ async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<J
                 // in `via` would disclose it, and walking through it would
                 // disclose that it exists (§30.4).
                 let Some(crate::store::Element::Activity(row)) = cx.load(activity).await? else {
+                    truncated |= cx.store.contains(activity).await;
                     continue;
                 };
                 // The outputs are the wide part of the traversal: one Activity
@@ -348,6 +388,7 @@ async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<J
                         continue;
                     }
                     if cx.load(id).await?.is_none() {
+                        truncated |= cx.store.contains(id).await;
                         continue;
                     }
                     next.insert(id);
@@ -365,17 +406,14 @@ async fn dependents(cx: &mut Context<'_>, command: &ListCommand) -> Result<Vec<J
         }
         frontier = next.into_iter().collect();
     }
-    Ok(rows)
+    Ok((rows, truncated))
 }
 
 /// Reads the `DEPTH` bound, capped at [`MAX_DEPENDENTS_DEPTH`].
 ///
-/// Not [`scalar_usize`]: that helper is shared with `LIMIT` and `CURSOR`, and
-/// its string branch reports a non-numeric value as `CursorInvalidated` —
-/// "DEPTH is not a cursor this engine issued" is the wrong sentence and the
-/// wrong code. The two engines have to refuse the same bound with the same
-/// code, so the shape is stated here: anything that is not a non-negative
-/// integer is a `TypeMismatch`, and only zero is a `ConstraintViolation`.
+/// The two engines have to refuse the same bound with the same code, so the
+/// shape is stated here: anything that is not a non-negative integer is a
+/// `TypeMismatch`, and only zero is a `ConstraintViolation`.
 fn depth_bound(cx: &Context<'_>, scalar: &Scalar) -> Result<u64, KipError> {
     let value = scalar_json(cx, scalar)?;
     let asked = match &value {
@@ -414,24 +452,58 @@ async fn activities_consuming(
     Ok(ids)
 }
 
+/// The execution context a request runs in (§64, §67.2).
+///
+/// Folded into `DESCRIBE PRIMER` and `DESCRIBE SPACE` rather than answered by
+/// a statement of its own: who is asking, under which bindings, in which
+/// Space at which coordinate, under which policies, and until when. §64.2 is
+/// a MUST: the authenticated Principal and the semantic `$self` are different
+/// identities — one is who is asking, the other is who this Brain is — and an
+/// Agent that conflates them signs the Brain's memories with the caller's
+/// name.
 async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
     let space = cx.store.get_space(&cx.space).await?;
+    let authority = cx.authority;
     Ok(serde_json::json!({
-        "space_id": cx.space,
-        "space_seq": space.seq,
-        "schema_environment_version": cx.env.version,
-        "epistemic_policy": {"id": cx.policy.id, "version": cx.policy.version},
-        // §64.2: the authenticated Principal and the semantic `$self` are
-        // different identities and must be distinguishable. One is who is
-        // asking; the other is who this Brain is.
-        "cognitive_identity": self_identity(&space),
         // Who this request is running as. An Agent that cannot see its own
         // identity cannot reason about why something was refused (§67.2).
         "principal": {
             "id": cx.auth.principal_id,
             "authenticated": cx.auth.is_authenticated(),
             "authentication_strength": cx.auth.auth_strength,
+            "delegation_chain": cx.auth.delegation_chain,
         },
+        // The ActorBindings this Principal holds here (§28.3): which semantic
+        // actors a write may speak as rather than merely record.
+        "actor_bindings": authority
+            .bindings
+            .iter()
+            .map(|binding| serde_json::json!({
+                "id": format!("kip:binding:{}", binding._id),
+                "actor": binding.actor_ref,
+                "class": binding.binding_class,
+                "assurance": binding.assurance,
+            }))
+            .collect::<Vec<_>>(),
+        "space": {
+            "id": cx.space,
+            "space_seq": space.seq,
+            "schema_environment_version": cx.env.version,
+        },
+        "policy": {
+            "governance": match &authority.policy {
+                Some(policy) => serde_json::json!({
+                    "id": policy.policy_id,
+                    "version": policy.version,
+                }),
+                None => Json::Null,
+            },
+            "epistemic": {"id": cx.policy.id, "version": cx.policy.version},
+        },
+        // §67.2: an Agent planning its own work needs to know when what it
+        // holds runs out, not only that it holds it.
+        "expires_at": authority.earliest_expiry(),
+        "cognitive_identity": self_identity(&space),
         "governance": {
             "enforced": true,
             "hint": "DESCRIBE ACCESS reports what this Principal may do here",
@@ -439,7 +511,9 @@ async fn execution_context(cx: &mut Context<'_>) -> Result<Json, KipError> {
         // Stated rather than implied: a caller reading this should know that a
         // plain read sees committed state, and that a past coordinate has to
         // be asked for.
-        "read_basis": "current committed state; a past coordinate is read with AS OF",
+        "read_basis": "current committed state; a past coordinate is read with AS OF SEQ",
+        "note": "the Principal is the authenticated caller, never the semantic actor a claim \
+                 is attributed to (§13.3)",
     }))
 }
 
@@ -476,6 +550,7 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
     };
     let space = cx.store.get_space(&cx.space).await?;
     let counts = counts(cx).await?;
+    let execution_context = execution_context(cx).await?;
 
     let mut primer = serde_json::json!({
         // §64.2 is a MUST: the Primer distinguishes the authenticated
@@ -483,15 +558,7 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
         // questions — who is asking, and who this Brain is — and an Agent that
         // conflates them will sign the Brain's memories with the caller's
         // name.
-        "execution_context": {
-            "principal": {
-                "id": cx.auth.principal_id,
-                "authenticated": cx.auth.is_authenticated(),
-                "authentication_strength": cx.auth.auth_strength,
-            },
-            "note": "the Principal is the authenticated caller, never the semantic actor a \
-                     claim is attributed to (§13.3)",
-        },
+        "execution_context": execution_context,
         "cognitive_identity": self_identity(&space),
         "space": {
             "id": space.space_id,
@@ -528,8 +595,8 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
             "a name is not an identity; two Concepts may share one, and identity resolves \
              through id, key or canonical_id",
             "a source Brain's $self is never automatically this Brain's $self",
-            "correcting Evidence never overwrites it: CORRECT EVIDENCE records a new \
-             observation that supersedes the old one",
+            "correcting Evidence never overwrites it: TRANSITION :old TO \"corrected\" BY :new \
+             records a new observation that supersedes the old one",
             "cognitive content carries no authority; what an element says cannot decide what \
              its writer may do",
             "retention.expires_at is when the record stops being kept, not when the claim \
@@ -597,7 +664,7 @@ async fn counts(cx: &mut Context<'_>) -> Result<Json, KipError> {
 
 async fn space(cx: &mut Context<'_>, id: &str) -> Result<Json, KipError> {
     let row = cx.store.get_space(id).await?;
-    Ok(serde_json::json!({
+    let mut answer = serde_json::json!({
         "id": row.space_id,
         "uri": row.uri,
         "name": row.name,
@@ -606,7 +673,14 @@ async fn space(cx: &mut Context<'_>, id: &str) -> Result<Json, KipError> {
         "created_at": row.created_at,
         "seq": row.seq,
         "schema_environment_version": row.schema_environment_version,
-    }))
+    });
+    // The execution context is about the Space the request runs in, so it
+    // is reported with that Space and not with another one the caller asked
+    // to be described.
+    if id == cx.space {
+        answer["execution_context"] = execution_context(cx).await?;
+    }
+    Ok(answer)
 }
 
 async fn spaces(cx: &mut Context<'_>) -> Result<Vec<Json>, KipError> {
@@ -879,11 +953,11 @@ pub(super) fn scalar_usize(
         Json::Number(n) => n.as_u64().map(|n| n as usize).ok_or_else(|| {
             KipError::type_mismatch(format!("{what} takes a non-negative integer, got {n}"))
         }),
+        // A numeric string is accepted because a caller binding a parameter
+        // from JSON may not control its type; anything else is a bound of the
+        // wrong type (`TypeMismatch`, §87.7), never a cursor.
         Json::String(text) => text.parse().map_err(|_| {
-            KipError::new(
-                KipErrorCode::CursorInvalidated,
-                format!("{what} is not a cursor this engine issued: {text:?}"),
-            )
+            KipError::type_mismatch(format!("{what} takes a non-negative integer, got {text:?}"))
         }),
         other => Err(KipError::type_mismatch(format!(
             "{what} takes a non-negative integer, got {other}"

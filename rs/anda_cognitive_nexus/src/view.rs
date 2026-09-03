@@ -123,6 +123,7 @@ struct EnvelopeParts<'a> {
     space: &'a str,
     state: &'a str,
     version: u64,
+    plane_versions: &'a Json,
     seq: u64,
     created_at: &'a str,
     updated_at: &'a str,
@@ -134,6 +135,21 @@ struct EnvelopeParts<'a> {
     facets: &'a Map<String, Json>,
 }
 
+/// The Governance block a reader sees (§31.3).
+///
+/// `authority_class` is filled in rather than left absent: `descriptive` is
+/// the class every element has until Governance raises it (§31.4), so
+/// answering `null` would make each client reimplement that default — and a
+/// client that read the hole as "no ceiling" would have it exactly backwards.
+fn governance_state(governance: &Json) -> GovernanceState {
+    let mut state =
+        serde_json::from_value::<GovernanceState>(governance.clone()).unwrap_or_default();
+    if state.authority_class.is_none() {
+        state.authority_class = Some(crate::governance::authority::DEFAULT.to_string());
+    }
+    state
+}
+
 fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
     let EnvelopeParts {
         id,
@@ -141,6 +157,7 @@ fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
         space,
         state,
         version,
+        plane_versions,
         seq,
         created_at,
         updated_at,
@@ -155,7 +172,7 @@ fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
         id,
         kind,
         space_id: some_text(space),
-        governance: serde_json::from_value::<GovernanceState>(governance.clone()).ok(),
+        governance: Some(governance_state(governance)),
         retention: serde_json::from_value::<Retention>(retention.clone()).ok(),
         facets: facets
             .iter()
@@ -167,6 +184,12 @@ fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
             .collect(),
         system: Some(SystemState {
             version: Some(version),
+            // Facet counters keyed by local name, so
+            // `?x._system.plane_versions.facets["MnemonicState"]` reads the
+            // name a command writes (§6.3, §35.1).
+            plane_versions: Some(crate::store::planes::to_wire(
+                &crate::store::planes::decode(plane_versions),
+            )),
             created_at: some_text(created_at),
             updated_at: some_text(updated_at),
             created_tx: some_text(created_tx),
@@ -214,6 +237,7 @@ fn concept(row: &ConceptRow) -> Json {
             space: &row.space,
             state: &row.state,
             version: row.version,
+            plane_versions: &row.plane_versions,
             seq: row.seq,
             created_at: &row.created_at,
             updated_at: &row.updated_at,
@@ -251,6 +275,7 @@ fn proposition(row: &PropositionRow) -> Json {
             space: &row.space,
             state: &row.state,
             version: row.version,
+            plane_versions: &row.plane_versions,
             seq: row.seq,
             created_at: &row.created_at,
             updated_at: &row.updated_at,
@@ -261,11 +286,25 @@ fn proposition(row: &PropositionRow) -> Json {
             retention: &row.retention,
             facets: &row.facets,
         }),
-        subject: row.subject.clone(),
+        subject: endpoint_view(&row.subject),
         predicate_ref: row.predicate_ref.clone(),
-        object: row.object.clone(),
+        object: endpoint_view(&row.object),
     };
     finish(&value, &row.structural, &[])
+}
+
+/// A stored tuple endpoint as a read returns it.
+///
+/// A reference is returned as the reference object it is; a Literal as the
+/// bare scalar — §9.2's baseline has exactly four datatypes and no tag, so the
+/// `{value, datatype}` object the row keeps to stay self-describing adds
+/// nothing a reader needs (KIP2-CORE-024), and `?p.object == "dark"` compares
+/// the value rather than a wrapper.
+pub fn endpoint_view(value: &Json) -> Json {
+    match crate::term::Endpoint::from_json(value) {
+        Ok(crate::term::Endpoint::Literal(literal)) => literal.value,
+        _ => value.clone(),
+    }
 }
 
 fn assertion(row: &AssertionRow) -> Json {
@@ -280,6 +319,7 @@ fn assertion(row: &AssertionRow) -> Json {
             space: &row.space,
             state: &row.state,
             version: row.version,
+            plane_versions: &row.plane_versions,
             seq: row.seq,
             created_at: &row.created_at,
             updated_at: &row.updated_at,
@@ -362,6 +402,7 @@ fn evidence(row: &EvidenceRow) -> Json {
             space: &row.space,
             state: &row.state,
             version: row.version,
+            plane_versions: &row.plane_versions,
             seq: row.seq,
             created_at: &row.created_at,
             updated_at: &row.updated_at,
@@ -400,6 +441,7 @@ fn activity(row: &ActivityRow) -> Json {
             space: &row.space,
             state: &row.state,
             version: row.version,
+            plane_versions: &row.plane_versions,
             seq: row.seq,
             created_at: &row.created_at,
             updated_at: &row.updated_at,

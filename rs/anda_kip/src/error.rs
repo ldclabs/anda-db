@@ -233,7 +233,7 @@ kip_error_codes! {
     ImmutableField,
     /// Changing this requires a new Assertion plus supersession.
     EpistemicRevisionRequired,
-    /// Changing this requires `CORRECT EVIDENCE`.
+    /// Changing this requires `TRANSITION :old TO "corrected" BY :new`.
     EvidenceCorrectionRequired,
     /// The requested lifecycle transition is not legal from the current state.
     InvalidLifecycleTransition,
@@ -300,13 +300,17 @@ kip_error_codes! {
     /// The cursor is for a different result kind.
     CursorTypeMismatch,
     /// The cursor is past its retention window.
+    ///
+    /// One code for every cursor family (KQL, SEARCH, HISTORY, LIST, CHANGES,
+    /// EXPORT): `details.family` names the family and `details.reason` says
+    /// why (§87.7). A Change cursor that expired restarts from a sequence the
+    /// consumer durably recorded, never from the current head (§69).
     CursorExpired,
-    /// The cursor was invalidated by an intervening change.
-    CursorInvalidated,
-    /// The change cursor is past its retention window.
-    ChangeCursorExpired,
-    /// The change cursor is malformed or forged.
-    ChangeCursorInvalid,
+    /// The cursor is malformed, was issued for another traversal, or was
+    /// invalidated by an intervening change — `details.reason` is one of
+    /// `malformed`, `access_revoked`, `schema_changed`; `details.family` names
+    /// the cursor family (§87.7).
+    CursorInvalid,
 
     // ── §87.8 Search ─────────────────────────────────────────────────
     /// The requested SEARCH mode is not supported.
@@ -412,9 +416,7 @@ impl KipErrorCode {
             | CursorMismatch
             | CursorTypeMismatch
             | CursorExpired
-            | CursorInvalidated
-            | ChangeCursorExpired
-            | ChangeCursorInvalid => ErrorCategory::History,
+            | CursorInvalid => ErrorCategory::History,
             SearchModeUnsupported | SearchIndexUnavailable | HistoricalSearchUnavailable => {
                 ErrorCategory::Search
             }
@@ -463,11 +465,13 @@ impl KipErrorCode {
             | ActorBindingRequired
             | LegalHoldConflict
             | PurgeDenied => RetryClass::RequiresAuthority,
-            // Acquire a fresh coordinate first.
-            HistoricalSnapshotUnavailable
-            | CursorExpired
-            | CursorInvalidated
-            | ChangeCursorExpired => RetryClass::RequiresNewSnapshot,
+            // Acquire a fresh coordinate first. A cursor that is gone —
+            // expired, invalidated by a schema change or a revocation, or
+            // never issued by this engine — is restarted from a fresh first
+            // page, whichever reason `details` names.
+            HistoricalSnapshotUnavailable | CursorExpired | CursorInvalid => {
+                RetryClass::RequiresNewSnapshot
+            }
             // The bytes are gone or wrong; fetch them again.
             ArtifactUnavailable | DigestMismatch | BlobUnavailable => {
                 RetryClass::RequiresReacquireArtifact
@@ -583,13 +587,13 @@ impl KipErrorCode {
                 "The field is immutable after creation; express the change as new state instead."
             }
             EpistemicRevisionRequired => {
-                "An Assertion's epistemic payload never changes. Record a new Assertion and `SUPERSEDE` the old one."
+                "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`."
             }
             EvidenceCorrectionRequired => {
-                "Evidence payload never changes. Use `CORRECT EVIDENCE :old BY :new`."
+                "Evidence payload never changes. Record the corrected Evidence and `TRANSITION :old TO \"corrected\" BY :new`."
             }
             InvalidLifecycleTransition => {
-                "Read the element's current lifecycle state first; that transition is not legal from where it is."
+                "Read the element's current lifecycle state first (`details.from` / `details.to`); that TRANSITION is not legal from where it is, or not for its kind."
             }
             RetractionNotAuthorized => "Only the assertor may retract their own Assertion.",
             SupersessionMismatch => {
@@ -599,7 +603,7 @@ impl KipErrorCode {
                 "That Evidence already has a conflicting correction. Re-read its lineage."
             }
             ActivityTerminal => {
-                "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ACTIVITY` that ends it."
+                "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ... TO \"completed\" SET STRUCTURAL` that ends it."
             }
             ProjectionTargetUnbound => {
                 "Bind the projection's Proposition in the WHERE block first."
@@ -653,13 +657,11 @@ impl KipErrorCode {
             }
             CursorMismatch => "The cursor belongs to a different query. Restart pagination.",
             CursorTypeMismatch => "The cursor is for a different result kind. Restart pagination.",
-            CursorExpired => "Restart pagination from a fresh first page.",
-            CursorInvalidated => {
-                "An intervening change invalidated the cursor. Restart pagination."
+            CursorExpired => {
+                "Restart pagination from a fresh first page; a change cursor restarts from a sequence you recorded, never from the current head. `details.family` names the cursor family."
             }
-            ChangeCursorExpired => "Re-subscribe from a newer change coordinate.",
-            ChangeCursorInvalid => {
-                "The change cursor is malformed. Re-acquire it from the runtime."
+            CursorInvalid => {
+                "The cursor is malformed, belongs to another traversal, or was invalidated (`details.reason`: malformed, access_revoked, schema_changed). Restart pagination from a fresh first page."
             }
             SearchModeUnsupported => {
                 "Run `DESCRIBE CAPABILITIES` for the SEARCH modes this runtime offers."
@@ -779,6 +781,40 @@ impl KipError {
     /// The effective hint: the per-occurrence one, else the registry default.
     pub fn effective_hint(&self) -> &str {
         self.hint.as_deref().unwrap_or_else(|| self.code.hint())
+    }
+
+    /// A [`KipErrorCode::CursorExpired`] carrying the family it belongs to.
+    ///
+    /// §87.7: one code covers every cursor family, and `details.family` is
+    /// how a consumer tells a KQL page from a change stream — the recovery
+    /// differs, a fresh first page against a durably recorded sequence.
+    pub fn cursor_expired(family: &str, message: impl Display) -> Self {
+        Self::new(KipErrorCode::CursorExpired, message.to_string())
+            .with_details(serde_json::json!({ "family": family, "reason": "expired" }))
+    }
+
+    /// A [`KipErrorCode::CursorInvalid`] carrying the family and the reason —
+    /// `malformed`, `access_revoked` or `schema_changed` (§87.7).
+    pub fn cursor_invalid(family: &str, reason: &str, message: impl Display) -> Self {
+        Self::new(KipErrorCode::CursorInvalid, message.to_string())
+            .with_details(serde_json::json!({ "family": family, "reason": reason }))
+    }
+
+    /// A [`KipErrorCode::InvalidLifecycleTransition`] naming the move that
+    /// was refused, as `details.from` / `details.to` (§52.5).
+    pub fn invalid_lifecycle_transition_from(from: &str, to: &str, message: impl Display) -> Self {
+        Self::new(
+            KipErrorCode::InvalidLifecycleTransition,
+            message.to_string(),
+        )
+        .with_details(serde_json::json!({ "from": from, "to": to }))
+    }
+
+    /// A [`KipErrorCode::VersionConflict`] on one version plane, named in
+    /// `details.plane` (§35.1).
+    pub fn version_conflict_on_plane(plane: &str, message: impl Display) -> Self {
+        Self::new(KipErrorCode::VersionConflict, message.to_string())
+            .with_details(serde_json::json!({ "plane": plane }))
     }
 }
 
@@ -1022,9 +1058,11 @@ mod tests {
 
     #[test]
     fn registry_covers_the_whole_spec_listing() {
-        // §87 lists 79 codes across ten sections; a miss here means a section
-        // was dropped when the registry was transcribed.
-        assert_eq!(KipErrorCode::ALL.len(), 79);
+        // §87 lists 77 codes across ten sections (the four cursor codes of
+        // earlier drafts collapsed into `CursorExpired` / `CursorInvalid`,
+        // §87.7); a miss here means a section was dropped when the registry
+        // was transcribed.
+        assert_eq!(KipErrorCode::ALL.len(), 77);
         let mut names: Vec<&str> = KipErrorCode::ALL.iter().map(|c| c.name()).collect();
         names.sort_unstable();
         let unique = names.len();

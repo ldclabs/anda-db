@@ -22,12 +22,14 @@ claim writes a new Assertion and a supersession link, not a rewritten row.
   handles, preconditions, receipts and dry runs;
 - **KQL**: element, tuple and structural patterns, hop-quantified traversal,
   `FILTER`, `NOT` / `OPTIONAL` / `UNION`, aggregates, paging, and two time axes
-  kept apart: `FOR TIME` (what was true then) and `AS OF` (what this Brain held
-  then, reconstructed from the version log rather than approximated);
+  kept apart: `FOR TIME` (what was true then) and `AS OF SEQ` (what this Brain
+  held then, reconstructed from the version log rather than approximated);
 - the **Epistemic Projection** behind `BELIEF`, under a named versioned policy:
   silence is `insufficient`, not `rejected`, and repetition is not corroboration;
-- **META** — `DESCRIBE`, `LIST`, `SEARCH`, `VALIDATE`, `PREVIEW`, `HISTORY`,
-  `CHANGES`, `SNAPSHOT` — plus Capsule export and verification;
+- **META** — `DESCRIBE` (including `DESCRIBE SNAPSHOT`, which resolves a
+  timestamp to the coordinate an `AS OF SEQ` read can use), `LIST`, `SEARCH`,
+  `VALIDATE`, `PREVIEW`, `HISTORY`, `CHANGES` — plus Capsule export and
+  verification;
 - **Governance** in a separate control plane — Principals, Grants, Delegations,
   versioned Policies, approvals, audit — authorizing every command and every
   element it touches under default deny, and reachable from no KML clause;
@@ -50,7 +52,7 @@ by triggering an error — or, worse, reading an absent feature as an absent fac
 Gaps are refused as `UnsupportedCapability` rather than answered wrongly: atomic
 batches; idempotency keys, recorded but not replayed, so a resend re-executes;
 grouped aggregation; `STRUCTURAL` over Core reference fields; semantic and hybrid
-`SEARCH`, and `SEARCH … AS OF`; Capsule signatures; Space-level retention
+`SEARCH`, and `SEARCH … AS OF SEQ`; Capsule signatures; Space-level retention
 defaults. There is no trust model and no evidence-quality evaluation either, so
 every corroboration group counts equally — and every projection says so.
 

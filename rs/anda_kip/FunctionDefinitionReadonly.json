@@ -1,12 +1,12 @@
 {
   "name": "execute_kip_readonly",
-  "description": "Executes read-only KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Accepts KQL (FIND) and META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). State-changing KML is rejected here regardless of how it is labelled. Ground before you read precisely: SEARCH finds candidates, then read them by exact id. A SEARCH miss is not evidence of absence, and a SEARCH score is not confidence.",
+  "description": "Executes read-only KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Accepts KQL (FIND) and META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / EXPORT CAPSULE). State-changing KML is rejected here regardless of how it is labelled. Ground before you read precisely: SEARCH finds candidates, then read them by exact id. A SEARCH miss is not evidence of absence, and a SEARCH score is not confidence.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "A single complete read-only KIP 2.0 command (FIND / DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). Mutually exclusive with operations."
+        "description": "A single complete read-only KIP 2.0 command (FIND / DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / EXPORT CAPSULE). Mutually exclusive with operations."
       },
       "operations": {
         "type": "array",

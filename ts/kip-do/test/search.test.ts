@@ -184,7 +184,7 @@ describe('SEARCH', () => {
       ).toHaveLength(1)
 
       // Archiving leaves ordinary recall, and SEARCH is ordinary recall.
-      nexus.execute(`ARCHIVE "${id}"`)
+      nexus.execute(`TRANSITION "${id}" TO "archived"`)
       expect(
         (nexus.describe('SEARCH CONCEPT "Dana"') as unknown as Answer).hits,
       ).toHaveLength(0)

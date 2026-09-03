@@ -251,9 +251,25 @@ pub struct PredicateDef {
     /// Whether absence of a claim means unknown rather than false (§51).
     #[serde(default = "yes")]
     pub open_world: bool,
-    /// Whether the recorded set is claimed to be exhaustive.
+    /// Whether the candidate objects of a functional slot are exclusive:
+    /// accepting one rejects the others (§20.15, §25).
+    ///
+    /// Declaratory here: this engine's conflict-set expansion already reads a
+    /// functional slot's rivals as opposing one another, which is the
+    /// exclusive reading, so `complete` adds nothing to the projection beyond
+    /// what `functional` already does. It is carried so `DESCRIBE PREDICATE`
+    /// reports what the package declared.
     #[serde(default)]
     pub complete: bool,
+    /// For a boolean-valued Predicate, whether object `false` is the negation
+    /// of object `true` (§12.7, §20.15): support for one then opposes the
+    /// other. `false` keeps them structurally distinct claims.
+    #[serde(default)]
+    pub boolean_completeness: bool,
+    /// When two accepted values conflict on time (§20.15, §25.2):
+    /// `overlapping_valid_time` (the default) or `none`.
+    #[serde(default = "overlapping_valid_time")]
+    pub temporal_conflict: String,
     /// Groups of object values that cannot hold together for one subject
     /// (§25.1, §12.7).
     ///
@@ -272,6 +288,11 @@ pub struct PredicateDef {
     pub extra: Map<String, Json>,
 }
 
+/// The default `temporal_conflict` (§20.15).
+fn overlapping_valid_time() -> String {
+    "overlapping_valid_time".to_string()
+}
+
 /// What may occupy one end of a Proposition or structural edge.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct EndpointSpec {
@@ -281,9 +302,21 @@ pub struct EndpointSpec {
     /// Permitted Core element kinds, e.g. `Concept`, `Assertion`.
     #[serde(default)]
     pub kinds: Vec<String>,
-    /// Permitted Literal datatypes, when a Literal is allowed (§44).
+    /// Permitted Literal datatypes, in §20.15's spelling.
+    #[serde(default)]
+    pub literal_types: Vec<String>,
+    /// Permitted Literal datatypes, in the spelling earlier drafts used; the
+    /// same declaration as `literal_types`.
     #[serde(default)]
     pub datatypes: Vec<String>,
+    /// Whether `null` is a permitted object (§9.5, §20.15).
+    #[serde(default)]
+    pub nullable: bool,
+    /// The shape a string Literal must take — `timestamp`, `uri`, or a
+    /// package-defined name — validated on write and never part of identity
+    /// (§9.2, §20.15). Empty for none.
+    #[serde(default)]
+    pub format: String,
     /// Anything else.
     #[serde(flatten)]
     pub extra: Map<String, Json>,
@@ -292,7 +325,28 @@ pub struct EndpointSpec {
 impl EndpointSpec {
     /// Whether this endpoint declares no restriction at all.
     pub fn is_unconstrained(&self) -> bool {
-        self.concept_types.is_empty() && self.kinds.is_empty() && self.datatypes.is_empty()
+        self.concept_types.is_empty()
+            && self.kinds.is_empty()
+            && self.literal_datatypes().is_empty()
+            && self.format.is_empty()
+    }
+
+    /// The Literal datatypes this end admits, in the baseline spelling
+    /// (§9.2): `literal_types` and `datatypes` are one declaration, and
+    /// `nullable` adds `null` to it.
+    pub fn literal_datatypes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .literal_types
+            .iter()
+            .chain(self.datatypes.iter())
+            .map(|name| crate::term::normalize_datatype(name))
+            .collect();
+        if self.nullable && !out.iter().any(|name| name == crate::term::DT_NULL) {
+            out.push(crate::term::DT_NULL.to_string());
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 }
 

@@ -19,12 +19,20 @@ export {
   PAYLOAD_PURGED,
   State,
   TABLES,
+  bumpPlane,
+  changeEntryOf,
   classificationOf,
+  emptyPlanes,
   erasePayload,
+  planeCounter,
+  planesFromJson,
+  planesToJson,
   schemaRefOf,
+  symbolLocalName,
   type ActivityRow,
   type AssertionRow,
   type ChangeEntry,
+  type ChangeOp,
   type ConceptRow,
   type Element,
   type ElementRow,
@@ -33,11 +41,14 @@ export {
   type Envelope,
   type EvidenceRef,
   type EvidenceRow,
+  type PlaneKey,
+  type PlaneVersions,
   type PropositionRow,
   type SchemaEnvRow,
   type SchemaPackageRow,
   type SpaceRow,
   type TransactionRow,
+  type WirePlaneVersions,
 } from './rows.js'
 
 export {
@@ -63,7 +74,8 @@ export {
   asConcept,
   asEvidence,
   asProposition,
-  type ChangeOp,
+  wireOp,
+  type ChangeVerb,
 } from './store.js'
 
 export {

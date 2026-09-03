@@ -42,7 +42,10 @@ describe('the Durable Object', () => {
     const body = (await response.json()) as KipResponse
     expect(body.kip).toBe('2.0')
     expect(body.results[0]?.status).toBe('succeeded')
-    expect(body.receipt?.status).toBe('committed')
+    // §75: the operation's own Receipt; the top-level slot exists only in
+    // atomic mode, which this engine has no.
+    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.receipt).toBeUndefined()
   })
 
   it('runs each language through the surface it belongs to', async () => {
@@ -56,7 +59,8 @@ describe('the Durable Object', () => {
     )
     const body = (await response.json()) as KipResponse
     expect(body.results[0]?.status).toBe('succeeded')
-    expect(body.receipt?.status).toBe('committed')
+    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.results[1]?.receipt).toBeUndefined()
     expect(body.results[1]?.result).toEqual(['Alice'])
     expect((body.results[2]?.result as { kip: string }).kip).toBe('2.0')
   })
@@ -106,7 +110,7 @@ describe('the Durable Object', () => {
     expect(response.status).toBe(207)
     const body = (await response.json()) as KipResponse
     expect(body.results[0]?.status).toBe('succeeded')
-    expect(body.receipt?.status).toBe('committed')
+    expect(body.results[0]?.receipt?.status).toBe('committed')
     expect(body.results[1]?.error?.code).toBe('SchemaSymbolNotFound')
   })
 
@@ -263,10 +267,10 @@ describe('a host that authenticates its callers', () => {
     expect(body.results[0]?.op_id).toBe('op-1')
     expect(body.results[0]?.status).toBe('succeeded')
     expect(body.context?.space_id).toBe('kip:space:default')
-    // §81 puts one receipt on the envelope, and the schema closes an operation
-    // result to the fields it names — so the per-operation detail is namespaced.
-    expect(body.receipt?.status).toBe('committed')
-    expect(body.receipt?.transaction_class).toBe('cognitive')
+    // §75: every state-changing operation carries its own Receipt, in the
+    // shape §33.2 fixes; the rest of the outcome is namespaced.
+    expect(body.results[0]?.receipt?.status).toBe('committed')
+    expect(body.results[0]?.receipt?.transaction_class).toBe('cognitive')
     expect(
       body.results[0]?.extensions?.['kip-do/outcome']?.handles,
     ).toBeDefined()

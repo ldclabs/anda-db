@@ -144,7 +144,7 @@ pub async fn merge(
             // until somebody releases them.
             *element.state_mut() = crate::store::rows::state::QUARANTINED.to_string();
         }
-        tx.stage_new(id, element, "import");
+        tx.stage_new(id, element, anda_kip::ChangeOp::Create);
         *counts.entry(record.kind.to_string()).or_default() += 1;
     }
 
@@ -321,7 +321,12 @@ async fn resolve_tuple(
     ) else {
         return Ok(None);
     };
-    let predicate = text(view, "predicate_ref");
+    // §12.3, §20.14: tuple identity compares the predicate's *lineage*, which
+    // is what `build` writes into `tuple_key`. Looking the tuple up under the
+    // exact reference instead would miss the Proposition this Space already
+    // holds, and the miss would surface as a unique-index collision on insert
+    // rather than as a resolution.
+    let predicate = crate::schema::lineage_of(&text(view, "predicate_ref"));
     let key = tuple_key(space_id, &subject, &predicate, &object);
     Ok(store
         .find_proposition(&key)
@@ -380,7 +385,15 @@ fn build(
                 predicate_ref: predicate_ref.clone(),
                 object: object.to_json(),
                 object_key: object.key(),
-                tuple_key: tuple_key(space_id, &subject, &predicate_ref, &object),
+                // §12.3, §20.14: tuple identity compares the predicate's
+                // lineage, so an import under a later package version
+                // resolves onto the tuple the Space already holds.
+                tuple_key: tuple_key(
+                    space_id,
+                    &subject,
+                    &crate::schema::lineage_of(&predicate_ref),
+                    &object,
+                ),
                 facets,
                 structural,
                 expires_at,

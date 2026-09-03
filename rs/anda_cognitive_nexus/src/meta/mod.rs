@@ -35,6 +35,7 @@ pub mod inspect;
 
 use anda_kip::{
     Json, KipError, Map, MetaCommand, Operation, Request, Response, ResponseContext, ResultContext,
+    Warning,
 };
 
 use crate::governance::{AuthContext, EffectiveAuthority};
@@ -69,6 +70,7 @@ pub async fn execute(
         Ok(Answer {
             result,
             next_cursor,
+            warnings,
         }) => Response {
             context: Some(ResponseContext {
                 space_id: Some(space.to_string()),
@@ -84,6 +86,7 @@ pub async fn execute(
                     ..Default::default()
                 }),
                 next_cursor,
+                warnings,
                 ..anda_kip::OperationResult::ok(result)
             }],
             ..Default::default()
@@ -129,6 +132,8 @@ pub struct Answer {
     pub result: Json,
     /// The cursor for the next page, when more remain.
     pub next_cursor: Option<String>,
+    /// Non-fatal caveats about the answer, carried on the operation result.
+    pub warnings: Vec<Warning>,
 }
 
 impl Answer {
@@ -137,6 +142,7 @@ impl Answer {
         Self {
             result,
             next_cursor: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -159,7 +165,6 @@ async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<
         MetaCommand::Verify { target, value } => inspect::verify(cx, *target, value),
         MetaCommand::History(history) => history::history(cx, history).await,
         MetaCommand::Changes(changes) => history::changes(cx, changes).await,
-        MetaCommand::Snapshot { as_of } => history::snapshot(cx, as_of.as_ref()).await,
         MetaCommand::ExportCapsule(command) => inspect::export_capsule(cx, command).await,
     }
 }
@@ -184,14 +189,38 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
     let capabilities = anda_kip::Capabilities {
         profiles: CONFORMANCE_PROFILES.to_vec(),
         supported: as_map(serde_json::json!({
+            // §67.4: the registry names a `requires` block may ask about,
+            // each with its value. Reported beside the engine's own names —
+            // which stay, because clients read them — rather than instead
+            // of them.
+            "registry": registry_json(),
             "kml": [
                 "CREATE CONCEPT", "UPSERT CONCEPT", "ENSURE PROPOSITION",
                 "CREATE EVIDENCE", "CREATE ASSERTION", "CREATE ACTIVITY",
-                "ASSERT (desugared)", "UPDATE", "RETRACT ASSERTION",
-                "SUPERSEDE ASSERTION", "CORRECT EVIDENCE", "TRANSITION ACTIVITY",
-                "SET RETENTION", "ARCHIVE", "TOMBSTONE", "PURGE", "PURGE PAYLOAD",
-                "MERGE CONCEPT", "WHERE selection blocks", "LIMIT"
+                "ASSERT (desugared)", "UPDATE", "TRANSITION", "SET RETENTION",
+                "PURGE", "PURGE PAYLOAD", "MERGE CONCEPT", "WHERE selection blocks",
+                "LIMIT", "EXPECT VERSION [OF plane]"
             ],
+            // §52.5: one lifecycle statement, and what it moves.
+            "transition": {
+                "states": anda_kip::transition_state::ALL,
+                "by": anda_kip::transition_state::WITH_BY,
+                "finalizing": anda_kip::transition_state::ACTIVITY,
+                "same_state": "no_effect",
+                "illegal_move": "InvalidLifecycleTransition with details {from, to}",
+                "terminal_activity": "ActivityTerminal"
+            },
+            // §6.3, §35.1: the version planes a guard may name, and the rule
+            // each counter advances by.
+            "version_planes": {
+                "planes": ["attributes", "structural", "retention", "facets.<Symbol>"],
+                "advances": "a plane counter moves once per committed transaction that \
+                             changed that plane; _system.version moves on every change",
+                "creation": "a new element starts every plane it carries content in at 1 \
+                             and every other plane at 0",
+                "guard": "EXPECT VERSION n OF <plane> compares the plane counter; the bare \
+                          guard compares _system.version, and only the bare 0 is create-only"
+            },
             // §11: identity consolidation is non-destructive, and the three
             // rules that make it so are stated because a caller who assumed
             // any of them backwards would read a forwarded write as a lost one.
@@ -218,7 +247,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "STRUCTURAL", "BELIEF", "BELIEF SLOT", "FILTER", "NOT",
                 "OPTIONAL", "UNION", "ORDER BY", "LIMIT", "CURSOR", "FOR TIME",
                 "WITH EPISTEMIC", "aggregates", "predicate alternation",
-                "hop quantifiers", "AS OF SEQ | TX | TIME"
+                "hop quantifiers", "AS OF SEQ", "canonical matching through merged_into",
+                "?p.canonical_subject / ?p.canonical_object"
             ],
             "epistemic": {
                 // §49's settings, honored rather than parsed and dropped.
@@ -242,7 +272,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
             "meta": [
                 "DESCRIBE", "LIST", "LIST DEPENDENTS", "SEARCH", "VALIDATE",
                 "PREVIEW KML", "PREVIEW IMPORT CAPSULE", "HISTORY", "CHANGES",
-                "SNAPSHOT", "EXPORT CAPSULE", "VERIFY CAPSULE", "DESCRIBE CAPSULE"
+                "DESCRIBE SNAPSHOT [AS OF SEQ | AT TIME]", "EXPORT CAPSULE",
+                "VERIFY CAPSULE", "DESCRIBE CAPSULE"
             ],
             // §63.5: what this engine actually traverses, stated because the
             // Structural-Field extension is optional and an Agent that assumed
@@ -253,6 +284,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "default_depth": 1,
                 "max_depth": describe::MAX_DEPENDENTS_DEPTH,
                 "row": ["id", "kind", "distance", "via.activity"],
+                "truncated": "a coded `truncated` warning on the result when an element the \
+                              caller may not discover cut the traversal (§63.5)",
                 "note": "a transformation that recorded no Activity provenance is not \
                          discoverable here"
             },
@@ -268,7 +301,16 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                     "transaction_class", "snapshot_seq", "status",
                     "schema_environment_version", "changes"
                 ],
-                "change": ["id", "kind", "op", "version"],
+                "change": [
+                    "op", "kind", "id", "schema_ref", "old_version", "new_version",
+                    "state", "refs", "touched", "planes"
+                ],
+                "ops": ["create", "update", "lifecycle", "retention", "merge", "purge",
+                        "payload_purge"],
+                "touched": "changed paths, names only: attributes.<name>, fields.<name>, \
+                            facets.<Symbol>, structural.<field>, retention, governance.<member>",
+                "planes": "the element's complete plane counters after the commit, on every \
+                           entry that moved a plane",
                 "deduplicate_by": "space_id + space_seq + tx_id",
                 "shared_by": ["HISTORY ELEMENT", "HISTORY SPACE", "CHANGES"],
                 // The cursor is the coordinate the page consumed, issued
@@ -281,7 +323,10 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
                 // traversal began at, and belongs to the family that issued it.
                 "cursor": "opaque token, snapshot-pinned, per operation family",
-                "families": ["find", "search", "list", "history"]
+                "families": ["kql", "search", "list", "history", "changes"],
+                "refusals": "CursorInvalid {family, reason: malformed} for a token this engine \
+                             did not issue for this Space and family; a bound of the wrong type \
+                             is TypeMismatch"
             },
             "structural": {
                 // §8.2 and §17: the pattern reads both planes. A Profile field
@@ -340,11 +385,23 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "identity_resolution": ["prior import", "canonical_id", "proposition tuple"]
             },
             "execution_modes": ["independent", "sequence"],
+            // §33.2, §75: where a Receipt sits and what it carries.
+            "receipts": {
+                "location": "results[].receipt for every state-changing operation; the \
+                             top-level receipt is reserved for atomic execution",
+                "no_effect": "carries no space_seq",
+                "receipt_digest": "sha3-256 over RFC 8785 canonical JSON of the Receipt \
+                                   without receipt_digest, proofs and extensions",
+                "origin": ["principal_id", "actor_binding_id", "delegation_digest"],
+                "on_error_default": "stop; the operations not started are reported skipped"
+            },
             "historical_read": {
                 // Every commit appends the row it wrote, so a past coordinate
                 // is reconstructed rather than approximated.
                 "retention": "unbounded: every element version is kept",
-                "coordinates": ["SEQ", "TX", "TIME"],
+                "coordinates": ["SEQ"],
+                "resolution": "a transaction id resolves through DESCRIBE TRANSACTION, an \
+                               instant through DESCRIBE SNAPSHOT AT TIME",
                 "snapshot_token": true,
                 // The indexes describe the present, so a historical pattern
                 // reconstructs its candidates from the version log.
@@ -413,14 +470,32 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                                       does not block a replay, because the approval \
                                       authorized work that already happened"
                 },
-                "preconditions": ["EXPECT VERSION", "EXPECT STATE"],
+                "preconditions": ["EXPECT VERSION", "EXPECT VERSION OF <plane>"],
                 "dry_run": true
             },
+            // §21.10, §27.2: the projection capability, folded in here from
+            // the statement that used to answer it on its own.
             "projection": {
                 "policies": ["kip:policy:baseline", "kip:policy:forecast"],
+                "statuses": ["accepted", "rejected", "contested", "uncertain", "insufficient"],
+                "leading": ["support", "opposition", "none"],
+                "score_semantics": "normalized_support_not_probability",
+                "baseline": "structural: every eligible corroboration group counts equally",
+                "weighted": false,
                 "explanation": true,
                 "conflict_set_expansion": true,
-                "corroboration_grouping": true
+                "corroboration_grouping": true,
+                "implemented_stages": [
+                    // Not a stage the projection performs so much as one it
+                    // inherits: every Assertion it reads comes through the
+                    // same authorization gate every other read does, so a
+                    // claim the caller may not see contributes nothing.
+                    "governance_visibility",
+                    "semantic_grounding", "conflict_set_expansion", "lifecycle_eligibility",
+                    "temporal_eligibility", "mode_eligibility", "corroboration_grouping",
+                    "aggregation", "classification", "explanation"
+                ],
+                "missing_stages": ["trust_evaluation", "evidence_quality"]
             },
             "governance": {
                 // What is enforced, stated as what it is rather than as a
@@ -455,9 +530,13 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                                is narrower than the Space",
                     "writes": "every mutation target is authorized individually, and a sweep \
                                that reaches one it may not touch fails rather than doing less",
-                    "protected_fields": "`governance` is refused by the protocol's parser; \
-                                         `retention` needs manage_retention wherever it is \
-                                         written",
+                    "protected_fields": "`governance` is refused by the protocol's parser, \
+                                         `authority_class` and `classification` as \
+                                         ProtectedGovernanceField; `retention` needs \
+                                         manage_retention wherever it is written, and its \
+                                         legal_hold manage_legal_hold",
+                    "record_outcome": "outcome-class Evidence and outcome_observation \
+                                       Activities need record_outcome, by KML and by ingest",
                     "attribution": "which epistemic permission a new Assertion needs is \
                                     decided by the writer's ActorBinding, not by the command",
                     "retraction": "recorded only by the Principal that wrote the Assertion or \
@@ -505,7 +584,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 },
                 {
                 "capability": "unregistered_permissions",
-                "detail": "derive, share, manage_trust",
+                "detail": "derive, share, manage_trust, approve",
                 "reason": "§29.6 requires a runtime that does not distinguish derived writes to \
                            refuse `derive` where a Grant names it, and the same reasoning covers \
                            the other two: a permission that is accepted and gates nothing is \
@@ -660,14 +739,75 @@ fn as_map(value: Json) -> Map<String, Json> {
 
 /// Whether this engine implements one named capability, for `requires` (§67).
 ///
-/// `None` means the name is not one this engine knows. A fail-fast check that
-/// passes because nobody recognized the requirement is worse than no check at
-/// all, because the caller believes it ran.
+/// `None` means the name is not one this engine knows — neither the §67.4
+/// registry nor a name this engine reports. A fail-fast check that passes
+/// because nobody recognized the requirement is worse than no check at all,
+/// because the caller believes it ran.
 pub fn capability_state(name: &str) -> Option<bool> {
+    if let Some((_, supported, _)) = REGISTRY.iter().find(|(entry, _, _)| *entry == name) {
+        return Some(*supported);
+    }
     if UNSUPPORTED_NAMES.contains(&name) {
         return Some(false);
     }
     SUPPORTED_NAMES.contains(&name).then_some(true)
+}
+
+/// The §67.4 capability registry, as this engine answers it.
+///
+/// Name, whether it is supported, and the value `DESCRIBE CAPABILITIES`
+/// reports — the boolean itself unless the registry gives the entry a richer
+/// value. A runtime MUST NOT rename these.
+const REGISTRY: &[(&str, bool, Option<&str>)] = &[
+    // §32.2: mutations serialize behind one write lock that readers share.
+    ("serializable_isolation", true, None),
+    // §34.5: every journalled transaction is kept, so a key never expires.
+    (
+        "idempotency_retention",
+        true,
+        Some(r#"{"unbounded": true}"#),
+    ),
+    ("historical_reads", true, None),
+    ("historical_search", false, None),
+    ("semantic_search", false, None),
+    ("hybrid_search", false, None),
+    // §66.5: the keyword index is written by the committing transaction.
+    (
+        "search_index_freshness",
+        true,
+        Some(r#"{"mode": "synchronous"}"#),
+    ),
+    ("belief_slot", true, None),
+    // §21.10: the structural baseline; no trust-weighted policy.
+    ("weighted_projection", false, None),
+    ("materialized_projection", false, None),
+    ("signed_receipts", false, None),
+    ("ingestion_context", true, None),
+    ("streaming", false, None),
+    ("artifacts", false, None),
+    ("change_stream", true, None),
+    ("filtered_delivery", false, None),
+    ("watch_evaluation", false, None),
+    ("list_dependents", true, None),
+    ("payload_purge", true, None),
+    ("capsule_export", true, None),
+    ("capsule_import", true, None),
+    ("capsule_signatures", false, None),
+    ("derive_permission", false, None),
+    ("record_outcome_permission", true, None),
+];
+
+/// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4).
+fn registry_json() -> Json {
+    let mut out = Map::new();
+    for (name, supported, value) in REGISTRY {
+        let value = match value {
+            Some(text) => serde_json::from_str(text).unwrap_or(Json::Bool(*supported)),
+            None => Json::Bool(*supported),
+        };
+        out.insert((*name).to_string(), value);
+    }
+    Json::Object(out)
 }
 
 /// The capability names `requires` may ask about and get `true` for.
@@ -766,6 +906,40 @@ mod tests {
         // check that passed because nobody recognized it is the failure mode
         // this exists to prevent.
         assert_eq!(capability_state("read_everything"), None);
+    }
+
+    /// The §67.4 registry and the engine's own names agree about every gap
+    /// both of them name, and every registry entry is answerable.
+    #[test]
+    fn the_registry_agrees_with_the_local_names() {
+        for (name, supported, _) in REGISTRY {
+            assert_eq!(capability_state(name), Some(*supported), "{name}");
+            if UNSUPPORTED_NAMES.contains(name) {
+                assert!(
+                    !supported,
+                    "{name} is disclaimed locally and claimed by the registry"
+                );
+            }
+            if SUPPORTED_NAMES.contains(name) {
+                assert!(
+                    supported,
+                    "{name} is claimed locally and disclaimed by the registry"
+                );
+            }
+        }
+        let declared = capabilities(None, &AuthContext::system());
+        for (name, _, _) in REGISTRY {
+            assert!(
+                declared["supported"]["registry"].get(name).is_some(),
+                "{name} is not reported"
+            );
+        }
+        assert_eq!(
+            declared["supported"]["registry"]["weighted_projection"],
+            false
+        );
+        assert_eq!(declared["supported"]["registry"]["belief_slot"], true);
+        assert!(declared["supported"]["projection"]["missing_stages"].is_array());
     }
 
     /// The prose gap list and the `requires` registry name the same gaps.

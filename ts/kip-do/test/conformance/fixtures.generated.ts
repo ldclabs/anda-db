@@ -43,7 +43,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "consequence",
     "description": "The consequence channel: what the world did after the Brain acted, and what a Skill's standing is spent from. Outcome Evidence (Spec §15.7) carries an OutcomeRecord Facet — the graded index over an untouched payload — and cognition subscribes to a stream by task family rather than by reference. What an engine owes here is the Profile's schema discipline: the scoring handle a Skill cannot be compiled without, the four lifecycle states, a graded index its subject cannot rewrite, and the one guarded statement (Appendix F.6) a lifecycle verdict executes as. The verdict rule itself is Brain policy; that it lands as one recomputable transition is not.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      task_family: \"deploy/pre-flight\",\n      summary: \"Dry-run the migration before the deploy\",\n      procedure: \"1. dry-run the migration 2. deploy 3. verify\",\n      status: \"proposed\"\n    }\n    SET FACET \"SkillUtility\" {utility: 0.5}\n  }\n}",
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      task_family: \"deploy/pre-flight\",\n      summary: \"Dry-run the migration before the deploy\",\n      procedure: \"1. dry-run the migration 2. deploy 3. verify\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n  }\n}",
       "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
     ],
     "cases": [
@@ -122,12 +122,12 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a lifecycle move is one guarded statement: the verdict Activity and the transition commit together",
-        "command": "MUTATE {\n  CREATE ACTIVITY ?verdict {\n    SET FIELDS {\n      activity_class: \"lifecycle_verdict\",\n      status: \"completed\",\n      parameters_digest: \"sha3-256:ru1e\"\n    }\n    SET STRUCTURAL {\n      (\"inputs\", \"E-1\")\n      (\"inputs\", \"E-2\")\n      (\"outputs\", \"C-1\")\n    }\n  }\n  UPDATE \"C-1\"\n  EXPECT VERSION 1\n  SET ATTRIBUTES {status: \"trialed\"}\n  SET FACET \"SkillUtility\" {success_count: 1, failure_count: 1, graded_count: 2}\n}",
+        "command": "MUTATE {\n  CREATE ACTIVITY ?verdict {\n    SET FIELDS {\n      activity_class: \"lifecycle_verdict\",\n      status: \"completed\",\n      parameters_digest: \"sha3-256:ru1e\"\n    }\n    SET STRUCTURAL {\n      (\"inputs\", \"E-1\")\n      (\"inputs\", \"E-2\")\n      (\"outputs\", \"C-1\")\n    }\n  }\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"trialed\"}\n  SET FACET \"GradingState\" {success_count: 1, failure_count: 1, graded_count: 2}\n  EXPECT VERSION 1\n}",
         "expect": {}
       },
       {
-        "name": "standing is what the verdict moved, and the tallies count graded outcomes",
-        "command": "FIND(?s.attributes.status, ?s.facets[\"SkillUtility\"].graded_count, ?s.facets[\"SkillUtility\"].utility) WHERE { ?s CONCEPT {type: \"Skill\"} }",
+        "name": "standing is what the verdict moved, the tallies count graded outcomes, and the admission bet stays on MnemonicState",
+        "command": "FIND(?s.attributes.status, ?s.facets[\"GradingState\"].graded_count, ?s.facets[\"MnemonicState\"].utility) WHERE { ?s CONCEPT {type: \"Skill\"} }",
         "expect": {
           "result": [
             [
@@ -140,7 +140,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "replaying the same verdict against the version it already consumed is refused",
-        "command": "MUTATE {\n  UPDATE \"C-1\"\n  EXPECT VERSION 1\n  SET ATTRIBUTES {status: \"adopted\"}\n}",
+        "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n  EXPECT VERSION 1\n}",
         "expect": {
           "error": "VersionConflict"
         }
@@ -254,7 +254,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "and the tallies belong on the Skill, not on the outcome that moved them",
-        "command": "MUTATE {\n  UPDATE \"E-1\"\n  SET FACET \"SkillUtility\" {utility: 1.0}\n}",
+        "command": "MUTATE {\n  UPDATE \"E-1\"\n  SET FACET \"GradingState\" {graded_count: 1}\n}",
         "expect": {
           "error": "ConstraintViolation"
         }
@@ -919,13 +919,13 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "content claiming an authority class has an ordinary attribute and nothing more",
-        "command": "FIND(?c.attributes.authority, ?c.governance.max_influence_authority) WHERE { ?c CONCEPT {name: \"Administrator\"} }",
+        "name": "content claiming an authority class has an ordinary attribute; Governance reports descriptive, the class every element has until Governance raises it",
+        "command": "FIND(?c.attributes.authority, ?c.governance.authority_class) WHERE { ?c CONCEPT {name: \"Administrator\"} }",
         "expect": {
           "result": [
             [
               "executable",
-              null
+              "descriptive"
             ]
           ]
         }
@@ -995,7 +995,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "history",
-    "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point. And the chronology itself is reported in transition envelopes (§36.1): §68.1 defines HISTORY as transition chronology and §36.2 defines a transition as one envelope, so HISTORY ELEMENT, HISTORY SPACE and CHANGES are the same unit asked for over different ranges — which is what lets a consumer deduplicate on space_id + space_seq + tx_id (§36.3).",
+    "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point. And the chronology itself is reported in transition envelopes (§36.1): §68.1 defines HISTORY as transition chronology and §36.2 defines a transition as one envelope, so HISTORY ELEMENT, HISTORY SPACE and CHANGES are the same unit asked for over different ranges — which is what lets a consumer deduplicate on space_id + space_seq + tx_id (§36.3). Each entry of `changes` is the normative shape of schemas/kip-change-envelope.schema.json: op, kind, id, new_version, old_version where the element existed, state {from, to} for a lifecycle move, refs.proposition on an Assertion entry — names and versions, never values.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
@@ -1014,7 +1014,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "retracting it changes the present",
-        "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} }",
+        "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
         "expect": {}
       },
       {
@@ -1046,14 +1046,14 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a coordinate the Space has not reached is refused, never rounded to the present",
-        "command": "SNAPSHOT AS OF SEQ 9999",
+        "command": "DESCRIBE SNAPSHOT AS OF SEQ 9999",
         "expect": {
           "error": "HistoricalSnapshotUnavailable"
         }
       },
       {
         "name": "an unknown transaction names no coordinate",
-        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {} } AS OF TX \"kip:space:default#9999\"",
+        "command": "DESCRIBE TRANSACTION \"kip:space:default#9999\"",
         "expect": {
           "error": "TransactionUnknown"
         }
@@ -1073,10 +1073,13 @@ export const FIXTURES: readonly Fixture[] = [
               "schema_environment_version": 1,
               "changes": [
                 {
-                  "id": "A:<1>",
-                  "kind": "assertion",
                   "op": "create",
-                  "version": 1
+                  "kind": "assertion",
+                  "id": "A:<1>",
+                  "new_version": 1,
+                  "refs": {
+                    "proposition": "P:<2>"
+                  }
                 }
               ]
             },
@@ -1089,10 +1092,22 @@ export const FIXTURES: readonly Fixture[] = [
               "schema_environment_version": 1,
               "changes": [
                 {
-                  "id": "A:<1>",
+                  "op": "lifecycle",
                   "kind": "assertion",
-                  "op": "retract",
-                  "version": 2
+                  "id": "A:<1>",
+                  "old_version": 1,
+                  "new_version": 2,
+                  "state": {
+                    "from": "active",
+                    "to": "retracted"
+                  },
+                  "refs": {
+                    "proposition": "P:<2>"
+                  },
+                  "touched": [
+                    "fields.retracted_at",
+                    "fields.status"
+                  ]
                 }
               ]
             }
@@ -1114,10 +1129,22 @@ export const FIXTURES: readonly Fixture[] = [
               "schema_environment_version": 1,
               "changes": [
                 {
-                  "id": "A:<1>",
+                  "op": "lifecycle",
                   "kind": "assertion",
-                  "op": "retract",
-                  "version": 2
+                  "id": "A:<1>",
+                  "old_version": 1,
+                  "new_version": 2,
+                  "state": {
+                    "from": "active",
+                    "to": "retracted"
+                  },
+                  "refs": {
+                    "proposition": "P:<2>"
+                  },
+                  "touched": [
+                    "fields.retracted_at",
+                    "fields.status"
+                  ]
                 }
               ]
             }
@@ -1139,10 +1166,22 @@ export const FIXTURES: readonly Fixture[] = [
               "schema_environment_version": 1,
               "changes": [
                 {
-                  "id": "A:<1>",
+                  "op": "lifecycle",
                   "kind": "assertion",
-                  "op": "retract",
-                  "version": 2
+                  "id": "A:<1>",
+                  "old_version": 1,
+                  "new_version": 2,
+                  "state": {
+                    "from": "active",
+                    "to": "retracted"
+                  },
+                  "refs": {
+                    "proposition": "P:<2>"
+                  },
+                  "touched": [
+                    "fields.retracted_at",
+                    "fields.status"
+                  ]
                 }
               ]
             }
@@ -1409,8 +1448,20 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+              "local_name": "DecisionRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
               "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
               "local_name": "DerivationState",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+              "local_name": "GradingState",
               "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
@@ -1427,8 +1478,8 @@ export const FIXTURES: readonly Fixture[] = [
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/SkillUtility",
-              "local_name": "SkillUtility",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/TrialState",
+              "local_name": "TrialState",
               "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
@@ -1579,7 +1630,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a selection block reads the state the transaction started from",
-        "command": "MUTATE {\n  CREATE CONCEPT ?fresh { TYPE \"Experience\" NAME \"Fourth\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} }\n  ARCHIVE ?m WHERE { ?m CONCEPT {type: \"Experience\"} }\n}",
+        "command": "MUTATE {\n  CREATE CONCEPT ?fresh { TYPE \"Experience\" NAME \"Fourth\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} }\n  TRANSITION ?m TO \"archived\" WHERE { ?m CONCEPT {type: \"Experience\"} }\n}",
         "expect": {}
       },
       {
@@ -1824,7 +1875,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "request-envelope",
-    "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope.",
+    "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope. `requires` is the third: §67.4 fixes the capability names, so a fail-fast precondition written once must get the same answer from either engine — including for an entry whose value is a detail object rather than a bare `true`, and for a name no registry knows, which fails exactly as an unsupported one does. And an `ingest` block is minted inside the request's transaction, so a request that carries only reads opens no scope to mint into: refused, because minting nothing while answering `succeeded` leaves the caller believing the observation was recorded.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {canonical_id: \"urn:x:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
     ],
@@ -1840,7 +1891,9 @@ export const FIXTURES: readonly Fixture[] = [
                 "evidence_class": "user_statement",
                 "payload": "I prefer   dark mode.",
                 "media_type": "text/plain",
-                "source_actor": "urn:x:alice"
+                "source_actor": {
+                  "id": "C-1"
+                }
               }
             ]
           }
@@ -1913,7 +1966,9 @@ export const FIXTURES: readonly Fixture[] = [
                 "key": "msg",
                 "evidence_class": "user_statement",
                 "payload": "hi",
-                "source_actor": "urn:x:nobody"
+                "source_actor": {
+                  "id": "C-999"
+                }
               }
             ]
           }
@@ -1971,6 +2026,95 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             2
           ]
+        }
+      },
+      {
+        "name": "a source actor is an element reference, never a name: a bare string is refused at the envelope",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Bob\" }",
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "hi",
+                "source_actor": "urn:x:alice"
+              }
+            ]
+          }
+        },
+        "expect": {
+          "error": "InvalidRequestEnvelope"
+        }
+      },
+      {
+        "name": "a supported capability lets the request through",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "requires": {
+            "change_stream": true
+          }
+        },
+        "expect": {
+          "result": [
+            3
+          ]
+        }
+      },
+      {
+        "name": "an entry that carries a detail object still answers as supported",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "requires": {
+            "idempotency_retention": true
+          }
+        },
+        "expect": {
+          "result": [
+            3
+          ]
+        }
+      },
+      {
+        "name": "a capability the engine does not have is refused before the command runs",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "requires": {
+            "semantic_search": true
+          }
+        },
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
+      },
+      {
+        "name": "a name no registry knows fails the same way, never by passing unrecognized",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "requires": {
+            "telepathy": true
+          }
+        },
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
+      },
+      {
+        "name": "an ingest block on a read-only request is refused, never silently dropped",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "I prefer dark mode."
+              }
+            ]
+          }
+        },
+        "expect": {
+          "error": "InvalidRequestEnvelope"
         }
       }
     ]
@@ -2622,7 +2766,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "transactions",
-    "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it, and the two guards ask different questions — EXPECT VERSION about what the caller read, EXPECT STATE about the engine state, which is not an Assertion's epistemic status.",
+    "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it. EXPECT VERSION is the one guard, and it is always the trailing clause (Spec §52.8); there is no EXPECT STATE — TRANSITION validates the target's current lifecycle state itself and fails InvalidLifecycleTransition from the wrong one (§35.3, §52.5), while a move to the state already held is a no_effect rather than an error.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
@@ -2645,7 +2789,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a stale EXPECT VERSION refuses the write",
-        "command": "UPSERT CONCEPT ?p { MATCH {key: \"person:alice\"} EXPECT VERSION 99 SET FIELDS {name: \"Rewritten\"} }",
+        "command": "UPSERT CONCEPT ?p { MATCH {key: \"person:alice\"} SET FIELDS {name: \"Rewritten\"} } EXPECT VERSION 99",
         "expect": {
           "error": "VersionConflict"
         }
@@ -2665,10 +2809,10 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {}
       },
       {
-        "name": "EXPECT STATE on a retraction asks about the claim's standing, and refuses when it does not hold",
-        "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"retracted\"",
+        "name": "TRANSITION validates the move against the target's kind: an Assertion has no Activity state to move to",
+        "command": "TRANSITION ?a TO \"running\" WHERE { ?a ASSERTION {} }",
         "expect": {
-          "error": "PreconditionFailed"
+          "error": "InvalidLifecycleTransition"
         }
       },
       {
@@ -2681,8 +2825,8 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "a guard that holds lets the withdrawal through",
-        "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"active\"",
+        "name": "the assertor's withdrawal is one TRANSITION, legal from active",
+        "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
         "expect": {}
       },
       {
@@ -2695,6 +2839,39 @@ export const FIXTURES: readonly Fixture[] = [
               0.9
             ]
           ]
+        }
+      },
+      {
+        "name": "a move to the state the target already holds is no_effect, not an error",
+        "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
+        "expect": {}
+      },
+      {
+        "name": "and a move that is not legal from retracted is refused",
+        "command": "TRANSITION ?a TO \"superseded\" BY \"A-1\" WHERE { ?a ASSERTION {} }",
+        "expect": {
+          "error": "InvalidLifecycleTransition"
+        }
+      },
+      {
+        "name": "a stale guard on one version plane names the plane it refused",
+        "command": "UPDATE ?c SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} } EXPECT VERSION 99 OF ATTRIBUTES",
+        "expect": {
+          "error": "VersionConflict"
+        }
+      },
+      {
+        "name": "the same guard on two planes is refused as syntax, before anything runs",
+        "command": "UPDATE ?c SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} } EXPECT VERSION 1 OF ATTRIBUTES EXPECT VERSION 1 OF ATTRIBUTES",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "a guard between the target and the actions is not where a mutation keeps its preconditions",
+        "command": "UPDATE ?c EXPECT VERSION 1 SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+        "expect": {
+          "error": "InvalidSyntax"
         }
       }
     ]
@@ -2779,4 +2956,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 224
+export const CASE_COUNT = 235

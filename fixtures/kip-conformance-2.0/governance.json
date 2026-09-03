@@ -20,13 +20,13 @@
       }
     },
     {
-      "name": "content claiming an authority class has an ordinary attribute and nothing more",
-      "command": "FIND(?c.attributes.authority, ?c.governance.max_influence_authority) WHERE { ?c CONCEPT {name: \"Administrator\"} }",
+      "name": "content claiming an authority class has an ordinary attribute; Governance reports descriptive, the class every element has until Governance raises it",
+      "command": "FIND(?c.attributes.authority, ?c.governance.authority_class) WHERE { ?c CONCEPT {name: \"Administrator\"} }",
       "expect": {
         "result": [
           [
             "executable",
-            null
+            "descriptive"
           ]
         ]
       }

@@ -35,8 +35,10 @@ import type {
   PredicateDef,
   StructuralFieldDef,
 } from './package.js'
-import { isUnconstrained } from './package.js'
+import { isUnconstrained, literalTypesOf } from './package.js'
 import type { ElementKind } from '../id.js'
+import type { Endpoint } from '../term.js'
+import { normalizeTime } from '../time.js'
 
 /** How much a violation matters (Spec §98). */
 export type Severity = 'error' | 'warning' | 'info'
@@ -395,7 +397,7 @@ export function checkEndpoint(
   }
   const kinds = spec?.kinds ?? []
   const conceptTypes = spec?.concept_types ?? []
-  const datatypes = spec?.datatypes ?? []
+  const datatypes = literalTypesOf(spec)
 
   switch (facts.kind) {
     case 'unresolved':
@@ -405,7 +407,7 @@ export function checkEndpoint(
         refuse(
           'the schema declares this endpoint an element reference, not a Literal',
         )
-      } else if (!datatypes.includes(facts.datatype)) {
+      } else if (!datatypes.some((name) => sameDatatype(name, facts.datatype))) {
         refuse(
           `a Literal of datatype ${facts.datatype} is not among the declared ` +
             `datatypes: ${datatypes.join(', ')}`,
@@ -457,6 +459,82 @@ export function checkEndpoint(
       return
     }
   }
+}
+
+/**
+ * Whether a declared datatype name and a Literal's datatype symbol agree.
+ *
+ * §9.2 spells the four names bare — `string`, `number`, `boolean`, `null` —
+ * and the engine's datatype symbols carry the `kip:` scheme; a package may
+ * write either.
+ */
+function sameDatatype(declared: string, actual: string): boolean {
+  const strip = (name: string) => (name.startsWith('kip:') ? name.slice(4) : name)
+  return strip(declared) === strip(actual)
+}
+
+/**
+ * Validates a Proposition's object Literal against the Predicate's `nullable`
+ * and `format` declarations (§20.15).
+ *
+ * Both are write-time checks and neither is part of identity: a `null` object
+ * is a semantic Literal only where the Predicate permits it (§9.5), and a
+ * `format` says what shape a string must have — a timestamp, a URI — without
+ * changing which Literal it is. A package-defined format name this engine
+ * does not know is accepted: it cannot be checked, and inventing a failure
+ * would reject data on the strength of a word.
+ */
+export function validatePredicateObjectLiteral(
+  schemaRef: string,
+  def: PredicateDef,
+  object: Endpoint,
+): Validation {
+  const result = new Validation()
+  if (object.kind !== 'literal') return result
+  const spec = def.object
+  const { value } = object.literal
+  if (value === null) {
+    if (spec?.nullable !== true) {
+      result.push(
+        error(
+          'SCHEMA_NULL_NOT_PERMITTED',
+          schemaRef,
+          'object',
+          'the Predicate does not permit a null object (§9.5); represent ' +
+            'unknown state by absence or uncertainty rather than an invented null',
+        ),
+      )
+    }
+    return result
+  }
+  const format = spec?.format
+  if (typeof format !== 'string' || typeof value !== 'string') return result
+  if (format === 'timestamp') {
+    try {
+      normalizeTime(value, 'object')
+    } catch {
+      result.push(
+        error(
+          'SCHEMA_FORMAT_VIOLATION',
+          schemaRef,
+          'object',
+          `the Predicate declares its object a timestamp, and ${JSON.stringify(value)} is not one`,
+        ),
+      )
+    }
+  } else if (format === 'uri') {
+    if (!/^[A-Za-z][A-Za-z0-9+.-]*:\S+$/.test(value)) {
+      result.push(
+        error(
+          'SCHEMA_FORMAT_VIOLATION',
+          schemaRef,
+          'object',
+          `the Predicate declares its object a URI, and ${JSON.stringify(value)} has no scheme`,
+        ),
+      )
+    }
+  }
+  return result
 }
 
 /**

@@ -466,6 +466,7 @@ describe('package validation', () => {
       'validateAttributes',
       'validateAttributeMutability',
       'validateFacetMutability',
+      'validatePredicateObjectLiteral',
       'validateFacetCarrier',
       'validatePredicateEndpoints',
       'validateStructuralEndpoints',

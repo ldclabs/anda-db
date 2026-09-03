@@ -1,5 +1,5 @@
 {
- "source": "@ldclabs/kip-lang 2.1.0 — lower(parse(command).ast)",
+ "source": "@ldclabs/kip-lang 2.2.0 — lower(parse(command).ast)",
  "note": "Regenerate with tests/fixtures/README.md; every entry must decode to the same anda_kip AST.",
  "cases": [
   {
@@ -112,7 +112,7 @@
         "object": {
          "Param": "dark_mode"
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -228,7 +228,7 @@
           "String": "+01:00"
          }
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -286,14 +286,23 @@
        }
       },
       {
-       "SupersedeAssertion": {
+       "Transition": {
         "target": {
          "Param": "old_assertion"
+        },
+        "to": {
+         "Literal": {
+          "String": "superseded"
+         }
         },
         "by": {
          "Handle": "a"
         },
-        "expect_state": null
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
        }
       }
      ]
@@ -318,7 +327,7 @@
         "object": {
          "Param": "dark_mode"
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -582,7 +591,7 @@
    }
   },
   {
-   "command": "UPSERT CONCEPT ?proj {                      // stable identity-bearing Concept\n  MATCH { type: \"Project\", key: \"kip-2\" }   // identity = id/key; name-only upsert is forbidden\n  EXPECT VERSION :v                         // optional; 0 = create-only\n  SET FIELDS { name: \"KIP 2.0\" }\n}",
+   "command": "UPSERT CONCEPT ?proj {                      // stable identity-bearing Concept\n  MATCH { type: \"Project\", key: \"kip-2\" }   // identity = id/key; name-only upsert is forbidden\n  SET FIELDS { name: \"KIP 2.0\" }\n} EXPECT VERSION :v                         // optional trailing guard; 0 = create-only",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
@@ -602,9 +611,14 @@
           }
          }
         },
-        "expect_version": {
-         "Param": "v"
-        },
+        "expect_versions": [
+         {
+          "version": {
+           "Param": "v"
+          },
+          "plane": null
+         }
+        ],
         "set_fields": [
          [
           "name",
@@ -689,7 +703,7 @@
           "String": "+01:00"
          }
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -747,14 +761,23 @@
        }
       },
       {
-       "SupersedeAssertion": {
+       "Transition": {
         "target": {
          "Param": "a_old"
+        },
+        "to": {
+         "Literal": {
+          "String": "superseded"
+         }
         },
         "by": {
          "Handle": "a"
         },
-        "expect_state": null
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
        }
       },
       {
@@ -816,7 +839,7 @@
    }
   },
   {
-   "command": "UPDATE ?m EXPECT VERSION :v\nSET FACET \"MnemonicState\" {\n  memory_strength: CLAMP(MUL(?m.facets[\"MnemonicState\"].memory_strength, :decay), 0, 1)\n}\nWHERE {\n  ?m {type: \"Experience\"}\n  FILTER(?m.facets[\"MnemonicState\"].memory_strength > 0)\n}\nLIMIT :n",
+   "command": "UPDATE ?m\nSET FACET \"MnemonicState\" {\n  memory_strength: CLAMP(MUL(?m.facets[\"MnemonicState\"].memory_strength, :decay), 0, 1)\n}\nWHERE {\n  ?m {type: \"Experience\"}\n  FILTER(?m.facets[\"MnemonicState\"].memory_strength > 0)\n}\nLIMIT :n\nEXPECT VERSION :v OF FACET \"MnemonicState\"",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
@@ -825,9 +848,6 @@
        "Update": {
         "target": {
          "Handle": "m"
-        },
-        "expect_version": {
-         "Param": "v"
         },
         "actions": [
          {
@@ -930,7 +950,19 @@
         ],
         "limit": {
          "Param": "n"
-        }
+        },
+        "expect_versions": [
+         {
+          "version": {
+           "Param": "v"
+          },
+          "plane": {
+           "Facet": {
+            "Name": "MnemonicState"
+           }
+          }
+         }
+        ]
        }
       }
      ]
@@ -948,7 +980,6 @@
         "target": {
          "Param": "concept_id"
         },
-        "expect_version": null,
         "actions": [
          {
           "UnsetAttributes": [
@@ -980,7 +1011,8 @@
          }
         ],
         "where_clauses": null,
-        "limit": null
+        "limit": null,
+        "expect_versions": []
        }
       }
      ]
@@ -1055,7 +1087,7 @@
    }
   },
   {
-   "command": "FIND(?a.confidence, COUNT(DISTINCT ?p)) WHERE { ?p (?s, \"a\"|\"b\"{1,3}, ?o) ?a ASSERTION {proposition: ?p} FILTER(?a.confidence >= 0.5 && !IS_NULL(?s)) NOT { ?x {type: \"Y\"} } OPTIONAL { ?e EVIDENCE {evidence_class: \"message\"} } UNION { ?z {type: \"Z\"} } } AS OF TX :tx FOR TIME :t WITH EPISTEMIC {explain: \"full\", n: [1,:p]} ORDER BY ?a.confidence DESC, ?p LIMIT :l CURSOR :c",
+   "command": "FIND(?a.confidence, COUNT(DISTINCT ?p)) WHERE { ?p (?s, \"a\"|\"b\"{1,3}, ?o) ?a ASSERTION {proposition: ?p} FILTER(?a.confidence >= 0.5 && !IS_NULL(?s)) NOT { ?x {type: \"Y\"} } OPTIONAL { ?e EVIDENCE {evidence_class: \"message\"} } UNION { ?z {type: \"Z\"} } } AS OF SEQ :seq FOR TIME :t WITH EPISTEMIC {explain: \"full\", n: [1,:p]} ORDER BY ?a.confidence DESC, ?p LIMIT :l CURSOR :c",
    "ast": {
     "Kql": {
      "find_clause": {
@@ -1221,8 +1253,8 @@
       }
      ],
      "as_of": {
-      "Tx": {
-       "Param": "tx"
+      "Seq": {
+       "Param": "seq"
       }
      },
      "for_time": {
@@ -1370,7 +1402,7 @@
         "object": {
          "Param": "dark"
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -1476,14 +1508,23 @@
        }
       },
       {
-       "SupersedeAssertion": {
+       "Transition": {
         "target": {
          "Param": "old"
+        },
+        "to": {
+         "Literal": {
+          "String": "superseded"
+         }
         },
         "by": {
          "Handle": "a"
         },
-        "expect_state": null
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
        }
       }
      ]
@@ -1508,7 +1549,7 @@
         "object": {
          "Param": "b"
         },
-        "expect_version": null
+        "expect_versions": []
        }
       },
       {
@@ -1554,7 +1595,7 @@
    }
   },
   {
-   "command": "MUTATE { CREATE CONCEPT ?c { TYPE \"Person\" CLIENT KEY \"k\" NAME \"Alice\" SET FIELDS {a: 1} SET ATTRIBUTES {b: [1,:p]} SET FACET \"F\" {x: 1} SET STRUCTURAL { (\"rel\", ?c) {index: 0} } } UPSERT CONCEPT ?d { MATCH {key: \"kk\"} EXPECT VERSION :v UNSET ATTRIBUTES {a, \"b\"} UNSET FACET \"F\" {x} UNSET STRUCTURAL { (\"rel\", ?c) } } }",
+   "command": "MUTATE { CREATE CONCEPT ?c { TYPE \"Person\" CLIENT KEY \"k\" NAME \"Alice\" SET FIELDS {a: 1} SET ATTRIBUTES {b: [1,:p]} SET FACET \"F\" {x: 1} SET STRUCTURAL { (\"rel\", ?c) {index: 0} } } UPSERT CONCEPT ?d { MATCH {key: \"kk\"} UNSET ATTRIBUTES {a, \"b\"} UNSET FACET \"F\" {x} UNSET STRUCTURAL { (\"rel\", ?c) } } EXPECT VERSION :v }",
    "ast": {
     "Kml": {
      "explicit_transaction": true,
@@ -1648,9 +1689,14 @@
           }
          }
         },
-        "expect_version": {
-         "Param": "v"
-        },
+        "expect_versions": [
+         {
+          "version": {
+           "Param": "v"
+          },
+          "plane": null
+         }
+        ],
         "set_fields": null,
         "set_attributes": null,
         "set_facets": [],
@@ -1696,7 +1742,6 @@
         "target": {
          "Param": "t"
         },
-        "expect_version": null,
         "actions": [
          {
           "SetFacet": {
@@ -1740,7 +1785,8 @@
          }
         ],
         "where_clauses": null,
-        "limit": null
+        "limit": null,
+        "expect_versions": []
        }
       }
      ]
@@ -1748,21 +1794,22 @@
    }
   },
   {
-   "command": "TRANSITION ACTIVITY :act TO \"succeeded\" SET FIELDS {ended_at: :now} SET STRUCTURAL { (\"outputs\", :o) } EXPECT STATE \"running\"",
+   "command": "TRANSITION :act TO \"completed\" SET FIELDS {ended_at: :now} SET STRUCTURAL { (\"outputs\", :o) } EXPECT VERSION 2",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
      "clauses": [
       {
-       "TransitionActivity": {
+       "Transition": {
         "target": {
          "Param": "act"
         },
         "to": {
          "Literal": {
-          "String": "succeeded"
+          "String": "completed"
          }
         },
+        "by": null,
         "set_fields": [
          [
           "ended_at",
@@ -1782,11 +1829,18 @@
           "options": null
          }
         ],
-        "expect_state": {
-         "Literal": {
-          "String": "running"
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 2
+           }
+          },
+          "plane": null
          }
-        }
+        ]
        }
       }
      ]
@@ -1823,6 +1877,7 @@
           "Number": 5
          }
         },
+        "expect_versions": [],
         "reference_policy": {
          "Literal": {
           "String": "detach"
@@ -1863,11 +1918,16 @@
           }
          }
         ],
-        "expect_version": {
-         "Literal": {
-          "Number": 2
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 2
+           }
+          },
+          "plane": null
          }
-        }
+        ]
        }
       }
      ]
@@ -1920,11 +1980,16 @@
           "Number": 3
          }
         },
-        "expect_version": {
-         "Literal": {
-          "Number": 1
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 1
+           }
+          },
+          "plane": null
          }
-        }
+        ]
        }
       }
      ]
@@ -1932,16 +1997,24 @@
    }
   },
   {
-   "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {id: \"A-1\"} } LIMIT 1 EXPECT STATE \"active\"",
+   "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {id: \"A-1\"} } LIMIT 1 EXPECT VERSION :v",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
      "clauses": [
       {
-       "RetractAssertion": {
+       "Transition": {
         "target": {
          "Handle": "a"
         },
+        "to": {
+         "Literal": {
+          "String": "retracted"
+         }
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
         "where_clauses": [
          {
           "Assertion": {
@@ -1961,11 +2034,14 @@
           "Number": 1
          }
         },
-        "expect_state": {
-         "Literal": {
-          "String": "active"
+        "expect_versions": [
+         {
+          "version": {
+           "Param": "v"
+          },
+          "plane": null
          }
-        }
+        ]
        }
       }
      ]
@@ -1973,24 +2049,29 @@
    }
   },
   {
-   "command": "CORRECT EVIDENCE :old BY :new EXPECT STATE \"active\"",
+   "command": "TRANSITION :old TO \"corrected\" BY :new",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
      "clauses": [
       {
-       "CorrectEvidence": {
+       "Transition": {
         "target": {
          "Param": "old"
+        },
+        "to": {
+         "Literal": {
+          "String": "corrected"
+         }
         },
         "by": {
          "Param": "new"
         },
-        "expect_state": {
-         "Literal": {
-          "String": "active"
-         }
-        }
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
        }
       }
      ]
@@ -1998,16 +2079,24 @@
    }
   },
   {
-   "command": "ARCHIVE :x WHERE { ?x {type: \"T\"} } LIMIT 2 EXPECT STATE \"active\"",
+   "command": "TRANSITION :x TO \"archived\" WHERE { ?x {type: \"T\"} } LIMIT 2 EXPECT VERSION 3 OF ATTRIBUTES EXPECT VERSION 1 OF STRUCTURAL",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
      "clauses": [
       {
-       "Archive": {
+       "Transition": {
         "target": {
          "Param": "x"
         },
+        "to": {
+         "Literal": {
+          "String": "archived"
+         }
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
         "where_clauses": [
          {
           "Concept": {
@@ -2027,11 +2116,24 @@
           "Number": 2
          }
         },
-        "expect_state": {
-         "Literal": {
-          "String": "active"
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 3
+           }
+          },
+          "plane": "Attributes"
+         },
+         {
+          "version": {
+           "Literal": {
+            "Number": 1
+           }
+          },
+          "plane": "Structural"
          }
-        }
+        ]
        }
       }
      ]
@@ -2039,19 +2141,27 @@
    }
   },
   {
-   "command": "TOMBSTONE :x",
+   "command": "TRANSITION :x TO \"tombstoned\"",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
      "clauses": [
       {
-       "Tombstone": {
+       "Transition": {
         "target": {
          "Param": "x"
         },
+        "to": {
+         "Literal": {
+          "String": "tombstoned"
+         }
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
         "where_clauses": null,
         "limit": null,
-        "expect_state": null
+        "expect_versions": []
        }
       }
      ]
@@ -2078,11 +2188,16 @@
           "String": "lit"
          }
         },
-        "expect_version": {
-         "Literal": {
-          "Number": 4
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 4
+           }
+          },
+          "plane": null
          }
-        }
+        ]
        }
       }
      ]
@@ -2114,10 +2229,32 @@
    }
   },
   {
-   "command": "DESCRIBE EXECUTION CONTEXT",
+   "command": "TRANSITION :old TO \"superseded\" BY :new",
    "ast": {
-    "Meta": {
-     "Describe": "ExecutionContext"
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Transition": {
+        "target": {
+         "Param": "old"
+        },
+        "to": {
+         "Literal": {
+          "String": "superseded"
+         }
+        },
+        "by": {
+         "Param": "new"
+        },
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
+       }
+      }
+     ]
     }
    }
   },
@@ -2295,16 +2432,15 @@
    }
   },
   {
-   "command": "DESCRIBE SNAPSHOT AS OF TIME \"t\"",
+   "command": "DESCRIBE SNAPSHOT AT TIME \"t\"",
    "ast": {
     "Meta": {
      "Describe": {
       "Snapshot": {
-       "as_of": {
-        "Time": {
-         "Literal": {
-          "String": "t"
-         }
+       "as_of": null,
+       "at_time": {
+        "Literal": {
+         "String": "t"
         }
        }
       }
@@ -2341,10 +2477,28 @@
    }
   },
   {
-   "command": "DESCRIBE PROJECTION CAPABILITY",
+   "command": "TRANSITION :a TO :state",
    "ast": {
-    "Meta": {
-     "Describe": "ProjectionCapability"
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Transition": {
+        "target": {
+         "Param": "a"
+        },
+        "to": {
+         "Param": "state"
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
+       }
+      }
+     ]
     }
    }
   },
@@ -2826,33 +2980,39 @@
    }
   },
   {
-   "command": "SNAPSHOT",
+   "command": "DESCRIBE SNAPSHOT",
    "ast": {
     "Meta": {
-     "Snapshot": {
-      "as_of": null
-     }
-    }
-   }
-  },
-  {
-   "command": "SNAPSHOT AS OF SEQ 1",
-   "ast": {
-    "Meta": {
-     "Snapshot": {
-      "as_of": {
-       "Seq": {
-        "Literal": {
-         "Number": 1
-        }
-       }
+     "Describe": {
+      "Snapshot": {
+       "as_of": null,
+       "at_time": null
       }
      }
     }
    }
   },
   {
-   "command": "EXPORT CAPSULE :out WHERE { ?c {type: \"T\"} (?c, \"p\", ?o) } WITH {redact: true} AS OF TX :tx",
+   "command": "DESCRIBE SNAPSHOT AS OF SEQ 1",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "Snapshot": {
+       "as_of": {
+        "Seq": {
+         "Literal": {
+          "Number": 1
+         }
+        }
+       },
+       "at_time": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "EXPORT CAPSULE :out WHERE { ?c {type: \"T\"} (?c, \"p\", ?o) } WITH {redact: true} AS OF SEQ :seq",
    "ast": {
     "Meta": {
      "ExportCapsule": {
@@ -2901,8 +3061,8 @@
        }
       },
       "as_of": {
-       "Tx": {
-        "Param": "tx"
+       "Seq": {
+        "Param": "seq"
        }
       }
      }
@@ -2922,6 +3082,7 @@
         },
         "where_clauses": null,
         "limit": null,
+        "expect_versions": [],
         "confirm": "PURGE"
        }
       }
@@ -2959,6 +3120,7 @@
           "Number": 5
          }
         },
+        "expect_versions": [],
         "confirm": "PURGE"
        }
       }
@@ -3007,6 +3169,427 @@
        "Param": "c"
       }
      }
+    }
+   }
+  },
+  {
+   "command": "TRANSITION :act TO \"running\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Transition": {
+        "target": {
+         "Param": "act"
+        },
+        "to": {
+         "Literal": {
+          "String": "running"
+         }
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "TRANSITION :a TO \"retracted\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Transition": {
+        "target": {
+         "Param": "a"
+        },
+        "to": {
+         "Literal": {
+          "String": "retracted"
+         }
+        },
+        "by": null,
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "PURGE :e WHERE { ?e EVIDENCE {id: \"E-1\"} } LIMIT 1 EXPECT VERSION 2 REFERENCE POLICY \"deny_if_referenced\" CONFIRM \"PURGE\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Purge": {
+        "target": {
+         "Param": "e"
+        },
+        "where_clauses": [
+         {
+          "Evidence": {
+           "variable": "e",
+           "matcher": {
+            "id": {
+             "Literal": {
+              "String": "E-1"
+             }
+            }
+           }
+          }
+         }
+        ],
+        "limit": {
+         "Literal": {
+          "Number": 1
+         }
+        },
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 2
+           }
+          },
+          "plane": null
+         }
+        ],
+        "reference_policy": {
+         "Literal": {
+          "String": "deny_if_referenced"
+         }
+        },
+        "confirm": "PURGE"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "PURGE PAYLOAD :e EXPECT VERSION 2 OF RETENTION CONFIRM \"PURGE\"",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "PurgePayload": {
+        "target": {
+         "Param": "e"
+        },
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 2
+           }
+          },
+          "plane": "Retention"
+         }
+        ],
+        "confirm": "PURGE"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "UPDATE :skill SET ATTRIBUTES {status: \"adopted\"} SET FACET \"GradingState\" {graded_count: 12} EXPECT VERSION :va OF ATTRIBUTES EXPECT VERSION 0 OF FACET \"GradingState\" EXPECT VERSION :vr OF RETENTION EXPECT VERSION :v",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Update": {
+        "target": {
+         "Param": "skill"
+        },
+        "actions": [
+         {
+          "SetAttributes": [
+           [
+            "status",
+            {
+             "Value": {
+              "String": "adopted"
+             }
+            }
+           ]
+          ]
+         },
+         {
+          "SetFacet": {
+           "facet": {
+            "Name": "GradingState"
+           },
+           "values": [
+            [
+             "graded_count",
+             {
+              "Value": {
+               "Number": 12
+              }
+             }
+            ]
+           ]
+          }
+         }
+        ],
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": [
+         {
+          "version": {
+           "Param": "va"
+          },
+          "plane": "Attributes"
+         },
+         {
+          "version": {
+           "Literal": {
+            "Number": 0
+           }
+          },
+          "plane": {
+           "Facet": {
+            "Name": "GradingState"
+           }
+          }
+         },
+         {
+          "version": {
+           "Param": "vr"
+          },
+          "plane": "Retention"
+         },
+         {
+          "version": {
+           "Param": "v"
+          },
+          "plane": null
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ENSURE PROPOSITION (:a, \"p\", :b) EXPECT VERSION 0",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": null,
+        "subject": {
+         "Param": "a"
+        },
+        "predicate": {
+         "Literal": "p"
+        },
+        "object": {
+         "Param": "b"
+        },
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 0
+           }
+          },
+          "plane": null
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "ASSERT ?closed (:alice, \"timezone\", \"+08:00\") { by: :alice, mode: \"stated\", valid: {from: :since, until: :moved_at}, evidence: :msg } SUPERSEDING :a_old",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "closed#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "timezone"
+        },
+        "object": {
+         "Literal": {
+          "String": "+08:00"
+         }
+        },
+        "expect_versions": []
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "closed",
+        "client_key": null,
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "closed#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ],
+         [
+          "valid_time",
+          {
+           "Object": [
+            [
+             "from",
+             {
+              "Param": "since"
+             }
+            ],
+            [
+             "until",
+             {
+              "Param": "moved_at"
+             }
+            ]
+           ]
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": [
+         {
+          "field": {
+           "Name": "evidence"
+          },
+          "value": {
+           "Param": "msg"
+          },
+          "options": {
+           "role": {
+            "Value": {
+             "String": "support"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "Transition": {
+        "target": {
+         "Param": "a_old"
+        },
+        "to": {
+         "Literal": {
+          "String": "superseded"
+         }
+        },
+        "by": {
+         "Handle": "closed"
+        },
+        "set_fields": null,
+        "set_structural": null,
+        "where_clauses": null,
+        "limit": null,
+        "expect_versions": []
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ :s",
+   "ast": {
+    "Meta": {
+     "Describe": {
+      "SchemaEnvironment": {
+       "as_of": {
+        "Seq": {
+         "Param": "s"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  {
+   "command": "MERGE CONCEPT :a INTO :b EXPECT VERSION 1 OF ATTRIBUTES",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "MergeConcept": {
+        "source": {
+         "Param": "a"
+        },
+        "into": {
+         "Param": "b"
+        },
+        "where_clauses": null,
+        "expect_versions": [
+         {
+          "version": {
+           "Literal": {
+            "Number": 1
+           }
+          },
+          "plane": "Attributes"
+         }
+        ]
+       }
+      }
+     ]
     }
    }
   }

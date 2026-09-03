@@ -41,6 +41,7 @@
 //! [`Store::has_poisoned_handle`] first.
 
 pub mod history;
+pub mod planes;
 pub mod rows;
 pub mod schema;
 pub mod space;
@@ -763,6 +764,23 @@ impl Element {
         *envelope!(self, seq)
     }
 
+    /// The per-plane counters `EXPECT VERSION ... OF` compares against (§6.3).
+    pub fn plane_versions(&self) -> anda_kip::PlaneVersions {
+        planes::decode(envelope!(self, plane_versions))
+    }
+
+    /// Writes the per-plane counters; the transaction commit is the one caller.
+    pub(crate) fn set_plane_versions(&mut self, planes: &anda_kip::PlaneVersions) {
+        let encoded = planes::encode(planes);
+        match self {
+            Element::Concept(row) => row.plane_versions = encoded,
+            Element::Proposition(row) => row.plane_versions = encoded,
+            Element::Assertion(row) => row.plane_versions = encoded,
+            Element::Evidence(row) => row.plane_versions = encoded,
+            Element::Activity(row) => row.plane_versions = encoded,
+        }
+    }
+
     /// Whether this element is in ordinary recall.
     ///
     /// Archived and tombstoned elements still exist and still resolve as
@@ -1074,15 +1092,18 @@ impl Store {
     /// The key is immutable identity, unlike `name`, which is why `UPSERT`
     /// resolves through it (§54).
     ///
-    /// `schema_ref` narrows the lookup rather than filtering its result,
-    /// because §7.3 scopes key uniqueness to `(space_id, schema_ref, key)`: a
-    /// Person and a Preference both keyed `"alice"` are two identities, not a
-    /// collision — which is also what makes the 1.x migration of `(type, name)`
-    /// identity into a key collision-free.
+    /// `schema_ref` narrows the lookup to the type's **lineage** (§7.3,
+    /// §20.14): key uniqueness is scoped to `(space_id, type lineage, key)`,
+    /// so a Person and a Preference both keyed `"alice"` are two identities,
+    /// not a collision — which is also what makes the 1.x migration of
+    /// `(type, name)` identity into a key collision-free — while a Person
+    /// written under an earlier version of the same package is the same
+    /// Person, and an upsert by `key` after an upgrade finds it rather than
+    /// minting a duplicate.
     ///
     /// Without a declared type the key alone must still land on one Concept.
-    /// Returning the first of several would be the arbitrary winner §51 forbids
-    /// for names, arriving through `key` instead.
+    /// Returning the first of several would be the arbitrary winner §54.2
+    /// forbids for names, arriving through `key` instead.
     pub async fn find_concept_by_key(
         &self,
         space: &str,
@@ -1095,33 +1116,51 @@ impl Store {
             // answer an upsert meant for one of them.
             return Ok(None);
         }
-        let mut fields = vec![
+        let collection = self.concepts();
+        // The declared type narrows the *index* over its whole lineage, and
+        // `same_lineage` settles the symbol on the rows that come back — the
+        // same two-step `predicate_ref` matching uses (§20.14). Filtering
+        // without the range would fetch every Concept in the Space that
+        // carries the key, however many unrelated types share it.
+        let mut filter = eq_fields(&[
             ("space", Fv::Text(space.to_string())),
             ("key", Fv::Text(key.to_string())),
-        ];
-        if let Some(schema_ref) = schema_ref {
-            fields.push(("schema_ref", Fv::Text(schema_ref.to_string())));
+        ]);
+        if let Some((low, high)) = schema_ref.and_then(crate::schema::lineage_range) {
+            filter = Filter::And(vec![
+                Box::new(filter),
+                Box::new(Filter::Field((
+                    "schema_ref".to_string(),
+                    RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+                ))),
+            ]);
         }
-        let collection = self.concepts();
         let ids = collection
-            .query_all_ids(eq_fields(&fields))
+            .query_all_ids(filter)
             .await
             .map_err(crate::error::db_error)?;
-        match ids.as_slice() {
-            [] => Ok(None),
-            [id] => Ok(Some(
-                collection
-                    .get_as(*id)
-                    .await
-                    .map_err(crate::error::db_error)?,
-            )),
-            ids => Err(KipError::new(
+        let mut found: Vec<rows::ConceptRow> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row: rows::ConceptRow = collection
+                .get_as(id)
+                .await
+                .map_err(crate::error::db_error)?;
+            if let Some(schema_ref) = schema_ref
+                && !crate::schema::same_lineage(&row.schema_ref, schema_ref)
+            {
+                continue;
+            }
+            found.push(row);
+        }
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            n => Err(KipError::new(
                 KipErrorCode::IdentityConflict,
                 format!(
-                    "the key {key:?} is carried by {} Concepts in this Space, so it does not name \
+                    "the key {key:?} is carried by {n} Concepts in this Space, so it does not name \
                      one on its own; add the type — MATCH {{type: ..., key: ...}} — rather than \
-                     letting the engine pick among them",
-                    ids.len()
+                     letting the engine pick among them"
                 ),
             )),
         }

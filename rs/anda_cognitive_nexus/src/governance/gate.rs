@@ -19,7 +19,10 @@
 //!   engine, not the Space. Gating them would mean an unauthorized caller could
 //!   not discover *how to authenticate*.
 
-use anda_kip::{DescribeTarget, KmlStatement, KqlQuery, MetaCommand, MutationClause, WhereClause};
+use anda_kip::{
+    DescribeTarget, KmlStatement, KqlQuery, MetaCommand, MutationClause, Transition, WhereClause,
+    transition_state,
+};
 
 use super::Permission;
 
@@ -63,7 +66,6 @@ pub fn meta_permissions(command: &MetaCommand) -> Vec<Permission> {
         MetaCommand::History(_) | MetaCommand::Changes(_) => {
             vec![Permission::Read, Permission::ReadHistory]
         }
-        MetaCommand::Snapshot { .. } => vec![Permission::ReadHistory],
         MetaCommand::ExportCapsule(_) => vec![Permission::Export],
     }
 }
@@ -75,11 +77,10 @@ fn describe_permissions(target: &DescribeTarget) -> Vec<Permission> {
         | DescribeTarget::Capabilities
         | DescribeTarget::Error(_)
         | DescribeTarget::Compatibility { .. }
-        | DescribeTarget::ProjectionCapability
         | DescribeTarget::EpistemicPolicy { .. } => Vec::new(),
         // About the caller itself. §67.2: an Agent must be able to learn what it
         // may do without first being permitted to do it.
-        DescribeTarget::ExecutionContext | DescribeTarget::Access { .. } => Vec::new(),
+        DescribeTarget::Access { .. } => Vec::new(),
         DescribeTarget::Trust { .. } => vec![Permission::Read],
         DescribeTarget::Transaction(_)
         | DescribeTarget::TransactionByIdempotencyKey(_)
@@ -124,18 +125,53 @@ pub fn clause_permissions(clause: &MutationClause) -> Vec<Permission> {
         // (§17, §18). `assert` is the floor.
         MutationClause::CreateAssertion(_) => vec![Permission::Assert],
         MutationClause::Update(_) => vec![Permission::Update],
-        MutationClause::RetractAssertion(_) => vec![Permission::RetractOwn],
-        MutationClause::SupersedeAssertion(_) => vec![Permission::SupersedeOwn],
-        // Correcting Evidence is a maintenance act on an immutable record: it
-        // writes a new record and links it, never edits the old one.
-        MutationClause::CorrectEvidence(_) => vec![Permission::Create, Permission::Maintain],
-        MutationClause::TransitionActivity(_) => vec![Permission::Update],
+        MutationClause::Transition(transition) => transition_permissions(transition),
         MutationClause::SetRetention(_) => vec![Permission::ManageRetention],
-        MutationClause::Archive(_) => vec![Permission::Archive],
-        MutationClause::Tombstone(_) => vec![Permission::Tombstone],
         MutationClause::Purge(_) | MutationClause::PurgePayload(_) => vec![Permission::Purge],
         MutationClause::MergeConcept(_) => vec![Permission::MergeIdentity, Permission::Maintain],
     }
+}
+
+/// What one `TRANSITION` needs, by the state it moves to (§52.5).
+///
+/// The state decides the permission: withdrawing a claim is `retract_own`,
+/// replacing one is `supersede_own`, correcting Evidence is a maintenance act
+/// that also writes the new record (`create` + `maintain`), moving an Activity
+/// is an ordinary `update`, and leaving recall is `archive` or `tombstone`.
+///
+/// A state written as a `:parameter` is bound at execution time, so it cannot
+/// be classified here. The gate then asks for nothing extra rather than
+/// guessing: every target is authorized individually in the executor with the
+/// precise permission once the state is known, which is the check that
+/// actually decides — a Space-scope refusal here would only have refused it
+/// earlier.
+pub fn transition_permissions(transition: &Transition) -> Vec<Permission> {
+    match transition.state() {
+        Some(state) => transition_permission(state).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// The permission one lifecycle state asks for, when the state is known.
+///
+/// `None` for a word that names no state: the parser refuses it for a literal
+/// and the executor refuses it for a bound parameter, so nothing is gated on
+/// it.
+pub fn transition_permission(state: &str) -> Option<Vec<Permission>> {
+    Some(match state {
+        transition_state::RETRACTED => vec![Permission::RetractOwn],
+        transition_state::SUPERSEDED => vec![Permission::SupersedeOwn],
+        // Correcting Evidence is a maintenance act on an immutable record: it
+        // writes a new record and links it, never edits the old one.
+        transition_state::CORRECTED => vec![Permission::Create, Permission::Maintain],
+        transition_state::RUNNING
+        | transition_state::COMPLETED
+        | transition_state::FAILED
+        | transition_state::CANCELLED => vec![Permission::Update],
+        transition_state::ARCHIVED => vec![Permission::Archive],
+        transition_state::TOMBSTONED => vec![Permission::Tombstone],
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -211,7 +247,7 @@ mod tests {
         for command in ["DESCRIBE PROTOCOL", "DESCRIBE CAPABILITIES"] {
             assert!(meta_permissions(&meta(command)).is_empty(), "{command}");
         }
-        assert!(meta_permissions(&meta("DESCRIBE EXECUTION CONTEXT")).is_empty());
+        assert!(meta_permissions(&meta("DESCRIBE ACCESS")).is_empty());
     }
 
     #[test]
@@ -230,7 +266,7 @@ mod tests {
     fn removal_and_erasure_ask_for_different_things() {
         // §102 again: logical removal is not erasure.
         assert_eq!(
-            kml_permissions(&kml("TOMBSTONE :x")),
+            kml_permissions(&kml(r#"TRANSITION :x TO "tombstoned""#)),
             vec![Permission::Tombstone]
         );
         assert_eq!(
@@ -260,9 +296,37 @@ mod tests {
     fn a_multi_clause_statement_asks_for_the_union() {
         let needed = kml_permissions(&kml(r#"MUTATE {
                 CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }
-                ARCHIVE :old
+                TRANSITION :old TO "archived"
             }"#));
         assert!(needed.contains(&Permission::Create));
         assert!(needed.contains(&Permission::Archive));
+    }
+
+    #[test]
+    fn a_transition_asks_for_the_permission_its_state_names() {
+        // §52.5: one statement, and the state decides what it costs.
+        for (state, expected) in [
+            ("retracted", vec![Permission::RetractOwn]),
+            ("archived", vec![Permission::Archive]),
+            ("tombstoned", vec![Permission::Tombstone]),
+            ("running", vec![Permission::Update]),
+        ] {
+            assert_eq!(
+                kml_permissions(&kml(&format!(r#"TRANSITION :x TO "{state}""#))),
+                expected,
+                "{state}"
+            );
+        }
+        assert_eq!(
+            kml_permissions(&kml(r#"TRANSITION :old TO "superseded" BY :new"#)),
+            vec![Permission::SupersedeOwn]
+        );
+        assert_eq!(
+            kml_permissions(&kml(r#"TRANSITION :old TO "corrected" BY :new"#)),
+            vec![Permission::Create, Permission::Maintain]
+        );
+        // A bound state cannot be classified here; the executor authorizes
+        // each target with the precise permission once it is bound.
+        assert!(kml_permissions(&kml("TRANSITION :x TO :state")).is_empty());
     }
 }

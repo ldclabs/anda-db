@@ -240,7 +240,16 @@ mod tests {
             );
         }
         assert!(SELF_INSTRUCTIONS.contains("SUPERSEDING"));
-        assert!(SYSTEM_INSTRUCTIONS.contains("outcome_unknown"));
+        // Both prompts are deltas over the brain/ policies (upstream
+        // 793af73): they name the canonical documents they assume are loaded
+        // rather than restating them.
+        assert!(SELF_INSTRUCTIONS.contains("brain/BrainFormation.md"));
+        assert!(SYSTEM_INSTRUCTIONS.contains("brain/BrainMaintenance.md"));
+        // And the LLM-facing syntax card teaches the one lifecycle statement
+        // and the recovery contract.
+        assert!(KIP_SYNTAX.contains("TRANSITION"));
+        assert!(!KIP_SYNTAX.contains("RETRACT ASSERTION"));
+        assert!(KIP_SYNTAX.contains("outcome_unknown"));
         // Both prompts tell the Agent this document is part of its context, so
         // shipping the prompts without a way to reach it would leave a host
         // unable to honour what they promise.

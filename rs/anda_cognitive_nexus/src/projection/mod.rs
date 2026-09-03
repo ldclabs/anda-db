@@ -150,6 +150,42 @@ impl Belief {
     /// and the reason `support.root_groups` was once spelled
     /// `independent_groups` on this side alone.
     pub fn to_json(&self) -> Json {
+        let mut json = self.projection_json();
+        // §27.2: `leading` names the side the policy would favor if it were
+        // forced to choose. Disclosure for a consumer that must act anyway;
+        // it never changes `status` (§21.6). Attached beside the protocol
+        // crate's shape, which has no slot for it yet.
+        if let Some(object) = json.as_object_mut() {
+            object.insert("leading".to_string(), Json::from(self.leading()));
+        }
+        json
+    }
+
+    /// The side the policy would favor if forced to choose (§27.2).
+    ///
+    /// `support` under `accepted`, `opposition` under `rejected`, and under
+    /// `contested` the side with more eligible independent roots — this
+    /// engine's structural baseline (§21.10) counts corroboration groups and
+    /// weighs nothing else — with an exact tie, `uncertain` and
+    /// `insufficient` reporting `none`.
+    pub fn leading(&self) -> &'static str {
+        match self.status {
+            BeliefStatus::Accepted => "support",
+            BeliefStatus::Rejected => "opposition",
+            BeliefStatus::Contested => {
+                let support = self.ledger.support_groups.len();
+                let opposition = self.ledger.opposition_groups.len();
+                match support.cmp(&opposition) {
+                    std::cmp::Ordering::Greater => "support",
+                    std::cmp::Ordering::Less => "opposition",
+                    std::cmp::Ordering::Equal => "none",
+                }
+            }
+            BeliefStatus::Uncertain | BeliefStatus::Insufficient => "none",
+        }
+    }
+
+    fn projection_json(&self) -> Json {
         let projection = Projection {
             proposition_id: self.proposition.map(|id| id.to_string()),
             status: self.status,
@@ -351,13 +387,13 @@ impl Context<'_> {
     /// predicate, each projected (§35).
     pub async fn project_slot(
         &mut self,
-        subject_key: &str,
+        subject: &Endpoint,
         predicate_ref: &str,
         policy: &Policy,
         at: &str,
     ) -> Result<Slot, KipError> {
         let mut candidates = Vec::new();
-        for id in self.slot_propositions(subject_key, predicate_ref).await? {
+        for id in self.slot_propositions(subject, predicate_ref).await? {
             candidates.push(self.project_belief(id, policy, at).await?);
         }
         Ok(Slot {
@@ -544,6 +580,11 @@ impl Context<'_> {
         let Ok(def) = self.env.predicate_def(&symbol) else {
             return Ok(vec![]);
         };
+        // §20.15, §25.2: a Predicate whose values never conflict on time has
+        // no conflict set at any instant.
+        if def.temporal_conflict == "none" {
+            return Ok(vec![]);
+        }
         let functional = def.functional;
         // §25.1 names two conflict shapes and §92 requires both. Functional is
         // the strong one: one subject, one true object, so every rival value
@@ -555,12 +596,18 @@ impl Context<'_> {
             .iter()
             .find(|group| group.iter().any(|value| same_object(value, &row.object)))
             .cloned();
-        if !functional && group.is_none() {
+        // §12.7, §20.15: under `boolean_completeness`, object `false` is the
+        // negation of object `true`, so each opposes the other.
+        let negation: Option<Json> = if def.boolean_completeness {
+            boolean_object(&row.object).map(|flag| Json::Bool(!flag))
+        } else {
+            None
+        };
+        if !functional && group.is_none() && negation.is_none() {
             return Ok(vec![]);
         }
-        let mut rivals = self
-            .slot_propositions(&row.subject_key, &row.predicate_ref)
-            .await?;
+        let subject = Endpoint::from_json(&row.subject)?;
+        let mut rivals = self.slot_propositions(&subject, &row.predicate_ref).await?;
         rivals.retain(|id| *id != target);
         if functional {
             return Ok(rivals);
@@ -569,7 +616,10 @@ impl Context<'_> {
         let mut exclusive = Vec::new();
         for id in rivals {
             if let Some(Element::Proposition(rival)) = self.load(id).await?
-                && group.iter().any(|value| same_object(value, &rival.object))
+                && (group.iter().any(|value| same_object(value, &rival.object))
+                    || negation
+                        .as_ref()
+                        .is_some_and(|flag| boolean_object(&rival.object) == flag.as_bool()))
             {
                 exclusive.push(id);
             }
@@ -578,11 +628,31 @@ impl Context<'_> {
     }
 
     /// Every active Proposition in one `(subject, predicate)` slot.
+    ///
+    /// The slot is canonical on both coordinates (§12.3, §20.14): the subject
+    /// is its merge class, so a slot named by the surviving identity holds
+    /// the tuples recorded on what was merged into it, and the predicate is
+    /// its lineage, so a `BELIEF SLOT` over a later package version sees every
+    /// Assertion the slot ever gathered.
     pub async fn slot_propositions(
         &mut self,
-        subject_key: &str,
+        subject: &Endpoint,
         predicate_ref: &str,
     ) -> Result<Vec<ElementId>, KipError> {
+        let subject_keys = self.endpoint_keys(subject).await?;
+        let predicate = match crate::schema::lineage_range(predicate_ref) {
+            Some((low, high)) => anda_db::query::Filter::Field((
+                "predicate_ref".to_string(),
+                anda_db::query::RangeQuery::Between(
+                    anda_db_schema::Fv::Text(low),
+                    anda_db_schema::Fv::Text(high),
+                ),
+            )),
+            None => crate::store::eq_field(
+                "predicate_ref",
+                anda_db_schema::Fv::Text(predicate_ref.to_string()),
+            ),
+        };
         let ids = self
             .candidates(
                 anda_kip::ElementKind::Proposition,
@@ -595,30 +665,31 @@ impl Context<'_> {
                         "state",
                         anda_db_schema::Fv::Text("active".to_string()),
                     )),
-                    Box::new(crate::store::eq_field(
-                        "subject_key",
-                        anda_db_schema::Fv::Text(subject_key.to_string()),
-                    )),
-                    Box::new(crate::store::eq_field(
-                        "predicate_ref",
-                        anda_db_schema::Fv::Text(predicate_ref.to_string()),
-                    )),
+                    Box::new(anda_db::query::Filter::Field((
+                        "subject_key".to_string(),
+                        anda_db::query::RangeQuery::Include(
+                            subject_keys
+                                .iter()
+                                .map(|key| anda_db_schema::Fv::Text(key.clone()))
+                                .collect(),
+                        ),
+                    ))),
+                    Box::new(predicate),
                 ])),
             )
             .await?;
         self.charge(ids.len())?;
 
-        if !self.is_historical() {
-            return Ok(ids);
-        }
-        // At a coordinate the index could not narrow, so the slot is matched
-        // against the historical rows.
+        // The predicate index was ranged over a lineage, so the symbol is
+        // settled here; at a past coordinate the index could not narrow at
+        // all, so the whole slot is matched against the historical rows.
+        let historical = self.is_historical();
         let mut slot = Vec::new();
         for id in ids {
             if let Some(Element::Proposition(row)) = self.load(id).await?
-                && row.state == "active"
-                && row.subject_key == subject_key
-                && row.predicate_ref == predicate_ref
+                && crate::schema::same_lineage(&row.predicate_ref, predicate_ref)
+                && (!historical
+                    || (row.state == "active" && subject_keys.contains(&row.subject_key)))
             {
                 slot.push(id);
             }
@@ -736,6 +807,14 @@ fn dedup_json(values: &mut Vec<Json>) {
             true
         }
     });
+}
+
+/// The boolean a Proposition object carries, when it is a boolean Literal.
+fn boolean_object(object: &Json) -> Option<bool> {
+    match Endpoint::from_json(object) {
+        Ok(Endpoint::Literal(literal)) => literal.value.as_bool(),
+        _ => None,
+    }
 }
 
 /// Whether a declared exclusive value names this Proposition object.

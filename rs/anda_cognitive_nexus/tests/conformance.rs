@@ -132,8 +132,24 @@ async fn execute(
     for (key, value) in envelope {
         object.insert(key.clone(), value.clone());
     }
-    let request: Request =
-        serde_json::from_value(body).expect("a fixture command must build a request");
+    // An envelope member of the wrong shape never becomes a Request at all,
+    // and that refusal is itself a conformance outcome: §71.1 makes
+    // `source_actor` an element reference (`{id}` or `{type, key}`), so a bare
+    // string is `InvalidRequestEnvelope` before any command runs — which is
+    // exactly what a transport that deserializes the body reports.
+    let request: Request = match serde_json::from_value(body) {
+        Ok(request) => request,
+        Err(_) => return (None, Some("InvalidRequestEnvelope".to_string())),
+    };
+
+    // The structural gate a real transport runs before dispatch
+    // (`anda_kip::execute_request`). The harness calls one operation directly,
+    // so without this an envelope invariant — an `ingest` block with nothing to
+    // mint into, a capability name that is not an identifier — would be
+    // enforced in production and invisible here.
+    if let Err(err) = request.validate() {
+        return (None, Some(err.name().to_string()));
+    }
 
     let parsed = match request.operations[0].parse() {
         Ok(parsed) => parsed,

@@ -167,6 +167,35 @@ impl<'a> Context<'a> {
         if let Some(cached) = self.loaded.get(&id) {
             return Ok(cached.clone());
         }
+        let element = self.load_unattached(id).await?;
+        // §43.2: a Proposition's view keeps both readings of each endpoint —
+        // `subject` / `object` as stored, `canonical_subject` /
+        // `canonical_object` merge-resolved at this read's coordinate.
+        if let Some(Element::Proposition(row)) = &element {
+            let subject = self.canonical_endpoint(&row.subject).await?;
+            let object = self.canonical_endpoint(&row.object).await?;
+            if let Some(view) = self.views.get(&id) {
+                let mut view = (**view).clone();
+                if let Some(object_view) = view.as_object_mut() {
+                    object_view.insert("canonical_subject".to_string(), subject);
+                    object_view.insert("canonical_object".to_string(), object);
+                }
+                self.views.insert(id, Arc::new(view));
+            }
+        }
+        Ok(element)
+    }
+
+    /// Loads and admits one element without attaching the canonical
+    /// endpoints a Proposition's view carries.
+    ///
+    /// The merge chain a Proposition's endpoints resolve through is walked
+    /// with this, so following a pointer never re-enters the attachment that
+    /// asked for it.
+    async fn load_unattached(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
+        if let Some(cached) = self.loaded.get(&id) {
+            return Ok(cached.clone());
+        }
         let element = match self.as_of {
             Some(seq) => self.store.element_at(&self.space, id, seq).await?,
             None => self.store.get_element(id).await.ok(),
@@ -174,6 +203,118 @@ impl<'a> Context<'a> {
         let element = self.admit(element);
         self.loaded.insert(id, element.clone());
         Ok(element)
+    }
+
+    /// Follows a Concept's `merged_into` chain to the identity that survived
+    /// (§11.1, §12.3), at this read's coordinate.
+    ///
+    /// Walked through the read path's own admission, so a Concept the caller
+    /// may not discover ends the chain rather than being named through it
+    /// (§30.4). Bounded independently of the cycle check the write path keeps,
+    /// because a corrupt chain must refuse rather than spin.
+    pub async fn canonical_of(&mut self, id: ElementId) -> Result<ElementId, KipError> {
+        const MAX_HOPS: usize = 64;
+        let mut cursor = id;
+        for _ in 0..MAX_HOPS {
+            if cursor.kind != ElementKind::Concept {
+                return Ok(cursor);
+            }
+            let next = match self.load_unattached(cursor).await? {
+                Some(Element::Concept(row)) if !row.merged_into.is_empty() => {
+                    row.merged_into.parse::<ElementId>()?
+                }
+                _ => return Ok(cursor),
+            };
+            if next == cursor {
+                return Ok(cursor);
+            }
+            cursor = next;
+        }
+        Err(KipError::internal_error(format!(
+            "the merged_into chain above {id} is longer than {MAX_HOPS} hops"
+        )))
+    }
+
+    /// Every Concept whose `merged_into` chain resolves to the same canonical
+    /// identity as `id` — the class a canonical term matches (§12.3, §43.2).
+    ///
+    /// After `MERGE CONCEPT :alicia INTO :alice` the class of either is
+    /// `{alice, alicia}`, so a term naming B finds the tuples recorded on an A
+    /// merged into B, and a term naming A still finds them. Sorted, so two
+    /// engines walk the same class in the same order.
+    pub async fn merge_class(&mut self, id: ElementId) -> Result<Vec<ElementId>, KipError> {
+        if id.kind != ElementKind::Concept {
+            return Ok(vec![id]);
+        }
+        let canonical = self.canonical_of(id).await?;
+        let mut class = vec![canonical];
+        let mut frontier = vec![canonical];
+        while let Some(target) = frontier.pop() {
+            for source in self.merged_sources(target).await? {
+                if !class.contains(&source) {
+                    class.push(source);
+                    frontier.push(source);
+                }
+            }
+        }
+        if !class.contains(&id) {
+            class.push(id);
+        }
+        class.sort();
+        Ok(class)
+    }
+
+    /// The Concepts merged directly into one, at this read's coordinate.
+    async fn merged_sources(&mut self, target: ElementId) -> Result<Vec<ElementId>, KipError> {
+        let ids = self
+            .candidates(
+                ElementKind::Concept,
+                Some(anda_db::query::Filter::And(vec![
+                    Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                    Box::new(eq_field("merged_into", Fv::Text(target.to_string()))),
+                ])),
+            )
+            .await?;
+        self.charge(ids.len())?;
+        let mut out = Vec::new();
+        for id in ids {
+            // At a past coordinate the index could not narrow, so the pointer
+            // is checked on the row that was current then.
+            if let Some(Element::Concept(row)) = self.load_unattached(id).await?
+                && row.merged_into == target.to_string()
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The equality keys a fixed tuple endpoint matches: the merge class of a
+    /// Concept, the endpoint itself otherwise.
+    pub async fn endpoint_keys(
+        &mut self,
+        endpoint: &crate::term::Endpoint,
+    ) -> Result<Vec<String>, KipError> {
+        Ok(match endpoint {
+            crate::term::Endpoint::Local(id) if id.kind == ElementKind::Concept => self
+                .merge_class(*id)
+                .await?
+                .into_iter()
+                .map(|member| crate::term::Endpoint::Local(member).key())
+                .collect(),
+            other => vec![other.key()],
+        })
+    }
+
+    /// A stored endpoint, merge-resolved, as a read returns it.
+    async fn canonical_endpoint(&mut self, value: &Json) -> Result<Json, KipError> {
+        match crate::term::Endpoint::from_json(value) {
+            Ok(crate::term::Endpoint::Local(id)) if id.kind == ElementKind::Concept => {
+                let canonical = self.canonical_of(id).await?;
+                Ok(crate::term::Endpoint::Local(canonical).to_json())
+            }
+            _ => Ok(crate::view::endpoint_view(value)),
+        }
     }
 
     /// Applies the read decision to one loaded element, caching its view.
@@ -439,27 +580,23 @@ impl<'a> Context<'a> {
     }
 
     /// Resolves an `AS OF` coordinate to a Space sequence.
+    ///
+    /// `AS OF SEQ` is the only historical axis (§48.1): a transaction id
+    /// resolves to its sequence through `DESCRIBE TRANSACTION`, and an instant
+    /// through `DESCRIBE SNAPSHOT AT TIME`, so a historical read always names
+    /// the exact coordinate it was served from.
     pub async fn resolve_as_of(&mut self, as_of: &anda_kip::AsOf) -> Result<u64, KipError> {
-        let (scalar, kind) = match as_of {
-            anda_kip::AsOf::Seq(scalar) => (scalar, "SEQ"),
-            anda_kip::AsOf::Tx(scalar) => (scalar, "TX"),
-            anda_kip::AsOf::Time(scalar) => (scalar, "TIME"),
-        };
+        let anda_kip::AsOf::Seq(scalar) = as_of;
         let value = match scalar {
             Scalar::Literal(literal) => Json::from(literal.clone()),
             Scalar::Param(name) => self.param_ref(name)?,
         };
-        match (kind, value) {
-            ("SEQ", Json::Number(number)) => number
+        match value {
+            Json::Number(number) => number
                 .as_u64()
                 .ok_or_else(|| KipError::type_mismatch("AS OF SEQ takes a non-negative sequence")),
-            ("TX", Json::String(tx_id)) => self.store.seq_of_transaction(&self.space, &tx_id).await,
-            ("TIME", Json::String(at)) => {
-                let at = crate::time::normalize(&at, "AS OF TIME")?;
-                self.store.seq_at_time(&self.space, &at).await
-            }
-            (kind, other) => Err(KipError::type_mismatch(format!(
-                "AS OF {kind} does not take {other}"
+            other => Err(KipError::type_mismatch(format!(
+                "AS OF SEQ does not take {other}"
             ))),
         }
     }
@@ -668,8 +805,9 @@ fn page_cursor(
         Scalar::Param(name) => cx.param_ref(name)?,
     };
     let Json::String(token) = token else {
-        return Err(KipError::new(
-            anda_kip::KipErrorCode::CursorInvalidated,
+        return Err(KipError::cursor_invalid(
+            crate::store::history::CursorFamily::Query.tag(),
+            "malformed",
             format!("CURSOR takes the opaque token this engine issued, got {token}"),
         ));
     };
@@ -825,12 +963,14 @@ fn scalar_usize(cx: &Context<'_>, scalar: &Scalar, what: &str) -> Result<usize, 
         Json::Number(n) => n.as_u64().map(|n| n as usize).ok_or_else(|| {
             KipError::type_mismatch(format!("{what} must be a non-negative integer, got {n}"))
         }),
-        // A cursor round-trips as the opaque string this engine emitted.
+        // A numeric string is accepted for the same reason `DEPTH` accepts
+        // one: a caller binding a parameter from JSON may not control its
+        // type. Anything else is a bound of the wrong type, never a cursor —
+        // `LIMIT` misuse is `TypeMismatch` (§87.7).
         Json::String(text) => text.parse().map_err(|_| {
-            KipError::new(
-                anda_kip::KipErrorCode::CursorInvalidated,
-                format!("{what} is not a cursor this engine issued: {text:?}"),
-            )
+            KipError::type_mismatch(format!(
+                "{what} must be a non-negative integer, got {text:?}"
+            ))
         }),
         other => Err(KipError::type_mismatch(format!(
             "{what} must be a non-negative integer, got {other}"

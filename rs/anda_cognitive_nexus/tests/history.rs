@@ -1,4 +1,4 @@
-//! Reading the Space at a past coordinate: `AS OF`, `SNAPSHOT`, and the
+//! Reading the Space at a past coordinate: `AS OF SEQ`, `DESCRIBE SNAPSHOT`, and the
 //! `read.snapshot_token` binding.
 //!
 //! `AS OF` asks what this Brain *held* then. That is not what was *true* then —
@@ -87,7 +87,12 @@ async fn commit(nexus: &CognitiveNexus, command: &str) -> (u64, String) {
         "{command}\n{:#?}",
         response.results
     );
-    let receipt = response.receipt.expect("a write produces a receipt");
+    // §75: the Receipt of a single operation sits on the operation's own
+    // result; the top-level slot belongs to an `atomic` transaction.
+    let receipt = response.results[0]
+        .receipt
+        .clone()
+        .expect("a write produces a receipt");
     (
         receipt.space_seq.expect("a commit reports its sequence"),
         receipt.tx_id.expect("a commit reports its transaction"),
@@ -150,41 +155,79 @@ async fn as_of_seq_reads_the_state_that_coordinate_held() {
     assert!(rows(&before_creation).is_empty());
 }
 
+/// §48.1 left `AS OF SEQ` as the only historical axis: `AS OF TX` and
+/// `AS OF TIME` are gone from KQL. A transaction id and a wall-clock instant
+/// are still legitimate ways to *name* a coordinate, so each now resolves to a
+/// sequence through META first, and the read names that sequence.
+///
+/// The split is the point. An instant is ambiguous — several transactions may
+/// share a millisecond, and none may have committed at that one — so the
+/// engine resolves it in a statement whose whole job is to answer "which
+/// sequence", and a historical read always names the exact coordinate it was
+/// served from rather than one the engine guessed at.
 #[tokio::test]
-async fn as_of_tx_and_time_name_the_same_kind_of_coordinate() {
-    let (nexus, created, _, tx) = evolving("as_of_tx").await;
+async fn a_transaction_and_an_instant_each_resolve_to_a_sequence() {
+    let (nexus, created, _, tx) = evolving("as_of_resolution").await;
 
+    // A transaction id resolves through `DESCRIBE TRANSACTION`, which answers
+    // the Change Envelope it committed — `space_seq` is the coordinate.
+    let described = ok(&nexus, &format!(r#"DESCRIBE TRANSACTION "{tx}""#)).await;
+    assert_eq!(described["space_seq"], json!(created));
     let by_tx = ok(
         &nexus,
-        &format!(r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{}} }} AS OF TX "{tx}""#),
+        &format!(
+            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{}} }} AS OF SEQ {}"#,
+            described["space_seq"].as_u64().unwrap()
+        ),
     )
     .await;
     assert_eq!(rows(&by_tx), &vec![json!("Alice")]);
 
-    // `AS OF TIME` resolves to the last transaction committed by then. A time
-    // before anything committed is coordinate 0 — an empty Space, not an
-    // error.
+    // An instant resolves through `DESCRIBE SNAPSHOT AT TIME` to the last
+    // sequence committed at or before it. A time before anything committed is
+    // coordinate 0 — an empty Space, not an error.
+    let before = ok(
+        &nexus,
+        r#"DESCRIBE SNAPSHOT AT TIME "2000-01-01T00:00:00Z""#,
+    )
+    .await;
+    assert_eq!(before["space_seq"], json!(0));
     let empty = ok(
         &nexus,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TIME "2000-01-01T00:00:00Z""#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF SEQ 0"#,
     )
     .await;
     assert!(rows(&empty).is_empty());
 
+    let head = ok(
+        &nexus,
+        r#"DESCRIBE SNAPSHOT AT TIME "2099-01-01T00:00:00Z""#,
+    )
+    .await;
     let now = ok(
         &nexus,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TIME "2099-01-01T00:00:00Z""#,
+        &format!(
+            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{}} }} AS OF SEQ {}"#,
+            head["space_seq"].as_u64().unwrap()
+        ),
     )
     .await;
     assert_eq!(rows(&now), &vec![json!("Alice A.")]);
 
-    let unknown = err(
-        &nexus,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TX "kip:space:default#999""#,
-    )
-    .await;
+    // A transaction nobody committed is still refused at the resolving step,
+    // which is where the caller can act on it.
+    let unknown = err(&nexus, r#"DESCRIBE TRANSACTION "kip:space:default#999""#).await;
     assert_eq!(unknown.code, "TransactionUnknown", "{unknown:?}");
-    let _ = created;
+
+    // And the removed axes really are removed: the parser says so, and says
+    // where the coordinate now comes from.
+    for gone in [
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TX "kip:space:default#1""#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TIME "2099-01-01T00:00:00Z""#,
+    ] {
+        let refused = anda_kip::parse_kip(gone).expect_err("AS OF SEQ is the only axis");
+        assert_eq!(refused.code, anda_kip::KipErrorCode::InvalidSyntax);
+    }
 }
 
 /// A tuple that was retracted later is still there at the coordinate before
@@ -204,7 +247,11 @@ async fn a_past_coordinate_still_holds_what_was_later_removed() {
         }"#,
     )
     .await;
-    commit(&nexus, r#"RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} }"#).await;
+    commit(
+        &nexus,
+        r#"TRANSITION ?a TO "retracted" WHERE { ?a ASSERTION {} }"#,
+    )
+    .await;
 
     let now = ok(
         &nexus,
@@ -244,7 +291,7 @@ async fn archiving_changes_what_recall_returns_only_from_that_coordinate_on() {
     .await;
     commit(
         &nexus,
-        r#"ARCHIVE ?c WHERE { ?c CONCEPT {name: "Old note"} }"#,
+        r#"TRANSITION ?c TO "archived" WHERE { ?c CONCEPT {name: "Old note"} }"#,
     )
     .await;
 
@@ -259,18 +306,18 @@ async fn archiving_changes_what_recall_returns_only_from_that_coordinate_on() {
     assert_eq!(rows(&then), &vec![json!(1)]);
 }
 
-/// `SNAPSHOT` now issues a token, because the engine can honour what a token
+/// `DESCRIBE SNAPSHOT` issues a token, because the engine can honour what a token
 /// promises: a later read carrying it answers at the same coordinate.
 #[tokio::test]
 async fn a_snapshot_token_binds_a_later_read_to_its_coordinate() {
     let (nexus, created, _, _) = evolving("snapshot_token").await;
 
-    let at_creation = ok(&nexus, &format!("SNAPSHOT AS OF SEQ {created}")).await;
+    let at_creation = ok(&nexus, &format!("DESCRIBE SNAPSHOT AS OF SEQ {created}")).await;
     let token = at_creation["snapshot_token"]
         .as_str()
         .expect("a snapshot issues a token")
         .to_string();
-    assert_eq!(at_creation["snapshot_seq"], json!(created));
+    assert_eq!(at_creation["space_seq"], json!(created));
 
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
@@ -313,7 +360,12 @@ async fn a_snapshot_token_binds_a_later_read_to_its_coordinate() {
         .into_iter()
         .find_map(|result| result.error)
         .expect("a foreign token must be refused");
-    assert_eq!(error.code, "CursorInvalidated", "{error:?}");
+    assert_eq!(error.code, "CursorInvalid", "{error:?}");
+    // §87.7 merged the three cursor codes into two that carry the family and
+    // the reason as details. A snapshot token is its own family, so a client
+    // can tell a bad coordinate binding from a bad page cursor.
+    assert_eq!(error.details.as_ref().unwrap()["family"], "snapshot");
+    assert_eq!(error.details.as_ref().unwrap()["reason"], "malformed");
 }
 
 /// One read answers at one coordinate: a request bound to a snapshot and a
@@ -321,7 +373,7 @@ async fn a_snapshot_token_binds_a_later_read_to_its_coordinate() {
 #[tokio::test]
 async fn a_bound_request_and_a_disagreeing_command_are_refused() {
     let (nexus, created, renamed, _) = evolving("conflicting_coordinates").await;
-    let snapshot = ok(&nexus, &format!("SNAPSHOT AS OF SEQ {created}")).await;
+    let snapshot = ok(&nexus, &format!("DESCRIBE SNAPSHOT AS OF SEQ {created}")).await;
     let token = snapshot["snapshot_token"].as_str().unwrap().to_string();
 
     let request = serde_json::from_value::<Request>(json!({
@@ -349,7 +401,11 @@ async fn a_bound_request_and_a_disagreeing_command_are_refused() {
 #[tokio::test]
 async fn a_future_coordinate_is_refused() {
     let (nexus, _, renamed, _) = evolving("future_coordinate").await;
-    let error = err(&nexus, &format!("SNAPSHOT AS OF SEQ {}", renamed + 100)).await;
+    let error = err(
+        &nexus,
+        &format!("DESCRIBE SNAPSHOT AS OF SEQ {}", renamed + 100),
+    )
+    .await;
     assert_eq!(error.code, "HistoricalSnapshotUnavailable", "{error:?}");
 }
 
@@ -380,8 +436,8 @@ async fn a_later_schema_activation_has_a_real_history_coordinate() {
         .activate_schema(DEFAULT_SPACE, SchemaLock::default())
         .await
         .unwrap();
-    let snapshot = ok(&nexus, "SNAPSHOT").await;
-    assert_eq!(snapshot["snapshot_seq"], json!(2));
+    let snapshot = ok(&nexus, "DESCRIBE SNAPSHOT").await;
+    assert_eq!(snapshot["space_seq"], json!(2));
     assert_eq!(snapshot["schema_environment_version"], json!(2));
     let before = ok(&nexus, "DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ 1").await;
     assert_eq!(before["version"], json!(1));

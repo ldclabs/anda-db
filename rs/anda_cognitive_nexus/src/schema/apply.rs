@@ -29,8 +29,10 @@ pub enum EndpointFacts {
     },
     /// A Literal value.
     Literal {
-        /// The Literal's datatype symbol.
+        /// The Literal's datatype, in the baseline spelling (§9.2).
         datatype: String,
+        /// The canonical value, for the `format` check (§20.15).
+        value: Json,
     },
     /// A reference this engine cannot resolve locally — a canonical identity
     /// or a foreign Space reference.
@@ -74,17 +76,38 @@ fn check_endpoint(
 
     match facts {
         EndpointFacts::Unresolved => {}
-        EndpointFacts::Literal { datatype } => {
-            if spec.datatypes.is_empty() {
+        EndpointFacts::Literal { datatype, value } => {
+            let datatype = crate::term::normalize_datatype(datatype);
+            let allowed = spec.literal_datatypes();
+            // §9.5: `null` is a semantic Literal only where the Predicate
+            // permits it, and `nullable` is how a Predicate says so.
+            if datatype == crate::term::DT_NULL && !allowed.iter().any(|name| name == "null") {
+                into.push(refuse(
+                    "null is not a permitted object here; the Predicate declares no nullable \
+                     object (§9.5)"
+                        .into(),
+                ));
+                return;
+            }
+            if allowed.is_empty() {
+                if spec.kinds.is_empty() && spec.concept_types.is_empty() {
+                    // Only a `format` was declared: a string Literal, shaped.
+                    check_format(&spec.format, value, &refuse, into);
+                    return;
+                }
                 into.push(refuse(
                     "the schema declares this endpoint an element reference, not a Literal".into(),
                 ));
-            } else if !spec.datatypes.iter().any(|allowed| allowed == datatype) {
+                return;
+            }
+            if !allowed.contains(&datatype) {
                 into.push(refuse(format!(
                     "a Literal of datatype {datatype} is not among the declared datatypes: {}",
-                    spec.datatypes.join(", ")
+                    allowed.join(", ")
                 )));
+                return;
             }
+            check_format(&spec.format, value, &refuse, into);
         }
         EndpointFacts::Element {
             kind,
@@ -98,7 +121,7 @@ fn check_endpoint(
             if spec.kinds.is_empty() && spec.concept_types.is_empty() {
                 into.push(refuse(format!(
                     "the schema declares this endpoint a Literal of {}, not an element reference",
-                    spec.datatypes.join(", ")
+                    spec.literal_datatypes().join(", ")
                 )));
                 return;
             }
@@ -138,6 +161,50 @@ fn check_endpoint(
                 )));
             }
         }
+    }
+}
+
+/// Checks a string Literal against the `format` its Predicate declares
+/// (§9.2, §20.15).
+///
+/// `timestamp` is an RFC 3339 instant and `uri` a string with a scheme; any
+/// other name is package-defined, which this engine cannot check and so
+/// accepts — inventing a failure out of a name it has not implemented would
+/// reject data on the strength of a word. A format constrains the shape of
+/// the value and never its identity: the stored Literal is the string as
+/// canonicalized (§9.6), not a parsed instant.
+fn check_format(
+    format: &str,
+    value: &Json,
+    refuse: &impl Fn(String) -> Violation,
+    into: &mut Validation,
+) {
+    if format.is_empty() {
+        return;
+    }
+    let Json::String(text) = value else {
+        // `null` was admitted above, and a non-string cannot take a string
+        // shape; the datatype check already said so where it applies.
+        return;
+    };
+    let well_formed = match format {
+        "timestamp" => crate::time::parse(text).is_ok(),
+        "uri" => {
+            let scheme_end = text.find(':').unwrap_or(0);
+            scheme_end > 0
+                && text[..scheme_end].bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_alphabetic()
+                        || (index > 0
+                            && (byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')))
+                })
+        }
+        _ => true,
+    };
+    if !well_formed {
+        into.push(refuse(format!(
+            "{text:?} is not a well-formed {format}, the shape this Predicate declares for its \
+             object (§20.15)"
+        )));
     }
 }
 
@@ -410,6 +477,7 @@ mod tests {
                 &person(),
                 &EndpointFacts::Literal {
                     datatype: "kip:string".into(),
+                    value: Json::String("x".into()),
                 },
                 Intent::Write,
             )
@@ -453,6 +521,7 @@ mod tests {
             &spec,
             &EndpointFacts::Literal {
                 datatype: "kip:string".into(),
+                value: Json::String("x".into()),
             },
             &mut allowed,
         );
@@ -486,6 +555,7 @@ mod tests {
             &either,
             &EndpointFacts::Literal {
                 datatype: "kip:string".into(),
+                value: Json::String("x".into()),
             },
             &mut both,
         );
@@ -563,15 +633,15 @@ mod tests {
 
     #[test]
     fn a_facet_declaring_concept_types_is_state_about_those_concepts() {
-        // §58: `SkillUtility` is procedural usefulness, so it belongs on a
-        // Skill. Checking only the carrier's *kind* would leave half the
-        // declaration unenforceable, and a Person carrying it would read as
-        // procedural memory nobody wrote.
+        // §58: `GradingState` tallies graded outcomes for an artifact that
+        // carries a task_family, so it belongs on a Skill. Checking only the
+        // carrier's *kind* would leave half the declaration unenforceable, and
+        // a Person carrying it would read as a grade nobody awarded.
         let env = env();
         let skill = format!("{PROFILE}@2.0.0/Skill");
         let ok = env
             .validate_facets(
-                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &map(json!({"GradingState": {"graded_count": 3}})),
                 &concept_carrier(Some(&skill)),
                 Intent::Write,
             )
@@ -581,7 +651,7 @@ mod tests {
         let person = format!("{PROFILE}@2.0.0/Person");
         let wrong = env
             .validate_facets(
-                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &map(json!({"GradingState": {"graded_count": 3}})),
                 &concept_carrier(Some(&person)),
                 Intent::Write,
             )
@@ -592,7 +662,7 @@ mod tests {
         // type, so it is not refused on that ground.
         let unknown = env
             .validate_facets(
-                &map(json!({"SkillUtility": {"utility": 0.5}})),
+                &map(json!({"GradingState": {"graded_count": 3}})),
                 &concept_carrier(None),
                 Intent::Write,
             )

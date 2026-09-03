@@ -701,6 +701,15 @@ async fn run_as(session: &Session, command: &str) -> Response {
         .await
 }
 
+/// The Receipt of a single-operation write.
+///
+/// §75 puts it on the operation's own result in `sequence` and `independent`
+/// execution; the top-level slot is reserved for an `atomic` transaction,
+/// which this engine does not run.
+fn receipt(response: &Response) -> Option<&anda_kip::Receipt> {
+    response.results.first().and_then(|r| r.receipt.as_ref())
+}
+
 fn error_code(response: &Response) -> &str {
     response
         .error
@@ -839,7 +848,7 @@ async fn a_writer_without_the_clause_permission_is_refused() {
 
     // Creating is not erasing, and it is not removing either.
     for (command, code) in [
-        (r#"TOMBSTONE "C-1""#, "NotAuthorized"),
+        (r#"TRANSITION "C-1" TO "tombstoned""#, "NotAuthorized"),
         (r#"PURGE "C-1" CONFIRM "PURGE""#, "NotAuthorized"),
     ] {
         assert_eq!(
@@ -2148,13 +2157,17 @@ async fn a_sweep_refuses_what_it_may_not_touch_rather_than_doing_less() {
     assert_eq!(
         run_as(
             &session,
-            r#"ARCHIVE ?c WHERE { ?c CONCEPT {type: "Person"} }"#
+            r#"TRANSITION ?c TO "archived" WHERE { ?c CONCEPT {type: "Person"} }"#
         )
         .await
         .status,
         TopLevelStatus::Succeeded
     );
-    let overreach = run_as(&session, r#"ARCHIVE ?e WHERE { ?e EVIDENCE {} }"#).await;
+    let overreach = run_as(
+        &session,
+        r#"TRANSITION ?e TO "archived" WHERE { ?e EVIDENCE {} }"#,
+    )
+    .await;
     assert_eq!(error_code(&overreach), "NotAuthorized");
 
     // And the Evidence really is still active, so the refusal was not partial.
@@ -2417,15 +2430,15 @@ async fn a_moderator_may_remove_a_claim_but_not_say_the_source_withdrew_it() {
     .await;
     let session = nexus.session(AuthContext::principal(&moderator));
 
-    let manufactured = run_as(&session, r#"RETRACT ASSERTION "A-1""#).await;
+    let manufactured = run_as(&session, r#"TRANSITION "A-1" TO "retracted""#).await;
     assert_eq!(error_code(&manufactured), "RetractionNotAuthorized");
     let message = &manufactured.error.as_ref().unwrap().message;
-    assert!(message.contains("ARCHIVE") && message.contains("TOMBSTONE"));
+    assert!(message.contains("\"archived\"") && message.contains("\"tombstoned\""));
 
     // The author, who wrote it, may withdraw their own record.
     let own = run_as(
         &nexus.session(AuthContext::principal(&author)),
-        r#"RETRACT ASSERTION "A-1""#,
+        r#"TRANSITION "A-1" TO "retracted""#,
     )
     .await;
     assert_eq!(own.status, TopLevelStatus::Succeeded, "{:?}", own.error);
@@ -2433,7 +2446,9 @@ async fn a_moderator_may_remove_a_claim_but_not_say_the_source_withdrew_it() {
     // And what the moderator may do instead says what it means: removal from
     // recall, with no claim about the source.
     assert_eq!(
-        run_as(&session, r#"ARCHIVE "A-1""#).await.status,
+        run_as(&session, r#"TRANSITION "A-1" TO "archived""#)
+            .await
+            .status,
         TopLevelStatus::Succeeded
     );
 }
@@ -2461,7 +2476,7 @@ async fn representing_the_actor_is_the_other_way_to_withdraw_a_claim() {
     .await;
     let session = nexus.session(AuthContext::principal(&agent_for_alice));
     assert_eq!(
-        error_code(&run_as(&session, r#"RETRACT ASSERTION "A-1""#).await),
+        error_code(&run_as(&session, r#"TRANSITION "A-1" TO "retracted""#).await),
         "RetractionNotAuthorized",
         "no binding, and it did not write the claim"
     );
@@ -2481,7 +2496,9 @@ async fn representing_the_actor_is_the_other_way_to_withdraw_a_claim() {
         .await
         .unwrap();
     assert_eq!(
-        run_as(&session, r#"RETRACT ASSERTION "A-1""#).await.status,
+        run_as(&session, r#"TRANSITION "A-1" TO "retracted""#)
+            .await
+            .status,
         TopLevelStatus::Succeeded,
         "representation authority is the other way to hold this"
     );
@@ -2705,13 +2722,28 @@ async fn element_governance_changes_join_the_transaction_journal() {
         .unwrap();
     let response = run_as(&owner, "CHANGES AFTER SEQ 1").await;
     let transactions = response.first_result().unwrap().as_array().unwrap();
-    assert!(transactions.iter().any(|transaction| {
-        transaction["changes"].as_array().is_some_and(|changes| {
-            changes
-                .iter()
-                .any(|change| change["id"] == "C-1" && change["op"] == "classify")
-        })
-    }));
+    // §36.1 closed the `op` vocabulary to create/update/lifecycle/retention/
+    // merge/purge/payload_purge, so a Governance decision no longer names
+    // itself in `op`. A relabel that leaves the lifecycle state alone is an
+    // `update`, and `touched` says which Governance member moved — names, not
+    // values, which is exactly what a follower needs to decide whether to
+    // re-read the element.
+    let entry = transactions
+        .iter()
+        .filter_map(|transaction| transaction["changes"].as_array())
+        .flatten()
+        .find(|change| change["id"] == "C-1" && change["op"] == "update")
+        .unwrap_or_else(|| panic!("the classify must reach the journal: {transactions:#?}"));
+    assert_eq!(entry["kind"], "concept");
+    assert_eq!(
+        entry["touched"],
+        serde_json::json!(["governance.classification"])
+    );
+    assert_eq!(entry["old_version"], serde_json::json!(1));
+    assert_eq!(entry["new_version"], serde_json::json!(2));
+    // The label itself is not in the envelope: §36.1 carries names, never
+    // values, and a consumer reads the payload under its own authority.
+    assert!(!entry.to_string().contains("secret"));
 }
 
 #[tokio::test]
@@ -2915,7 +2947,7 @@ async fn releasing_something_that_was_archived_is_refused() {
         r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
     )
     .await;
-    run_as(&owner, r#"ARCHIVE "C-1""#).await;
+    run_as(&owner, r#"TRANSITION "C-1" TO "archived""#).await;
     let err = owner
         .release_quarantine(
             DEFAULT_SPACE,
@@ -2982,7 +3014,9 @@ async fn purging_needs_the_purge_permission_and_not_merely_tombstone() {
         "NotAuthorized"
     );
     assert_eq!(
-        run_as(&session, r#"TOMBSTONE "C-1""#).await.status,
+        run_as(&session, r#"TRANSITION "C-1" TO "tombstoned""#)
+            .await
+            .status,
         TopLevelStatus::Succeeded
     );
 }
@@ -3113,7 +3147,7 @@ async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
     .await;
     let session = nexus.session(AuthContext::principal(&moderator));
 
-    let denied = run_as(&session, r#"ARCHIVE "A-1""#).await;
+    let denied = run_as(&session, r#"TRANSITION "A-1" TO "archived""#).await;
     assert_eq!(error_code(&denied), "NotAuthorized");
     assert!(
         denied
@@ -3123,14 +3157,16 @@ async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
             .is_some_and(|e| e.message.contains("moderate_assertion"))
     );
     assert_eq!(
-        error_code(&run_as(&session, r#"TOMBSTONE "A-1""#).await),
+        error_code(&run_as(&session, r#"TRANSITION "A-1" TO "tombstoned""#).await),
         "NotAuthorized"
     );
 
     // A Concept is not an Assertion, so nothing about it is moderation — the
     // gate narrows what it asks for rather than taxing every sweep.
     assert_eq!(
-        run_as(&session, r#"ARCHIVE "C-2""#).await.status,
+        run_as(&session, r#"TRANSITION "C-2" TO "archived""#)
+            .await
+            .status,
         TopLevelStatus::Succeeded
     );
 
@@ -3148,7 +3184,9 @@ async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
         TopLevelStatus::Succeeded
     );
     assert_eq!(
-        run_as(&session, r#"ARCHIVE "A-2""#).await.status,
+        run_as(&session, r#"TRANSITION "A-2" TO "archived""#)
+            .await
+            .status,
         TopLevelStatus::Succeeded
     );
 }
@@ -3184,7 +3222,11 @@ async fn binding_a_canonical_identity_asks_for_more_than_editing_a_label() {
     );
 
     // Ordinary grounding state is what `create` and `update` cover.
-    let created = run_as(&session, r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#).await;
+    let created = run_as(
+        &session,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
     assert_eq!(created.status, TopLevelStatus::Succeeded);
     let alice = created.results[0].result.as_ref().unwrap()["handles"]["c"]
         .as_str()
@@ -3319,8 +3361,8 @@ async fn a_permission_no_gate_asks_for_is_refused_rather_than_accepted() {
     // exposes no controlled cross-Space view and versions no trust policy, so
     // nothing would ever ask for either.
     for name in ["derive", "share", "manage_trust"] {
-        let error = Permission::parse(name)
-            .expect_err("a name no gate asks for is not in the registry");
+        let error =
+            Permission::parse(name).expect_err("a name no gate asks for is not in the registry");
         assert_eq!(error.code, anda_kip::KipErrorCode::NotAuthorized, "{name}");
     }
 
@@ -3381,7 +3423,14 @@ async fn a_cognitive_writer_cannot_lift_a_legal_hold_by_writing_around_it() {
     )
     .await;
     assert_eq!(error_code(&lifted), "NotAuthorized");
-    assert!(lifted.error.as_ref().unwrap().message.contains("legal_hold"));
+    assert!(
+        lifted
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("legal_hold")
+    );
 
     // Neither is naming it as false.
     assert_eq!(
@@ -3407,7 +3456,7 @@ async fn a_cognitive_writer_cannot_lift_a_legal_hold_by_writing_around_it() {
     grant(
         &nexus,
         &holder,
-        &["read", "manage_retention", "legal_hold"],
+        &["read", "manage_retention", "manage_legal_hold"],
         AuthorityScope::default(),
     )
     .await;
@@ -4115,14 +4164,7 @@ async fn a_high_impact_receipt_explains_what_authorized_it() {
     )
     .await;
     let purged = run_as(&owner, r#"PURGE "E-1" CONFIRM "PURGE""#).await;
-    let provenance = purged
-        .receipt
-        .as_ref()
-        .unwrap()
-        .extensions
-        .as_ref()
-        .unwrap()["governance"]
-        .clone();
+    let provenance = receipt(&purged).unwrap().extensions.as_ref().unwrap()["governance"].clone();
     assert_eq!(provenance["principal_id"], SYSTEM_PRINCIPAL);
     assert!(
         provenance["operations"]
@@ -4140,9 +4182,7 @@ async fn a_high_impact_receipt_explains_what_authorized_it() {
     )
     .await;
     assert!(
-        ordinary
-            .receipt
-            .as_ref()
+        receipt(&ordinary)
             .unwrap()
             .extensions
             .as_ref()

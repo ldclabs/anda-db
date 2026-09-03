@@ -32,9 +32,15 @@
  */
 
 import { formatElementId, type ElementId } from '../id.js'
-import { jsonEquals, type Json, type JsonMap } from '../json.js'
-import { predicateDef } from '../schema/index.js'
-import { parseSymbolRef } from '../schema/index.js'
+import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
+import {
+  lineageText,
+  parseSymbolRef,
+  predicateDef,
+  predicateRules,
+  type PredicateRules,
+} from '../schema/index.js'
+import { endpointFromJson, endpointKey } from '../term.js'
 import {
   State,
   type AssertionRow,
@@ -145,12 +151,17 @@ export function project(
     if (candidate !== null) candidates.push(candidate)
   }
 
-  // Conflict-set expansion (§58): support for a rival value of a functional
-  // slot is opposition to this one. The schema says the slot holds one value,
-  // so somebody claiming another value *is* disagreeing — even though no
-  // Assertion anywhere says "not this".
-  if (policy.expand_conflicts) {
-    for (const rival of functionalRivals(cx, proposition)) {
+  // Conflict-set expansion (§25, §20.15): support for a rival value of a
+  // functional slot is opposition to this one. The schema says the slot holds
+  // one value, so somebody claiming another value *is* disagreeing — even
+  // though no Assertion anywhere says "not this". `complete` says the
+  // candidates are exclusive, which this expansion already treats them as;
+  // `boolean_completeness` does the same for `true` against `false` on a
+  // non-functional Predicate; and `temporal_conflict: "none"` turns the whole
+  // rule off, because values that never conflict on time never conflict.
+  const rules = predicateRulesOf(cx, proposition)
+  if (policy.expand_conflicts && rules.temporal_conflict !== 'none') {
+    for (const rival of exclusiveRivals(cx, proposition, rules)) {
       for (const row of assertionsAbout(cx, rival)) {
         const candidate = admit(row, policy, ledger, true)
         if (candidate !== null) candidates.push(candidate)
@@ -162,6 +173,14 @@ export function project(
   const [opposition, oppositionGroups] = aggregate(candidates, true)
   ledger.supportGroups = supportGroups
   ledger.oppositionGroups = oppositionGroups
+
+  if (!rules.open_world) {
+    ledger.warnings.push(
+      'the Predicate is declared closed-world (§24.2): an absence of ' +
+        'Propositions may be read as closed-world, but this projection still ' +
+        'reports insufficient rather than inferring rejection from silence',
+    )
+  }
 
   return {
     proposition,
@@ -369,12 +388,39 @@ function classify(
   return 'uncertain'
 }
 
+/**
+ * The side the policy would favor if forced to choose (§27.2, §21.6).
+ *
+ * `support` under `accepted`, `opposition` under `rejected`, and under
+ * `contested` the side with more eligible independent roots — the
+ * corroboration groups §23 counts once each — with an exact tie, `uncertain`
+ * and `insufficient` reporting `none`. Disclosure for a consumer that must act
+ * anyway; it never changes `status`.
+ */
+export function leadingSide(belief: Belief): 'support' | 'opposition' | 'none' {
+  switch (belief.status) {
+    case 'accepted':
+      return 'support'
+    case 'rejected':
+      return 'opposition'
+    case 'contested': {
+      const support = belief.ledger.supportGroups.length
+      const opposition = belief.ledger.oppositionGroups.length
+      if (support === opposition) return 'none'
+      return support > opposition ? 'support' : 'opposition'
+    }
+    default:
+      return 'none'
+  }
+}
+
 /** The projection output a query binds and projects (§27.2). */
 export function beliefToJson(belief: Belief): JsonMap {
   return {
     proposition_id:
       belief.proposition === null ? null : formatElementId(belief.proposition),
     status: belief.status,
+    leading: leadingSide(belief),
     // The Assertion ids and the corroboration groups *are* the ledger: they
     // name who said it and which observations stood behind them. A caller that
     // asked for no explanation is not handed them under another key (§49.2).
@@ -605,40 +651,73 @@ function assertionsAbout(cx: Context, proposition: ElementId): AssertionRow[] {
   return visible
 }
 
-/** The Propositions competing with this one for a functional slot. */
-export function functionalRivals(
+/** The Predicate's declarations behind one Proposition, with §20.15's defaults. */
+function predicateRulesOf(cx: Context, target: ElementId): PredicateRules {
+  const element = cx.load(target)
+  if (element === null || element.kind !== 'Proposition') return predicateRules(undefined)
+  try {
+    const symbol = parseSymbolRef(element.row.predicate_ref)
+    const definition = cx.env.definitionPackage(symbol)
+    return predicateRules(
+      definition === undefined ? undefined : predicateDef(definition, symbol.name),
+    )
+  } catch {
+    // A predicate this environment cannot resolve declares nothing, so it
+    // declares no exclusivity either.
+    return predicateRules(undefined)
+  }
+}
+
+/**
+ * The Propositions whose support counts against this one (§25, §20.15).
+ *
+ * On a `functional` slot every other object is a rival — the slot holds one
+ * value, and `complete` only says out loud that accepting one rejects the
+ * others. Under `boolean_completeness` the one rival is the other boolean
+ * value: `(s, p, false)` is the negation of `(s, p, true)`, and nothing else
+ * in the slot is.
+ */
+export function exclusiveRivals(
   cx: Context,
   target: ElementId,
+  rules: PredicateRules,
 ): ElementId[] {
   const element = cx.load(target)
   if (element === null || element.kind !== 'Proposition') return []
   const row = element.row
+  const others = () =>
+    slotPropositions(cx, [row.subject_key], lineageText(row.predicate_ref)).filter(
+      (id) => id.seq !== target.seq,
+    )
 
-  let functional = false
-  try {
-    const symbol = parseSymbolRef(row.predicate_ref)
-    const definition = cx.env.definitionPackage(symbol)
-    functional =
-      definition !== undefined &&
-      predicateDef(definition, symbol.name)?.functional === true
-  } catch {
-    // A predicate this environment cannot resolve declares nothing, so it
-    // declares no exclusivity either.
-    return []
+  if (rules.functional) return others()
+  if (rules.boolean_completeness) {
+    const object = row.object as Json
+    const value = isJsonMap(object) ? object.value : undefined
+    if (typeof value !== 'boolean') return []
+    const negation = endpointKey(endpointFromJson({ value: !value, datatype: 'kip:boolean' }))
+    return others().filter((id) => {
+      const rival = cx.load(id)
+      return rival?.kind === 'Proposition' && rival.row.object_key === negation
+    })
   }
-  if (!functional) return []
-
-  return slotPropositions(cx, row.subject_key, row.predicate_ref).filter(
-    (id) => id.seq !== target.seq,
-  )
+  return []
 }
 
-/** Every active Proposition in one `(subject, predicate)` slot. */
+/**
+ * Every active Proposition in one `(subject, predicate)` slot (§47.2).
+ *
+ * The subject is a set of endpoint keys — every merged spelling of one
+ * canonical identity (§43.2) — and the predicate a lineage (§20.14), so the
+ * slot sees every Assertion in it whichever version or spelling its
+ * Proposition was created under.
+ */
 export function slotPropositions(
   cx: Context,
-  subjectKey: string,
-  predicateRef: string,
+  subjectKeys: readonly string[],
+  predicateLineage: string,
 ): ElementId[] {
+  if (subjectKeys.length === 0) return []
   if (cx.historical) {
     return cx
       .reconstruct('Proposition')
@@ -646,8 +725,9 @@ export function slotPropositions(
         const row = element.row as PropositionRow
         return (
           row.state === State.ACTIVE &&
-          row.subject_key === subjectKey &&
-          row.predicate_ref === predicateRef
+          subjectKeys.includes(row.subject_key) &&
+          (row.predicate_lineage === '' ? lineageText(row.predicate_ref) : row.predicate_lineage) ===
+            predicateLineage
         )
       })
       .map((element) => ({ kind: 'Proposition', seq: element.row.id }) as ElementId)
@@ -660,12 +740,14 @@ export function slotPropositions(
   const rows = cx.store.sql
     .exec<SqlRow>(
       `SELECT * FROM propositions
-         WHERE space = ? AND state = ? AND subject_key = ? AND predicate_ref = ?
+         WHERE space = ? AND state = ?
+           AND subject_key IN (SELECT value FROM json_each(?))
+           AND predicate_lineage = ?
          ORDER BY id`,
       cx.space,
       State.ACTIVE,
-      subjectKey,
-      predicateRef,
+      JSON.stringify(subjectKeys),
+      predicateLineage,
     )
     .toArray()
   cx.spend('scans', rows.length)

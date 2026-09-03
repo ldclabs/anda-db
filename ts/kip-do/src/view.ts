@@ -30,15 +30,22 @@ import {
   isQualified,
   type SchemaEnvironment,
 } from './schema/index.js'
-import type {
-  ActivityRow,
-  AssertionRow,
-  ConceptRow,
-  Element,
-  Envelope,
-  EvidenceRow,
-  PropositionRow,
+import {
+  planesToJson,
+  type ActivityRow,
+  type AssertionRow,
+  type ConceptRow,
+  type Element,
+  type Envelope,
+  type EvidenceRow,
+  type PropositionRow,
 } from './store/index.js'
+
+/**
+ * The influence-authority class an element has when Governance never
+ * assigned one (§31.3).
+ */
+const DEFAULT_AUTHORITY_CLASS = 'descriptive'
 
 /** Drops the members the Core wire shape omits when they are empty. */
 function present(map: Record<string, Json | undefined>): JsonMap {
@@ -59,11 +66,14 @@ function envelope(id: ElementId, row: Envelope): JsonMap {
     // Lowercase, as the wire tag: `?c.kind` answers "concept", not "Concept".
     kind: id.kind.toLowerCase(),
     space_id: row.space,
-    governance: row.governance,
+    // §31.3: an element without the member has `descriptive` authority, and
+    // the view says so rather than leaving a reader to know the default.
+    governance: { authority_class: DEFAULT_AUTHORITY_CLASS, ...row.governance },
     retention: row.retention,
     facets: row.facets,
     _system: present({
       version: row.version,
+      plane_versions: planesToJson(row.plane_versions),
       created_at: row.created_at,
       updated_at: row.updated_at,
       created_tx: row.created_tx,

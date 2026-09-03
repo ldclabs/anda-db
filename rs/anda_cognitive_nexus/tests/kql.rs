@@ -394,7 +394,7 @@ async fn an_archived_element_leaves_ordinary_recall_but_still_exists() {
 
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
-        "operations": [{"command": "ARCHIVE :x", "parameters": {"x": alice}}]
+        "operations": [{"command": "TRANSITION :x TO \"archived\"", "parameters": {"x": alice}}]
     }))
     .unwrap();
     let parsed = request.operations[0].parse().unwrap();

@@ -5,7 +5,7 @@
  * `anda_kip_wasm::error_catalog()`.
  * Regenerate with `pnpm run codegen:errors` after changing the Rust registry.
  *
- * Grammar version: 0.12.0
+ * Grammar version: 0.13.0
  */
 
 /** The coarse family an error belongs to (Spec §86.2). */
@@ -101,9 +101,7 @@ export type KipErrorCode =
   | "CursorMismatch"
   | "CursorTypeMismatch"
   | "CursorExpired"
-  | "CursorInvalidated"
-  | "ChangeCursorExpired"
-  | "ChangeCursorInvalid"
+  | "CursorInvalid"
   | "SearchModeUnsupported"
   | "SearchIndexUnavailable"
   | "HistoricalSearchUnavailable"
@@ -182,9 +180,7 @@ export const KIP_ERROR_CODES: readonly KipErrorCode[] = [
   "CursorMismatch",
   "CursorTypeMismatch",
   "CursorExpired",
-  "CursorInvalidated",
-  "ChangeCursorExpired",
-  "ChangeCursorInvalid",
+  "CursorInvalid",
   "SearchModeUnsupported",
   "SearchIndexUnavailable",
   "HistoricalSearchUnavailable",
@@ -354,17 +350,17 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   "EpistemicRevisionRequired": {
     category: "epistemic",
     retry: "requires_different_input",
-    hint: "An Assertion's epistemic payload never changes. Record a new Assertion and `SUPERSEDE` the old one.",
+    hint: "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`.",
   },
   "EvidenceCorrectionRequired": {
     category: "epistemic",
     retry: "requires_different_input",
-    hint: "Evidence payload never changes. Use `CORRECT EVIDENCE :old BY :new`.",
+    hint: "Evidence payload never changes. Record the corrected Evidence and `TRANSITION :old TO \"corrected\" BY :new`.",
   },
   "InvalidLifecycleTransition": {
     category: "epistemic",
     retry: "requires_different_input",
-    hint: "Read the element's current lifecycle state first; that transition is not legal from where it is.",
+    hint: "Read the element's current lifecycle state first (`details.from` / `details.to`); that TRANSITION is not legal from where it is, or not for its kind.",
   },
   "RetractionNotAuthorized": {
     category: "epistemic",
@@ -384,7 +380,7 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   "ActivityTerminal": {
     category: "epistemic",
     retry: "requires_different_input",
-    hint: "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ACTIVITY` that ends it.",
+    hint: "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ... TO \"completed\" SET STRUCTURAL` that ends it.",
   },
   "ProjectionTargetUnbound": {
     category: "epistemic",
@@ -509,22 +505,12 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   "CursorExpired": {
     category: "history",
     retry: "requires_new_snapshot",
-    hint: "Restart pagination from a fresh first page.",
+    hint: "Restart pagination from a fresh first page; a change cursor restarts from a sequence you recorded, never from the current head. `details.family` names the cursor family.",
   },
-  "CursorInvalidated": {
+  "CursorInvalid": {
     category: "history",
     retry: "requires_new_snapshot",
-    hint: "An intervening change invalidated the cursor. Restart pagination.",
-  },
-  "ChangeCursorExpired": {
-    category: "history",
-    retry: "requires_new_snapshot",
-    hint: "Re-subscribe from a newer change coordinate.",
-  },
-  "ChangeCursorInvalid": {
-    category: "history",
-    retry: "requires_different_input",
-    hint: "The change cursor is malformed. Re-acquire it from the runtime.",
+    hint: "The cursor is malformed, belongs to another traversal, or was invalidated (`details.reason`: malformed, access_revoked, schema_changed). Restart pagination from a fresh first page.",
   },
   "SearchModeUnsupported": {
     category: "search",

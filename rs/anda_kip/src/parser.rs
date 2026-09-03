@@ -387,7 +387,10 @@ mod tests {
                 r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated" }"#,
                 CommandType::Kml,
             ),
-            (r#"MUTATE { ARCHIVE :old }"#, CommandType::Kml),
+            (
+                r#"MUTATE { TRANSITION :old TO "archived" }"#,
+                CommandType::Kml,
+            ),
             (r#"DESCRIBE PRIMER"#, CommandType::Meta),
             (r#"SEARCH CONCEPT "aspirin""#, CommandType::Meta),
             (
@@ -404,8 +407,12 @@ mod tests {
     #[test]
     fn a_write_is_a_write_whatever_it_is_labelled() {
         // Spec §73.1: the runtime classifies actual semantics.
-        assert!(parse_kip(r#"TOMBSTONE :x"#).unwrap().is_mutation());
-        assert!(!parse_kip(r#"SNAPSHOT"#).unwrap().is_mutation());
+        assert!(
+            parse_kip(r#"TRANSITION :x TO "tombstoned""#)
+                .unwrap()
+                .is_mutation()
+        );
+        assert!(!parse_kip(r#"DESCRIBE SNAPSHOT"#).unwrap().is_mutation());
     }
 
     #[test]

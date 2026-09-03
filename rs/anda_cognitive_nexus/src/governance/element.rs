@@ -52,8 +52,9 @@ use crate::id::ElementId;
 use crate::store::rows::state;
 use crate::store::{Element, Store};
 
-/// The `governance` member holding an element's influence-authority ceiling.
-pub const AUTHORITY_KEY: &str = "max_influence_authority";
+/// The `governance` member holding an element's influence-authority ceiling
+/// (§31.3): read as `?x.governance.authority_class`, `descriptive` when absent.
+pub const AUTHORITY_KEY: &str = "authority_class";
 /// The `governance` member recording what a derived element was derived from.
 pub const LINEAGE_KEY: &str = "authority_lineage";
 /// The `governance` member recording why an element is held out of use.
@@ -456,6 +457,13 @@ where
     R: crate::store::write::Row,
     F: Fn(&Json) -> Json,
 {
+    // Read before the patch, not after it: an entry whose `before` was taken
+    // from the already-patched row can only ever report that nothing moved,
+    // and §36.1's `touched` and `state {from, to}` are the two things a
+    // follower reads to decide whether to re-read the element at all.
+    let before_version = *row.envelope_mut().version;
+    let before_state = row.envelope_mut().state.clone();
+    let before_governance = row.envelope_mut().governance.clone();
     {
         let envelope = row.envelope_mut();
         let updated = patch(envelope.governance);
@@ -468,6 +476,43 @@ where
     let id = ElementId::new(R::KIND, row.id());
     store.record_version(cx, id, version, op, &row).await?;
     let schema_environment_version = store.get_space(&cx.space).await?.schema_environment_version;
+    // The same entry shape a cognitive commit journals (§36.1): a Governance
+    // decision that moved the state is a `lifecycle` entry, one that relabelled
+    // the element is an `update` naming the Governance member it touched.
+    let after_state = row.envelope_mut().state.clone();
+    let after_governance = row.envelope_mut().governance.clone();
+    let mut touched: Vec<String> = Vec::new();
+    let empty = serde_json::Map::new();
+    let before_members = before_governance.as_object().unwrap_or(&empty);
+    let after_members = after_governance.as_object().unwrap_or(&empty);
+    for member in before_members.keys().chain(after_members.keys()) {
+        if before_members.get(member) != after_members.get(member) {
+            touched.push(format!("governance.{member}"));
+        }
+    }
+    touched.sort();
+    touched.dedup();
+    let moved = before_state != after_state || op == "expire";
+    let entry = anda_kip::ChangeEntry {
+        op: if moved {
+            anda_kip::ChangeOp::Lifecycle
+        } else {
+            anda_kip::ChangeOp::Update
+        },
+        kind: id.kind,
+        id: id.to_string(),
+        schema_ref: None,
+        old_version: Some(before_version),
+        new_version: version,
+        state: moved.then(|| anda_kip::ChangeState {
+            from: lifecycle_word(&before_state, op, true),
+            to: lifecycle_word(&after_state, op, false),
+        }),
+        refs: None,
+        touched,
+        planes: None,
+        extensions: None,
+    };
     store
         .journal(
             cx,
@@ -476,17 +521,27 @@ where
                 transaction_class: "governance".to_string(),
                 schema_environment_version,
                 result: serde_json::json!({"element": id.to_string(), "op": op}),
-                changes: vec![serde_json::json!({
-                    "id": id.to_string(),
-                    "kind": id.kind.to_string(),
-                    "op": op,
-                    "version": version,
-                })],
+                changes: vec![crate::tx::entry_json(&entry)],
                 ..Default::default()
             },
         )
         .await?;
     Ok(version)
+}
+
+/// The lifecycle word a Governance move records (§36.1).
+///
+/// An Assertion expiry keeps the engine state `active` and moves the record's
+/// own status, so it is spelled from that status rather than from `state`.
+fn lifecycle_word(state: &str, op: &str, before: bool) -> String {
+    if op == "expire" {
+        return if before { "active" } else { "expired" }.to_string();
+    }
+    if state.is_empty() {
+        crate::store::rows::state::ACTIVE.to_string()
+    } else {
+        state.to_string()
+    }
 }
 
 /// Merges one member into an element's Governance block.

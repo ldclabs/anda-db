@@ -140,3 +140,57 @@ export const errors: ErrorFactories = Object.fromEntries(
     (message: string, details?: Json) => new KipError(code, message, details),
   ]),
 ) as ErrorFactories
+
+/**
+ * The cursor families §87.7 names, plus `snapshot` for a `read.snapshot_token`.
+ *
+ * `details.family` on a `CursorExpired` / `CursorInvalid` names which
+ * traversal the token belonged to, so a client restarting pagination knows
+ * which first page to ask for again.
+ */
+export type CursorFamily =
+  | 'kql'
+  | 'search'
+  | 'history'
+  | 'list'
+  | 'changes'
+  | 'export'
+  | 'snapshot'
+
+/** Why a cursor was refused (§87.7). */
+export type CursorReason = 'expired' | 'malformed' | 'access_revoked' | 'schema_changed'
+
+/**
+ * The detail-carrying constructors `anda_kip::KipError` has, so the two
+ * engines put the same members in `details` for the same failure.
+ *
+ * Kept beside the generated factories rather than folded into them: the
+ * generated ones take an opaque `details`, and a caller that had to remember
+ * the member names for a cursor refusal would eventually spell one of them
+ * differently from the Rust engine.
+ */
+export const detailed = {
+  /** A `CursorExpired` naming its family (§87.7). */
+  cursorExpired(family: CursorFamily, message: string): KipError {
+    return new KipError('CursorExpired', message, { family, reason: 'expired' })
+  },
+  /** A `CursorInvalid` naming its family and the reason (§87.7). */
+  cursorInvalid(
+    family: CursorFamily,
+    reason: Exclude<CursorReason, 'expired'>,
+    message: string,
+  ): KipError {
+    return new KipError('CursorInvalid', message, { family, reason })
+  },
+  /**
+   * An `InvalidLifecycleTransition` naming the move it refused, as
+   * `details.from` / `details.to` (§52.5).
+   */
+  invalidLifecycleTransitionFrom(from: string, to: string, message: string): KipError {
+    return new KipError('InvalidLifecycleTransition', message, { from, to })
+  },
+  /** A `VersionConflict` on one version plane, named in `details.plane` (§35.1). */
+  versionConflictOnPlane(plane: string, message: string): KipError {
+    return new KipError('VersionConflict', message, { plane })
+  },
+} as const

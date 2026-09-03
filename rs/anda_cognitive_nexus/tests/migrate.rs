@@ -279,6 +279,34 @@ async fn a_1_x_database_migrates_on_the_first_2_0_start() {
     )
     .await;
     assert_eq!(legacy, json!(["private"]));
+
+    // What arrives is a 2.0 element, not a 1.x row wearing a new name: §6.3's
+    // version planes have to be there from the first read, or every
+    // `EXPECT VERSION ... OF <plane>` a migrated Space serves would compare
+    // against a counter that was never initialized. A migrated Concept has
+    // attributes and no structural references, so §35.2 wants exactly one
+    // plane at 1 and the rest at 0.
+    let planes = query(
+        &nexus,
+        r#"FIND(?c._system.version, ?c._system.plane_versions)
+           WHERE { ?c CONCEPT {name: "Alice"} }"#,
+    )
+    .await;
+    let row = &planes.as_array().unwrap()[0];
+    assert_eq!(row[0], json!(1), "a migrated element starts at version 1");
+    assert_eq!(row[1]["attributes"], json!(1));
+    assert_eq!(row[1]["structural"], json!(0));
+    assert_eq!(row[1]["retention"], json!(0));
+
+    // And §31.4's floor is reported rather than left as a hole for a client to
+    // fill in: nothing carried in from 1.x may influence behaviour until this
+    // Space's Governance says so.
+    let ceiling = query(
+        &nexus,
+        r#"FIND(?c.governance.authority_class) WHERE { ?c CONCEPT {name: "Alice"} }"#,
+    )
+    .await;
+    assert_eq!(ceiling, json!(["descriptive"]));
 }
 
 #[tokio::test]

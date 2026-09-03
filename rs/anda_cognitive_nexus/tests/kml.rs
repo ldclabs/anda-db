@@ -55,6 +55,15 @@ async fn run(nexus: &CognitiveNexus, command: &str) -> anda_kip::Response {
         .await
 }
 
+/// The Receipt of a single-operation write.
+///
+/// §75 puts it on the operation's own result in `sequence` and `independent`
+/// execution; the top-level slot is reserved for an `atomic` transaction,
+/// which this engine does not run.
+fn receipt(response: &anda_kip::Response) -> Option<&anda_kip::Receipt> {
+    response.results.first().and_then(|r| r.receipt.as_ref())
+}
+
 /// Runs one command and asserts it succeeded, returning the result body.
 async fn ok(nexus: &CognitiveNexus, command: &str) -> Json {
     let response = run(nexus, command).await;
@@ -210,10 +219,7 @@ async fn ensure_resolves_an_existing_tuple_instead_of_duplicating_it() {
     );
     // Resolving an existing tuple is not a change: no version bump, and the
     // receipt says so rather than claiming a transition.
-    assert_eq!(
-        response.receipt.as_ref().unwrap().status,
-        ReceiptStatus::NoEffect
-    );
+    assert_eq!(receipt(&response).unwrap().status, ReceiptStatus::NoEffect);
     let Element::Proposition(row) = nexus.store.get_element(proposition).await.unwrap() else {
         panic!("must be a Proposition");
     };
@@ -248,7 +254,7 @@ async fn correcting_a_claim_supersedes_it_rather_than_rewriting_it() {
                 CREATE ASSERTION ?new {
                     SET FIELDS {proposition: :p, asserted_by: :alice, stance: "reject", mode: "stated", confidence: 0.8}
                 }
-                SUPERSEDE ASSERTION :old BY ?new
+                TRANSITION :old TO "superseded" BY ?new
             }"#,
             "parameters": {
                 "p": proposition.to_string(),
@@ -314,7 +320,7 @@ async fn supersession_must_stay_inside_one_lineage() {
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
         "operations": [{
-            "command": "SUPERSEDE ASSERTION :a1 BY :a2",
+            "command": "TRANSITION :a1 TO \"superseded\" BY :a2",
             "parameters": {
                 "a1": handle(&setup, "a1").to_string(),
                 "a2": handle(&setup, "a2").to_string()
@@ -398,7 +404,7 @@ async fn a_dry_run_computes_the_plan_and_commits_nothing() {
         .await;
 
     assert_eq!(response.status, TopLevelStatus::Succeeded);
-    let receipt = response.receipt.as_ref().unwrap();
+    let receipt = receipt(&response).unwrap();
     assert_eq!(receipt.status, ReceiptStatus::NoEffect);
     assert!(receipt.space_seq.is_none(), "nothing committed");
     // It still reports what it would have done.
@@ -435,7 +441,7 @@ async fn retraction_withdraws_a_claim_without_deleting_it() {
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
         "operations": [{
-            "command": "RETRACT ASSERTION :a",
+            "command": "TRANSITION :a TO \"retracted\"",
             "parameters": {"a": assertion.to_string()}
         }]
     }))
@@ -537,10 +543,7 @@ async fn an_upsert_resolves_identity_through_key_and_never_through_name() {
            }"#,
     )
     .await;
-    assert_eq!(
-        response.receipt.as_ref().unwrap().status,
-        ReceiptStatus::NoEffect
-    );
+    assert_eq!(receipt(&response).unwrap().status, ReceiptStatus::NoEffect);
     let Element::Concept(row) = nexus.store.get_element(id).await.unwrap() else {
         panic!("must be a Concept");
     };
@@ -747,7 +750,7 @@ async fn an_expect_version_guard_stops_a_lost_update() {
 
     let stale = run(
         &nexus,
-        r#"UPSERT CONCEPT ?p { MATCH {key: "k"} EXPECT VERSION 99 SET FIELDS {name: "Two"} }"#,
+        r#"UPSERT CONCEPT ?p { MATCH {key: "k"} SET FIELDS {name: "Two"} } EXPECT VERSION 99"#,
     )
     .await;
     assert_eq!(
@@ -780,7 +783,7 @@ async fn archiving_removes_from_recall_without_breaking_references() {
 
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
-        "operations": [{"command": "ARCHIVE :x", "parameters": {"x": dark.to_string()}}]
+        "operations": [{"command": "TRANSITION :x TO \"archived\"", "parameters": {"x": dark.to_string()}}]
     }))
     .unwrap();
     let parsed = request.operations[0].parse().unwrap();
@@ -820,7 +823,7 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
         .execute(parsed, &request, &request.operations[0])
         .await;
     assert_eq!(response.status, TopLevelStatus::Succeeded);
-    let tx_id = response.receipt.as_ref().unwrap().tx_id.clone().unwrap();
+    let tx_id = receipt(&response).unwrap().tx_id.clone().unwrap();
 
     let recovered = nexus
         .store
@@ -860,10 +863,7 @@ async fn a_resend_under_the_same_key_replays_instead_of_writing_again() {
 
     // The same receipt, down to the transaction it names: a caller that
     // compares them can tell its write landed.
-    let (a, b) = (
-        first.receipt.as_ref().unwrap(),
-        again.receipt.as_ref().unwrap(),
-    );
+    let (a, b) = (receipt(&first).unwrap(), receipt(&again).unwrap());
     // The whole receipt, member for member: a replay that reconstructed one
     // field through a second expression is exactly how the two would drift.
     assert_eq!(a, b);
@@ -883,7 +883,7 @@ async fn a_resend_under_the_same_key_replays_instead_of_writing_again() {
     // key being the caller's to choose.
     let other = send(&nexus, "key-2").await;
     assert_eq!(other.status, TopLevelStatus::Succeeded);
-    assert_ne!(other.receipt.as_ref().unwrap().tx_id, a.tx_id);
+    assert_ne!(receipt(&other).unwrap().tx_id, a.tx_id);
     let found = ok(
         &nexus,
         r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: "Person", name: "Alice"} }"#,
@@ -1004,7 +1004,7 @@ async fn a_payload_purge_destroys_the_bytes_and_keeps_the_evidence() {
         "the purged payload must leave the search index: {found:#?}"
     );
 
-    // The change stream names it `purge_payload`, not `purge`: a follower that
+    // The change stream names it `payload_purge`, not `purge`: a follower that
     // could not tell the two apart would read a data-minimization decision as
     // the loss of the record (§36).
     let history = ok(&nexus, r#"HISTORY ELEMENT "E-1""#).await;
@@ -1015,7 +1015,7 @@ async fn a_payload_purge_destroys_the_bytes_and_keeps_the_evidence() {
         .flat_map(|entry| entry["changes"].as_array().unwrap())
         .filter_map(|change| change["op"].as_str())
         .collect();
-    assert_eq!(ops, vec!["create", "purge_payload"], "{history:#?}");
+    assert_eq!(ops, vec!["create", "payload_purge"], "{history:#?}");
 
     // The citation still resolves: an Assertion whose Evidence went to a stub
     // would be a history pointing at nothing, which is the failure element
@@ -1034,7 +1034,7 @@ async fn a_payload_purge_reaches_the_version_log() {
     // the whole row it wrote, so a payload cleared only in the current row
     // stays fully readable through `AS OF`.
     let nexus = with_cited_evidence("purge_payload_history").await;
-    let seq_before = ok(&nexus, "SNAPSHOT").await["snapshot_seq"]
+    let seq_before = ok(&nexus, "DESCRIBE SNAPSHOT").await["space_seq"]
         .as_u64()
         .unwrap();
     ok(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
@@ -1067,7 +1067,7 @@ async fn purging_an_already_purged_payload_is_a_no_effect() {
     let again = run(&nexus, r#"PURGE PAYLOAD "E-1" CONFIRM "PURGE""#).await;
     assert_eq!(again.status, TopLevelStatus::Succeeded);
     assert_eq!(
-        again.receipt.as_ref().map(|r| r.status),
+        receipt(&again).map(|r| r.status),
         Some(ReceiptStatus::NoEffect)
     );
     assert_eq!(
@@ -1112,5 +1112,603 @@ async fn a_legal_hold_blocks_a_payload_purge_exactly_as_it_blocks_an_element_pur
     assert_eq!(
         response.error.as_ref().unwrap().code.as_str(),
         "LegalHoldConflict"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §52.5 — one lifecycle statement
+// ---------------------------------------------------------------------------
+
+/// A Space with one Experience, one Assertion about Alice, and one Activity.
+async fn lifecycle_ground(name: &str) -> CognitiveNexus {
+    let nexus = nexus(name).await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?exp { TYPE "Experience" NAME "First"
+              SET ATTRIBUTES {goal: "learn", outcome_status: "success"} }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE ASSERTION ?a {
+                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.7}
+            }
+            CREATE ACTIVITY ?run { SET FIELDS {activity_class: "consolidation"} }
+        }"#,
+    )
+    .await;
+    nexus
+}
+
+/// §52.5: the quoted state names the move, and the engine validates it against
+/// the target's *kind*. Six statements collapsed into one, so the check that
+/// used to be carried by the statement's own name — only an Assertion can be
+/// retracted, only an Activity can complete — is now the engine's, and it has
+/// to be made where the element is loaded rather than where it is parsed.
+#[tokio::test]
+async fn a_state_that_does_not_fit_the_target_kind_is_an_illegal_move() {
+    let nexus = lifecycle_ground("transition_kind").await;
+
+    // A Concept has no claim to withdraw.
+    let refused = run(&nexus, r#"TRANSITION "C-1" TO "retracted""#).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "InvalidLifecycleTransition"
+    );
+    // §35.3 removed EXPECT STATE precisely because this check exists, so the
+    // refusal has to carry what a guard would have compared.
+    let details = refused.error.as_ref().unwrap().details.as_ref().unwrap();
+    assert_eq!(details["from"], "active");
+    assert_eq!(details["to"], "retracted");
+
+    // And an Assertion is not an Activity.
+    let refused = run(&nexus, r#"TRANSITION "A-1" TO "running""#).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "InvalidLifecycleTransition"
+    );
+    assert_eq!(
+        refused.error.as_ref().unwrap().details.as_ref().unwrap()["to"],
+        "running"
+    );
+}
+
+/// §52.5: a move to the state the target already holds is `no_effect`, not an
+/// error and not a second write. A sweep that runs twice — which is what a
+/// resend or a retried maintenance job is — must not burn a version.
+#[tokio::test]
+async fn a_move_to_the_state_already_held_changes_nothing() {
+    let nexus = lifecycle_ground("transition_same_state").await;
+
+    let first = run(&nexus, r#"TRANSITION "C-1" TO "archived""#).await;
+    assert_eq!(
+        receipt(&first).unwrap().status,
+        anda_kip::ReceiptStatus::Committed
+    );
+
+    let again = run(&nexus, r#"TRANSITION "C-1" TO "archived""#).await;
+    assert_eq!(again.status, TopLevelStatus::Succeeded);
+    assert_eq!(
+        receipt(&again).unwrap().status,
+        anda_kip::ReceiptStatus::NoEffect
+    );
+
+    let Element::Concept(row) = nexus
+        .store
+        .get_element("C-1".parse().unwrap())
+        .await
+        .unwrap()
+    else {
+        panic!("must be a Concept");
+    };
+    assert_eq!(row.version, 2, "the replay must not advance the version");
+}
+
+/// §52.5: `archived` and `tombstoned` are the only states with a legal path
+/// between them, and it runs one way. Tombstoning is logical deletion, so a
+/// Space cannot walk an element back out of it by archiving it again.
+#[tokio::test]
+async fn tombstoning_is_reachable_from_archived_but_not_the_other_way() {
+    let nexus = lifecycle_ground("transition_order").await;
+
+    ok(&nexus, r#"TRANSITION "C-1" TO "archived""#).await;
+    ok(&nexus, r#"TRANSITION "C-1" TO "tombstoned""#).await;
+
+    let refused = run(&nexus, r#"TRANSITION "C-1" TO "archived""#).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "InvalidLifecycleTransition"
+    );
+    let details = refused.error.as_ref().unwrap().details.as_ref().unwrap();
+    assert_eq!(details["from"], "tombstoned");
+    assert_eq!(details["to"], "archived");
+}
+
+/// §52.5, §60.1: leaving ordinary recall starts from a state that still holds
+/// it.
+///
+/// A merged-away identity, a quarantined element and a purged stub are engine
+/// states with their own exits, and archiving out of one would overwrite the
+/// reason the element is where it is. An Activity that has left recall has no
+/// lifecycle left to move either: finalizing it would write provenance into an
+/// element a reader is no longer meant to reach. The second reference engine
+/// refuses the same moves with the same `details`.
+#[tokio::test]
+async fn removal_starts_from_a_state_that_still_holds_the_element() {
+    let nexus = lifecycle_ground("transition_removal_legality").await;
+
+    ok(&nexus, r#"MERGE CONCEPT "C-1" INTO "C-2""#).await;
+    for state in ["tombstoned", "archived"] {
+        let refused = run(&nexus, &format!(r#"TRANSITION "C-1" TO "{state}""#)).await;
+        let error = refused.error.as_ref().unwrap();
+        assert_eq!(error.code.as_str(), "InvalidLifecycleTransition", "{state}");
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["from"], "merged");
+        assert_eq!(details["to"], state);
+    }
+
+    ok(&nexus, r#"TRANSITION "X-1" TO "archived""#).await;
+    let frozen = run(&nexus, r#"TRANSITION "X-1" TO "running""#).await;
+    let error = frozen.error.as_ref().unwrap();
+    assert_eq!(error.code.as_str(), "InvalidLifecycleTransition");
+    let details = error.details.as_ref().unwrap();
+    assert_eq!(details["from"], "archived");
+    assert_eq!(details["to"], "running");
+}
+
+/// §52.5: `BY` belongs to exactly two states, and `SET FIELDS` / `SET
+/// STRUCTURAL` to the Activity states. These are syntax errors rather than
+/// runtime refusals, because the grammar can see them: a statement whose
+/// clauses do not go with its state means something the engine has no reading
+/// for, and guessing which half the author meant is how a lifecycle move
+/// silently becomes a different one.
+#[tokio::test]
+async fn clauses_that_do_not_belong_to_the_state_are_refused_by_the_grammar() {
+    for command in [
+        r#"TRANSITION "A-1" TO "archived" BY "A-2""#,
+        r#"TRANSITION "A-1" TO "retracted" BY "A-2""#,
+        r#"TRANSITION "A-1" TO "superseded""#,
+        r#"TRANSITION "E-1" TO "corrected""#,
+        r#"TRANSITION "C-1" TO "archived" SET FIELDS {name: "X"}"#,
+        r#"TRANSITION "A-1" TO "retracted" SET STRUCTURAL { ("evidence", "E-1") {} }"#,
+    ] {
+        let refused = anda_kip::parse_kip(command)
+            .expect_err("a clause that does not go with the state is a syntax error");
+        assert_eq!(
+            refused.code,
+            anda_kip::KipErrorCode::InvalidSyntax,
+            "{command}: {refused}"
+        );
+    }
+
+    // The states themselves are a closed registry, so a plausible-looking word
+    // that is not one of the nine is refused rather than stored. That refusal
+    // is a `ConstraintViolation` and not a syntax error: the statement is
+    // well-formed, and what it violates is a Core registry — the same answer
+    // every other closed vocabulary gives, so a client handles them alike.
+    let refused = anda_kip::parse_kip(r#"TRANSITION "C-1" TO "deleted""#)
+        .expect_err("the state vocabulary is closed");
+    assert_eq!(refused.code, anda_kip::KipErrorCode::ConstraintViolation);
+}
+
+/// §52.5: an Activity finalizes its terminal fields and its provenance
+/// topology in the same statement that moves it, because §16.6 freezes that
+/// topology once the Activity is terminal — a second statement would arrive
+/// too late to write what the first one made immutable.
+#[tokio::test]
+async fn an_activity_finalizes_its_fields_in_the_statement_that_completes_it() {
+    let nexus = lifecycle_ground("transition_activity").await;
+
+    ok(&nexus, r#"TRANSITION "X-1" TO "running""#).await;
+    ok(
+        &nexus,
+        r#"TRANSITION "X-1" TO "completed"
+             SET FIELDS {ended_at: "2026-01-01T00:00:00Z"}
+             SET STRUCTURAL { ("outputs", "C-3") {} }"#,
+    )
+    .await;
+
+    let finalized = ok(
+        &nexus,
+        r#"FIND(?x.status, ?x.ended_at) WHERE { ?x ACTIVITY {} }"#,
+    )
+    .await;
+    assert_eq!(
+        finalized.as_array().unwrap()[0],
+        json!(["completed", "2026-01-01T00:00:00.000Z"])
+    );
+
+    // §16.6: the topology is frozen now, so a second terminal move is refused
+    // by the rule that protects it rather than by the same-state shortcut.
+    let refused = run(&nexus, r#"TRANSITION "X-1" TO "failed""#).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "ActivityTerminal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §6.3, §35.1 — version planes
+// ---------------------------------------------------------------------------
+
+/// §6.3: `_system.version` advances on every committed change; a plane counter
+/// advances only when its own plane changes. That difference is the whole
+/// point of planes, so it is readable from the element rather than only
+/// inferable from which guards happen to pass.
+#[tokio::test]
+async fn a_plane_counter_advances_only_when_its_own_plane_changes() {
+    let nexus = lifecycle_ground("planes_counters").await;
+
+    async fn planes(nexus: &CognitiveNexus) -> Json {
+        ok(
+            nexus,
+            r#"FIND(?c._system.version, ?c._system.plane_versions)
+               WHERE { ?c CONCEPT {name: "First"} }"#,
+        )
+        .await
+    }
+
+    // Created with attributes and nothing else: §35.2 wants `EXPECT VERSION 0
+    // OF <plane>` to read as "never written" from the first version on.
+    let start = planes(&nexus).await;
+    assert_eq!(start.as_array().unwrap()[0][0], json!(1));
+    assert_eq!(start.as_array().unwrap()[0][1]["attributes"], json!(1));
+    assert_eq!(start.as_array().unwrap()[0][1]["structural"], json!(0));
+    assert_eq!(start.as_array().unwrap()[0][1]["retention"], json!(0));
+
+    // A Facet write moves the element and that Facet's counter, and leaves the
+    // attributes counter exactly where it was.
+    ok(
+        &nexus,
+        r#"UPDATE ?c SET FACET "MnemonicState" {salience: 0.5}
+           WHERE { ?c CONCEPT {name: "First"} }"#,
+    )
+    .await;
+    let after = planes(&nexus).await;
+    assert_eq!(after.as_array().unwrap()[0][0], json!(2));
+    assert_eq!(after.as_array().unwrap()[0][1]["attributes"], json!(1));
+    assert_eq!(
+        after.as_array().unwrap()[0][1]["facets"]["MnemonicState"],
+        json!(1)
+    );
+}
+
+/// §35.1: a guard on one plane is not spoiled by a concurrent write to
+/// another. This is the case the section is written for — a `MnemonicState`
+/// decay sweep and a status verdict on the same element, neither invalidating
+/// the other — and it is exactly what a bare `EXPECT VERSION` cannot express.
+#[tokio::test]
+async fn a_plane_guard_survives_a_write_to_a_different_plane() {
+    let nexus = lifecycle_ground("planes_guard").await;
+
+    // The decay sweep lands first, moving `_system.version` to 2.
+    ok(
+        &nexus,
+        r#"UPDATE ?c SET FACET "MnemonicState" {memory_strength: 0.4}
+           WHERE { ?c CONCEPT {name: "First"} }"#,
+    )
+    .await;
+
+    // The verdict was planned against attributes version 1 and still commits,
+    // because that is the counter it guarded.
+    let verdict = run(
+        &nexus,
+        r#"UPDATE ?c SET ATTRIBUTES {outcome_status: "partial"}
+           WHERE { ?c CONCEPT {name: "First"} }
+           EXPECT VERSION 1 OF ATTRIBUTES"#,
+    )
+    .await;
+    assert_eq!(
+        verdict.status,
+        TopLevelStatus::Succeeded,
+        "{:#?}",
+        verdict.error
+    );
+
+    // The bare guard is the one that would have been spoiled: it compares
+    // `_system.version`, which every write moves.
+    let spoiled = run(
+        &nexus,
+        r#"UPDATE ?c SET ATTRIBUTES {outcome_status: "failure"}
+           WHERE { ?c CONCEPT {name: "First"} }
+           EXPECT VERSION 1"#,
+    )
+    .await;
+    assert_eq!(
+        spoiled.error.as_ref().unwrap().code.as_str(),
+        "VersionConflict"
+    );
+}
+
+/// §35.1: a mismatch names the plane that mismatched, so a caller that sent
+/// several guards learns which precondition it lost rather than only that it
+/// lost one.
+#[tokio::test]
+async fn a_plane_mismatch_names_the_plane_it_mismatched_on() {
+    let nexus = lifecycle_ground("planes_details").await;
+    ok(
+        &nexus,
+        r#"UPDATE ?c SET FACET "MnemonicState" {salience: 0.5}
+           WHERE { ?c CONCEPT {name: "First"} }"#,
+    )
+    .await;
+
+    for (guard, plane) in [
+        ("EXPECT VERSION 9 OF ATTRIBUTES", "attributes"),
+        ("EXPECT VERSION 9 OF STRUCTURAL", "structural"),
+        ("EXPECT VERSION 9 OF RETENTION", "retention"),
+        (
+            r#"EXPECT VERSION 9 OF FACET "MnemonicState""#,
+            "facets.MnemonicState",
+        ),
+    ] {
+        let refused = run(
+            &nexus,
+            &format!(
+                r#"UPDATE ?c SET ATTRIBUTES {{outcome_status: "partial"}}
+                   WHERE {{ ?c CONCEPT {{name: "First"}} }}
+                   {guard}"#
+            ),
+        )
+        .await;
+        let error = refused.error.as_ref().unwrap();
+        assert_eq!(error.code.as_str(), "VersionConflict", "{guard}");
+        assert_eq!(
+            error.details.as_ref().unwrap()["plane"],
+            json!(plane),
+            "{guard}"
+        );
+    }
+
+    // A bare guard names no plane: it guarded the whole element, and reporting
+    // one would say the conflict was narrower than it was.
+    let refused = run(
+        &nexus,
+        r#"UPDATE ?c SET ATTRIBUTES {outcome_status: "partial"}
+           WHERE { ?c CONCEPT {name: "First"} }
+           EXPECT VERSION 9"#,
+    )
+    .await;
+    let error = refused.error.as_ref().unwrap();
+    assert_eq!(error.code.as_str(), "VersionConflict");
+    assert!(
+        error
+            .details
+            .as_ref()
+            .is_none_or(|details| details.get("plane").is_none())
+    );
+}
+
+/// §35.1: guards may repeat, one per plane, and naming the same plane twice is
+/// a syntax error — two counters cannot both be the one true expectation, and
+/// silently keeping the last would make the first guard decorative.
+#[tokio::test]
+async fn guards_repeat_once_per_plane_and_never_twice_on_one() {
+    let both = anda_kip::parse_kip(
+        r#"UPDATE "C-1" SET ATTRIBUTES {goal: "x"}
+           EXPECT VERSION 1 OF ATTRIBUTES EXPECT VERSION 0 OF STRUCTURAL"#,
+    );
+    assert!(both.is_ok(), "{both:?}");
+
+    for command in [
+        r#"UPDATE "C-1" SET ATTRIBUTES {goal: "x"}
+           EXPECT VERSION 1 OF ATTRIBUTES EXPECT VERSION 2 OF ATTRIBUTES"#,
+        r#"UPDATE "C-1" SET ATTRIBUTES {goal: "x"}
+           EXPECT VERSION 1 EXPECT VERSION 2"#,
+        r#"UPDATE "C-1" SET ATTRIBUTES {goal: "x"}
+           EXPECT VERSION 1 OF FACET "MnemonicState"
+           EXPECT VERSION 2 OF FACET "MnemonicState""#,
+    ] {
+        let refused = anda_kip::parse_kip(command).expect_err("one plane may be guarded only once");
+        assert_eq!(
+            refused.code,
+            anda_kip::KipErrorCode::InvalidSyntax,
+            "{command}"
+        );
+    }
+}
+
+/// §35.2: only the *bare* `EXPECT VERSION 0` is the create-only guard. The
+/// plane form at 0 is an ordinary guard saying that plane has never been
+/// written, which is a different claim — and reading the two as one would make
+/// every never-written plane assert that the element does not exist.
+#[tokio::test]
+async fn a_plane_guard_at_zero_is_not_the_create_only_guard() {
+    let nexus = lifecycle_ground("planes_zero").await;
+
+    // "First" exists and has never had a structural reference written.
+    let allowed = run(
+        &nexus,
+        r#"UPDATE ?c SET ATTRIBUTES {outcome_status: "partial"}
+           WHERE { ?c CONCEPT {name: "First"} }
+           EXPECT VERSION 0 OF STRUCTURAL"#,
+    )
+    .await;
+    assert_eq!(
+        allowed.status,
+        TopLevelStatus::Succeeded,
+        "{:#?}",
+        allowed.error
+    );
+
+    // The bare form at 0 says the addressed identity must not already exist.
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Bob" SET FIELDS {key: "person:bob"} }"#,
+    )
+    .await;
+    let refused = run(
+        &nexus,
+        r#"UPSERT CONCEPT ?c { MATCH {type: "Person", key: "person:bob"} SET FIELDS {name: "Robert"} }
+           EXPECT VERSION 0"#,
+    )
+    .await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "VersionConflict"
+    );
+
+    // The same statement against a key nobody holds is a creation, which is
+    // what the create-only guard is for.
+    let created = run(
+        &nexus,
+        r#"UPSERT CONCEPT ?c { MATCH {type: "Person", key: "person:carol"} SET FIELDS {name: "Carol"} }
+           EXPECT VERSION 0"#,
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        TopLevelStatus::Succeeded,
+        "{:#?}",
+        created.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §36.1 — the Change Envelope entry
+// ---------------------------------------------------------------------------
+
+/// §36.1: one commit yields one envelope, and every entry carries the members
+/// the section makes normative. This is the shape a Watch reads to decide
+/// whether a slot, an element or a type moved, so it is asserted member by
+/// member rather than by spot-check — and asserted to carry names only, never
+/// values, because a follower that may not read the element must still be able
+/// to receive the entry.
+#[tokio::test]
+async fn a_change_entry_carries_the_members_36_1_makes_normative() {
+    let nexus = lifecycle_ground("envelope_shape").await;
+
+    // An `update` entry: versions before and after, the paths that changed,
+    // and the plane counters after the commit.
+    ok(
+        &nexus,
+        r#"UPDATE ?c SET ATTRIBUTES {outcome_status: "partial"}
+                    SET FACET "MnemonicState" {salience: 0.25}
+           WHERE { ?c CONCEPT {name: "First"} }"#,
+    )
+    .await;
+    let changes = ok(&nexus, r#"HISTORY ELEMENT "C-3""#).await;
+    let entry = changes.as_array().unwrap().last().unwrap()["changes"]
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    assert_eq!(entry["op"], "update");
+    assert_eq!(entry["kind"], "concept");
+    assert_eq!(entry["id"], "C-3");
+    assert_eq!(entry["old_version"], json!(1));
+    assert_eq!(entry["new_version"], json!(2));
+    assert!(
+        entry["schema_ref"]
+            .as_str()
+            .unwrap()
+            .ends_with("/Experience"),
+        "a Concept entry names the type it was written against: {entry}"
+    );
+    assert_eq!(
+        entry["touched"],
+        json!(["attributes.outcome_status", "facets.MnemonicState"])
+    );
+    assert_eq!(entry["planes"]["attributes"], json!(2));
+    assert_eq!(entry["planes"]["facets"]["MnemonicState"], json!(1));
+    // Names, never values: the entry says the slot moved, not what to.
+    assert!(!entry.to_string().contains("partial"));
+    assert!(!entry.to_string().contains("0.25"));
+
+    // A `lifecycle` entry: the move is `state {from, to}`, and an Assertion
+    // entry names the Proposition it is about so a follower can find the slot
+    // whose belief just changed without reading the Assertion.
+    ok(&nexus, r#"TRANSITION "A-1" TO "retracted""#).await;
+    let changes = ok(&nexus, r#"HISTORY ELEMENT "A-1""#).await;
+    let entry = changes.as_array().unwrap().last().unwrap()["changes"]
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    assert_eq!(entry["op"], "lifecycle");
+    assert_eq!(entry["kind"], "assertion");
+    assert_eq!(entry["state"], json!({"from": "active", "to": "retracted"}));
+    assert_eq!(entry["refs"]["proposition"], "P-1");
+    // `state` and `touched` answer different questions, so both are there: a
+    // consumer watching the belief slot reads the move, and one watching named
+    // paths reads the columns it moved. Neither is a plane, though — a
+    // lifecycle move advances `_system.version` and no counter — so the entry
+    // reports no `planes` at all.
+    assert_eq!(
+        entry["touched"],
+        json!(["fields.retracted_at", "fields.status"])
+    );
+    assert!(
+        entry["planes"].is_null(),
+        "a lifecycle move touches no plane"
+    );
+
+    // A `create` entry: no `old_version`, and a Proposition entry names its
+    // subject and the predicate it was resolved against.
+    let changes = ok(&nexus, r#"HISTORY ELEMENT "P-1""#).await;
+    let entry = changes.as_array().unwrap()[0]["changes"]
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    assert_eq!(entry["op"], "create");
+    assert_eq!(entry["kind"], "proposition");
+    assert_eq!(entry["new_version"], json!(1));
+    assert!(entry["old_version"].is_null());
+    assert_eq!(entry["refs"]["subject"], "C-1");
+    assert!(
+        entry["refs"]["predicate_ref"]
+            .as_str()
+            .unwrap()
+            .ends_with("/prefers")
+    );
+}
+
+/// §36.1, §36.2: one state-changing commit is one envelope, and everything in
+/// it is one cognitive transition. A `MUTATE` block that writes four elements
+/// must therefore arrive as four entries under one `space_seq`, not as four
+/// envelopes a consumer would have to reassemble.
+#[tokio::test]
+async fn one_commit_is_one_envelope_however_many_elements_it_touched() {
+    let nexus = nexus("envelope_atomicity").await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
+            CREATE ASSERTION ?a {
+                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated"}
+            }
+        }"#,
+    )
+    .await;
+
+    let envelopes = ok(&nexus, "CHANGES AFTER SEQ 0").await;
+    let envelopes = envelopes.as_array().unwrap();
+    assert_eq!(envelopes.len(), 1, "{envelopes:#?}");
+    let envelope = &envelopes[0];
+    assert_eq!(envelope["space_seq"], json!(1));
+    assert!(envelope["tx_id"].is_string());
+    assert!(envelope["committed_at"].is_string());
+    assert_eq!(envelope["transaction_class"], "cognitive");
+
+    // §36.3: the deduplication key a consumer is promised.
+    assert!(envelope["space_id"].is_string());
+
+    // Four elements, four entries. They are ordered by element id rather than
+    // by the order the clauses ran: §36.2 makes the envelope one transition,
+    // so nothing inside it happened before anything else, and a stable order
+    // is worth more to a consumer than a re-run of the plan.
+    let ids: Vec<&str> = envelope["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["A-1", "C-1", "C-2", "P-1"]);
+    assert!(
+        envelope["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|change| change["op"] == "create")
     );
 }

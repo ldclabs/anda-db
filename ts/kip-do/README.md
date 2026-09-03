@@ -38,8 +38,8 @@ here:
   authorized again individually: an element outside the Grant is not in the query
   universe at all, a masked field is invisible to `FILTER` as well as to the
   projection, a sweep that reaches something it may not touch fails rather than
-  doing less, and a `RETRACT` needs the standing to say the source withdrew its
-  claim. Classification is enforced in both directions: a derived element joins
+  doing less, and a `TRANSITION` to `retracted` needs the standing to say the
+  source withdrew its claim, where archiving it needs only a moderator's. Classification is enforced in both directions: a derived element joins
   its inputs' labels upward at commit — so *read secret Evidence, summarize,
   write public summary* is not an exfiltration path — while raising a label needs
   only `update` and lowering one needs `declassify`, because it is disclosure
@@ -67,8 +67,9 @@ here:
   index, and an empty answer would read as "no such claim exists".
 
 Reading the past works on both axes, and they are deliberately kept apart:
-`AS OF SEQ | TX | TIME` asks what this Brain *held* then, `FOR TIME` asks what
-was *true* then. One read answers at one coordinate — a request pinned by a
+`AS OF SEQ` asks what this Brain *held* then, `FOR TIME` asks what was *true*
+then. A caller holding a wall-clock time gets its coordinate from
+`DESCRIBE SNAPSHOT AT TIME "…"` and reads at that, so one axis has one spelling. One read answers at one coordinate — a request pinned by a
 `snapshot_token` whose command names a different one is refused — and symbols
 resolve through the Schema Environment that was in force at the coordinate
 rather than today's.
@@ -112,7 +113,7 @@ The oracle currently reports no divergences in either direction across the
 whole corpus. The four it found on the way — the worst of which rounded an
 out-of-range integer instead of refusing it, so a command executed with a
 different number than it said — were fixed upstream in
-`@ldclabs/kip-lang@2.0.1`.
+`@ldclabs/kip-lang@2.0.1`. The package now tracks the 2.0 draft at 2.2.0.
 
 ### The error registry
 

@@ -223,14 +223,19 @@ describe('endpoints and literals', () => {
     expect(key('1')).not.toBe(one)
   })
 
-  it('makes a language tag part of Literal identity', () => {
-    // Spec §9.5.
-    const bare = key('苹果')
-    const tagged = key({ value: '苹果', language: 'zh-Hans' })
-    expect(tagged).not.toBe(bare)
-    expect(
-      key({ value: '苹果', datatype: 'kip:string', language: 'zh-Hans' }),
-    ).toBe(tagged)
+  it('refuses a language tag rather than making it part of identity', () => {
+    // Spec §9.4: the baseline Literal carries no language tag, and a
+    // `language` member is TypeMismatch. Dropping it silently would merge
+    // `"苹果"@zh-Hans` with a bare `"苹果"` the writer meant to keep apart.
+    expect(() => key({ value: '苹果', language: 'zh-Hans' })).toThrowError(
+      expect.objectContaining({ code: 'TypeMismatch' }),
+    )
+    // §9.6: strings compare by NFC form — an NFD spelling of one word is the
+    // same Literal — and never trimmed or case-folded.
+    expect(key('\u00e9')).toBe(key('e\u0301'))
+    expect(key('É')).not.toBe(key('é'))
+    expect(key(' é')).not.toBe(key('é'))
+    expect(key(-0)).toBe(key(0))
   })
 
   it('makes null equal only to null', () => {

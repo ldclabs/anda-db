@@ -60,8 +60,15 @@ import { rebuildSearch } from './search.js'
  *
  * 5 — the three FTS5 indexes behind `SEARCH`. Additive, but they start empty,
  * so an existing database is backfilled once (see {@link backfillSearch}).
+ *
+ * 7 — the KIP 2.0 draft at 793af73: `plane_versions` on every element table
+ * (§6.3), `concepts.lineage` and `propositions.predicate_lineage` (§20.14),
+ * and `idx_concepts_key` re-scoped from the exact `schema_ref` to the lineage
+ * (§7.3), so a package upgrade never mints a second `"alice"`. This engine
+ * never shipped a KIP 1.x, so there is no data to migrate; the additive steps
+ * exist so a development database written a day earlier still opens.
  */
-export const SCHEMA_VERSION = 6
+export const SCHEMA_VERSION = 7
 
 /**
  * The `_system` envelope every element table repeats.
@@ -74,6 +81,7 @@ const ENVELOPE = `
   space       TEXT NOT NULL,
   state       TEXT NOT NULL,
   version     INTEGER NOT NULL,
+  plane_versions TEXT NOT NULL DEFAULT '{}',
   seq         INTEGER NOT NULL,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL,
@@ -115,6 +123,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS concepts (${ENVELOPE},
      client_key   TEXT NOT NULL DEFAULT '',
      schema_ref   TEXT NOT NULL DEFAULT '',
+     lineage      TEXT NOT NULL DEFAULT '',
      key          TEXT NOT NULL DEFAULT '',
      name         TEXT NOT NULL DEFAULT '',
      canonical_id TEXT NOT NULL DEFAULT '',
@@ -125,18 +134,22 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   ...envelopeIndexes('concepts'),
   // The Space-local logical key is the immutable identity (§5.3), so this
   // index *is* that rule and not an optimization. Scoped to
-  // `(space, schema_ref, key)` as §7.3 requires: a Person and a Preference may
-  // both be keyed `alice` and they are two identities, which is what lets a 1.x
-  // database whose identity was `(type, name)` migrate those names into keys
-  // without merging unrelated Concepts. Partial: a Concept may have no key at
-  // all, and several such Concepts must not collide on `''`.
+  // `(space, lineage of schema_ref, key)` as §7.3 requires: a Person and a
+  // Preference may both be keyed `alice` and they are two identities, while a
+  // Person written under `Person@1.0.0` and one upserted after the package
+  // moved to `1.1.0` are one identity (§20.14). Partial: a Concept may have no
+  // key at all, and several such Concepts must not collide on `''`.
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_concepts_key
-     ON concepts(space, schema_ref, key) WHERE key <> ''`,
+     ON concepts(space, lineage, key) WHERE key <> ''`,
   // `name` is mutable grounding state and duplicates are allowed (§5.2), so
   // this one is deliberately not unique.
   `CREATE INDEX IF NOT EXISTS idx_concepts_name ON concepts(space, name)`,
   `CREATE INDEX IF NOT EXISTS idx_concepts_schema_ref
      ON concepts(space, schema_ref)`,
+  // `type:` matches every readable version of a lineage (§43.1), so the
+  // pattern's seek is on the lineage rather than on the exact reference.
+  `CREATE INDEX IF NOT EXISTS idx_concepts_lineage
+     ON concepts(space, lineage)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_concepts_canonical
      ON concepts(space, canonical_id) WHERE canonical_id <> ''`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_concepts_client_key
@@ -150,6 +163,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      subject       TEXT NOT NULL DEFAULT '{}',
      subject_key   TEXT NOT NULL DEFAULT '',
      predicate_ref TEXT NOT NULL DEFAULT '',
+     predicate_lineage TEXT NOT NULL DEFAULT '',
      object        TEXT NOT NULL DEFAULT '{}',
      object_key    TEXT NOT NULL DEFAULT '',
      tuple_key     TEXT NOT NULL DEFAULT ''
@@ -167,13 +181,14 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_propositions_tuple
      ON propositions(tuple_key) WHERE tuple_key <> ''`,
   // Predicate-first, so `(?s, "treats", ?o)` is a seek rather than a scan of
-  // every tuple in the Space.
+  // every tuple in the Space. On the lineage, because a pattern's predicate
+  // matches every readable version of it (§12.3, §20.14).
   `CREATE INDEX IF NOT EXISTS idx_propositions_predicate
-     ON propositions(space, predicate_ref, subject_key)`,
+     ON propositions(space, predicate_lineage, subject_key)`,
   `CREATE INDEX IF NOT EXISTS idx_propositions_subject
-     ON propositions(space, subject_key, predicate_ref)`,
+     ON propositions(space, subject_key, predicate_lineage)`,
   `CREATE INDEX IF NOT EXISTS idx_propositions_object
-     ON propositions(space, object_key, predicate_ref)`,
+     ON propositions(space, object_key, predicate_lineage)`,
 
   // --- assertions --------------------------------------------------------
   //
@@ -705,6 +720,19 @@ export function configureSql(sql: SqlStorage): void {
 const ADDED_COLUMNS: readonly { table: string; column: string; definition: string }[] = [
   { table: 'schema_envs', column: 'seq', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'spaces', column: 'self_concept', definition: "TEXT NOT NULL DEFAULT ''" },
+  ...['concepts', 'propositions', 'assertions', 'evidence', 'activities'].map(
+    (table) => ({
+      table,
+      column: 'plane_versions',
+      definition: "TEXT NOT NULL DEFAULT '{}'",
+    }),
+  ),
+  { table: 'concepts', column: 'lineage', definition: "TEXT NOT NULL DEFAULT ''" },
+  {
+    table: 'propositions',
+    column: 'predicate_lineage',
+    definition: "TEXT NOT NULL DEFAULT ''",
+  },
 ]
 
 function addMissingColumns(sql: SqlStorage): void {
@@ -733,7 +761,10 @@ function addMissingColumns(sql: SqlStorage): void {
  * interrupted mid-migration converges on a re-run, like every other step here.
  */
 const REDEFINED_INDEXES: readonly { index: string; column: string }[] = [
-  { index: 'idx_concepts_key', column: 'schema_ref' },
+  { index: 'idx_concepts_key', column: 'lineage' },
+  { index: 'idx_propositions_predicate', column: 'predicate_lineage' },
+  { index: 'idx_propositions_subject', column: 'predicate_lineage' },
+  { index: 'idx_propositions_object', column: 'predicate_lineage' },
 ]
 
 function dropRedefinedIndexes(sql: SqlStorage): void {
@@ -751,10 +782,16 @@ export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
   // Before the `CREATE`s, which would otherwise skip the stale definition.
   dropRedefinedIndexes(sql)
+  // The tables first, then any column a later revision added, then the
+  // indexes: an index over a column the table does not have yet cannot be
+  // created, and `CREATE TABLE IF NOT EXISTS` does nothing to an old table.
   for (const statement of SCHEMA_STATEMENTS) {
-    sql.exec(statement)
+    if (statement.trimStart().startsWith('CREATE TABLE')) sql.exec(statement)
   }
   addMissingColumns(sql)
+  for (const statement of SCHEMA_STATEMENTS) {
+    if (!statement.trimStart().startsWith('CREATE TABLE')) sql.exec(statement)
+  }
 
   rebuildSearchIfStale(sql)
 

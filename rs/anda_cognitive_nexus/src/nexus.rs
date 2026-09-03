@@ -28,8 +28,8 @@ use tokio::sync::{Mutex, RwLock};
 use crate::governance::approval::Approved;
 use crate::governance::rows::principal_class;
 use crate::governance::rows::{
-    ActorBindingRow, ApprovalRow, DelegationRow, GovernancePolicyRow, GrantRow,
-    PrincipalGroupRow, PrincipalRow,
+    ActorBindingRow, ApprovalRow, DelegationRow, GovernancePolicyRow, GrantRow, PrincipalGroupRow,
+    PrincipalRow,
 };
 use crate::governance::store::{
     ActorBindingDraft, DelegationDraft, GrantDraft, GroupDraft, PolicyDraft, PrincipalDraft,
@@ -1145,7 +1145,8 @@ impl Executor for Session {
                 // response resends the same key and gets the outcome its first
                 // attempt produced, rather than writing a second time or being
                 // told its own write is a conflict.
-                match self.replay(&space, request, operation, &authority, &auth, &permissions)
+                match self
+                    .replay(&space, request, operation, &authority, &auth, &permissions)
                     .await
                 {
                     Ok(Some(response)) => return response,

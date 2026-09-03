@@ -32,12 +32,63 @@ export const KIP_VERSION = '2.0'
 export const MAX_DEPENDENTS_DEPTH = 8
 
 /**
- * The capability names `requires` may ask about and get `true` for (§67).
+ * The §67.4 capability registry, and what this engine answers for each.
+ *
+ * A runtime MUST NOT rename these; it MAY add namespaced entries of its own,
+ * and this engine's older local names stay beside them below so a `requires`
+ * block written against either spelling still gets an answer. `false` is a
+ * fact a caller can plan around; a name absent from the registry and from the
+ * local list is *unrecognized*, which §67.4 makes a failure rather than a
+ * pass.
+ */
+export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
+  serializable_isolation: true, // §32.2: one Durable Object serializes its callers
+  // §34.5: every committed transaction is kept, so a key never expires. The
+  // detail rides on the entry rather than in a sibling map, because §67.4
+  // shows the value there and a caller that read the two apart could read a
+  // ceiling as belonging to the wrong name.
+  idempotency_retention: { unbounded: true },
+  historical_reads: true, // §48, §100
+  historical_search: false, // §66.1: the index keeps no history of itself
+  semantic_search: false, // §66.3: no embedding model
+  hybrid_search: false, // §66.3
+  search_index_freshness: { mode: 'synchronous' }, // §66.5: written by the committing transaction
+  belief_slot: true, // §47
+  weighted_projection: false, // §21.10: the structural baseline only
+  materialized_projection: false, // §21.9: every projection is computed on read
+  signed_receipts: false, // §33.3: no signing keys
+  ingestion_context: true, // §71.1
+  streaming: false, // §84
+  artifacts: false, // §85: no artifact store
+  change_stream: true, // §36, §68
+  filtered_delivery: false, // §36.3: CHANGES is unfiltered
+  watch_evaluation: false, // Cognitive Memory Profile §5.11
+  list_dependents: true, // §63.5
+  payload_purge: true, // §60.6
+  capsule_export: true, // §63.4
+  capsule_import: false, // §39
+  capsule_signatures: false, // §37.8
+  derive_permission: false, // §29.6: this engine does not distinguish derived writes
+  record_outcome_permission: true, // §29.8
+}
+
+/**
+ * Ceilings that apply whatever the caller is allowed to ask for (§67).
+ *
+ * A registry entry's own value is not a limit and does not belong here: it is
+ * reported on the entry, where §67.4 puts it.
+ */
+export const CAPABILITY_LIMITS: Readonly<Record<string, Json>> = {
+  list_dependents_max_depth: MAX_DEPENDENTS_DEPTH,
+}
+
+/**
+ * This engine's own capability names, beside the §67.4 registry (§67).
  *
  * Spelled out rather than derived from the `supported` map, because the map is
  * organized for a reader and this list is a contract: a name here is one a
- * caller may build a fail-fast check on. The same list the reference engine
- * keeps, so a `requires` block is portable between the two.
+ * caller may build a fail-fast check on. Kept because `anda-brain` reads them;
+ * a name is added, never renamed.
  */
 const SUPPORTED_NAMES: readonly string[] = [
   'kql',
@@ -65,6 +116,12 @@ const SUPPORTED_NAMES: readonly string[] = [
   'opaque_cursors',
   'payload_purge',
   'list_dependents',
+  'transition',
+  'version_planes',
+  'snapshot_at_time',
+  'per_operation_receipts',
+  'canonical_matching',
+  'symbol_lineage',
 ]
 
 /**
@@ -103,18 +160,53 @@ const UNSUPPORTED_NAMES: readonly string[] = [
  * exists to prevent, because the caller believes it ran.
  */
 export function capabilityState(name: string): boolean | undefined {
+  // An entry that carries a detail object is supported; only a literal `false`
+  // is a refusal. Reading the value's truthiness instead would make a future
+  // `{"seconds": 0}` read as unsupported.
+  if (Object.hasOwn(CAPABILITY_REGISTRY, name)) {
+    return CAPABILITY_REGISTRY[name] !== false
+  }
   if (UNSUPPORTED_NAMES.includes(name)) return false
   return SUPPORTED_NAMES.includes(name) ? true : undefined
 }
 
 /** The gap names this engine documents, for the drift test. */
 export function unsupportedCapabilityNames(): string[] {
-  return [...UNSUPPORTED_NAMES]
+  return [
+    ...UNSUPPORTED_NAMES,
+    ...Object.entries(CAPABILITY_REGISTRY)
+      .filter(([, state]) => state === false)
+      .map(([name]) => name),
+  ]
 }
 
 export function capabilities(): Json {
   return {
     kip: KIP_VERSION,
+    limits: { ...CAPABILITY_LIMITS },
+    // §21.9, §27: what the old DESCRIBE PROJECTION CAPABILITY reported, now a
+    // member here (§68).
+    projection: {
+      policies: [BASELINE_ID, 'kip:policy:forecast'],
+      statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
+      leading: ['support', 'opposition', 'none'],
+      score_semantics: 'normalized_support_not_probability',
+      explanation: true,
+      // §21.10: the structural baseline, and nothing weighted on top of it.
+      weighted_projection: false,
+      missing_stages: [
+        {
+          stage: 'trust_evaluation',
+          reason: 'no trust model; every eligible corroboration group counts equally',
+        },
+        {
+          stage: 'evidence_quality',
+          reason:
+            'a cited Evidence record is counted for its independence, never ' +
+            'for how good it is',
+        },
+      ],
+    },
     // §89 makes declaring the conformance profiles a MUST. A claim, not a
     // wish — each of these is exercised by the shared conformance fixtures both
     // engines run, and the four §89 names that are absent are absent for a
@@ -138,6 +230,12 @@ export function capabilities(): Json {
     ],
     languages: ['KQL', 'KML', 'META'],
     supported: {
+      // §67.4: the registry, by the names the Specification fixes, at the
+      // address the reference engine reports it from. A registry a client has
+      // to look for in a different place on each engine is not a negotiation
+      // surface. Reported beside this engine's own names rather than instead
+      // of them, because clients read those too.
+      registry: { ...CAPABILITY_REGISTRY },
       kml: [
         'CREATE CONCEPT',
         'UPSERT CONCEPT (matching an existing identity)',
@@ -145,26 +243,62 @@ export function capabilities(): Json {
         'CREATE EVIDENCE',
         'CREATE ASSERTION',
         'CREATE ACTIVITY',
-        'ASSERT (desugared)',
-        'RETRACT ASSERTION',
-        'SUPERSEDE ASSERTION',
-        'CORRECT EVIDENCE',
-        'TRANSITION ACTIVITY',
+        'ASSERT (desugared, SUPERSEDING included)',
+        'TRANSITION TO retracted | superseded | corrected | running | ' +
+          'completed | failed | cancelled | archived | tombstoned (§52.5)',
         'SET RETENTION',
-        'ARCHIVE',
-        'TOMBSTONE',
         'UPDATE',
         'MERGE CONCEPT',
         'PURGE, with all three reference policies',
         'PURGE PAYLOAD',
-        // §52.7 names exactly these seven. `MERGE CONCEPT` is deliberately not
+        // §52.7 names exactly these five. `MERGE CONCEPT` is deliberately not
         // among them: its source and target are already named, and its WHERE
         // only guards them — so it takes no LIMIT, and the grammar has no
         // field for one.
-        'selection blocks: WHERE and LIMIT on UPDATE, SET RETENTION, ARCHIVE, ' +
-          'TOMBSTONE, RETRACT, PURGE and PURGE PAYLOAD; WHERE alone on ' +
-          'MERGE CONCEPT',
+        'selection blocks: WHERE and LIMIT on UPDATE, TRANSITION, SET ' +
+          'RETENTION, PURGE and PURGE PAYLOAD; WHERE alone on MERGE CONCEPT',
+        'EXPECT VERSION n [OF ATTRIBUTES | STRUCTURAL | RETENTION | FACET ' +
+          '"<symbol>"], one guard per plane, trailing (§35.1, §52.8)',
       ],
+      // §52.5: the one lifecycle statement, and what each move needs.
+      transition: {
+        states: {
+          retracted: 'Assertion, from active; retract_own and standing (§57.3)',
+          superseded:
+            'Assertion BY the newer Assertion, from active, same Proposition; ' +
+            'supersede_own and standing (§57.4)',
+          corrected: 'Evidence BY the new Evidence, from active; create + maintain (§57.2)',
+          running: 'Activity, from pending; update',
+          'completed | failed | cancelled':
+            'Activity, from pending or running; update; SET FIELDS / SET ' +
+            'STRUCTURAL finalize started_at, ended_at, parameters_digest and topology',
+          archived: 'any element; archive, plus moderate_assertion over another actor\'s Assertion',
+          tombstoned: 'any element; tombstone, plus moderate_assertion likewise',
+        },
+        wrong_move:
+          'InvalidLifecycleTransition with details.from / details.to; a move ' +
+          'to the state already held is no_effect; from a terminal Activity ' +
+          'state, ActivityTerminal',
+        parameter_state:
+          'a :parameter state is checked for BY and SET at execution time under ' +
+          'InvalidSyntax, and each selected element is authorized with the ' +
+          'permission the literal form would have paid',
+      },
+      // §6.3, §35.1: the four planes, and what moves each.
+      version_planes: {
+        planes: ['attributes', 'structural', 'retention', 'facets.<Symbol>'],
+        attributes: 'Core fields and a Concept\'s attributes',
+        structural: 'Structural References, Core and Profile alike',
+        retention: 'the retention record',
+        facets: 'one counter per Facet, keyed by its local symbol name',
+        lifecycle: 'advances _system.version and no plane, unless it finalizes one',
+        guard:
+          'EXPECT VERSION n OF <plane> compares that counter; a mismatch names ' +
+          'the plane in VersionConflict.details.plane; EXPECT VERSION 0 OF ' +
+          '<plane> means never written, and only the bare EXPECT VERSION 0 is ' +
+          'create-only (§35.2)',
+        read: '?x._system.plane_versions.attributes, .structural, .retention, .facets["<Symbol>"]',
+      },
       // §11: identity consolidation is non-destructive, and the three rules
       // that make it so are stated because a caller who assumed any of them
       // backwards would read a forwarded write as a lost one.
@@ -264,7 +398,13 @@ export function capabilities(): Json {
         // family issues its own, because a family that accepts one and never
         // hands one out cannot be paged at all.
         cursor: 'opaque token, snapshot-pinned, per operation family',
-        families: ['find', 'search', 'list'],
+        families: ['kql', 'search', 'list', 'history'],
+        // §87.7: one code for every family, with the family and the reason
+        // in `details`. A change cursor is a sequence and not a token, so its
+        // refusal is `family: changes`.
+        refusal:
+          'CursorInvalid {family, reason: malformed | access_revoked | ' +
+          'schema_changed}; CursorExpired {family, reason: expired}',
       },
       structural: {
         // §8.2 and §17: the pattern reads both planes. A Profile field is
@@ -306,8 +446,12 @@ export function capabilities(): Json {
             'an entry’s client_key resolves to the Evidence the first attempt ' +
             'minted, exactly as CLIENT KEY does on a CREATE (§52.1)',
           source_actor:
-            'resolved to a Concept in this Space, by id or canonical_id, and ' +
-            'refused rather than stored as a name nothing resolves',
+            'an element reference, {id} or {type, key} — the key resolved ' +
+            'through the Concept Type lineage — and refused rather than stored ' +
+            'as a name nothing resolves; a bare string is InvalidRequestEnvelope',
+          facets:
+            'a map from Facet name to value object, validated exactly as SET ' +
+            'FACET on CREATE EVIDENCE; an outcome entry needs record_outcome (§29.8)',
           payload_artifact:
             'refused — see `artifact_store`; a handle would name bytes this ' +
             'engine cannot read',
@@ -331,7 +475,25 @@ export function capabilities(): Json {
           'schema_environment_version',
           'changes',
         ],
-        change: ['id', 'kind', 'op', 'version'],
+        // §36.1, schemas/kip-change-envelope.schema.json: names and versions,
+        // never values.
+        change: {
+          always: ['op', 'kind', 'id', 'new_version'],
+          op: ['create', 'update', 'lifecycle', 'retention', 'merge', 'purge', 'payload_purge'],
+          old_version: 'when the element existed',
+          state: '{from, to} on a lifecycle entry',
+          schema_ref: 'on a Concept entry',
+          refs: 'proposition on an Assertion; subject and predicate_ref on a Proposition; merged_into on a merge source',
+          touched:
+            'paths only, sorted: fields.<name>, attributes.<name>, ' +
+            'structural.<name>, facets.<name>, retention, state, ' +
+            'governance.<member> — Profile symbols by their local name, and ' +
+            'empty on a create, whose paths would only repeat the row',
+          planes:
+            'the element\'s plane counters after the commit, on every entry ' +
+            'that moved a plane; a lifecycle move or a merge that only ' +
+            're-pointed identity moved none, and reports none',
+        },
         deduplicate_by: 'space_id + space_seq + tx_id',
         shared_by: ['HISTORY ELEMENT', 'HISTORY SPACE', 'CHANGES'],
         // The cursor is the coordinate the page consumed, issued whenever it
@@ -381,9 +543,9 @@ export function capabilities(): Json {
           'SET RETENTION replaces the whole block rather than patching it, so ' +
           'an omitted member is cleared',
         legal_hold:
-          'gated in both directions — placing a hold needs `legal_hold`, and ' +
-          'so does any SET RETENTION over an element that currently holds one, ' +
-          'because replacement would otherwise lift it silently',
+          'gated in both directions — placing a hold needs `manage_legal_hold`, ' +
+          'and so does any SET RETENTION over an element that currently holds ' +
+          'one, because replacement would otherwise lift it silently (§29.9)',
       },
       capsule: {
         // §37.7, and the same profile rs/anda_cognitive_nexus writes: a
@@ -444,15 +606,24 @@ export function capabilities(): Json {
       },
       historical_read: {
         retention: 'unbounded: every element version is kept',
+        // §48.1: AS OF SEQ is the only historical axis. A transaction id
+        // resolves through DESCRIBE TRANSACTION and an instant through
+        // DESCRIBE SNAPSHOT AT TIME, so a read always names the exact
+        // coordinate it was served from.
         available_through: [
-          'FIND ... AS OF SEQ | TX | TIME',
+          'FIND ... AS OF SEQ',
           'read.snapshot_token',
-          'SNAPSHOT',
-          'DESCRIBE SCHEMA ENVIRONMENT AS OF',
+          'DESCRIBE SNAPSHOT [AS OF SEQ | AT TIME]',
+          'DESCRIBE SCHEMA ENVIRONMENT AS OF SEQ',
           'HISTORY ELEMENT',
           'HISTORY SPACE',
           'CHANGES',
         ],
+        snapshot:
+          'space_id, space_seq, tx_id, committed_at, schema_environment_version ' +
+          'and the snapshot_token a later read binds to; AT TIME resolves to ' +
+          'the last sequence committed at or before the instant, 0 before the ' +
+          'first commit',
         coordinate:
           'one read answers at one coordinate; a request bound by a snapshot ' +
           'token whose command names a different one is refused rather than ' +
@@ -529,9 +700,20 @@ export function capabilities(): Json {
             'or `assert_as_actor` depending on what an ActorBinding says about ' +
             'the writer — never on what the command claims (§17)',
           retraction:
-            'RETRACT and SUPERSEDE need standing: the caller wrote the record, ' +
-            'or a binding says it represents the actor. ARCHIVE and TOMBSTONE ' +
-            'are the honest alternative for anyone else',
+            'TRANSITION TO retracted or superseded needs standing: the caller ' +
+            'wrote the record, or a binding says it represents the actor. ' +
+            'TRANSITION TO archived or tombstoned is the honest alternative ' +
+            'for anyone else',
+          outcome:
+            'outcome-class Evidence and an outcome_observation Activity need ' +
+            'record_outcome on top of create, and never derive (§29.8)',
+          legal_hold:
+            'setting or lifting retention.legal_hold needs manage_legal_hold, ' +
+            'distinct from manage_retention (§29.9)',
+          authority_class:
+            'governance.authority_class is read as descriptive when unset, ' +
+            'written only through the elevate_authority host API, and refused ' +
+            'as ProtectedGovernanceField from KML (§31.3)',
           retention:
             'a `retention` block on a creation needs `manage_retention`; the ' +
             'UPDATE path refuses the field outright',
@@ -597,7 +779,11 @@ export function capabilities(): Json {
           'explicit deny, then the least restrictive matching allow — owner, ' +
           'Grant, Delegation or Policy statement — then default deny',
         revocation: 'resolved per command, so a session does not outlive it',
-        reports: ['DESCRIBE ACCESS', 'DESCRIBE EXECUTION CONTEXT'],
+        reports: [
+          'DESCRIBE ACCESS (with elevatable_authority_classes)',
+          'DESCRIBE PRIMER execution_context',
+          'DESCRIBE SPACE execution_context',
+        ],
         audit: {
           records:
             'every control-plane mutation with its whole new record, plus every ' +
@@ -619,6 +805,53 @@ export function capabilities(): Json {
             'carries none',
         },
       },
+      // §33.2, §75: every state-changing operation answers with its own
+      // Receipt.
+      receipts: {
+        where: 'results[].receipt in independent and sequence modes; the top-level receipt only in atomic, which this engine has no',
+        members: [
+          'status',
+          'tx_id',
+          'space_id',
+          'snapshot_seq',
+          'space_seq (absent on no_effect)',
+          'committed_at (absent on no_effect)',
+          'transaction_class',
+          'schema_environment_version',
+          'receipt_digest',
+          'origin {principal_id, actor_binding_id, delegation_digest}',
+        ],
+        receipt_digest:
+          'sha3-256 over RFC 8785 canonical JSON of the Receipt without ' +
+          'receipt_digest, proofs and extensions, spelled sha3-256:<hex> — ' +
+          'the profile a Capsule digest already carries (§37.7)',
+        origin:
+          'the authenticated Principal; the ActorBinding the statement spoke ' +
+          'through, or null; sha3-256:<hex> over the canonical JSON of the ' +
+          'delegation chain, or null when the request ran on none',
+        idempotency: 'execution.idempotency_key is echoed on the response',
+        on_error: 'stop by default; operations not started are reported skipped',
+      },
+      // §9.2, §9.4, §9.6: what a Literal is here.
+      literals: {
+        datatypes: ['string', 'number', 'boolean', 'null'],
+        canonical:
+          'strings NFC-normalized, never trimmed or case-folded; numbers by ' +
+          'mathematical value, -0 as 0',
+        language: 'a `language` member is TypeMismatch',
+      },
+      // §12.3, §43.2: canonical matching through merges.
+      canonical_matching:
+        'a tuple pattern naming a Concept matches tuples recorded on any ' +
+        'Concept merged into the same identity; ?p.subject / ?p.object are the ' +
+        'stored endpoints, ?p.canonical_subject / ?p.canonical_object the ' +
+        'merge-resolved ones; AS OF SEQ before the merge resolves nothing through it',
+      // §20.14: identity and matching compare lineages.
+      symbol_lineage:
+        'one version per package path is active at a time; key uniqueness, ' +
+        'the Proposition tuple key, type: and predicate matching are computed ' +
+        'from kip://<path>/<Symbol>, so an upgrade never splits memory; ' +
+        'schema_ref and predicate_ref stay exact',
       grammar: { parser: parserVersion(), spec_revision: specRevision() },
     },
     unsupported: [
@@ -636,23 +869,25 @@ export function capabilities(): Json {
       },
       {
         capability: 'unregistered_permissions',
-        detail: 'derive, share, manage_trust',
+        detail: 'derive, share, manage_trust, approve',
         reason:
           '§29.6 requires a runtime that does not distinguish derived writes ' +
           'to refuse `derive` where a Grant names it, and the same reasoning ' +
-          'covers the other two: a permission that is accepted and gates ' +
+          'covers the others: a permission that is accepted and gates ' +
           'nothing is authority that looks conferred and is not, discovered ' +
-          'during an incident. So these three are not in the registry at all ' +
+          'during an incident. So these names are not in the registry at all ' +
           'and a Grant listing one is rejected where it is written. `share` ' +
           'and `manage_trust` name operations this engine has no surface for ' +
           '— no controlled cross-Space view to expose, no trust policy to ' +
-          'version. `derive` is the one that is a judgement rather than an ' +
-          'absence: §29.6 triggers it on an element recorded as an output of ' +
-          'an Activity that has at least one input, and this engine does not ' +
-          'make that distinction at the gate yet. Every other registered name ' +
-          'is asked for by a gate, which is the property this entry exists to ' +
-          'report the exceptions to. The reference engine registers exactly ' +
-          'the same set',
+          'version — and `approve` is what this engine spells ' +
+          '`approve_high_risk`. `derive` is the one that is a judgement rather ' +
+          'than an absence: §29.6 triggers it on an element recorded as an ' +
+          'output of an Activity that has at least one input, and this engine ' +
+          'does not make that distinction at the gate yet; `derive_permission` ' +
+          'in the §67.4 registry says so. `record_outcome` and ' +
+          '`manage_legal_hold` are registered because a gate asks for each. ' +
+          'Every other registered name is asked for by a gate, which is the ' +
+          'property this entry exists to report the exceptions to',
       },
       {
         capability: 'semantic_search',

@@ -174,7 +174,7 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
     nextCursor:
       query.limit !== null && consumed < paged.total
         ? pageToken(cx.space, {
-            family: 'find',
+            family: 'kql',
             snapshotSeq: pinnedSeq,
             offset: consumed,
           })
@@ -224,27 +224,21 @@ export function bindCoordinate(
   return seq
 }
 
-/** Resolves an `AS OF` coordinate to a Space sequence. */
-export function resolveAsOf(asOf: AsOf, cx: KqlContext, b: ReadBindings): number {
-  if ('Seq' in asOf) {
-    const value = scalarValue(asOf.Seq, b)
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-      throw errors.typeMismatch('AS OF SEQ takes a non-negative sequence')
-    }
-    return value
+/**
+ * Resolves an `AS OF` coordinate to a Space sequence.
+ *
+ * `AS OF SEQ` is the only historical axis (§48.1). A transaction id resolves
+ * to its sequence through `DESCRIBE TRANSACTION`, and a wall-clock instant
+ * through `DESCRIBE SNAPSHOT AT TIME` (§68) — the engine never guesses which
+ * of several sequences an instant means, and a historical read always names
+ * the exact coordinate it was served from.
+ */
+export function resolveAsOf(asOf: AsOf, _cx: KqlContext, b: ReadBindings): number {
+  const value = scalarValue(asOf.Seq, b)
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw errors.typeMismatch('AS OF SEQ takes a non-negative sequence')
   }
-  if ('Tx' in asOf) {
-    const value = scalarValue(asOf.Tx, b)
-    if (typeof value !== 'string') {
-      throw errors.typeMismatch('AS OF TX takes a transaction id')
-    }
-    return cx.store.seqOfTransaction(cx.space, value)
-  }
-  const value = scalarValue(asOf.Time, b)
-  if (typeof value !== 'string') {
-    throw errors.typeMismatch('AS OF TIME takes an RFC 3339 timestamp')
-  }
-  return cx.store.seqAtTime(cx.space, normalizeTime(value, 'AS OF TIME'))
+  return value
 }
 
 function time(scalar: Scalar, b: ReadBindings): string {
@@ -513,7 +507,7 @@ function readCursor(
         `${JSON.stringify(value)}`,
     )
   }
-  return pageCursorFromToken(value, space, 'find')
+  return pageCursorFromToken(value, space, 'kql')
 }
 
 function count(scalar: Scalar, b: ReadBindings, what: string): number {

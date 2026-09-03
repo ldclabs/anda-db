@@ -28,8 +28,14 @@ import {
   spaceResource,
   toIdentityOnly,
 } from '../governance/index.js'
-import { formatElementId, type ElementId, type ElementKind } from '../id.js'
-import type { JsonMap } from '../json.js'
+import {
+  elementIdEquals,
+  formatElementId,
+  tryParseElementId,
+  type ElementId,
+  type ElementKind,
+} from '../id.js'
+import { isJsonMap, type Json, type JsonMap } from '../json.js'
 import type { SchemaEnvironment } from '../schema/index.js'
 import { State, TABLES, type Element, type Store } from '../store/index.js'
 import { render } from '../view.js'
@@ -217,6 +223,15 @@ export class Context {
           : Math.min(this.governedResultLimit, constraints.max_results)
     }
     const view = render(element)
+    if (element.kind === 'Proposition') {
+      // §43.2: the binding keeps both views. `subject` / `object` are the
+      // stored endpoints; `canonical_subject` / `canonical_object` follow
+      // `merged_into` to the identity that survived — at this read's
+      // coordinate, so a coordinate before the merge resolves nothing through
+      // it (§48.1).
+      view.canonical_subject = this.canonicalEndpoint(element.row.subject as Json)
+      view.canonical_object = this.canonicalEndpoint(element.row.object as Json)
+    }
     if (visibility.content) {
       redactView(view, constraints, this.readOrigin)
     } else {
@@ -224,6 +239,85 @@ export class Context {
     }
     this.views.set(key, view)
     return element
+  }
+
+  /**
+   * The Concept a local Concept reference resolves to after merges (§12.3).
+   *
+   * Follows `merged_into` to its fixpoint through this read's own loads, so
+   * the chain is read at the read's coordinate and stops at an element this
+   * caller may not discover — naming one it may not would be the existence
+   * leak §30.4 forbids. Bounded, because a corrupt chain must hang nothing.
+   */
+  canonicalOf(id: ElementId): ElementId {
+    let cursor = id
+    for (let hop = 0; hop < 64; hop += 1) {
+      if (cursor.kind !== 'Concept') return cursor
+      const element = this.load(cursor)
+      if (element === null || element.kind !== 'Concept') return cursor
+      if (element.row.merged_into === '') return cursor
+      const next = tryParseElementId(element.row.merged_into)
+      if (next === null || elementIdEquals(next, cursor)) return cursor
+      cursor = next
+    }
+    return cursor
+  }
+
+  /**
+   * Every Concept whose `merged_into` chain ends at the same identity as
+   * this one (§43.2): the canonical target and everything merged into it,
+   * transitively. What a raw Proposition pattern's endpoint matches through.
+   */
+  canonicalCluster(id: ElementId): ElementId[] {
+    const canonical = this.canonicalOf(id)
+    if (canonical.kind !== 'Concept') return [canonical]
+    const out: ElementId[] = [canonical]
+    const seen = new Set<string>([formatElementId(canonical)])
+    let frontier = [canonical]
+    while (frontier.length > 0) {
+      const next: ElementId[] = []
+      for (const target of frontier) {
+        for (const source of this.mergedInto(target)) {
+          const key = formatElementId(source)
+          if (seen.has(key)) continue
+          seen.add(key)
+          // Only a Concept this caller may discover joins the cluster: the
+          // pattern then matches what it may see, and nothing else.
+          if (this.load(source) === null) continue
+          out.push(source)
+          next.push(source)
+        }
+      }
+      frontier = next
+    }
+    return out
+  }
+
+  /** The Concepts whose `merged_into` names one target, at this read's coordinate. */
+  private mergedInto(target: ElementId): ElementId[] {
+    const named = formatElementId(target)
+    if (this.historical) {
+      return this.reconstruct('Concept')
+        .filter((element) => element.kind === 'Concept' && element.row.merged_into === named)
+        .map((element) => ({ kind: 'Concept', seq: element.row.id }) as ElementId)
+    }
+    const rows = this.store.sql
+      .exec<{ id: number }>(
+        'SELECT id FROM concepts WHERE space = ? AND merged_into = ? ORDER BY id',
+        this.space,
+        named,
+      )
+      .toArray()
+    this.spend('scans', rows.length)
+    return rows.map((row) => ({ kind: 'Concept', seq: row.id }) as ElementId)
+  }
+
+  private canonicalEndpoint(endpoint: Json): Json {
+    if (!isJsonMap(endpoint) || typeof endpoint.id !== 'string') return endpoint
+    const id = tryParseElementId(endpoint.id)
+    if (id === null || id.kind !== 'Concept') return endpoint
+    const canonical = this.canonicalOf(id)
+    return elementIdEquals(canonical, id) ? endpoint : { id: formatElementId(canonical) }
   }
 
   /** The tightest result cap carried by an authority used by this read. */

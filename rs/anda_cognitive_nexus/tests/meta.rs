@@ -307,7 +307,11 @@ async fn validate_reports_legality_without_promising_a_commit() {
     assert!(!bad["violations"].as_array().unwrap().is_empty());
 
     // Validating a mutation as a query is a language mismatch, not a pass.
-    let mismatched = ok(&nexus, r#"VALIDATE KQL "ARCHIVE \"C-1\"""#).await;
+    let mismatched = ok(
+        &nexus,
+        r#"VALIDATE KQL "TRANSITION \"C-1\" TO \"archived\"""#,
+    )
+    .await;
     assert_eq!(mismatched["valid"], false);
     assert_eq!(mismatched["violations"][0]["code"], "LanguageMismatch");
 }
@@ -437,7 +441,15 @@ async fn a_transaction_is_recoverable_by_id_and_by_idempotency_key() {
     let response = nexus
         .execute(parsed, &request, &request.operations[0])
         .await;
-    let tx_id = response.receipt.as_ref().unwrap().tx_id.clone().unwrap();
+    // §75: a single operation carries its own Receipt; the top-level slot is
+    // reserved for an `atomic` transaction, which this engine does not run.
+    let tx_id = response.results[0]
+        .receipt
+        .as_ref()
+        .unwrap()
+        .tx_id
+        .clone()
+        .unwrap();
 
     let by_id = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
@@ -470,21 +482,26 @@ async fn a_transaction_is_recoverable_by_id_and_by_idempotency_key() {
 
 #[tokio::test]
 async fn a_snapshot_reports_a_coordinate_a_later_read_can_bind_to() {
-    // A token promises a later read can be bound to this coordinate. The
-    // engine keeps that promise now, so it issues one; `tests/history.rs`
-    // exercises the binding itself.
+    // §68: the bare `SNAPSHOT` statement became `DESCRIBE SNAPSHOT`, which
+    // answers a coordinate — the sequence, the transaction that committed it,
+    // its commit time and the schema environment in force. A token promises a
+    // later read can be bound to it; `tests/history.rs` exercises the binding.
     let nexus = seeded("snapshot").await;
-    let snapshot = ok(&nexus, "SNAPSHOT").await;
-    let seq = snapshot["snapshot_seq"].as_u64().unwrap();
+    let snapshot = ok(&nexus, "DESCRIBE SNAPSHOT").await;
+    let seq = snapshot["space_seq"].as_u64().unwrap();
     assert!(seq >= 1);
     assert!(snapshot["snapshot_token"].is_string());
+    assert_eq!(snapshot["space_id"], DEFAULT_SPACE);
+    assert!(snapshot["tx_id"].is_string());
+    assert!(snapshot["committed_at"].is_string());
+    assert_eq!(snapshot["schema_environment_version"], 1);
 
-    let historical = ok(&nexus, "SNAPSHOT AS OF SEQ 1").await;
-    assert_eq!(historical["snapshot_seq"], serde_json::json!(1));
+    let historical = ok(&nexus, "DESCRIBE SNAPSHOT AS OF SEQ 1").await;
+    assert_eq!(historical["space_seq"], serde_json::json!(1));
 
     // A coordinate the Space has not reached is refused rather than rounded
     // down to the present.
-    let ahead = run(&nexus, &format!("SNAPSHOT AS OF SEQ {}", seq + 50)).await;
+    let ahead = run(&nexus, &format!("DESCRIBE SNAPSHOT AS OF SEQ {}", seq + 50)).await;
     assert_eq!(
         ahead
             .results
@@ -496,6 +513,47 @@ async fn a_snapshot_reports_a_coordinate_a_later_read_can_bind_to() {
             .as_str(),
         "HistoricalSnapshotUnavailable"
     );
+}
+
+/// §48.1 dropped `AS OF TIME` from KQL, so wall-clock time now enters a
+/// historical read through one door only: `DESCRIBE SNAPSHOT AT TIME` resolves
+/// an instant to the last sequence committed at or before it, and the caller
+/// carries that sequence into `AS OF SEQ`. The engine never guesses which of
+/// several sequences an instant meant.
+#[tokio::test]
+async fn an_instant_resolves_to_the_sequence_it_names() {
+    let nexus = seeded("snapshot_at_time").await;
+    let head = ok(&nexus, "DESCRIBE SNAPSHOT").await;
+    let seq = head["space_seq"].as_u64().unwrap();
+    let committed_at = head["committed_at"].as_str().unwrap().to_string();
+
+    // The instant of the head commit resolves to the head itself: `at or
+    // before` includes the commit that happened exactly then.
+    let resolved = ok(
+        &nexus,
+        &format!(r#"DESCRIBE SNAPSHOT AT TIME "{committed_at}""#),
+    )
+    .await;
+    assert_eq!(resolved["space_seq"], serde_json::json!(seq));
+
+    // An instant later than every commit still names the last sequence
+    // committed at or before it, which is the head — not a future coordinate.
+    let later = ok(
+        &nexus,
+        r#"DESCRIBE SNAPSHOT AT TIME "2999-01-01T00:00:00Z""#,
+    )
+    .await;
+    assert_eq!(later["space_seq"], serde_json::json!(seq));
+
+    // An instant before the Space existed is sequence 0 — an empty Space, not
+    // an error: this engine keeps every version, so no instant falls below a
+    // retention floor.
+    let before = ok(
+        &nexus,
+        r#"DESCRIBE SNAPSHOT AT TIME "1990-01-01T00:00:00Z""#,
+    )
+    .await;
+    assert_eq!(before["space_seq"], serde_json::json!(0));
 }
 
 #[tokio::test]
@@ -549,28 +607,81 @@ async fn the_epistemic_policy_is_introspectable_before_it_is_used() {
             .any(|n| n.as_str().unwrap().contains("does not grant trust"))
     );
 
-    let capability = ok(&nexus, "DESCRIBE PROJECTION CAPABILITY").await;
-    assert!(
-        capability["missing_stages"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("trust_evaluation"))
-    );
+    // §67.4 replaced `DESCRIBE PROJECTION CAPABILITY` with one registry every
+    // engine spells the same way, so a client asks the same question of any
+    // engine. This one runs the structural baseline (§21.10) and evaluates no
+    // source trust, which is `weighted_projection: false` — a stated absence,
+    // not a silence a caller has to interpret.
+    let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
+    assert_eq!(registry["weighted_projection"], json!(false));
+    assert_eq!(registry["materialized_projection"], json!(false));
+    assert_eq!(registry["belief_slot"], json!(true));
 }
 
+/// §67.4 is a closed registry: a `requires` block names an entry from it, and
+/// an engine MUST NOT rename one. So every name the section lists is reported,
+/// spelled exactly as the section spells it, whether or not this engine has it.
 #[tokio::test]
-async fn execution_context_states_what_the_next_read_will_see() {
+async fn the_capability_registry_names_everything_the_spec_registered() {
+    let nexus = fresh("registry").await;
+    let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
+    for name in [
+        "serializable_isolation",
+        "idempotency_retention",
+        "historical_reads",
+        "historical_search",
+        "semantic_search",
+        "hybrid_search",
+        "search_index_freshness",
+        "belief_slot",
+        "weighted_projection",
+        "materialized_projection",
+        "signed_receipts",
+        "ingestion_context",
+        "streaming",
+        "artifacts",
+        "change_stream",
+        "filtered_delivery",
+        "watch_evaluation",
+        "list_dependents",
+        "payload_purge",
+        "capsule_export",
+        "capsule_import",
+        "capsule_signatures",
+        "derive_permission",
+        "record_outcome_permission",
+    ] {
+        assert!(
+            !registry[name].is_null(),
+            "§67.4 registers {name}, and an engine may add entries but not drop one"
+        );
+    }
+    // An entry MAY carry a value rather than a bare flag; §67.4 gives
+    // `idempotency_retention` a window as its example.
+    assert!(registry["idempotency_retention"].is_object());
+    assert!(registry["search_index_freshness"].is_object());
+}
+
+/// §68 removed `DESCRIBE EXECUTION CONTEXT`: what the next read will see is a
+/// snapshot coordinate, and there is now one statement that reports one. The
+/// question survived the statement, so the answer must still carry it — which
+/// Space, which sequence, and which schema environment is in force there.
+#[tokio::test]
+async fn the_head_coordinate_states_what_the_next_read_will_see() {
     let nexus = seeded("execution_context").await;
-    let context = ok(&nexus, "DESCRIBE EXECUTION CONTEXT").await;
+    let context = ok(&nexus, "DESCRIBE SNAPSHOT").await;
     assert_eq!(context["space_id"], DEFAULT_SPACE);
     assert!(context["space_seq"].as_u64().unwrap() >= 1);
     assert_eq!(context["schema_environment_version"], 1);
-    assert!(
-        context["read_basis"]
-            .as_str()
-            .unwrap()
-            .contains("committed state")
-    );
+
+    // And it really is the head: a write moves it, so a caller that reads the
+    // coordinate twice can tell that the Space advanced under it.
+    let before = context["space_seq"].as_u64().unwrap();
+    ok(&nexus, r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Dana" }"#).await;
+    let after = ok(&nexus, "DESCRIBE SNAPSHOT").await["space_seq"]
+        .as_u64()
+        .unwrap();
+    assert!(after > before, "the head coordinate advances with a commit");
 }
 
 // ---------------------------------------------------------------------------

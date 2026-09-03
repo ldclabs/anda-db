@@ -210,6 +210,46 @@ impl FromStr for SymbolRef {
     }
 }
 
+/// The lineage identity of a symbol reference: `kip://<package-path>/<symbol>`
+/// (Spec §20.14).
+///
+/// Every rule that compares, matches or deduplicates by symbol — key
+/// uniqueness (§7.3), Proposition tuple identity (§12.3), `type:` sugar
+/// (§43.1) — operates on the lineage rather than on the exact reference, so
+/// elements written under two versions of one package stay one population.
+/// A string that is not an exact symbol reference is its own lineage: the
+/// Core structural field names and the empty reference pass through unchanged.
+///
+/// This engine activates one version per package path in a Space (the Schema
+/// Lock maps a package id to one version), so today the exact symbol the
+/// environment resolves is the lineage's only live version; the keys are
+/// lineage-based anyway, so that an upgrade never splits memory that was
+/// written under the version before it.
+pub fn lineage_of(reference: &str) -> String {
+    match reference.parse::<SymbolRef>() {
+        Ok(symbol) => format!("{}/{}", symbol.package.package_id, symbol.name),
+        Err(_) => reference.to_string(),
+    }
+}
+
+/// Whether two references belong to one lineage (§20.14).
+pub fn same_lineage(a: &str, b: &str) -> bool {
+    lineage_of(a) == lineage_of(b)
+}
+
+/// The index range every version of one lineage falls in.
+///
+/// Exact references are spelled `<package-id>@<version>/<symbol>`, so every
+/// version of one package sorts between `<package-id>@` and the same prefix
+/// followed by the largest scalar value; the symbol name is checked afterwards
+/// with [`same_lineage`]. `None` for a reference that is not an exact symbol.
+pub fn lineage_range(reference: &str) -> Option<(String, String)> {
+    let symbol: SymbolRef = reference.parse().ok()?;
+    let low = format!("{}@", symbol.package.package_id);
+    let high = format!("{low}\u{10FFFF}");
+    Some((low, high))
+}
+
 /// Whether a string is already a canonical, fully-qualified reference.
 ///
 /// This is the test that separates "the caller named an exact symbol" from

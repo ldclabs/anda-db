@@ -21,7 +21,8 @@ pub mod update;
 pub mod value;
 
 use anda_kip::{
-    ElementKind, Json, KipError, KmlStatement, Map, Operation, Request, Response, ResponseContext,
+    ElementKind, ElementReference, Json, KipError, KmlStatement, Map, Operation, OperationResult,
+    OperationStatus, Receipt, ReceiptStatus, Request, Response, ResponseContext, ResultContext,
     Warning,
 };
 
@@ -87,16 +88,19 @@ pub async fn execute(
     let provenance = access_provenance(statement, authority, auth);
     match tx.commit(entry).await {
         Ok(outcome) => {
-            let mut response = success(outcome, space_id, schema_environment_version);
-            if let Some(provenance) = provenance
-                && let Some(receipt) = response.receipt.as_mut()
-            {
+            let mut receipt = outcome.receipt.clone();
+            if let Some(provenance) = provenance {
                 receipt
                     .extensions
                     .get_or_insert_with(Map::new)
                     .insert("governance".to_string(), provenance);
             }
-            response
+            // The digest covers the members §33.2 names, not the namespaced
+            // `extensions`, so it does not matter that the provenance was
+            // attached first — and a replay, which cannot rebuild the
+            // provenance, recovers the same digest.
+            let receipt = crate::tx::seal_receipt(receipt);
+            success(outcome, space_id, schema_environment_version, receipt)
         }
         Err(err) => Response::from(err),
     }
@@ -271,6 +275,11 @@ async fn mint_ingested_evidence(
             Some(at) => crate::time::normalize(at, "ingest.observed_at")?,
             None => tx.cx.at.clone(),
         };
+        // §71.1: the entry's Facets are validated exactly as `SET FACET` on
+        // `CREATE EVIDENCE` would be — which is how instrumentation attaches
+        // an OutcomeRecord to an ingested outcome without re-typing anything,
+        // and how a member the Facet does not declare fails the whole request.
+        let facets = ingested_facets(tx, &entry.facets)?;
 
         let id = tx.mint(ElementKind::Evidence).await?;
         let row = crate::store::rows::EvidenceRow {
@@ -284,43 +293,98 @@ async fn mint_ingested_evidence(
             source_refs,
             status: "active".to_string(),
             client_key,
+            facets,
             ..Default::default()
         };
         let element = crate::store::Element::Evidence(Box::new(row));
         tx.authorize_created(&element, crate::governance::Permission::Create)?;
-        tx.stage_new(id, element, "create");
+        // §29.8: writing into the consequence channel costs `record_outcome`,
+        // whichever path the Evidence arrives by — the envelope is not a way
+        // around the gate.
+        clauses::require_outcome_authority(tx, &element)?;
+        tx.stage_new(id, element, anda_kip::ChangeOp::Create);
         bound.insert(entry.key.clone(), serde_json::json!({"id": id.to_string()}));
     }
     Ok(bound)
 }
 
+/// Resolves and validates the Facets an ingest entry attaches (§71.1).
+fn ingested_facets(
+    tx: &Transaction,
+    declared: &std::collections::BTreeMap<String, Map<String, Json>>,
+) -> Result<Map<String, Json>, KipError> {
+    let mut facets = Map::new();
+    for (name, members) in declared {
+        let symbol = tx.env.resolve_symbol(
+            crate::schema::SymbolKind::Facet,
+            name,
+            crate::schema::Intent::Write,
+        )?;
+        facets.insert(symbol.to_string(), Json::Object(members.clone()));
+    }
+    tx.env
+        .validate_facets(
+            &facets,
+            &crate::schema::EndpointFacts::Element {
+                kind: ElementKind::Evidence,
+                schema_ref: None,
+            },
+            crate::schema::Intent::Write,
+        )?
+        .into_result()?;
+    Ok(facets)
+}
+
 /// Resolves an ingest entry's `source_actor` to a reference in this Space.
 ///
-/// Refused rather than stored as a bare name. §71.1 records the actor as
-/// Evidence *source*, and a source slot holding a string nothing resolves is a
-/// citation a reader cannot follow — indistinguishable, later, from one that
-/// was checked. The actor is a semantic actor and never a Principal (§88.1),
-/// so this looks it up among Concepts and never in the control plane.
+/// An element reference — `{id}` or `{type, key}` — and never a name (§71.1,
+/// §7.2): the actor is recorded as the Evidence's *source*, and a source slot
+/// holding something nothing resolves is a citation a reader cannot follow,
+/// indistinguishable later from one that was checked. A key resolves through
+/// the Concept Type's lineage (§20.14). The actor is a semantic actor and
+/// never a Principal (§88.1), so this looks it up among elements and never in
+/// the control plane; one it cannot find is `NotFoundOrNotVisible`.
 async fn resolve_source_actor(
     store: &Store,
     tx: &Transaction,
-    actor: &str,
+    actor: &ElementReference,
 ) -> Result<Json, KipError> {
-    if let Ok(id) = actor.parse::<crate::id::ElementId>()
-        && store.get_element(id).await.is_ok()
-    {
-        return Ok(serde_json::json!({"id": id.to_string()}));
+    let missing = |named: String| {
+        KipError::not_found_or_not_visible(format!(
+            "the ingest source actor {named} names no element in this Space; an Evidence source \
+             must resolve to something a reader can follow"
+        ))
+    };
+    if let Some(id) = &actor.id {
+        let Ok(parsed) = id.parse::<crate::id::ElementId>() else {
+            return Err(missing(format!("{id:?}")));
+        };
+        return match store.get_element(parsed).await {
+            Ok(element) if element.space() == tx.cx.space => {
+                Ok(serde_json::json!({"id": parsed.to_string()}))
+            }
+            _ => Err(missing(format!("{id:?}"))),
+        };
     }
-    if let Some(id) = store
-        .find_concept_by_canonical_id(&tx.cx.space, actor)
+    let (Some(type_name), Some(key)) = (&actor.r#type, &actor.key) else {
+        return Err(KipError::invalid_request_envelope(
+            "ingest source_actor is an element reference: {id} or {type, key}",
+        ));
+    };
+    let symbol = tx.env.resolve_symbol(
+        crate::schema::SymbolKind::ConceptType,
+        type_name,
+        crate::schema::Intent::Read,
+    )?;
+    match store
+        .find_concept_by_key(&tx.cx.space, Some(&symbol.to_string()), key)
         .await?
     {
-        return Ok(serde_json::json!({"id": id.to_string()}));
+        Some(row) => Ok(serde_json::json!({
+            "id": crate::id::ElementId::new(ElementKind::Concept, row._id).to_string()
+        })),
+        None => Err(missing(format!("{{type: {type_name:?}, key: {key:?}}}"))),
     }
-    Err(KipError::not_found_or_not_visible(format!(
-        "the ingest source actor {actor:?} names no Concept in this Space; an Evidence source \
-         must resolve to something a reader can follow"
-    )))
 }
 
 /// The response a recorded transaction produced, handed back on a resend.
@@ -333,13 +397,25 @@ async fn resolve_source_actor(
 ///   landed, which is the fact it resent to find out;
 /// - the original run's own warnings are not persisted and are therefore gone.
 ///   A replay that invented them would be worse than one that says nothing.
+///
+/// The `origin` is read back from the journal rather than rebuilt: the commit
+/// was attributed to whoever made it, and deriving one from the resending
+/// caller would attribute the first commit to whoever happened to ask about
+/// it. Dropping it instead would change `receipt_digest`, so the Receipt a
+/// client recovers would no longer be the one that was sealed (§33.3).
+///
+/// The governance provenance an audited commit carries in `extensions` is not
+/// journalled and is therefore absent here. That is why the digest is sealed
+/// over the members §33.2 names and not over `extensions` — otherwise every
+/// purge and every tombstone would replay under a digest that did not match
+/// the one it committed with.
 pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
     let committed = row.status == "committed";
-    let receipt = anda_kip::Receipt {
+    let receipt = crate::tx::seal_receipt(Receipt {
         status: if committed {
-            anda_kip::ReceiptStatus::Committed
+            ReceiptStatus::Committed
         } else {
-            anda_kip::ReceiptStatus::NoEffect
+            ReceiptStatus::NoEffect
         },
         tx_id: Some(row.tx_id.clone()),
         space_id: Some(row.space.clone()),
@@ -353,42 +429,84 @@ pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
         schema_environment_version: Some(row.schema_environment_version),
         change_summary: Some(crate::tx::summarize(&row.changes)),
         proofs: Vec::new(),
+        receipt_digest: None,
+        origin: serde_json::from_value(row.origin.clone()).unwrap_or(None),
         extensions: None,
-    };
-    Response {
-        receipt: Some(receipt),
-        warnings: vec![Warning::Message(format!(
-            "this is the recorded outcome of transaction {}, replayed under the idempotency key \
-             it committed with: nothing ran a second time, and any warnings the first attempt \
-             reported are not kept",
-            row.tx_id
-        ))],
-        context: Some(ResponseContext {
-            space_id: Some(row.space.clone()),
-            schema_environment_version: Some(row.schema_environment_version),
-            compatibility_profile_used: None,
-            extensions: None,
-        }),
-        ..Response::ok(row.result.clone())
-    }
+    });
+    let mut response = operation_response(
+        row.result.clone(),
+        &row.space,
+        row.schema_environment_version,
+        receipt,
+    );
+    response.warnings = vec![Warning::Message(format!(
+        "this is the recorded outcome of transaction {}, replayed under the idempotency key \
+         it committed with: nothing ran a second time, and any warnings the first attempt \
+         reported are not kept",
+        row.tx_id
+    ))];
+    response
 }
 
-fn success(outcome: Outcome, space_id: &str, schema_environment_version: u64) -> Response {
+fn success(
+    outcome: Outcome,
+    space_id: &str,
+    schema_environment_version: u64,
+    receipt: Receipt,
+) -> Response {
     let warnings: Vec<Warning> = outcome
         .warnings
         .iter()
         .map(|message| Warning::Message(message.clone()))
         .collect();
+    let mut response = operation_response(
+        outcome.result(),
+        space_id,
+        schema_environment_version,
+        receipt,
+    );
+    response.warnings = warnings;
+    response
+}
+
+/// The single-operation response a state-changing command answers with.
+///
+/// The Receipt sits on the operation's result (§75, §81): in `sequence` and
+/// `independent` execution every state-changing operation returns its own,
+/// and the top-level `receipt` is reserved for an `atomic` transaction, which
+/// this engine does not run. A transaction that changed nothing reports its
+/// operation as `no_effect` (§32.8).
+fn operation_response(
+    result: Json,
+    space_id: &str,
+    schema_environment_version: u64,
+    receipt: Receipt,
+) -> Response {
+    let status = if receipt.status == ReceiptStatus::NoEffect {
+        OperationStatus::NoEffect
+    } else {
+        OperationStatus::Succeeded
+    };
     Response {
-        receipt: Some(outcome.receipt.clone()),
-        warnings,
         context: Some(ResponseContext {
             space_id: Some(space_id.to_string()),
             schema_environment_version: Some(schema_environment_version),
             compatibility_profile_used: None,
             extensions: None,
         }),
-        ..Response::ok(outcome.result())
+        results: vec![OperationResult {
+            status,
+            result: Some(result),
+            context: Some(ResultContext {
+                space_id: Some(space_id.to_string()),
+                snapshot_seq: receipt.snapshot_seq,
+                schema_environment_version: Some(schema_environment_version),
+                ..Default::default()
+            }),
+            receipt: Some(receipt),
+            ..Default::default()
+        }],
+        ..Default::default()
     }
 }
 

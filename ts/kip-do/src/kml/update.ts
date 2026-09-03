@@ -8,7 +8,7 @@
  * ```text
  * Assertion    EpistemicRevisionRequired    a new Assertion + SUPERSEDE
  * Evidence     EvidenceCorrectionRequired   CORRECT ... BY
- * Activity     InvalidLifecycleTransition   TRANSITION ACTIVITY
+ * Activity     InvalidLifecycleTransition   TRANSITION … TO an Activity state
  * Proposition  ImmutableField               the tuple is its identity
  * ```
  *
@@ -18,6 +18,7 @@
  */
 
 import {
+  GOVERNANCE_FIELDS,
   authorizeCanonicalIdentity,
   canonicalizeReference,
   edgeIndex,
@@ -86,7 +87,8 @@ function immutableTarget(element: Element, what: string) {
     case 'Activity':
       return errors.invalidLifecycleTransition(
         `${what} does not reach ${named}: an Activity finalizes its fields ` +
-          `and topology through TRANSITION ACTIVITY`,
+          `and topology through TRANSITION … TO "completed" | "failed" | ` +
+          `"cancelled" (§52.5)`,
       )
     default:
       return errors.immutableField(
@@ -163,6 +165,15 @@ export function applyAction(
           )
           break
         default:
+          // §31.3: a Governance member spelled as a field is refused under its
+          // own code, so an agent learns it is the control plane's to assign.
+          if (GOVERNANCE_FIELDS.includes(name)) {
+            throw errors.protectedGovernanceField(
+              `\`${name}\` is Governance state (§31.3): it is assigned and ` +
+                `enforced by the control plane, never written by cognitive ` +
+                `content and never inferred from it`,
+            )
+          }
           // `key` is the immutable Space-local identity, and `_system`,
           // `governance` and `retention` are engine and control-plane state.
           throw errors.immutableField(

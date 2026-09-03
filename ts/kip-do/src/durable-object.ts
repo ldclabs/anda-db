@@ -13,8 +13,10 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import { DIGEST_PROFILE } from './capsule/index.js'
+import { sha3_256Text } from './digest.js'
 import { KipError, type KipErrorJSON } from './errors.js'
-import type { Json, JsonMap } from './json.js'
+import { canonicalJson, type Json, type JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import { checkIngest, type IngestContext } from './kml/index.js'
 import {
@@ -66,12 +68,12 @@ export type KipOperationStatus =
  * consumer reading "no error" as "committed" would count a write that never
  * happened.
  *
- * The full mutation outcome — bound handles, per-element changes, the
- * governance decision — rides in `extensions` rather than as a sibling
- * `receipt`. §81 puts one `receipt` on the envelope, and the normative schema
- * closes `OperationResult` to additional properties; a batch here is several
- * transactions, so the per-operation detail needs a namespaced home and the
- * envelope's `receipt` reports the last commit.
+ * §75: in `independent` and `sequence` modes every state-changing operation
+ * returns its own Receipt in `receipt`; the top-level `receipt` exists only in
+ * `atomic` mode, which this engine does not have. The rest of the mutation
+ * outcome — bound handles, per-element changes, the governance decision —
+ * rides in `extensions`, because the wire Receipt is closed to the members
+ * §33.2 names.
  */
 export interface KipResult {
   /** The request-local id of the operation this answers (§73). */
@@ -88,8 +90,28 @@ export interface KipResult {
    */
   next_cursor?: string
   warnings?: string[]
-  extensions?: { 'kip-do/outcome': Outcome }
+  /** This operation's own transaction Receipt (§33.2, §75). */
+  receipt?: KipReceipt
+  extensions?: {
+    'kip-do/outcome'?: Outcome
+    /**
+     * §63.5: a `LIST DEPENDENTS` walk was cut short by an element the caller
+     * may not discover. The rows stay a bare array, so the flag rides here.
+     */
+    'kip-do/dependents'?: { truncated: true }
+  }
   error?: KipErrorJSON
+}
+
+/**
+ * The Principal a commit was attributed to, the ActorBinding it exercised
+ * and the delegation chain it acted under (§33.2), so an auditor can tie the
+ * Receipt to the Governance decision without reading the audit log.
+ */
+export interface KipReceiptOrigin {
+  principal_id: string
+  actor_binding_id: string | null
+  delegation_digest: string | null
 }
 
 /** A transaction outcome in the shape §33.2 fixes for the wire. */
@@ -98,10 +120,17 @@ export interface KipReceipt {
   tx_id: string
   space_id: string
   snapshot_seq: number
+  /** Absent on `no_effect`: no sequence was taken. */
   space_seq?: number
   committed_at?: string
   transaction_class: string
   schema_environment_version: number
+  /**
+   * The canonical digest of the Receipt without `receipt_digest` and
+   * `proofs` (§33.2); a signed Receipt would sign it.
+   */
+  receipt_digest: string
+  origin: KipReceiptOrigin
 }
 
 /** The response envelope (Spec §81). */
@@ -111,17 +140,20 @@ export interface KipResponse {
   request_id?: string
   /** §82. Derived from the operations, never from the transport status. */
   status: 'succeeded' | 'failed' | 'partial'
-  execution?: { mode: string; on_error?: string }
+  /**
+   * The mode and error policy that were used, and the request's idempotency
+   * key echoed back so an `outcome_unknown` response can be recovered by key
+   * (§80.4, §81).
+   */
+  execution?: { mode: string; on_error?: string; idempotency_key?: string }
   results: KipResult[]
   context?: { space_id: string }
   /**
-   * The last commit this request produced (§81).
-   *
-   * One slot, and a batch here is several transactions, so it reports the
-   * latest — the one a caller normally needs to inspect. Every operation's own
-   * outcome stays on that operation.
+   * The transaction's Receipt in `atomic` mode only (§75.3). This engine has
+   * no atomic batch, so the member is never present; every operation's own
+   * Receipt is on that operation.
    */
-  receipt?: KipReceipt | null
+  receipt?: KipReceipt
   error?: KipErrorJSON
 }
 
@@ -189,7 +221,8 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     idempotencyKey?: string,
   ): KipResult {
     try {
-      const session = this.nexus.session(this.authenticate(context))
+      const auth = this.authenticate(context)
+      const session = this.nexus.session(auth)
       const parsed = parseKip(command)
       if ('Kml' in parsed) {
         const outcome = session.mutate(parsed.Kml, params, {
@@ -204,6 +237,8 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
           ...(outcome.warnings.length === 0
             ? {}
             : { warnings: outcome.warnings }),
+          // §75: the operation's own Receipt, in the shape §33.2 fixes.
+          receipt: receiptOf(outcome, auth),
           extensions: { 'kip-do/outcome': outcome },
         }
       }
@@ -228,6 +263,15 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         ...(answer.nextCursor === null
           ? {}
           : { next_cursor: answer.nextCursor }),
+        ...(answer.truncated
+          ? {
+              warnings: [
+                'the traversal was cut short by an element this caller may not ' +
+                  'discover (§63.5); the closure reported is incomplete',
+              ],
+              extensions: { 'kip-do/dependents': { truncated: true as const } },
+            }
+          : {}),
       }
     } catch (err) {
       return { status: 'failed', error: KipError.from(err).toJSON() }
@@ -330,9 +374,12 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
 
     const operations = envelope.operations ?? []
     const mode = (envelope.execution?.mode ?? 'independent') as ExecutionMode
+    // §75.2: `stop` when absent. A sequence that defaulted to `continue`
+    // would commit the writes the caller asked to have skipped.
     const onError = (envelope.execution?.on_error ?? 'stop') as OnError
+    const idempotencyKey = envelope.execution?.idempotency_key
     const results = this.executeKipBatch(
-      operations.map((operation) => ({
+      operations.map((operation, index) => ({
         ...(operation.op_id === undefined ? {} : { op_id: operation.op_id }),
         command: operation.command ?? '',
         // §74: a top-level `parameters` block is the request's own binding
@@ -340,16 +387,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         // than in the engine, because binding is an envelope concern and the
         // engine only ever sees one map.
         parameters: { ...(envelope.parameters ?? {}), ...(operation.parameters ?? {}) },
-        // §71.3: an operation's own key wins over the request's. A batch that
-        // shared one key across several writes would have the second replay
-        // the first, so the narrower one is the one that means anything.
-        ...(operation.idempotency_key ?? envelope.execution?.idempotency_key) ===
-        undefined
-          ? {}
-          : {
-              idempotencyKey:
-                operation.idempotency_key ?? envelope.execution?.idempotency_key,
-            },
+        ...operationIdempotency(operation, envelope, index),
       })),
       envelope.context,
       envelope.read,
@@ -363,9 +401,11 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         execution: {
           mode,
           ...(mode === 'sequence' ? { on_error: onError } : {}),
+          // §81: echoed, so an `outcome_unknown` response can be recovered
+          // by the key the caller chose (§80.4).
+          ...(idempotencyKey === undefined ? {} : { idempotency_key: idempotencyKey }),
         },
         context: { space_id: this.nexus.space },
-        receipt: lastReceipt(results),
       },
       statusFor(results),
     )
@@ -554,16 +594,45 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     // what every operation of the batch can cite: discovering it malformed
     // after the first statement committed would leave durable writes behind a
     // request that was never valid.
-    if (envelope.ingest !== undefined) checkIngest(envelope.ingest)
+    if (envelope.ingest !== undefined) {
+      checkIngest(envelope.ingest)
+      // §71.1 mints each entry inside the request's transaction scope, and
+      // makes ingestion transactional. A request whose operations are all
+      // reads opens no such scope, so the Evidence would be minted nowhere
+      // while the request still answered `succeeded` — and the caller would go
+      // on believing the observation was recorded, which is the fidelity
+      // failure §88.12 has ingestion exist to prevent.
+      //
+      // Only refused once every operation parsed. A command that does not
+      // parse should still report its own syntax error rather than being
+      // recast as an envelope fault.
+      let allParsed = true
+      let anyMutation = false
+      for (const operation of operations) {
+        try {
+          if ('Kml' in parseKip(operation.command ?? '')) anyMutation = true
+        } catch {
+          allParsed = false
+        }
+      }
+      if (allParsed && !anyMutation) {
+        throw new KipError(
+          'InvalidRequestEnvelope',
+          'an `ingest` block mints Evidence inside the request\'s ' +
+            'transaction, so the request must carry at least one KML ' +
+            'operation; a read-only request would drop the observation ' +
+            'while reporting success',
+        )
+      }
+    }
   }
 
   private envelope(
     partial: {
       request_id?: string
       results?: KipResult[]
-      execution?: { mode: string; on_error?: string }
+      execution?: { mode: string; on_error?: string; idempotency_key?: string }
       context?: { space_id: string }
-      receipt?: KipReceipt | null
       error?: KipErrorJSON
     },
     status: number,
@@ -586,7 +655,6 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         : { execution: partial.execution }),
       results,
       ...(partial.context === undefined ? {} : { context: partial.context }),
-      ...(partial.receipt === undefined ? {} : { receipt: partial.receipt }),
       ...(partial.error === undefined ? {} : { error: partial.error }),
     }
     return Response.json(response, { status })
@@ -628,6 +696,38 @@ interface KipRequestEnvelope {
 }
 
 /**
+ * The idempotency key one operation of a batch commits under (§34.2, §73).
+ *
+ * An operation's own key wins: §73 puts `idempotency_key` on the operation
+ * precisely so a caller can name one logical mutation intent per write. The
+ * envelope's key is one intent *for the request*, and this engine has no
+ * atomic batch — each operation is its own transaction — so handing the same
+ * key to three writes would make the second and third replay the first's
+ * outcome and commit nothing. §34.2 requires the key to be scoped at least by
+ * operation endpoint, so the envelope's key is narrowed by the operation's
+ * position: an identical retry reproduces the same positions and still
+ * deduplicates, while three different writes in one request stay three.
+ *
+ * The position rather than `op_id`, which is optional: a key that existed only
+ * for the operations that named one would be retry-safe by accident.
+ */
+function operationIdempotency(
+  operation: { idempotency_key?: string },
+  envelope: KipRequestEnvelope,
+  index: number,
+): { idempotencyKey?: string } {
+  if (operation.idempotency_key !== undefined) {
+    return { idempotencyKey: operation.idempotency_key }
+  }
+  const requestKey = envelope.execution?.idempotency_key
+  if (requestKey === undefined) return {}
+  const operations = envelope.operations ?? []
+  return {
+    idempotencyKey: operations.length === 1 ? requestKey : `${requestKey}#${index}`,
+  }
+}
+
+/**
  * §82, from the operations rather than from the transport.
  *
  * `partial` needs an operation that actually succeeded, not merely one that did
@@ -647,31 +747,47 @@ function topLevelStatus(
 }
 
 /**
- * The last commit a batch produced, in the shape §33.2 fixes.
+ * One transaction outcome in the shape §33.2 fixes for the wire.
  *
  * A projection rather than the raw outcome: the wire Receipt is closed to the
- * fields §33.2 names, and this engine's outcome also carries bound handles and
- * per-element changes — which belong to the operation that produced them and
- * stay there.
+ * members §33.2 names, and this engine's outcome also carries bound handles
+ * and per-element changes — which stay in the operation's `extensions`.
+ *
+ * `space_seq` and `committed_at` are absent on `no_effect`: no sequence was
+ * taken and nothing was committed, and a Receipt that carried a coordinate
+ * would claim a commit that did not happen. `receipt_digest` is the engine's
+ * canonical-JSON digest over the Receipt without itself and without
+ * `proofs`, so a signed Receipt (§33.3) would sign exactly what a reader can
+ * recompute. sha3-256, the algorithm §37.7's profile is registered under in
+ * this project and the one a Capsule digest already carries: a Receipt and a
+ * Capsule from the same Space must not be verifiable under two different
+ * hashes, and the other reference engine seals under the same one. `origin` is read off the authorization context the statement
+ * ran under: the Principal, the ActorBinding it spoke through if any, and a
+ * digest of the delegation chain when the request named one.
  */
-function lastReceipt(results: readonly KipResult[]): KipReceipt | null {
-  for (let i = results.length - 1; i >= 0; i -= 1) {
-    const outcome = results[i]?.extensions?.['kip-do/outcome']
-    if (outcome === undefined) continue
-    return {
-      status: outcome.status,
-      tx_id: outcome.tx_id,
-      space_id: outcome.space_id,
-      snapshot_seq: outcome.snapshot_seq,
-      ...(outcome.space_seq === null ? {} : { space_seq: outcome.space_seq }),
-      ...(outcome.committed_at === null
-        ? {}
-        : { committed_at: outcome.committed_at }),
-      transaction_class: 'cognitive',
-      schema_environment_version: outcome.schema_environment_version,
-    }
+export function receiptOf(outcome: Outcome, auth: AuthContext): KipReceipt {
+  const unsigned: Omit<KipReceipt, 'receipt_digest'> = {
+    status: outcome.status,
+    tx_id: outcome.tx_id,
+    space_id: outcome.space_id,
+    snapshot_seq: outcome.snapshot_seq,
+    ...(outcome.space_seq === null ? {} : { space_seq: outcome.space_seq }),
+    ...(outcome.committed_at === null ? {} : { committed_at: outcome.committed_at }),
+    transaction_class: 'cognitive',
+    schema_environment_version: outcome.schema_environment_version,
+    origin: {
+      principal_id: auth.principal_id,
+      actor_binding_id: outcome.actor_binding_id,
+      delegation_digest:
+        auth.delegation_chain.length === 0
+          ? null
+          : `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(auth.delegation_chain))}`,
+    },
   }
-  return null
+  return {
+    ...unsigned,
+    receipt_digest: `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(unsigned))}`,
+  }
 }
 
 /**

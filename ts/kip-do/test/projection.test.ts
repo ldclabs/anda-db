@@ -240,7 +240,7 @@ describe('the Epistemic Projection', () => {
     await withNexus('retracted', (nexus) => {
       const id = assert_(nexus, 'Loud', 'Alice', 'support', 0.9)
       expect(nexus.query(`FIND(?b.status) ${BELIEF('Loud')}`)).toEqual(['accepted'])
-      nexus.execute(`RETRACT ASSERTION "${id}"`)
+      nexus.execute(`TRANSITION "${id}" TO "retracted"`)
       // Withdrawn is history, and history is not what this Brain holds now.
       expect(nexus.query(`FIND(?b.status) ${BELIEF('Loud')}`)).toEqual([
         'insufficient',
@@ -261,7 +261,7 @@ describe('the Epistemic Projection', () => {
       ) as string[]
       nexus.execute(
         `CREATE ASSERTION ?a {
-           SET FIELDS { proposition: :p, stance: "support", mode: "hypothetical", confidence: 0.95 }
+           SET FIELDS { proposition: :p, asserted_by: "C-1", stance: "support", mode: "hypothetical", confidence: 0.95 }
          }`,
         { p: pid! },
       )

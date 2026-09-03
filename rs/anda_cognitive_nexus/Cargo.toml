@@ -36,6 +36,9 @@ regex = { workspace = true }
 rustc-hash = { workspace = true }
 sha3 = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+# §9.6: a string Literal is canonicalized to NFC on write, so NFC/NFD twins
+# resolve to one Proposition.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 anda_object_store = { path = "../anda_object_store", version = "0.11" }

@@ -619,14 +619,18 @@ async fn a_page_cursor_is_opaque_and_not_interchangeable() {
     .await;
     assert_eq!(second, json!(["Carol"]));
 
-    // A bare offset is not a cursor this engine issued.
+    // A bare offset is not a cursor this engine issued. §87.7 collapsed the
+    // three older cursor codes into `CursorInvalid`, which names the family it
+    // was handed to and why it was refused instead of encoding that in a code.
     let error = err(
         &nexus,
         r#"FIND(?c.name) WHERE { ?c CONCEPT {} } LIMIT 2 CURSOR "2""#,
         json!({}),
     )
     .await;
-    assert_eq!(error.code, "CursorInvalidated");
+    assert_eq!(error.code, "CursorInvalid");
+    assert_eq!(error.details.as_ref().unwrap()["family"], "kql");
+    assert_eq!(error.details.as_ref().unwrap()["reason"], "malformed");
 
     // Neither is one from another operation family (§102.28), even though both
     // count from zero.
@@ -641,7 +645,12 @@ async fn a_page_cursor_is_opaque_and_not_interchangeable() {
         json!({}),
     )
     .await;
-    assert_eq!(error.code, "CursorInvalidated");
+    assert_eq!(error.code, "CursorInvalid");
+    // The family reported is the one this slot expected, not the one that
+    // issued the token: telling a forger which half to fix is the only thing
+    // the other answer would buy.
+    assert_eq!(error.details.as_ref().unwrap()["family"], "kql");
+    assert_eq!(error.details.as_ref().unwrap()["reason"], "malformed");
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ use nom::{
     character::complete::char,
     combinator::{cut, map, opt, value},
     multi::separated_list1,
-    sequence::preceded,
 };
 
 use super::common::{
@@ -59,18 +58,23 @@ pub fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
     ))
 }
 
-/// `AS OF SEQ|TX|TIME ...` — the cognitive history the read runs against.
+/// `AS OF SEQ ...` — the cognitive history the read runs against (Spec §48.1).
 ///
-/// Shared with META, which uses the same clause on `SNAPSHOT`, `DESCRIBE
-/// SNAPSHOT`, `DESCRIBE SCHEMA ENVIRONMENT` and `EXPORT CAPSULE`.
+/// The sequence is the only historical axis: a transaction id or a wall-clock
+/// instant is resolved to one first (`DESCRIBE TRANSACTION`, `DESCRIBE SNAPSHOT
+/// AT TIME`), so the read itself names the coordinate it ran against. Shared
+/// with META, which uses the same clause on `DESCRIBE SNAPSHOT`, `DESCRIBE
+/// SCHEMA ENVIRONMENT` and `EXPORT CAPSULE`.
 pub fn as_of_clause(input: &str) -> VResult<'_, AsOf> {
-    let (input, _) = ws(words(&["AS", "OF"])).parse(input)?;
-    cut(alt((
-        map(preceded(ws(word("SEQ")), cut(ws(scalar))), AsOf::Seq),
-        map(preceded(ws(word("TX")), cut(ws(scalar))), AsOf::Tx),
-        map(preceded(ws(word("TIME")), cut(ws(scalar))), AsOf::Time),
-    )))
-    .parse(input)
+    let (after, _) = ws(words(&["AS", "OF"])).parse(input)?;
+    let Ok((after, _)) = ws(word("SEQ")).parse(after) else {
+        return fail(
+            after,
+            "SEQ: AS OF SEQ is the only historical axis — resolve a transaction id through \
+             DESCRIBE TRANSACTION and an instant through DESCRIBE SNAPSHOT AT TIME",
+        );
+    };
+    map(cut(ws(scalar)), AsOf::Seq).parse(after)
 }
 
 /// `projection_expression = aggregate_expression | expression`
@@ -188,13 +192,26 @@ mod tests {
     #[test]
     fn as_of_and_for_time_are_independent_axes() {
         // Spec §48.3: history basis and world-valid time never imply each other.
-        let query = kql(r#"FIND(?x) WHERE { ?x {type: "T"} } AS OF TX :tx FOR TIME :t"#);
-        assert!(matches!(query.as_of, Some(AsOf::Tx(_))));
+        let query = kql(r#"FIND(?x) WHERE { ?x {type: "T"} } AS OF SEQ :seq FOR TIME :t"#);
+        assert!(matches!(query.as_of, Some(AsOf::Seq(_))));
         assert!(query.for_time.is_some());
 
         let only_time = kql(r#"FIND(?x) WHERE { ?x {type: "T"} } FOR TIME :t"#);
         assert!(only_time.as_of.is_none());
         assert!(only_time.for_time.is_some());
+    }
+
+    #[test]
+    fn the_sequence_is_the_only_historical_axis() {
+        // Spec §48.1: a transaction id or an instant resolves to a sequence
+        // first, through DESCRIBE TRANSACTION / DESCRIBE SNAPSHOT AT TIME.
+        for source in [
+            r#"FIND(?x) WHERE { ?x {type: "T"} } AS OF TX "tx-1""#,
+            r#"FIND(?x) WHERE { ?x {type: "T"} } AS OF TIME "2026-01-01T00:00:00Z""#,
+        ] {
+            let err = crate::parse_kql(source).expect_err("not a history axis");
+            assert!(err.message.contains("SEQ"), "{err}");
+        }
     }
 
     #[test]

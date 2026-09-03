@@ -31,15 +31,16 @@
  * @see rs/anda_cognitive_nexus/src/store/history.rs
  */
 
-import { errors } from '../errors.js'
+import { detailed, errors, type CursorFamily as WireCursorFamily } from '../errors.js'
 import { formatElementId, kindOfTag, tagOf, type ElementId, type ElementKind } from '../id.js'
 import type { Json } from '../json.js'
 import { decodeRow, type SqlRow } from './codec.js'
-import type {
-  Element,
-  ElementRow,
-  ElementVersionRow,
-  TransactionRow,
+import {
+  planesFromJson,
+  type Element,
+  type ElementRow,
+  type ElementVersionRow,
+  type TransactionRow,
 } from './rows.js'
 
 /** A coordinate a read is bound to. */
@@ -60,10 +61,18 @@ export function snapshotToken(spaceId: string, coordinate: Coordinate): string {
   return hexEncode(`kip:snapshot:${spaceId}:${coordinate.seq}`)
 }
 
-/** Reads a token back, refusing one issued for another Space. */
+/**
+ * Reads a token back, refusing one issued for another Space.
+ *
+ * Both refusals are `CursorInvalid` with `reason: malformed` (§87.7): a token
+ * for another Space is, from this Space's point of view, not a token at all,
+ * and saying more would confirm the other Space exists.
+ */
 export function coordinateFromToken(token: string, spaceId: string): Coordinate {
   const invalid = () =>
-    errors.cursorInvalidated(
+    detailed.cursorInvalid(
+      'snapshot',
+      'malformed',
       `${JSON.stringify(token)} is not a snapshot token this engine issued for ` +
         `this Space`,
     )
@@ -81,7 +90,9 @@ export function coordinateFromToken(token: string, spaceId: string): Coordinate 
   const seq = Number(rest.slice(at + 1))
   if (!Number.isInteger(seq) || seq < 0) throw invalid()
   if (space !== spaceId) {
-    throw errors.cursorInvalidated(
+    throw detailed.cursorInvalid(
+      'snapshot',
+      'malformed',
       `this snapshot token was issued for Space ${JSON.stringify(space)}; a ` +
         `sequence means something different in ${JSON.stringify(spaceId)}`,
     )
@@ -110,8 +121,15 @@ export interface PageCursor {
   offset: number
 }
 
-/** The operation families that issue page cursors (§102.28). */
-export type CursorFamily = 'find' | 'search' | 'list' | 'history'
+/**
+ * The operation families that issue page cursors (§87.7, §102.28).
+ *
+ * The same names `details.family` carries on a refusal, so a client reads one
+ * vocabulary whichever side of the cursor it is looking at. `changes` is
+ * absent: a change cursor is a Space sequence rather than a page token, and
+ * is read by `meta/index.ts` on its own.
+ */
+export type CursorFamily = Extract<WireCursorFamily, 'kql' | 'search' | 'list' | 'history' | 'export'>
 
 /** The opaque token a client passes back to continue. */
 export function pageToken(spaceId: string, cursor: PageCursor): string {
@@ -130,7 +148,9 @@ export function pageCursorFromToken(
   family: CursorFamily,
 ): PageCursor {
   const invalid = () =>
-    errors.cursorInvalidated(
+    detailed.cursorInvalid(
+      family,
+      'malformed',
       `${JSON.stringify(token)} is not a ${family} cursor this engine issued ` +
         `for this Space; a cursor is opaque and belongs to the traversal that ` +
         `produced it`,
@@ -191,7 +211,9 @@ export function elementOfVersion(row: ElementVersionRow): Element {
       `a version row carries the unknown kind ${JSON.stringify(row.kind)}`,
     )
   }
-  return { kind, row: row.row as unknown as ElementRow } as Element
+  const stored = row.row as unknown as ElementRow
+  stored.plane_versions = planesFromJson(stored.plane_versions)
+  return { kind, row: stored } as Element
 }
 
 /** One element as it stood at a coordinate, or `null` when it did not exist. */

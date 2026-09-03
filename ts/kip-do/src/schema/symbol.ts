@@ -146,6 +146,28 @@ export function parseSymbolRef(text: string): SymbolRef {
 }
 
 /**
+ * The lineage identity of a symbol: `kip://<package-path>/<symbol>` (§20.14).
+ *
+ * The exact identity is what durable state persists; the lineage is what
+ * identity and matching compare, so that elements written under different
+ * versions of one package path remain one population — one `key` scope, one
+ * Proposition tuple, one `type:` match. A fork is a distinct package path and
+ * therefore a distinct lineage even when its content is identical.
+ */
+export function lineageOfSymbol(symbol: SymbolRef): string {
+  return `${symbol.package.packageId}/${symbol.name}`
+}
+
+/** The lineage of an exact symbol reference in text, or the text itself when it is not one. */
+export function lineageText(text: string): string {
+  try {
+    return lineageOfSymbol(parseSymbolRef(text))
+  } catch {
+    return text
+  }
+}
+
+/**
  * Whether a string is already a canonical, fully-qualified reference.
  *
  * This is the test that separates "the caller named an exact symbol" from "the

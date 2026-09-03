@@ -235,8 +235,8 @@ export function stagePayload(
  * Whether an element is held against erasure (§60.3).
  *
  * A cognitive writer cannot set this: `legal_hold` in a `retention` block needs
- * the `legal_hold` permission of its own, precisely so that content cannot make
- * itself undeletable.
+ * the `manage_legal_hold` permission of its own (§29.9), precisely so that
+ * content cannot make itself undeletable.
  */
 function hasLegalHold(element: Element): boolean {
   return element.row.retention.legal_hold === true
@@ -256,6 +256,7 @@ const PURGE_KEEPS: ReadonlySet<string> = new Set([
   'space',
   'state',
   'version',
+  'plane_versions',
   'seq',
   'created_at',
   'updated_at',

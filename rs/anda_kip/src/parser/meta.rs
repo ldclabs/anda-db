@@ -33,7 +33,6 @@ pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
         map(preview, MetaCommand::Preview),
         map(history, MetaCommand::History),
         map(changes, MetaCommand::Changes),
-        snapshot,
         map(export_capsule, MetaCommand::ExportCapsule),
     ))
     .parse(input)
@@ -53,20 +52,12 @@ fn describe(input: &str) -> VResult<'_, DescribeTarget> {
             |as_of| DescribeTarget::SchemaEnvironment { as_of },
         ),
         map(
-            preceded(ws(words(&["EXECUTION", "CONTEXT"])), nothing),
-            |_| DescribeTarget::ExecutionContext,
-        ),
-        map(
             preceded(ws(words(&["STRUCTURAL", "FIELD"])), cut(ws(scalar))),
             DescribeTarget::StructuralField,
         ),
         map(
             preceded(ws(words(&["EPISTEMIC", "POLICY"])), opt(ws(scalar))),
             |value| DescribeTarget::EpistemicPolicy { value },
-        ),
-        map(
-            preceded(ws(words(&["PROJECTION", "CAPABILITY"])), nothing),
-            |_| DescribeTarget::ProjectionCapability,
         ),
         map(
             preceded(ws(word("PRIMER")), opt_after(&["MODE"], ws(scalar))),
@@ -108,10 +99,7 @@ fn describe(input: &str) -> VResult<'_, DescribeTarget> {
             DescribeTarget::Error,
         ),
         describe_transaction,
-        map(
-            preceded(ws(word("SNAPSHOT")), opt(ws(as_of_clause))),
-            |as_of| DescribeTarget::Snapshot { as_of },
-        ),
+        describe_snapshot,
         map(
             preceded(ws(word("CAPSULE")), cut(ws(scalar))),
             DescribeTarget::Capsule,
@@ -139,9 +127,20 @@ fn describe_transaction(input: &str) -> VResult<'_, DescribeTarget> {
     .parse(input)
 }
 
-/// A target that takes no operand still has to consume nothing successfully.
-fn nothing(input: &str) -> VResult<'_, ()> {
-    Ok((input, ()))
+/// `DESCRIBE SNAPSHOT [AS OF SEQ :s | AT TIME :t]` — the snapshot coordinate.
+///
+/// `AT TIME` is the one place wall-clock time enters cognitive-time
+/// addressing: it resolves an instant to the last sequence committed at or
+/// before it, and the answer names that sequence, so a later `AS OF SEQ` reads
+/// exactly what was described (§68).
+fn describe_snapshot(input: &str) -> VResult<'_, DescribeTarget> {
+    let (input, _) = ws(word("SNAPSHOT")).parse(input)?;
+    let (input, as_of) = opt(ws(as_of_clause)).parse(input)?;
+    let (input, at_time) = match as_of {
+        Some(_) => (input, None),
+        None => opt_after(&["AT", "TIME"], ws(scalar)).parse(input)?,
+    };
+    Ok((input, DescribeTarget::Snapshot { as_of, at_time }))
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +335,7 @@ fn preview(input: &str) -> VResult<'_, PreviewCommand> {
 }
 
 // ---------------------------------------------------------------------------
-// HISTORY / CHANGES / SNAPSHOT
+// HISTORY / CHANGES
 // ---------------------------------------------------------------------------
 
 fn history(input: &str) -> VResult<'_, HistoryCommand> {
@@ -405,12 +404,6 @@ fn changes(input: &str) -> VResult<'_, ChangesCommand> {
     .parse(input)
 }
 
-fn snapshot(input: &str) -> VResult<'_, MetaCommand> {
-    let (input, _) = ws(word("SNAPSHOT")).parse(input)?;
-    let (input, as_of) = opt(ws(as_of_clause)).parse(input)?;
-    Ok((input, MetaCommand::Snapshot { as_of }))
-}
-
 // ---------------------------------------------------------------------------
 // EXPORT CAPSULE
 // ---------------------------------------------------------------------------
@@ -462,17 +455,21 @@ mod tests {
             MetaCommand::Describe(DescribeTarget::Protocol)
         );
         assert_eq!(
-            meta("DESCRIBE EXECUTION CONTEXT"),
-            MetaCommand::Describe(DescribeTarget::ExecutionContext)
-        );
-        assert_eq!(
             meta("DESCRIBE CAPABILITIES"),
             MetaCommand::Describe(DescribeTarget::Capabilities)
         );
-        assert_eq!(
-            meta("DESCRIBE PROJECTION CAPABILITY"),
-            MetaCommand::Describe(DescribeTarget::ProjectionCapability)
-        );
+    }
+
+    #[test]
+    fn the_execution_context_and_projection_capability_have_no_statement() {
+        // Spec §63.3: the resolved execution context is part of DESCRIBE
+        // PRIMER, projection capability part of DESCRIBE CAPABILITIES.
+        assert!(parse_meta_command("DESCRIBE EXECUTION CONTEXT").is_err());
+        assert!(parse_meta_command("DESCRIBE PROJECTION CAPABILITY").is_err());
+        // And the SNAPSHOT token statement is gone: a coordinate is described,
+        // not issued (§68).
+        assert!(crate::parse_meta("SNAPSHOT").is_err());
+        assert!(crate::parse_meta("SNAPSHOT AS OF SEQ 3").is_err());
     }
 
     #[test]
@@ -647,17 +644,36 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_takes_the_shared_history_coordinate() {
+    fn describe_snapshot_takes_a_sequence_or_resolves_an_instant() {
         assert!(matches!(
-            meta("SNAPSHOT"),
-            MetaCommand::Snapshot { as_of: None }
+            meta("DESCRIBE SNAPSHOT"),
+            MetaCommand::Describe(DescribeTarget::Snapshot {
+                as_of: None,
+                at_time: None
+            })
         ));
         assert!(matches!(
-            meta(r#"SNAPSHOT AS OF TIME "2026-01-01T00:00:00Z""#),
-            MetaCommand::Snapshot {
-                as_of: Some(AsOf::Time(_))
-            }
+            meta("DESCRIBE SNAPSHOT AS OF SEQ 42"),
+            MetaCommand::Describe(DescribeTarget::Snapshot {
+                as_of: Some(AsOf::Seq(_)),
+                at_time: None
+            })
         ));
+        // §68: AT TIME is the one place wall-clock time enters cognitive-time
+        // addressing, and it answers with the sequence it resolved to.
+        assert!(matches!(
+            meta(r#"DESCRIBE SNAPSHOT AT TIME "2026-01-01T00:00:00Z""#),
+            MetaCommand::Describe(DescribeTarget::Snapshot {
+                as_of: None,
+                at_time: Some(_)
+            })
+        ));
+        // The removed axes are not a second spelling of AT TIME.
+        assert!(
+            crate::parse_meta(r#"DESCRIBE SNAPSHOT AS OF TIME "2026-01-01T00:00:00Z""#).is_err()
+        );
+        assert!(crate::parse_meta(r#"DESCRIBE SNAPSHOT AS OF TX "tx-1""#).is_err());
+        assert!(crate::parse_meta(r#"DESCRIBE SNAPSHOT AS OF SEQ 1 AT TIME :t"#).is_err());
     }
 
     #[test]

@@ -50,7 +50,10 @@ import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import {
   State,
+  changeEntryOf,
   classificationOf,
+  wireOp,
+  type ChangeVerb,
   type Element,
   type Store,
 } from '../store/index.js'
@@ -67,8 +70,12 @@ import {
 import type { Permission } from './permission.js'
 import { authority, classification } from './lattice.js'
 
-/** The `governance` member holding an element's influence-authority ceiling. */
-export const AUTHORITY_KEY = 'max_influence_authority'
+/**
+ * The `governance` member holding an element's influence-authority ceiling
+ * (§31.3): `authority_class`, read as `?x.governance.authority_class` and
+ * `descriptive` when absent.
+ */
+export const AUTHORITY_KEY = 'authority_class'
 /** The `governance` member recording what a derived element was derived from. */
 export const LINEAGE_KEY = 'authority_lineage'
 /** The `governance` member recording why an element is held out of use. */
@@ -267,7 +274,7 @@ function apply(
   approved: Approved,
 ): number {
   const id: ElementId = { kind: element.kind, seq: element.row.id }
-  const version = commit(cx, element, op as never, newState, patch)
+  const version = commit(cx, element, op as ChangeVerb, newState, patch)
   audit(cx, id, auditOp, record(version))
   approved.spend(cx.store)
   return version
@@ -324,7 +331,7 @@ function inheritedCeiling(cx: ElementGovernanceContext, element: Element): strin
 function commit(
   cx: ElementGovernanceContext,
   element: Element,
-  op: string,
+  verb: ChangeVerb,
   state: string | null,
   patch: (block: JsonMap) => JsonMap,
 ): number {
@@ -332,6 +339,8 @@ function commit(
   const at = nowTime()
   const txId = `tx-${cx.space}-${seq}-${at}`
   const row = element.row
+  const before = { state: row.state, status: 'status' in row ? row.status : '', version: row.version }
+  const governanceBefore = { ...row.governance }
   row.governance = patch(row.governance)
   if (state !== null) row.state = state
   row.version += 1
@@ -342,7 +351,27 @@ function commit(
   // this *is* a new version of the element, and attributing it to the original
   // author would misreport who reclassified it.
   row.origin = { principal_id: cx.auth.principal_id, channel: 'governance' }
-  const change = cx.store.put(element, op as never, txId)
+  cx.store.put(element, verb, txId)
+  // §36.1: a relabel is an `update` whose `touched` names the Governance
+  // member; a quarantine, a release or a retention expiry is a `lifecycle`
+  // move with the state it went from and to. No plane counter moves — the
+  // Governance block is not one of the four planes (§6.3).
+  const op = wireOp(verb)
+  const after = 'status' in row ? row.status : ''
+  const moved =
+    before.state !== row.state
+      ? { from: before.state, to: row.state }
+      : before.status !== after
+        ? { from: before.status, to: after }
+        : undefined
+  const touched = [...new Set([...Object.keys(governanceBefore), ...Object.keys(row.governance)])]
+    .filter((member) => governanceBefore[member] !== row.governance[member])
+    .map((member) => `governance.${member}`)
+  const change = changeEntryOf(element, op, {
+    old_version: before.version,
+    ...(op === 'lifecycle' && moved !== undefined ? { state: moved } : {}),
+    touched,
+  })
   cx.store.putGovernanceTransaction({
     tx_id: txId,
     space: cx.space,
@@ -350,7 +379,7 @@ function commit(
     snapshot_seq: seq - 1,
     committed_at: at,
     schema_environment_version: cx.authority.space.schema_environment_version,
-    result: { element: formatElementId({ kind: element.kind, seq: row.id }), op },
+    result: { element: formatElementId({ kind: element.kind, seq: row.id }), op: verb },
     changes: [change],
   })
   return row.version

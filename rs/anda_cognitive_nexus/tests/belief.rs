@@ -325,7 +325,7 @@ async fn retracting_a_claim_removes_it_from_belief_but_not_from_the_ledger() {
         .to_string();
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
-        "operations": [{"command": "RETRACT ASSERTION :a", "parameters": {"a": assertion}}]
+        "operations": [{"command": "TRANSITION :a TO \"retracted\"", "parameters": {"a": assertion}}]
     }))
     .unwrap();
     let parsed = request.operations[0].parse().unwrap();

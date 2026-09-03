@@ -1,7 +1,8 @@
 //! # Choosing what a mutation acts on
 //!
-//! A mutation either names its target — `ARCHIVE :old` — or binds it with a
-//! selection block: `ARCHIVE ?c WHERE { ?c CONCEPT {type: "Note"} } LIMIT 100`.
+//! A mutation either names its target — `TRANSITION :old TO "archived"` — or
+//! binds it with a selection block: `TRANSITION ?c TO "archived" WHERE { ?c
+//! CONCEPT {type: "Note"} } LIMIT 100`.
 //! This module is the second case, and it is where KML borrows the KQL solver.
 //!
 //! ## The snapshot the block reads
@@ -92,7 +93,8 @@ impl Targets {
 /// - a directly named target (`:id`, `"id"`) keeps its identity and the block
 ///   is a **guard**: it must have at least one solution, or the clause does
 ///   nothing. A guard that fails is not an error — that is what makes
-///   `ARCHIVE :x WHERE {...}` a conditional sweep rather than a precondition.
+///   `TRANSITION :x TO "archived" WHERE {...}` a conditional sweep rather than
+///   a precondition.
 ///
 /// `WHERE` absent: the statement names its target, and `LIMIT` has nothing to
 /// bound.

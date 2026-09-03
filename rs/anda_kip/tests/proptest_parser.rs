@@ -69,16 +69,18 @@ const KML_SEEDS: &[&str] = &[
         }
         UPSERT CONCEPT ?drug {
             MATCH {key: "drug:aspirin"}
-            EXPECT VERSION 3
             SET ATTRIBUTES { risk_level: 2 }
             UNSET ATTRIBUTES { deprecated_note }
             SET FACET "MnemonicState" { salience: 0.4 }
-        }
+        } EXPECT VERSION 3
         UPDATE ?c
             SET FACET "MnemonicState" { memory_strength: MUL(?c.facets["MnemonicState"].memory_strength, 0.99) }
             WHERE { ?c CONCEPT {type: "Experience"} }
             LIMIT 100
-        TRANSITION ACTIVITY :act TO "succeeded" SET FIELDS { ended_at: :now }
+            EXPECT VERSION :v OF FACET "MnemonicState"
+        TRANSITION :act TO "completed" SET FIELDS { ended_at: :now }
+        TRANSITION :old TO "superseded" BY :claim
+        TRANSITION :stale TO "archived" WHERE { ?stale CONCEPT {type: "Event"} } LIMIT 5 EXPECT VERSION 2 OF ATTRIBUTES
         PURGE :leak REFERENCE POLICY "detach" CONFIRM "PURGE"
     }
     "#,

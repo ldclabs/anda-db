@@ -17,9 +17,10 @@
  * not used here. It is an editor-facing linter and makes three calls this
  * engine cannot:
  *
- * - it restricts `TRANSITION ACTIVITY … TO` to the three *terminal* states,
- *   but §20.13 registers those, not the whole lifecycle vocabulary, and an
- *   Activity may legitimately move to a non-terminal one;
+ * - it may judge which `TRANSITION … TO` state fits which target kind, but
+ *   §52.5 makes that the engine's check (`InvalidLifecycleTransition`); only
+ *   the state *vocabulary* is fixed by the language, and only that is checked
+ *   here;
  * - it caps `THRESHOLD` at 1, but §66.5 has an engine *declare* its score
  *   semantics rather than adopt one, and §27.3 lists `log_odds` among them;
  * - it enforces the Cognitive Memory Profile's `[0,1]` signals, which belong
@@ -69,11 +70,56 @@ export const ASSERTION_LIFECYCLE = [
   'expired',
 ] as const
 
+/** The Evidence lifecycle states (§57.2). */
+export const EVIDENCE_LIFECYCLE = ['active', 'corrected'] as const
+
 /** What an Evidence citation does for a claim (§56.2). */
 export const EVIDENCE_ROLES = ['support', 'challenge', 'context'] as const
 
+/** The Activity statuses (§16). */
+export const ACTIVITY_STATUS = [
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+] as const
+
 /** The Activity terminal states (§16.6). */
 export const ACTIVITY_TERMINAL = ['completed', 'failed', 'cancelled'] as const
+
+/**
+ * The states `TRANSITION ... TO` may name, in Spec §52.5 order.
+ *
+ * The same vocabulary `anda_kip::transition_state::ALL` fixes: the language
+ * decides which words are states, and the engine decides which state fits
+ * which kind and which current state a move is legal from.
+ */
+export const TRANSITION_STATES = [
+  'retracted',
+  'superseded',
+  'corrected',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+  'archived',
+  'tombstoned',
+] as const
+
+/** The moves that name the replacing element with `BY` (§52.5). */
+export const TRANSITION_WITH_BY = ['superseded', 'corrected'] as const
+
+/**
+ * The Activity status moves: the only ones that may finalize fields or
+ * topology in the same statement (§52.5).
+ */
+export const TRANSITION_ACTIVITY = [
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+] as const
 
 /** The belief statuses an Epistemic Projection can return (§21.3). */
 export const BELIEF_STATUSES = [
@@ -256,39 +302,27 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
     warnUnbounded('UPDATE', !!update.where_clauses, !!update.limit, out)
     return
   }
-  // The target of these two is an Assertion by construction, so the Assertion
-  // lifecycle registry is the right vocabulary. `ARCHIVE`, `TOMBSTONE` and
-  // `CORRECT EVIDENCE` take other kinds, for which Core registers no lifecycle
-  // vocabulary — checking them would reject states the Specification admits.
-  if ('RetractAssertion' in clause) {
-    const retract = clause.RetractAssertion
+  // §52.5 fixes the state vocabulary the statement may name; which states
+  // fit which target kind, and which current state a move is legal from, is
+  // the engine's check (`InvalidLifecycleTransition`). Whether `BY` and
+  // `SET` fit the state is the grammar's, for a literal state — `lower`
+  // refuses `TO "retracted" BY :b` — and the engine's for a `:parameter`.
+  if ('Transition' in clause) {
+    const transition = clause.Transition
     checkEnum(
-      scalarStr(retract.expect_state),
-      ASSERTION_LIFECYCLE,
-      'EXPECT STATE on an Assertion',
+      scalarStr(transition.to),
+      TRANSITION_STATES,
+      'TRANSITION ... TO',
       out,
     )
-    warnUnbounded(
-      'RETRACT ASSERTION',
-      !!retract.where_clauses,
-      !!retract.limit,
-      out,
-    )
-    return
-  }
-  if ('SupersedeAssertion' in clause) {
-    checkEnum(
-      scalarStr(clause.SupersedeAssertion.expect_state),
-      ASSERTION_LIFECYCLE,
-      'EXPECT STATE on an Assertion',
-      out,
-    )
-    return
-  }
-  if ('TransitionActivity' in clause) {
-    const transition = clause.TransitionActivity
     if (transition.set_fields) analyzeAssignments(transition.set_fields, out)
     analyzeStructural(transition.set_structural, out)
+    warnUnbounded(
+      'TRANSITION',
+      !!transition.where_clauses,
+      !!transition.limit,
+      out,
+    )
     return
   }
   if ('SetRetention' in clause) {
@@ -298,24 +332,6 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
       'SET RETENTION',
       !!retention.where_clauses,
       !!retention.limit,
-      out,
-    )
-    return
-  }
-  if ('Archive' in clause) {
-    warnUnbounded(
-      'ARCHIVE',
-      !!clause.Archive.where_clauses,
-      !!clause.Archive.limit,
-      out,
-    )
-    return
-  }
-  if ('Tombstone' in clause) {
-    warnUnbounded(
-      'TOMBSTONE',
-      !!clause.Tombstone.where_clauses,
-      !!clause.Tombstone.limit,
       out,
     )
     return

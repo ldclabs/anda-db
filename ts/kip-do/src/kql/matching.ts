@@ -39,7 +39,12 @@ import type {
   WhereClause,
 } from '../kip/ast.js'
 import { kipValue as kipLiteral } from '../kml/value.js'
-import { formatSymbolRef, structuralFieldDef } from '../schema/index.js'
+import {
+  formatSymbolRef,
+  lineageOfSymbol,
+  lineageText,
+  structuralFieldDef,
+} from '../schema/index.js'
 import { State, type PropositionRow, type SqlRow } from '../store/index.js'
 import { decodeRow } from '../store/codec.js'
 import type { Element, ElementRow } from '../store/index.js'
@@ -117,18 +122,24 @@ const FIELD_PATHS: Readonly<Record<string, string[]>> = {
   predicate: ['predicate_ref'],
 }
 
-/** The SQL column a literal matcher field narrows on, by kind. */
+/**
+ * The SQL column a literal matcher field narrows on, by kind.
+ *
+ * `type` and `predicate` seek on the *lineage* columns (§20.14, §43.1): a
+ * pattern's symbol matches every readable version of it, and each matched
+ * element reports its own exact `schema_ref` / `predicate_ref`.
+ */
 const COLUMNS: Readonly<Record<ElementKind, Readonly<Record<string, string>>>> =
   {
     Concept: {
-      type: 'schema_ref',
+      type: 'lineage',
       schema_ref: 'schema_ref',
       name: 'name',
       key: 'key',
       canonical_id: 'canonical_id',
       state: 'state',
     },
-    Proposition: { predicate: 'predicate_ref', state: 'state' },
+    Proposition: { predicate: 'predicate_lineage', state: 'state' },
     Assertion: {
       stance: 'stance',
       mode: 'mode',
@@ -162,6 +173,13 @@ const BELIEF_TARGET = '__belief_target'
 
 /** The matcher fields whose value is a schema symbol to resolve. */
 const SYMBOL_FIELDS = new Set(['type', 'schema_ref', 'predicate'])
+
+/**
+ * The matcher fields that compare by symbol lineage rather than exact
+ * reference (§20.14): `type` and `predicate` are resolution sugar for a
+ * lineage, while `schema_ref` names an exact version and is matched exactly.
+ */
+const LINEAGE_FIELDS = new Set(['type', 'predicate'])
 
 /** Runs a whole `WHERE` block against one starting solution set. */
 export function solveAll(
@@ -401,6 +419,13 @@ function checkMatcher(
           `yet; see DESCRIBE CAPABILITIES`,
       )
     }
+    if (LINEAGE_FIELDS.has(field) && typeof wanted === 'string') {
+      // The view carries the exact reference; the pattern names a lineage.
+      if (typeof actual !== 'string' || lineageText(actual) !== resolveSymbol(cx, field, wanted)) {
+        return null
+      }
+      continue
+    }
     const resolved =
       SYMBOL_FIELDS.has(field) && typeof wanted === 'string'
         ? resolveSymbol(cx, field, wanted)
@@ -474,10 +499,16 @@ function literalOf(
   return undefined
 }
 
-/** Resolves a schema symbol a matcher wrote as a local name. */
+/**
+ * Resolves a schema symbol a matcher wrote as a local name.
+ *
+ * `type` and `predicate` resolve to the lineage the pattern matches over
+ * (§20.14); `schema_ref` to the exact reference it names.
+ */
 function resolveSymbol(cx: Context, field: string, name: string): string {
   const kind = field === 'predicate' ? 'PredicateType' : 'ConceptType'
-  return formatSymbolRef(cx.env.resolveSymbol(kind, name, 'read'))
+  const symbol = cx.env.resolveSymbol(kind, name, 'read')
+  return LINEAGE_FIELDS.has(field) ? lineageOfSymbol(symbol) : formatSymbolRef(symbol)
 }
 
 // --- Proposition patterns ---------------------------------------------------
@@ -523,9 +554,9 @@ function propositions(
       // not bound.
       if (cx.view(id) === null) continue
       let current: Solution | null = solution
-      current = bindTerm(current, subject, row.subject, b)
+      current = bindTupleTerm(cx, current, subject, row.subject, b)
       if (current === null) continue
-      current = bindTerm(current, object, row.object, b)
+      current = bindTupleTerm(cx, current, object, row.object, b)
       if (current === null) continue
       if ('Variable' in predicate.Atom) {
         current = extend(current, predicate.Atom.Variable, symbolBinding(row.predicate_ref))
@@ -548,7 +579,16 @@ interface TupleRow {
   predicate_ref: string
 }
 
-/** The Proposition rows a tuple pattern could match, narrowed by its pinned ends. */
+/**
+ * The Proposition rows a tuple pattern could match, narrowed by its pinned
+ * ends.
+ *
+ * Matching is **canonical** (§12.3, §43.2): an endpoint naming a Concept
+ * matches a stored endpoint whose `merged_into` chain resolves to the same
+ * identity, so after `MERGE CONCEPT :alicia INTO :alice` both spellings find
+ * the tuple recorded on `alicia`. The predicate matches by lineage (§20.14),
+ * so a tuple written under an earlier package version is still found.
+ */
 function tupleCandidates(
   cx: Context,
   subject: Term,
@@ -561,16 +601,16 @@ function tupleCandidates(
   // JavaScript, so the present and historical paths cannot drift apart about
   // what a tuple pattern matches. Splitting them into two independent filters is
   // how a historical read would silently answer more than a present one.
-  const subjectKey = pinnedKey(subject, solution, b)
-  const objectKey = pinnedKey(object, solution, b)
-  let predicateRef: string | null = null
+  const subjectKeys = pinnedKeys(cx, subject, solution, b)
+  const objectKeys = pinnedKeys(cx, object, solution, b)
+  let predicateLineage: string | null = null
   if (!('Variable' in predicate)) {
     const name =
       'Literal' in predicate ? predicate.Literal : parameterValue(b, predicate.Param)
     if (typeof name !== 'string') {
       throw errors.typeMismatch('a predicate must be a symbol string')
     }
-    predicateRef = resolveSymbol(cx, 'predicate', name)
+    predicateLineage = resolveSymbol(cx, 'predicate', name)
   }
 
   if (cx.historical) {
@@ -580,9 +620,10 @@ function tupleCandidates(
       .filter(
         (row) =>
           row.state === State.ACTIVE &&
-          (subjectKey === null || row.subject_key === subjectKey) &&
-          (objectKey === null || row.object_key === objectKey) &&
-          (predicateRef === null || row.predicate_ref === predicateRef),
+          (subjectKeys === null || subjectKeys.includes(row.subject_key)) &&
+          (objectKeys === null || objectKeys.includes(row.object_key)) &&
+          (predicateLineage === null ||
+            lineageOfRow(row) === predicateLineage),
       )
       .map((row) => ({
         seq: row.id,
@@ -594,17 +635,17 @@ function tupleCandidates(
 
   const wheres = ['space = ?', 'state = ?']
   const values: SqlStorageValue[] = [cx.space, State.ACTIVE]
-  if (subjectKey !== null) {
-    wheres.push('subject_key = ?')
-    values.push(subjectKey)
+  if (subjectKeys !== null) {
+    wheres.push(`subject_key IN (SELECT value FROM json_each(?))`)
+    values.push(JSON.stringify(subjectKeys))
   }
-  if (objectKey !== null) {
-    wheres.push('object_key = ?')
-    values.push(objectKey)
+  if (objectKeys !== null) {
+    wheres.push(`object_key IN (SELECT value FROM json_each(?))`)
+    values.push(JSON.stringify(objectKeys))
   }
-  if (predicateRef !== null) {
-    wheres.push('predicate_ref = ?')
-    values.push(predicateRef)
+  if (predicateLineage !== null) {
+    wheres.push('predicate_lineage = ?')
+    values.push(predicateLineage)
   }
 
   // The whole row rather than the four columns the tuple needs, so the element
@@ -632,19 +673,41 @@ function tupleCandidates(
   })
 }
 
+/** A stored Proposition's predicate lineage, filled from the exact ref for an older row. */
+function lineageOfRow(row: PropositionRow): string {
+  return row.predicate_lineage === '' ? lineageText(row.predicate_ref) : row.predicate_lineage
+}
+
 /**
- * The endpoint key a term is already pinned to, if it is.
- *
- * A variable an earlier pattern bound counts as pinned — that is what turns a
- * join into an index seek instead of a scan of every tuple in the Space.
+ * The endpoint keys a term is already pinned to, if it is — every spelling of
+ * one canonical identity (§43.2), or `null` for an open slot.
  */
-function pinnedKey(
+function pinnedKeys(
+  cx: Context,
   term: Term,
   solution: Solution,
   b: ReadBindings,
-): string | null {
+): string[] | null {
   const endpoint = termEndpoint(term, solution, b)
-  return endpoint === null ? null : endpointKey(endpointFromJson(endpoint))
+  if (endpoint === null) return null
+  return canonicalKeys(cx, endpointFromJson(endpoint))
+}
+
+/**
+ * Every endpoint key that matches one endpoint canonically (§12.3).
+ *
+ * A local Concept reference matches the whole cluster of Concepts whose
+ * `merged_into` chains end at the same identity; any other endpoint — a
+ * Literal, a canonical identity, a foreign reference, a record — matches
+ * itself alone.
+ */
+export function canonicalKeys(cx: Context, endpoint: ReturnType<typeof endpointFromJson>): string[] {
+  if (endpoint.kind !== 'local' || endpoint.id.kind !== 'Concept') {
+    return [endpointKey(endpoint)]
+  }
+  return cx
+    .canonicalCluster(endpoint.id)
+    .map((id) => endpointKey({ kind: 'local', id }))
 }
 
 /**
@@ -772,6 +835,25 @@ function bindTerm(
     endpointKey(endpointFromJson(value))
     ? solution
     : null
+}
+
+/**
+ * Binds a tuple endpoint's variable, or checks it canonically against what
+ * it holds (§43.2): a pinned Concept matches a stored endpoint anywhere in
+ * its merge cluster, while a Literal or a record matches exactly.
+ */
+function bindTupleTerm(
+  cx: Context,
+  solution: Solution,
+  term: Term,
+  value: Json,
+  b: ReadBindings,
+): Solution | null {
+  if ('Variable' in term) return bindTerm(solution, term, value, b)
+  const expected = termEndpoint(term, solution, b)
+  if (expected === null) return solution
+  const stored = endpointKey(endpointFromJson(value))
+  return canonicalKeys(cx, endpointFromJson(expected)).includes(stored) ? solution : null
 }
 
 // --- structural patterns ----------------------------------------------------
@@ -1205,11 +1287,14 @@ function beliefSlot(
     if (typeof name !== 'string') {
       throw errors.typeMismatch('a predicate must be a symbol string')
     }
-    const predicateRef = resolveSymbol(cx, 'predicate', name)
-    const key = endpointKey(endpointFromJson(subject))
+    const predicateLineage = resolveSymbol(cx, 'predicate', name)
+    const keys = canonicalKeys(cx, endpointFromJson(subject))
     const validAt = nowTime()
     const slot: Slot = {
-      candidates: slotPropositions(cx, key, predicateRef).map((id) =>
+      // §12.3: the slot sees every Assertion in it, whichever version its
+      // Proposition was created under and whichever merged spelling of the
+      // subject it was recorded on.
+      candidates: slotPropositions(cx, keys, predicateLineage).map((id) =>
         project(cx, id, b.policy, validAt),
       ),
       policy: b.policy,
@@ -1225,7 +1310,7 @@ function beliefSlot(
     const next = extend(
       solution,
       clause.variable,
-      literalBinding(slotToJson(subject, predicateRef, slot) as Json),
+      literalBinding(slotToJson(subject, predicateLineage, slot) as Json),
     )
     if (next !== null) out.push(next)
   }

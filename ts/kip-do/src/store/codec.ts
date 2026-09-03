@@ -26,6 +26,7 @@ const ENVELOPE_COLUMNS = [
   'space',
   'state',
   'version',
+  'plane_versions',
   'seq',
   'created_at',
   'updated_at',
@@ -39,7 +40,14 @@ const ENVELOPE_COLUMNS = [
   'expires_at',
 ] as const
 
-const ENVELOPE_JSON = ['origin', 'facets', 'structural', 'governance', 'retention']
+const ENVELOPE_JSON = [
+  'plane_versions',
+  'origin',
+  'facets',
+  'structural',
+  'governance',
+  'retention',
+]
 
 function spec(
   extraColumns: readonly string[],
@@ -56,6 +64,7 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
     [
       'client_key',
       'schema_ref',
+      'lineage',
       'key',
       'name',
       'canonical_id',
@@ -66,7 +75,15 @@ export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
     ['aliases', 'attributes'],
   ),
   propositions: spec(
-    ['subject', 'subject_key', 'predicate_ref', 'object', 'object_key', 'tuple_key'],
+    [
+      'subject',
+      'subject_key',
+      'predicate_ref',
+      'predicate_lineage',
+      'object',
+      'object_key',
+      'tuple_key',
+    ],
     ['subject', 'object'],
   ),
   assertions: spec(

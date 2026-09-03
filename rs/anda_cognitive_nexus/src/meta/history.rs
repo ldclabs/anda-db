@@ -12,20 +12,43 @@
 
 use anda_db::query::{Filter, RangeQuery};
 use anda_db_schema::Fv;
-use anda_kip::{AsOf, ChangesCommand, HistoryCommand, Json, KipError, KipErrorCode, Scalar};
+use anda_kip::{
+    AsOf, ChangeEntry, ChangesCommand, HistoryCommand, Json, KipError, KipErrorCode, Scalar,
+};
 
 use super::Answer;
-use super::describe::{scalar_str, scalar_usize};
+use super::describe::{scalar_json, scalar_str, scalar_usize};
 use crate::kql::Context;
 use crate::store::history::CursorFamily;
 use crate::store::rows::TransactionRow;
 
-/// `SNAPSHOT [AS OF ...]` — the coordinate a later read can bind to.
-pub async fn snapshot(cx: &mut Context<'_>, as_of: Option<&AsOf>) -> Result<Answer, KipError> {
+/// `DESCRIBE SNAPSHOT [AS OF SEQ :s | AT TIME :t]` — a snapshot coordinate
+/// (§68).
+///
+/// Without an operand it describes the current head; `AS OF SEQ` a past
+/// coordinate; `AT TIME` resolves an instant to the last sequence committed
+/// at or before it, which is how wall-clock time enters `AS OF SEQ` (§48.1).
+/// A sequence the Space has not reached is refused rather than rounded down
+/// to the present. The coordinate is a description: the sequence, the
+/// transaction that committed it and when, the schema environment in force —
+/// and the token a later read may bind to (§78).
+pub async fn snapshot(
+    cx: &mut Context<'_>,
+    as_of: Option<&AsOf>,
+    at_time: Option<&Scalar>,
+) -> Result<Answer, KipError> {
     let space = cx.store.get_space(&cx.space).await?;
-    let seq = match as_of {
-        Some(as_of) => cx.resolve_as_of(as_of).await?,
-        None => space.seq,
+    let seq = match (as_of, at_time) {
+        (Some(as_of), _) => cx.resolve_as_of(as_of).await?,
+        (None, Some(scalar)) => {
+            let at = scalar_str(cx, scalar, "DESCRIBE SNAPSHOT AT TIME")?;
+            let at = crate::time::normalize(&at, "AT TIME")?;
+            // This engine keeps every version, so no instant is below a
+            // retention floor: a time before the first commit is sequence 0,
+            // an empty Space rather than an error.
+            cx.store.seq_at_time(&cx.space, &at).await?
+        }
+        (None, None) => space.seq,
     };
     if seq > space.seq {
         return Err(KipError::new(
@@ -37,12 +60,14 @@ pub async fn snapshot(cx: &mut Context<'_>, as_of: Option<&AsOf>) -> Result<Answ
         ));
     }
     let coordinate = crate::store::history::Coordinate { seq };
+    let committed = cx.store.transaction_at_seq(&cx.space, seq).await?;
     let schema_version = cx.store.schema_version_at(&cx.space, seq).await?;
-    // The token is now a promise the engine keeps: a later read carrying it in
+    // The token is a promise the engine keeps: a later read carrying it in
     // `read.snapshot_token` answers at this coordinate.
     Ok(Answer::whole(crate::store::history::snapshot_json(
         &cx.space,
         coordinate,
+        committed.as_ref(),
         schema_version,
     )))
 }
@@ -133,6 +158,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
     Ok(Answer {
         result: Json::Array(page),
         next_cursor: super::next_cursor(cx, CursorFamily::History, consumed, total),
+        warnings: Vec::new(),
     })
 }
 
@@ -146,10 +172,7 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
         ChangesCommand::Since { cursor, limit } => {
             // The cursor this engine issues *is* the sequence, so a caller can
             // reason about it — but it is still parsed rather than trusted.
-            (
-                scalar_usize(cx, cursor, "CHANGES SINCE")? as u64,
-                limit.as_ref(),
-            )
+            (change_cursor(cx, cursor)?, limit.as_ref())
         }
     };
     let limit = match limit {
@@ -188,6 +211,28 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
         // where it got to, and deriving that from the envelopes is work only it
         // can get wrong.
         next_cursor: consumed.map(|seq| seq.to_string()),
+        warnings: Vec::new(),
+    })
+}
+
+/// Reads a `CHANGES SINCE` cursor: the sequence the previous page consumed.
+///
+/// A token this engine did not issue — anything but a non-negative sequence,
+/// spelled as a number or as the numeric string `next_cursor` carried — is
+/// `CursorInvalid` with `family: "changes"` and `reason: "malformed"` (§87.7).
+fn change_cursor(cx: &Context<'_>, scalar: &Scalar) -> Result<u64, KipError> {
+    let value = scalar_json(cx, scalar)?;
+    let parsed = match &value {
+        Json::Number(number) => number.as_u64(),
+        Json::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    };
+    parsed.ok_or_else(|| {
+        KipError::cursor_invalid(
+            "changes",
+            "malformed",
+            format!("{value} is not a change cursor this engine issued"),
+        )
     })
 }
 
@@ -291,15 +336,18 @@ async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
 /// transition is (§36.2); what is filtered is which of its changes are
 /// relevant to this chronology.
 fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
-    let changes: Vec<Json> = match element {
-        Some(id) => row
-            .changes
-            .iter()
-            .filter(|change| change.get("id").and_then(Json::as_str) == Some(id))
-            .cloned()
-            .collect(),
-        None => row.changes.clone(),
-    };
+    // The journal stores each change in the entry shape it was committed
+    // with; one that does not decode is dropped rather than rendered in a
+    // shape no consumer was promised.
+    let changes: Vec<ChangeEntry> = row
+        .changes
+        .iter()
+        .filter(|change| match element {
+            Some(id) => change.get("id").and_then(Json::as_str) == Some(id),
+            None => true,
+        })
+        .filter_map(|change| serde_json::from_value(change.clone()).ok())
+        .collect();
     let envelope = anda_kip::ChangeEnvelope {
         space_id: row.space.clone(),
         space_seq: row.seq,

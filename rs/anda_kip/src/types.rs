@@ -118,13 +118,15 @@ pub struct GovernanceState {
     /// The policy this element is evaluated under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_ref: Option<String>,
-    /// How strongly this element may influence action (§31.3).
+    /// How far this element may influence behavior (§31.3): `descriptive`,
+    /// `advisory`, `behavioral` or `executable`.
     ///
     /// A ceiling, not a truth score: a memory can be certainly true and still
-    /// be `descriptive`. Absent means the runtime's default, which §31.4 makes
-    /// the bottom of the ladder for anything imported.
+    /// be `descriptive`. Governance-protected — ordinary KML cannot write it,
+    /// and it is never inferred from cognitive content. Absent means
+    /// `descriptive`, which §31.4 also makes the floor for anything imported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_influence_authority: Option<String>,
+    pub authority_class: Option<String>,
     /// What this element was derived from, for authority non-amplification.
     ///
     /// §31.5: transformation, summarization and compilation MUST NOT erase
@@ -158,12 +160,40 @@ pub struct Retention {
     pub legal_hold: Option<bool>,
 }
 
+/// The memory-authority classes §31.3 names, lowest first.
+pub const AUTHORITY_CLASSES: &[&str] = &["descriptive", "advisory", "behavioral", "executable"];
+
+/// One counter per version plane (Spec §6.3).
+///
+/// `version` advances on every committed change to the element; each plane
+/// counter advances only when its plane changes, so a guard on one plane
+/// (`EXPECT VERSION n OF ATTRIBUTES`, §35.1) is not spoiled by a concurrent
+/// write to another.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlaneVersions {
+    /// Fields and attributes.
+    #[serde(default)]
+    pub attributes: u64,
+    /// Structural References.
+    #[serde(default)]
+    pub structural: u64,
+    /// The retention record.
+    #[serde(default)]
+    pub retention: u64,
+    /// One counter per Facet symbol.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facets: BTreeMap<String, u64>,
+}
+
 /// Engine-maintained state (Spec §6.3).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SystemState {
-    /// Monotonic mutation counter; the target of `EXPECT VERSION`.
+    /// Monotonic mutation counter; the target of a bare `EXPECT VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
+    /// The per-plane counters `EXPECT VERSION ... OF` guards (§35.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane_versions: Option<PlaneVersions>,
     /// When the engine first wrote this element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
@@ -289,9 +319,13 @@ pub enum AssertionStatus {
     Active,
     /// Withdrawn by the assertor or an authorized representative (§14.1).
     Retracted,
-    /// Replaced by a newer Assertion in a compatible lineage (§14.2).
+    /// Replaced by a newer Assertion in a compatible lineage (§14.2): the
+    /// claim was wrong for the time it covered, so projection drops it for
+    /// every `FOR TIME`.
     Superseded,
-    /// No longer current under its lifecycle model (§14.3).
+    /// Computed, never stored (§14.3): the Assertion's `valid_time.until`
+    /// lies before the projection's `valid_at`. No statement produces it and
+    /// no Change Envelope carries it.
     Expired,
 }
 
@@ -410,7 +444,7 @@ pub struct EvidencePayload {
 /// An Evidence record — an observation (Spec §15.3).
 ///
 /// Payload and observation identity are immutable; a mistake is corrected with
-/// `CORRECT EVIDENCE`, never by rewriting (§15.5).
+/// `TRANSITION :old TO "corrected" BY :new`, never by rewriting (§15.5).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Evidence {
     /// The common envelope.
@@ -728,9 +762,10 @@ pub struct ChangeEnvelope {
     /// The Schema Environment version in force when it committed (§33.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_environment_version: Option<u64>,
-    /// What changed. Shapes are engine-defined; the atomicity is not.
+    /// What changed, one entry per element (§36.1,
+    /// `schemas/kip-change-envelope.schema.json`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub changes: Vec<Json>,
+    pub changes: Vec<ChangeEntry>,
 }
 
 impl ChangeEnvelope {
@@ -738,6 +773,94 @@ impl ChangeEnvelope {
     pub fn dedup_key(&self) -> (&str, u64, &str) {
         (&self.space_id, self.space_seq, &self.tx_id)
     }
+}
+
+/// What one commit did to one element (Spec §36.1).
+///
+/// Names and versions, never values: `touched` carries the paths that changed
+/// and `planes` the counters after the commit, which is exactly what a Watch
+/// needs to decide whether a slot, an element or a type moved without reading
+/// payload. Existence protection applies per entry (§30.4): an element the
+/// consumer may not discover is omitted from the envelope it receives.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ChangeEntry {
+    /// What the commit did to the element.
+    pub op: ChangeOp,
+    /// Which Core kind the element is.
+    pub kind: ElementKind,
+    /// The element id.
+    pub id: String,
+    /// The exact Concept Type reference; present for Concept entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_ref: Option<String>,
+    /// The version before this commit, when the element existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_version: Option<u64>,
+    /// The version after this commit.
+    pub new_version: u64,
+    /// The stored status before and after; present for `lifecycle` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ChangeState>,
+    /// The references that place the entry: the Proposition for an Assertion,
+    /// subject and predicate for a Proposition, the target for a merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<ChangeRefs>,
+    /// The paths changed — attribute, Facet, Structural Field or retention
+    /// names — carrying names only, never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched: Vec<String>,
+    /// The plane counters after this commit, for each plane the entry touched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planes: Option<PlaneVersions>,
+    /// Namespaced extensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The operations a Change Envelope entry records (Spec §36.1).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOp {
+    /// The element was created.
+    Create,
+    /// Mutable state changed.
+    Update,
+    /// The lifecycle status moved (`TRANSITION`).
+    Lifecycle,
+    /// The retention record changed.
+    Retention,
+    /// The Concept was merged into another.
+    Merge,
+    /// The element was physically erased.
+    Purge,
+    /// The Evidence payload was erased; the record survives.
+    PayloadPurge,
+}
+
+/// A lifecycle move, as an entry records it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChangeState {
+    /// The stored status before the commit.
+    pub from: String,
+    /// The stored status after it.
+    pub to: String,
+}
+
+/// The references that place a Change Envelope entry (Spec §36.1).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChangeRefs {
+    /// Assertion entries: the Proposition the Assertion is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposition: Option<String>,
+    /// Proposition entries: the subject element id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Proposition entries: the exact Predicate reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_ref: Option<String>,
+    /// Merge entries on the source Concept: the canonical target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 /// What `DESCRIBE CAPABILITIES` answers with (Spec §67).
@@ -866,9 +989,55 @@ mod tests {
             snapshot_seq: Some(1500),
             status: Some("committed".into()),
             schema_environment_version: Some(1),
-            changes: vec![serde_json::json!({ "kind": "concept", "op": "create" })],
+            changes: vec![ChangeEntry {
+                op: ChangeOp::Create,
+                kind: ElementKind::Concept,
+                id: "C-1".into(),
+                schema_ref: Some("kip://profiles/cognitive-memory@2.0.0/Person".into()),
+                old_version: None,
+                new_version: 1,
+                state: None,
+                refs: None,
+                touched: vec!["attributes.name".into()],
+                planes: Some(PlaneVersions {
+                    attributes: 1,
+                    ..Default::default()
+                }),
+                extensions: None,
+            }],
         };
         assert_eq!(envelope.dedup_key(), ("space-1", 1501, "tx-900"));
+        // §36.1: entries carry names and versions, never values, in the shape
+        // `schemas/kip-change-envelope.schema.json` fixes.
+        let entry = serde_json::to_value(&envelope.changes[0]).unwrap();
+        assert_eq!(entry["op"], "create");
+        assert_eq!(entry["kind"], "concept");
+        assert_eq!(entry["planes"]["attributes"], 1);
+        assert!(entry.get("old_version").is_none());
+        let lifecycle = ChangeEntry {
+            op: ChangeOp::Lifecycle,
+            kind: ElementKind::Assertion,
+            id: "A-1".into(),
+            schema_ref: None,
+            old_version: Some(2),
+            new_version: 3,
+            state: Some(ChangeState {
+                from: "active".into(),
+                to: "superseded".into(),
+            }),
+            refs: Some(ChangeRefs {
+                proposition: Some("P-1".into()),
+                ..Default::default()
+            }),
+            touched: vec![],
+            planes: None,
+            extensions: None,
+        };
+        let json = serde_json::to_value(&lifecycle).unwrap();
+        assert_eq!(json["op"], "lifecycle");
+        assert_eq!(json["state"]["to"], "superseded");
+        assert_eq!(json["refs"]["proposition"], "P-1");
+        assert!(json["refs"].get("subject").is_none());
 
         let replayed = envelope.clone();
         assert_eq!(replayed.dedup_key(), envelope.dedup_key());

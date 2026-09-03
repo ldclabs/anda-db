@@ -7,12 +7,18 @@
  * Proposition per semantic tuple (§12.5, §93.6) — an equality question the
  * storage layer has to answer, not a matter of taste.
  *
- * The two rules that make it deterministic:
+ * The rules that make it deterministic are §9.6's canonical form, applied on
+ * write and on match alike:
  *
- * - a number is equal by *normalized finite value*, so `1`, `1.0` and `1e0`
- *   are one Literal and not three Propositions (§9.4);
- * - a language tag is part of Literal identity, so `"苹果"@zh-Hans` and a bare
- *   `"苹果"` are different Literals (§9.5).
+ * - a string is its Unicode scalar values after NFC normalization — no
+ *   trimming, no case folding — so an NFC and an NFD spelling of one word are
+ *   one Literal;
+ * - a number is equal by *mathematical value*, so `1`, `1.0` and `1e0` are one
+ *   Literal and not three Propositions, and `-0` is `0`;
+ * - there is no language tag (§9.4): a `language` member is refused, because
+ *   its identity rules could not be stated here. Multilingual text is modelled
+ *   where they can be — a Concept with per-language attributes, or a
+ *   schema-defined value object.
  */
 
 import { digestParts } from './digest.js'
@@ -43,8 +49,6 @@ export interface Literal {
    * refinement such as `kip:datetime`.
    */
   datatype: string
-  /** The language tag, when language is semantically relevant. */
-  language?: string
 }
 
 /**
@@ -57,14 +61,19 @@ export interface Literal {
 export function literalFromScalar(value: Json): Literal {
   switch (typeof value) {
     case 'string':
-      return { value, datatype: DT_STRING }
+      // §9.6: canonicalized on write, so an NFC and an NFD spelling resolve
+      // to one Proposition. No trimming and no case folding: those change
+      // what was said.
+      return { value: value.normalize('NFC'), datatype: DT_STRING }
     case 'number':
       if (!Number.isFinite(value)) {
         throw errors.typeMismatch(
           'NaN and Infinity are not valid Core JSON numbers',
         )
       }
-      return { value, datatype: DT_NUMBER }
+      // `-0` is `0` (§9.6): the two compare equal already, but the stored
+      // value and the Capsule serialization have to spell it one way.
+      return { value: Object.is(value, -0) ? 0 : value, datatype: DT_NUMBER }
     case 'boolean':
       return { value, datatype: DT_BOOLEAN }
     case 'object':
@@ -87,14 +96,15 @@ export function literalFromObject(map: JsonMap): Literal {
     }
     literal.datatype = datatype
   }
-  const language = map.language
-  if (language !== undefined && language !== null) {
-    if (typeof language !== 'string') {
-      throw errors.typeMismatch(
-        'a Literal language must be a language tag string',
-      )
-    }
-    literal.language = language
+  // §9.4: the baseline Literal carries no language tag. Refused rather than
+  // dropped, because dropping it would silently merge `"苹果"@zh-Hans` with a
+  // bare `"苹果"` that the writer meant to keep apart.
+  if (Object.hasOwn(map, 'language')) {
+    throw errors.typeMismatch(
+      'a Literal carries no `language` member (§9.4); model multilingual text ' +
+        'as a Concept with per-language attributes or a schema-defined value ' +
+        'object',
+    )
   }
   return literal
 }
@@ -106,9 +116,7 @@ export function literalFromObject(map: JsonMap): Literal {
  * refined it — `kip:datetime` would read back as `kip:string`.
  */
 export function literalToJson(literal: Literal): JsonMap {
-  const map: JsonMap = { value: literal.value, datatype: literal.datatype }
-  if (literal.language !== undefined) map.language = literal.language
-  return map
+  return { value: literal.value, datatype: literal.datatype }
 }
 
 /**
@@ -225,8 +233,11 @@ export function endpointKey(endpoint: Endpoint): string {
     case 'foreign':
       return `fs${SEP}${endpoint.spaceId}${SEP}${endpoint.elementId}`
     case 'literal': {
-      const { value, datatype, language } = endpoint.literal
-      const head = `lit${SEP}${datatype}${SEP}${language ?? ''}${SEP}`
+      const { value, datatype } = endpoint.literal
+      // The empty segment where a language tag once sat is kept, so every
+      // stored `subject_key` / `object_key` written before §9.4 removed the
+      // tag still compares equal to one written now.
+      const head = `lit${SEP}${datatype}${SEP}${SEP}`
       switch (typeof value) {
         case 'string':
           return `${head}s${value}`

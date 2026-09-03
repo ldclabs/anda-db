@@ -1,6 +1,6 @@
 {
   "name": "transactions",
-  "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it, and the two guards ask different questions — EXPECT VERSION about what the caller read, EXPECT STATE about the engine state, which is not an Assertion's epistemic status.",
+  "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it. EXPECT VERSION is the one guard, and it is always the trailing clause (Spec §52.8); there is no EXPECT STATE — TRANSITION validates the target's current lifecycle state itself and fails InvalidLifecycleTransition from the wrong one (§35.3, §52.5), while a move to the state already held is a no_effect rather than an error.",
   "setup": [
     "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
   ],
@@ -16,12 +16,14 @@
       "name": "so the clause that succeeded left nothing behind",
       "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {name: \"Rollback probe\"} }",
       "expect": {
-        "result": [0]
+        "result": [
+          0
+        ]
       }
     },
     {
       "name": "a stale EXPECT VERSION refuses the write",
-      "command": "UPSERT CONCEPT ?p { MATCH {key: \"person:alice\"} EXPECT VERSION 99 SET FIELDS {name: \"Rewritten\"} }",
+      "command": "UPSERT CONCEPT ?p { MATCH {key: \"person:alice\"} SET FIELDS {name: \"Rewritten\"} } EXPECT VERSION 99",
       "expect": {
         "error": "VersionConflict"
       }
@@ -30,7 +32,9 @@
       "name": "and the refused write changed nothing",
       "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
       "expect": {
-        "result": ["Alice"]
+        "result": [
+          "Alice"
+        ]
       }
     },
     {
@@ -39,29 +43,69 @@
       "expect": {}
     },
     {
-      "name": "EXPECT STATE on a retraction asks about the claim's standing, and refuses when it does not hold",
-      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"retracted\"",
+      "name": "TRANSITION validates the move against the target's kind: an Assertion has no Activity state to move to",
+      "command": "TRANSITION ?a TO \"running\" WHERE { ?a ASSERTION {} }",
       "expect": {
-        "error": "PreconditionFailed"
+        "error": "InvalidLifecycleTransition"
       }
     },
     {
       "name": "the claim it refused to touch is still active",
       "command": "FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }",
       "expect": {
-        "result": ["active"]
+        "result": [
+          "active"
+        ]
       }
     },
     {
-      "name": "a guard that holds lets the withdrawal through",
-      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} } EXPECT STATE \"active\"",
+      "name": "the assertor's withdrawal is one TRANSITION, legal from active",
+      "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
       "expect": {}
     },
     {
       "name": "and the claim is withdrawn rather than deleted",
       "command": "FIND(?a.lifecycle.status, ?a.confidence) WHERE { ?a ASSERTION {} }",
       "expect": {
-        "result": [["retracted", 0.9]]
+        "result": [
+          [
+            "retracted",
+            0.9
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a move to the state the target already holds is no_effect, not an error",
+      "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
+      "expect": {}
+    },
+    {
+      "name": "and a move that is not legal from retracted is refused",
+      "command": "TRANSITION ?a TO \"superseded\" BY \"A-1\" WHERE { ?a ASSERTION {} }",
+      "expect": {
+        "error": "InvalidLifecycleTransition"
+      }
+    },
+    {
+      "name": "a stale guard on one version plane names the plane it refused",
+      "command": "UPDATE ?c SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} } EXPECT VERSION 99 OF ATTRIBUTES",
+      "expect": {
+        "error": "VersionConflict"
+      }
+    },
+    {
+      "name": "the same guard on two planes is refused as syntax, before anything runs",
+      "command": "UPDATE ?c SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} } EXPECT VERSION 1 OF ATTRIBUTES EXPECT VERSION 1 OF ATTRIBUTES",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "name": "a guard between the target and the actions is not where a mutation keeps its preconditions",
+      "command": "UPDATE ?c EXPECT VERSION 1 SET ATTRIBUTES { note: \"late\" } WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+      "expect": {
+        "error": "InvalidSyntax"
       }
     }
   ]

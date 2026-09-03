@@ -294,23 +294,35 @@ describe('META', () => {
       const [id] = nexus.query(
         'FIND(?c.id) WHERE { ?c CONCEPT {name: "Alice"} }',
       ) as string[]
-      nexus.execute(`ARCHIVE "${id!}"`)
+      nexus.execute(`TRANSITION "${id!}" TO "archived"`)
 
       const element = nexus.describe(`HISTORY ELEMENT "${id!}"`) as {
         space_id: string
         space_seq: number
         tx_id: string
         status: string
-        changes: { id: string; kind: string; op: string; version: number }[]
+        changes: {
+          id: string
+          kind: string
+          op: string
+          new_version: number
+          old_version?: number
+          state?: { from: string; to: string }
+          schema_ref?: string
+        }[]
       }[]
+      // §36.1: the normative op vocabulary, with the move itself in `state`.
       expect(element.map((e) => e.changes.map((c) => c.op))).toEqual([
         ['create'],
-        ['archive'],
+        ['lifecycle'],
       ])
-      expect(element.map((e) => e.changes.map((c) => c.version))).toEqual([
+      expect(element.map((e) => e.changes.map((c) => c.new_version))).toEqual([
         [1],
         [2],
       ])
+      expect(element[1]?.changes[0]?.state).toEqual({ from: 'active', to: 'archived' })
+      expect(element[1]?.changes[0]?.old_version).toBe(1)
+      expect(element[0]?.changes[0]?.schema_ref).toBe(`${CM}/Person`)
       // §36.3's deduplication key is present on every envelope, which is what
       // a follower needs and what a flattened change list cannot offer.
       for (const envelope of element) {
@@ -389,13 +401,17 @@ describe('META', () => {
       )
       // A token that promises a coordinate can be read back is only issued
       // once the engine can honour it — and now it can, so it is issued and
-      // binds a later read to that coordinate.
-      const snapshot = nexus.describe('SNAPSHOT') as {
-        snapshot_seq: number
+      // binds a later read to that coordinate (§68).
+      const snapshot = nexus.describe('DESCRIBE SNAPSHOT') as {
+        space_seq: number
         snapshot_token: string
       }
-      expect(snapshot.snapshot_seq).toBe(nexus.store.currentSeq(nexus.space))
+      expect(snapshot.space_seq).toBe(nexus.store.currentSeq(nexus.space))
       expect(snapshot.snapshot_token).toMatch(/^[0-9a-f]+$/)
+      // The statements §68 removed are refused by the grammar, not answered.
+      expect(() => nexus.describe('SNAPSHOT')).toThrowError()
+      expect(() => nexus.describe('DESCRIBE EXECUTION CONTEXT')).toThrowError()
+      expect(() => nexus.describe('DESCRIBE PROJECTION CAPABILITY')).toThrowError()
       // Reporting an unchecked artifact as valid would cancel the point of
       // asking.
       expect(() =>
@@ -587,7 +603,12 @@ describe('Capsules', () => {
     await withNexus('dependents', (nexus) => {
       for (const statement of DERIVED) nexus.execute(statement)
 
-      const one = nexus.describe('LIST DEPENDENTS "C-3"') as unknown as Dependent[]
+      const answer = nexus.describePage('LIST DEPENDENTS "C-3"')
+      // §63.5: nothing the caller may not discover cut the walk short. The
+      // rows stay the bare array every LIST answers with; the flag rides
+      // beside the page cursor.
+      expect(answer.truncated).toBe(false)
+      const one = answer.result as unknown as Dependent[]
       expect(one).toHaveLength(1)
       expect(one[0]!.id).toBe('C-4')
       expect(one[0]!.kind).toBe('concept')

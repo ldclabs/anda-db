@@ -1,6 +1,6 @@
 {
   "name": "execute_kip",
-  "description": "Executes KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Read with KQL (FIND), change cognition with KML (ASSERT / MUTATE / ENSURE / CREATE / UPDATE / RETRACT / SUPERSEDE / CORRECT / MERGE / ARCHIVE / TOMBSTONE / PURGE), and ground or introspect with META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / SNAPSHOT / EXPORT CAPSULE). Remember: a Proposition existing is not the same as it being true — raw FIND reads claims, BELIEF projects what is currently believed. Never rewrite an Assertion to correct it; record a new one with SUPERSEDING.",
+  "description": "Executes KIP 2.0 (Knowledge Interaction Protocol) commands against your Cognitive Nexus — your persistent memory. Read with KQL (FIND), change cognition with KML (ASSERT / MUTATE / ENSURE / CREATE / UPDATE / TRANSITION / SET RETENTION / MERGE / PURGE), and ground or introspect with META (DESCRIBE / LIST / SEARCH / VERIFY / VALIDATE / PREVIEW / HISTORY / CHANGES / EXPORT CAPSULE). Remember: a Proposition existing is not the same as it being true — raw FIND reads claims, BELIEF projects what is currently believed. Never rewrite an Assertion to correct it; record a new one with SUPERSEDING.",
   "parameters": {
     "type": "object",
     "properties": {

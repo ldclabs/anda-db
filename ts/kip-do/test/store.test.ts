@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { elementId, formatElementId } from '../src/id.js'
+import { lineageText } from '../src/schema/index.js'
 import { nowTime } from '../src/time.js'
 import {
   endpointFromJson,
@@ -11,6 +12,7 @@ import {
 import {
   State,
   Store,
+  emptyPlanes,
   type ConceptRow,
   type Element,
   type PropositionRow,
@@ -43,6 +45,7 @@ function envelope(space: string, id: number) {
     space,
     state: State.ACTIVE,
     version: 1,
+    plane_versions: emptyPlanes(),
     seq: 1,
     created_at: at,
     updated_at: at,
@@ -58,10 +61,13 @@ function envelope(space: string, id: number) {
 }
 
 function concept(space: string, id: number, extra: Partial<ConceptRow> = {}) {
+  const schemaRef = extra.schema_ref ?? 'kip://profiles/cognitive-memory@2.0.0/Person'
   const row: ConceptRow = {
     ...envelope(space, id),
     client_key: '',
-    schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Person',
+    schema_ref: schemaRef,
+    // §7.3, §20.14: key uniqueness is scoped to the type's lineage.
+    lineage: lineageText(schemaRef),
     key: '',
     name: '',
     canonical_id: '',
@@ -87,6 +93,7 @@ function proposition(
     subject: endpointToJson(s),
     subject_key: endpointKey(s),
     predicate_ref: predicate,
+    predicate_lineage: lineageText(predicate),
     object: endpointToJson(o),
     object_key: endpointKey(o),
     tuple_key: tupleKey(space, s, predicate, o),
@@ -218,8 +225,8 @@ describe('the store', () => {
 
       expect(store.conceptByKey('space://a', null, 'person:alice')?.id).toBe(a.seq)
       expect(store.conceptByKey('space://b', null, 'person:alice')?.id).toBe(b.seq)
-      expect(store.conceptByKey('space://a', PERSON, 'person:alice')?.id).toBe(a.seq)
-      expect(store.conceptByKey('space://a', PREFERENCE, 'person:alice')).toBeNull()
+      expect(store.conceptByKey('space://a', lineageText(PERSON), 'person:alice')?.id).toBe(a.seq)
+      expect(store.conceptByKey('space://a', lineageText(PREFERENCE), 'person:alice')).toBeNull()
 
       // Within one Space and one type it is an identity, so a second claim on
       // it fails.
@@ -245,7 +252,7 @@ describe('the store', () => {
         'create',
         't',
       )
-      expect(store.conceptByKey('space://a', PREFERENCE, 'person:alice')?.id).toBe(
+      expect(store.conceptByKey('space://a', lineageText(PREFERENCE), 'person:alice')?.id).toBe(
         other.seq,
       )
 
@@ -404,7 +411,7 @@ describe('the store', () => {
         result_digest: '',
         schema_environment_version: 1,
         result: { handles: { c: 'C-1' } },
-        changes: [{ id: 'C-1', kind: 'Concept', op: 'create', version: 1 }],
+        changes: [{ id: 'C-1', kind: 'concept', op: 'create', new_version: 1 }],
       })
 
       expect(store.transactionByKey('space://a', 'client-42')?.tx_id).toBe('tx-1')
@@ -521,7 +528,7 @@ describe('the store', () => {
           .exec<{ name: string }>('PRAGMA index_info(idx_concepts_key)')
           .toArray()
           .map((row) => row.name),
-      ).toContain('schema_ref')
+      ).toContain('lineage')
 
       newSpace(store, 'space://a')
       const person = store.reserve('Concept', 'space://a')
@@ -539,7 +546,7 @@ describe('the store', () => {
         'create',
         't',
       )
-      expect(store.conceptByKey('space://a', PREFERENCE, 'alice')?.id).toBe(
+      expect(store.conceptByKey('space://a', lineageText(PREFERENCE), 'alice')?.id).toBe(
         preference.seq,
       )
 
@@ -552,7 +559,7 @@ describe('the store', () => {
           .exec<{ name: string }>('PRAGMA index_info(idx_concepts_key)')
           .toArray()
           .map((row) => row.name),
-      ).toContain('schema_ref')
+      ).toContain('lineage')
       const clash = store.reserve('Concept', 'space://a')
       expect(() =>
         store.put(

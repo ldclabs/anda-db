@@ -464,15 +464,16 @@ pub struct KqlQuery {
     pub cursor: Option<Scalar>,
 }
 
-/// `AS OF SEQ|TX|TIME` — which cognitive history the read runs against.
+/// `AS OF SEQ` — which cognitive history the read runs against (Spec §48.1).
+///
+/// Cognitive time is a sequence coordinate, and it is the only historical
+/// axis: a transaction id resolves to its sequence through `DESCRIBE
+/// TRANSACTION`, a wall-clock instant through `DESCRIBE SNAPSHOT AT TIME`, so
+/// a historical read always names the exact coordinate it was served from.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub enum AsOf {
     /// A Space sequence coordinate.
     Seq(Scalar),
-    /// A transaction coordinate.
-    Tx(Scalar),
-    /// An engine-time coordinate.
-    Time(Scalar),
 }
 
 /// The projection list of a query.
@@ -765,20 +766,10 @@ pub enum MutationClause {
     CreateActivity(RecordCreate),
     /// `UPDATE target ...`
     Update(UpdateStatement),
-    /// `RETRACT ASSERTION target`
-    RetractAssertion(RetractAssertion),
-    /// `SUPERSEDE ASSERTION old BY new`
-    SupersedeAssertion(SupersedeAssertion),
-    /// `CORRECT EVIDENCE old BY new`
-    CorrectEvidence(CorrectEvidence),
-    /// `TRANSITION ACTIVITY target TO state`
-    TransitionActivity(TransitionActivity),
+    /// `TRANSITION target TO "state" [BY ref] ...` — the one lifecycle statement.
+    Transition(Transition),
     /// `SET RETENTION target { ... }`
     SetRetention(SetRetention),
-    /// `ARCHIVE target`
-    Archive(RemovalStatement),
-    /// `TOMBSTONE target`
-    Tombstone(RemovalStatement),
     /// `PURGE target ... CONFIRM "PURGE"`
     Purge(PurgeStatement),
     /// `PURGE PAYLOAD target ... CONFIRM "PURGE"`
@@ -830,8 +821,8 @@ pub struct ConceptUpsert {
     pub handle: String,
     /// `MATCH { ... }` — must carry `id` or `key`.
     pub r#match: Option<ObjectMatcher>,
-    /// `EXPECT VERSION ...`
-    pub expect_version: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards, after the closing brace (§52.8).
+    pub expect_versions: Vec<ExpectVersion>,
     /// `SET FIELDS { ... }`
     pub set_fields: Option<Assignments>,
     /// `SET ATTRIBUTES { ... }`
@@ -874,8 +865,60 @@ pub struct EnsureProposition {
     pub predicate: PredAtom,
     /// The object endpoint.
     pub object: Term,
-    /// `EXPECT VERSION ...`
-    pub expect_version: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards; `EXPECT VERSION 0` is the
+    /// create-only form (§35.2).
+    pub expect_versions: Vec<ExpectVersion>,
+}
+
+/// `EXPECT VERSION n [OF plane]` — one optimistic-concurrency guard (Spec §35.1).
+///
+/// Without a plane the guard compares the element's `_system.version`; with
+/// one, that plane's own counter in `_system.plane_versions`, so a Facet sweep
+/// and an attribute write on the same element do not spoil each other's guard.
+/// A statement carries at most one guard per plane, and every mutation carries
+/// them in the same place: last (§52.8).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ExpectVersion {
+    /// The version the caller believes the element (or plane) is at.
+    pub version: Scalar,
+    /// The version plane, or `None` for the element's whole version.
+    pub plane: Option<VersionPlane>,
+}
+
+impl ExpectVersion {
+    /// A guard on the element's whole `_system.version`.
+    pub fn element(version: Scalar) -> Self {
+        Self {
+            version,
+            plane: None,
+        }
+    }
+
+    /// The deduplication key of this guard's plane: two guards with the same
+    /// key cannot both be meant.
+    pub fn plane_key(&self) -> String {
+        match &self.plane {
+            None => "element".to_string(),
+            Some(VersionPlane::Attributes) => "attributes".to_string(),
+            Some(VersionPlane::Structural) => "structural".to_string(),
+            Some(VersionPlane::Retention) => "retention".to_string(),
+            Some(VersionPlane::Facet(SymbolRef::Name(name))) => format!("facet:{name}"),
+            Some(VersionPlane::Facet(SymbolRef::Param(name))) => format!("facet::{name}"),
+        }
+    }
+}
+
+/// The version planes `EXPECT VERSION ... OF` may name (Spec §6.3, §35.1).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum VersionPlane {
+    /// Fields and attributes.
+    Attributes,
+    /// Structural References.
+    Structural,
+    /// The retention record.
+    Retention,
+    /// One Facet, by symbol.
+    Facet(SymbolRef),
 }
 
 /// One `SET FACET` clause.
@@ -1008,15 +1051,15 @@ impl UpdateFunction {
 pub struct UpdateStatement {
     /// The element to update.
     pub target: ElementRef,
-    /// `EXPECT VERSION ...`
-    pub expect_version: Option<Scalar>,
     /// The actions, in source order.
     pub actions: Vec<UpdateAction>,
     /// `None` when the statement names its target directly and omits WHERE —
-    /// the same shape as the removal family (Spec §58).
+    /// the same shape as `TRANSITION` and the removal family (Spec §58).
     pub where_clauses: Option<Vec<WhereClause>>,
     /// The bound on how many matched elements may be updated.
     pub limit: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards (§52.8).
+    pub expect_versions: Vec<ExpectVersion>,
 }
 
 /// One action of an `UPDATE`.
@@ -1038,54 +1081,90 @@ pub enum UpdateAction {
     UnsetStructural(Vec<StructuralRemoval>),
 }
 
-/// `RETRACT ASSERTION` — the assertor withdraws their commitment (Spec §57.3).
+/// The lifecycle states `TRANSITION ... TO` may name (Spec §52.5).
+///
+/// Which states fit which target kind — and which current state a move is
+/// legal from — is the engine's check (`InvalidLifecycleTransition`); what the
+/// language fixes is the vocabulary, which is why the list lives here rather
+/// than in a Schema Package.
+pub mod transition_state {
+    /// The assertor withdraws the claim (§57.3). Assertion only.
+    pub const RETRACTED: &str = "retracted";
+    /// The claim was wrong; revision lineage (§57.4). Assertion only, `BY` the
+    /// newer Assertion.
+    pub const SUPERSEDED: &str = "superseded";
+    /// Wrong record; correction lineage (§57.2). Evidence only, `BY` the new
+    /// Evidence.
+    pub const CORRECTED: &str = "corrected";
+    /// An Activity has started (§16).
+    pub const RUNNING: &str = "running";
+    /// An Activity ended successfully (§16.6).
+    pub const COMPLETED: &str = "completed";
+    /// An Activity ended in failure (§16.6).
+    pub const FAILED: &str = "failed";
+    /// An Activity was cancelled (§16.6).
+    pub const CANCELLED: &str = "cancelled";
+    /// Out of ordinary recall, history preserved (§60). Any element.
+    pub const ARCHIVED: &str = "archived";
+    /// Logical deletion, identity and audit preserved (§60). Any element.
+    pub const TOMBSTONED: &str = "tombstoned";
+
+    /// Every state the statement may name, in Spec §52.5 order.
+    pub const ALL: &[&str] = &[
+        RETRACTED, SUPERSEDED, CORRECTED, RUNNING, COMPLETED, FAILED, CANCELLED, ARCHIVED,
+        TOMBSTONED,
+    ];
+    /// The moves that name the replacing element with `BY`.
+    pub const WITH_BY: &[&str] = &[SUPERSEDED, CORRECTED];
+    /// The Activity status moves: the only ones that may finalize fields or
+    /// topology in the same statement.
+    pub const ACTIVITY: &[&str] = &[RUNNING, COMPLETED, FAILED, CANCELLED];
+}
+
+/// `TRANSITION target TO "state" [BY ref] [SET FIELDS] [SET STRUCTURAL]
+/// [WHERE] [LIMIT] {EXPECT VERSION}` — the one lifecycle statement (Spec §52.5).
+///
+/// The quoted state names the move and the engine validates it against the
+/// target's kind and current lifecycle state, which is why there is no
+/// `EXPECT STATE`: a move from the wrong state fails
+/// `InvalidLifecycleTransition`, and a version guard covers the rest. `by`
+/// carries the replacing element for `superseded` / `corrected`; `set_fields`
+/// and `set_structural` finalize a pending Activity in the same transition.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct RetractAssertion {
-    /// The Assertion to retract.
+pub struct Transition {
+    /// The element whose lifecycle moves.
     pub target: ElementRef,
+    /// The state the move goes to.
+    pub to: Scalar,
+    /// The replacing element, for `superseded` / `corrected`.
+    pub by: Option<ElementRef>,
+    /// Terminal fields finalized in the same transition (Activity states only).
+    pub set_fields: Option<Assignments>,
+    /// Terminal topology finalized in the same transition (Activity states only).
+    pub set_structural: Option<Vec<StructuralEdge>>,
     /// The selection block, when the target is bound by one.
     pub where_clauses: Option<Vec<WhereClause>>,
-    /// The bound on how many matched Assertions may be retracted.
+    /// The bound on how many matched elements may move.
     pub limit: Option<Scalar>,
-    /// `EXPECT STATE ...`
-    pub expect_state: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards (§52.8).
+    pub expect_versions: Vec<ExpectVersion>,
 }
 
-/// `SUPERSEDE ASSERTION old BY new` — belief revision (Spec §57.4).
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct SupersedeAssertion {
-    /// The superseded Assertion.
-    pub target: ElementRef,
-    /// The superseding Assertion.
-    pub by: ElementRef,
-    /// `EXPECT STATE ...`
-    pub expect_state: Option<Scalar>,
-}
+impl Transition {
+    /// The state the statement names, when it was written as a literal.
+    ///
+    /// `None` for a `:parameter`, which is bound at execution time.
+    pub fn state(&self) -> Option<&str> {
+        match &self.to {
+            Scalar::Literal(KipValue::String(state)) => Some(state.as_str()),
+            _ => None,
+        }
+    }
 
-/// `CORRECT EVIDENCE old BY new` — Evidence correction (Spec §57.2).
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct CorrectEvidence {
-    /// The corrected Evidence.
-    pub target: ElementRef,
-    /// The correcting Evidence.
-    pub by: ElementRef,
-    /// `EXPECT STATE ...`
-    pub expect_state: Option<Scalar>,
-}
-
-/// `TRANSITION ACTIVITY` — advance an Activity's lifecycle, finalizing atomically.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct TransitionActivity {
-    /// The Activity to transition.
-    pub target: ElementRef,
-    /// The target state.
-    pub to: Scalar,
-    /// Terminal outputs finalized in the same transition.
-    pub set_fields: Option<Assignments>,
-    /// Terminal topology finalized in the same transition.
-    pub set_structural: Option<Vec<StructuralEdge>>,
-    /// `EXPECT STATE ...`
-    pub expect_state: Option<Scalar>,
+    /// Whether the statement finalizes fields or topology.
+    pub fn finalizes(&self) -> bool {
+        self.set_fields.is_some() || self.set_structural.is_some()
+    }
 }
 
 /// `SET RETENTION` — storage lifecycle, never valid time (Spec §19).
@@ -1099,21 +1178,8 @@ pub struct SetRetention {
     pub where_clauses: Option<Vec<WhereClause>>,
     /// The bound on how many matched elements may be changed.
     pub limit: Option<Scalar>,
-    /// `EXPECT VERSION ...`
-    pub expect_version: Option<Scalar>,
-}
-
-/// `ARCHIVE` / `TOMBSTONE` share one shape.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct RemovalStatement {
-    /// The element to remove.
-    pub target: ElementRef,
-    /// The selection block, when the target is bound by one.
-    pub where_clauses: Option<Vec<WhereClause>>,
-    /// The bound on how many matched elements may be removed.
-    pub limit: Option<Scalar>,
-    /// `EXPECT STATE ...`
-    pub expect_state: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards (§52.8).
+    pub expect_versions: Vec<ExpectVersion>,
 }
 
 /// `PURGE` — physical erasure. The grammar freezes the confirmation spelling.
@@ -1125,6 +1191,8 @@ pub struct PurgeStatement {
     pub where_clauses: Option<Vec<WhereClause>>,
     /// The bound on how many matched elements may be erased.
     pub limit: Option<Scalar>,
+    /// The `EXPECT VERSION` guards, before the statement's own trailing words.
+    pub expect_versions: Vec<ExpectVersion>,
     /// `REFERENCE POLICY ...`
     pub reference_policy: Option<Scalar>,
     /// Always the literal `PURGE`; the grammar freezes the spelling.
@@ -1144,6 +1212,8 @@ pub struct PurgePayloadStatement {
     pub where_clauses: Option<Vec<WhereClause>>,
     /// The bound on how many matched elements may be erased.
     pub limit: Option<Scalar>,
+    /// The `EXPECT VERSION` guards, before `CONFIRM`.
+    pub expect_versions: Vec<ExpectVersion>,
     /// Always the literal `PURGE`; the grammar freezes the spelling.
     pub confirm: String,
 }
@@ -1158,8 +1228,8 @@ pub struct MergeConcept {
     pub into: ElementRef,
     /// A guard block; MERGE never selects its operands by pattern.
     pub where_clauses: Option<Vec<WhereClause>>,
-    /// `EXPECT VERSION ...`
-    pub expect_version: Option<Scalar>,
+    /// The trailing `EXPECT VERSION` guards, on the source (§52.8).
+    pub expect_versions: Vec<ExpectVersion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,11 +1260,6 @@ pub enum MetaCommand {
     History(HistoryCommand),
     /// `CHANGES ...`
     Changes(ChangesCommand),
-    /// `SNAPSHOT [AS OF ...]`
-    Snapshot {
-        /// The history coordinate, when written.
-        as_of: Option<AsOf>,
-    },
     /// `EXPORT CAPSULE ...`
     ExportCapsule(ExportCapsuleCommand),
 }
@@ -1209,9 +1274,7 @@ pub enum DescribeTarget {
     },
     /// `DESCRIBE PROTOCOL`
     Protocol,
-    /// `DESCRIBE EXECUTION CONTEXT`
-    ExecutionContext,
-    /// `DESCRIBE CAPABILITIES`
+    /// `DESCRIBE CAPABILITIES` — projection capability included (§67).
     Capabilities,
     /// `DESCRIBE SPACE [...]`
     Space {
@@ -1246,10 +1309,13 @@ pub enum DescribeTarget {
     Transaction(Scalar),
     /// `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY ...`
     TransactionByIdempotencyKey(Scalar),
-    /// `DESCRIBE SNAPSHOT [AS OF ...]`
+    /// `DESCRIBE SNAPSHOT [AS OF SEQ :s | AT TIME :t]` — the snapshot
+    /// coordinate; `AT TIME` resolves an instant to a sequence (§68).
     Snapshot {
         /// The history coordinate, when written.
         as_of: Option<AsOf>,
+        /// The wall-clock instant to resolve, when written. Never both.
+        at_time: Option<Scalar>,
     },
     /// `DESCRIBE CAPSULE ...`
     Capsule(Scalar),
@@ -1258,8 +1324,6 @@ pub enum DescribeTarget {
         /// The policy name; the active policy when absent.
         value: Option<Scalar>,
     },
-    /// `DESCRIBE PROJECTION CAPABILITY`
-    ProjectionCapability,
     /// `DESCRIBE TRUST [...]`
     Trust {
         /// The trust subject; the whole trust state when absent.
@@ -1550,13 +1614,59 @@ mod tests {
                 subject: Term::Param("alice".into()),
                 predicate: PredAtom::Literal("prefers".into()),
                 object: Term::Param("dark_mode".into()),
-                expect_version: None,
+                expect_versions: Vec::new(),
             })],
         });
         let encoded = serde_json::to_string(&command).unwrap();
         let decoded: Command = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, command);
         assert!(decoded.is_mutation());
+    }
+
+    #[test]
+    fn version_planes_encode_the_way_the_reference_toolkit_does() {
+        // `exec-ast.ts`: `plane: 'Attributes' | { Facet: SymbolRef } | null`.
+        assert_eq!(
+            serde_json::to_string(&ExpectVersion::element(Scalar::Param("v".into()))).unwrap(),
+            r#"{"version":{"Param":"v"},"plane":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ExpectVersion {
+                version: Scalar::Literal(KipValue::Number(Number::from(3))),
+                plane: Some(VersionPlane::Attributes),
+            })
+            .unwrap(),
+            r#"{"version":{"Literal":{"Number":3}},"plane":"Attributes"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&VersionPlane::Facet(SymbolRef::Name(
+                "MnemonicState".into()
+            )))
+            .unwrap(),
+            r#"{"Facet":{"Name":"MnemonicState"}}"#
+        );
+    }
+
+    #[test]
+    fn a_transition_knows_its_literal_state() {
+        let transition = Transition {
+            target: ElementRef::Param("a".into()),
+            to: Scalar::Literal(KipValue::String("retracted".into())),
+            by: None,
+            set_fields: None,
+            set_structural: None,
+            where_clauses: None,
+            limit: None,
+            expect_versions: Vec::new(),
+        };
+        assert_eq!(transition.state(), Some("retracted"));
+        assert!(!transition.finalizes());
+        let bound = Transition {
+            to: Scalar::Param("state".into()),
+            ..transition
+        };
+        assert_eq!(bound.state(), None);
+        assert!(transition_state::ALL.contains(&"tombstoned"));
     }
 
     #[test]

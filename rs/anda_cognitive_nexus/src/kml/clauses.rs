@@ -13,18 +13,21 @@
 //!
 //! **An Assertion's epistemic payload is immutable** (§58.1). There is no clause
 //! that edits stance, mode, confidence or evidence — correcting a claim is
-//! `CREATE ASSERTION` plus `SUPERSEDE`, which is why the parser rejects
-//! `UPDATE ?a SET FIELDS {confidence: ...}` before an engine ever sees it.
+//! `CREATE ASSERTION` plus `TRANSITION ... TO "superseded"`, which is why the
+//! parser rejects `UPDATE ?a SET FIELDS {confidence: ...}` before an engine
+//! ever sees it.
 //!
-//! **Retraction is not deletion** (§41.1). A retracted Assertion keeps
+//! **Retraction is not deletion** (§57.3, §60). A retracted Assertion keeps
 //! existing; only its lifecycle status moves, so the historical record of what
-//! was once believed survives.
+//! was once believed survives. Every lifecycle move is the one `TRANSITION`
+//! statement (§52.5), dispatched on the state it names and the kind it lands
+//! on.
 
 use anda_kip::{
-    ASSERTION_MODES, ConceptCreate, ConceptUpsert, CorrectEvidence, EVIDENCE_ROLES, ElementKind,
-    EnsureProposition, Json, KipError, KipErrorCode, Map, MatchValue, MergeConcept, MutationClause,
-    RecordCreate, RemovalStatement, RetractAssertion, STANCES, SetRetention, SupersedeAssertion,
-    SymbolRef as AstSymbolRef, TransitionActivity, UpdateAction, UpdateStatement,
+    ASSERTION_MODES, ChangeOp, ConceptCreate, ConceptUpsert, EVIDENCE_ROLES, ElementKind,
+    EnsureProposition, ExpectVersion, Json, KipError, KipErrorCode, Map, MatchValue, MergeConcept,
+    MutationClause, RecordCreate, STANCES, SetRetention, SymbolRef as AstSymbolRef, Transition,
+    UpdateAction, UpdateStatement, VersionPlane, transition_state,
 };
 use std::collections::BTreeMap;
 
@@ -34,11 +37,12 @@ use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::governance::Permission;
 use crate::id::ElementId;
 use crate::schema::{EndpointFacts, Intent, SymbolKind};
+use crate::store::planes::{self, PlaneKey};
 use crate::store::rows::*;
 use crate::store::{Element, Store};
 use crate::term::{Endpoint, tuple_key};
 use crate::time;
-use crate::tx::Transaction;
+use crate::tx::{Guard, Transaction};
 
 /// Declares the handles a clause binds, before any clause is interpreted.
 ///
@@ -118,37 +122,8 @@ pub async fn apply(
             create_record(store, tx, c, ElementKind::Activity, request, operation).await
         }
         MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
-        MutationClause::RetractAssertion(c) => retract(store, tx, c, request, operation).await,
-        MutationClause::SupersedeAssertion(c) => supersede(tx, c, request, operation).await,
-        MutationClause::CorrectEvidence(c) => correct_evidence(tx, c, request, operation).await,
-        MutationClause::TransitionActivity(c) => transition(tx, c, request, operation).await,
+        MutationClause::Transition(c) => transition(store, tx, c, request, operation).await,
         MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
-        MutationClause::Archive(c) => {
-            remove(
-                store,
-                tx,
-                c,
-                state::ARCHIVED,
-                "archive",
-                Permission::Archive,
-                request,
-                operation,
-            )
-            .await
-        }
-        MutationClause::Tombstone(c) => {
-            remove(
-                store,
-                tx,
-                c,
-                state::TOMBSTONED,
-                "tombstone",
-                Permission::Tombstone,
-                request,
-                operation,
-            )
-            .await
-        }
         MutationClause::MergeConcept(c) => merge_concept(store, tx, c, request, operation).await,
         MutationClause::Purge(c) => purge(store, tx, c, request, operation).await,
         MutationClause::PurgePayload(c) => purge_payload(store, tx, c, request, operation).await,
@@ -523,6 +498,7 @@ async fn create_concept(
     let retention = fields.json("retention");
     require_retention_authority(tx, &retention)?;
     let extra_name = fields.text("name")?;
+    refuse_protected_fields(&fields)?;
     fields.rest("Concept")?;
 
     // Kind only here: the Concept's type symbol is resolved a few lines down by
@@ -568,8 +544,22 @@ async fn create_concept(
     };
     let element = Element::Concept(Box::new(row));
     tx.authorize_created(&element, Permission::Create)?;
-    tx.stage_new(id, element, "create");
+    tx.stage_new(id, element, ChangeOp::Create);
     check_structural(store, tx, id).await
+}
+
+/// Refuses a Governance member spelled as a Core field (§28.1, §31.3).
+///
+/// `authority_class` and `classification` are assigned by Governance and read
+/// under `governance`; a `SET FIELDS` naming one is refused as protected rather
+/// than as unknown, so the caller learns which plane the member lives on.
+fn refuse_protected_fields(fields: &Fields) -> Result<(), KipError> {
+    for protected in ["authority_class", "classification", "governance"] {
+        if fields.0.contains_key(protected) {
+            return Err(update::protected_governance(protected));
+        }
+    }
+    Ok(())
 }
 
 async fn create_record(
@@ -622,14 +612,16 @@ async fn create_record(
     // under a Concept the Space said was the same as another one.
     structural.canonicalize(tx).await?;
 
+    refuse_protected_fields(&fields)?;
     let row = match kind {
         ElementKind::Evidence => {
             let payload = fields.json("payload");
             let (payload_mode, payload_inline, content_ref) = split_payload(payload)?;
             let source_refs = structural.values("source");
+            let evidence_class = require_text(&mut fields, "evidence_class", "CREATE EVIDENCE")?;
             let row = EvidenceRow {
                 _id: id.seq,
-                evidence_class: require_text(&mut fields, "evidence_class", "CREATE EVIDENCE")?,
+                evidence_class,
                 payload_mode,
                 payload_inline,
                 content_ref,
@@ -658,6 +650,17 @@ async fn create_record(
             // one has to resolve to the surviving identity or the actor's own
             // claims split across two Concepts the Space calls one (§11.3).
             let asserted_by = canonicalize_reference(tx, fields.json("asserted_by")).await?;
+            // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be
+            // resolved is recorded as Evidence, not asserted — an Assertion is
+            // one actor's commitment, and one with no actor commits nobody.
+            let asserted_by_key = endpoint_key(&asserted_by);
+            if asserted_by_key.is_empty() {
+                return Err(KipError::constraint_violation(
+                    "CREATE ASSERTION requires `asserted_by`, the semantic actor whose commitment \
+                     this is (§13.3); a claim with no resolvable actor is recorded as Evidence, \
+                     not asserted",
+                ));
+            }
             // Each citation keeps the role it was cited in: Core records that
             // this Assertion cites E *as supporting*, and never that E proves
             // anything — that judgement belongs to the Projection (§8.4).
@@ -690,7 +693,7 @@ async fn create_record(
             let row = AssertionRow {
                 _id: id.seq,
                 proposition_id: proposition.to_string(),
-                asserted_by_key: endpoint_key(&asserted_by),
+                asserted_by_key,
                 asserted_by,
                 stance: require_registry(&mut fields, "stance", STANCES, "CREATE ASSERTION")?,
                 mode: require_registry(&mut fields, "mode", ASSERTION_MODES, "CREATE ASSERTION")?,
@@ -714,9 +717,10 @@ async fn create_record(
         ElementKind::Activity => {
             let inputs = structural.values("inputs");
             let outputs = structural.values("outputs");
+            let activity_class = require_text(&mut fields, "activity_class", "CREATE ACTIVITY")?;
             let row = ActivityRow {
                 _id: id.seq,
-                activity_class: require_text(&mut fields, "activity_class", "CREATE ACTIVITY")?,
+                activity_class,
                 started_at: fields.timestamp("started_at")?,
                 ended_at: fields.timestamp("ended_at")?,
                 input_keys: inputs.iter().map(endpoint_key).collect(),
@@ -759,11 +763,58 @@ async fn create_record(
         if extra != Permission::Assert {
             tx.authorize_created(&row_element(row), extra)?;
         }
+        // The binding this write exercised, for the Receipt's `origin`
+        // (§33.2): the one covering the actor, when the caller holds one.
+        if let Some(binding) = tx
+            .authority
+            .bindings
+            .iter()
+            .find(|binding| binding.actor_key == row.asserted_by_key)
+        {
+            tx.note_binding(format!("kip:binding:{}", binding._id));
+        }
     } else {
         tx.authorize_created(&row, Permission::Create)?;
     }
-    tx.stage_new(id, row, "create");
+    require_outcome_authority(tx, &row)?;
+    tx.stage_new(id, row, ChangeOp::Create);
     check_structural(store, tx, id).await
+}
+
+/// The Evidence class that is the consequence channel (§15.7).
+pub(crate) const OUTCOME_EVIDENCE_CLASS: &str = "outcome";
+/// The Activity class that links an outcome to the decision it grades (§15.7).
+pub(crate) const OUTCOME_OBSERVATION_CLASS: &str = "outcome_observation";
+
+/// Whether a new record is part of the consequence channel (§15.7, §29.8).
+pub(crate) fn records_outcome(element: &Element) -> bool {
+    match element {
+        Element::Evidence(row) => row.evidence_class == OUTCOME_EVIDENCE_CLASS,
+        Element::Activity(row) => row.activity_class == OUTCOME_OBSERVATION_CLASS,
+        _ => false,
+    }
+}
+
+/// Requires `record_outcome` for a write into the consequence channel (§29.8).
+///
+/// Writing `outcome`-class Evidence, and the observation Activity that links
+/// it to a decision, is what a lifecycle verdict later grades cognition
+/// against; Governance restricts it to instrumentation Principals. It is
+/// asked for in addition to the permission the creation itself needs and
+/// never instead of it, and it does not additionally require `derive`.
+///
+/// Asked against the element being created, not at Space scope: a policy that
+/// grants instrumentation `record_outcome` only for a classification or a type
+/// has to be able to say so, and the other reference engine authorizes the
+/// same write the same way.
+pub(crate) fn require_outcome_authority(
+    tx: &mut Transaction,
+    element: &Element,
+) -> Result<(), KipError> {
+    if records_outcome(element) {
+        tx.authorize_created(element, Permission::RecordOutcome)?;
+    }
+    Ok(())
 }
 
 /// Wraps one Assertion row back into an [`Element`] for authorization.
@@ -814,7 +865,7 @@ async fn purge(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let (targets, policy) = {
+    let (targets, policy, guards) = {
         let b = bindings(tx, request, operation);
         let policy = clause
             .reference_policy
@@ -832,13 +883,18 @@ async fn purge(
             &b,
         )
         .await?;
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
         (
             targets,
             crate::governance::purge::ReferencePolicy::parse(policy.as_deref())?,
+            guards,
         )
     };
 
     let ids = targets.authorized(tx).await?;
+    for id in &ids {
+        tx.expect_versions(*id, &guards).await?;
+    }
     if tx.dry_run {
         // A preview must compute the effect without performing it, and there is
         // no such thing as a reversible erasure to perform and undo.
@@ -874,9 +930,9 @@ async fn purge_payload(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let targets = {
+    let (targets, guards) = {
         let b = bindings(tx, request, operation);
-        select::targets(
+        let targets = select::targets(
             store,
             tx,
             "PURGE PAYLOAD",
@@ -886,10 +942,14 @@ async fn purge_payload(
             clause.limit.as_ref(),
             &b,
         )
-        .await?
+        .await?;
+        (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
     };
 
     let ids = targets.authorized(tx).await?;
+    for id in &ids {
+        tx.expect_versions(*id, &guards).await?;
+    }
     if tx.dry_run {
         // A preview must compute the effect without performing it, and there
         // is no such thing as a reversible byte destruction to perform and
@@ -993,11 +1053,7 @@ async fn ensure_proposition(
         }
     };
 
-    let expect_version = clause
-        .expect_version
-        .as_ref()
-        .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
-        .transpose()?;
+    let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
     // `b` borrows `tx`, and resolving endpoint facts needs it mutably.
     let _ = b;
 
@@ -1015,32 +1071,34 @@ async fn ensure_proposition(
             .prepare_proposition(&predicate, &subject_facts, &object_facts, Intent::Write)?;
     validation.into_result()?;
 
-    let key = tuple_key(&tx.cx.space, &subject, &symbol.to_string(), &object);
+    // §12.3, §20.14: identity compares the predicate's lineage, so the same
+    // tuple written under a later version of the package resolves to the
+    // Proposition the Space already holds; the stored `predicate_ref` stays
+    // the exact reference resolved now.
+    let key = tuple_key(
+        &tx.cx.space,
+        &subject,
+        &crate::schema::lineage_of(&symbol.to_string()),
+        &object,
+    );
 
     // Resolve-or-create: one Space keeps one canonical Proposition per
-    // semantic tuple (§59), so an existing tuple is bound rather than
+    // semantic tuple (§12.4), so an existing tuple is bound rather than
     // duplicated — and binding it changes nothing, because the tuple is
-    // immutable (§61).
+    // immutable (§12.5).
     if let Some(existing) = store.find_proposition(&key).await? {
         let id = ElementId::new(ElementKind::Proposition, existing._id);
-        if let Some(expected) = expect_version {
-            tx.expect_version(id, expected).await?;
-        }
+        tx.expect_versions(id, &guards).await?;
         if let Some(handle) = &clause.handle {
             tx.bind_existing(handle, id)?;
         }
         return Ok(());
     }
 
-    if let Some(expected) = expect_version {
-        // Spec §42: `EXPECT VERSION 0` is the create-only guard, and it is
-        // satisfied precisely because nothing was found above.
-        if expected != 0 {
-            return Err(KipError::version_conflict(format!(
-                "this tuple does not exist yet, so it cannot be at version {expected}"
-            )));
-        }
-    }
+    // §35.2: the bare `EXPECT VERSION 0` is the create-only guard, and it is
+    // satisfied precisely because nothing was found above; a plane guard at
+    // 0 says the plane has never been written, which is also true here.
+    check_guards_absent(&guards, "this tuple does not exist yet")?;
 
     let id = tx.mint(ElementKind::Proposition).await?;
     if let Some(handle) = &clause.handle {
@@ -1058,7 +1116,7 @@ async fn ensure_proposition(
     };
     let element = Element::Proposition(Box::new(row));
     tx.authorize_created(&element, Permission::Create)?;
-    tx.stage_new(id, element, "create");
+    tx.stage_new(id, element, ChangeOp::Create);
     Ok(())
 }
 
@@ -1146,23 +1204,14 @@ async fn upsert_concept(
             .map(|row| ElementId::new(ElementKind::Concept, row._id)),
     };
 
+    let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
     let id = match existing {
         Some(id) => {
-            if let Some(expected) = &clause.expect_version {
-                let expected = b.scalar_u64(expected, "EXPECT VERSION")?;
-                tx.expect_version(id, expected).await?;
-            }
+            tx.expect_versions(id, &guards).await?;
             id
         }
         None => {
-            if let Some(expected) = &clause.expect_version {
-                let expected = b.scalar_u64(expected, "EXPECT VERSION")?;
-                if expected != 0 {
-                    return Err(KipError::version_conflict(format!(
-                        "no Concept matches this selector, so it cannot be at version {expected}"
-                    )));
-                }
-            }
+            check_guards_absent(&guards, "no Concept matches this selector")?;
             if selector.0 == "id" {
                 return Err(KipError::not_found_or_not_visible(format!(
                     "{selector_value} does not exist, and an UPSERT by id cannot mint an id the \
@@ -1185,7 +1234,7 @@ async fn upsert_concept(
             };
             let element = Element::Concept(Box::new(row));
             tx.authorize_created(&element, Permission::Create)?;
-            tx.stage_new(id, element, "create");
+            tx.stage_new(id, element, ChangeOp::Create);
             id
         }
     };
@@ -1294,9 +1343,9 @@ async fn apply_concept_assignments(
     }
 
     // A no-effect final state changes nothing: no version bump, no change
-    // record, no receipt claiming a transition that did not happen (§44).
+    // record, no receipt claiming a transition that did not happen (§32.8).
     if changed {
-        tx.mark_changed(id, "update");
+        tx.mark_changed(id, ChangeOp::Update);
     }
     Ok(())
 }
@@ -1313,9 +1362,9 @@ async fn update_elements(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let targets = {
+    let (targets, guards) = {
         let b = bindings(tx, request, operation);
-        select::targets(
+        let targets = select::targets(
             store,
             tx,
             "UPDATE",
@@ -1325,17 +1374,12 @@ async fn update_elements(
             clause.limit.as_ref(),
             &b,
         )
-        .await?
+        .await?;
+        (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
     };
 
     for id in targets.authorized(tx).await? {
-        if let Some(expected) = &clause.expect_version {
-            let expected = {
-                let b = bindings(tx, request, operation);
-                b.scalar_u64(expected, "EXPECT VERSION")?
-            };
-            tx.expect_version(id, expected).await?;
-        }
+        tx.expect_versions(id, &guards).await?;
 
         // Every action of one UPDATE reads the element as it was when the
         // statement began: two actions on the same Facet member must not
@@ -1355,70 +1399,482 @@ async fn update_elements(
             check_structural(store, tx, id).await?;
         }
         if changed {
-            tx.mark_changed(id, "update");
+            tx.mark_changed(id, ChangeOp::Update);
         }
     }
     Ok(())
 }
 
-async fn retract(
+/// `TRANSITION <target> TO "<state>" [BY <ref>] [SET FIELDS {...}]
+/// [SET STRUCTURAL {...}] [WHERE {...}] [LIMIT :n] {EXPECT VERSION ...}` — the
+/// one lifecycle statement (§52.5).
+///
+/// The quoted state names the move, and the engine validates it against the
+/// target's kind and its current lifecycle state (§35.3): an Assertion moved
+/// to `running` and a Concept moved to `retracted` are refused as
+/// `InvalidLifecycleTransition`, a move to the state already held is a
+/// `no_effect`, and there is no `EXPECT STATE` because the executor already
+/// checks what one would restate.
+///
+/// A literal state was classified before it got here: the parser checked the
+/// vocabulary, `BY` and the finalizing clauses (§52.5), and the gate asked for
+/// the state's permission at Space scope. A `:parameter` state arrives
+/// unclassified, so the same rules are applied at execution, and every target
+/// is authorized individually with the permission the bound state names —
+/// which is the check that decides in either case.
+async fn transition(
     store: &Store,
     tx: &mut Transaction,
-    clause: &RetractAssertion,
+    clause: &Transition,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let targets = {
+    let (targets, guards, state, by, set_fields) = {
         let b = bindings(tx, request, operation);
-        select::targets(
+        let state = b.scalar_str(&clause.to, "TRANSITION ... TO")?;
+        if clause.state().is_none() {
+            // The three rules the parser applies to a literal state, applied
+            // here to a bound one (§52.5).
+            check_registry(&state, "TRANSITION ... TO", transition_state::ALL)?;
+            let names_replacement = transition_state::WITH_BY.contains(&state.as_str());
+            if clause.by.is_some() != names_replacement {
+                return Err(KipError::invalid_syntax(if names_replacement {
+                    format!(
+                        "TRANSITION ... TO {state:?} names the replacing element with BY (§52.5)"
+                    )
+                } else {
+                    format!(
+                        "TRANSITION ... TO {state:?} takes no BY: only superseded and corrected \
+                         name a replacement (§52.5)"
+                    )
+                }));
+            }
+            if clause.finalizes() && !transition_state::ACTIVITY.contains(&state.as_str()) {
+                return Err(KipError::invalid_syntax(format!(
+                    "SET FIELDS and SET STRUCTURAL finalize an Activity; TRANSITION ... TO \
+                     {state:?} carries neither (§52.5)"
+                )));
+            }
+        }
+        let permission = element_permission(&state).ok_or_else(|| {
+            KipError::constraint_violation(format!("{state:?} is not a lifecycle state (§52.5)"))
+        })?;
+        let targets = select::targets(
             store,
             tx,
-            "RETRACT ASSERTION",
-            Permission::RetractOwn,
+            "TRANSITION",
+            permission,
             &clause.target,
             clause.where_clauses.as_ref(),
             clause.limit.as_ref(),
             &b,
         )
-        .await?
-    };
-    let expect_state = {
-        let b = bindings(tx, request, operation);
-        clause
-            .expect_state
+        .await?;
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+        let by = match &clause.by {
+            Some(reference) => Some(b.element_ref(reference)?),
+            None => None,
+        };
+        let set_fields = clause
+            .set_fields
             .as_ref()
-            .map(|s| b.scalar_str(s, "EXPECT STATE"))
-            .transpose()?
+            .map(|fields| assignments_to_json(&b, fields, None))
+            .transpose()?;
+        (targets, guards, state, by, set_fields)
     };
-    let at = tx.cx.at.clone();
+    // Correcting Evidence writes the new record as well as linking it, so it
+    // costs `create` on top of the per-element `maintain` (§57.2).
+    if state == transition_state::CORRECTED {
+        tx.require(Permission::Create)?;
+    }
 
     for id in targets.authorized(tx).await? {
-        if let Some(expected) = &expect_state {
-            tx.expect_assertion_status(id, expected).await?;
-        }
-        require_representation(tx, id, "RETRACT ASSERTION").await?;
-        let row = assertion_mut(tx, id).await?;
-        // Spec §41.1: retraction is not deletion. The Assertion goes on
-        // existing, so the record of what was once believed — and by whom —
-        // survives.
-        if row.status == "retracted" {
-            continue;
-        }
-        row.status = "retracted".to_string();
-        row.retracted_at = at.clone();
-        tx.mark_changed(id, "retract");
+        tx.expect_versions(id, &guards).await?;
+        move_element(
+            store,
+            tx,
+            id,
+            &state,
+            by,
+            set_fields.as_ref(),
+            clause.set_structural.as_ref(),
+            request,
+            operation,
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// Refuses to record a withdrawal the caller has no standing to make (§68).
+/// The permission each target of a `TRANSITION` is authorized with (§52.5).
+fn element_permission(state: &str) -> Option<Permission> {
+    Some(match state {
+        transition_state::RETRACTED => Permission::RetractOwn,
+        transition_state::SUPERSEDED => Permission::SupersedeOwn,
+        transition_state::CORRECTED => Permission::Maintain,
+        transition_state::RUNNING
+        | transition_state::COMPLETED
+        | transition_state::FAILED
+        | transition_state::CANCELLED => Permission::Update,
+        transition_state::ARCHIVED => Permission::Archive,
+        transition_state::TOMBSTONED => Permission::Tombstone,
+        _ => return None,
+    })
+}
+
+/// Moves one element to one lifecycle state (§52.5, §57.2–§57.4, §60).
+///
+/// The legality table, by state and current lifecycle word:
+///
+/// ```text
+/// retracted     Assertion   from active
+/// superseded    Assertion   from active, BY an Assertion about the same Proposition
+/// corrected     Evidence    from active, BY new Evidence
+/// running       Activity    from pending
+/// completed |   Activity    from pending or running; from a terminal state the
+/// failed |                  refusal is ActivityTerminal, because the provenance
+/// cancelled                 topology is frozen (§16.6)
+/// archived      any         from active (engine state)
+/// tombstoned    any         from active or archived (engine state)
+/// ```
+///
+/// A move to the state already held returns without staging anything, so the
+/// transaction reports `no_effect` for it (§32.8).
+#[allow(clippy::too_many_arguments)]
+async fn move_element(
+    store: &Store,
+    tx: &mut Transaction,
+    id: ElementId,
+    state: &str,
+    by: Option<ElementId>,
+    set_fields: Option<&Map<String, Json>>,
+    set_structural: Option<&Vec<anda_kip::StructuralEdge>>,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    use transition_state as ts;
+
+    let (kind, current, engine_state) = {
+        let element = tx.load(id).await?;
+        (
+            element.kind(),
+            planes::lifecycle_state(element),
+            element.state().to_string(),
+        )
+    };
+    let refuse = |from: &str| {
+        KipError::invalid_lifecycle_transition_from(
+            from,
+            state,
+            format!("{id} is {from:?}, and a {kind} cannot move from there to {state:?} (§52.5)"),
+        )
+    };
+    let fits = match state {
+        ts::RETRACTED | ts::SUPERSEDED => kind == ElementKind::Assertion,
+        ts::CORRECTED => kind == ElementKind::Evidence,
+        ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => kind == ElementKind::Activity,
+        ts::ARCHIVED | ts::TOMBSTONED => true,
+        _ => false,
+    };
+    if !fits {
+        return Err(refuse(&current));
+    }
+
+    match state {
+        ts::ARCHIVED | ts::TOMBSTONED => {
+            if engine_state == state {
+                return Ok(());
+            }
+            let legal = engine_state == state::ACTIVE
+                || (state == ts::TOMBSTONED && engine_state == state::ARCHIVED);
+            if !legal {
+                return Err(refuse(&current));
+            }
+            // §14.1, §29: administratively excluding somebody else's claim is
+            // a different act from tidying one's own, and only the first is
+            // moderation. Asked for on top of `archive`/`tombstone`, never
+            // instead of it, so a Grant listing only `moderate_assertion`
+            // confers nothing.
+            if let Element::Assertion(row) = tx.load(id).await? {
+                let row = row.clone();
+                if !tx.may_represent_assertion(&row) {
+                    tx.require(Permission::ModerateAssertion)?;
+                }
+            }
+            // Neither archive nor tombstone erases anything: references keep
+            // resolving (§60.1, §60.2), which is what stops a removal from
+            // silently breaking every Assertion that cited the element.
+            set_state(tx.load(id).await?, state);
+            tx.mark_changed(id, ChangeOp::Lifecycle);
+        }
+        ts::RETRACTED => {
+            if current == ts::RETRACTED {
+                return Ok(());
+            }
+            if current != state::ACTIVE {
+                return Err(refuse(&current));
+            }
+            require_representation(tx, id, "TRANSITION ... TO \"retracted\"").await?;
+            // §57.3: retraction preserves the historical payload. The
+            // Assertion goes on existing, so the record of what was once
+            // believed — and by whom — survives.
+            let at = tx.cx.at.clone();
+            let row = assertion_mut(tx, id).await?;
+            row.status = ts::RETRACTED.to_string();
+            row.retracted_at = at;
+            tx.mark_changed(id, ChangeOp::Lifecycle);
+        }
+        ts::SUPERSEDED => {
+            let new = by.ok_or_else(|| {
+                KipError::invalid_syntax(
+                    "TRANSITION ... TO \"superseded\" names the newer Assertion with BY",
+                )
+            })?;
+            // §52.5 makes the current lifecycle state the first thing the
+            // engine validates: from `retracted` no replacement is legal, so
+            // the answer is `InvalidLifecycleTransition` whatever BY names.
+            // Checking the operand first would report a mismatch between two
+            // Assertions when the move was never available in the first place.
+            //
+            // `no_effect` only when this very supersession is already
+            // recorded. Superseded by *another* Assertion is a second revision
+            // and `superseded` is not a state one is legal from (§57.4);
+            // answering `no_effect` there would tell the caller its lineage was
+            // recorded when nothing was written.
+            if current == ts::SUPERSEDED {
+                let already = assertion_mut(tx, id)
+                    .await?
+                    .superseded_by
+                    .contains(&new.to_string());
+                if already {
+                    return Ok(());
+                }
+            }
+            if current != state::ACTIVE {
+                return Err(refuse(&current));
+            }
+            if new == id {
+                return Err(KipError::new(
+                    KipErrorCode::SupersessionMismatch,
+                    "an Assertion cannot supersede itself",
+                ));
+            }
+            tx.authorize_element(new, Permission::SupersedeOwn).await?;
+            require_representation(tx, id, "TRANSITION ... TO \"superseded\"").await?;
+
+            // Supersession is belief revision within one lineage, so the
+            // replacement must be about the same Proposition. Two claims
+            // about different tuples are a contradiction, and a contradiction
+            // is not a supersession (§57.4).
+            let proposition = assertion_mut(tx, id).await?.proposition_id.clone();
+            let new_row = assertion_mut(tx, new).await?;
+            if new_row.proposition_id != proposition {
+                return Err(KipError::new(
+                    KipErrorCode::SupersessionMismatch,
+                    format!(
+                        "{new} is about {}, not about {proposition}",
+                        new_row.proposition_id
+                    ),
+                ));
+            }
+            if !new_row.supersedes.contains(&id.to_string()) {
+                new_row.supersedes.push(id.to_string());
+                tx.mark_changed(new, ChangeOp::Update);
+            }
+            let old_row = assertion_mut(tx, id).await?;
+            old_row.status = ts::SUPERSEDED.to_string();
+            if !old_row.superseded_by.contains(&new.to_string()) {
+                old_row.superseded_by.push(new.to_string());
+            }
+            tx.mark_changed(id, ChangeOp::Lifecycle);
+        }
+        ts::CORRECTED => {
+            let new = by.ok_or_else(|| {
+                KipError::invalid_syntax(
+                    "TRANSITION ... TO \"corrected\" names the new Evidence with BY",
+                )
+            })?;
+            // The move is judged before the operand, as supersession judges
+            // it, and by the same rule: already corrected by this very record
+            // is `no_effect`, corrected by another is a second correction and
+            // `corrected` is not a state one is legal from (§57.2).
+            if current == ts::CORRECTED {
+                let already = evidence_mut(tx, id)
+                    .await?
+                    .corrected_by
+                    .contains(&new.to_string());
+                if already {
+                    return Ok(());
+                }
+            }
+            if current != state::ACTIVE {
+                return Err(refuse(&current));
+            }
+            if new == id {
+                return Err(KipError::new(
+                    KipErrorCode::EvidenceCorrectionConflict,
+                    "an Evidence record cannot correct itself",
+                ));
+            }
+            tx.authorize_element(new, Permission::Maintain).await?;
+            // §57.2: wrong Evidence is corrected, never rewritten. The
+            // original observation stays exactly as observed, because what a
+            // source said is a historical fact even when it was wrong.
+            let new_row = evidence_mut(tx, new).await?;
+            if !new_row.corrects.contains(&id.to_string()) {
+                new_row.corrects.push(id.to_string());
+                tx.mark_changed(new, ChangeOp::Update);
+            }
+            let old_row = evidence_mut(tx, id).await?;
+            old_row.status = ts::CORRECTED.to_string();
+            if !old_row.corrected_by.contains(&new.to_string()) {
+                old_row.corrected_by.push(new.to_string());
+            }
+            tx.mark_changed(id, ChangeOp::Lifecycle);
+        }
+        ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => {
+            if current == state {
+                return Ok(());
+            }
+            // §16.6: a terminal Activity's provenance topology is immutable.
+            // Once it has ended, what it consumed and produced is a
+            // historical record.
+            if is_terminal(&current) {
+                return Err(KipError::activity_terminal(format!(
+                    "{id} is already {current:?}; a finished Activity's provenance is immutable"
+                )));
+            }
+            if engine_state != state::ACTIVE {
+                return Err(refuse(&current));
+            }
+            let legal = match state {
+                ts::RUNNING => current == "pending",
+                _ => current == "pending" || current == ts::RUNNING,
+            };
+            if !legal {
+                return Err(refuse(&current));
+            }
+            finalize_activity(
+                store,
+                tx,
+                id,
+                state,
+                set_fields,
+                set_structural,
+                request,
+                operation,
+            )
+            .await?;
+            tx.mark_changed(id, ChangeOp::Lifecycle);
+        }
+        _ => return Err(refuse(&current)),
+    }
+    Ok(())
+}
+
+/// Moves an Activity's status, finalizing the fields and topology the same
+/// statement carries (§52.5, §16.6).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_activity(
+    store: &Store,
+    tx: &mut Transaction,
+    id: ElementId,
+    state: &str,
+    set_fields: Option<&Map<String, Json>>,
+    set_structural: Option<&Vec<anda_kip::StructuralEdge>>,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    let mut fields = Fields(set_fields.cloned().unwrap_or_default());
+    let started = fields.timestamp("started_at")?;
+    let ended = fields.timestamp("ended_at")?;
+    let parameters_digest = fields.text("parameters_digest")?;
+    refuse_protected_fields(&fields)?;
+    fields.rest("Activity")?;
+
+    let structural = match set_structural {
+        Some(edges) => {
+            let mut structural = {
+                let b = bindings(tx, request, operation);
+                collect_structural(tx, &b, Some(edges), core_fields(ElementKind::Activity))?
+            };
+            // §11.3: a reference added now resolves through whatever merges
+            // the Space has already declared.
+            structural.canonicalize(tx).await?;
+            Some(structural)
+        }
+        None => None,
+    };
+
+    let at = tx.cx.at.clone();
+    let row = activity_mut(tx, id).await?;
+    if !started.is_empty() {
+        row.started_at = started;
+    }
+    if !parameters_digest.is_empty() {
+        row.parameters_digest = parameters_digest;
+    }
+    if let Some(mut structural) = structural {
+        // Finalized topology is added to what the Activity already recorded:
+        // an output named twice is one output, and a reference the Activity
+        // already carries is not moved.
+        for (field, refs) in [
+            ("inputs", &mut row.inputs),
+            ("outputs", &mut row.outputs),
+            ("associated_actors", &mut row.associated_actors),
+        ] {
+            for (value, _) in structural.take(field) {
+                let key = endpoint_key(&value);
+                if !refs.iter().any(|held| endpoint_key(held) == key) {
+                    refs.push(value);
+                }
+            }
+        }
+        row.input_keys = row.inputs.iter().map(endpoint_key).collect();
+        row.output_keys = row.outputs.iter().map(endpoint_key).collect();
+        for (field, refs) in structural.profile {
+            let Json::Array(items) = refs else {
+                continue;
+            };
+            let entry = row
+                .structural
+                .entry(field.clone())
+                .or_insert_with(|| Json::Array(Vec::new()));
+            if let Json::Array(held) = entry {
+                for item in items {
+                    update::place_reference(held, item, None, false, &field)?;
+                }
+            }
+        }
+    }
+
+    row.status = state.to_string();
+    if !ended.is_empty() {
+        row.ended_at = ended;
+    } else if is_terminal(state) && row.ended_at.is_empty() {
+        // Terminal outputs freeze with the end time, so a transition that
+        // forgot to give one still records when the freeze happened. Only when
+        // the Activity has none: an `ended_at` the caller already recorded is
+        // an observed instant, and replacing it with the commit time would
+        // lose the observation to a clock the caller never asked about.
+        row.ended_at = at;
+    }
+    if set_structural.is_some() {
+        check_structural(store, tx, id).await?;
+    }
+    Ok(())
+}
+
+/// Refuses to record a withdrawal the caller has no standing to make (§14.1,
+/// §57.3).
 ///
 /// Retraction and supersession both say something about the *source*: that it
 /// took its claim back, or replaced it. A moderator who merely wants the claim
-/// out of recall has `ARCHIVE` and `TOMBSTONE`, which say what they actually
-/// mean. Letting administrative dislike write itself down as the source's own
-/// withdrawal would make the epistemic record report an event that never
-/// happened — and that record is the entire product of this engine.
+/// out of recall has `TRANSITION ... TO "archived"` and `"tombstoned"`, which
+/// say what they actually mean. Letting administrative dislike write itself
+/// down as the source's own withdrawal would make the epistemic record report
+/// an event that never happened — and that record is the entire product of
+/// this engine.
 async fn require_representation(
     tx: &mut Transaction,
     id: ElementId,
@@ -1430,8 +1886,8 @@ async fn require_representation(
     }
     Err(KipError::retraction_not_authorized(format!(
         "{what} records that the source withdrew this claim, and this Principal neither wrote \
-         {id} nor holds an ActorBinding representing {}. ARCHIVE or TOMBSTONE removes it from \
-         recall without claiming a withdrawal that did not happen",
+         {id} nor holds an ActorBinding representing {}. TRANSITION ... TO \"archived\" or \
+         \"tombstoned\" removes it from recall without claiming a withdrawal that did not happen",
         if row.asserted_by_key.is_empty() {
             "its author"
         } else {
@@ -1440,166 +1896,69 @@ async fn require_representation(
     )))
 }
 
-async fn supersede(
-    tx: &mut Transaction,
-    clause: &SupersedeAssertion,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let old = b.element_ref(&clause.target)?;
-    let new = b.element_ref(&clause.by)?;
-    let expect_state = clause
-        .expect_state
-        .as_ref()
-        .map(|s| b.scalar_str(s, "EXPECT STATE"))
-        .transpose()?;
-    if old == new {
-        return Err(KipError::new(
-            anda_kip::KipErrorCode::SupersessionMismatch,
-            "an Assertion cannot supersede itself",
-        ));
+/// Resolves a statement's trailing `EXPECT VERSION` guards (§35.1, §52.8).
+///
+/// A guard without a plane compares the element's `_system.version`; one with
+/// a plane compares that plane's own counter. A Facet plane is resolved to its
+/// exact symbol here, and the refusal a mismatch produces names the local
+/// name the guard was written with.
+pub(super) fn resolve_guards(
+    tx: &Transaction,
+    b: &Bindings<'_>,
+    guards: &[ExpectVersion],
+) -> Result<Vec<Guard>, KipError> {
+    let mut out = Vec::with_capacity(guards.len());
+    for guard in guards {
+        let version = b.scalar_u64(&guard.version, "EXPECT VERSION")?;
+        let plane = match &guard.plane {
+            None => PlaneKey::Element,
+            Some(VersionPlane::Attributes) => PlaneKey::Attributes,
+            Some(VersionPlane::Structural) => PlaneKey::Structural,
+            Some(VersionPlane::Retention) => PlaneKey::Retention,
+            Some(VersionPlane::Facet(symbol)) => {
+                let name = symbol_name(b, symbol)?;
+                let resolved = tx
+                    .env
+                    .resolve_symbol(SymbolKind::Facet, &name, Intent::Read)?;
+                // The local name, which is the lineage's key (§20.14): the
+                // counter a Facet accumulated under an earlier version of its
+                // package is the same counter after an upgrade.
+                PlaneKey::Facet {
+                    local: resolved.name.clone(),
+                }
+            }
+        };
+        out.push(Guard { version, plane });
     }
-    if let Some(expected) = expect_state {
-        tx.expect_assertion_status(old, &expected).await?;
-    }
-    tx.authorize_element(old, Permission::SupersedeOwn).await?;
-    tx.authorize_element(new, Permission::SupersedeOwn).await?;
-    require_representation(tx, old, "SUPERSEDE ASSERTION").await?;
+    Ok(out)
+}
 
-    let old_row = assertion_mut(tx, old).await?;
-    let proposition = old_row.proposition_id.clone();
-    old_row.status = "superseded".to_string();
-    if !old_row.superseded_by.contains(&new.to_string()) {
-        old_row.superseded_by.push(new.to_string());
-    }
-    tx.mark_changed(old, "supersede");
-
-    let new_row = assertion_mut(tx, new).await?;
-    // Supersession is belief revision within one lineage, so the replacement
-    // must be about the same Proposition. Two claims about different tuples
-    // are a contradiction, and a contradiction is not a supersession (§31 of
-    // the Epistemic Model).
-    if new_row.proposition_id != proposition {
-        return Err(KipError::new(
-            anda_kip::KipErrorCode::SupersessionMismatch,
-            format!(
-                "{new} is about {}, not about {proposition}",
-                new_row.proposition_id
+/// Checks a statement's guards against an element that does not exist (§35.2).
+///
+/// Every counter of an absent element is 0, so the bare `EXPECT VERSION 0` —
+/// the create-only guard — passes, and so does a plane guard at 0, which says
+/// the plane has never been written. Anything else names a version the
+/// element cannot be at.
+fn check_guards_absent(guards: &[Guard], why: &str) -> Result<(), KipError> {
+    for guard in guards {
+        if guard.version == 0 {
+            continue;
+        }
+        return Err(match &guard.plane {
+            PlaneKey::Element => KipError::version_conflict(format!(
+                "{why}, so it cannot be at version {}",
+                guard.version
+            )),
+            plane => KipError::version_conflict_on_plane(
+                &plane.name(),
+                format!(
+                    "{why}, so its {} plane cannot be at version {}",
+                    plane.name(),
+                    guard.version
+                ),
             ),
-        ));
+        });
     }
-    if !new_row.supersedes.contains(&old.to_string()) {
-        new_row.supersedes.push(old.to_string());
-        tx.mark_changed(new, "supersede");
-    }
-    Ok(())
-}
-
-async fn correct_evidence(
-    tx: &mut Transaction,
-    clause: &CorrectEvidence,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let old = b.element_ref(&clause.target)?;
-    let new = b.element_ref(&clause.by)?;
-    if old == new {
-        return Err(KipError::new(
-            anda_kip::KipErrorCode::EvidenceCorrectionConflict,
-            "an Evidence record cannot correct itself",
-        ));
-    }
-
-    tx.authorize_element(old, Permission::Maintain).await?;
-    tx.authorize_element(new, Permission::Maintain).await?;
-
-    // Spec §70: wrong Evidence is corrected, never rewritten. The original
-    // observation stays exactly as observed, because what a source said is a
-    // historical fact even when it was wrong.
-    let old_row = evidence_mut(tx, old).await?;
-    old_row.status = "corrected".to_string();
-    if !old_row.corrected_by.contains(&new.to_string()) {
-        old_row.corrected_by.push(new.to_string());
-    }
-    tx.mark_changed(old, "correct");
-
-    let new_row = evidence_mut(tx, new).await?;
-    if !new_row.corrects.contains(&old.to_string()) {
-        new_row.corrects.push(old.to_string());
-        tx.mark_changed(new, "correct");
-    }
-    Ok(())
-}
-
-async fn transition(
-    tx: &mut Transaction,
-    clause: &TransitionActivity,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let id = b.element_ref(&clause.target)?;
-    let to = b.scalar_str(&clause.to, "TRANSITION ACTIVITY ... TO")?;
-    let expect_state = clause
-        .expect_state
-        .as_ref()
-        .map(|s| b.scalar_str(s, "EXPECT STATE"))
-        .transpose()?;
-    let set_fields = clause
-        .set_fields
-        .as_ref()
-        .map(|f| assignments_to_json(&b, f, None))
-        .transpose()?
-        .unwrap_or_default();
-    let at = tx.cx.at.clone();
-
-    let element = tx.load(id).await?;
-    let Element::Activity(_) = element else {
-        return Err(KipError::structural_reference_invalid(format!(
-            "{id} is not an Activity"
-        )));
-    };
-    tx.authorize_element(id, Permission::Update).await?;
-    let Element::Activity(row) = tx.load(id).await? else {
-        unreachable!("just checked");
-    };
-    if let Some(expected) = expect_state
-        && row.status != expected
-    {
-        return Err(KipError::precondition_failed(format!(
-            "{id} is {:?}, not the expected {expected:?}",
-            row.status
-        )));
-    }
-    // Spec §93: a terminal Activity's provenance topology is immutable. Once
-    // it has ended, what it consumed and produced is a historical record.
-    if is_terminal(&row.status) {
-        return Err(KipError::activity_terminal(format!(
-            "{id} is already {:?}; a completed Activity's provenance is immutable",
-            row.status
-        )));
-    }
-
-    let mut fields = Fields(set_fields);
-    let outputs = fields.array("outputs")?;
-    if !outputs.is_empty() {
-        row.output_keys = outputs.iter().map(endpoint_key).collect();
-        row.outputs = outputs;
-    }
-    let ended = fields.timestamp("ended_at")?;
-    fields.rest("Activity")?;
-
-    row.status = to.clone();
-    if is_terminal(&to) {
-        // Terminal outputs freeze with the end time, so a transition that
-        // forgot to give one still records when the freeze happened.
-        row.ended_at = if ended.is_empty() { at } else { ended };
-    } else if !ended.is_empty() {
-        row.ended_at = ended;
-    }
-    tx.mark_changed(id, "transition");
     Ok(())
 }
 
@@ -1610,7 +1969,7 @@ async fn set_retention(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let (targets, values, expected) = {
+    let (targets, values, guards) = {
         let b = bindings(tx, request, operation);
         let targets = select::targets(
             store,
@@ -1624,12 +1983,8 @@ async fn set_retention(
         )
         .await?;
         let values = assignments_to_json(&b, &clause.values, None)?;
-        let expected = clause
-            .expect_version
-            .as_ref()
-            .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
-            .transpose()?;
-        (targets, values, expected)
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+        (targets, values, guards)
     };
 
     // Spec §19: retention is storage lifecycle. `expires_at` here is when the
@@ -1639,9 +1994,7 @@ async fn set_retention(
     check_retention(&retention)?;
     let expires = expires_at(&retention)?;
     for id in targets.authorized(tx).await? {
-        if let Some(expected) = expected {
-            tx.expect_version(id, expected).await?;
-        }
+        tx.expect_versions(id, &guards).await?;
         let current = retention_mut(tx.load(id).await?).0.clone();
         // The hold gate needs what is recorded, not only what was written: the
         // block replaces rather than patches, so omitting `legal_hold` lifts one.
@@ -1652,69 +2005,7 @@ async fn set_retention(
         let (slot, slot_expires) = retention_mut(tx.load(id).await?);
         *slot = retention.clone();
         *slot_expires = expires.clone();
-        tx.mark_changed(id, "set_retention");
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn remove(
-    store: &Store,
-    tx: &mut Transaction,
-    clause: &RemovalStatement,
-    to: &str,
-    op: &'static str,
-    permission: Permission,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, expect_state) = {
-        let b = bindings(tx, request, operation);
-        let targets = select::targets(
-            store,
-            tx,
-            op,
-            permission,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
-            &b,
-        )
-        .await?;
-        let expect_state = clause
-            .expect_state
-            .as_ref()
-            .map(|s| b.scalar_str(s, "EXPECT STATE"))
-            .transpose()?;
-        (targets, expect_state)
-    };
-
-    for id in targets.authorized(tx).await? {
-        if let Some(expected) = &expect_state {
-            tx.expect_state(id, expected).await?;
-        }
-
-        // §29: administratively excluding somebody else's claim is a
-        // different act from tidying one's own, and only the first is
-        // moderation. Asked for on top of `archive`/`tombstone`, never
-        // instead of it, so a Grant listing only `moderate_assertion` confers
-        // nothing.
-        if let Element::Assertion(row) = tx.load(id).await? {
-            let row = row.clone();
-            if !tx.may_represent_assertion(&row) {
-                tx.require(Permission::ModerateAssertion)?;
-            }
-        }
-
-        // Neither archive nor tombstone erases anything: references keep
-        // resolving (§93.33), which is what stops a removal from silently
-        // breaking every Assertion that cited the element.
-        let element = tx.load(id).await?;
-        if element.state() == to {
-            continue;
-        }
-        set_state(element, to);
-        tx.mark_changed(id, op);
+        tx.mark_changed(id, ChangeOp::Retention);
     }
     Ok(())
 }
@@ -1734,7 +2025,7 @@ async fn merge_concept(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let (source, target, expected) = {
+    let (source, target, guards) = {
         let b = bindings(tx, request, operation);
         // MERGE takes no LIMIT: its operands are named, and the block only
         // guards them (§52.7). Each side must therefore resolve to exactly one
@@ -1760,12 +2051,8 @@ async fn merge_concept(
             &b,
         )
         .await?;
-        let expected = clause
-            .expect_version
-            .as_ref()
-            .map(|scalar| b.scalar_u64(scalar, "EXPECT VERSION"))
-            .transpose()?;
-        (source, target, expected)
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+        (source, target, guards)
     };
     let source = match source {
         Some(targets) => targets.authorized(tx).await?.into_iter().next(),
@@ -1791,9 +2078,9 @@ async fn merge_concept(
             "MERGE CONCEPT consolidates Concepts; other element kinds have no merged identity",
         ));
     }
-    if let Some(expected) = expected {
-        tx.expect_version(source, expected).await?;
-    }
+    // The guards apply to the source, the Concept whose identity the statement
+    // moves.
+    tx.expect_versions(source, &guards).await?;
 
     // §11.1: canonical resolution follows `merged_into` to its fixpoint, so a
     // cycle would make that walk run forever. The check is on the target's
@@ -1833,7 +2120,7 @@ async fn merge_concept(
     // of ordinary recall"; merged additionally means "this identity is now
     // that one", which is what a reader needs in order to follow the pointer.
     row.state = state::MERGED.to_string();
-    tx.mark_changed(source, "merge");
+    tx.mark_changed(source, ChangeOp::Merge);
     Ok(())
 }
 
@@ -1968,8 +2255,8 @@ async fn canonical_chain(
 ///
 /// The set is the Core Package's, not this engine's (§20.13). Inventing a
 /// terminal state locally is how the two reference engines came to disagree
-/// about whether `TRANSITION ACTIVITY ... TO "cancelled"` froze anything —
-/// each had a plausible extra word and neither had the registry.
+/// about whether `TRANSITION ... TO "cancelled"` froze anything — each had a
+/// plausible extra word and neither had the registry.
 fn is_terminal(status: &str) -> bool {
     anda_kip::ACTIVITY_TERMINAL.contains(&status)
 }
@@ -2261,6 +2548,15 @@ async fn evidence_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut Eviden
     }
 }
 
+async fn activity_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut ActivityRow, KipError> {
+    match tx.load(id).await? {
+        Element::Activity(row) => Ok(row),
+        _ => Err(KipError::structural_reference_invalid(format!(
+            "{id} is not an Activity"
+        ))),
+    }
+}
+
 /// What the Schema Environment needs to know about one endpoint.
 /// Validates one element's Profile structural fields against their
 /// declarations (§62–§66).
@@ -2329,6 +2625,7 @@ async fn facts_for(
     Ok(match endpoint {
         Endpoint::Literal(literal) => EndpointFacts::Literal {
             datatype: literal.datatype.clone(),
+            value: literal.value.clone(),
         },
         Endpoint::Local(id) => {
             // A staged element is the authority: within a transaction a

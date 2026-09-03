@@ -75,6 +75,10 @@ pub struct ConceptRow {
     pub state: String,
     /// `_system.version` — the target of `EXPECT VERSION`.
     pub version: u64,
+    /// `_system.plane_versions` — one counter per version plane (§6.3), the
+    /// target of `EXPECT VERSION ... OF`. Stored as the wire shape of
+    /// [`anda_kip::PlaneVersions`]; `null` decodes as every counter at zero.
+    pub plane_versions: Json,
     /// `_system.space_seq` of the last state change; the `CHANGES` cursor.
     pub seq: u64,
     /// `_system.created_at`.
@@ -137,6 +141,8 @@ pub struct PropositionRow {
     pub state: String,
     /// `_system.version`.
     pub version: u64,
+    /// `_system.plane_versions` (§6.3); see [`ConceptRow::plane_versions`].
+    pub plane_versions: Json,
     /// `_system.space_seq` of the last state change.
     pub seq: u64,
     /// `_system.created_at`.
@@ -194,6 +200,8 @@ pub struct AssertionRow {
     pub state: String,
     /// `_system.version`.
     pub version: u64,
+    /// `_system.plane_versions` (§6.3); see [`ConceptRow::plane_versions`].
+    pub plane_versions: Json,
     /// `_system.space_seq` of the last state change.
     pub seq: u64,
     /// `_system.created_at`.
@@ -275,6 +283,8 @@ pub struct EvidenceRow {
     pub state: String,
     /// `_system.version`.
     pub version: u64,
+    /// `_system.plane_versions` (§6.3); see [`ConceptRow::plane_versions`].
+    pub plane_versions: Json,
     /// `_system.space_seq` of the last state change.
     pub seq: u64,
     /// `_system.created_at`.
@@ -344,6 +354,8 @@ pub struct ActivityRow {
     pub state: String,
     /// `_system.version`.
     pub version: u64,
+    /// `_system.plane_versions` (§6.3); see [`ConceptRow::plane_versions`].
+    pub plane_versions: Json,
     /// `_system.space_seq` of the last state change.
     pub seq: u64,
     /// `_system.created_at`.
@@ -608,4 +620,15 @@ pub struct TransactionRow {
     pub changes: Vec<Json>,
     /// The changed elements' ids, for `HISTORY ELEMENT`.
     pub changed_ids: Vec<String>,
+    /// The Receipt `origin` this commit was attributed to (§33.2): the
+    /// Principal, the ActorBinding it exercised and the digest of the
+    /// delegation chain it acted under.
+    ///
+    /// Journalled rather than recomputed, because a resend replays the
+    /// Receipt the first attempt produced (§80.4). Rebuilding it from the
+    /// caller who happened to ask would attribute the original commit to
+    /// whoever resent it, and dropping it would change `receipt_digest` — so
+    /// the replayed Receipt would no longer be the one that was signed
+    /// (§33.3).
+    pub origin: Json,
 }

@@ -22,10 +22,13 @@
  *
  * ## A name is here only when a gate asks for it
  *
- * The maintenance contract, and the reason `derive`, `share` and `manage_trust`
- * are absent: this engine distinguishes no derived write, exposes no controlled
- * cross-Space view, and versions no trust policy, so nothing would ever ask for
- * them. Registering them anyway would fail in exactly the way an unrecognized
+ * The maintenance contract, and the reason `derive`, `share`, `manage_trust`
+ * and `approve` are absent: this engine distinguishes no derived write,
+ * exposes no controlled cross-Space view, versions no trust policy, and
+ * records approvals under `approve_high_risk`, so nothing would ever ask for
+ * them. `record_outcome` (§29.8) and `manage_legal_hold` (§29.9) are present
+ * because a gate asks for each: the consequence channel's writes, and the
+ * retention hook's `legal_hold` member. Registering them anyway would fail in exactly the way an unrecognized
  * name is rejected to prevent — a Grant that looks like authority and is not —
  * except worse, because it would be *accepted*, and §29.6 makes refusing it a
  * MUST for that reason.
@@ -129,6 +132,11 @@ export const PERMISSIONS = {
     family: 'cognitive_mutation',
     description: 'change mutable, non-protected fields of an existing element',
   },
+  record_outcome: {
+    family: 'cognitive_mutation',
+    description:
+      'create outcome-class Evidence and the observation Activity that links an outcome to the decision it grades (§29.8)',
+  },
 
   // Epistemic mutation (§63–§70)
   assert: {
@@ -207,9 +215,9 @@ export const PERMISSIONS = {
     family: 'lifecycle',
     description: 'set or change how long an element is retained',
   },
-  legal_hold: {
+  manage_legal_hold: {
     family: 'lifecycle',
-    description: 'place or lift a hold that blocks erasure',
+    description: 'set or lift retention.legal_hold, the hold that blocks erasure for everyone (§29.9)',
   },
   purge: {
     family: 'lifecycle',
@@ -325,6 +333,6 @@ export function isAlwaysAudited(permission: Permission): boolean {
     permission === 'import' ||
     permission === 'export' ||
     permission === 'purge' ||
-    permission === 'legal_hold'
+    permission === 'manage_legal_hold'
   )
 }

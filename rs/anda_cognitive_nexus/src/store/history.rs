@@ -22,7 +22,7 @@
 
 use anda_db::query::{Filter, RangeQuery};
 use anda_db_schema::Fv;
-use anda_kip::{ElementKind, Json, KipError, KipErrorCode};
+use anda_kip::{ElementKind, Json, KipError};
 use std::collections::BTreeMap;
 
 use super::rows::*;
@@ -228,30 +228,44 @@ impl Store {
         latest.into_values().map(decode).collect()
     }
 
-    /// Resolves `AS OF TX :tx` to the Space sequence that transaction produced.
-    pub async fn seq_of_transaction(&self, space_id: &str, tx_id: &str) -> Result<u64, KipError> {
-        let row = self.find_transaction(tx_id).await?.ok_or_else(|| {
-            KipError::new(
-                KipErrorCode::TransactionUnknown,
-                format!("this Nexus has no transaction {tx_id:?} to read as of"),
-            )
-        })?;
-        if row.space != space_id {
-            return Err(KipError::new(
-                KipErrorCode::TransactionUnknown,
-                format!("{tx_id:?} committed in another Space, so it names no coordinate here"),
-            ));
+    /// The transaction that produced one Space sequence, when the journal
+    /// holds it.
+    ///
+    /// Sequence 0 is "nothing has happened here yet" and names no transaction;
+    /// a sequence allocated by a run that never journalled — an aborted
+    /// statement burns its number — names none either.
+    pub async fn transaction_at_seq(
+        &self,
+        space_id: &str,
+        seq: u64,
+    ) -> Result<Option<TransactionRow>, KipError> {
+        if seq == 0 {
+            return Ok(None);
         }
-        Ok(row.seq)
+        let ids = self
+            .transactions()
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(space_id.to_string())),
+                ("seq", Fv::U64(seq)),
+            ]))
+            .await
+            .map_err(db_error)?;
+        match ids.first() {
+            None => Ok(None),
+            Some(id) => Ok(Some(
+                self.transactions().get_as(*id).await.map_err(db_error)?,
+            )),
+        }
     }
 
-    /// Resolves `AS OF TIME :t` to the last coordinate committed at or before
-    /// it.
+    /// Resolves `DESCRIBE SNAPSHOT AT TIME :t` to the last coordinate
+    /// committed at or before the instant (§68).
     ///
     /// Wall-clock time is not the Space's ordering, so this is a lookup in the
     /// journal rather than arithmetic: the answer is the sequence of the last
     /// transaction that had committed by then, and a time before the first
-    /// commit is coordinate 0 — an empty Space, not an error.
+    /// commit is coordinate 0 — an empty Space, not an error. This engine keeps
+    /// every version, so no instant falls below a retention floor.
     pub async fn seq_at_time(&self, space_id: &str, at: &str) -> Result<u64, KipError> {
         let ids = self
             .transactions()
@@ -368,10 +382,16 @@ impl Coordinate {
     }
 
     /// Reads a token back, refusing one issued for another Space.
+    ///
+    /// A token this engine did not issue for this Space is `CursorInvalid`
+    /// with `family: "snapshot"` and `reason: "malformed"` (§87.7): whether
+    /// the bytes were forged or belong to another Space, they name no
+    /// coordinate here.
     pub fn from_token(token: &str, space_id: &str) -> Result<Self, KipError> {
         let invalid = || {
-            KipError::new(
-                KipErrorCode::CursorInvalidated,
+            KipError::cursor_invalid(
+                "snapshot",
+                "malformed",
                 format!("{token:?} is not a snapshot token this engine issued for this Space"),
             )
         };
@@ -380,8 +400,9 @@ impl Coordinate {
         let rest = text.strip_prefix("kip:snapshot:").ok_or_else(invalid)?;
         let (space, seq) = rest.rsplit_once(':').ok_or_else(invalid)?;
         if space != space_id {
-            return Err(KipError::new(
-                KipErrorCode::CursorInvalidated,
+            return Err(KipError::cursor_invalid(
+                "snapshot",
+                "malformed",
                 format!(
                     "this snapshot token was issued for Space {space:?}; a sequence means \
                      something different in {space_id:?}"
@@ -432,9 +453,11 @@ pub enum CursorFamily {
 }
 
 impl CursorFamily {
-    fn tag(self) -> &'static str {
+    /// The family name §87.7 reports in `details.family`, which is also the
+    /// tag inside the token.
+    pub fn tag(self) -> &'static str {
         match self {
-            CursorFamily::Query => "find",
+            CursorFamily::Query => "kql",
             CursorFamily::Search => "search",
             CursorFamily::List => "list",
             CursorFamily::History => "history",
@@ -459,10 +482,17 @@ impl PageCursor {
 
     /// Reads a token back, refusing one this engine did not issue for this
     /// Space and this operation family.
+    ///
+    /// Every refusal is `CursorInvalid` with `reason: "malformed"` and the
+    /// family this slot expected (§87.7): a forged token, one from another
+    /// Space and one from another operation family all fail to name a page
+    /// of this traversal, and telling them apart would only tell a forger
+    /// which part to fix.
     pub fn from_token(token: &str, space_id: &str, family: CursorFamily) -> Result<Self, KipError> {
         let invalid = || {
-            KipError::new(
-                KipErrorCode::CursorInvalidated,
+            KipError::cursor_invalid(
+                family.tag(),
+                "malformed",
                 format!(
                     "{token:?} is not a {} cursor this engine issued for this Space; a cursor is \
                      opaque and belongs to the traversal that produced it",
@@ -490,11 +520,23 @@ impl PageCursor {
     }
 }
 
-/// The JSON a snapshot answer carries.
-pub fn snapshot_json(space_id: &str, coordinate: Coordinate, schema_version: u64) -> Json {
+/// The snapshot coordinate `DESCRIBE SNAPSHOT` answers with (§68).
+///
+/// The sequence, the transaction that committed it and when, the schema
+/// environment in force, and the token a later read binds to (§78). Sequence
+/// 0 — nothing committed yet — names no transaction and says so with nulls
+/// rather than inventing one.
+pub fn snapshot_json(
+    space_id: &str,
+    coordinate: Coordinate,
+    committed: Option<&TransactionRow>,
+    schema_version: u64,
+) -> Json {
     serde_json::json!({
         "space_id": space_id,
-        "snapshot_seq": coordinate.seq,
+        "space_seq": coordinate.seq,
+        "tx_id": committed.map(|row| row.tx_id.clone()),
+        "committed_at": committed.map(|row| row.committed_at.clone()),
         "schema_environment_version": schema_version,
         "snapshot_token": coordinate.to_token(space_id),
     })

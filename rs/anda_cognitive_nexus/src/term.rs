@@ -6,62 +6,69 @@
 //! Proposition per semantic tuple (§12.5, §93.6) — which is an equality
 //! question the storage layer has to answer, not a matter of taste.
 //!
-//! The two rules that make it deterministic:
+//! The rules that make it deterministic are §9.6's canonical form, applied on
+//! write:
 //!
-//! - a number is equal by *normalized finite value*, so `1`, `1.0` and `1e0`
-//!   are one Literal and not three Propositions (§9.4);
-//! - a language tag is part of Literal identity, so `"苹果"@zh-Hans` and a
-//!   bare `"苹果"` are different Literals (§9.5).
+//! - a string is compared by its Unicode scalar values after NFC
+//!   normalization — no trimming, no case folding — so NFC and NFD spellings
+//!   of one word are one Literal and two strings that differ by a trailing
+//!   space are two;
+//! - a number is equal by *mathematical value*, so `1`, `1.0` and `1e0` are
+//!   one Literal and not three Propositions, and `-0` is `0` (§9.3, §9.6);
+//! - there is no language tag (§9.4): a `language` member is refused as
+//!   `TypeMismatch` rather than accepted and dropped, or accepted and made
+//!   part of identity.
 
 use anda_kip::{Json, KipError, Map, Number};
 use std::fmt::Write as _;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::id::ElementId;
 
-/// The Core datatype of a string Literal.
-pub const DT_STRING: &str = "kip:string";
+/// The Core datatype of a string Literal (§9.2).
+pub const DT_STRING: &str = "string";
 /// The Core datatype of a numeric Literal.
-pub const DT_NUMBER: &str = "kip:number";
+pub const DT_NUMBER: &str = "number";
 /// The Core datatype of a boolean Literal.
-pub const DT_BOOLEAN: &str = "kip:boolean";
+pub const DT_BOOLEAN: &str = "boolean";
 /// The Core datatype of the `null` Literal.
-pub const DT_NULL: &str = "kip:null";
+pub const DT_NULL: &str = "null";
 
 /// A Core Literal (Spec §9.2).
 ///
 /// The payload is restricted to JSON scalar semantics; an array or object is
 /// not a Core Literal, and a structured value that needs semantic identity
-/// belongs in a Concept.
+/// belongs in a Concept. The `datatype` is one of the four baseline names;
+/// a finer value shape — a timestamp, a URI — is a `format` the Predicate
+/// declares (§20.15), validated on write and never part of identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Literal {
-    /// The scalar payload.
+    /// The scalar payload, in canonical form (§9.6).
     pub value: Json,
-    /// The datatype symbol; one of the `DT_*` constants, or a Schema-defined
-    /// refinement such as `kip:datetime`.
+    /// The datatype: one of the `DT_*` constants.
     pub datatype: String,
-    /// The language tag, when language is semantically relevant.
-    pub language: Option<String>,
 }
 
 impl Literal {
-    /// Builds a Literal from a bare JSON scalar, inferring the Core datatype.
+    /// Builds a Literal from a bare JSON scalar, inferring the Core datatype
+    /// and canonicalizing the value (§9.6).
     ///
-    /// This is the "primitive shorthand" of §9.3: the model-facing syntax
+    /// This is the "primitive shorthand" of §9.1: the model-facing syntax
     /// writes `"+08:00"` or `3`, and the canonical internal model still
     /// distinguishes the datatype.
     pub fn from_scalar(value: Json) -> Result<Self, KipError> {
-        let datatype = match &value {
-            Json::String(_) => DT_STRING,
+        let (value, datatype) = match value {
+            Json::String(text) => (Json::String(text.nfc().collect()), DT_STRING),
             Json::Number(n) => {
                 if n.as_f64().is_some_and(|f| !f.is_finite()) {
                     return Err(KipError::type_mismatch(
                         "NaN and Infinity are not valid Core JSON numbers",
                     ));
                 }
-                DT_NUMBER
+                (canonical_number_json(&n), DT_NUMBER)
             }
-            Json::Bool(_) => DT_BOOLEAN,
-            Json::Null => DT_NULL,
+            Json::Bool(flag) => (Json::Bool(flag), DT_BOOLEAN),
+            Json::Null => (Json::Null, DT_NULL),
             Json::Array(_) | Json::Object(_) => {
                 return Err(KipError::type_mismatch(
                     "arrays and objects are not Core Literals; a structured value with its own \
@@ -72,18 +79,40 @@ impl Literal {
         Ok(Self {
             value,
             datatype: datatype.to_string(),
-            language: None,
         })
     }
 
-    /// Reads the explicit `{value, datatype, language}` form.
+    /// Reads the explicit `{value, datatype}` form.
+    ///
+    /// A `language` member is refused (§9.4): the baseline Literal carries no
+    /// tag, and accepting one only to drop it would let a caller believe two
+    /// tagged strings were kept apart. A `datatype` is accepted in the
+    /// baseline spelling or with the `kip:` prefix earlier drafts used, and
+    /// must agree with the value it labels.
     pub fn from_object(map: &Map<String, Json>) -> Result<Self, KipError> {
+        if let Some(language) = map.get("language")
+            && !language.is_null()
+        {
+            return Err(KipError::type_mismatch(
+                "a Literal carries no language tag (§9.4); multilingual text belongs on a \
+                 Concept with per-language attributes or in a schema-defined value object",
+            ));
+        }
         let value = map.get("value").cloned().unwrap_or(Json::Null);
-        let mut literal = Self::from_scalar(value)?;
+        let literal = Self::from_scalar(value)?;
         if let Some(datatype) = map.get("datatype") {
             match datatype {
                 Json::Null => {}
-                Json::String(s) => literal.datatype = s.clone(),
+                Json::String(name) => {
+                    let declared = normalize_datatype(name);
+                    if declared != literal.datatype {
+                        return Err(KipError::type_mismatch(format!(
+                            "a Literal of datatype {declared:?} cannot carry {}; the baseline \
+                             datatypes are string, number, boolean and null (§9.2)",
+                            literal.value
+                        )));
+                    }
+                }
                 _ => {
                     return Err(KipError::type_mismatch(
                         "a Literal datatype must be a symbol string",
@@ -91,52 +120,56 @@ impl Literal {
                 }
             }
         }
-        match map.get("language") {
-            None | Some(Json::Null) => {}
-            Some(Json::String(tag)) => literal.language = Some(tag.clone()),
-            Some(_) => {
-                return Err(KipError::type_mismatch(
-                    "a Literal language must be a language tag string",
-                ));
-            }
-        }
         Ok(literal)
     }
 
     /// The persisted form: always the explicit object, never the shorthand.
     ///
-    /// Storing the shorthand would throw away the datatype the moment a Schema
-    /// refined it — `kip:datetime` would read back as `kip:string`.
+    /// Storing the object keeps a stored endpoint self-describing: a reader
+    /// that meets `{value, datatype}` knows it holds a Literal and never
+    /// mistakes a string that happens to spell an element id for a reference.
     pub fn to_json(&self) -> Json {
         let mut map = Map::new();
         map.insert("value".into(), self.value.clone());
         map.insert("datatype".into(), Json::String(self.datatype.clone()));
-        if let Some(language) = &self.language {
-            map.insert("language".into(), Json::String(language.clone()));
-        }
         Json::Object(map)
     }
 }
 
-/// Canonicalizes a finite JSON number to its normalized value form.
+/// One datatype name in the baseline spelling (§9.2).
 ///
-/// `1`, `1.0` and `1e0` all reduce to `1`, so they cannot become three
-/// distinct Propositions (§9.4).
-fn canonical_number(n: &Number) -> String {
+/// Earlier drafts spelled the four names `kip:string` and so on; a package or
+/// a caller still using that spelling means the same datatype.
+pub fn normalize_datatype(name: &str) -> String {
+    name.strip_prefix("kip:").unwrap_or(name).to_string()
+}
+
+/// Canonicalizes a finite JSON number to its mathematical value (§9.6).
+///
+/// `1`, `1.0` and `1e0` all become the integer `1`, and `-0` becomes `0`, so
+/// none of them can become a second Proposition.
+fn canonical_number_json(n: &Number) -> Json {
     if let Some(i) = n.as_i64() {
-        return i.to_string();
+        return Json::from(i);
     }
     if let Some(u) = n.as_u64() {
-        return u.to_string();
+        return Json::from(u);
     }
-    let f = n.as_f64().unwrap_or(f64::NAN);
-    // A float that is exactly an integer must agree with the integer spelling,
-    // or `1` and `1.0` would key differently after all.
-    if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.007_199_254_740_992e15 {
-        return format!("{}", f as i64);
+    let f = n.as_f64().unwrap_or(0.0);
+    if f.fract() == 0.0 && f.abs() < 9.007_199_254_740_992e15 {
+        // `-0.0 as i64` is 0, which is the point.
+        return Json::from(f as i64);
     }
-    // Rust's `{}` for f64 is the shortest representation that round-trips.
-    format!("{f}")
+    Number::from_f64(f).map(Json::Number).unwrap_or(Json::Null)
+}
+
+/// Canonicalizes a finite JSON number to its normalized value form, for the
+/// equality key.
+fn canonical_number(n: &Number) -> String {
+    match canonical_number_json(n) {
+        Json::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// One endpoint of a Proposition tuple.
@@ -252,7 +285,6 @@ impl Endpoint {
             Endpoint::Literal(literal) => {
                 let mut key = String::from("lit");
                 let _ = write!(key, "{SEP}{}", literal.datatype);
-                let _ = write!(key, "{SEP}{}", literal.language.as_deref().unwrap_or(""));
                 let _ = match &literal.value {
                     Json::String(s) => write!(key, "{SEP}s{s}"),
                     Json::Number(n) => write!(key, "{SEP}n{}", canonical_number(n)),
@@ -410,15 +442,37 @@ mod tests {
     }
 
     #[test]
-    fn a_language_tag_changes_literal_identity() {
-        // Spec §9.5.
-        let bare = key_of(json!("苹果"));
-        let tagged = key_of(json!({"value": "苹果", "language": "zh-Hans"}));
-        assert_ne!(bare, tagged);
+    fn a_language_tag_is_refused_rather_than_dropped() {
+        // Spec §9.4, KIP2-CORE-024: accepted and dropped, two tagged strings
+        // would silently collapse; accepted and kept, they would split a
+        // Literal the baseline says is one.
+        let err =
+            Endpoint::from_json(&json!({"value": "苹果", "language": "zh-Hans"})).unwrap_err();
+        assert_eq!(err.name(), "TypeMismatch");
+        // A `kip:`-prefixed datatype is the same datatype.
         assert_eq!(
-            tagged,
-            key_of(json!({"value": "苹果", "datatype": "kip:string", "language": "zh-Hans"}))
+            key_of(json!({"value": "苹果", "datatype": "kip:string"})),
+            key_of(json!("苹果"))
         );
+    }
+
+    #[test]
+    fn nfc_and_nfd_spellings_are_one_literal_and_whitespace_is_not() {
+        // Spec §9.6, KIP2-CORE-023: canonical form normalizes and never trims.
+        let composed = key_of(json!("caf\u{e9}"));
+        let decomposed = key_of(json!("cafe\u{301}"));
+        assert_eq!(composed, decomposed);
+        assert_ne!(composed, key_of(json!("caf\u{e9} ")));
+        assert_ne!(composed, key_of(json!("CAF\u{c9}")));
+        // The stored value is the canonical form.
+        let literal = Literal::from_scalar(json!("cafe\u{301}")).unwrap();
+        assert_eq!(literal.value, json!("caf\u{e9}"));
+    }
+
+    #[test]
+    fn negative_zero_is_zero() {
+        assert_eq!(key_of(json!(-0.0)), key_of(json!(0)));
+        assert_eq!(Literal::from_scalar(json!(1.0)).unwrap().value, json!(1));
     }
 
     #[test]
@@ -430,13 +484,15 @@ mod tests {
     }
 
     #[test]
-    fn a_refined_datatype_survives_a_round_trip() {
-        let value = json!({"value": "2026-08-13T10:00:00Z", "datatype": "kip:datetime"});
+    fn a_datatype_must_agree_with_its_value() {
+        // §9.2: the four baseline names, and nothing finer — a timestamp is a
+        // `format` the Predicate declares, never a datatype of its own.
+        let value = json!({"value": "2026-08-13T10:00:00Z", "datatype": "string"});
         let endpoint = Endpoint::from_json(&value).unwrap();
         assert_eq!(endpoint.to_json(), value);
-        // A datetime and a plain string with the same text are different
-        // Literals, so they cannot silently share a Proposition.
-        assert_ne!(endpoint.key(), key_of(json!("2026-08-13T10:00:00Z")));
+        assert_eq!(endpoint.key(), key_of(json!("2026-08-13T10:00:00Z")));
+        let err = Endpoint::from_json(&json!({"value": 3, "datatype": "string"})).unwrap_err();
+        assert_eq!(err.name(), "TypeMismatch");
     }
 
     #[test]

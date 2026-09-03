@@ -1,6 +1,6 @@
 {
   "name": "history",
-  "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point. And the chronology itself is reported in transition envelopes (§36.1): §68.1 defines HISTORY as transition chronology and §36.2 defines a transition as one envelope, so HISTORY ELEMENT, HISTORY SPACE and CHANGES are the same unit asked for over different ranges — which is what lets a consumer deduplicate on space_id + space_seq + tx_id (§36.3).",
+  "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point. And the chronology itself is reported in transition envelopes (§36.1): §68.1 defines HISTORY as transition chronology and §36.2 defines a transition as one envelope, so HISTORY ELEMENT, HISTORY SPACE and CHANGES are the same unit asked for over different ranges — which is what lets a consumer deduplicate on space_id + space_seq + tx_id (§36.3). Each entry of `changes` is the normative shape of schemas/kip-change-envelope.schema.json: op, kind, id, new_version, old_version where the element existed, state {from, to} for a lifecycle move, refs.proposition on an Assertion entry — names and versions, never values.",
   "setup": [
     "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
   ],
@@ -19,7 +19,7 @@
     },
     {
       "name": "retracting it changes the present",
-      "command": "RETRACT ASSERTION ?a WHERE { ?a ASSERTION {} }",
+      "command": "TRANSITION ?a TO \"retracted\" WHERE { ?a ASSERTION {} }",
       "expect": {}
     },
     {
@@ -51,14 +51,14 @@
     },
     {
       "name": "a coordinate the Space has not reached is refused, never rounded to the present",
-      "command": "SNAPSHOT AS OF SEQ 9999",
+      "command": "DESCRIBE SNAPSHOT AS OF SEQ 9999",
       "expect": {
         "error": "HistoricalSnapshotUnavailable"
       }
     },
     {
       "name": "an unknown transaction names no coordinate",
-      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {} } AS OF TX \"kip:space:default#9999\"",
+      "command": "DESCRIBE TRANSACTION \"kip:space:default#9999\"",
       "expect": {
         "error": "TransactionUnknown"
       }
@@ -78,10 +78,13 @@
             "schema_environment_version": 1,
             "changes": [
               {
-                "id": "A:<1>",
-                "kind": "assertion",
                 "op": "create",
-                "version": 1
+                "kind": "assertion",
+                "id": "A:<1>",
+                "new_version": 1,
+                "refs": {
+                  "proposition": "P:<2>"
+                }
               }
             ]
           },
@@ -94,10 +97,22 @@
             "schema_environment_version": 1,
             "changes": [
               {
-                "id": "A:<1>",
+                "op": "lifecycle",
                 "kind": "assertion",
-                "op": "retract",
-                "version": 2
+                "id": "A:<1>",
+                "old_version": 1,
+                "new_version": 2,
+                "state": {
+                  "from": "active",
+                  "to": "retracted"
+                },
+                "refs": {
+                  "proposition": "P:<2>"
+                },
+                "touched": [
+                  "fields.retracted_at",
+                  "fields.status"
+                ]
               }
             ]
           }
@@ -119,10 +134,22 @@
             "schema_environment_version": 1,
             "changes": [
               {
-                "id": "A:<1>",
+                "op": "lifecycle",
                 "kind": "assertion",
-                "op": "retract",
-                "version": 2
+                "id": "A:<1>",
+                "old_version": 1,
+                "new_version": 2,
+                "state": {
+                  "from": "active",
+                  "to": "retracted"
+                },
+                "refs": {
+                  "proposition": "P:<2>"
+                },
+                "touched": [
+                  "fields.retracted_at",
+                  "fields.status"
+                ]
               }
             ]
           }
@@ -144,10 +171,22 @@
             "schema_environment_version": 1,
             "changes": [
               {
-                "id": "A:<1>",
+                "op": "lifecycle",
                 "kind": "assertion",
-                "op": "retract",
-                "version": 2
+                "id": "A:<1>",
+                "old_version": 1,
+                "new_version": 2,
+                "state": {
+                  "from": "active",
+                  "to": "retracted"
+                },
+                "refs": {
+                  "proposition": "P:<2>"
+                },
+                "touched": [
+                  "fields.retracted_at",
+                  "fields.status"
+                ]
               }
             ]
           }

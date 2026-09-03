@@ -130,7 +130,7 @@ pub async fn execute_kip(
 /// Parses and executes one KIP command on a read-only path.
 ///
 /// Accepts KQL and META — including `VERIFY`, `VALIDATE`, `PREVIEW`, `HISTORY`,
-/// `CHANGES`, `SNAPSHOT` and `EXPORT CAPSULE` — and rejects state-changing
+/// `CHANGES` and `EXPORT CAPSULE` — and rejects state-changing
 /// semantics (Spec §76).
 ///
 /// The rejection is on parsed semantics, not on a declared label, so no
@@ -273,6 +273,12 @@ pub async fn execute_request(executor: &impl Executor, request: &Request) -> Res
             mode,
             on_error: Some(on_error),
             isolation: request.execution.as_ref().and_then(|e| e.isolation.clone()),
+            // §81: echoed so a client holding `outcome_unknown` can recover by
+            // key without re-deriving it.
+            idempotency_key: request
+                .execution
+                .as_ref()
+                .and_then(|e| e.idempotency_key.clone()),
             extensions: None,
         }),
         results,
@@ -341,6 +347,8 @@ mod tests {
             schema_environment_version: None,
             change_summary: None,
             proofs: vec![],
+            receipt_digest: None,
+            origin: None,
             extensions: None,
         }
     }
@@ -386,7 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_readonly_path_rejects_writes_by_semantics() {
-        let (language, response) = execute_readonly(&EchoNexus, r#"TOMBSTONE :x"#, false).await;
+        let (language, response) =
+            execute_readonly(&EchoNexus, r#"TRANSITION :x TO "tombstoned""#, false).await;
         assert_eq!(language, CommandType::Kml);
         assert_eq!(
             response.error.unwrap().parsed_code(),
@@ -398,7 +407,7 @@ mod tests {
             "DESCRIBE PRIMER",
             r#"EXPORT CAPSULE :out WHERE { ?c {type: "T"} }"#,
             r#"FIND(?x) WHERE { ?x {type: "T"} }"#,
-            "SNAPSHOT",
+            "DESCRIBE SNAPSHOT",
         ] {
             let (_, response) = execute_readonly(&EchoNexus, command, false).await;
             assert_eq!(response.status, TopLevelStatus::Succeeded, "for {command}");
@@ -468,7 +477,11 @@ mod tests {
 
         // Spec §80.3: recovering a lost outcome means looking the transaction
         // up, which needs the `tx_id` the executor reported.
-        let response = execute_request(&Committing, &Request::single(r#"ARCHIVE :x"#)).await;
+        let response = execute_request(
+            &Committing,
+            &Request::single(r#"TRANSITION :x TO "archived""#),
+        )
+        .await;
         assert_eq!(
             response.receipt.as_ref().and_then(|r| r.tx_id.as_deref()),
             Some("tx-9")
@@ -482,7 +495,10 @@ mod tests {
     async fn atomic_execution_is_refused_rather_than_faked() {
         let request = Request {
             execution: Some(Execution::new(ExecutionMode::Atomic)),
-            operations: vec![Operation::new("ARCHIVE :a"), Operation::new("ARCHIVE :b")],
+            operations: vec![
+                Operation::new(r#"TRANSITION :a TO "archived""#),
+                Operation::new(r#"TRANSITION :b TO "archived""#),
+            ],
             ..Default::default()
         };
         let response = execute_request(&EchoNexus, &request).await;
@@ -574,7 +590,11 @@ mod tests {
             }
         }
 
-        let response = execute_request(&UnknownOutcome, &Request::single("ARCHIVE :x")).await;
+        let response = execute_request(
+            &UnknownOutcome,
+            &Request::single(r#"TRANSITION :x TO "archived""#),
+        )
+        .await;
         assert_eq!(response.status, TopLevelStatus::OutcomeUnknown);
         assert_eq!(
             response
@@ -611,8 +631,8 @@ mod tests {
         let request = Request {
             execution: Some(Execution::new(ExecutionMode::Independent)),
             operations: vec![
-                Operation::new("ARCHIVE :a").with_op_id("known"),
-                Operation::new("ARCHIVE :b").with_op_id("unknown"),
+                Operation::new(r#"TRANSITION :a TO "archived""#).with_op_id("known"),
+                Operation::new(r#"TRANSITION :b TO "archived""#).with_op_id("unknown"),
             ],
             ..Default::default()
         };

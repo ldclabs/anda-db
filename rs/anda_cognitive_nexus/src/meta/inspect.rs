@@ -231,6 +231,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             "exhaustive": scanned < window,
         }),
         next_cursor: super::next_cursor(cx, CursorFamily::Search, consumed, total),
+        warnings: Vec::new(),
     })
 }
 
@@ -399,10 +400,17 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
             "error": error,
         })));
     }
+    // §75 puts a single operation's Receipt on its own result; the top-level
+    // slot belongs to an `atomic` transaction, which this engine does not run.
+    // Reading the wrong one made every preview report a null Receipt.
+    let receipt = response
+        .results
+        .first()
+        .and_then(|result| result.receipt.as_ref());
     Ok(Answer::whole(serde_json::json!({
         "would_commit": true,
         "effect": response.first_result(),
-        "receipt": response.receipt,
+        "receipt": receipt,
         "note": "a preview reserves no identity and establishes no durable state",
     })))
 }

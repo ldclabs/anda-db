@@ -16,14 +16,18 @@
  * a field named `evidence` and quietly change what an Assertion cites.
  */
 
-import { errors } from '../errors.js'
+import { detailed, errors } from '../errors.js'
 import {
   ACTIVITY_TERMINAL,
   ASSERTION_MODES,
   EVIDENCE_ROLES,
   STANCES,
+  TRANSITION_ACTIVITY,
+  TRANSITION_STATES,
+  TRANSITION_WITH_BY,
 } from '../kip/semantics.js'
-import type { Permission } from '../governance/index.js'
+import { permissionForTargetState, permissionsForState } from '../governance/gate.js'
+import { bindingId, type Permission } from '../governance/index.js'
 import {
   referencePolicy,
   stage as stagePurge,
@@ -40,9 +44,11 @@ import {
 } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
 import type {
+  Assignments,
   ConceptCreate,
   ConceptUpsert,
   ElementRef,
+  ExpectVersion,
   Scalar,
   WhereClause,
   EnsureProposition,
@@ -52,16 +58,20 @@ import type {
   RecordCreate,
   StructuralEdge,
   Term,
+  Transition,
 } from '../kip/ast.js'
 import {
   facetDef,
   formatSymbolRef,
+  lineageOfSymbol,
+  parseSymbolRef,
   predicateDef,
   structuralFieldDef,
   validateAttributes,
   validateFacet,
   validateFacetCarrier,
   validatePredicateEndpoints,
+  validatePredicateObjectLiteral,
   validateStructural,
   validateStructuralEndpoints,
   type EndpointFacts,
@@ -70,10 +80,13 @@ import {
 } from '../schema/index.js'
 import {
   State,
+  emptyPlanes,
+  type ActivityRow,
   type AssertionRow,
   type ConceptRow,
   type Element,
   type EvidenceRow,
+  type PlaneKey,
   type PropositionRow,
 } from '../store/index.js'
 import {
@@ -85,7 +98,7 @@ import {
 } from '../term.js'
 import { normalizeTime } from '../time.js'
 import { render } from '../view.js'
-import type { Transaction } from '../tx.js'
+import type { Transaction, VersionGuard } from '../tx.js'
 import { resolveTargets } from './select.js'
 import {
   applyAction,
@@ -192,60 +205,12 @@ export function apply(
   if ('CreateEvidence' in clause) return createRecord(tx, b, clause.CreateEvidence, 'Evidence')
   if ('CreateAssertion' in clause) return createRecord(tx, b, clause.CreateAssertion, 'Assertion')
   if ('CreateActivity' in clause) return createRecord(tx, b, clause.CreateActivity, 'Activity')
-  if ('RetractAssertion' in clause) {
-    const { target, where_clauses, limit, expect_state } = clause.RetractAssertion
-    for (const id of select(target, where_clauses, limit, 'RETRACT', 'retract_own').authorized(tx)) {
-      if (expect_state !== null) {
-        tx.expectAssertionStatus(id, scalarText(b, expect_state, 'EXPECT STATE'))
-      }
-      retract(tx, id)
-    }
-    return
-  }
-  if ('SupersedeAssertion' in clause) {
-    const { target, by, expect_state } = clause.SupersedeAssertion
-    const id = refTarget(b, target, 'SUPERSEDE')
-    if (expect_state !== null) tx.expectAssertionStatus(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return supersede(tx, id, refTarget(b, by, 'SUPERSEDE ... BY'))
-  }
-  if ('CorrectEvidence' in clause) {
-    const { target, by, expect_state } = clause.CorrectEvidence
-    const id = refTarget(b, target, 'CORRECT')
-    if (expect_state !== null) tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return correct(tx, id, refTarget(b, by, 'CORRECT ... BY'))
-  }
-  if ('TransitionActivity' in clause) {
-    const { target, to, expect_state } = clause.TransitionActivity
-    const id = refTarget(b, target, 'TRANSITION')
-    if (expect_state !== null) tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-    return transition(tx, id, scalarText(b, to, 'TRANSITION ... TO'))
-  }
-  if ('Archive' in clause) {
-    const { target, where_clauses, limit, expect_state } = clause.Archive
-    for (const id of select(target, where_clauses, limit, 'ARCHIVE', 'archive').authorized(tx)) {
-      if (expect_state !== null) {
-        tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-      }
-      changeState(tx, id, State.ARCHIVED, 'archive')
-    }
-    return
-  }
-  if ('Tombstone' in clause) {
-    const { target, where_clauses, limit, expect_state } = clause.Tombstone
-    for (const id of select(target, where_clauses, limit, 'TOMBSTONE', 'tombstone').authorized(tx)) {
-      if (expect_state !== null) {
-        tx.expectState(id, scalarText(b, expect_state, 'EXPECT STATE'))
-      }
-      changeState(tx, id, State.TOMBSTONED, 'tombstone')
-    }
-    return
-  }
+  if ('Transition' in clause) return transition(tx, b, clause.Transition, select)
   if ('Update' in clause) {
-    const { target, where_clauses, limit, expect_version, actions } = clause.Update
+    const { target, where_clauses, limit, expect_versions, actions } = clause.Update
+    const guards = versionGuards(tx, b, expect_versions)
     for (const id of select(target, where_clauses, limit, 'UPDATE', 'update').authorized(tx)) {
-      if (expect_version !== null) {
-        tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
-      }
+      tx.expectVersions(id, guards)
       const element = tx.load(id)
       const before = JSON.stringify(element.row)
       const attributesBefore =
@@ -263,11 +228,13 @@ export function apply(
     return
   }
   if ('Purge' in clause) {
-    const { target, where_clauses, limit, reference_policy } = clause.Purge
+    const { target, where_clauses, limit, reference_policy, expect_versions } = clause.Purge
     const policy = referencePolicy(
       reference_policy === null ? null : scalarText(b, reference_policy, 'REFERENCE POLICY'),
     )
+    const guards = versionGuards(tx, b, expect_versions)
     for (const id of select(target, where_clauses, limit, 'PURGE', 'purge').authorized(tx)) {
+      tx.expectVersions(id, guards)
       stagePurge(tx, id, policy)
     }
     return
@@ -277,9 +244,11 @@ export function apply(
     // bytes after digesting them without destroying the evidence event, its
     // citations, or its provenance role. No `REFERENCE POLICY` and no referrer
     // check: the element survives, so nothing can be left pointing at nothing.
-    const { target, where_clauses, limit } = clause.PurgePayload
+    const { target, where_clauses, limit, expect_versions } = clause.PurgePayload
     const selected = select(target, where_clauses, limit, 'PURGE PAYLOAD', 'purge')
+    const guards = versionGuards(tx, b, expect_versions)
     for (const id of selected.authorized(tx)) {
+      tx.expectVersions(id, guards)
       const report = stagePayloadPurge(tx, id)
       if (!report.erased) {
         // §60.6: purging an already-purged payload is a `no_effect`, and saying
@@ -296,7 +265,7 @@ export function apply(
     return
   }
   if ('SetRetention' in clause) {
-    const { target, values, where_clauses, limit, expect_version } = clause.SetRetention
+    const { target, values, where_clauses, limit, expect_versions } = clause.SetRetention
     const selected = select(
       target,
       where_clauses,
@@ -310,10 +279,9 @@ export function apply(
     const retention = assignments(b, values)
     checkRetention(retention)
     const expires = expiresAt(retention)
+    const guards = versionGuards(tx, b, expect_versions)
     for (const id of selected.authorized(tx)) {
-      if (expect_version !== null) {
-        tx.expectVersion(id, numberOf(b, expect_version, 'EXPECT VERSION'))
-      }
+      tx.expectVersions(id, guards)
       const element = tx.load(id)
       authorizeLegalHold(tx, element.row.retention, retention)
       // A block that says what is already recorded is a no-op rather than a
@@ -327,10 +295,10 @@ export function apply(
     return
   }
   if ('MergeConcept' in clause) {
-    const { source, into, where_clauses, expect_version } = clause.MergeConcept
+    const { source, into, where_clauses, expect_versions } = clause.MergeConcept
     const sources = select(source, where_clauses, null, 'MERGE CONCEPT', 'merge_identity').authorized(tx)
     const targets = select(into, where_clauses, null, 'MERGE CONCEPT ... INTO', 'merge_identity').authorized(tx)
-    return merge(tx, b, sources, targets, expect_version)
+    return merge(tx, sources, targets, versionGuards(tx, b, expect_versions))
   }
 
   // Every clause the grammar produces is handled above, so this is a guard
@@ -396,6 +364,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
     ...blank(id),
     client_key: clientKey,
     schema_ref: formatSymbolRef(symbol),
+    lineage: lineageOfSymbol(symbol),
     key,
     name: clause.name === null ? extraName : scalarText(b, clause.name, 'NAME'),
     canonical_id: canonicalId,
@@ -464,9 +433,21 @@ function createRecord(
     }
     case 'Assertion': {
       const proposition = fields.reference('proposition', 'CREATE ASSERTION')
+      // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be named
+      // is recorded as Evidence, not asserted — an Assertion nobody made is
+      // not a weaker commitment, it is no commitment at all. A bare id string
+      // in this slot is a reference, as it is for `proposition`.
+      const actor = fields.value('asserted_by')
+      if (actor === null || (isJsonMap(actor) && Object.keys(actor).length === 0)) {
+        throw errors.constraintViolation(
+          'CREATE ASSERTION needs `asserted_by`: an Assertion is one actor\'s ' +
+            'commitment (§13.3), and a claim whose actor cannot be resolved is ' +
+            'recorded as Evidence, not asserted',
+        )
+      }
       // §11.3: a claim recorded now is attributed to the identity that
       // survived the merge, or the two would never meet again.
-      const assertedBy = canonicalizeReference(tx, fields.json('asserted_by'))
+      const assertedBy = canonicalizeReference(tx, referenceValue(actor, 'asserted_by'))
       // Each citation keeps the role it was cited in: Core records that this
       // Assertion cites E *as supporting*, and never that E proves anything —
       // that judgement belongs to the Projection (§8.4).
@@ -550,11 +531,31 @@ function createRecord(
     tx.authorizeCreated(element, 'assert')
     const extra = attributionPermission(tx, element.row.asserted_by_key)
     if (extra !== 'assert') tx.authorizeCreated(element, extra)
+    // §33.2: the Receipt names the ActorBinding the commit exercised. That is
+    // the one this Principal holds to the actor it just spoke as.
+    const bound = tx.authority.bindingTo(element.row.asserted_by_key)
+    if (bound !== null) tx.exerciseBinding(bindingId(bound.id))
   } else {
     tx.authorizeCreated(element, 'create')
+    // §29.8: outcome Evidence, and the observation Activity that links an
+    // outcome to the decision it grades, need `record_outcome` on top of
+    // `create`. Asked per element once the class is bound, so a `:parameter`
+    // class pays what a literal one does; `derive` is deliberately not asked
+    // for — an observation of the world is not a transformation of held
+    // cognition.
+    if (recordsOutcome(element)) tx.authorizeCreated(element, 'record_outcome')
   }
   tx.stageNew(id, element)
   checkStructural(tx, element)
+}
+
+/** Whether a new record is part of the consequence channel (§15.7, §29.8). */
+export function recordsOutcome(element: Element): boolean {
+  if (element.kind === 'Evidence') return element.row.evidence_class === 'outcome'
+  if (element.kind === 'Activity') {
+    return element.row.activity_class === 'outcome_observation'
+  }
+  return false
 }
 
 /**
@@ -620,32 +621,45 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
   // place the new Concept's type can come from, and `schema_ref` is fixed at
   // creation — so a Concept minted without one stays untyped forever, which
   // §10.1 does not admit as a state a Concept can be in.
+  // §54.4, §20.14: the declared type is a *lineage*. On the resolve half it
+  // is part of the identity address, so a Concept written under an earlier
+  // package version is found; on the create half it binds the new Concept to
+  // the environment's write version of that lineage.
   const declaredType = matchText(b, matcher, 'type')
-  const schemaRef =
+  const typeSymbol =
     declaredType === null
       ? null
-      : formatSymbolRef(tx.env.resolveSymbol('ConceptType', declaredType, 'write'))
+      : tx.env.resolveSymbol('ConceptType', declaredType, 'write')
+  const lineage = typeSymbol === null ? null : lineageOfSymbol(typeSymbol)
   const found =
     selectorId === null
-      ? resolveByKey(tx, selectorKey as string, schemaRef)
-      : resolveById(tx, selectorId, schemaRef)
+      ? resolveByKey(tx, selectorKey as string, lineage)
+      : resolveById(tx, selectorId, lineage)
+  const guards = versionGuards(tx, b, clause.expect_versions)
 
   let existing: ElementId
   if (found !== null) {
     existing = found
     tx.bindExisting(clause.handle, existing)
-    if (clause.expect_version !== null) {
-      tx.expectVersion(existing, numberOf(b, clause.expect_version, 'EXPECT VERSION'))
-    }
+    tx.expectVersions(existing, guards)
   } else {
     // Nothing matched, so this is the "insert" half — and three things can stop
     // it, in the order they stop being about what the caller asked for and
-    // start being about what the engine may mint.
-    if (clause.expect_version !== null) {
-      const expected = numberOf(b, clause.expect_version, 'EXPECT VERSION')
-      if (expected !== 0) {
+    // start being about what the engine may mint. A guard is checked against
+    // an element that does not exist: version 0 on every plane, so the bare
+    // `EXPECT VERSION 0` is exactly the create-only form (§35.2) and any
+    // other bare value cannot be met.
+    for (const guard of guards) {
+      if (guard.plane === null && guard.version !== 0) {
         throw errors.versionConflict(
-          `no Concept matches this selector, so it cannot be at version ${expected}`,
+          `no Concept matches this selector, so it cannot be at version ${guard.version}`,
+        )
+      }
+      if (guard.plane !== null && guard.version !== 0) {
+        throw detailed.versionConflictOnPlane(
+          guard.plane,
+          `no Concept matches this selector, so its ${guard.plane} plane cannot ` +
+            `be at version ${guard.version}`,
         )
       }
     }
@@ -659,7 +673,12 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
           'the caller chose',
       )
     }
-    existing = createFromMatch(tx, clause.handle, selectorKey as string, schemaRef)
+    existing = createFromMatch(
+      tx,
+      clause.handle,
+      selectorKey as string,
+      typeSymbol === null ? null : formatSymbolRef(typeSymbol),
+    )
   }
 
   const element = tx.load(existing)
@@ -773,6 +792,7 @@ function createFromMatch(
     ...blank(id),
     client_key: '',
     schema_ref: schemaRef,
+    lineage: lineageOfSymbol(parseSymbolRef(schemaRef)),
     key,
     name: '',
     canonical_id: '',
@@ -815,6 +835,7 @@ function ensureProposition(
     'write',
   )
   const predicateRef = formatSymbolRef(predicate)
+  const predicateLineage = lineageOfSymbol(predicate)
   const definition = tx.env.definitionPackage(predicate)
   const def = definition === undefined ? undefined : predicateDef(definition, predicate.name)
   if (def !== undefined) {
@@ -824,8 +845,13 @@ function ensureProposition(
       factsFor(tx, subject),
       factsFor(tx, object),
     ).throwIfInvalid()
+    validatePredicateObjectLiteral(predicateRef, def, object).throwIfInvalid()
   }
-  const key = tupleKey(tx.cx.space, subject, predicateRef, object)
+  // §12.3, §20.14: identity compares the predicate's *lineage*, so an ENSURE
+  // under a later version of the same package resolves to the existing
+  // Proposition instead of minting a parallel one. The stored `predicate_ref`
+  // stays exact.
+  const key = tupleKey(tx.cx.space, subject, predicateLineage, object)
 
   const found = tx.store.propositionByTuple(key)
   const id =
@@ -839,6 +865,7 @@ function ensureProposition(
       subject: endpointToJson(subject),
       subject_key: endpointKey(subject),
       predicate_ref: predicateRef,
+      predicate_lineage: predicateLineage,
       object: endpointToJson(object),
       object_key: endpointKey(object),
       tuple_key: key,
@@ -848,10 +875,8 @@ function ensureProposition(
     tx.stageNew(id, element)
   } else {
     tx.load(id)
-    if (clause.expect_version !== null) {
-      tx.expectVersion(id, numberOf(b, clause.expect_version, 'EXPECT VERSION'))
-    }
   }
+  tx.expectVersions(id, versionGuards(tx, b, clause.expect_versions))
   if (clause.handle !== null) tx.bindExisting(clause.handle, id)
   return id
 }
@@ -859,32 +884,197 @@ function ensureProposition(
 // --- lifecycle --------------------------------------------------------------
 
 /**
- * `RETRACT` — the source withdraws its claim (§68).
+ * `TRANSITION <target> TO "<state>"` — the one lifecycle statement (§52.5).
+ *
+ * The quoted state names the move, and the engine validates it against the
+ * target's kind and current state:
+ *
+ * ```text
+ * retracted                          Assertion   from active            §57.3
+ * superseded  BY newer               Assertion   from active            §57.4
+ * corrected   BY new                 Evidence    from active            §57.2
+ * running                            Activity    from pending           §16
+ * completed | failed | cancelled     Activity    from pending, running  §16.6
+ * archived | tombstoned              any         engine state           §60
+ * ```
+ *
+ * A state that does not fit the kind, or is not legal from the current one,
+ * fails `InvalidLifecycleTransition` naming the move in `details.from` /
+ * `details.to`; a move to the state already held is `no_effect` — no version
+ * bump, no envelope entry (§34.4). There is no `EXPECT STATE`: the engine
+ * already checks the state the guard would have restated (§35.3).
+ *
+ * The state may arrive as a `:parameter`. The parser then could not check
+ * the two shape rules it checks for a literal — `BY` exactly on `superseded`
+ * / `corrected`, `SET` only on an Activity state — so they are checked here,
+ * under the same code, and the command gate could not classify the
+ * permission either, so each selected element is authorized here with the
+ * permission the literal form would have paid (`governance/gate.ts`).
+ */
+function transition(
+  tx: Transaction,
+  b: Bindings,
+  clause: Transition,
+  select: (
+    target: ElementRef,
+    where: readonly WhereClause[] | null,
+    limit: Scalar | null,
+    what: string,
+    permission: Permission,
+  ) => { authorized(tx: Transaction): ElementId[] },
+): void {
+  const state = scalarText(b, clause.to, 'TRANSITION ... TO')
+  // The registry check the parser runs for a literal (§52.5), repeated here
+  // because a parameter is the first moment the value exists.
+  checkRegistry(state, 'TRANSITION ... TO', TRANSITION_STATES)
+  const withBy = (TRANSITION_WITH_BY as readonly string[]).includes(state)
+  const activity = (TRANSITION_ACTIVITY as readonly string[]).includes(state)
+  if (clause.by !== null && !withBy) {
+    throw errors.invalidSyntax(
+      `TRANSITION TO ${JSON.stringify(state)} takes no BY; only superseded and ` +
+        `corrected name a replacing element (§52.5)`,
+    )
+  }
+  if (clause.by === null && withBy) {
+    throw errors.invalidSyntax(
+      `TRANSITION TO ${JSON.stringify(state)} names the replacing element with BY (§52.5)`,
+    )
+  }
+  if ((clause.set_fields !== null || clause.set_structural !== null) && !activity) {
+    throw errors.invalidSyntax(
+      `TRANSITION TO ${JSON.stringify(state)} cannot finalize fields or topology; ` +
+        `only an Activity state does (§52.5)`,
+    )
+  }
+
+  // Which permission each *target element* is authorized with, and which is
+  // asked for once at Space scope. Correcting Evidence is a maintenance act on
+  // the record it names and additionally writes a new one, so the element pays
+  // `maintain` and the Space pays `create` — the split the Rust engine makes,
+  // and the one a resource-scoped Grant is written against.
+  const elementPermission = permissionForTargetState(state)
+  const spaceScoped = permissionsForState(state).filter(
+    (permission) => permission !== elementPermission,
+  )
+  const selected = select(
+    clause.target,
+    clause.where_clauses,
+    clause.limit,
+    'TRANSITION',
+    elementPermission,
+  )
+  // Asked once, not once per matched element: a Space-scope check does not
+  // depend on which element the sweep reached. A `:parameter` state pays
+  // exactly what a literal one does, which the command gate could not know.
+  for (const permission of spaceScoped) tx.require(permission)
+  const guards = versionGuards(tx, b, clause.expect_versions)
+  const by = clause.by === null ? null : refTarget(b, clause.by, 'TRANSITION ... BY')
+  for (const id of selected.authorized(tx)) {
+    tx.expectVersions(id, guards)
+    switch (state) {
+      case 'retracted':
+        retract(tx, id)
+        break
+      case 'superseded':
+        supersede(tx, id, by as ElementId)
+        break
+      case 'corrected':
+        correct(tx, id, by as ElementId)
+        break
+      case 'archived':
+        changeState(tx, id, State.ARCHIVED, 'archive')
+        break
+      case 'tombstoned':
+        changeState(tx, id, State.TOMBSTONED, 'tombstone')
+        break
+      default:
+        transitionActivity(tx, b, id, state, clause.set_fields, clause.set_structural)
+    }
+  }
+}
+
+/**
+ * The lifecycle state a TRANSITION judges its move from: a record's own
+ * status for an Assertion, an Evidence record or an Activity, and the engine
+ * state for a Concept or a Proposition, which have no other.
+ */
+function lifecycleStateOf(element: Element): string {
+  // The engine state wins once it has left ordinary recall: an archived
+  // Assertion is `archived`, not `active`, and `details.from` has to say the
+  // word the move was actually refused from. Below that, the record's own
+  // status, which is the only lifecycle a Concept or a Proposition has none of.
+  const state = element.row.state
+  if (state !== '' && state !== State.ACTIVE) return state
+  switch (element.kind) {
+    case 'Assertion':
+    case 'Evidence':
+    case 'Activity':
+      return element.row.status
+    default:
+      return State.ACTIVE
+  }
+}
+
+/** The refusal for a move that does not fit the target's kind (§52.5). */
+function wrongKind(element: Element, id: ElementId, to: string, fits: string): never {
+  throw detailed.invalidLifecycleTransitionFrom(
+    lifecycleStateOf(element),
+    to,
+    `${formatElementId(id)} is a ${element.kind.toLowerCase()}, and ` +
+      `${JSON.stringify(to)} is a state ${fits} moves to (§52.5)`,
+  )
+}
+
+/** The refusal for a move that is not legal from the current state (§52.5). */
+function notFrom(id: ElementId, from: string, to: string, legalFrom: string): never {
+  throw detailed.invalidLifecycleTransitionFrom(
+    from,
+    to,
+    `${formatElementId(id)} is ${JSON.stringify(from)}, and a move to ` +
+      `${JSON.stringify(to)} is legal only from ${legalFrom} (§52.5)`,
+  )
+}
+
+/**
+ * `TO "retracted"` — the source withdraws its claim (§57.3).
  *
  * The record stays exactly where it is: retraction is an epistemic status, not
  * a deletion, and the Assertion remains readable and citable. Its engine
- * `state` does not move.
+ * `state` does not move. Legal only from `active`; a second retraction is
+ * `no_effect`.
  */
 function retract(tx: Transaction, id: ElementId): void {
-  const element = requireKind(tx, id, 'Assertion')
-  requireStanding(tx, id, element.row, 'RETRACT')
-  if (element.row.status === 'retracted') return
+  const element = tx.load(id)
+  if (element.kind !== 'Assertion') wrongKind(element, id, 'retracted', 'only an Assertion')
+  // The move is judged before the caller is: a second retraction is `no_effect`
+  // whoever asks (§52.5), and a move from `superseded` is illegal whoever asks.
+  // Asking about standing first would answer a governance question the engine
+  // never had to reach, and report `RetractionNotAuthorized` where the other
+  // reference engine reports `no_effect`.
+  const current = lifecycleStateOf(element)
+  if (current === 'retracted') return
+  if (current !== 'active') {
+    notFrom(id, current, 'retracted', 'active')
+  }
+  requireStanding(tx, id, element.row, 'TRANSITION TO "retracted"')
   element.row.status = 'retracted'
   element.row.retracted_at = tx.cx.at
   tx.markChanged(id, 'retract')
 }
 
 /**
- * Whether this caller may record that the *source* withdrew a claim (§68).
+ * Whether this caller may record that the *source* withdrew a claim (§57.3).
  *
- * `RETRACT` and `SUPERSEDE` state something about the original actor: that it
- * took its claim back. Only two kinds of caller can honestly say so — the one
- * that wrote the record, and one an ActorBinding says represents the actor.
+ * Retraction and supersession state something about the original actor: that
+ * it took its claim back. Only two kinds of caller can honestly say so — the
+ * one that wrote the record, and one an ActorBinding says represents the
+ * actor.
  *
- * A moderator who holds neither is not stuck: `ARCHIVE` and `TOMBSTONE` remove
- * the Assertion from ordinary recall without claiming anybody recanted, which is
- * the true statement available to it. Letting it retract instead would have the
- * engine assert something about the source that never happened.
+ * A moderator who holds neither is not stuck: `archived` and `tombstoned`
+ * remove the Assertion from ordinary recall without claiming anybody
+ * recanted, which is the true statement available to it. Letting it retract
+ * instead would have the engine assert something about the source that never
+ * happened (§14.1).
  */
 function requireStanding(
   tx: Transaction,
@@ -896,62 +1086,77 @@ function requireStanding(
   throw errors.retractionNotAuthorized(
     `${what} records that the source withdrew ${formatElementId(id)}, and this ` +
       `Principal neither wrote it nor is bound to the actor it is attributed ` +
-      `to. ARCHIVE or TOMBSTONE excludes it from recall without claiming a ` +
-      `retraction that did not happen`,
+      `to. TRANSITION TO "archived" or "tombstoned" excludes it from recall ` +
+      `without claiming a retraction that did not happen`,
   )
 }
 
-/** `SUPERSEDE ... BY` — a later Assertion replaces an earlier one (§15.1). */
+/** `TO "superseded" BY newer` — a later Assertion replaces an earlier one (§57.4). */
 function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
-  if (elementIdEquals(id, by)) {
-    throw errors.supersessionMismatch(
-      `${formatElementId(id)} cannot supersede itself`,
-    )
+  const older = tx.load(id)
+  if (older.kind !== 'Assertion') wrongKind(older, id, 'superseded', 'only an Assertion')
+  const olderId = formatElementId(id)
+  const newerId = formatElementId(by)
+  // Already superseded by this very Assertion: the move happened, and saying
+  // so again changes nothing (§52.5). Superseded by *another* is a second
+  // revision, and `superseded` is not a state one is legal from (§57.4) —
+  // answering `no_effect` there would tell the caller its lineage was recorded
+  // when nothing was written. Judged before the replacing element is otherwise
+  // looked at, because the move is decided whatever BY names.
+  const current = lifecycleStateOf(older)
+  if (current === 'superseded' && older.row.superseded_by.includes(newerId)) {
+    return
   }
-  tx.authorizeElement(id, 'supersede_own')
+  if (current !== 'active') {
+    notFrom(id, current, 'superseded', 'active')
+  }
+  if (elementIdEquals(id, by)) {
+    throw errors.supersessionMismatch(`${olderId} cannot supersede itself`)
+  }
   tx.authorizeElement(by, 'supersede_own')
-  const older = requireKind(tx, id, 'Assertion')
   const newer = requireKind(tx, by, 'Assertion')
-  requireStanding(tx, id, older.row, 'SUPERSEDE')
+  requireStanding(tx, id, older.row, 'TRANSITION TO "superseded"')
   if (older.row.proposition_id !== newer.row.proposition_id) {
     // Supersession is a claim about the same Proposition; across two of them it
     // would silently retire a claim nobody revised.
     throw errors.supersessionMismatch(
-      `${formatElementId(by)} is about ${newer.row.proposition_id} and ` +
-        `${formatElementId(id)} about ${older.row.proposition_id}`,
+      `${newerId} is about ${newer.row.proposition_id} and ` +
+        `${olderId} about ${older.row.proposition_id}`,
     )
   }
-  const olderId = formatElementId(id)
-  const newerId = formatElementId(by)
-  if (!older.row.superseded_by.includes(newerId)) {
-    older.row.superseded_by.push(newerId)
-    older.row.status = 'superseded'
-    tx.markChanged(id, 'supersede')
-  }
+  older.row.superseded_by.push(newerId)
+  older.row.status = 'superseded'
+  tx.markChanged(id, 'supersede')
   if (!newer.row.supersedes.includes(olderId)) {
     newer.row.supersedes.push(olderId)
     tx.markChanged(by, 'supersede')
   }
 }
 
-/** `CORRECT ... BY` — a later observation corrects an earlier one (§20). */
+/** `TO "corrected" BY new` — a later observation corrects an earlier one (§57.2). */
 function correct(tx: Transaction, id: ElementId, by: ElementId): void {
-  if (elementIdEquals(id, by)) {
-    throw errors.evidenceCorrectionConflict(
-      `${formatElementId(id)} cannot correct itself`,
-    )
-  }
-  tx.authorizeElement(id, 'maintain')
-  tx.authorizeElement(by, 'maintain')
-  const older = requireKind(tx, id, 'Evidence')
-  const newer = requireKind(tx, by, 'Evidence')
+  const older = tx.load(id)
+  if (older.kind !== 'Evidence') wrongKind(older, id, 'corrected', 'only Evidence')
   const olderId = formatElementId(id)
   const newerId = formatElementId(by)
-  if (!older.row.corrected_by.includes(newerId)) {
-    older.row.corrected_by.push(newerId)
-    older.row.status = 'corrected'
-    tx.markChanged(id, 'correct')
+  // The same rule supersession follows: already corrected by this very record
+  // is the move having happened (§52.5); corrected by another is a second
+  // correction, and `corrected` is not a state one is legal from (§57.2).
+  const current = lifecycleStateOf(older)
+  if (current === 'corrected' && older.row.corrected_by.includes(newerId)) {
+    return
   }
+  if (current !== 'active') {
+    notFrom(id, current, 'corrected', 'active')
+  }
+  if (elementIdEquals(id, by)) {
+    throw errors.evidenceCorrectionConflict(`${olderId} cannot correct itself`)
+  }
+  tx.authorizeElement(by, 'maintain')
+  const newer = requireKind(tx, by, 'Evidence')
+  older.row.corrected_by.push(newerId)
+  older.row.status = 'corrected'
+  tx.markChanged(id, 'correct')
   if (!newer.row.corrects.includes(olderId)) {
     newer.row.corrects.push(olderId)
     tx.markChanged(by, 'correct')
@@ -959,14 +1164,185 @@ function correct(tx: Transaction, id: ElementId, by: ElementId): void {
 }
 
 /**
- * `TRANSITION ... TO` — an Activity's lifecycle (§55).
+ * The Activity terminal states, from the Core Package (§20.13).
  *
- * The terminal set is the Core Package's (§20.13), not this engine's.
  * Inventing one locally is how the two reference engines came to disagree
  * about whether `TO "cancelled"` froze anything: each had a plausible extra
  * word and neither had the registry.
  */
 const TERMINAL = new Set<string>(ACTIVITY_TERMINAL)
+
+/**
+ * `TO "running" | "completed" | "failed" | "cancelled"` — an Activity's
+ * lifecycle (§16), with the fields and topology it finalizes on the way.
+ *
+ * `running` is legal only from `pending`; a terminal state from `pending` or
+ * `running`. From a terminal state the move is `ActivityTerminal`: terminal
+ * topology freezes with the Activity (§16.6), and re-opening a finished
+ * process would let its provenance be rewritten after the fact. A move to the
+ * status already held is `no_effect`.
+ */
+function transitionActivity(
+  tx: Transaction,
+  b: Bindings,
+  id: ElementId,
+  to: string,
+  setFields: Assignments | null,
+  setStructural: StructuralEdge[] | null,
+): void {
+  const element = tx.load(id)
+  if (element.kind !== 'Activity') wrongKind(element, id, to, 'only an Activity')
+  const row = element.row
+  if (row.status === to) return
+  // An Activity that has left ordinary recall — archived, tombstoned,
+  // quarantined, merged, purged — has no lifecycle left to move: finalizing
+  // topology onto it would write provenance into an element a reader is no
+  // longer meant to reach (§60.1, §60.2).
+  if (row.state !== State.ACTIVE) {
+    notFrom(id, row.state, to, 'an Activity still in ordinary recall')
+  }
+  if (TERMINAL.has(row.status)) {
+    throw errors.activityTerminal(
+      `${formatElementId(id)} is ${row.status} and cannot transition ` +
+        `to ${JSON.stringify(to)}`,
+    )
+  }
+  if (to === 'running' && row.status !== 'pending') {
+    notFrom(id, row.status, to, 'pending')
+  }
+  if (TERMINAL.has(to) && row.status !== 'pending' && row.status !== 'running') {
+    notFrom(id, row.status, to, 'pending or running')
+  }
+
+  // The fields a transition may finalize (§52.5): when the process started and
+  // ended, and the digest of what it ran with. The class is what the Activity
+  // *is* and the status is what `TO` names; neither is a field to set here.
+  if (setFields !== null) {
+    const fields = new Fields(assignments(b, setFields))
+    finalizeActivityFields(row, fields)
+  }
+  if (setStructural !== null) {
+    const edges = collectStructural(tx, b, setStructural, CORE_STRUCTURAL.Activity)
+    for (const core of ['inputs', 'outputs', 'associated_actors'] as const) {
+      for (const value of edges.values(core)) {
+        if (!row[core].some((held) => sameReference(held, value))) row[core].push(value)
+      }
+    }
+    for (const [field, values] of Object.entries(edges.profile)) {
+      const current = row.structural[field]
+      const items = Array.isArray(current) ? [...current] : []
+      for (const value of values as Json[]) {
+        placeReference(items, value, null, orderedField(tx, field), field)
+      }
+      row.structural[field] = items
+    }
+  }
+
+  row.status = to
+  if (TERMINAL.has(to) && row.ended_at === '') row.ended_at = tx.cx.at
+  tx.markChanged(id, 'transition')
+  checkStructural(tx, element)
+}
+
+/** The Core record fields a terminal transition may write (§52.5). */
+function finalizeActivityFields(row: ActivityRow, fields: Fields): void {
+  const started = fields.timestamp('started_at')
+  if (started !== '') row.started_at = started
+  const ended = fields.timestamp('ended_at')
+  if (ended !== '') row.ended_at = ended
+  const digest = fields.text('parameters_digest')
+  if (digest !== '') row.parameters_digest = digest
+  if (fields.has('status') || fields.has('activity_class')) {
+    throw errors.invalidSyntax(
+      'TRANSITION names the Activity status with TO, and the class is what the ' +
+        'Activity is; neither is a field SET FIELDS finalizes (§52.5)',
+    )
+  }
+  fields.rest('Activity transition')
+}
+
+/** `TO "archived"` / `TO "tombstoned"` — engine state, never an epistemic claim (§60). */
+function changeState(
+  tx: Transaction,
+  id: ElementId,
+  state: string,
+  verb: 'archive' | 'tombstone',
+): void {
+  const element = tx.load(id)
+  // The move is judged before the caller is: a second archive is `no_effect`
+  // and an illegal one is `InvalidLifecycleTransition`, whoever asks. Asking
+  // about moderation first would report `NotAuthorized` for a statement the
+  // engine was never going to perform.
+  if (element.row.state === state) return
+  // Only an element still in ordinary recall leaves it, and only an archived
+  // one goes on to a tombstone (§60.1, §60.2). Quarantine, a merged-away
+  // identity and a purged stub are Governance and identity states with their
+  // own exits; archiving out of them would overwrite the reason the element is
+  // where it is.
+  const legal =
+    element.row.state === State.ACTIVE ||
+    (state === State.TOMBSTONED && element.row.state === State.ARCHIVED)
+  if (!legal) {
+    notFrom(
+      id,
+      element.row.state,
+      state,
+      state === State.TOMBSTONED ? 'active or archived' : 'active',
+    )
+  }
+  // §29: administratively excluding somebody else's claim is a different act
+  // from tidying one's own, and only the first is moderation. `archive` is
+  // still asked for — this is on top of it, not instead of it, so a moderator
+  // needs both and a Grant listing only `moderate_assertion` confers nothing.
+  if (element.kind === 'Assertion' && !tx.mayRepresentAssertion(element.row)) {
+    tx.require('moderate_assertion')
+  }
+  element.row.state = state
+  tx.markChanged(id, verb)
+}
+
+/**
+ * Resolves the trailing `EXPECT VERSION` guards of one statement (§35.1).
+ *
+ * A Facet plane is named by a symbol the environment resolves, and the
+ * guard's key is the Facet's local name — the same key `_system.plane_versions
+ * .facets` carries. Two guards on one plane are a syntax error, which the
+ * parser already refused for literal symbols; a parameter can spell one plane
+ * two ways, and is refused here under the same code.
+ */
+export function versionGuards(
+  tx: Transaction,
+  b: Bindings,
+  guards: readonly ExpectVersion[],
+): VersionGuard[] {
+  const out: VersionGuard[] = []
+  const seen = new Set<string>()
+  for (const guard of guards) {
+    const version = numberOf(b, guard.version, 'EXPECT VERSION')
+    if (version < 0) {
+      throw errors.typeMismatch(`EXPECT VERSION takes a non-negative integer, got ${version}`)
+    }
+    let plane: PlaneKey | null
+    if (guard.plane === null) plane = null
+    else if (guard.plane === 'Attributes') plane = 'attributes'
+    else if (guard.plane === 'Structural') plane = 'structural'
+    else if (guard.plane === 'Retention') plane = 'retention'
+    else {
+      const symbol = tx.env.resolveSymbol('Facet', symbolName(b, guard.plane.Facet), 'read')
+      plane = `facets.${symbol.name}`
+    }
+    const key = plane ?? 'version'
+    if (seen.has(key)) {
+      throw errors.invalidSyntax(
+        `EXPECT VERSION names the ${key} plane twice; one statement carries at ` +
+          `most one guard per plane (§35.1)`,
+      )
+    }
+    seen.add(key)
+    out.push({ version, plane })
+  }
+  return out
+}
 
 /**
  * The stored stand-in for "this Assertion states no confidence".
@@ -1019,45 +1395,6 @@ export function checkRegistry(
   )
 }
 
-function transition(tx: Transaction, id: ElementId, to: string): void {
-  tx.authorizeElement(id, 'update')
-  const element = requireKind(tx, id, 'Activity')
-  if (TERMINAL.has(element.row.status)) {
-    // Terminal topology freezes with the Activity (§22.3): re-opening a
-    // finished process would let its provenance be rewritten after the fact.
-    throw errors.activityTerminal(
-      `${formatElementId(id)} is ${element.row.status} and cannot transition ` +
-        `to ${JSON.stringify(to)}`,
-    )
-  }
-  if (element.row.status === to) return
-  element.row.status = to
-  if (TERMINAL.has(to) && element.row.ended_at === '') {
-    element.row.ended_at = tx.cx.at
-  }
-  tx.markChanged(id, 'transition')
-}
-
-/** `ARCHIVE` / `TOMBSTONE` — engine state, never an epistemic claim (§80). */
-function changeState(
-  tx: Transaction,
-  id: ElementId,
-  state: string,
-  op: 'archive' | 'tombstone',
-): void {
-  const element = tx.load(id)
-  // §29: administratively excluding somebody else's claim is a different act
-  // from tidying one's own, and only the first is moderation. `archive` is
-  // still asked for — this is on top of it, not instead of it, so a moderator
-  // needs both and a Grant listing only `moderate_assertion` confers nothing.
-  if (element.kind === 'Assertion' && !tx.mayRepresentAssertion(element.row)) {
-    tx.require('moderate_assertion')
-  }
-  if (element.row.state === state) return
-  element.row.state = state
-  tx.markChanged(id, op)
-}
-
 /**
  * `MERGE CONCEPT ... INTO` — consolidating two records of one thing.
  *
@@ -1073,10 +1410,9 @@ function changeState(
  */
 function merge(
   tx: Transaction,
-  b: Bindings,
   sources: readonly ElementId[],
   targets: readonly ElementId[],
-  expectVersion: Scalar | null,
+  guards: readonly VersionGuard[],
 ): void {
   if (sources.length !== 1 || targets.length !== 1) {
     // Not a merge conflict — a selector problem. Identity is never chosen by
@@ -1095,9 +1431,7 @@ function merge(
       `${formatElementId(source)} cannot be merged into itself`,
     )
   }
-  if (expectVersion !== null) {
-    tx.expectVersion(source, numberOf(b, expectVersion, 'EXPECT VERSION'))
-  }
+  tx.expectVersions(source, guards)
 
   const from = requireKind(tx, source, 'Concept')
   requireKind(tx, target, 'Concept')
@@ -1247,7 +1581,7 @@ function requireKind<K extends ElementKind>(
 function resolveById(
   tx: Transaction,
   id: string,
-  schemaRef: string | null,
+  lineage: string | null,
 ): ElementId | null {
   const parsed = parseElementId(id)
   // The kind is spelled in the id the caller wrote, so saying so reveals
@@ -1263,7 +1597,8 @@ function resolveById(
   // simply not a match. Reported as no match rather than as a type mismatch,
   // which would let an id probe map the Space by reading the difference
   // (§86.4) — and an upsert by id may not create, so this still fails loudly.
-  if (schemaRef !== null && element.row.schema_ref !== schemaRef) return null
+  // Compared by lineage (§20.14): a Person under `1.0.0` is a Person.
+  if (lineage !== null && element.row.lineage !== lineage) return null
   return parsed
 }
 
@@ -1271,9 +1606,9 @@ function resolveById(
 function resolveByKey(
   tx: Transaction,
   key: string,
-  schemaRef: string | null,
+  lineage: string | null,
 ): ElementId | null {
-  const found = tx.store.conceptByKey(tx.cx.space, schemaRef, key)
+  const found = tx.store.conceptByKey(tx.cx.space, lineage, key)
   return found === null ? null : { kind: 'Concept', seq: found.id }
 }
 
@@ -1336,6 +1671,20 @@ class Fields {
         )
       }
     }
+    for (const name of GOVERNANCE_FIELDS) {
+      if (Object.hasOwn(map, name)) {
+        throw errors.protectedGovernanceField(
+          `\`${name}\` is Governance state (§31.3): it is assigned and enforced ` +
+            `by the control plane, never written by cognitive content and never ` +
+            `inferred from it`,
+        )
+      }
+    }
+  }
+
+  /** Whether the map still carries a field nothing has taken. */
+  has(name: string): boolean {
+    return Object.hasOwn(this.map, name)
   }
 
   private take(name: string): Json | undefined {
@@ -1467,6 +1816,14 @@ class Fields {
  * Governance plane exists to close.
  */
 const PROTECTED_FIELDS = ['_system', 'governance', 'space_id', 'space_seq']
+
+/**
+ * The Governance members a command might try to write as if they were fields
+ * (§31.3). Refused under their own code: `authority_class` is the ceiling on
+ * how far a memory may influence action, and content that could set it would
+ * be granting itself authority — the laundering §28.1 exists to close.
+ */
+export const GOVERNANCE_FIELDS = ['authority_class', 'classification', 'authority_lineage']
 
 /** The subset of Concept fields an `UPSERT` may rewrite. */
 function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): void {
@@ -1800,6 +2157,7 @@ function blank(id: ElementId) {
     space: '',
     state: State.ACTIVE,
     version: 0,
+    plane_versions: emptyPlanes(),
     seq: 0,
     created_at: '',
     updated_at: '',
@@ -1917,9 +2275,10 @@ function authorizeRetention(tx: Transaction, retention: JsonMap): void {
  *
  * §19.1 gives the retention hook its `legal_hold` member and §60.3 states what
  * it does: a held element may not be purged, by anyone, whatever the reference
- * policy says. §60.3 then draws the conclusion this gate implements — because a
- * hold blocks erasure for everyone, the authority to set or lift one SHOULD be
- * scoped apart from ordinary retention management.
+ * policy says. §29.9 then names the authority this gate asks for —
+ * `manage_legal_hold`, distinct from `manage_retention` — because a hold
+ * blocks erasure for everyone, and the authority to set or lift one must not
+ * be reachable through ordinary cognitive writes.
  *
  * Both directions are gated. *Placing* a hold is that authority. *Lifting* one
  * is a writer evading deletion — and lifting does not require naming the
@@ -1933,7 +2292,7 @@ function authorizeLegalHold(
   next: JsonMap,
 ): void {
   const held = (block: JsonMap) => block.legal_hold === true
-  if (held(next) || held(current)) tx.require('legal_hold')
+  if (held(next) || held(current)) tx.require('manage_legal_hold')
 }
 
 /**

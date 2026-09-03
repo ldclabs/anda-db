@@ -20,6 +20,7 @@
 //!   `atomic` (§75.4).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::ast::{Command, CommandType, Json, Map};
 use crate::error::{ErrorObject, KipError, KipErrorCode};
@@ -56,8 +57,12 @@ pub mod limits {
     pub const RISK: usize = 128;
     /// `context.locale`.
     pub const LOCALE: usize = 64;
-    /// `ingest.evidence[].source_actor`.
+    /// `ElementReference.id` — `ingest.evidence[].source_actor` by id.
     pub const SOURCE_ACTOR: usize = 512;
+    /// `ElementReference.type` and `.key`.
+    pub const ELEMENT_REFERENCE_KEY: usize = 1024;
+    /// A Facet name in `ingest.evidence[].facets`.
+    pub const FACET_NAME: usize = 512;
     /// `ingest.evidence[].client_key`.
     pub const CLIENT_KEY: usize = 1024;
 }
@@ -292,6 +297,40 @@ impl Request {
         }
         if let Some(ingest) = &self.ingest {
             ingest.validate()?;
+            // §71.1 mints each entry "inside the request's transaction scope"
+            // and makes ingestion transactional. A request whose operations are
+            // all reads opens no such scope, so the Evidence would be minted
+            // nowhere while the request still answered `succeeded` — and the
+            // caller would go on believing the observation was recorded, which
+            // is precisely the fidelity failure §88.12 has ingestion exist to
+            // prevent.
+            //
+            // Only refused once every operation parsed. A command that does not
+            // parse should still report its own syntax error rather than being
+            // recast as an envelope fault.
+            //
+            // The scan stops at the first mutation and keeps no command: the
+            // question is whether *some* operation opens a transaction, and
+            // the executor parses them all again anyway.
+            let mut every_operation_parsed = true;
+            let mut opens_a_transaction = false;
+            for operation in &self.operations {
+                match operation.parse() {
+                    Ok(command) if command.is_mutation() => {
+                        opens_a_transaction = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => every_operation_parsed = false,
+                }
+            }
+            if every_operation_parsed && !opens_a_transaction {
+                return Err(KipError::invalid_request_envelope(
+                    "an `ingest` block mints Evidence inside the request's transaction, so the \
+                     request must carry at least one KML operation; a read-only request would \
+                     drop the observation while reporting success",
+                ));
+            }
         }
 
         Ok(())
@@ -397,7 +436,8 @@ pub struct SpaceSelector {
 pub struct Execution {
     /// The execution mode.
     pub mode: ExecutionMode,
-    /// What to do when an operation fails; meaningful mainly for `sequence`.
+    /// What to do when an operation fails; meaningful for `sequence`, and
+    /// `stop` when absent (§75.2). Atomic execution aborts unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_error: Option<OnError>,
     /// The requested isolation guarantee. An unsupported stronger guarantee
@@ -422,6 +462,11 @@ impl Execution {
             idempotency_key: None,
             extensions: None,
         }
+    }
+
+    /// The error policy in force: what was declared, else `stop` (§75.2).
+    pub fn effective_on_error(&self) -> OnError {
+        self.on_error.unwrap_or_default()
     }
 }
 
@@ -448,10 +493,12 @@ impl ExecutionMode {
 }
 
 /// What a `sequence` run does after a failure (Spec §75.2).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum OnError {
-    /// Stop at the first failure.
+    /// Stop at the first failure; the operations not started are reported
+    /// `skipped`. The default.
+    #[default]
     Stop,
     /// Keep going. Illegal under `atomic`.
     Continue,
@@ -701,6 +748,57 @@ impl IngestContext {
     }
 }
 
+/// A same-Space element reference on the wire: by exact id, or by Concept
+/// Type lineage plus key (Spec §7.2, §20.14). Names are never references.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ElementReference {
+    /// The exact element id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The Concept Type — local name or exact reference — resolved through
+    /// the symbol lineage.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// The Space-local logical key within that type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl ElementReference {
+    /// A reference by exact id.
+    pub fn by_id(id: impl Into<String>) -> Self {
+        Self {
+            id: Some(id.into()),
+            r#type: None,
+            key: None,
+        }
+    }
+
+    /// A reference by Concept Type lineage plus key.
+    pub fn by_key(r#type: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            r#type: Some(r#type.into()),
+            key: Some(key.into()),
+        }
+    }
+
+    /// Checks that the reference takes exactly one of its two shapes.
+    pub fn validate(&self, what: &str) -> Result<(), KipError> {
+        match (&self.id, &self.r#type, &self.key) {
+            (Some(id), None, None) => validate_bounded(id, what, limits::SOURCE_ACTOR),
+            (None, Some(r#type), Some(key)) => {
+                validate_bounded(r#type, what, limits::ELEMENT_REFERENCE_KEY)?;
+                validate_bounded(key, what, limits::ELEMENT_REFERENCE_KEY)
+            }
+            _ => Err(KipError::invalid_request_envelope(format!(
+                "{what} is an element reference: {{id}} or {{type, key}}, never a name"
+            ))),
+        }
+    }
+}
+
 /// One Evidence entry to mint inside the request's transaction scope.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -721,13 +819,20 @@ pub struct IngestEvidence {
     /// When the observation happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
-    /// The semantic source actor — recorded as Evidence source, never as
-    /// Principal identity (§88.1).
+    /// The semantic source actor, as an element reference — recorded as the
+    /// Evidence's `source`, never as Principal identity and never resolved by
+    /// name (§71.1, §88.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_actor: Option<String>,
+    pub source_actor: Option<ElementReference>,
     /// A retry-safe logical identity for the minted Evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
+    /// Facet name (local or exact ref) to value object, validated exactly as
+    /// `SET FACET` on `CREATE EVIDENCE` would be (§71.1). This is how
+    /// instrumentation attaches `OutcomeRecord` to an ingested `outcome`
+    /// without re-typing anything.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facets: BTreeMap<String, Map<String, Json>>,
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
@@ -754,12 +859,13 @@ impl IngestEvidence {
         )?;
         validate_optional_non_empty(&self.media_type, "ingest media_type", limits::SHORT_LABEL)?;
         validate_optional_non_empty(&self.observed_at, "ingest observed_at", limits::SHORT_LABEL)?;
-        validate_optional_non_empty(
-            &self.source_actor,
-            "ingest source_actor",
-            limits::SOURCE_ACTOR,
-        )?;
+        if let Some(source_actor) = &self.source_actor {
+            source_actor.validate("ingest source_actor")?;
+        }
         validate_optional_non_empty(&self.client_key, "ingest client_key", limits::CLIENT_KEY)?;
+        for facet in self.facets.keys() {
+            validate_bounded(facet, "ingest facets name", limits::FACET_NAME)?;
+        }
         validate_extensions(&self.extensions, "ingest evidence extensions")?;
         match (&self.payload, &self.payload_artifact) {
             (Some(_), None) | (None, Some(_)) => Ok(()),
@@ -1064,6 +1170,10 @@ pub struct ResponseExecution {
     /// The isolation that was actually provided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<String>,
+    /// Echo of the request's idempotency key when one was given, so an
+    /// `outcome_unknown` response can be recovered by key (§80.4, §81).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
@@ -1092,6 +1202,11 @@ pub struct OperationResult {
     /// The cursor to continue from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// The operation's own transaction Receipt in `sequence` and
+    /// `independent` modes (§75); absent in `atomic` mode, where the
+    /// top-level receipt is the transaction's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Receipt>,
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
@@ -1353,9 +1468,32 @@ pub struct Receipt {
     /// Signatures over the receipt (§33.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proofs: Vec<Json>,
+    /// The canonical digest of the Receipt without `receipt_digest` and
+    /// `proofs` (§33.2); a signed Receipt signs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_digest: Option<String>,
+    /// The Principal the commit was attributed to, the ActorBinding it
+    /// exercised and the delegation chain it acted under (§33.2), so an
+    /// auditor can tie the Receipt to the Governance decision without
+    /// reading the audit log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ReceiptOrigin>,
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
+}
+
+/// Who a commit was attributed to (Spec §33.2).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ReceiptOrigin {
+    /// The authenticated Principal.
+    pub principal_id: String,
+    /// The ActorBinding exercised (§28.3), when one was.
+    #[serde(default)]
+    pub actor_binding_id: Option<String>,
+    /// The digest of the delegation chain acted under (§28.5), when any.
+    #[serde(default)]
+    pub delegation_digest: Option<String>,
 }
 
 /// What a transaction did (Spec §33.2).
@@ -1438,7 +1576,7 @@ mod tests {
         // requested dry run into a durable write.
         let bad_request = serde_json::json!({
             "kip": "2.0",
-            "operations": [{"command": "ARCHIVE :x"}],
+            "operations": [{"command": "TRANSITION :x TO \"archived\""}],
             "option": {"dry_run": true}
         });
         assert!(serde_json::from_value::<Request>(bad_request).is_err());
@@ -1455,7 +1593,7 @@ mod tests {
         let bad_operation_option = serde_json::json!({
             "kip": "2.0",
             "operations": [{
-                "command": "ARCHIVE :x",
+                "command": "TRANSITION :x TO \"archived\"",
                 "options": {"dry_run": true}
             }]
         });
@@ -1625,8 +1763,10 @@ mod tests {
 
     #[test]
     fn an_atomic_transaction_cannot_continue_past_an_error() {
-        let mut request = Request::single("ARCHIVE :a");
-        request.operations.push(Operation::new("ARCHIVE :b"));
+        let mut request = Request::single(r#"TRANSITION :a TO "archived""#);
+        request
+            .operations
+            .push(Operation::new(r#"TRANSITION :b TO "archived""#));
         request.execution = Some(Execution {
             on_error: Some(OnError::Continue),
             ..Execution::new(ExecutionMode::Atomic)
@@ -1645,14 +1785,14 @@ mod tests {
         // Spec §73.1 / §88.3: the parsed command is authoritative.
         let operation = Operation {
             language: Some(CommandType::Kql),
-            ..Operation::new(r#"TOMBSTONE :x"#)
+            ..Operation::new(r#"TRANSITION :x TO "tombstoned""#)
         };
         let err = operation.parse().expect_err("mislabelled write");
         assert_eq!(err.code, KipErrorCode::LanguageMismatch);
 
         let honest = Operation {
             language: Some(CommandType::Kml),
-            ..Operation::new(r#"TOMBSTONE :x"#)
+            ..Operation::new(r#"TRANSITION :x TO "tombstoned""#)
         };
         assert!(honest.parse().unwrap().is_mutation());
     }
@@ -1690,13 +1830,13 @@ mod tests {
             "explicit_transaction": false,
             "clauses": [{"Update": {
                 "target": {"Handle": "a"},
-                "expect_version": Json::Null,
                 "actions": [{"SetFields": [["confidence", {"Value": {"Number": 0.1}}]]}],
                 "where_clauses": [{"Assertion": {
                     "variable": "a",
                     "matcher": {"id": {"Literal": {"String": "A-1"}}}
                 }}],
-                "limit": Json::Null
+                "limit": Json::Null,
+                "expect_versions": []
             }}]
         }});
         let write_engine_truth = serde_json::json!({"Kml": {
@@ -1711,7 +1851,7 @@ mod tests {
             "explicit_transaction": false,
             "clauses": [{"Purge": {
                 "target": {"Param": "x"}, "where_clauses": Json::Null, "limit": Json::Null,
-                "reference_policy": Json::Null, "confirm": ""
+                "expect_versions": [], "reference_policy": Json::Null, "confirm": ""
             }}]
         }});
         let belief_as_an_export_selector = serde_json::json!({"Meta": {"ExportCapsule": {
@@ -1738,7 +1878,7 @@ mod tests {
 
         // A tree that the parser would have produced still round-trips.
         let honest = Operation {
-            ast: Some(parse_kip(r#"ARCHIVE :old"#).unwrap()),
+            ast: Some(parse_kip(r#"TRANSITION :old TO "archived""#).unwrap()),
             ..Default::default()
         };
         assert!(honest.parse().unwrap().is_mutation());
@@ -1795,6 +1935,53 @@ mod tests {
     }
 
     #[test]
+    fn an_ingest_block_needs_a_transaction_to_be_minted_into() {
+        // §71.1 mints each entry inside the request's transaction scope, and
+        // makes ingestion transactional. A read-only request opens no such
+        // scope: minting nothing while answering `succeeded` would leave the
+        // caller believing the observation was recorded, which is the fidelity
+        // failure ingestion exists to prevent.
+        let ingest = IngestContext {
+            evidence: vec![IngestEvidence {
+                key: "msg".into(),
+                evidence_class: "user_statement".into(),
+                payload: Some(Json::from("I prefer dark mode.")),
+                ..Default::default()
+            }],
+            extensions: None,
+        };
+
+        let mut read = Request::single(r#"FIND(?x) WHERE { ?x {type: "T"} }"#);
+        read.ingest = Some(ingest.clone());
+        let err = read
+            .validate()
+            .expect_err("a read has nothing to mint into");
+        assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope);
+
+        let mut write = Request::single(
+            r#"ASSERT (:alice, "prefers", :dark) { by: :alice, mode: "stated", evidence: :msg }"#,
+        );
+        write.ingest = Some(ingest.clone());
+        write.validate().expect("a KML operation carries the mint");
+
+        // One KML operation among reads is enough: the transaction it opens is
+        // the scope, and which operation opened it is not the caller's problem.
+        let mut mixed = Request::single("DESCRIBE PRIMER");
+        mixed
+            .operations
+            .push(Operation::new(r#"CREATE CONCEPT ?c { TYPE "T" NAME "n" }"#));
+        mixed.execution = Some(Execution {
+            mode: ExecutionMode::Sequence,
+            on_error: None,
+            isolation: None,
+            idempotency_key: None,
+            extensions: None,
+        });
+        mixed.ingest = Some(ingest);
+        mixed.validate().expect("one mutation is a transaction");
+    }
+
+    #[test]
     fn a_partial_batch_is_not_a_failed_batch() {
         // Spec §75.2: under `sequence`, earlier commits are durable. Reporting
         // the whole request as failed invites a caller to re-issue them.
@@ -1834,7 +2021,7 @@ mod tests {
                 isolation: Some("serializable".into()),
                 ..Execution::new(ExecutionMode::Atomic)
             }),
-            operations: vec![Operation::new(r#"ARCHIVE :x"#).with_op_id("op-1")],
+            operations: vec![Operation::new(r#"TRANSITION :x TO "archived""#).with_op_id("op-1")],
             options: Some(RequestOptions {
                 deadline_ms: Some(10_000),
                 ..Default::default()
@@ -1863,6 +2050,8 @@ mod tests {
                 schema_environment_version: None,
                 change_summary: None,
                 proofs: vec![],
+                receipt_digest: None,
+                origin: None,
                 extensions: None,
             }),
             warnings: vec![Warning::Message("search index lagged".into())],

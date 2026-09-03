@@ -384,7 +384,7 @@ export class CognitiveNexus {
   describePage(
     command: string,
     params: JsonMap = {},
-  ): { result: Json; nextCursor: string | null } {
+  ): { result: Json; nextCursor: string | null; truncated: boolean } {
     return this.systemSession().describePage(command, params)
   }
 
@@ -495,9 +495,9 @@ export class CognitiveNexus {
 /**
  * The `read` block of a request envelope (§85).
  *
- * A snapshot token binds a read to the coordinate a previous `SNAPSHOT`
- * reported, which is how a caller makes several requests answer at one
- * coordinate rather than at whatever each of them happens to find.
+ * A snapshot token binds a read to the coordinate a previous `DESCRIBE
+ * SNAPSHOT` reported, which is how a caller makes several requests answer at
+ * one coordinate rather than at whatever each of them happens to find.
  */
 export interface ReadOptions {
   snapshot_token?: string
@@ -576,7 +576,7 @@ export class Session {
   describePage(
     command: string,
     params: JsonMap = {},
-  ): { result: Json; nextCursor: string | null } {
+  ): { result: Json; nextCursor: string | null; truncated: boolean } {
     const parsed: Command = parseKip(command)
     if (!('Meta' in parsed)) {
       throw errors.languageMismatch('this command is not a META command')
@@ -584,7 +584,7 @@ export class Session {
     const space = this.nexus.space
     const authority = this.effectiveAuthority(space)
     const decisions = this.gate(authority, metaPermissions(parsed.Meta))
-    const page: { next_cursor?: string } = {}
+    const page: { next_cursor?: string; truncated?: boolean } = {}
     const cx: MetaContext = {
       store: this.nexus.store,
       space,
@@ -603,7 +603,9 @@ export class Session {
       this.consume(decisions)
       return answer
     })
-    return { result, nextCursor: page.next_cursor ?? null }
+    // §63.5: `truncated` says a LIST DEPENDENTS walk was cut short by an
+    // element this caller may not discover, without saying where.
+    return { result, nextCursor: page.next_cursor ?? null, truncated: page.truncated === true }
   }
 
   /** Runs one parsed KQL query, reporting its coordinates and page cursor. */
@@ -1294,7 +1296,10 @@ function requirePermittedForReplay(decision: Authorization): void {
  *   replay that invented them would be worse than one that says nothing.
  */
 function replay(row: TransactionRow): Outcome {
-  const result = (row.result ?? {}) as { handles?: Record<string, string> }
+  const result = (row.result ?? {}) as {
+    handles?: Record<string, string>
+    actor_binding_id?: string | null
+  }
   return {
     status: row.status === 'committed' ? 'committed' : 'no_effect',
     tx_id: row.tx_id,
@@ -1305,6 +1310,7 @@ function replay(row: TransactionRow): Outcome {
     schema_environment_version: row.schema_environment_version,
     handles: result.handles ?? {},
     changes: row.changes,
+    actor_binding_id: result.actor_binding_id ?? null,
     warnings: [
       `this is the recorded outcome of transaction ${row.tx_id}, replayed ` +
         `under the idempotency key it committed with: nothing ran a second ` +

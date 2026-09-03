@@ -50,3 +50,13 @@ dropped for the same reason: they are engine truth, not behaviour.
 
 Everything else is compared exactly. A fixture that had to be loose about its
 expected values would not be pinning anything down.
+
+**The counter is global and the walk is sorted by key.** `C:<1>`, `P:<2>`,
+`A:<3>` — one sequence across every kind, in the order a sorted-key walk of the
+answer reaches each id. So inside a change entry the element's own `id` is
+numbered before anything under `refs`, because `id` sorts before `refs`. Write
+the ordinal that walk actually produces: the TypeScript harness compares it
+literally, while the Rust one re-numbers a fixture's placeholders through the
+same aliasing and so tolerates a wrong ordinal. A fixture that satisfies the
+literal reading passes under both; one that does not looks like an engine
+divergence when it is an authoring slip.

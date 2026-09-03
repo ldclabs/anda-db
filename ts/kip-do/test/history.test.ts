@@ -56,7 +56,7 @@ describe('AS OF', () => {
   it('reads the lifecycle state of the coordinate, not of today', async () => {
     await withNexus('lifecycle', (nexus) => {
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
-      nexus.execute('ARCHIVE "C-1"')
+      nexus.execute('TRANSITION "C-1" TO "archived"')
 
       // A pattern matches active elements unless it says otherwise, and what
       // was active is a question about the coordinate: the index that says
@@ -68,21 +68,32 @@ describe('AS OF', () => {
     })
   })
 
-  it('names a coordinate by transaction as well as by sequence', async () => {
+  it('resolves a transaction id to its coordinate through DESCRIBE TRANSACTION', async () => {
+    // §48.1: AS OF SEQ is the only historical axis. A transaction id resolves
+    // to its sequence through DESCRIBE TRANSACTION, so a historical read
+    // always names the exact coordinate it was served from.
     await withNexus('by-tx', (nexus) => {
       const receipt = nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
       nexus.execute('UPDATE "C-1" SET FIELDS { name: "Alicia" }')
 
+      const described = nexus.describe('DESCRIBE TRANSACTION :tx', {
+        tx: receipt.tx_id,
+      }) as { seq: number }
+      expect(described.seq).toBe(1)
       expect(
-        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TX :tx', {
-          tx: receipt.tx_id,
+        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF SEQ :seq', {
+          seq: described.seq,
         }),
       ).toEqual(['Alice'])
       // An unknown transaction names no coordinate — refusing beats answering
       // about the present under a name that meant something else.
       expect(() =>
-        nexus.query('FIND(?c) WHERE { ?c CONCEPT {} } AS OF TX :tx', { tx: 'tx-nope' }),
+        nexus.describe('DESCRIBE TRANSACTION :tx', { tx: 'tx-nope' }),
       ).toThrowError(/no transaction/)
+      // And the grammar no longer admits the removed axes at all.
+      expect(() =>
+        nexus.query('FIND(?c) WHERE { ?c CONCEPT {} } AS OF TX :tx', { tx: 'x' }),
+      ).toThrowError()
     })
   })
 
@@ -131,7 +142,7 @@ describe('AS OF', () => {
           SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
         }
       }`)
-      nexus.execute('RETRACT ASSERTION "A-1"')
+      nexus.execute('TRANSITION "A-1" TO "retracted"')
 
       const STATUS =
         'FIND(?b.status) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }'
@@ -212,27 +223,87 @@ describe('AS OF', () => {
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
       const before = nexus.environment().version
       nexus.activatePackages([])
-      const snapshot = nexus.describe('SNAPSHOT') as {
-        snapshot_seq: number
+      const snapshot = nexus.describe('DESCRIBE SNAPSHOT') as {
+        space_seq: number
         schema_environment_version: number
       }
-      expect(snapshot.snapshot_seq).toBe(2)
+      expect(snapshot.space_seq).toBe(2)
       expect(snapshot.schema_environment_version).toBe(before + 1)
     })
   })
 })
 
-describe('SNAPSHOT', () => {
+describe('DESCRIBE SNAPSHOT', () => {
+  it('describes a coordinate: the sequence, the transaction that committed it, and when', async () => {
+    // §68: a snapshot coordinate is a description, not only a token. The
+    // transaction id it names is what DESCRIBE TRANSACTION resolves back.
+    await withNexus('coordinate', (nexus) => {
+      const empty = nexus.describe('DESCRIBE SNAPSHOT') as {
+        space_id: string
+        space_seq: number
+        tx_id: string | null
+        committed_at: string | null
+      }
+      // Before the first commit: coordinate 0, and nothing committed it.
+      expect(empty.space_seq).toBe(0)
+      expect(empty.tx_id).toBeNull()
+      expect(empty.committed_at).toBeNull()
+
+      const receipt = nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      const head = nexus.describe('DESCRIBE SNAPSHOT') as typeof empty
+      expect(head.space_id).toBe(nexus.space)
+      expect(head.space_seq).toBe(1)
+      expect(head.tx_id).toBe(receipt.tx_id)
+      expect(head.committed_at).toBe(receipt.committed_at)
+
+      // A past coordinate, named by sequence.
+      nexus.execute('UPDATE "C-1" SET FIELDS { name: "Alicia" }')
+      const past = nexus.describe('DESCRIBE SNAPSHOT AS OF SEQ 1') as typeof empty
+      expect(past.space_seq).toBe(1)
+      expect(past.tx_id).toBe(receipt.tx_id)
+      // A coordinate the Space has not reached is refused, never rounded.
+      expect(() => nexus.describe('DESCRIBE SNAPSHOT AS OF SEQ 9999')).toThrowError(
+        /names no coordinate/,
+      )
+    })
+  })
+
+  it('resolves an instant to the last sequence committed at or before it', async () => {
+    // §48.1, §68: this is how wall-clock time enters AS OF SEQ. The engine
+    // never guesses which of several sequences an instant means; the caller
+    // reads the coordinate and names it.
+    await withNexus('at-time', (nexus) => {
+      const first = nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
+      const second = nexus.execute('UPDATE "C-1" SET FIELDS { name: "Alicia" }')
+      const at = (t: string) =>
+        nexus.describe('DESCRIBE SNAPSHOT AT TIME :t', { t }) as {
+          space_seq: number
+          tx_id: string | null
+        }
+
+      // Before anything was committed: coordinate 0, an empty Space and not
+      // an error.
+      expect(at('2000-01-01T00:00:00Z').space_seq).toBe(0)
+      // At the first commit's own instant, that commit; after the second,
+      // the second.
+      expect(at(first.committed_at!).space_seq).toBeGreaterThanOrEqual(1)
+      expect(at(second.committed_at!).space_seq).toBe(2)
+      expect(at(second.committed_at!).tx_id).toBe(second.tx_id)
+      expect(at('2999-01-01T00:00:00Z').space_seq).toBe(2)
+      expect(() => nexus.describe('DESCRIBE SNAPSHOT AT TIME "yesterday"')).toThrowError()
+    })
+  })
+
   it('issues a token that binds a later read to its coordinate', async () => {
     await withNexus('token', (nexus) => {
       nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
-      const snapshot = nexus.describe('SNAPSHOT') as {
-        snapshot_seq: number
+      const snapshot = nexus.describe('DESCRIBE SNAPSHOT') as {
+        space_seq: number
         snapshot_token: string
       }
       nexus.execute('UPDATE "C-1" SET FIELDS { name: "Alicia" }')
 
-      expect(snapshot.snapshot_seq).toBe(1)
+      expect(snapshot.space_seq).toBe(1)
       expect(
         nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} }', {}, {
           snapshot_token: snapshot.snapshot_token,
@@ -241,17 +312,21 @@ describe('SNAPSHOT', () => {
     })
   })
 
-  it('refuses a token issued for another Space', async () => {
+  it('refuses a token issued for another Space, as a malformed snapshot cursor', async () => {
     await withNexus('cross-space', (nexus) => {
-      const snapshot = nexus.describe('SNAPSHOT') as { snapshot_token: string }
-      const elsewhere = CognitiveNexus.connect
-      void elsewhere
+      const snapshot = nexus.describe('DESCRIBE SNAPSHOT') as { snapshot_token: string }
       // The token carries its Space, because the same sequence means something
-      // entirely different in another one.
+      // entirely different in another one. §87.7: the refusal names the
+      // family and the reason.
       const forged = Buffer.from('kip:snapshot:kip:space:other:1').toString('hex')
-      expect(() =>
-        nexus.query('FIND(?c) WHERE { ?c CONCEPT {} }', {}, { snapshot_token: forged }),
-      ).toThrowError(/issued for Space/)
+      let refused: { code: string; details?: unknown } | null = null
+      try {
+        nexus.query('FIND(?c) WHERE { ?c CONCEPT {} }', {}, { snapshot_token: forged })
+      } catch (err) {
+        refused = err as { code: string; details?: unknown }
+      }
+      expect(refused?.code).toBe('CursorInvalid')
+      expect(refused?.details).toEqual({ family: 'snapshot', reason: 'malformed' })
       expect(snapshot.snapshot_token).not.toBe(forged)
     })
   })
@@ -259,7 +334,7 @@ describe('SNAPSHOT', () => {
   it('refuses a request whose token and command name different coordinates', async () => {
     await withNexus('disagreement', (nexus) => {
       nexus.execute('CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" }')
-      const snapshot = nexus.describe('SNAPSHOT') as { snapshot_token: string }
+      const snapshot = nexus.describe('DESCRIBE SNAPSHOT') as { snapshot_token: string }
       nexus.execute('CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }')
 
       // One read answers at one coordinate: an answer whose own `snapshot_seq`

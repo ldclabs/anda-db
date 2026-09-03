@@ -72,12 +72,14 @@ export type {
   UpdateFunction,
   ExecUpdateStatement as UpdateStatement,
   ExecUpdateAction as UpdateAction,
-  RetractAssertion,
-  SupersedeAssertion,
-  CorrectEvidence,
-  TransitionActivity,
+  // The one lifecycle statement (Spec §52.5): `TO` names the move, the
+  // engine validates it against the target's kind and current state.
+  Transition,
+  // `EXPECT VERSION n [OF plane]` (Spec §35.1). Every mutation carries a list
+  // of these, one guard per plane.
+  ExpectVersion,
+  VersionPlane,
   SetRetention,
-  RemovalStatement,
   ExecPurgeStatement as PurgeStatement,
   ExecPurgePayloadStatement as PurgePayloadStatement,
   MergeConcept,
