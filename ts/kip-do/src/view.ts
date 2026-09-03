@@ -22,7 +22,7 @@
  * engine sends nothing would compare unequal across the two engines.
  */
 
-import { formatElementId, tagOf, type ElementId } from './id.js'
+import { formatElementId, type ElementId } from './id.js'
 import { isJsonMap, type Json, type JsonMap } from './json.js'
 import type { PathStep } from './kip/ast.js'
 import {
@@ -251,6 +251,3 @@ function resolveMember(
   }
   return name
 }
-
-/** The element id tag, for the `IS_KIND` filter function. */
-export const kindTag = (id: ElementId): string => tagOf(id.kind)

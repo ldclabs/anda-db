@@ -509,13 +509,68 @@ async fn a_structural_pattern_reads_record_topology() {
 }
 
 #[tokio::test]
-async fn ordering_by_an_aggregate_is_refused_rather_than_silently_ignored() {
+async fn an_aggregate_groups_by_the_projected_expressions() {
     let nexus = seeded("unit").await;
-    // `ORDER BY COUNT(?a)` is a grouped sort. The engine has no grouping, and
-    // the failure mode it replaced is the dangerous one: the aggregation was
-    // dropped and the rows came back sorted by the bare variable, which is a
+    // §44.6: grouping is implicit — the non-aggregated projected expressions
+    // are the key. A plain variable beside an aggregate is one row per group,
+    // not one global row with a variable picked out of whichever solution
+    // happened to come first.
+    let counts = ok(
+        &nexus,
+        r#"FIND(?c.name, COUNT(?a))
+           WHERE {
+             ?c CONCEPT {type: "Person"}
+             ?a ASSERTION {asserted_by: ?c}
+           }
+           ORDER BY ?c.name"#,
+    )
+    .await;
+    let rows = counts.as_array().expect("one row per group").clone();
+    assert!(!rows.is_empty());
+    for row in &rows {
+        let pair = row.as_array().expect("name and count");
+        assert!(pair[0].is_string(), "{pair:?}");
+        assert!(pair[1].as_u64().is_some_and(|count| count > 0), "{pair:?}");
+    }
+    // Ascending by name, which is what the ORDER BY asked for.
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row[0].as_str().unwrap_or_default())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted);
+}
+
+#[tokio::test]
+async fn ordering_by_an_aggregate_orders_the_groups_it_counts() {
+    let nexus = seeded("unit").await;
+    // `ORDER BY COUNT(?a)` is a grouped sort over an aggregate the caller did
+    // not project. The failure mode it replaced is the dangerous one: the
+    // aggregation dropped and the rows sorted by the bare variable, which is a
     // plausible-looking answer to a question nobody asked.
-    let response = run(
+    let ordered = ok(
+        &nexus,
+        r#"FIND(?c.name, COUNT(?a))
+           WHERE {
+             ?c CONCEPT {type: "Person"}
+             ?a ASSERTION {asserted_by: ?c}
+           }
+           ORDER BY COUNT(?a) DESC"#,
+    )
+    .await;
+    let counts: Vec<u64> = ordered
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[1].as_u64().unwrap_or_default())
+        .collect();
+    let mut descending = counts.clone();
+    descending.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(counts, descending);
+
+    // And the aggregate does not have to be projected to be sorted by.
+    let names = ok(
         &nexus,
         r#"FIND(?c.name)
            WHERE {
@@ -525,14 +580,28 @@ async fn ordering_by_an_aggregate_is_refused_rather_than_silently_ignored() {
            ORDER BY COUNT(?a) DESC"#,
     )
     .await;
+    assert!(names.as_array().is_some_and(|rows| !rows.is_empty()));
+}
+
+#[tokio::test]
+async fn a_sort_key_that_varies_inside_a_group_is_refused() {
+    let nexus = seeded("unit").await;
+    // Grouping makes the projected expressions the only values a group has, so
+    // a key that varies inside one has nothing to sort by — and picking a row
+    // to read it from would be inventing an answer.
+    let response = run(
+        &nexus,
+        r#"FIND(?c.name, COUNT(?a))
+           WHERE {
+             ?c CONCEPT {type: "Person"}
+             ?a ASSERTION {asserted_by: ?c}
+           }
+           ORDER BY ?a.confidence"#,
+    )
+    .await;
     assert_eq!(response.status, TopLevelStatus::Failed);
     let error = response.error.expect("a refusal carries an error");
-    assert_eq!(error.code, "UnsupportedCapability");
-    assert!(
-        error.message.contains("ORDER BY over an aggregate"),
-        "{}",
-        error.message
-    );
+    assert_eq!(error.code, "ConstraintViolation");
 }
 
 #[tokio::test]

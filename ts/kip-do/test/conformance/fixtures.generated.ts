@@ -456,6 +456,16 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
+        "name": "and so does an Activity status, whether it is written or bound",
+        "command": "CREATE ACTIVITY ?a { SET FIELDS {activity_class: \"test\", status: :s} }",
+        "params": {
+          "s": "banana"
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        }
+      },
+      {
         "name": "a CLIENT KEY makes a resend a retry rather than a second creation",
         "command": "FIND(COUNT(?e)) WHERE { ?e EVIDENCE {evidence_class: \"user_statement\"} }",
         "expect": {
@@ -1065,11 +1075,10 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
+              "kip": "2.0",
               "space_id": "kip:space:default",
               "space_seq": 1,
               "transaction_class": "cognitive",
-              "status": "committed",
-              "snapshot_seq": 0,
               "schema_environment_version": 1,
               "changes": [
                 {
@@ -1081,14 +1090,19 @@ export const FIXTURES: readonly Fixture[] = [
                     "proposition": "P:<2>"
                   }
                 }
-              ]
+              ],
+              "extensions": {
+                "anda/transition": {
+                  "snapshot_seq": 0,
+                  "status": "committed"
+                }
+              }
             },
             {
+              "kip": "2.0",
               "space_id": "kip:space:default",
               "space_seq": 2,
               "transaction_class": "cognitive",
-              "status": "committed",
-              "snapshot_seq": 1,
               "schema_environment_version": 1,
               "changes": [
                 {
@@ -1109,7 +1123,13 @@ export const FIXTURES: readonly Fixture[] = [
                     "fields.status"
                   ]
                 }
-              ]
+              ],
+              "extensions": {
+                "anda/transition": {
+                  "snapshot_seq": 1,
+                  "status": "committed"
+                }
+              }
             }
           ]
         }
@@ -1121,11 +1141,10 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
+              "kip": "2.0",
               "space_id": "kip:space:default",
               "space_seq": 2,
               "transaction_class": "cognitive",
-              "status": "committed",
-              "snapshot_seq": 1,
               "schema_environment_version": 1,
               "changes": [
                 {
@@ -1146,7 +1165,13 @@ export const FIXTURES: readonly Fixture[] = [
                     "fields.status"
                   ]
                 }
-              ]
+              ],
+              "extensions": {
+                "anda/transition": {
+                  "snapshot_seq": 1,
+                  "status": "committed"
+                }
+              }
             }
           ]
         }
@@ -1158,11 +1183,10 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
+              "kip": "2.0",
               "space_id": "kip:space:default",
               "space_seq": 2,
               "transaction_class": "cognitive",
-              "status": "committed",
-              "snapshot_seq": 1,
               "schema_environment_version": 1,
               "changes": [
                 {
@@ -1183,7 +1207,13 @@ export const FIXTURES: readonly Fixture[] = [
                     "fields.status"
                   ]
                 }
-              ]
+              ],
+              "extensions": {
+                "anda/transition": {
+                  "snapshot_seq": 1,
+                  "status": "committed"
+                }
+              }
             }
           ]
         }
@@ -1200,6 +1230,47 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "HISTORY ELEMENT \"C-999\"",
         "expect": {
           "error": "NotFoundOrNotVisible"
+        }
+      },
+      {
+        "name": "a write under an idempotency key is recoverable by it",
+        "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Recoverable\" }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "idempotency_key": "history:recover"
+          }
+        },
+        "expect": {}
+      },
+      {
+        "name": "and the description is the envelope shape plus whether it committed",
+        "command": "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY \"history:recover\"",
+        "expect": {
+          "result": {
+            "kip": "2.0",
+            "space_id": "kip:space:default",
+            "space_seq": 3,
+            "snapshot_seq": 2,
+            "status": "committed",
+            "transaction_class": "cognitive",
+            "schema_environment_version": 1,
+            "extensions": {
+              "anda/transition": {
+                "snapshot_seq": 2,
+                "status": "committed"
+              }
+            },
+            "changes": [
+              {
+                "op": "create",
+                "kind": "concept",
+                "id": "C:<1>",
+                "new_version": 1,
+                "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person"
+              }
+            ]
+          }
         }
       }
     ]
@@ -1902,6 +1973,69 @@ export const FIXTURES: readonly Fixture[] = [
               "concept"
             ]
           ]
+        }
+      },
+      {
+        "name": "a cursor a caller invented is malformed, whatever it is spelled as",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {} } LIMIT 1 CURSOR :c",
+        "params": {
+          "c": "not-a-cursor"
+        },
+        "expect": {
+          "error": "CursorInvalid"
+        }
+      },
+      {
+        "name": "and a number is the same refusal: a cursor is opaque, never a position a caller can type",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {} } LIMIT 1 CURSOR :c",
+        "params": {
+          "c": 1
+        },
+        "expect": {
+          "error": "CursorInvalid"
+        }
+      },
+      {
+        "name": "grouping is implicit: the non-aggregated projected expressions are the key",
+        "command": "FIND(?c.name, COUNT(?p)) WHERE { ?c CONCEPT {type: \"Person\"}  ?p (?c, \"prefers\", ?o) } ORDER BY ?c.name",
+        "ordered": true,
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              1
+            ]
+          ]
+        }
+      },
+      {
+        "name": "and a FIND of aggregates alone is one global group",
+        "command": "FIND(COUNT(?c), COUNT(DISTINCT ?c.name)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "expect": {
+          "result": [
+            [
+              2,
+              2
+            ]
+          ]
+        }
+      },
+      {
+        "name": "ORDER BY may name an aggregate the caller did not project",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY COUNT(?c) DESC, ?c.name",
+        "ordered": true,
+        "expect": {
+          "result": [
+            "Alice",
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "but a sort key that varies inside a group has no value to sort by",
+        "command": "FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name",
+        "expect": {
+          "error": "ConstraintViolation"
         }
       }
     ]
@@ -3081,4 +3215,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 249
+export const CASE_COUNT = 258

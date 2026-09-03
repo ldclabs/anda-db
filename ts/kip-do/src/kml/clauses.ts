@@ -18,6 +18,7 @@
 
 import { detailed, errors } from '../errors.js'
 import {
+  ACTIVITY_STATUS,
   ACTIVITY_TERMINAL,
   ASSERTION_MODES,
   EVIDENCE_ROLES,
@@ -76,7 +77,6 @@ import {
   validateStructuralEndpoints,
   type EndpointFacts,
   type StructuralFieldDef,
-  type SymbolKind,
 } from '../schema/index.js'
 import {
   State,
@@ -504,7 +504,11 @@ function createRecord(
       break
     }
     case 'Activity': {
+      // §16, §20.13: the Activity status registry is Core's, so a word outside
+      // it is refused here rather than stored — the parser only sees a written
+      // literal, and a `:parameter` status is bound at execution time.
       const status = fields.text('status')
+      if (status !== '') checkRegistry(status, 'status', ACTIVITY_STATUS)
       element = {
         kind,
         row: {
@@ -2473,12 +2477,3 @@ function splitPayload(payload: Json): [string, Json, string] {
 
 /** Exposed for the tests that pin the routing table. */
 export const CORE_STRUCTURAL_FIELDS = CORE_STRUCTURAL
-
-/** Exposed so `DESCRIBE CAPABILITIES` can name what is not built yet. */
-export const SYMBOL_KINDS: readonly SymbolKind[] = [
-  'ConceptType',
-  'PredicateType',
-  'Facet',
-  'StructuralField',
-  'Enum',
-]

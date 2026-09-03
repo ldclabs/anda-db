@@ -565,14 +565,6 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                            operations are not implemented; a batch runs operation by operation"
             },
             {
-                "capability": "grouped_aggregation",
-                "detail": "FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)",
-                "reason": "a plain variable projected beside an aggregate, or an aggregate used \
-                           as a sort key, needs grouping. Answering either without it returns one \
-                           global row where the caller asked for one per group, or sorts by the \
-                           bare variable instead of the aggregate"
-            },
-            {
                 "capability": "capsule_digest_profiles",
                     "detail": "verifying a Capsule digested under an algorithm other than sha3-256",
                     "reason": "this engine digests a Capsule as sha3-256 over RFC 8785 canonical \
@@ -696,16 +688,19 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
 /// The §89 profiles this engine claims.
 ///
 /// A claim, not a wish: each of these is exercised by the shared conformance
-/// fixtures both engines run, and the three §89 names that are absent are
-/// absent for a reason a caller can check in `unsupported`:
+/// fixtures both engines run, and the two §89 names that are absent are absent
+/// for a reason a caller can check in `unsupported`:
 ///
 /// ```text
-/// KIP-KQL             §96 requires aggregation, and §44.6 defines it with
-///                     implicit grouping — see `grouped_aggregation`
-/// KIP-Transactions    §94 also requires one transaction across several
+/// KIP-Transactions    §94 requires one transaction across several
 ///                     operations — see `atomic_batch`
 /// KIP-High-Assurance  this engine signs nothing (§101)
 /// ```
+///
+/// `KIP-KQL` is claimed against §96's own list, which every item of is built.
+/// The two KQL gaps that remain — `nested_proposition_endpoint` and the
+/// projection ledger — are outside that list and stay in `unsupported`, where
+/// a caller can find them.
 ///
 /// `KIP-1-Migration` is present because this engine does migrate a 1.x
 /// database (§103).
@@ -715,6 +710,7 @@ pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
     anda_kip::ConformanceProfile::Epistemic,
     anda_kip::ConformanceProfile::Governance,
     anda_kip::ConformanceProfile::Capsule,
+    anda_kip::ConformanceProfile::Kql,
     anda_kip::ConformanceProfile::Kml,
     anda_kip::ConformanceProfile::Meta,
     anda_kip::ConformanceProfile::Runtime,
@@ -874,6 +870,9 @@ const SUPPORTED_NAMES: &[&str] = &[
     "per_operation_receipts",
     "canonical_matching",
     "symbol_lineage",
+    // §44.6: implicit grouping over the non-aggregated projected expressions,
+    // and ORDER BY over an aggregate.
+    "grouped_aggregation",
     // §76: `anda_kip::execute_readonly` is the read-only path in front of this
     // engine — it refuses a mutation on parsed semantics, so no envelope field
     // can talk a write past it.
@@ -886,7 +885,6 @@ const SUPPORTED_NAMES: &[&str] = &[
 /// disclaiming the same thing; the unit test below checks they do not overlap.
 const UNSUPPORTED_NAMES: &[&str] = &[
     "atomic_batch",
-    "grouped_aggregation",
     "unregistered_permissions",
     "capsule_digest_profiles",
     "historical_search",

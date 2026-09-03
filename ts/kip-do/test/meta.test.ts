@@ -150,8 +150,8 @@ describe('META', () => {
     }
     // Claimed only where it is true. Each absence has an entry in
     // `unsupported` a caller can read the reason from.
+    expect(report.profiles).toContain('KIP-KQL')
     expect(report.profiles).not.toContain('KIP-High-Assurance')
-    expect(report.profiles).not.toContain('KIP-KQL')
     expect(report.profiles).not.toContain('KIP-Transactions')
     expect(report.profiles).not.toContain('KIP-Capsule')
   })
@@ -337,6 +337,7 @@ describe('META', () => {
           state?: { from: string; to: string }
           schema_ref?: string
         }[]
+        extensions?: Record<string, { status?: string; snapshot_seq?: number }>
       }[]
       // §36.1: the normative op vocabulary, with the move itself in `state`.
       expect(element.map((e) => e.changes.map((c) => c.op))).toEqual([
@@ -355,7 +356,10 @@ describe('META', () => {
       for (const envelope of element) {
         expect(envelope.space_id).toBe('kip:space:default')
         expect(envelope.tx_id).not.toBe('')
-        expect(envelope.status).toBe('committed')
+        // §36.1's shape has no slot for the status, and the schema is
+        // `additionalProperties: false`, so it rides in the namespaced
+        // extension both engines spell the same way.
+        expect(envelope.extensions?.['anda/transition']?.status).toBe('committed')
         // Narrowed to the element asked about, not to the whole transition.
         expect(envelope.changes.every((c) => c.id === id)).toBe(true)
       }

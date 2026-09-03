@@ -279,7 +279,7 @@ function describe(
     if (row === null) {
       throw errors.transactionUnknown(`no transaction ${id} in this Nexus`)
     }
-    return { ...row, id: undefined } as unknown as Json
+    return describedTransaction(row)
   }
   if ('TransactionByIdempotencyKey' in target) {
     const key = text(
@@ -295,7 +295,7 @@ function describe(
         `no transaction committed under idempotency key ${JSON.stringify(key)}`,
       )
     }
-    return { ...row, id: undefined } as unknown as Json
+    return describedTransaction(row)
   }
   if ('EpistemicPolicy' in target) {
     const named =
@@ -962,7 +962,13 @@ function readPageCursor(
 ): PageCursor {
   const value = scalarValue(cursor, b)
   if (typeof value !== 'string') {
-    throw errors.cursorTypeMismatch(
+    // Malformed, not a cross-family reuse: §87's `CursorTypeMismatch` is "the
+    // cursor is for a different result kind", and a value that is not a token
+    // at all is `CursorInvalid` with `details.reason: malformed` — which is
+    // what the reference engine answers and what the retry class needs.
+    throw detailed.cursorInvalid(
+      family,
+      'malformed',
       `a CURSOR is the opaque token this engine issued, got ` +
         `${JSON.stringify(value)}`,
     )
@@ -1161,20 +1167,51 @@ function history(
  * @see rs/anda_cognitive_nexus/src/meta/history.rs — `entry`
  * @see anda_kip::ChangeEnvelope
  */
+/**
+ * One transaction, as `DESCRIBE TRANSACTION` answers it.
+ *
+ * The Change Envelope shape (§36.1) plus the two facts a *description* is asked
+ * for and a *stream entry* is not: whether it committed, and the coordinate it
+ * was decided against. §80.4's whole use for this command is "did my write
+ * land", and a caller reading the envelope's namespaced extension to answer
+ * that would be reading around the answer rather than at it. The envelope keeps
+ * the schema's shape; this adds to it — and neither leaks the storage columns
+ * the row carries beside them.
+ *
+ * @see rs/anda_cognitive_nexus/src/meta/history.rs — `described`
+ */
+function describedTransaction(row: TransactionRow): Json {
+  return {
+    ...(changeEnvelope(row, null) as Record<string, unknown>),
+    status: row.status,
+    snapshot_seq: row.snapshot_seq,
+  } as unknown as Json
+}
+
 function changeEnvelope(row: TransactionRow, element: string | null): Json {
   return {
+    kip: '2.0',
     space_id: row.space,
     space_seq: row.seq,
     tx_id: row.tx_id,
     committed_at: row.committed_at,
     transaction_class: row.transaction_class,
-    snapshot_seq: row.snapshot_seq,
-    status: row.status,
     schema_environment_version: row.schema_environment_version,
     changes:
       element === null
         ? row.changes
         : row.changes.filter((change) => change.id === element),
+    // `schemas/kip-change-envelope.schema.json` is `additionalProperties:
+    // false`, so the two facts §36.1 has no slot for ride in the namespaced
+    // extension both engines spell the same way (`anda_kip::
+    // CHANGE_TRANSITION_EXTENSION`): the coordinate the transaction read from,
+    // and its status, so a `no_effect` transition stays a real entry.
+    extensions: {
+      'anda/transition': {
+        snapshot_seq: row.snapshot_seq,
+        status: row.status,
+      },
+    },
   } as unknown as Json
 }
 

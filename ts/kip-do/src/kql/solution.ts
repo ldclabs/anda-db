@@ -75,8 +75,6 @@ export type Solution = ReadonlyMap<string, Binding>
 /** A mutable solution under construction. */
 export type MutableSolution = Map<string, Binding>
 
-export const emptySolution = (): MutableSolution => new Map()
-
 /**
  * Extends a solution, or returns `null` when it disagrees.
  *
@@ -96,19 +94,6 @@ export function extend(
   return next
 }
 
-/** Extends with several bindings at once, all or nothing. */
-export function extendAll(
-  solution: Solution,
-  bindings: readonly [string, Binding][],
-): MutableSolution | null {
-  let next: MutableSolution = new Map(solution)
-  for (const [name, binding] of bindings) {
-    const extended = extend(next, name, binding)
-    if (extended === null) return null
-    next = extended
-  }
-  return next
-}
 
 /** The identity of a whole solution, for de-duplication after a UNION. */
 export function solutionKey(solution: Solution): string {

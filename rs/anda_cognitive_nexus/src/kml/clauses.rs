@@ -736,10 +736,15 @@ async fn create_record(
                 associated_actors: structural.values("associated_actors"),
                 parameters_digest: fields.text("parameters_digest")?,
                 status: {
+                    // §16, §20.13: the Activity status registry is Core's, so
+                    // a word outside it is refused here rather than stored —
+                    // the parser only sees a written literal, and a
+                    // `:parameter` status is bound at execution time.
                     let status = fields.text("status")?;
                     if status.is_empty() {
                         "pending".to_string()
                     } else {
+                        check_registry(&status, "status", anda_kip::ACTIVITY_STATUS)?;
                         status
                     }
                 },

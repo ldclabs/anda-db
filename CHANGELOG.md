@@ -75,6 +75,42 @@ engines run the shared fixtures, so every item below is pinned by one.
   the digest covers) and the `LIST TYPES` / `PREDICATES` / `FACETS` /
   `STRUCTURAL FIELDS` answers.
 
+### Added — `KIP-KQL` (§96), claimed by both engines
+
+- **Grouped aggregation** (§44.6). Grouping is implicit: the non-aggregated
+  projected expressions are the key, so `FIND(?c.name, COUNT(?a))` is one row
+  per group where it used to be `UnsupportedCapability`, and a `FIND` of
+  aggregates alone stays one global group. `ORDER BY COUNT(?a)` orders the
+  groups, and may name an aggregate the caller did not project; a sort key
+  that varies *inside* a group is `ConstraintViolation` rather than resolved
+  to whichever row came first. `LIMIT` and the page cursor apply to groups.
+- With it, §96's own list is complete in both engines, so both declare
+  `KIP-KQL`. `nested_proposition_endpoint`, `hop_quantifiers` and the
+  projection ledger are outside that list and stay in `unsupported`.
+
+### Fixed — the Change Envelope against its own schema
+
+`schemas/kip-change-envelope.schema.json` is `additionalProperties: false`,
+and both engines emitted `snapshot_seq` and `status` beside the members §36.1
+defines — so every `CHANGES` and `HISTORY` answer failed the normative schema.
+They now ride in the namespaced extension `anda/transition`
+(`anda_kip::CHANGE_TRANSITION_EXTENSION`), and the envelope carries `kip` and
+envelope-level `extensions`, which the Rust type had no fields for.
+`rs/anda_kip/tests/wire_schema.rs` validates the envelope in both directions
+now, as it already did for the request and the response.
+
+`DESCRIBE TRANSACTION` keeps `status` and `snapshot_seq` at the top level: it
+describes a transaction rather than streaming one, and §80.4's "did my write
+land" should not be answered from inside an extension. Both engines answer the
+same shape now — `ts/kip-do` was returning its raw storage row, whose `seq`,
+`space` and `idempotency_key` are not envelope members at all.
+
+### Fixed — an unregistered Activity status
+
+`CREATE ACTIVITY … SET FIELDS {status: "banana"}` parsed and stored in both
+engines. §16's status registry is Core's, so it is checked at execution, where
+a `:parameter` status is bound.
+
 ### Fixed — self-description
 
 - `anda_cognitive_nexus` documents `artifact_store` and `deadlines` in
@@ -83,6 +119,20 @@ engines run the shared fixtures, so every item below is pinned by one.
 - Its `unregistered_permissions` entry says what `approve` is, and counts the
   four names it lists.
 - `§240.18` in the generated profile header is `§20.12`, in the generator.
+
+### Fixed — toolchain
+
+- `pnpm-workspace.yaml`'s `minimumReleaseAgeExclude` entries were
+  `name@version`; pnpm matches package *names*, so the exclusion did nothing
+  and `make test-ts` failed at the install gate on pnpm 11 while CI, pinned to
+  pnpm 10, did not apply the policy at all. Name only now, and CI moves to
+  pnpm 11 so both halves run the same check.
+
+### Removed
+
+- Three unused `ts/kip-do` exports (`emptySolution`, `extendAll`, `kindTag`,
+  and the `SYMBOL_KINDS` list nothing named); `BELIEF_STATUSES` is now read
+  where `DESCRIBE CAPABILITIES` used to spell the five statuses by hand.
 
 
 ## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ

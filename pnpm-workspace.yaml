@@ -4,7 +4,9 @@ allowBuilds:
   esbuild: true
   sharp: false
   workerd: true
+# The reference toolkit this repository tracks release-for-release; a version
+# published hours ago is one this workspace is *meant* to be on. Name only:
+# pnpm matches these against package names, so a `name@version` entry excludes
+# nothing and the policy rejects the lockfile it was written to allow.
 minimumReleaseAgeExclude:
-  - '@ldclabs/kip-lang@2.0.2'
-  - '@ldclabs/kip-lang@2.1.0'
-  - '@ldclabs/kip-lang@2.2.0'
+  - '@ldclabs/kip-lang'

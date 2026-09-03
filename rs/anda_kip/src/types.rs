@@ -733,6 +733,9 @@ pub const SCORE_SEMANTICS: &[&str] = &[
 /// silently lacks.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ChangeEnvelope {
+    /// The protocol version, when the runtime stamps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kip: Option<String>,
     /// The Space that committed.
     pub space_id: String,
     /// The commit sequence this transition produced.
@@ -745,20 +748,6 @@ pub struct ChangeEnvelope {
     /// The transaction class, e.g. `cognitive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_class: Option<String>,
-    /// The coordinate the transaction read from, when the runtime records one.
-    ///
-    /// `space_seq` says what this commit produced; this says what it was
-    /// decided against, which is what a reader needs to tell a stale write
-    /// from a serial one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_seq: Option<u64>,
-    /// `committed`, `aborted` or `no_effect`, when the runtime journals it.
-    ///
-    /// A `no_effect` transition is a real entry in a chronology — the caller
-    /// asked and nothing moved — and dropping it would make the absence of a
-    /// change indistinguishable from the absence of a request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
     /// The Schema Environment version in force when it committed (§33.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_environment_version: Option<u64>,
@@ -766,6 +755,35 @@ pub struct ChangeEnvelope {
     /// `schemas/kip-change-envelope.schema.json`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<ChangeEntry>,
+    /// Namespaced extensions (§36.1).
+    ///
+    /// The schema is `additionalProperties: false`, so anything past §36.1's
+    /// shape lives here rather than beside it: a member one runtime invents at
+    /// the top level is a member the other's consumer rejects outright.
+    /// [`transition_detail`] is what both engines in this repository carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Map<String, Json>>,
+}
+
+/// The extension key carrying what a transition was decided against (§36.1).
+///
+/// Two facts §36.1's shape has no slot for and a chronology reader wants:
+/// `snapshot_seq`, the coordinate the transaction read from — `space_seq` says
+/// what the commit produced, this says what it was decided against, which is
+/// how a stale write is told from a serial one — and `status`, so that a
+/// `no_effect` transition stays a real entry rather than becoming
+/// indistinguishable from a request nobody made.
+pub const CHANGE_TRANSITION_EXTENSION: &str = "anda/transition";
+
+impl ChangeEnvelope {
+    /// Builds the [`CHANGE_TRANSITION_EXTENSION`] value, so both engines spell
+    /// it the same way.
+    pub fn transition_detail(snapshot_seq: u64, status: &str) -> Map<String, Json> {
+        let mut detail = Map::new();
+        detail.insert("snapshot_seq".to_string(), Json::from(snapshot_seq));
+        detail.insert("status".to_string(), Json::from(status));
+        detail
+    }
 }
 
 impl ChangeEnvelope {
@@ -980,15 +998,20 @@ mod tests {
     fn a_change_envelope_dedupes_on_the_key_the_spec_names() {
         // §36.3: delivery may be at-least-once, so the consumer needs exactly
         // this triple to recognize a replay.
+        let mut extensions = Map::new();
+        extensions.insert(
+            CHANGE_TRANSITION_EXTENSION.to_string(),
+            Json::Object(ChangeEnvelope::transition_detail(1500, "committed")),
+        );
         let envelope = ChangeEnvelope {
+            kip: Some("2.0".into()),
             space_id: "space-1".into(),
             space_seq: 1501,
             tx_id: "tx-900".into(),
             committed_at: Some("2026-01-01T00:00:00Z".into()),
             transaction_class: Some("cognitive".into()),
-            snapshot_seq: Some(1500),
-            status: Some("committed".into()),
             schema_environment_version: Some(1),
+            extensions: Some(extensions),
             changes: vec![ChangeEntry {
                 op: ChangeOp::Create,
                 kind: ElementKind::Concept,

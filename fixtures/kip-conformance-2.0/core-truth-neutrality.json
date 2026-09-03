@@ -161,6 +161,16 @@
       }
     },
     {
+      "name": "and so does an Activity status, whether it is written or bound",
+      "command": "CREATE ACTIVITY ?a { SET FIELDS {activity_class: \"test\", status: :s} }",
+      "params": {
+        "s": "banana"
+      },
+      "expect": {
+        "error": "ConstraintViolation"
+      }
+    },
+    {
       "name": "a CLIENT KEY makes a resend a retry rather than a second creation",
       "command": "FIND(COUNT(?e)) WHERE { ?e EVIDENCE {evidence_class: \"user_statement\"} }",
       "expect": {

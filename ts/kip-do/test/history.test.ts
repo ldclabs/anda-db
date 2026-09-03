@@ -76,13 +76,16 @@ describe('AS OF', () => {
       const receipt = nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
       nexus.execute('UPDATE "C-1" SET FIELDS { name: "Alicia" }')
 
+      // The coordinate is `space_seq`, the name §36.1 gives it and the one
+      // the reference engine answers with — not the storage column behind it.
       const described = nexus.describe('DESCRIBE TRANSACTION :tx', {
         tx: receipt.tx_id,
-      }) as { seq: number }
-      expect(described.seq).toBe(1)
+      }) as { space_seq: number; status: string }
+      expect(described.space_seq).toBe(1)
+      expect(described.status).toBe('committed')
       expect(
         nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF SEQ :seq', {
-          seq: described.seq,
+          seq: described.space_seq,
         }),
       ).toEqual(['Alice'])
       // An unknown transaction names no coordinate — refusing beats answering

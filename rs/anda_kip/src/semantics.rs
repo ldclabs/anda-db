@@ -762,6 +762,66 @@ mod tests {
         );
     }
 
+    /// The registry strings and the typed enums are one vocabulary.
+    ///
+    /// `STANCES` validates a written word; `Stance` serializes a stored one.
+    /// They are spelled in two places, and nothing but this test connects
+    /// them — a variant added to the enum, or a `rename` on it, would leave
+    /// the checker refusing a value the engine can produce. `TRANSITION_STATES`
+    /// needs no row here: it *is* `transition_state::ALL`.
+    #[test]
+    fn the_registry_strings_are_the_enums_own_spellings() {
+        use crate::types::{AssertionMode, AssertionStatus, BeliefStatus, Stance};
+
+        fn spellings<T: serde::Serialize>(values: &[T]) -> Vec<String> {
+            values
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(value)
+                        .expect("a registry enum serializes")
+                        .as_str()
+                        .expect("as a string")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            spellings(&[Stance::Support, Stance::Reject, Stance::Uncertain]),
+            STANCES
+        );
+        assert_eq!(
+            spellings(&[
+                AssertionMode::Observed,
+                AssertionMode::Stated,
+                AssertionMode::Inferred,
+                AssertionMode::Predicted,
+                AssertionMode::Hypothetical,
+                AssertionMode::Imported,
+            ]),
+            ASSERTION_MODES
+        );
+        assert_eq!(
+            spellings(&[
+                AssertionStatus::Active,
+                AssertionStatus::Retracted,
+                AssertionStatus::Superseded,
+                AssertionStatus::Expired,
+            ]),
+            ASSERTION_LIFECYCLE
+        );
+        assert_eq!(
+            spellings(&[
+                BeliefStatus::Accepted,
+                BeliefStatus::Rejected,
+                BeliefStatus::Contested,
+                BeliefStatus::Uncertain,
+                BeliefStatus::Insufficient,
+            ]),
+            BELIEF_STATUSES
+        );
+    }
+
     #[test]
     fn diagnostics_carry_the_registry_code_they_would_be_reported_under() {
         let err = parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "guessed" }"#)
