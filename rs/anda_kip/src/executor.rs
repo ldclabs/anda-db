@@ -114,17 +114,7 @@ pub async fn execute_kip(
     command: &str,
     dry_run: bool,
 ) -> (CommandType, Response) {
-    let request = single_command_request(command, dry_run);
-    match parse_kip(command) {
-        Ok(command) => {
-            let language = CommandType::from(&command);
-            let response = executor
-                .execute(command, &request, &request.operations[0])
-                .await;
-            (language, response)
-        }
-        Err(err) => (CommandType::Unknown, err.into()),
-    }
+    execute_one(executor, command, dry_run, |_| Ok(())).await
 }
 
 /// Parses and executes one KIP command on a read-only path.
@@ -140,25 +130,44 @@ pub async fn execute_readonly(
     command: &str,
     dry_run: bool,
 ) -> (CommandType, Response) {
-    let request = single_command_request(command, dry_run);
-    match parse_kip(command) {
-        Ok(command) if command.is_mutation() => (
-            CommandType::Kml,
-            KipError::readonly_violation(
+    execute_one(executor, command, dry_run, |command| {
+        if command.is_mutation() {
+            return Err(KipError::readonly_violation(
                 "this endpoint executes KQL and META only; KML mutations must go through the \
                  state-capable runtime",
-            )
-            .into(),
-        ),
-        Ok(command) => {
-            let language = CommandType::from(&command);
-            let response = executor
-                .execute(command, &request, &request.operations[0])
-                .await;
-            (language, response)
+            ));
         }
-        Err(err) => (CommandType::Unknown, err.into()),
+        Ok(())
+    })
+    .await
+}
+
+/// Parses one command into its own single-operation request and runs it,
+/// refusing anything the endpoint does not admit.
+///
+/// The two entry points differ only in `admits`, and the difference is decided
+/// on the parsed command: a declared language never reaches this, so no
+/// envelope field can talk a write past a read-only endpoint (§73.1, §76).
+async fn execute_one(
+    executor: &impl Executor,
+    text: &str,
+    dry_run: bool,
+    admits: impl Fn(&Command) -> Result<(), KipError>,
+) -> (CommandType, Response) {
+    let command = match parse_kip(text) {
+        Ok(command) => command,
+        Err(err) => return (CommandType::Unknown, err.into()),
+    };
+    let language = CommandType::from(&command);
+    if let Err(err) = admits(&command) {
+        return (language, err.into());
     }
+
+    let request = single_command_request(text, dry_run);
+    let response = executor
+        .execute(command, &request, &request.operations[0])
+        .await;
+    (language, response)
 }
 
 fn single_command_request(command: &str, dry_run: bool) -> Request {

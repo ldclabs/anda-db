@@ -18,6 +18,7 @@ use nom::{
     combinator::{all_consuming, map},
     error::context,
 };
+use nom_language::error::VerboseError;
 
 use crate::ast::{Command, Json, KmlStatement, KqlQuery, MetaCommand};
 use crate::error::{KipError, format_nom_error};
@@ -74,19 +75,17 @@ pub const MAX_KIP_BATCH_COMMANDS: usize = 256;
 /// assert!(matches!(meta, Command::Meta(_)));
 /// ```
 pub fn parse_kip(input: &str) -> Result<Command, KipError> {
-    validate_parser_budget(input)?;
-
-    let (_, command) = all_consuming(json::ws(context(
-        "a KIP command: FIND (KQL), a mutation (KML), or DESCRIBE/LIST/SEARCH/… (META)",
-        alt((
-            map(kql::parse_kql_query, Command::Kql),
-            map(kml::parse_kml_statement, Command::Kml),
-            map(meta::parse_meta_command, Command::Meta),
-        )),
-    )))
-    .parse(input)
-    .map_err(|err| format_nom_error(input, err))?;
-
+    let command = parse_with(
+        input,
+        context(
+            "a KIP command: FIND (KQL), a mutation (KML), or DESCRIBE/LIST/SEARCH/… (META)",
+            alt((
+                map(kql::parse_kql_query, Command::Kql),
+                map(kml::parse_kml_statement, Command::Kml),
+                map(meta::parse_meta_command, Command::Meta),
+            )),
+        ),
+    )?;
     validate_command(&command)?;
     Ok(command)
 }
@@ -119,23 +118,13 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 /// ```
 pub fn validate_command(command: &Command) -> Result<(), KipError> {
     match command {
-        Command::Kml(statement) => kml::validate_plan(statement)?,
-        Command::Kql(query) => validate_query(query)?,
-        Command::Meta(MetaCommand::ExportCapsule(export)) => {
-            if export.where_clauses.is_empty() {
-                return Err(KipError::invalid_syntax(
-                    "EXPORT CAPSULE needs at least one selection pattern: an unbounded EXPORT is \
-                     not a Capsule",
-                ));
-            }
-            kml::validate_exact_patterns(&export.where_clauses)?;
-        }
-        Command::Meta(_) => {}
+        Command::Kql(query) => validate_query(query),
+        Command::Kml(statement) => validate_statement(statement),
+        Command::Meta(meta) => validate_meta_command(meta),
     }
-    crate::semantics::check(command)
 }
 
-/// The structural rules a `FIND` must satisfy, re-checked off the text path.
+/// Every schema-independent rule a KQL query must satisfy.
 ///
 /// `FIND()` never parses, but a hand-built or transported AST can carry an
 /// empty projection list — and a query with no column to name is not a
@@ -147,7 +136,27 @@ fn validate_query(query: &KqlQuery) -> Result<(), KipError> {
              shape",
         ));
     }
-    Ok(())
+    crate::semantics::check_kql(query)
+}
+
+/// Every schema-independent rule a KML plan must satisfy.
+fn validate_statement(statement: &KmlStatement) -> Result<(), KipError> {
+    kml::validate_plan(statement)?;
+    crate::semantics::check_kml(statement)
+}
+
+/// Every schema-independent rule a META command must satisfy.
+fn validate_meta_command(meta: &MetaCommand) -> Result<(), KipError> {
+    if let MetaCommand::ExportCapsule(export) = meta {
+        if export.where_clauses.is_empty() {
+            return Err(KipError::invalid_syntax(
+                "EXPORT CAPSULE needs at least one selection pattern: an unbounded EXPORT is \
+                 not a Capsule",
+            ));
+        }
+        kml::validate_exact_patterns(&export.where_clauses)?;
+    }
+    crate::semantics::check_meta(meta)
 }
 
 /// Parses a KQL query.
@@ -164,12 +173,8 @@ fn validate_query(query: &KqlQuery) -> Result<(), KipError> {
 /// assert_eq!(query.where_clauses.len(), 1);
 /// ```
 pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
-    validate_parser_budget(input)?;
-
-    let (_, query) = all_consuming(json::ws(kql::parse_kql_query))
-        .parse(input)
-        .map_err(|err| format_nom_error(input, err))?;
-    crate::semantics::check_kql(&query)?;
+    let query = parse_with(input, kql::parse_kql_query)?;
+    validate_query(&query)?;
     Ok(query)
 }
 
@@ -195,13 +200,8 @@ pub fn parse_kql(input: &str) -> Result<KqlQuery, KipError> {
 /// assert_eq!(statement.clauses.len(), 3);
 /// ```
 pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
-    validate_parser_budget(input)?;
-
-    let (_, statement) = all_consuming(json::ws(kml::parse_kml_statement))
-        .parse(input)
-        .map_err(|err| format_nom_error(input, err))?;
-    kml::validate_plan(&statement)?;
-    crate::semantics::check_kml(&statement)?;
+    let statement = parse_with(input, kml::parse_kml_statement)?;
+    validate_statement(&statement)?;
     Ok(statement)
 }
 
@@ -215,12 +215,8 @@ pub fn parse_kml(input: &str) -> Result<KmlStatement, KipError> {
 /// let command = parse_meta("DESCRIBE PRIMER MODE \"compact\"").unwrap();
 /// ```
 pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
-    validate_parser_budget(input)?;
-
-    let (_, command) = all_consuming(json::ws(meta::parse_meta_command))
-        .parse(input)
-        .map_err(|err| format_nom_error(input, err))?;
-    crate::semantics::check_meta(&command)?;
+    let command = parse_with(input, meta::parse_meta_command)?;
+    validate_meta_command(&command)?;
     Ok(command)
 }
 
@@ -238,9 +234,21 @@ pub fn parse_meta(input: &str) -> Result<MetaCommand, KipError> {
 /// assert_eq!(value["dosage"], 500);
 /// ```
 pub fn parse_json(input: &str) -> Result<Json, KipError> {
+    parse_with(input, json::json_value())
+}
+
+/// Runs one surface parser over a whole input, under the parser budget.
+///
+/// Every entry point shares this: the budget is checked before any parsing
+/// work happens, the parser must consume the whole input, and a nom failure is
+/// rendered with the line, column and snippet that locate it.
+fn parse_with<'a, O>(
+    input: &'a str,
+    parser: impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
+) -> Result<O, KipError> {
     validate_parser_budget(input)?;
 
-    let (_, value) = all_consuming(json::ws(json::json_value()))
+    let (_, value) = all_consuming(json::ws(parser))
         .parse(input)
         .map_err(|err| format_nom_error(input, err))?;
     Ok(value)
@@ -434,6 +442,52 @@ mod tests {
         assert_eq!(err.code, crate::error::KipErrorCode::DuplicateLocalHandle);
     }
 
+    /// A narrower entry point answers the same way the classifying one does.
+    ///
+    /// The three surface parsers and `parse_kip` share one gate per surface,
+    /// so a narrow entry point is `parse_kip` restricted rather than a laxer
+    /// parser. The gate's *unreachable-from-text* half — the empty `FIND`
+    /// projection and the unbounded `EXPORT` — is asserted through
+    /// `validate_command` in
+    /// `the_ast_channel_is_held_to_the_same_rules_as_the_text_channel`,
+    /// because no command text can reach either rule: the grammar refuses
+    /// both first.
+    #[test]
+    fn a_narrow_entry_point_answers_like_the_classifying_one() {
+        // (text, does the classifying parser accept it?)
+        let kql = [
+            (r#"FIND(?x) WHERE { ?x {a: 1} } LIMIT 1"#, true),
+            // A Core registry value, checked on the read surface.
+            (
+                r#"FIND(?x) WHERE { ?x {a: 1} } LIMIT 1 WITH EPISTEMIC {explanation: "loud"}"#,
+                false,
+            ),
+        ];
+        for (text, accepted) in kql {
+            assert_eq!(parse_kip(text).is_ok(), accepted, "parse_kip: {text}");
+            assert_eq!(parse_kql(text).is_ok(), accepted, "parse_kql: {text}");
+        }
+
+        let kml = [
+            (r#"PURGE :x CONFIRM "PURGE""#, true),
+            // A `PURGE` without its frozen confirmation is a plan rule.
+            (r#"PURGE :x"#, false),
+        ];
+        for (text, accepted) in kml {
+            assert_eq!(parse_kip(text).is_ok(), accepted, "parse_kip: {text}");
+            assert_eq!(parse_kml(text).is_ok(), accepted, "parse_kml: {text}");
+        }
+
+        let meta = [
+            (r#"DESCRIBE PRIMER MODE "compact""#, true),
+            (r#"DESCRIBE PRIMER MODE "loud""#, false),
+        ];
+        for (text, accepted) in meta {
+            assert_eq!(parse_kip(text).is_ok(), accepted, "parse_kip: {text}");
+            assert_eq!(parse_meta(text).is_ok(), accepted, "parse_meta: {text}");
+        }
+    }
+
     #[test]
     fn the_ast_channel_is_held_to_the_same_rules_as_the_text_channel() {
         // §73: an operation may carry a pre-parsed `ast` instead of `command`
@@ -462,6 +516,18 @@ mod tests {
             validate_command(&bad_search).unwrap_err().code,
             crate::error::KipErrorCode::ConstraintViolation
         );
+
+        // An `EXPORT` with no selection is the other rule the grammar refuses
+        // before the gate can — `where_block` is `cut` — so the transported
+        // tree is the only way to reach it, and an unbounded EXPORT is not a
+        // Capsule but a copy of the Space.
+        let unbounded_export: Command = serde_json::from_str(
+            r#"{"Meta":{"ExportCapsule":{"target":{"Id":"CAP-1"},"where_clauses":[],
+                "options":null,"as_of":null}}}"#,
+        )
+        .unwrap();
+        let err = validate_command(&unbounded_export).expect_err("unbounded export");
+        assert!(err.message.contains("selection pattern"), "{}", err.message);
     }
 
     #[test]

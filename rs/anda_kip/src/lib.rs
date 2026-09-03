@@ -127,6 +127,9 @@
 
 use std::sync::LazyLock;
 
+#[macro_use]
+mod vocabulary;
+
 pub mod ast;
 pub mod capsule;
 pub mod conformance;

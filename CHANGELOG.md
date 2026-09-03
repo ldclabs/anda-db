@@ -166,6 +166,58 @@ target still both apply.
   where `DESCRIBE CAPABILITIES` used to spell the five statuses by hand.
 
 
+### Changed — `anda_kip` declares each vocabulary once
+
+A refactor. It adds no types and changes no command's meaning; the two wire
+effects it does have are called out at the end of this section.
+
+- **The Core Error Registry (§87) is one list.** Each of the 77 codes was
+  written four times — in the enum, and again in `category()`, `retry_class()`
+  and `hint()` — with only the compiler's exhaustiveness check holding three of
+  them together and nothing at all holding `ALL` and `from_name`. A code now
+  declares all four facts in one place (`Variant: Category[, RetryClass] =>
+  "hint";`) and the four accessors are generated from it. Every code maps to
+  the same category, retry class and hint it did before.
+- **The closed wire vocabularies are declared by the enums that carry them.**
+  `Stance`, `AssertionMode`, `AssertionStatus`, `BeliefStatus`, `ElementKind`,
+  `ErrorCategory`, `RetryClass`, `SearchMode` and `ConformanceProfile` each
+  spell their wire values once. `STANCES`, `ASSERTION_MODES`,
+  `ASSERTION_LIFECYCLE`, `BELIEF_STATUSES` and `SEARCH_MODES` are now views on
+  `Stance::NAMES` and friends rather than a second copy checked by a test.
+- **Added, on those nine types:** `as_str()`, `from_wire()`, `Display`,
+  `FromStr`, `ALL` (the variants) and `NAMES` (their wire spellings).
+  `ConformanceProfile::name()` / `from_name()` are unchanged, and now read
+  through `as_str()` / `from_wire()`. Ordering is *not* added: `ElementKind`
+  stays unordered, which `anda_cognitive_nexus`'s `ElementId` relies on when it
+  sorts by wire tag instead.
+- **One parse gate.** `parse_kql`, `parse_kml`, `parse_meta` and `parse_kip`
+  each applied a different subset of the schema-independent rules —
+  `parse_meta` skipped the `EXPORT CAPSULE` selection rules and `parse_kql` the
+  empty-projection rule, both of which `parse_kip` enforced. All four now run
+  the same per-surface gate, which `validate_command` also dispatches to, so a
+  narrower entry point is `parse_kip` restricted to one surface rather than a
+  laxer parser. No text that parsed before is refused now: the rules the narrow
+  entry points were missing were unreachable from text and reachable only from
+  a transported `ast`.
+- **`Request::validate` orchestrates rather than reaches in.** `space`,
+  `execution`, `read`, `preconditions`, `context` and `options` each hold
+  themselves to their own rules, next to the fields they constrain; the request
+  decides only what no single block can. Same checks, same order, same messages.
+- **`execute_kip` and `execute_readonly` share one body**, differing only in
+  what the endpoint admits — decided, as before, on the parsed command and
+  never on a declared label.
+- The `ASSERT` desugaring's clause thunk is `FnOnce`, so the expansion moves
+  what it parsed instead of cloning every captured field on its single call.
+
+**The two wire effects.** A closed vocabulary now reads and writes a JSON
+string and nothing else. Previously the eight `#[derive(Deserialize)]`
+vocabularies also accepted serde's externally-tagged map form — `{"support":
+null}` where the schema says `"support"` — which no conforming producer emits
+and the vendored wire schemas type as `string`; that form is now refused.
+`ConformanceProfile` moves the other way and is *restored*: its hand-written
+deserializer had always been string-only, and a derive would have widened it.
+
+
 ## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
 
 Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the

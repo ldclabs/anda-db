@@ -61,6 +61,10 @@ impl Flavor {
 /// Checked on every assignment, not only on `UPDATE`: author content that could
 /// rewrite engine truth or its own authority is exactly what "external
 /// cognition cannot self-escalate authority" forbids.
+///
+/// These are top-level field names. The members inside `_system` are
+/// [`crate::types::PROTECTED_SYSTEM_FIELDS`]; nothing may write either, but
+/// only this list is reachable from a command's syntax.
 pub const PROTECTED_FIELDS: &[&str] = &["_system", "governance", "space_id", "space_seq"];
 
 /// True when a mutation may not write this field name.
@@ -1270,19 +1274,7 @@ pub fn collect_where_variables(clauses: &[WhereClause], out: &mut BTreeSet<Strin
 
 fn collect_matcher_variables(matcher: &ObjectMatcher, out: &mut BTreeSet<String>) {
     for value in matcher.values() {
-        match value {
-            MatchValue::Variable(name) => {
-                out.insert(name.clone());
-            }
-            MatchValue::Array(items) => {
-                for item in items {
-                    collect_match_value_variables(item, out);
-                }
-            }
-            MatchValue::Match(inner) => collect_matcher_variables(inner, out),
-            MatchValue::Proposition(inner) => collect_proposition_variables(inner, out),
-            MatchValue::Param(_) | MatchValue::Literal(_) => {}
-        }
+        collect_match_value_variables(value, out);
     }
 }
 

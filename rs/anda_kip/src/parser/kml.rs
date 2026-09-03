@@ -116,8 +116,11 @@ pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
 /// One source statement may lower to several clauses; `ASSERT` is the case.
 ///
 /// The clause's position in its plan keeps synthetic handles distinct between
-/// two handle-less `ASSERT`s in the same transaction.
-type ClauseGroup = Box<dyn Fn(usize) -> Vec<MutationClause>>;
+/// two handle-less `ASSERT`s in the same transaction, and the position is only
+/// known once the whole block has parsed — hence a thunk rather than the
+/// clauses themselves. `FnOnce` because it is called exactly once, which lets
+/// the expansion move what it parsed instead of cloning every field of it.
+type ClauseGroup = Box<dyn FnOnce(usize) -> Vec<MutationClause>>;
 
 fn flatten(groups: Vec<(&str, ClauseGroup)>) -> Vec<MutationClause> {
     groups
@@ -128,7 +131,7 @@ fn flatten(groups: Vec<(&str, ClauseGroup)>) -> Vec<MutationClause> {
 }
 
 fn single(clause: MutationClause) -> ClauseGroup {
-    Box::new(move |_| vec![clause.clone()])
+    Box::new(move |_| vec![clause])
 }
 
 fn mutation_clause(input: &str) -> VResult<'_, ClauseGroup> {
@@ -674,9 +677,7 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             // neither a user handle nor another ASSERT in the same plan. `#`
             // cannot occur in a KIP identifier, which rules out the first; the
             // clause position rules out the second.
-            let assertion_handle = written_handle
-                .clone()
-                .unwrap_or_else(|| format!("#assert{seq}"));
+            let assertion_handle = written_handle.unwrap_or_else(|| format!("#assert{seq}"));
             let proposition_handle = format!("{assertion_handle}#proposition");
 
             let mut set_fields: Assignments = vec![
@@ -684,21 +685,21 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
                     "proposition".into(),
                     MutationValue::Handle(proposition_handle.clone()),
                 ),
-                ("asserted_by".into(), by.clone()),
-                ("mode".into(), mode.clone()),
+                ("asserted_by".into(), by),
+                ("mode".into(), mode),
                 // The normative expansion carries a stance even when the source
                 // omitted one, so the default is materialized here rather than
                 // left for the engine to re-derive.
-                ("stance".into(), stance.clone()),
+                ("stance".into(), stance),
             ];
-            if let Some(value) = &confidence {
-                set_fields.push(("confidence".into(), value.clone()));
+            if let Some(value) = confidence {
+                set_fields.push(("confidence".into(), value));
             }
-            if let Some(value) = &asserted_at {
-                set_fields.push(("asserted_at".into(), value.clone()));
+            if let Some(value) = asserted_at {
+                set_fields.push(("asserted_at".into(), value));
             }
-            if let Some(value) = &valid_time {
-                set_fields.push(("valid_time".into(), value.clone()));
+            if let Some(value) = valid_time {
+                set_fields.push(("valid_time".into(), value));
             }
 
             // `evidence` is a reserved Core *structural* field, not a plain one:
@@ -706,7 +707,6 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             // An array cites several artifacts, so it becomes one role-qualified
             // edge each.
             let edges: Vec<StructuralEdge> = evidence
-                .as_ref()
                 .map(|value| {
                     evidence_refs(value)
                         .into_iter()
@@ -729,14 +729,14 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             let mut clauses = vec![
                 MutationClause::EnsureProposition(EnsureProposition {
                     handle: Some(proposition_handle),
-                    subject: triple.0.clone(),
-                    predicate: triple.1.clone(),
-                    object: triple.2.clone(),
+                    subject: triple.0,
+                    predicate: triple.1,
+                    object: triple.2,
                     expect_versions: Vec::new(),
                 }),
                 MutationClause::CreateAssertion(RecordCreate {
                     handle: assertion_handle.clone(),
-                    client_key: client_key.clone(),
+                    client_key,
                     set_fields: Some(set_fields),
                     set_facets: Vec::new(),
                     set_structural: (!edges.is_empty()).then_some(edges),
@@ -746,9 +746,9 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             // `SUPERSEDING :old` is revision (§14.2): the old claim was wrong.
             // It desugars to the one lifecycle statement, `BY` the new
             // Assertion (§55.1).
-            if let Some(target) = &superseding {
+            if let Some(target) = superseding {
                 clauses.push(MutationClause::Transition(Transition {
-                    target: target.clone(),
+                    target,
                     to: Scalar::Literal(KipValue::String(transition_state::SUPERSEDED.into())),
                     by: Some(ElementRef::Handle(assertion_handle)),
                     set_fields: None,
@@ -764,15 +764,15 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
 }
 
 /// Splits an `evidence:` member into one citation per artifact.
-fn evidence_refs(value: &MutationValue) -> Vec<MutationValue> {
+fn evidence_refs(value: MutationValue) -> Vec<MutationValue> {
     match value {
-        MutationValue::Array(items) => items.iter().cloned().map(MutationValue::from).collect(),
+        MutationValue::Array(items) => items.into_iter().map(MutationValue::from).collect(),
         // A wholly literal array collapsed on the way in; it still cites one
         // artifact per element.
         MutationValue::Value(KipValue::Array(items)) => {
-            items.iter().cloned().map(MutationValue::Value).collect()
+            items.into_iter().map(MutationValue::Value).collect()
         }
-        other => vec![other.clone()],
+        other => vec![other],
     }
 }
 

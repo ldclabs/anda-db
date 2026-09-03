@@ -24,11 +24,15 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
 use crate::ast::{Json, Map};
 
 /// Engine-maintained `_system` members ordinary KML must never write (§6.3).
+///
+/// These are the members *inside* `_system`. The top-level field names a
+/// mutation may not assign to at all — `_system` itself among them — are
+/// [`crate::parser::PROTECTED_FIELDS`], which is what the parser checks.
 pub const PROTECTED_SYSTEM_FIELDS: &[&str] = &[
     "version",
     "created_at",
@@ -40,37 +44,25 @@ pub const PROTECTED_SYSTEM_FIELDS: &[&str] = &[
     "space_seq",
 ];
 
-/// The Core Cognitive Element kinds (Spec §6.1).
-///
-/// `MemorySpace` is a Governance container, not an ordinary element, and Profile
-/// objects such as Experience or Skill are typed Concepts plus Facets — not new
-/// Core kinds.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ElementKind {
-    /// A unit of meaning.
-    #[default]
-    Concept,
-    /// A truth-neutral `(subject, predicate, object)` tuple.
-    Proposition,
-    /// One actor's epistemic commitment about a Proposition.
-    Assertion,
-    /// An observation record.
-    Evidence,
-    /// A provenance record for a process.
-    Activity,
-}
-
-impl fmt::Display for ElementKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            ElementKind::Concept => "concept",
-            ElementKind::Proposition => "proposition",
-            ElementKind::Assertion => "assertion",
-            ElementKind::Evidence => "evidence",
-            ElementKind::Activity => "activity",
-        };
-        f.write_str(name)
+wire_enum! {
+    /// The Core Cognitive Element kinds (Spec §6.1).
+    ///
+    /// `MemorySpace` is a Governance container, not an ordinary element, and
+    /// Profile objects such as Experience or Skill are typed Concepts plus
+    /// Facets — not new Core kinds.
+    #[derive(Default)]
+    pub enum ElementKind {
+        /// A unit of meaning.
+        #[default]
+        Concept = "concept",
+        /// A truth-neutral `(subject, predicate, object)` tuple.
+        Proposition = "proposition",
+        /// One actor's epistemic commitment about a Proposition.
+        Assertion = "assertion",
+        /// An observation record.
+        Evidence = "evidence",
+        /// A provenance record for a process.
+        Activity = "activity",
     }
 }
 
@@ -276,57 +268,57 @@ pub struct Proposition {
     pub object: Json,
 }
 
-/// The stance an Assertion takes (Spec §13.4).
-///
-/// A `reject` stance about `(x, allergic_to, y)` is not the same claim as a
-/// `support` stance about `(x, allergic_to, false)` (§12.7).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum Stance {
-    /// The assertor holds the Proposition.
-    Support,
-    /// The assertor denies the Proposition.
-    Reject,
-    /// The assertor holds neither.
-    Uncertain,
+wire_enum! {
+    /// The stance an Assertion takes (Spec §13.4).
+    ///
+    /// A `reject` stance about `(x, allergic_to, y)` is not the same claim as
+    /// a `support` stance about `(x, allergic_to, false)` (§12.7).
+    pub enum Stance {
+        /// The assertor holds the Proposition.
+        Support = "support",
+        /// The assertor denies the Proposition.
+        Reject = "reject",
+        /// The assertor holds neither.
+        Uncertain = "uncertain",
+    }
 }
 
-/// How an Assertion was arrived at (Spec §13.5, §26).
-///
-/// A mode does not automatically grant trust.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum AssertionMode {
-    /// Directly observed by the assertor.
-    Observed,
-    /// Said by the assertor.
-    Stated,
-    /// Derived by reasoning.
-    Inferred,
-    /// Projected about the future.
-    Predicted,
-    /// Entertained without commitment.
-    Hypothetical,
-    /// Carried in from another system.
-    Imported,
+wire_enum! {
+    /// How an Assertion was arrived at (Spec §13.5, §26).
+    ///
+    /// A mode does not automatically grant trust.
+    pub enum AssertionMode {
+        /// Directly observed by the assertor.
+        Observed = "observed",
+        /// Said by the assertor.
+        Stated = "stated",
+        /// Derived by reasoning.
+        Inferred = "inferred",
+        /// Projected about the future.
+        Predicted = "predicted",
+        /// Entertained without commitment.
+        Hypothetical = "hypothetical",
+        /// Carried in from another system.
+        Imported = "imported",
+    }
 }
 
-/// The lifecycle of an Assertion (Spec §14).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum AssertionStatus {
-    /// Current.
-    Active,
-    /// Withdrawn by the assertor or an authorized representative (§14.1).
-    Retracted,
-    /// Replaced by a newer Assertion in a compatible lineage (§14.2): the
-    /// claim was wrong for the time it covered, so projection drops it for
-    /// every `FOR TIME`.
-    Superseded,
-    /// Computed, never stored (§14.3): the Assertion's `valid_time.until`
-    /// lies before the projection's `valid_at`. No statement produces it and
-    /// no Change Envelope carries it.
-    Expired,
+wire_enum! {
+    /// The lifecycle of an Assertion (Spec §14).
+    pub enum AssertionStatus {
+        /// Current.
+        Active = "active",
+        /// Withdrawn by the assertor or an authorized representative (§14.1).
+        Retracted = "retracted",
+        /// Replaced by a newer Assertion in a compatible lineage (§14.2): the
+        /// claim was wrong for the time it covered, so projection drops it for
+        /// every `FOR TIME`.
+        Superseded = "superseded",
+        /// Computed, never stored (§14.3): the Assertion's `valid_time.until`
+        /// lies before the projection's `valid_at`. No statement produces it
+        /// and no Change Envelope carries it.
+        Expired = "expired",
+    }
 }
 
 /// The world-time window a claim applies to.
@@ -524,31 +516,33 @@ pub struct Activity {
     pub status: Option<String>,
 }
 
-/// The belief statuses an Epistemic Projection can return (Spec §21.3).
-///
-/// KIP is open-world: [`BeliefStatus::Insufficient`] is the unknown state, and
-/// [`BeliefStatus::Rejected`] must never be produced merely because support is
-/// absent (§21.5, §24).
-///
-/// Which is also why it is the `Default`: silence is the absence of a basis,
-/// never a verdict. A default of `Accepted` would let an unfilled field read as
-/// a belief nobody holds, and one of `Rejected` would turn "nobody said
-/// anything" into "the Brain denies it".
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum BeliefStatus {
-    /// Eligible support is sufficient and unresolved opposition is below the
-    /// policy boundary.
-    Accepted,
-    /// Eligible opposition is sufficient.
-    Rejected,
-    /// Material support and material opposition coexist, unresolved.
-    Contested,
-    /// Meaningful material exists but is too weak to decide.
-    Uncertain,
-    /// No sufficient eligible epistemic basis exists — the open-world unknown.
-    #[default]
-    Insufficient,
+wire_enum! {
+    /// The belief statuses an Epistemic Projection can return (Spec §21.3).
+    ///
+    /// KIP is open-world: [`BeliefStatus::Insufficient`] is the unknown state,
+    /// and [`BeliefStatus::Rejected`] must never be produced merely because
+    /// support is absent (§21.5, §24).
+    ///
+    /// Which is also why it is the `Default`: silence is the absence of a
+    /// basis, never a verdict. A default of `Accepted` would let an unfilled
+    /// field read as a belief nobody holds, and one of `Rejected` would turn
+    /// "nobody said anything" into "the Brain denies it".
+    #[derive(Default)]
+    pub enum BeliefStatus {
+        /// Eligible support is sufficient and unresolved opposition is below
+        /// the policy boundary.
+        Accepted = "accepted",
+        /// Eligible opposition is sufficient.
+        Rejected = "rejected",
+        /// Material support and material opposition coexist, unresolved.
+        Contested = "contested",
+        /// Meaningful material exists but is too weak to decide.
+        Uncertain = "uncertain",
+        /// No sufficient eligible epistemic basis exists — the open-world
+        /// unknown.
+        #[default]
+        Insufficient = "insufficient",
+    }
 }
 
 impl BeliefStatus {
@@ -611,8 +605,8 @@ pub const ACTIVITY_CLASSES: &[&str] = &[
 /// - support and opposition are reported **separately**, because a claim with
 ///   strong evidence on both sides is not the same as one with none, and a
 ///   single blended number cannot tell them apart;
-/// - scores never come without [`ScoreSemantics`]: an unlabelled 0.7 invites
-///   the reader to assume a probability (§27.3);
+/// - scores never come without their [`SCORE_SEMANTICS`] label: an unlabelled
+///   0.7 invites the reader to assume a probability (§27.3);
 /// - the policy that produced the answer is named, so a different threshold
 ///   yields a visibly different answer rather than a silently different one;
 /// - `temporal` carries both axes, since *what was known* and *what was true
@@ -760,7 +754,8 @@ pub struct ChangeEnvelope {
     /// The schema is `additionalProperties: false`, so anything past §36.1's
     /// shape lives here rather than beside it: a member one runtime invents at
     /// the top level is a member the other's consumer rejects outright.
-    /// [`transition_detail`] is what both engines in this repository carry.
+    /// [`ChangeEnvelope::transition_detail`] is what both engines in this
+    /// repository carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
 }
@@ -910,6 +905,79 @@ pub struct Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every spelling `wire_enum!` generates is the one spelling.
+    ///
+    /// The macro is the crate's only declaration of a closed wire vocabulary,
+    /// and nine public types now depend on it agreeing with itself:
+    /// `semantics::STANCES` and friends *are* `NAMES`, so a `NAMES` out of
+    /// step with `as_str` would have the parser validate written words against
+    /// strings the engine never emits. Checked per type rather than per
+    /// variant, so a variant added anywhere is covered without a new row here.
+    #[test]
+    fn a_wire_vocabulary_has_exactly_one_spelling_per_value() {
+        macro_rules! check {
+            ($ty:ty) => {{
+                let label = stringify!($ty);
+                let all = <$ty>::ALL;
+                let names = <$ty>::NAMES;
+                assert_eq!(all.len(), names.len(), "{label}: ALL and NAMES disagree");
+                assert!(!all.is_empty(), "{label}: an empty vocabulary");
+
+                for (value, name) in all.iter().zip(names) {
+                    // `as_str`, Display, serde and the registry slice are one
+                    // string,
+                    assert_eq!(value.as_str(), *name, "{label}: as_str");
+                    assert_eq!(&value.to_string(), name, "{label}: Display");
+                    assert_eq!(
+                        serde_json::to_value(value).expect("serializes"),
+                        Json::String((*name).to_string()),
+                        "{label}: Serialize"
+                    );
+                    // and every one of them round-trips back to the value.
+                    assert_eq!(
+                        &name.parse::<$ty>().expect("FromStr takes its own name"),
+                        value,
+                        "{label}: FromStr"
+                    );
+                    assert_eq!(
+                        &serde_json::from_value::<$ty>(Json::String((*name).to_string()))
+                            .expect("Deserialize takes its own name"),
+                        value,
+                        "{label}: Deserialize"
+                    );
+                    assert_eq!(<$ty>::from_wire(name), Some(*value), "{label}: from_wire");
+                }
+
+                // A vocabulary is closed: nothing outside the list is
+                // admitted, and the externally-tagged map form a *derived*
+                // enum would have accepted is not a KIP value.
+                assert!(
+                    "kip/not-a-value".parse::<$ty>().is_err(),
+                    "{label}: FromStr"
+                );
+                assert!(
+                    serde_json::from_str::<$ty>(r#"{"kip/not-a-value":null}"#).is_err(),
+                    "{label}: a wire vocabulary is a string, never a tagged map"
+                );
+
+                // Two variants sharing a spelling would make the wire
+                // ambiguous in the direction that has no error to report.
+                let unique: BTreeMap<&str, ()> = names.iter().map(|n| (*n, ())).collect();
+                assert_eq!(unique.len(), names.len(), "{label}: a repeated spelling");
+            }};
+        }
+
+        check!(ElementKind);
+        check!(Stance);
+        check!(AssertionMode);
+        check!(AssertionStatus);
+        check!(BeliefStatus);
+        check!(crate::error::ErrorCategory);
+        check!(crate::error::RetryClass);
+        check!(crate::request::SearchMode);
+        check!(crate::conformance::ConformanceProfile);
+    }
 
     #[test]
     fn vocabularies_use_their_wire_spellings() {

@@ -198,60 +198,14 @@ impl Request {
         )?;
         validate_extensions(&self.extensions, "extensions")?;
 
-        if let Some(space) = &self.space {
-            if space.id.is_none() && space.uri.is_none() {
-                return Err(KipError::invalid_request_envelope(
-                    "space must identify a MemorySpace by `id`, `uri`, or both",
-                ));
-            }
-            validate_optional_non_empty(&space.id, "space.id", limits::SPACE_ID)?;
-            validate_optional_non_empty(&space.uri, "space.uri", limits::SPACE_URI)?;
-        }
-
-        if let Some(execution) = &self.execution {
-            validate_optional_non_empty(
-                &execution.isolation,
-                "execution.isolation",
-                limits::ISOLATION,
-            )?;
-            validate_optional_non_empty(
-                &execution.idempotency_key,
-                "execution.idempotency_key",
-                limits::IDEMPOTENCY_KEY,
-            )?;
-            validate_extensions(&execution.extensions, "execution.extensions")?;
-        }
-        if let Some(read) = &self.read {
-            validate_optional_non_empty(
-                &read.snapshot_token,
-                "read.snapshot_token",
-                limits::OPAQUE_TOKEN,
-            )?;
-            validate_extensions(&read.extensions, "read.extensions")?;
-        }
-        if let Some(preconditions) = &self.preconditions {
-            validate_extensions(&preconditions.extensions, "preconditions.extensions")?;
-        }
-        if let Some(context) = &self.context {
-            validate_optional_non_empty(&context.purpose, "context.purpose", limits::SHORT_LABEL)?;
-            validate_optional_non_empty(&context.risk, "context.risk", limits::RISK)?;
-            validate_optional_non_empty(&context.locale, "context.locale", limits::LOCALE)?;
-            validate_optional_non_empty(&context.client, "context.client", limits::SHORT_LABEL)?;
-            validate_extensions(&context.extensions, "context.extensions")?;
-        }
-        if let Some(options) = &self.options {
-            validate_extensions(&options.extensions, "options.extensions")?;
-        }
-        if self
-            .options
-            .as_ref()
-            .and_then(|options| options.deadline_ms)
-            == Some(0)
-        {
-            return Err(KipError::invalid_request_envelope(
-                "options.deadline_ms must be greater than zero",
-            ));
-        }
+        // Each optional block holds itself to its own rules; what is left here
+        // is what only the whole envelope can decide.
+        validate_block(self.space.as_ref())?;
+        validate_block(self.execution.as_ref())?;
+        validate_block(self.read.as_ref())?;
+        validate_block(self.preconditions.as_ref())?;
+        validate_block(self.context.as_ref())?;
+        validate_block(self.options.as_ref())?;
 
         // A multi-operation request must say how its operations relate: whether
         // earlier commits survive a later failure is not a detail to leave to
@@ -260,15 +214,6 @@ impl Request {
             return Err(KipError::invalid_request_envelope(
                 "a multi-operation request must declare execution.mode: independent, sequence \
                  or atomic — operations[] is a batch, not a transaction",
-            ));
-        }
-
-        if let Some(execution) = &self.execution
-            && execution.mode == ExecutionMode::Atomic
-            && execution.on_error == Some(OnError::Continue)
-        {
-            return Err(KipError::invalid_request_envelope(
-                "an atomic transaction cannot continue past an error: it commits all or none",
             ));
         }
 
@@ -430,6 +375,18 @@ pub struct SpaceSelector {
     pub uri: Option<String>,
 }
 
+impl EnvelopeBlock for SpaceSelector {
+    fn validate(&self) -> Result<(), KipError> {
+        if self.id.is_none() && self.uri.is_none() {
+            return Err(KipError::invalid_request_envelope(
+                "space must identify a MemorySpace by `id`, `uri`, or both",
+            ));
+        }
+        validate_optional_non_empty(&self.id, "space.id", limits::SPACE_ID)?;
+        validate_optional_non_empty(&self.uri, "space.uri", limits::SPACE_URI)
+    }
+}
+
 /// How a request's operations relate to one another (Spec §75).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -467,6 +424,23 @@ impl Execution {
     /// The error policy in force: what was declared, else `stop` (§75.2).
     pub fn effective_on_error(&self) -> OnError {
         self.on_error.unwrap_or_default()
+    }
+}
+
+impl EnvelopeBlock for Execution {
+    fn validate(&self) -> Result<(), KipError> {
+        if self.mode == ExecutionMode::Atomic && self.on_error == Some(OnError::Continue) {
+            return Err(KipError::invalid_request_envelope(
+                "an atomic transaction cannot continue past an error: it commits all or none",
+            ));
+        }
+        validate_optional_non_empty(&self.isolation, "execution.isolation", limits::ISOLATION)?;
+        validate_optional_non_empty(
+            &self.idempotency_key,
+            "execution.idempotency_key",
+            limits::IDEMPOTENCY_KEY,
+        )?;
+        validate_extensions(&self.extensions, "execution.extensions")
     }
 }
 
@@ -518,6 +492,17 @@ pub struct ReadBinding {
     pub extensions: Option<Map<String, Json>>,
 }
 
+impl EnvelopeBlock for ReadBinding {
+    fn validate(&self) -> Result<(), KipError> {
+        validate_optional_non_empty(
+            &self.snapshot_token,
+            "read.snapshot_token",
+            limits::OPAQUE_TOKEN,
+        )?;
+        validate_extensions(&self.extensions, "read.extensions")
+    }
+}
+
 /// Space and schema preconditions for the whole request (Spec §35.4).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -531,6 +516,12 @@ pub struct Preconditions {
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
+}
+
+impl EnvelopeBlock for Preconditions {
+    fn validate(&self) -> Result<(), KipError> {
+        validate_extensions(&self.extensions, "preconditions.extensions")
+    }
 }
 
 /// One operation in a request (Spec §73).
@@ -691,6 +682,16 @@ pub struct RequestContext {
     pub extensions: Option<Map<String, Json>>,
 }
 
+impl EnvelopeBlock for RequestContext {
+    fn validate(&self) -> Result<(), KipError> {
+        validate_optional_non_empty(&self.purpose, "context.purpose", limits::SHORT_LABEL)?;
+        validate_optional_non_empty(&self.risk, "context.risk", limits::RISK)?;
+        validate_optional_non_empty(&self.locale, "context.locale", limits::LOCALE)?;
+        validate_optional_non_empty(&self.client, "context.client", limits::SHORT_LABEL)?;
+        validate_extensions(&self.extensions, "context.extensions")
+    }
+}
+
 /// Request-level options (Spec §80.1).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -706,6 +707,18 @@ pub struct RequestOptions {
     /// Namespaced extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
+}
+
+impl EnvelopeBlock for RequestOptions {
+    fn validate(&self) -> Result<(), KipError> {
+        validate_extensions(&self.extensions, "options.extensions")?;
+        if self.deadline_ms == Some(0) {
+            return Err(KipError::invalid_request_envelope(
+                "options.deadline_ms must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Source material the runtime mints into Evidence (Spec §71.1).
@@ -874,6 +887,28 @@ impl IngestEvidence {
                 self.key
             ))),
         }
+    }
+}
+
+/// One optional block of the request envelope, answering for its own fields.
+///
+/// [`Request::validate`] used to reach into all six of them, which put a
+/// block's rules three hundred lines from the fields they constrain — and made
+/// "does this block get checked at all?" a question about a long function
+/// rather than about the block. A block now carries its rules, and the request
+/// decides only what no single block can: how the operations relate, whether
+/// their ids collide, whether an `ingest` block has a transaction to be minted
+/// into.
+trait EnvelopeBlock {
+    /// The block's own rules.
+    fn validate(&self) -> Result<(), KipError>;
+}
+
+/// Validates an envelope block when the request carries one.
+fn validate_block<T: EnvelopeBlock>(block: Option<&T>) -> Result<(), KipError> {
+    match block {
+        Some(block) => block.validate(),
+        None => Ok(()),
     }
 }
 
@@ -1379,16 +1414,16 @@ pub struct SearchContext {
     pub extensions: Option<Map<String, Json>>,
 }
 
-/// The baseline SEARCH modes (Spec §66.3).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchMode {
-    /// Lexical matching.
-    Keyword,
-    /// Embedding similarity.
-    Semantic,
-    /// Both.
-    Hybrid,
+wire_enum! {
+    /// The baseline SEARCH modes (Spec §66.3).
+    pub enum SearchMode {
+        /// Lexical matching.
+        Keyword = "keyword",
+        /// Embedding similarity.
+        Semantic = "semantic",
+        /// Both.
+        Hybrid = "hybrid",
+    }
 }
 
 /// The snapshot coordinate a response was produced at (Spec §78).

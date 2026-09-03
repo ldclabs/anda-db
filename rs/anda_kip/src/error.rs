@@ -21,119 +21,108 @@ use thiserror::Error;
 
 use crate::ast::Json;
 
-/// The coarse family an error belongs to (Spec §86.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCategory {
-    /// The command text could not be parsed.
-    Syntax,
-    /// The request envelope or operation shape is wrong.
-    Protocol,
-    /// A Schema symbol, field or package problem.
-    Schema,
-    /// An identity or reference problem in the data.
-    Data,
-    /// An epistemic or mutability rule was violated.
-    Epistemic,
-    /// Authentication, authorization or protected state.
-    Governance,
-    /// A transaction precondition, conflict or unknown outcome.
-    Transaction,
-    /// Historical reads and cursors.
-    History,
-    /// SEARCH modes and indexes.
-    Search,
-    /// Artifacts, digests and proofs.
-    Artifact,
-    /// Limits, quotas and timeouts.
-    Resource,
-    /// The transport itself failed.
-    Transport,
-    /// An unclassified internal failure.
-    System,
-}
-
-impl ErrorCategory {
-    /// The wire spelling of this category.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ErrorCategory::Syntax => "syntax",
-            ErrorCategory::Protocol => "protocol",
-            ErrorCategory::Schema => "schema",
-            ErrorCategory::Data => "data",
-            ErrorCategory::Epistemic => "epistemic",
-            ErrorCategory::Governance => "governance",
-            ErrorCategory::Transaction => "transaction",
-            ErrorCategory::History => "history",
-            ErrorCategory::Search => "search",
-            ErrorCategory::Artifact => "artifact",
-            ErrorCategory::Resource => "resource",
-            ErrorCategory::Transport => "transport",
-            ErrorCategory::System => "system",
-        }
+wire_enum! {
+    /// The coarse family an error belongs to (Spec §86.2).
+    pub enum ErrorCategory {
+        /// The command text could not be parsed.
+        Syntax = "syntax",
+        /// The request envelope or operation shape is wrong.
+        Protocol = "protocol",
+        /// A Schema symbol, field or package problem.
+        Schema = "schema",
+        /// An identity or reference problem in the data.
+        Data = "data",
+        /// An epistemic or mutability rule was violated.
+        Epistemic = "epistemic",
+        /// Authentication, authorization or protected state.
+        Governance = "governance",
+        /// A transaction precondition, conflict or unknown outcome.
+        Transaction = "transaction",
+        /// Historical reads and cursors.
+        History = "history",
+        /// SEARCH modes and indexes.
+        Search = "search",
+        /// Artifacts, digests and proofs.
+        Artifact = "artifact",
+        /// Limits, quotas and timeouts.
+        Resource = "resource",
+        /// The transport itself failed.
+        Transport = "transport",
+        /// An unclassified internal failure.
+        System = "system",
     }
 }
 
-impl Display for ErrorCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// What kind of retry, if any, can make progress (Spec §86.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryClass {
-    /// Nothing durable happened; re-sending the identical request is safe.
-    SafeSameRequest,
-    /// Re-read the current state, then retry with what you learned.
-    RequiresRefresh,
-    /// The request itself must change.
-    RequiresDifferentInput,
-    /// The caller needs authority it does not currently hold.
-    RequiresAuthority,
-    /// Acquire a new snapshot or cursor first.
-    RequiresNewSnapshot,
-    /// Re-upload or re-fetch the artifact, then retry.
-    RequiresReacquireArtifact,
-    /// The outcome is unknown; look the transaction up before deciding.
-    OutcomeLookupRequired,
-    /// Retrying cannot help.
-    NonRetryable,
-}
-
-impl RetryClass {
-    /// The wire spelling of this retry class.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RetryClass::SafeSameRequest => "safe_same_request",
-            RetryClass::RequiresRefresh => "requires_refresh",
-            RetryClass::RequiresDifferentInput => "requires_different_input",
-            RetryClass::RequiresAuthority => "requires_authority",
-            RetryClass::RequiresNewSnapshot => "requires_new_snapshot",
-            RetryClass::RequiresReacquireArtifact => "requires_reacquire_artifact",
-            RetryClass::OutcomeLookupRequired => "outcome_lookup_required",
-            RetryClass::NonRetryable => "non_retryable",
-        }
-    }
-}
-
-impl Display for RetryClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+wire_enum! {
+    /// What kind of retry, if any, can make progress (Spec §86.3).
+    pub enum RetryClass {
+        /// Nothing durable happened; re-sending the identical request is safe.
+        ///
+        /// A serialization loss is an abort, a rate limit refused to run at
+        /// all, and an unavailable index only ever failed a read.
+        SafeSameRequest = "safe_same_request",
+        /// Re-read the current state, then retry with what you learned.
+        RequiresRefresh = "requires_refresh",
+        /// The request itself must change.
+        ///
+        /// The default a code carries when nothing more specific applies: the
+        /// problem is with what was sent, not with the runtime or the caller's
+        /// authority.
+        RequiresDifferentInput = "requires_different_input",
+        /// The caller lacks authority, not information.
+        RequiresAuthority = "requires_authority",
+        /// Acquire a fresh coordinate first.
+        ///
+        /// A cursor that is gone — expired, invalidated by a schema change or
+        /// a revocation, or never issued by this engine — is restarted from a
+        /// fresh first page, whichever reason `details` names.
+        RequiresNewSnapshot = "requires_new_snapshot",
+        /// The bytes are gone or wrong; fetch them again, then retry.
+        RequiresReacquireArtifact = "requires_reacquire_artifact",
+        /// The write's fate is undecided; look the transaction up before
+        /// deciding.
+        ///
+        /// A deadline is not an abort (§80.2): the transaction may still be
+        /// running, and may still commit. An internal failure says nothing
+        /// about whether the write landed either. Classifying either as
+        /// `safe_same_request` would state that nothing durable happened —
+        /// which is the one thing neither of them establishes — and a caller
+        /// acting on it re-issues a mutation that may already be in the log.
+        /// The conservative default is to look the transaction up (§80.3,
+        /// §80.4); a runtime that *knows* its read timed out without touching
+        /// state may override `retry` on the wire.
+        OutcomeLookupRequired = "outcome_lookup_required",
+        /// Retrying cannot help: the runtime will never support it, or the
+        /// history it needs is gone for good.
+        NonRetryable = "non_retryable",
     }
 }
 
 /// Declares the Core Error Registry once.
 ///
-/// The registry is one list, and three things have to agree with it: the enum,
-/// the `ALL` slice a caller enumerates, and the wire name a code parses back
-/// from. Written out by hand they did agree — but only `ALL` was unchecked by
-/// the compiler, so a code added to the enum and to `name()` and forgotten
-/// here would compile and then be silently unparseable. Generating all three
-/// from the one list removes the failure rather than documenting it.
+/// A code is not one fact but four — its name on the wire, its category, its
+/// retry class and the hint an Agent reads. Written as four parallel lists
+/// they did agree, but only the compiler's exhaustiveness check held them
+/// together, and `ALL` and `from_name` were outside even that: a code added to
+/// the enum and to `name()` and forgotten in the list would compile and then
+/// be silently unparseable. Declaring the four together removes the failure
+/// rather than documenting it.
+///
+/// ```text
+/// Variant: Category [, RetryClass] => "hint";
+/// ```
+///
+/// The retry class is omitted for [`RetryClass::RequiresDifferentInput`],
+/// which is what a code means when nothing more specific applies: the request
+/// itself has to change.
 macro_rules! kip_error_codes {
-    ($( $(#[$meta:meta])* $variant:ident ),+ $(,)?) => {
+    (@retry) => { RetryClass::RequiresDifferentInput };
+    (@retry $retry:ident) => { RetryClass::$retry };
+
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident : $category:ident $(, $retry:ident)? => $hint:expr
+    );+ $(;)?) => {
         /// The Core Error Registry (Spec §87).
         ///
         /// Codes are stable names, not numbers: an Agent switching on
@@ -162,6 +151,30 @@ macro_rules! kip_error_codes {
                     _ => None,
                 }
             }
+
+            /// The registry section this code belongs to (Spec §86.2).
+            pub fn category(&self) -> ErrorCategory {
+                match self {
+                    $( KipErrorCode::$variant => ErrorCategory::$category, )+
+                }
+            }
+
+            /// This crate's default retry classification (Spec §86.3).
+            ///
+            /// A runtime that knows more about one occurrence may override
+            /// `retry` on the wire; this is what the code alone establishes.
+            pub fn retry_class(&self) -> RetryClass {
+                match self {
+                    $( KipErrorCode::$variant => kip_error_codes!(@retry $($retry)?), )+
+                }
+            }
+
+            /// A recovery hint aimed at an Agent that must fix its own command.
+            pub fn hint(&self) -> &'static str {
+                match self {
+                    $( KipErrorCode::$variant => $hint, )+
+                }
+            }
         }
     };
 }
@@ -169,547 +182,295 @@ macro_rules! kip_error_codes {
 kip_error_codes! {
     // ── §87.1 Protocol / syntax ──────────────────────────────────────
     /// The command text could not be parsed.
-    InvalidSyntax,
+    InvalidSyntax: Syntax =>
+        "Check bracket matching, keyword spelling and clause order. Run `VALIDATE \
+         KQL`/`VALIDATE KML` on the text before re-sending.";
     /// An identifier does not match the required shape.
-    InvalidIdentifier,
+    InvalidIdentifier: Syntax =>
+        "Identifiers must match `[A-Za-z_][A-Za-z0-9_]*`.";
     /// The request envelope is malformed or self-contradictory.
-    InvalidRequestEnvelope,
+    InvalidRequestEnvelope: Protocol =>
+        "Check the envelope: `kip` version, `operations[]` shape, and that `execution.mode` is \
+         one of independent, sequence, atomic.";
     /// The declared `kip` protocol version is not supported.
-    UnsupportedProtocolVersion,
+    UnsupportedProtocolVersion: Protocol, NonRetryable =>
+        "Run `DESCRIBE PROTOCOL` to learn which protocol versions this runtime speaks.";
     /// A requested capability is not supported by this runtime.
-    UnsupportedCapability,
+    UnsupportedCapability: Protocol, NonRetryable =>
+        "Run `DESCRIBE CAPABILITIES` and request only what is both supported and available.";
     /// The requested transaction isolation is not supported.
-    UnsupportedIsolation,
+    UnsupportedIsolation: Protocol, NonRetryable =>
+        "Run `DESCRIBE CAPABILITIES` for the isolation levels this runtime offers.";
     /// The declared language does not match the command's actual semantics.
-    LanguageMismatch,
+    LanguageMismatch: Protocol =>
+        "The `language` label must match the command's real semantics; a KML write cannot be \
+         labelled KQL.";
     /// A state-changing command reached a read-only execution path.
-    ReadonlyViolation,
+    ReadonlyViolation: Protocol =>
+        "This endpoint executes KQL and META only. Re-send state-changing KML through the \
+         general runtime.";
     /// Two clauses in one mutation plan claim the same local handle.
-    DuplicateLocalHandle,
+    DuplicateLocalHandle: Protocol =>
+        "Two clauses claim the same `?handle`. Rename one: forward references must resolve to \
+         exactly one clause.";
     /// Two clauses in one transaction mutate the same element.
-    DuplicateMutationTarget,
+    DuplicateMutationTarget: Protocol =>
+        "One transaction may mutate an element once. Merge the two clauses into a single \
+         mutation.";
 
     // ── §87.2 Schema ─────────────────────────────────────────────────
     /// The Schema symbol does not exist in the active environment.
-    SchemaSymbolNotFound,
+    SchemaSymbolNotFound: Schema =>
+        "Run `LIST TYPES` / `LIST PREDICATES` or `DESCRIBE TYPE` to confirm the symbol. Symbols \
+         are case-sensitive.";
     /// A local name resolves to more than one package symbol.
-    SchemaSymbolAmbiguous,
+    SchemaSymbolAmbiguous: Schema =>
+        "The local name resolves in more than one package. Qualify it with its package path.";
     /// The field is not declared on this type or facet.
-    SchemaFieldNotFound,
+    SchemaFieldNotFound: Schema =>
+        "Run `DESCRIBE TYPE` / `DESCRIBE FACET` to see which fields the element actually \
+         declares.";
     /// The Schema Package is not loaded or not available.
-    SchemaPackageUnavailable,
+    SchemaPackageUnavailable: Schema, RequiresRefresh =>
+        "Run `LIST SCHEMA PACKAGES` to check what is active in this Schema Environment.";
     /// The Schema Environment changed under the request.
-    SchemaEnvironmentChanged,
+    SchemaEnvironmentChanged: Schema, RequiresRefresh =>
+        "The environment changed under the request. Re-read `DESCRIBE SCHEMA ENVIRONMENT` and \
+         retry.";
     /// The historical Schema needed for this read is no longer retained.
-    HistoricalSchemaUnavailable,
+    HistoricalSchemaUnavailable: Schema, NonRetryable =>
+        "The Schema needed to interpret that history is no longer retained; the historical read \
+         cannot be served.";
     /// A value's type does not match its declaration.
-    TypeMismatch,
+    TypeMismatch: Schema =>
+        "Correct the value's type to match its declaration.";
     /// A declared Schema constraint was violated.
-    ConstraintViolation,
+    ConstraintViolation: Schema =>
+        "Supply the missing required fields, or relax the value to satisfy the constraint.";
 
     // ── §87.3 Identity / reference ───────────────────────────────────
     /// The target does not exist, or is not visible to this Principal.
     ///
     /// Deliberately existence-neutral, so a probe cannot map protected state
     /// by distinguishing "absent" from "forbidden" (Spec §86.4).
-    NotFoundOrNotVisible,
+    NotFoundOrNotVisible: Data =>
+        "The target does not exist or is not visible to you. Ground with `SEARCH` and confirm \
+         with an exact id before writing.";
     /// A referenced variable, handle or parameter is not bound.
-    ReferenceError,
+    ReferenceError: Data =>
+        "Bind the variable in the WHERE block, or create the handle earlier in the same MUTATE \
+         plan.";
     /// A Structural Reference is not legal for its field.
-    StructuralReferenceInvalid,
+    StructuralReferenceInvalid: Data =>
+        "Run `DESCRIBE STRUCTURAL FIELD` for the field's legal target kinds and cardinality.";
     /// The statement needs a stable identity selector and none was given.
-    IdentitySelectorRequired,
+    IdentitySelectorRequired: Data =>
+        "Add a stable selector: `{id: ...}` or `{key: ...}`.";
     /// A name was used where only a stable identity is accepted.
-    NameIdentityForbidden,
+    NameIdentityForbidden: Data =>
+        "`name` is mutable grounding state and never identifies an element. Match on `id` or \
+         `key`.";
     /// Two identity claims for one element disagree.
-    IdentityConflict,
+    IdentityConflict: Data =>
+        "Two identity claims disagree. Resolve which element you mean before retrying.";
     /// The `client_key` is already bound to a different element.
-    ClientKeyConflict,
+    ClientKeyConflict: Data =>
+        "That `client_key` already names a different element. Use a fresh key, or address the \
+         existing element by id.";
     /// A merge would join two irreconcilable identities.
-    IdentityMergeConflict,
+    IdentityMergeConflict: Data =>
+        "The two Concepts cannot be merged. Inspect both with `DESCRIBE`/`FIND` before deciding \
+         a canonical target.";
 
     // ── §87.4 Epistemic / mutability ─────────────────────────────────
     /// The field is immutable after creation.
-    ImmutableField,
+    ImmutableField: Epistemic =>
+        "The field is immutable after creation; express the change as new state instead.";
     /// Changing this requires a new Assertion plus supersession.
-    EpistemicRevisionRequired,
+    EpistemicRevisionRequired: Epistemic =>
+        "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT \
+         ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`.";
     /// Changing this requires `TRANSITION :old TO "corrected" BY :new`.
-    EvidenceCorrectionRequired,
+    EvidenceCorrectionRequired: Epistemic =>
+        "Evidence payload never changes. Record the corrected Evidence and `TRANSITION :old TO \
+         \"corrected\" BY :new`.";
     /// The requested lifecycle transition is not legal from the current state.
-    InvalidLifecycleTransition,
+    InvalidLifecycleTransition: Epistemic =>
+        "Read the element's current lifecycle state first (`details.from` / `details.to`); that \
+         TRANSITION is not legal from where it is, or not for its kind.";
     /// Only the assertor may retract their own Assertion.
-    RetractionNotAuthorized,
+    RetractionNotAuthorized: Epistemic, RequiresAuthority =>
+        "Only the assertor may retract their own Assertion.";
     /// The superseding Assertion does not address the superseded slot.
-    SupersessionMismatch,
+    SupersessionMismatch: Epistemic, RequiresRefresh =>
+        "The superseding Assertion must address the same slot as the one it supersedes.";
     /// Two corrections of the same Evidence conflict.
-    EvidenceCorrectionConflict,
+    EvidenceCorrectionConflict: Epistemic, RequiresRefresh =>
+        "That Evidence already has a conflicting correction. Re-read its lineage.";
     /// The Activity is terminal and its outputs are frozen.
-    ActivityTerminal,
+    ActivityTerminal: Epistemic =>
+        "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ... TO \
+         \"completed\" SET STRUCTURAL` that ends it.";
     /// A projection target is not bound by the query.
-    ProjectionTargetUnbound,
+    ProjectionTargetUnbound: Epistemic =>
+        "Bind the projection's Proposition in the WHERE block first.";
     /// A projection target is not sufficiently bounded to evaluate.
-    ProjectionTargetUnbounded,
+    ProjectionTargetUnbounded: Epistemic =>
+        "BELIEF needs a bounded target: name the Proposition, or ground the subject and \
+         predicate.";
     /// The Principal may read but not project belief here.
-    ProjectionNotAuthorized,
+    ProjectionNotAuthorized: Epistemic, RequiresAuthority =>
+        "You may read the raw claims but not project belief here.";
     /// No epistemic policy is available to project with.
-    ProjectionPolicyUnavailable,
+    ProjectionPolicyUnavailable: Epistemic, RequiresRefresh =>
+        "Run `LIST EPISTEMIC POLICIES` / `DESCRIBE EPISTEMIC POLICY` to see what can be \
+         projected with.";
 
     // ── §87.5 Governance ─────────────────────────────────────────────
     /// No authenticated Principal.
-    Unauthenticated,
+    Unauthenticated: Governance, RequiresAuthority =>
+        "Authenticate before issuing this request.";
     /// The Principal is authenticated but lacks the permission.
-    NotAuthorized,
+    NotAuthorized: Governance, RequiresAuthority =>
+        "Run `DESCRIBE ACCESS` to see which operations you may perform here.";
     /// The operation needs out-of-band approval first.
-    RequiresApproval,
+    RequiresApproval: Governance, RequiresAuthority =>
+        "The operation is queued behind an out-of-band approval.";
     /// The operation needs a stronger authentication factor.
-    RequiresStrongerAuthentication,
+    RequiresStrongerAuthentication: Governance, RequiresAuthority =>
+        "Re-authenticate with a stronger factor and retry.";
     /// The write needs an ActorBinding for the claimed semantic actor.
-    ActorBindingRequired,
+    ActorBindingRequired: Governance, RequiresAuthority =>
+        "Attribution needs an ActorBinding: you cannot assert on behalf of an actor you are not \
+         bound to.";
     /// `_system` state is engine-owned and never author-writable.
-    ProtectedSystemField,
+    ProtectedSystemField: Governance, NonRetryable =>
+        "`_system` is engine truth and is never written by a mutation.";
     /// Governance state is part of the protected control plane.
-    ProtectedGovernanceField,
+    ProtectedGovernanceField: Governance, NonRetryable =>
+        "Governance lives in the protected control plane, not in cognitive mutations.";
     /// The Schema state is protected against this mutation.
-    ProtectedSchemaState,
+    ProtectedSchemaState: Governance, NonRetryable =>
+        "Schema state is immutable Package state; publish and activate a Package instead.";
     /// A legal hold forbids the removal.
-    LegalHoldConflict,
+    LegalHoldConflict: Governance, RequiresAuthority =>
+        "A legal hold covers this element; removal is blocked until it is lifted.";
     /// Physical purge was denied by policy.
-    PurgeDenied,
+    PurgeDenied: Governance, RequiresAuthority =>
+        "Physical purge was denied by policy.";
 
     // ── §87.6 Transaction ────────────────────────────────────────────
     /// `EXPECT VERSION` did not match.
-    VersionConflict,
+    VersionConflict: Transaction, RequiresRefresh =>
+        "The element changed since you read it. Re-read it, re-apply your change, and retry \
+         with the fresh `EXPECT VERSION`.";
     /// A declared precondition did not hold.
-    PreconditionFailed,
+    PreconditionFailed: Transaction, RequiresRefresh =>
+        "A declared precondition no longer holds. Re-read the current state and retry.";
     /// The transaction lost a serialization race.
-    SerializationConflict,
+    SerializationConflict: Transaction, SafeSameRequest =>
+        "The transaction lost a race. Re-sending the identical request is safe.";
     /// The idempotency key was reused with a different request.
-    IdempotencyConflict,
+    IdempotencyConflict: Transaction =>
+        "That idempotency key already names a different request. Use a new key, or re-send the \
+         original request bytes.";
     /// The named transaction is unknown to this runtime.
-    TransactionUnknown,
+    TransactionUnknown: Transaction, OutcomeLookupRequired =>
+        "Look the transaction up by its idempotency key before assuming anything about it.";
     /// The write may or may not have committed.
-    OutcomeUnknown,
+    OutcomeUnknown: Transaction, OutcomeLookupRequired =>
+        "Do not create a fresh mutation. Look the transaction up by idempotency key, or retry \
+         the exact same logical request with the same key.";
     /// The transaction exceeds the runtime's size limit.
-    TransactionTooLarge,
+    TransactionTooLarge: Transaction =>
+        "Split the mutation into smaller coherent transactions.";
 
     // ── §87.7 Historical / cursor ────────────────────────────────────
     /// The requested historical snapshot is no longer retained.
-    HistoricalSnapshotUnavailable,
+    HistoricalSnapshotUnavailable: History, RequiresNewSnapshot =>
+        "That history is no longer retained. Read at a newer coordinate.";
     /// The cursor does not belong to this query.
-    CursorMismatch,
+    CursorMismatch: History =>
+        "The cursor belongs to a different query. Restart pagination.";
     /// The cursor is for a different result kind.
-    CursorTypeMismatch,
+    CursorTypeMismatch: History =>
+        "The cursor is for a different result kind. Restart pagination.";
     /// The cursor is past its retention window.
     ///
     /// One code for every cursor family (KQL, SEARCH, HISTORY, LIST, CHANGES,
     /// EXPORT): `details.family` names the family and `details.reason` says
     /// why (§87.7). A Change cursor that expired restarts from a sequence the
     /// consumer durably recorded, never from the current head (§69).
-    CursorExpired,
+    CursorExpired: History, RequiresNewSnapshot =>
+        "Restart pagination from a fresh first page; a change cursor restarts from a sequence \
+         you recorded, never from the current head. `details.family` names the cursor family.";
     /// The cursor is malformed, was issued for another traversal, or was
     /// invalidated by an intervening change — `details.reason` is one of
     /// `malformed`, `access_revoked`, `schema_changed`; `details.family` names
     /// the cursor family (§87.7).
-    CursorInvalid,
+    CursorInvalid: History, RequiresNewSnapshot =>
+        "The cursor is malformed, belongs to another traversal, or was invalidated \
+         (`details.reason`: malformed, access_revoked, schema_changed). Restart pagination from \
+         a fresh first page.";
 
     // ── §87.8 Search ─────────────────────────────────────────────────
     /// The requested SEARCH mode is not supported.
-    SearchModeUnsupported,
+    SearchModeUnsupported: Search =>
+        "Run `DESCRIBE CAPABILITIES` for the SEARCH modes this runtime offers.";
     /// The SEARCH index is not currently available.
-    SearchIndexUnavailable,
+    SearchIndexUnavailable: Search, SafeSameRequest =>
+        "The index is temporarily unavailable; the same request may succeed shortly.";
     /// Historical SEARCH is not supported for this basis.
-    HistoricalSearchUnavailable,
+    HistoricalSearchUnavailable: Search, NonRetryable =>
+        "Historical SEARCH is not supported here; read the current index instead.";
 
     // ── §87.9 Artifact / proof ───────────────────────────────────────
     /// The artifact handle no longer resolves.
-    ArtifactUnavailable,
+    ArtifactUnavailable: Artifact, RequiresReacquireArtifact =>
+        "Re-upload or re-stage the artifact, then retry with the new handle.";
     /// The artifact exceeds the runtime's size limit.
-    ArtifactTooLarge,
+    ArtifactTooLarge: Artifact =>
+        "The artifact exceeds this runtime's limit. Split it or reference it externally.";
     /// The artifact bytes could not be parsed.
-    ArtifactParseError,
+    ArtifactParseError: Artifact =>
+        "The bytes are not a well-formed artifact of the declared kind.";
     /// The content digest does not match the bytes.
-    DigestMismatch,
+    DigestMismatch: Artifact, RequiresReacquireArtifact =>
+        "The bytes do not match the declared digest. Re-acquire the artifact.";
     /// A cryptographic proof did not verify.
-    ProofInvalid,
+    ProofInvalid: Artifact, NonRetryable =>
+        "The proof did not verify. Do not treat the artifact as trusted.";
     /// The signer is not known or not trusted.
-    SignerUnknown,
+    SignerUnknown: Artifact, NonRetryable =>
+        "The signer is unknown here. Establish trust explicitly before importing.";
     /// A referenced blob is not available.
-    BlobUnavailable,
+    BlobUnavailable: Artifact, RequiresReacquireArtifact =>
+        "A referenced blob is missing. Re-acquire it, or import with a redaction-tolerant mode.";
     /// The Capsule failed validation.
-    CapsuleValidationFailed,
+    CapsuleValidationFailed: Artifact =>
+        "Run `VALIDATE CAPSULE` to see exactly which invariant the Capsule breaks.";
     /// The import preview no longer matches the destination state.
-    ImportPreviewConflict,
+    ImportPreviewConflict: Artifact, RequiresRefresh =>
+        "The destination changed since the preview. Re-run `PREVIEW IMPORT CAPSULE` and retry.";
 
     // ── §87.10 Resource / runtime ────────────────────────────────────
     /// A resource limit was hit.
-    ResourceExhausted,
+    ResourceExhausted: Resource =>
+        "Reduce the request's cost: lower `LIMIT`, narrow the patterns, or paginate.";
     /// The result set exceeds the allowed size.
-    ResultLimitExceeded,
+    ResultLimitExceeded: Resource =>
+        "Use `LIMIT` with `CURSOR` to page through the result set.";
     /// Execution exceeded its deadline and was aborted.
-    ExecutionTimeout,
+    ExecutionTimeout: Resource, OutcomeLookupRequired =>
+        "A deadline is not an abort: look the transaction up by idempotency key before \
+         deciding. For a read, simplify it — fewer UNION branches, a lower LIMIT, fewer path \
+         hops.";
     /// The caller is being rate limited.
-    RateLimited,
+    RateLimited: Resource, SafeSameRequest =>
+        "Back off and retry the identical request.";
     /// An unclassified internal failure.
-    InternalError,
-}
-
-impl KipErrorCode {
-    /// The registry section this code belongs to (Spec §86.2).
-    pub fn category(&self) -> ErrorCategory {
-        use KipErrorCode::*;
-        match self {
-            InvalidSyntax | InvalidIdentifier => ErrorCategory::Syntax,
-            InvalidRequestEnvelope
-            | UnsupportedProtocolVersion
-            | UnsupportedCapability
-            | UnsupportedIsolation
-            | LanguageMismatch
-            | ReadonlyViolation
-            | DuplicateLocalHandle
-            | DuplicateMutationTarget => ErrorCategory::Protocol,
-            SchemaSymbolNotFound
-            | SchemaSymbolAmbiguous
-            | SchemaFieldNotFound
-            | SchemaPackageUnavailable
-            | SchemaEnvironmentChanged
-            | HistoricalSchemaUnavailable
-            | TypeMismatch
-            | ConstraintViolation => ErrorCategory::Schema,
-            NotFoundOrNotVisible
-            | ReferenceError
-            | StructuralReferenceInvalid
-            | IdentitySelectorRequired
-            | NameIdentityForbidden
-            | IdentityConflict
-            | ClientKeyConflict
-            | IdentityMergeConflict => ErrorCategory::Data,
-            ImmutableField
-            | EpistemicRevisionRequired
-            | EvidenceCorrectionRequired
-            | InvalidLifecycleTransition
-            | RetractionNotAuthorized
-            | SupersessionMismatch
-            | EvidenceCorrectionConflict
-            | ActivityTerminal
-            | ProjectionTargetUnbound
-            | ProjectionTargetUnbounded
-            | ProjectionNotAuthorized
-            | ProjectionPolicyUnavailable => ErrorCategory::Epistemic,
-            Unauthenticated
-            | NotAuthorized
-            | RequiresApproval
-            | RequiresStrongerAuthentication
-            | ActorBindingRequired
-            | ProtectedSystemField
-            | ProtectedGovernanceField
-            | ProtectedSchemaState
-            | LegalHoldConflict
-            | PurgeDenied => ErrorCategory::Governance,
-            VersionConflict
-            | PreconditionFailed
-            | SerializationConflict
-            | IdempotencyConflict
-            | TransactionUnknown
-            | OutcomeUnknown
-            | TransactionTooLarge => ErrorCategory::Transaction,
-            HistoricalSnapshotUnavailable
-            | CursorMismatch
-            | CursorTypeMismatch
-            | CursorExpired
-            | CursorInvalid => ErrorCategory::History,
-            SearchModeUnsupported | SearchIndexUnavailable | HistoricalSearchUnavailable => {
-                ErrorCategory::Search
-            }
-            ArtifactUnavailable
-            | ArtifactTooLarge
-            | ArtifactParseError
-            | DigestMismatch
-            | ProofInvalid
-            | SignerUnknown
-            | BlobUnavailable
-            | CapsuleValidationFailed
-            | ImportPreviewConflict => ErrorCategory::Artifact,
-            ResourceExhausted | ResultLimitExceeded | ExecutionTimeout | RateLimited => {
-                ErrorCategory::Resource
-            }
-            InternalError => ErrorCategory::System,
-        }
-    }
-
-    /// This crate's default retry classification (Spec §86.3).
-    pub fn retry_class(&self) -> RetryClass {
-        use KipErrorCode::*;
-        match self {
-            // Nothing durable happened and the same bytes may work next time.
-            // A serialization loss is an abort, a rate limit refused to run at
-            // all, and an unavailable index only ever failed a read.
-            SerializationConflict | SearchIndexUnavailable | RateLimited => {
-                RetryClass::SafeSameRequest
-            }
-            // Re-read, then retry with what you learned.
-            SchemaPackageUnavailable
-            | SchemaEnvironmentChanged
-            | SupersessionMismatch
-            | EvidenceCorrectionConflict
-            | ProjectionPolicyUnavailable
-            | VersionConflict
-            | PreconditionFailed
-            | ImportPreviewConflict => RetryClass::RequiresRefresh,
-            // The caller lacks authority, not information.
-            RetractionNotAuthorized
-            | ProjectionNotAuthorized
-            | Unauthenticated
-            | NotAuthorized
-            | RequiresApproval
-            | RequiresStrongerAuthentication
-            | ActorBindingRequired
-            | LegalHoldConflict
-            | PurgeDenied => RetryClass::RequiresAuthority,
-            // Acquire a fresh coordinate first. A cursor that is gone —
-            // expired, invalidated by a schema change or a revocation, or
-            // never issued by this engine — is restarted from a fresh first
-            // page, whichever reason `details` names.
-            HistoricalSnapshotUnavailable | CursorExpired | CursorInvalid => {
-                RetryClass::RequiresNewSnapshot
-            }
-            // The bytes are gone or wrong; fetch them again.
-            ArtifactUnavailable | DigestMismatch | BlobUnavailable => {
-                RetryClass::RequiresReacquireArtifact
-            }
-            // The write's fate is undecided.
-            //
-            // A deadline is not an abort (§80.2): the transaction may still be
-            // running, and may still commit. An internal failure says nothing
-            // about whether the write landed either. Classifying either as
-            // `safe_same_request` would state that nothing durable happened —
-            // which is the one thing neither of them establishes — and a
-            // caller acting on it re-issues a mutation that may already be in
-            // the log. The conservative default is to look the transaction up
-            // (§80.3, §80.4); a runtime that *knows* its read timed out
-            // without touching state may override `retry` on the wire.
-            TransactionUnknown | OutcomeUnknown | ExecutionTimeout | InternalError => {
-                RetryClass::OutcomeLookupRequired
-            }
-            // Retrying cannot help: the runtime will never support it, or the
-            // history it needs is gone for good.
-            UnsupportedProtocolVersion
-            | UnsupportedCapability
-            | UnsupportedIsolation
-            | HistoricalSchemaUnavailable
-            | HistoricalSearchUnavailable
-            | ProtectedSystemField
-            | ProtectedGovernanceField
-            | ProtectedSchemaState
-            | ProofInvalid
-            | SignerUnknown => RetryClass::NonRetryable,
-            // Everything else is a problem with the request itself.
-            _ => RetryClass::RequiresDifferentInput,
-        }
-    }
-
-    /// A recovery hint aimed at an Agent that must fix its own command.
-    pub fn hint(&self) -> &'static str {
-        use KipErrorCode::*;
-        match self {
-            InvalidSyntax => {
-                "Check bracket matching, keyword spelling and clause order. Run `VALIDATE KQL`/`VALIDATE KML` on the text before re-sending."
-            }
-            InvalidIdentifier => "Identifiers must match `[A-Za-z_][A-Za-z0-9_]*`.",
-            InvalidRequestEnvelope => {
-                "Check the envelope: `kip` version, `operations[]` shape, and that `execution.mode` is one of independent, sequence, atomic."
-            }
-            UnsupportedProtocolVersion => {
-                "Run `DESCRIBE PROTOCOL` to learn which protocol versions this runtime speaks."
-            }
-            UnsupportedCapability => {
-                "Run `DESCRIBE CAPABILITIES` and request only what is both supported and available."
-            }
-            UnsupportedIsolation => {
-                "Run `DESCRIBE CAPABILITIES` for the isolation levels this runtime offers."
-            }
-            LanguageMismatch => {
-                "The `language` label must match the command's real semantics; a KML write cannot be labelled KQL."
-            }
-            ReadonlyViolation => {
-                "This endpoint executes KQL and META only. Re-send state-changing KML through the general runtime."
-            }
-            DuplicateLocalHandle => {
-                "Two clauses claim the same `?handle`. Rename one: forward references must resolve to exactly one clause."
-            }
-            DuplicateMutationTarget => {
-                "One transaction may mutate an element once. Merge the two clauses into a single mutation."
-            }
-            SchemaSymbolNotFound => {
-                "Run `LIST TYPES` / `LIST PREDICATES` or `DESCRIBE TYPE` to confirm the symbol. Symbols are case-sensitive."
-            }
-            SchemaSymbolAmbiguous => {
-                "The local name resolves in more than one package. Qualify it with its package path."
-            }
-            SchemaFieldNotFound => {
-                "Run `DESCRIBE TYPE` / `DESCRIBE FACET` to see which fields the element actually declares."
-            }
-            SchemaPackageUnavailable => {
-                "Run `LIST SCHEMA PACKAGES` to check what is active in this Schema Environment."
-            }
-            SchemaEnvironmentChanged => {
-                "The environment changed under the request. Re-read `DESCRIBE SCHEMA ENVIRONMENT` and retry."
-            }
-            HistoricalSchemaUnavailable => {
-                "The Schema needed to interpret that history is no longer retained; the historical read cannot be served."
-            }
-            TypeMismatch => "Correct the value's type to match its declaration.",
-            ConstraintViolation => {
-                "Supply the missing required fields, or relax the value to satisfy the constraint."
-            }
-            NotFoundOrNotVisible => {
-                "The target does not exist or is not visible to you. Ground with `SEARCH` and confirm with an exact id before writing."
-            }
-            ReferenceError => {
-                "Bind the variable in the WHERE block, or create the handle earlier in the same MUTATE plan."
-            }
-            StructuralReferenceInvalid => {
-                "Run `DESCRIBE STRUCTURAL FIELD` for the field's legal target kinds and cardinality."
-            }
-            IdentitySelectorRequired => "Add a stable selector: `{id: ...}` or `{key: ...}`.",
-            NameIdentityForbidden => {
-                "`name` is mutable grounding state and never identifies an element. Match on `id` or `key`."
-            }
-            IdentityConflict => {
-                "Two identity claims disagree. Resolve which element you mean before retrying."
-            }
-            ClientKeyConflict => {
-                "That `client_key` already names a different element. Use a fresh key, or address the existing element by id."
-            }
-            IdentityMergeConflict => {
-                "The two Concepts cannot be merged. Inspect both with `DESCRIBE`/`FIND` before deciding a canonical target."
-            }
-            ImmutableField => {
-                "The field is immutable after creation; express the change as new state instead."
-            }
-            EpistemicRevisionRequired => {
-                "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`."
-            }
-            EvidenceCorrectionRequired => {
-                "Evidence payload never changes. Record the corrected Evidence and `TRANSITION :old TO \"corrected\" BY :new`."
-            }
-            InvalidLifecycleTransition => {
-                "Read the element's current lifecycle state first (`details.from` / `details.to`); that TRANSITION is not legal from where it is, or not for its kind."
-            }
-            RetractionNotAuthorized => "Only the assertor may retract their own Assertion.",
-            SupersessionMismatch => {
-                "The superseding Assertion must address the same slot as the one it supersedes."
-            }
-            EvidenceCorrectionConflict => {
-                "That Evidence already has a conflicting correction. Re-read its lineage."
-            }
-            ActivityTerminal => {
-                "A terminal Activity is immutable. Finalize outputs in the same `TRANSITION ... TO \"completed\" SET STRUCTURAL` that ends it."
-            }
-            ProjectionTargetUnbound => {
-                "Bind the projection's Proposition in the WHERE block first."
-            }
-            ProjectionTargetUnbounded => {
-                "BELIEF needs a bounded target: name the Proposition, or ground the subject and predicate."
-            }
-            ProjectionNotAuthorized => "You may read the raw claims but not project belief here.",
-            ProjectionPolicyUnavailable => {
-                "Run `LIST EPISTEMIC POLICIES` / `DESCRIBE EPISTEMIC POLICY` to see what can be projected with."
-            }
-            Unauthenticated => "Authenticate before issuing this request.",
-            NotAuthorized => "Run `DESCRIBE ACCESS` to see which operations you may perform here.",
-            RequiresApproval => "The operation is queued behind an out-of-band approval.",
-            RequiresStrongerAuthentication => "Re-authenticate with a stronger factor and retry.",
-            ActorBindingRequired => {
-                "Attribution needs an ActorBinding: you cannot assert on behalf of an actor you are not bound to."
-            }
-            ProtectedSystemField => "`_system` is engine truth and is never written by a mutation.",
-            ProtectedGovernanceField => {
-                "Governance lives in the protected control plane, not in cognitive mutations."
-            }
-            ProtectedSchemaState => {
-                "Schema state is immutable Package state; publish and activate a Package instead."
-            }
-            LegalHoldConflict => {
-                "A legal hold covers this element; removal is blocked until it is lifted."
-            }
-            PurgeDenied => "Physical purge was denied by policy.",
-            VersionConflict => {
-                "The element changed since you read it. Re-read it, re-apply your change, and retry with the fresh `EXPECT VERSION`."
-            }
-            PreconditionFailed => {
-                "A declared precondition no longer holds. Re-read the current state and retry."
-            }
-            SerializationConflict => {
-                "The transaction lost a race. Re-sending the identical request is safe."
-            }
-            IdempotencyConflict => {
-                "That idempotency key already names a different request. Use a new key, or re-send the original request bytes."
-            }
-            TransactionUnknown => {
-                "Look the transaction up by its idempotency key before assuming anything about it."
-            }
-            OutcomeUnknown => {
-                "Do not create a fresh mutation. Look the transaction up by idempotency key, or retry the exact same logical request with the same key."
-            }
-            TransactionTooLarge => "Split the mutation into smaller coherent transactions.",
-            HistoricalSnapshotUnavailable => {
-                "That history is no longer retained. Read at a newer coordinate."
-            }
-            CursorMismatch => "The cursor belongs to a different query. Restart pagination.",
-            CursorTypeMismatch => "The cursor is for a different result kind. Restart pagination.",
-            CursorExpired => {
-                "Restart pagination from a fresh first page; a change cursor restarts from a sequence you recorded, never from the current head. `details.family` names the cursor family."
-            }
-            CursorInvalid => {
-                "The cursor is malformed, belongs to another traversal, or was invalidated (`details.reason`: malformed, access_revoked, schema_changed). Restart pagination from a fresh first page."
-            }
-            SearchModeUnsupported => {
-                "Run `DESCRIBE CAPABILITIES` for the SEARCH modes this runtime offers."
-            }
-            SearchIndexUnavailable => {
-                "The index is temporarily unavailable; the same request may succeed shortly."
-            }
-            HistoricalSearchUnavailable => {
-                "Historical SEARCH is not supported here; read the current index instead."
-            }
-            ArtifactUnavailable => {
-                "Re-upload or re-stage the artifact, then retry with the new handle."
-            }
-            ArtifactTooLarge => {
-                "The artifact exceeds this runtime's limit. Split it or reference it externally."
-            }
-            ArtifactParseError => "The bytes are not a well-formed artifact of the declared kind.",
-            DigestMismatch => {
-                "The bytes do not match the declared digest. Re-acquire the artifact."
-            }
-            ProofInvalid => "The proof did not verify. Do not treat the artifact as trusted.",
-            SignerUnknown => {
-                "The signer is unknown here. Establish trust explicitly before importing."
-            }
-            BlobUnavailable => {
-                "A referenced blob is missing. Re-acquire it, or import with a redaction-tolerant mode."
-            }
-            CapsuleValidationFailed => {
-                "Run `VALIDATE CAPSULE` to see exactly which invariant the Capsule breaks."
-            }
-            ImportPreviewConflict => {
-                "The destination changed since the preview. Re-run `PREVIEW IMPORT CAPSULE` and retry."
-            }
-            ResourceExhausted => {
-                "Reduce the request's cost: lower `LIMIT`, narrow the patterns, or paginate."
-            }
-            ResultLimitExceeded => "Use `LIMIT` with `CURSOR` to page through the result set.",
-            ExecutionTimeout => {
-                "A deadline is not an abort: look the transaction up by idempotency key before \
-                 deciding. For a read, simplify it — fewer UNION branches, a lower LIMIT, fewer \
-                 path hops."
-            }
-            RateLimited => "Back off and retry the identical request.",
-            InternalError => {
-                "Retry under the same idempotency key; if it persists, report the `request_id`."
-            }
-        }
-    }
+    InternalError: System, OutcomeLookupRequired =>
+        "Retry under the same idempotency key; if it persists, report the `request_id`.";
 }
 
 impl Display for KipErrorCode {

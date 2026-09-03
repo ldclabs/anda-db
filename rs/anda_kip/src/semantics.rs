@@ -54,24 +54,23 @@ use crate::ast::{
 };
 use crate::error::{KipError, KipErrorCode};
 
+// The registries below are views, not copies. A vocabulary this crate already
+// types is spelled once, by the enum that carries it, and read back here
+// through `NAMES` — so a variant added to `Stance` cannot leave the checker
+// refusing a value the engine can produce. Only the vocabularies no enum
+// models — the ones an element carries as a plain `String` — are written out.
+
 /// `stance` — what an Assertion does with its Proposition (§13.4).
-pub const STANCES: &[&str] = &["support", "reject", "uncertain"];
+pub const STANCES: &[&str] = crate::types::Stance::NAMES;
 
 /// `mode` — how an Assertion was arrived at (§13.5).
-pub const ASSERTION_MODES: &[&str] = &[
-    "observed",
-    "stated",
-    "inferred",
-    "predicted",
-    "hypothetical",
-    "imported",
-];
+pub const ASSERTION_MODES: &[&str] = crate::types::AssertionMode::NAMES;
 
 /// The Assertion lifecycle states (§14).
 ///
 /// `expired` is computed, never stored (§14.3): no statement produces it, and
 /// the stored status stays `active`, `retracted` or `superseded`.
-pub const ASSERTION_LIFECYCLE: &[&str] = &["active", "retracted", "superseded", "expired"];
+pub const ASSERTION_LIFECYCLE: &[&str] = crate::types::AssertionStatus::NAMES;
 
 /// The Evidence lifecycle states (§57.2).
 pub const EVIDENCE_LIFECYCLE: &[&str] = &["active", "corrected"];
@@ -89,16 +88,10 @@ pub const ACTIVITY_TERMINAL: &[&str] = &["completed", "failed", "cancelled"];
 pub const TRANSITION_STATES: &[&str] = crate::ast::transition_state::ALL;
 
 /// The belief statuses an Epistemic Projection can return (§21.3).
-pub const BELIEF_STATUSES: &[&str] = &[
-    "accepted",
-    "rejected",
-    "contested",
-    "uncertain",
-    "insufficient",
-];
+pub const BELIEF_STATUSES: &[&str] = crate::types::BeliefStatus::NAMES;
 
 /// The baseline SEARCH modes (§66.3).
-pub const SEARCH_MODES: &[&str] = &["keyword", "semantic", "hybrid"];
+pub const SEARCH_MODES: &[&str] = crate::request::SearchMode::NAMES;
 
 /// The Core element kinds `kip://core` exports (§20.13).
 pub const CORE_ELEMENT_KINDS: &[&str] = &[
@@ -239,9 +232,11 @@ pub fn analyze(command: &Command) -> Vec<Diagnostic> {
 
 /// Fails on the first [`Severity::Error`] finding, ignoring warnings.
 ///
-/// This is what the parser runs, which is why a command whose `stance` is
-/// misspelled is rejected here rather than half-way through an engine's
-/// transaction.
+/// The parser reaches these checks through its own per-surface gate, which
+/// calls [`check_kql`], [`check_kml`] or [`check_meta`] — this is the same
+/// pass over a [`Command`] whose surface is not known yet, and it is why a
+/// command whose `stance` is misspelled is rejected before parsing returns
+/// rather than half-way through an engine's transaction.
 ///
 /// # Examples
 ///
@@ -759,66 +754,6 @@ mod tests {
                 r#"FIND(?x) WHERE { ?x {a: 1} } WITH EPISTEMIC { explanation: "ledger" } LIMIT 5"#
             )
             .is_ok()
-        );
-    }
-
-    /// The registry strings and the typed enums are one vocabulary.
-    ///
-    /// `STANCES` validates a written word; `Stance` serializes a stored one.
-    /// They are spelled in two places, and nothing but this test connects
-    /// them — a variant added to the enum, or a `rename` on it, would leave
-    /// the checker refusing a value the engine can produce. `TRANSITION_STATES`
-    /// needs no row here: it *is* `transition_state::ALL`.
-    #[test]
-    fn the_registry_strings_are_the_enums_own_spellings() {
-        use crate::types::{AssertionMode, AssertionStatus, BeliefStatus, Stance};
-
-        fn spellings<T: serde::Serialize>(values: &[T]) -> Vec<String> {
-            values
-                .iter()
-                .map(|value| {
-                    serde_json::to_value(value)
-                        .expect("a registry enum serializes")
-                        .as_str()
-                        .expect("as a string")
-                        .to_string()
-                })
-                .collect()
-        }
-
-        assert_eq!(
-            spellings(&[Stance::Support, Stance::Reject, Stance::Uncertain]),
-            STANCES
-        );
-        assert_eq!(
-            spellings(&[
-                AssertionMode::Observed,
-                AssertionMode::Stated,
-                AssertionMode::Inferred,
-                AssertionMode::Predicted,
-                AssertionMode::Hypothetical,
-                AssertionMode::Imported,
-            ]),
-            ASSERTION_MODES
-        );
-        assert_eq!(
-            spellings(&[
-                AssertionStatus::Active,
-                AssertionStatus::Retracted,
-                AssertionStatus::Superseded,
-                AssertionStatus::Expired,
-            ]),
-            ASSERTION_LIFECYCLE
-        );
-        assert_eq!(
-            spellings(&[
-                BeliefStatus::Accepted,
-                BeliefStatus::Rejected,
-                BeliefStatus::Contested,
-                BeliefStatus::Uncertain,
-                BeliefStatus::Insufficient,
-            ]),
-            BELIEF_STATUSES
         );
     }
 

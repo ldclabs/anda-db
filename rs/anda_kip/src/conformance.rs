@@ -17,113 +17,60 @@
 //! profile is evaluation, which belongs to the engine. Reporting the two
 //! separately is the difference between "this parses" and "this works".
 
-use std::{fmt, str::FromStr, sync::LazyLock};
+use std::sync::LazyLock;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// A KIP 2.0 conformance profile (Spec §89).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ConformanceProfile {
-    /// Core elements, envelope, identity, immutability, merge (§90).
-    Core,
-    /// Schema Packages and the Schema Environment (§91).
-    Schema,
-    /// Projection, policies, open-world semantics (§92).
-    Epistemic,
-    /// Principals, permissions, classification, authority (§93).
-    Governance,
-    /// Atomicity, idempotency, receipts, preconditions (§94).
-    Transactions,
-    /// Capsule export, verification, import pipeline (§95).
-    Capsule,
-    /// The read language (§96).
-    Kql,
-    /// The mutation language (§97).
-    Kml,
-    /// Introspection, grounding, verification, preview (§98).
-    Meta,
-    /// The request/response envelope and execution modes (§99).
-    Runtime,
-    /// `AS OF`, history, change cursors (§100).
-    Historical,
-    /// Proofs, signatures, checkpoints (§101).
-    HighAssurance,
-    /// KIP 1.x migration and compatibility, required only of an
-    /// implementation that claims it (§103).
-    Migration1x,
+wire_enum! {
+    /// A KIP 2.0 conformance profile (Spec §89).
+    ///
+    /// Ordered so a declared set can be held in a `BTreeSet` and printed in
+    /// one order; §89's listing order is the one the variants are declared in.
+    #[derive(PartialOrd, Ord)]
+    pub enum ConformanceProfile {
+        /// Core elements, envelope, identity, immutability, merge (§90).
+        Core = "KIP-Core",
+        /// Schema Packages and the Schema Environment (§91).
+        Schema = "KIP-Schema",
+        /// Projection, policies, open-world semantics (§92).
+        Epistemic = "KIP-Epistemic",
+        /// Principals, permissions, classification, authority (§93).
+        Governance = "KIP-Governance",
+        /// Atomicity, idempotency, receipts, preconditions (§94).
+        Transactions = "KIP-Transactions",
+        /// Capsule export, verification, import pipeline (§95).
+        Capsule = "KIP-Capsule",
+        /// The read language (§96).
+        Kql = "KIP-KQL",
+        /// The mutation language (§97).
+        Kml = "KIP-KML",
+        /// Introspection, grounding, verification, preview (§98).
+        Meta = "KIP-META",
+        /// The request/response envelope and execution modes (§99).
+        Runtime = "KIP-Runtime",
+        /// `AS OF`, history, change cursors (§100).
+        Historical = "KIP-Historical",
+        /// Proofs, signatures, checkpoints (§101).
+        HighAssurance = "KIP-High-Assurance",
+        /// KIP 1.x migration and compatibility, required only of an
+        /// implementation that claims it (§103).
+        Migration1x = "KIP-1-Migration",
+    }
 }
 
 impl ConformanceProfile {
-    /// Every profile §89 names, in the order it names them.
-    pub const ALL: &'static [ConformanceProfile] = &[
-        ConformanceProfile::Core,
-        ConformanceProfile::Schema,
-        ConformanceProfile::Epistemic,
-        ConformanceProfile::Governance,
-        ConformanceProfile::Transactions,
-        ConformanceProfile::Capsule,
-        ConformanceProfile::Kql,
-        ConformanceProfile::Kml,
-        ConformanceProfile::Meta,
-        ConformanceProfile::Runtime,
-        ConformanceProfile::Historical,
-        ConformanceProfile::HighAssurance,
-        ConformanceProfile::Migration1x,
-    ];
-
     /// The wire name, e.g. `"KIP-High-Assurance"`.
-    pub fn name(&self) -> &'static str {
-        match self {
-            ConformanceProfile::Core => "KIP-Core",
-            ConformanceProfile::Schema => "KIP-Schema",
-            ConformanceProfile::Epistemic => "KIP-Epistemic",
-            ConformanceProfile::Governance => "KIP-Governance",
-            ConformanceProfile::Transactions => "KIP-Transactions",
-            ConformanceProfile::Capsule => "KIP-Capsule",
-            ConformanceProfile::Kql => "KIP-KQL",
-            ConformanceProfile::Kml => "KIP-KML",
-            ConformanceProfile::Meta => "KIP-META",
-            ConformanceProfile::Runtime => "KIP-Runtime",
-            ConformanceProfile::Historical => "KIP-Historical",
-            ConformanceProfile::HighAssurance => "KIP-High-Assurance",
-            ConformanceProfile::Migration1x => "KIP-1-Migration",
-        }
+    ///
+    /// The spelling a profile is declared under is its name in §89, so this
+    /// reads better at call sites than [`Self::as_str`] does; they are the
+    /// same string.
+    pub const fn name(&self) -> &'static str {
+        self.as_str()
     }
 
     /// Looks a profile up by its wire name.
     pub fn from_name(name: &str) -> Option<Self> {
-        ConformanceProfile::ALL
-            .iter()
-            .copied()
-            .find(|profile| profile.name() == name)
-    }
-}
-
-impl fmt::Display for ConformanceProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl FromStr for ConformanceProfile {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ConformanceProfile::from_name(s)
-            .ok_or_else(|| format!("unknown KIP 2.0 conformance profile {s:?}"))
-    }
-}
-
-impl Serialize for ConformanceProfile {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.name())
-    }
-}
-
-impl<'de> Deserialize<'de> for ConformanceProfile {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        ConformanceProfile::from_str(&name).map_err(serde::de::Error::custom)
+        Self::from_wire(name)
     }
 }
 
