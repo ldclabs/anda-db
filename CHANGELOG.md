@@ -118,7 +118,12 @@ a `:parameter` status is bound.
   direction as well as the other.
 - Its `unregistered_permissions` entry says what `approve` is, and counts the
   four names it lists.
-- `§240.18` in the generated profile header is `§20.12`, in the generator.
+- `§240.18` in the generated profile header is `§20.12`, in the generator. A
+  test now scans every Rust and TypeScript source for a `§` citation past the
+  Specification's last section, which is the half of that problem a machine can
+  be sure about; an in-range citation pointing at the wrong section reads
+  exactly like a right one, and a script that rewrote those would produce
+  confidently wrong references.
 
 ### Added — the §27 invariant coverage matrix
 
