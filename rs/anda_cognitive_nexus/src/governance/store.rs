@@ -90,18 +90,73 @@ pub fn row_id_of(id: &str) -> Option<u64> {
 // Collections
 // ---------------------------------------------------------------------------
 
-/// The Governance Control Plane's persistent home.
-#[derive(Clone, Debug)]
-pub struct GovernanceStore {
-    db: Arc<AndaDB>,
-    principals: Slot,
-    groups: Slot,
-    bindings: Slot,
-    grants: Slot,
-    delegations: Slot,
-    policies: Slot,
-    approvals: Slot,
-    audit: Slot,
+// Declares the plane's handles and everything that iterates them, from one
+// list. Same reason as `crate::store::collections!`: `open`, `reopen` and the
+// flush and poison passes each used to spell the set out, and only `open`
+// failed visibly when one was missed.
+macro_rules! collections {
+    ($($field:ident: $row:ty = ($name:ident, $init:ident, $description:literal),)*) => {
+        /// The Governance Control Plane's persistent home.
+        #[derive(Clone, Debug)]
+        pub struct GovernanceStore {
+            db: Arc<AndaDB>,
+            $($field: Slot,)*
+        }
+
+        impl GovernanceStore {
+            /// Opens — creating if absent — every Governance collection.
+            pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
+                $(
+                    let $field = Slot::new(
+                        db.open_or_create_collection(
+                            <$row>::schema().map_err(schema_error)?,
+                            config($name, $description),
+                            $init,
+                        )
+                        .await
+                        .map_err(db_error)?,
+                    );
+                )*
+                Ok(Self { db, $($field,)* })
+            }
+
+            /// Reloads every handle from storage.
+            pub async fn reopen(&self) -> Result<(), KipError> {
+                $(self.$field.set(self.reload($name, $init).await?);)*
+                Ok(())
+            }
+
+            fn all(&self) -> impl Iterator<Item = Arc<Collection>> {
+                [$(self.$field.get(),)*].into_iter()
+            }
+        }
+    };
+}
+
+collections! {
+    principals: PrincipalRow =
+        (PRINCIPALS, init_principals, "Principals — authenticated runtime identities"),
+    groups: PrincipalGroupRow =
+        (PRINCIPAL_GROUPS, init_groups, "Principal groups — named sets that carry authority"),
+    bindings: ActorBindingRow = (
+        ACTOR_BINDINGS,
+        init_bindings,
+        "ActorBindings — Principal to semantic actor, under Governance authority"
+    ),
+    grants: GrantRow = (GRANTS, init_grants, "Grants — authority conferred over one MemorySpace"),
+    delegations: DelegationRow = (
+        DELEGATIONS,
+        init_delegations,
+        "Delegations — one Principal conferring part of its own authority"
+    ),
+    policies: GovernancePolicyRow =
+        (POLICIES, init_policies, "Governance Policy versions — append-only"),
+    approvals: ApprovalRow = (
+        APPROVALS,
+        init_approvals,
+        "Approvals — the control state a high-risk operation waits on"
+    ),
+    audit: GovernanceAuditRow = (AUDIT, init_audit, "The Governance audit log — append-preserving"),
 }
 
 async fn init_principals(c: &mut Collection) -> Result<(), DBError> {
@@ -184,117 +239,9 @@ fn config(name: &str, description: &str) -> CollectionConfig {
 }
 
 impl GovernanceStore {
-    /// Opens — creating if absent — every Governance collection.
-    pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
-        macro_rules! open {
-            ($row:ty, $name:ident, $init:ident, $description:literal) => {
-                db.open_or_create_collection(
-                    <$row>::schema().map_err(schema_error)?,
-                    config($name, $description),
-                    $init,
-                )
-                .await
-                .map_err(db_error)?
-            };
-        }
-
-        let principals = open!(
-            PrincipalRow,
-            PRINCIPALS,
-            init_principals,
-            "Principals — authenticated runtime identities"
-        );
-        let groups = open!(
-            PrincipalGroupRow,
-            PRINCIPAL_GROUPS,
-            init_groups,
-            "Principal groups — named sets that carry authority"
-        );
-        let bindings = open!(
-            ActorBindingRow,
-            ACTOR_BINDINGS,
-            init_bindings,
-            "ActorBindings — Principal to semantic actor, under Governance authority"
-        );
-        let grants = open!(
-            GrantRow,
-            GRANTS,
-            init_grants,
-            "Grants — authority conferred over one MemorySpace"
-        );
-        let delegations = open!(
-            DelegationRow,
-            DELEGATIONS,
-            init_delegations,
-            "Delegations — one Principal conferring part of its own authority"
-        );
-        let policies = open!(
-            GovernancePolicyRow,
-            POLICIES,
-            init_policies,
-            "Governance Policy versions — append-only"
-        );
-        let approvals = open!(
-            ApprovalRow,
-            APPROVALS,
-            init_approvals,
-            "Approvals — the control state a high-risk operation waits on"
-        );
-        let audit = open!(
-            GovernanceAuditRow,
-            AUDIT,
-            init_audit,
-            "The Governance audit log — append-preserving"
-        );
-
-        Ok(Self {
-            db,
-            principals: Slot::new(principals),
-            groups: Slot::new(groups),
-            bindings: Slot::new(bindings),
-            grants: Slot::new(grants),
-            delegations: Slot::new(delegations),
-            policies: Slot::new(policies),
-            approvals: Slot::new(approvals),
-            audit: Slot::new(audit),
-        })
-    }
-
-    fn all(&self) -> [Arc<Collection>; 8] {
-        [
-            self.principals.get(),
-            self.groups.get(),
-            self.bindings.get(),
-            self.grants.get(),
-            self.delegations.get(),
-            self.policies.get(),
-            self.approvals.get(),
-            self.audit.get(),
-        ]
-    }
-
     /// Whether any handle has been poisoned and needs reopening.
     pub fn has_poisoned_handle(&self) -> bool {
-        self.all().iter().any(|c| c.is_poisoned())
-    }
-
-    /// Reloads every handle from storage.
-    pub async fn reopen(&self) -> Result<(), KipError> {
-        self.principals
-            .set(self.reload(PRINCIPALS, init_principals).await?);
-        self.groups
-            .set(self.reload(PRINCIPAL_GROUPS, init_groups).await?);
-        self.bindings
-            .set(self.reload(ACTOR_BINDINGS, init_bindings).await?);
-        self.grants.set(self.reload(GRANTS, init_grants).await?);
-        self.delegations
-            .set(self.reload(DELEGATIONS, init_delegations).await?);
-        self.policies
-            .set(self.reload(POLICIES, init_policies).await?);
-        self.approvals
-            .set(self.reload(APPROVALS, init_approvals).await?);
-        self.audit.set(self.reload(AUDIT, init_audit).await?);
-        Ok(())
+        self.all().any(|c| c.is_poisoned())
     }
 
     async fn reload<F>(&self, name: &str, init: F) -> Result<Arc<Collection>, KipError>

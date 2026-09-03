@@ -218,6 +218,57 @@ and the vendored wire schemas type as `string`; that form is now refused.
 deserializer had always been string-only, and a derive would have widened it.
 
 
+### Changed — `anda_cognitive_nexus` states each repeated shape once
+
+A refactor of the engine crate. It moves no logic between layers and changes
+no command's meaning; the one behavioural change it does make is called out at
+the end.
+
+- **The element envelope is declared once.** The five element rows share
+  fifteen columns — `space`, `state`, `version`, `plane_versions`, `seq`, the
+  four timestamps and transaction ids, `origin`, `governance`, `retention`,
+  `expires_at`, `facets`, `structural` — and that list was written out by hand
+  in six files: `EnvelopeParts` in the view renderer, plus eight five-arm
+  `match`es for `state`, `governance`, `retention`, `facets` and the plane
+  counters. Two of them had already drifted into duplicates of each other
+  (`kml::clauses::set_state` reimplemented `Element::state_mut`). The columns
+  are now enumerated once, in `store::write::envelope_columns!`, which
+  generates `Envelope` / `EnvelopeMut` and the per-row implementations;
+  `Element::envelope()` dispatches on the kind exactly once and every accessor
+  reads a field off it. The five renderers no longer spell their own `C-`/`P-`/
+  `A-`/`E-`/`X-` prefix either — the id is built from the kind the envelope
+  already carries.
+- **Each collection is declared once.** The `(name, row type, index setup)`
+  triple for the engine's ten collections and the Governance plane's eight was
+  written three times over — in `open`, in `reopen`, and in the flush and
+  poison-detection lists — and only the first fails visibly when one is
+  missed: a collection absent from `reopen` leaves the Nexus bricked after a
+  poisoned flush, which no test that opens a fresh database can see. Both
+  stores now generate all four from one `collections!` table.
+- **The control-plane host calls share one gate.** Fifteen `Session` methods
+  spelled out the same ceremony — take the write guard, recover a poisoned
+  handle, take the §29 approval, run, spend — ten of them in full, three
+  without the guard, and two with a hand-rolled resolve; four more repeated
+  the guard-and-resolve-authority half. They now go through
+  `Session::governed`, `Session::gated` / `gated_under` (for the callers that
+  hold or take the guard themselves) and `Session::with_authority`. Each
+  omission failed silently: a missing guard corrupts under concurrency, a
+  missing recovery bricks the Nexus, an unspent approval stays available for a
+  second use.
+
+**The behavioural change.** `Session::designate_self` and
+`Session::sweep_expired` spent their approval *before* performing the
+operation, where the other nine control-plane calls spend it after. They now
+spend after, like the rest: an approval is authority to perform an operation,
+and an operation that refused did not perform it — previously a
+`designate_self` naming a Concept that does not resolve consumed the approval
+and left the caller to obtain another. Pinned by
+`a_control_plane_operation_that_failed_does_not_consume_its_approval` and
+`a_retention_sweep_gates_and_spends_like_every_other_control_plane_call`. As a
+consequence of running the same gate as the other eleven, these two also now
+write the Governance audit entries a denial or an `audit` obligation calls
+for, where they previously wrote none.
+
 ## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
 
 Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the

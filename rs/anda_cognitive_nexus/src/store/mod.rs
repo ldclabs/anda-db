@@ -63,6 +63,7 @@ use crate::error::{db_error, reopen_error, schema_error};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use rows::*;
+use write::Row;
 
 /// The collection names, in one place so a rename cannot half-happen.
 pub const CONCEPTS: &str = "concepts";
@@ -103,36 +104,120 @@ impl Slot {
     }
 }
 
-/// The persistent home of one Cognitive Nexus.
-#[derive(Clone, Debug)]
-pub struct Store {
-    /// The underlying database, shared with whatever else the host registered.
-    pub db: Arc<AndaDB>,
-    /// The Governance Control Plane's own collections.
-    ///
-    /// Reached from here so that the two planes share one database handle, one
-    /// flush and one poison recovery — and from nowhere in [`kml`](crate::kml),
-    /// which is what keeps an ordinary cognitive write off the control plane.
-    pub governance: crate::governance::store::GovernanceStore,
-    concepts: Slot,
-    propositions: Slot,
-    assertions: Slot,
-    evidence: Slot,
-    activities: Slot,
-    spaces: Slot,
-    transactions: Slot,
-    schema_packages: Slot,
-    schema_envs: Slot,
-    element_versions: Slot,
-    /// Resolved Schema Environments, keyed by Space and version.
-    ///
-    /// Safe to keep forever, and that is a property of the data rather than a
-    /// bet: activation only ever mints a *new* version (§20.8), and an installed
-    /// package is immutable by reference (§20.4). So one `(space, version)`
-    /// resolves to one environment for the life of the database. Without this,
-    /// every KQL, KML and META command re-read every installed artifact and
-    /// re-parsed it — tens of KB of JSON before the command looked at any data.
-    environments: Arc<parking_lot::RwLock<BTreeMap<(String, u64), SchemaEnvironment>>>,
+/// Declares the `Store`'s collection handles and everything that iterates them.
+///
+/// The `(name, row type, setup)` triple used to be written out three times —
+/// once in `open`, once in `reopen`, once in the flush and poison lists — and
+/// only the first was load-bearing for a fresh database, so a collection
+/// missing from the second or third failed nowhere until recovery needed it.
+macro_rules! collections {
+    ($($(#[$doc:meta])* $field:ident: $row:ty = ($name:ident, $init:ident, $description:literal),)*) => {
+        /// The persistent home of one Cognitive Nexus.
+        #[derive(Clone, Debug)]
+        pub struct Store {
+            /// The underlying database, shared with whatever else the host registered.
+            pub db: Arc<AndaDB>,
+            /// The Governance Control Plane's own collections.
+            ///
+            /// Reached from here so that the two planes share one database handle, one
+            /// flush and one poison recovery — and from nowhere in [`kml`](crate::kml),
+            /// which is what keeps an ordinary cognitive write off the control plane.
+            pub governance: crate::governance::store::GovernanceStore,
+            $($field: Slot,)*
+            /// Resolved Schema Environments, keyed by Space and version.
+            ///
+            /// Safe to keep forever, and that is a property of the data rather than a
+            /// bet: activation only ever mints a *new* version (§20.8), and an installed
+            /// package is immutable by reference (§20.4). So one `(space, version)`
+            /// resolves to one environment for the life of the database. Without this,
+            /// every KQL, KML and META command re-read every installed artifact and
+            /// re-parsed it — tens of KB of JSON before the command looked at any data.
+            environments: Arc<parking_lot::RwLock<BTreeMap<(String, u64), SchemaEnvironment>>>,
+        }
+
+        impl Store {
+            /// Opens — creating if absent — every collection the engine needs.
+            pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
+                $(
+                    let $field = Slot::new(
+                        db.open_or_create_collection(
+                            <$row>::schema().map_err(schema_error)?,
+                            collection_config($name, $description),
+                            $init,
+                        )
+                        .await
+                        .map_err(db_error)?,
+                    );
+                )*
+                let governance = crate::governance::store::GovernanceStore::open(db.clone()).await?;
+                Ok(Self {
+                    db,
+                    governance,
+                    $($field,)*
+                    environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+                })
+            }
+
+            /// Reloads every collection handle from storage.
+            ///
+            /// Idempotent, and safe to call when nothing is poisoned: reopening a
+            /// healthy handle costs a reload and changes no state. Each setup closure
+            /// runs again, which is what reinstalls the jieba tokenizer a freshly
+            /// loaded handle does not carry.
+            pub async fn reopen(&self) -> Result<(), KipError> {
+                $(self.$field.set(self.reload($name, $init).await?);)*
+                self.governance.reopen().await
+            }
+
+            /// Every collection handle, for the passes that touch all of them.
+            fn all(&self) -> impl Iterator<Item = Arc<Collection>> {
+                [$(self.$field.get(),)*].into_iter()
+            }
+
+            $(
+                $(#[$doc])*
+                pub fn $field(&self) -> Arc<Collection> {
+                    self.$field.get()
+                }
+            )*
+        }
+    };
+}
+
+// The engine's ten collections, declared once.
+//
+// Each row names the accessor, the row type whose schema it is opened with,
+// the collection name, the index setup, and the description. Opening,
+// reopening, flushing and poison detection are all generated from this list,
+// so a collection added here is reached by every one of them — the failure
+// this replaces was a handle that `open` created and `reopen` forgot, which
+// no compiler could have caught and which surfaces only as a Nexus that stays
+// bricked after a poisoned flush.
+collections! {
+    /// The Concept collection handle.
+    concepts: ConceptRow = (CONCEPTS, init_concepts, "Concepts — units of meaning"),
+    /// The Proposition collection handle.
+    propositions: PropositionRow =
+        (PROPOSITIONS, init_propositions, "Propositions — truth-neutral tuples"),
+    /// The Assertion collection handle.
+    assertions: AssertionRow =
+        (ASSERTIONS, init_assertions, "Assertions — actors' epistemic commitments"),
+    /// The Evidence collection handle.
+    evidence: EvidenceRow = (EVIDENCE, init_evidence, "Evidence — observation records"),
+    /// The Activity collection handle.
+    activities: ActivityRow = (ACTIVITIES, init_activities, "Activities — provenance records"),
+    /// The MemorySpace registry handle.
+    spaces: SpaceRow = (SPACES, init_spaces, "MemorySpaces — governance containers"),
+    /// The transaction journal handle.
+    transactions: TransactionRow = (TRANSACTIONS, init_transactions, "The transaction journal"),
+    /// The installed Schema Package handle.
+    schema_packages: SchemaPackageRow =
+        (SCHEMA_PACKAGES, init_schema_packages, "Installed Schema Package artifacts"),
+    /// The Schema Environment version handle.
+    schema_envs: SchemaEnvRow = (SCHEMA_ENVS, init_schema_envs, "Schema Environment versions"),
+    /// The element version log handle.
+    element_versions: ElementVersionRow =
+        (ELEMENT_VERSIONS, init_element_versions, "One row per element version"),
 }
 
 /// The columns every element kind is indexed on.
@@ -282,160 +367,6 @@ async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 impl Store {
-    /// Opens — creating if absent — every collection the engine needs.
-    pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
-        let concepts = db
-            .open_or_create_collection(
-                ConceptRow::schema().map_err(schema_error)?,
-                collection_config(CONCEPTS, "Concepts — units of meaning"),
-                init_concepts,
-            )
-            .await
-            .map_err(db_error)?;
-        let propositions = db
-            .open_or_create_collection(
-                PropositionRow::schema().map_err(schema_error)?,
-                collection_config(PROPOSITIONS, "Propositions — truth-neutral tuples"),
-                init_propositions,
-            )
-            .await
-            .map_err(db_error)?;
-        let assertions = db
-            .open_or_create_collection(
-                AssertionRow::schema().map_err(schema_error)?,
-                collection_config(ASSERTIONS, "Assertions — actors' epistemic commitments"),
-                init_assertions,
-            )
-            .await
-            .map_err(db_error)?;
-        let evidence = db
-            .open_or_create_collection(
-                EvidenceRow::schema().map_err(schema_error)?,
-                collection_config(EVIDENCE, "Evidence — observation records"),
-                init_evidence,
-            )
-            .await
-            .map_err(db_error)?;
-        let activities = db
-            .open_or_create_collection(
-                ActivityRow::schema().map_err(schema_error)?,
-                collection_config(ACTIVITIES, "Activities — provenance records"),
-                init_activities,
-            )
-            .await
-            .map_err(db_error)?;
-        let spaces = db
-            .open_or_create_collection(
-                SpaceRow::schema().map_err(schema_error)?,
-                collection_config(SPACES, "MemorySpaces — governance containers"),
-                init_spaces,
-            )
-            .await
-            .map_err(db_error)?;
-        let transactions = db
-            .open_or_create_collection(
-                TransactionRow::schema().map_err(schema_error)?,
-                collection_config(TRANSACTIONS, "The transaction journal"),
-                init_transactions,
-            )
-            .await
-            .map_err(db_error)?;
-
-        let schema_packages = db
-            .open_or_create_collection(
-                SchemaPackageRow::schema().map_err(schema_error)?,
-                collection_config(SCHEMA_PACKAGES, "Installed Schema Package artifacts"),
-                init_schema_packages,
-            )
-            .await
-            .map_err(db_error)?;
-        let schema_envs = db
-            .open_or_create_collection(
-                SchemaEnvRow::schema().map_err(schema_error)?,
-                collection_config(SCHEMA_ENVS, "Schema Environment versions"),
-                init_schema_envs,
-            )
-            .await
-            .map_err(db_error)?;
-
-        let element_versions = db
-            .open_or_create_collection(
-                ElementVersionRow::schema().map_err(schema_error)?,
-                collection_config(ELEMENT_VERSIONS, "One row per element version"),
-                init_element_versions,
-            )
-            .await
-            .map_err(db_error)?;
-
-        let governance = crate::governance::store::GovernanceStore::open(db.clone()).await?;
-
-        Ok(Self {
-            db,
-            governance,
-            concepts: Slot::new(concepts),
-            propositions: Slot::new(propositions),
-            assertions: Slot::new(assertions),
-            evidence: Slot::new(evidence),
-            activities: Slot::new(activities),
-            spaces: Slot::new(spaces),
-            transactions: Slot::new(transactions),
-            schema_packages: Slot::new(schema_packages),
-            schema_envs: Slot::new(schema_envs),
-            element_versions: Slot::new(element_versions),
-            environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
-        })
-    }
-
-    /// The Concept collection handle.
-    pub fn concepts(&self) -> Arc<Collection> {
-        self.concepts.get()
-    }
-
-    /// The Proposition collection handle.
-    pub fn propositions(&self) -> Arc<Collection> {
-        self.propositions.get()
-    }
-
-    /// The Assertion collection handle.
-    pub fn assertions(&self) -> Arc<Collection> {
-        self.assertions.get()
-    }
-
-    /// The Evidence collection handle.
-    pub fn evidence(&self) -> Arc<Collection> {
-        self.evidence.get()
-    }
-
-    /// The Activity collection handle.
-    pub fn activities(&self) -> Arc<Collection> {
-        self.activities.get()
-    }
-
-    /// The MemorySpace registry handle.
-    pub fn spaces(&self) -> Arc<Collection> {
-        self.spaces.get()
-    }
-
-    /// The transaction journal handle.
-    pub fn transactions(&self) -> Arc<Collection> {
-        self.transactions.get()
-    }
-
-    /// The installed Schema Package handle.
-    pub fn schema_packages(&self) -> Arc<Collection> {
-        self.schema_packages.get()
-    }
-
-    /// The Schema Environment version handle.
-    pub fn schema_envs(&self) -> Arc<Collection> {
-        self.schema_envs.get()
-    }
-
-    /// The element version log handle.
-    pub fn element_versions(&self) -> Arc<Collection> {
-        self.element_versions.get()
-    }
-
     /// The collection holding one Core element kind.
     pub fn elements(&self, kind: ElementKind) -> Arc<Collection> {
         match kind {
@@ -449,51 +380,7 @@ impl Store {
 
     /// Whether any handle has been poisoned and needs reopening.
     pub fn has_poisoned_handle(&self) -> bool {
-        [
-            self.concepts(),
-            self.propositions(),
-            self.assertions(),
-            self.evidence(),
-            self.activities(),
-            self.spaces(),
-            self.transactions(),
-            self.schema_packages(),
-            self.schema_envs(),
-            self.element_versions(),
-        ]
-        .iter()
-        .any(|c| c.is_poisoned())
-            || self.governance.has_poisoned_handle()
-    }
-
-    /// Reloads every collection handle from storage.
-    ///
-    /// Idempotent, and safe to call when nothing is poisoned: reopening a
-    /// healthy handle costs a reload and changes no state. Each setup closure
-    /// runs again, which is what reinstalls the jieba tokenizer a freshly
-    /// loaded handle does not carry.
-    pub async fn reopen(&self) -> Result<(), KipError> {
-        self.concepts
-            .set(self.reload(CONCEPTS, init_concepts).await?);
-        self.propositions
-            .set(self.reload(PROPOSITIONS, init_propositions).await?);
-        self.assertions
-            .set(self.reload(ASSERTIONS, init_assertions).await?);
-        self.evidence
-            .set(self.reload(EVIDENCE, init_evidence).await?);
-        self.activities
-            .set(self.reload(ACTIVITIES, init_activities).await?);
-        self.spaces.set(self.reload(SPACES, init_spaces).await?);
-        self.transactions
-            .set(self.reload(TRANSACTIONS, init_transactions).await?);
-        self.schema_packages
-            .set(self.reload(SCHEMA_PACKAGES, init_schema_packages).await?);
-        self.schema_envs
-            .set(self.reload(SCHEMA_ENVS, init_schema_envs).await?);
-        self.element_versions
-            .set(self.reload(ELEMENT_VERSIONS, init_element_versions).await?);
-        self.governance.reopen().await?;
-        Ok(())
+        self.all().any(|c| c.is_poisoned()) || self.governance.has_poisoned_handle()
     }
 
     async fn reload<F>(&self, name: &str, init: F) -> Result<Arc<Collection>, KipError>
@@ -516,18 +403,7 @@ impl Store {
 
     /// Flushes every collection, making the transaction's writes durable.
     pub async fn flush(&self, now_ms: u64) -> Result<(), KipError> {
-        for collection in [
-            self.concepts(),
-            self.propositions(),
-            self.assertions(),
-            self.evidence(),
-            self.activities(),
-            self.spaces(),
-            self.transactions(),
-            self.schema_packages(),
-            self.schema_envs(),
-            self.element_versions(),
-        ] {
+        for collection in self.all() {
             collection.flush(now_ms).await.map_err(db_error)?;
         }
         self.governance.flush(now_ms).await?;
@@ -545,22 +421,22 @@ impl Store {
                 "{id} does not exist in this Nexus, or policy hides it"
             ))
         };
+        // One arm per variant because `get_as` picks the row type from the
+        // binding: the kind decides which struct is deserialized, so the
+        // dispatch cannot be hoisted behind a value.
+        macro_rules! read {
+            ($variant:ident) => {
+                Element::$variant(Box::new(
+                    collection.get_as(id.seq).await.map_err(|_| missing())?,
+                ))
+            };
+        }
         Ok(match id.kind {
-            ElementKind::Concept => Element::Concept(Box::new(
-                collection.get_as(id.seq).await.map_err(|_| missing())?,
-            )),
-            ElementKind::Proposition => Element::Proposition(Box::new(
-                collection.get_as(id.seq).await.map_err(|_| missing())?,
-            )),
-            ElementKind::Assertion => Element::Assertion(Box::new(
-                collection.get_as(id.seq).await.map_err(|_| missing())?,
-            )),
-            ElementKind::Evidence => Element::Evidence(Box::new(
-                collection.get_as(id.seq).await.map_err(|_| missing())?,
-            )),
-            ElementKind::Activity => Element::Activity(Box::new(
-                collection.get_as(id.seq).await.map_err(|_| missing())?,
-            )),
+            ElementKind::Concept => read!(Concept),
+            ElementKind::Proposition => read!(Proposition),
+            ElementKind::Assertion => read!(Assertion),
+            ElementKind::Evidence => read!(Evidence),
+            ElementKind::Activity => read!(Activity),
         })
     }
 
@@ -714,71 +590,81 @@ pub enum Element {
     Activity(Box<ActivityRow>),
 }
 
-/// Reads one envelope column out of whichever row this is.
-macro_rules! envelope {
-    ($self:ident, $field:ident) => {
-        match $self {
-            Element::Concept(row) => &row.$field,
-            Element::Proposition(row) => &row.$field,
-            Element::Assertion(row) => &row.$field,
-            Element::Evidence(row) => &row.$field,
-            Element::Activity(row) => &row.$field,
-        }
-    };
-}
-
 impl Element {
-    /// Which Core kind this is.
-    pub fn kind(&self) -> ElementKind {
+    /// The shared envelope columns, whichever kind this is.
+    ///
+    /// The one place the five variants are told apart for a shared column.
+    /// Everything below reads a field off this rather than matching again, so
+    /// adding a column to `envelope_columns!` in [`write`](mod@write) reaches every
+    /// accessor without any of them being touched.
+    #[inline]
+    pub(crate) fn envelope(&self) -> write::Envelope<'_> {
         match self {
-            Element::Concept(_) => ElementKind::Concept,
-            Element::Proposition(_) => ElementKind::Proposition,
-            Element::Assertion(_) => ElementKind::Assertion,
-            Element::Evidence(_) => ElementKind::Evidence,
-            Element::Activity(_) => ElementKind::Activity,
+            Element::Concept(row) => row.envelope(),
+            Element::Proposition(row) => row.envelope(),
+            Element::Assertion(row) => row.envelope(),
+            Element::Evidence(row) => row.envelope(),
+            Element::Activity(row) => row.envelope(),
         }
+    }
+
+    /// The same columns, for the authorized paths that change them.
+    #[inline]
+    pub(crate) fn envelope_mut(&mut self) -> write::EnvelopeMut<'_> {
+        match self {
+            Element::Concept(row) => row.envelope_mut(),
+            Element::Proposition(row) => row.envelope_mut(),
+            Element::Assertion(row) => row.envelope_mut(),
+            Element::Evidence(row) => row.envelope_mut(),
+            Element::Activity(row) => row.envelope_mut(),
+        }
+    }
+
+    /// Which Core kind this is.
+    #[inline]
+    pub fn kind(&self) -> ElementKind {
+        self.envelope().kind
     }
 
     /// The element's Nexus-local id.
+    #[inline]
     pub fn id(&self) -> ElementId {
-        ElementId::new(self.kind(), *envelope!(self, _id))
+        let envelope = self.envelope();
+        ElementId::new(envelope.kind, envelope.id)
     }
 
     /// The element's home MemorySpace.
+    #[inline]
     pub fn space(&self) -> &str {
-        envelope!(self, space)
+        self.envelope().space
     }
 
     /// The engine-level state.
+    #[inline]
     pub fn state(&self) -> &str {
-        envelope!(self, state)
+        self.envelope().state
     }
 
     /// The mutation counter `EXPECT VERSION` compares against.
+    #[inline]
     pub fn version(&self) -> u64 {
-        *envelope!(self, version)
+        *self.envelope().version
     }
 
     /// The Space sequence of the last state change.
+    #[inline]
     pub fn seq(&self) -> u64 {
-        *envelope!(self, seq)
+        *self.envelope().seq
     }
 
     /// The per-plane counters `EXPECT VERSION ... OF` compares against (§6.3).
     pub fn plane_versions(&self) -> anda_kip::PlaneVersions {
-        planes::decode(envelope!(self, plane_versions))
+        planes::decode(self.envelope().plane_versions)
     }
 
     /// Writes the per-plane counters; the transaction commit is the one caller.
     pub(crate) fn set_plane_versions(&mut self, planes: &anda_kip::PlaneVersions) {
-        let encoded = planes::encode(planes);
-        match self {
-            Element::Concept(row) => row.plane_versions = encoded,
-            Element::Proposition(row) => row.plane_versions = encoded,
-            Element::Assertion(row) => row.plane_versions = encoded,
-            Element::Evidence(row) => row.plane_versions = encoded,
-            Element::Activity(row) => row.plane_versions = encoded,
-        }
+        *self.envelope_mut().plane_versions = planes::encode(planes);
     }
 
     /// Whether this element is in ordinary recall.
@@ -792,12 +678,38 @@ impl Element {
 
     /// The element's own Governance members (Spec §6.2).
     pub fn governance(&self) -> &anda_kip::Json {
-        envelope!(self, governance)
+        self.envelope().governance
     }
 
     /// The storage-lifecycle hook (Spec §19.1).
     pub fn retention(&self) -> &anda_kip::Json {
-        envelope!(self, retention)
+        self.envelope().retention
+    }
+
+    /// The storage-lifecycle hook and the sweep column that mirrors it.
+    pub(crate) fn retention_mut(&mut self) -> (&mut anda_kip::Json, &mut String) {
+        let envelope = self.envelope_mut();
+        (envelope.retention, envelope.expires_at)
+    }
+
+    /// `retention.expires_at`, the column the retention sweep ranges over.
+    pub(crate) fn expires_at(&self) -> &str {
+        self.envelope().expires_at
+    }
+
+    /// The element's Facets, keyed by facet symbol (§35).
+    pub(crate) fn facets(&self) -> &anda_db_schema::Map<String, anda_kip::Json> {
+        self.envelope().facets
+    }
+
+    /// The same map, for the authorized paths that change it.
+    pub(crate) fn facets_mut(&mut self) -> &mut anda_db_schema::Map<String, anda_kip::Json> {
+        self.envelope_mut().facets
+    }
+
+    /// The Profile structural fields this element carries (§8.2).
+    pub(crate) fn structural(&self) -> &anda_db_schema::Map<String, anda_kip::Json> {
+        self.envelope().structural
     }
 
     /// Every local element this one points at.
@@ -814,21 +726,21 @@ impl Element {
                 _ => None,
             }
         }
-        fn structural(map: &anda_db_schema::Map<String, anda_kip::Json>, out: &mut Vec<ElementId>) {
-            for refs in map.values() {
-                if let Some(items) = refs.as_array() {
-                    out.extend(items.iter().filter_map(local));
-                }
-            }
-        }
-
-        let mut out = Vec::new();
+        // The Profile structural fields are a shared column, so they are
+        // walked once here rather than per kind; only the typed Core edges
+        // below differ between the five.
+        let mut out: Vec<ElementId> = self
+            .structural()
+            .values()
+            .filter_map(anda_kip::Json::as_array)
+            .flatten()
+            .filter_map(local)
+            .collect();
         match self {
-            Element::Concept(row) => structural(&row.structural, &mut out),
+            Element::Concept(_) => {}
             Element::Proposition(row) => {
                 out.extend(local(&row.subject));
                 out.extend(local(&row.object));
-                structural(&row.structural, &mut out);
             }
             Element::Assertion(row) => {
                 if let Ok(id) = row.proposition_id.parse() {
@@ -841,7 +753,6 @@ impl Element {
                         .filter_map(|id| id.parse::<ElementId>().ok()),
                 );
                 out.extend(row.context_refs.iter().filter_map(local));
-                structural(&row.structural, &mut out);
             }
             Element::Evidence(row) => {
                 if let Ok(id) = row.generated_by.parse() {
@@ -854,38 +765,46 @@ impl Element {
                         .chain(row.corrected_by.iter())
                         .filter_map(|id| id.parse::<ElementId>().ok()),
                 );
-                structural(&row.structural, &mut out);
             }
             Element::Activity(row) => {
                 out.extend(row.inputs.iter().filter_map(local));
                 out.extend(row.outputs.iter().filter_map(local));
                 out.extend(row.associated_actors.iter().filter_map(local));
-                structural(&row.structural, &mut out);
             }
         }
         out
     }
 
+    /// Rebuilds an element of one kind from a stored row's JSON.
+    ///
+    /// The version log keeps whole rows as JSON, so replaying history is a
+    /// decode rather than a read; the kind comes from the log entry beside it.
+    pub(crate) fn from_json(
+        kind: ElementKind,
+        value: anda_kip::Json,
+    ) -> Result<Self, serde_json::Error> {
+        macro_rules! decode {
+            ($variant:ident) => {
+                Element::$variant(Box::new(serde_json::from_value(value)?))
+            };
+        }
+        Ok(match kind {
+            ElementKind::Concept => decode!(Concept),
+            ElementKind::Proposition => decode!(Proposition),
+            ElementKind::Assertion => decode!(Assertion),
+            ElementKind::Evidence => decode!(Evidence),
+            ElementKind::Activity => decode!(Activity),
+        })
+    }
+
     /// The engine-level state, for the authorized paths that change it.
     pub(crate) fn state_mut(&mut self) -> &mut String {
-        match self {
-            Element::Concept(row) => &mut row.state,
-            Element::Proposition(row) => &mut row.state,
-            Element::Assertion(row) => &mut row.state,
-            Element::Evidence(row) => &mut row.state,
-            Element::Activity(row) => &mut row.state,
-        }
+        self.envelope_mut().state
     }
 
     /// The same block, for the authorized paths that change it.
     pub(crate) fn governance_mut(&mut self) -> &mut anda_kip::Json {
-        match self {
-            Element::Concept(row) => &mut row.governance,
-            Element::Proposition(row) => &mut row.governance,
-            Element::Assertion(row) => &mut row.governance,
-            Element::Evidence(row) => &mut row.governance,
-            Element::Activity(row) => &mut row.governance,
-        }
+        self.envelope_mut().governance
     }
 
     /// The classification label this element carries, if it carries one.

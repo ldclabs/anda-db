@@ -470,17 +470,17 @@ impl Session {
         element: crate::id::ElementId,
         class: &str,
     ) -> Result<String, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        crate::governance::element::elevate_authority(
-            &self.nexus.store,
-            space_id,
-            element,
-            class,
-            &authority,
-            &self.auth,
-        )
+        self.with_authority(space_id, async |authority| {
+            crate::governance::element::elevate_authority(
+                &self.nexus.store,
+                space_id,
+                element,
+                class,
+                &authority,
+                &self.auth,
+            )
+            .await
+        })
         .await
     }
 
@@ -495,17 +495,17 @@ impl Session {
         element: crate::id::ElementId,
         reason: &str,
     ) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        crate::governance::element::quarantine(
-            &self.nexus.store,
-            space_id,
-            element,
-            reason,
-            &authority,
-            &self.auth,
-        )
+        self.with_authority(space_id, async |authority| {
+            crate::governance::element::quarantine(
+                &self.nexus.store,
+                space_id,
+                element,
+                reason,
+                &authority,
+                &self.auth,
+            )
+            .await
+        })
         .await
     }
 
@@ -515,16 +515,16 @@ impl Session {
         space_id: &str,
         element: crate::id::ElementId,
     ) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        crate::governance::element::release(
-            &self.nexus.store,
-            space_id,
-            element,
-            &authority,
-            &self.auth,
-        )
+        self.with_authority(space_id, async |authority| {
+            crate::governance::element::release(
+                &self.nexus.store,
+                space_id,
+                element,
+                &authority,
+                &self.auth,
+            )
+            .await
+        })
         .await
     }
 
@@ -562,75 +562,69 @@ impl Session {
         action: RetentionAction,
         limit: usize,
     ) -> Result<RetentionSweep, KipError> {
+        // The guard is taken here rather than by `governed`, because the sweep
+        // body needs the resolved authority and holding it across a second
+        // acquisition would deadlock. `gated_under` therefore does the gate and
+        // the spend against the authority this already resolved, and this does
+        // the guard.
         let _guard = self.nexus.lock.write().await;
         self.nexus.store.reopen_if_poisoned().await?;
         let authority = self.authority(space_id, &self.auth).await?;
-        let resource = ResourceContext::default();
-        Approved::require(
-            crate::governance::approval::resolve(
-                &self.nexus.store,
-                space_id,
-                &resource,
-                authority.authorize(Permission::ManageRetention, &resource, &self.auth),
-                &self.auth,
-            )
-            .await?,
-        )?
-        .spend(&self.nexus.store)
-        .await?;
-
-        let now = crate::time::now();
-        let mut report = RetentionSweep::default();
-        let expired = self.nexus.store.expired_elements(space_id, &now).await?;
-        for id in expired {
-            if report.swept.len() >= limit {
-                report.remaining += 1;
-                continue;
-            }
-            let element = match self.nexus.store.get_element(id).await {
-                Ok(element) => element,
-                Err(_) => continue,
-            };
-            // §60.3: a hold blocks removal for everyone, including a sweep the
-            // holder authorized. Reported as held rather than as failed, because
-            // nothing went wrong — the record is being kept on purpose.
-            if element
-                .retention()
-                .get("legal_hold")
-                .and_then(anda_kip::Json::as_bool)
-                .unwrap_or(false)
-            {
-                report.held += 1;
-                continue;
-            }
-            let outcome = match action {
-                RetentionAction::Archive => {
-                    crate::governance::element::archive_expired(
-                        &self.nexus.store,
-                        space_id,
-                        id,
-                        &authority,
-                        &self.auth,
-                    )
-                    .await
+        self.gated_under(&authority, Permission::ManageRetention, async || {
+            let now = crate::time::now();
+            let mut report = RetentionSweep::default();
+            let expired = self.nexus.store.expired_elements(space_id, &now).await?;
+            for id in expired {
+                if report.swept.len() >= limit {
+                    report.remaining += 1;
+                    continue;
                 }
-                RetentionAction::Tombstone => {
-                    crate::governance::element::tombstone_expired(
-                        &self.nexus.store,
-                        space_id,
-                        id,
-                        &authority,
-                        &self.auth,
-                    )
-                    .await
+                let element = match self.nexus.store.get_element(id).await {
+                    Ok(element) => element,
+                    Err(_) => continue,
+                };
+                // §60.3: a hold blocks removal for everyone, including a sweep the
+                // holder authorized. Reported as held rather than as failed, because
+                // nothing went wrong — the record is being kept on purpose.
+                if element
+                    .retention()
+                    .get("legal_hold")
+                    .and_then(anda_kip::Json::as_bool)
+                    .unwrap_or(false)
+                {
+                    report.held += 1;
+                    continue;
                 }
-            };
-            match outcome {
-                Ok(()) => report.swept.push(id.to_string()),
-                Err(_) => report.refused += 1,
+                let outcome = match action {
+                    RetentionAction::Archive => {
+                        crate::governance::element::archive_expired(
+                            &self.nexus.store,
+                            space_id,
+                            id,
+                            &authority,
+                            &self.auth,
+                        )
+                        .await
+                    }
+                    RetentionAction::Tombstone => {
+                        crate::governance::element::tombstone_expired(
+                            &self.nexus.store,
+                            space_id,
+                            id,
+                            &authority,
+                            &self.auth,
+                        )
+                        .await
+                    }
+                };
+                match outcome {
+                    Ok(()) => report.swept.push(id.to_string()),
+                    Err(_) => report.refused += 1,
+                }
             }
-        }
-        Ok(report)
+            Ok(report)
+        })
+        .await
     }
 
     /// Marks the Assertions whose validity windows have closed as `expired`.
@@ -690,50 +684,32 @@ impl Session {
         space_id: &str,
         concept: Option<crate::id::ElementId>,
     ) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        let decision = authority.authorize(
-            Permission::ManagePolicy,
-            &ResourceContext::default(),
-            &self.auth,
-        );
-        Approved::require(
-            crate::governance::approval::resolve(
-                &self.nexus.store,
-                space_id,
-                &ResourceContext::default(),
-                decision,
-                &self.auth,
-            )
-            .await?,
-        )?
-        .spend(&self.nexus.store)
-        .await?;
-
-        let mut row = self.nexus.store.get_space(space_id).await?;
-        row.self_concept = match concept {
-            Some(id) => {
-                // Refused rather than stored as a name nothing resolves: every
-                // `$self` rule downstream dereferences it, and a dangling one
-                // would make the Space's own identity a broken link.
-                let element = self.nexus.store.get_element(id).await?;
-                if element.kind() != anda_kip::ElementKind::Concept {
-                    return Err(KipError::structural_reference_invalid(format!(
-                        "{id} is a {:?}; a Space's self identity is a Concept (§5.6)",
-                        element.kind()
-                    )));
+        self.governed(space_id, Permission::ManagePolicy, async || {
+            let mut row = self.nexus.store.get_space(space_id).await?;
+            row.self_concept = match concept {
+                Some(id) => {
+                    // Refused rather than stored as a name nothing resolves: every
+                    // `$self` rule downstream dereferences it, and a dangling one
+                    // would make the Space's own identity a broken link.
+                    let element = self.nexus.store.get_element(id).await?;
+                    if element.kind() != anda_kip::ElementKind::Concept {
+                        return Err(KipError::structural_reference_invalid(format!(
+                            "{id} is a {:?}; a Space's self identity is a Concept (§5.6)",
+                            element.kind()
+                        )));
+                    }
+                    if element.space() != space_id {
+                        return Err(KipError::structural_reference_invalid(format!(
+                            "{id} belongs to another Space; a self identity is Space-local (§5.3)"
+                        )));
+                    }
+                    id.to_string()
                 }
-                if element.space() != space_id {
-                    return Err(KipError::structural_reference_invalid(format!(
-                        "{id} belongs to another Space; a self identity is Space-local (§5.3)"
-                    )));
-                }
-                id.to_string()
-            }
-            None => String::new(),
-        };
-        self.nexus.store.put_space(&row).await
+                None => String::new(),
+            };
+            self.nexus.store.put_space(&row).await
+        })
+        .await
     }
 
     // --- the governed control plane -------------------------------------
@@ -754,13 +730,12 @@ impl Session {
     /// Takes the one approval a control-plane operation needs, at Space scope.
     async fn gate_control_plane(
         &self,
-        space_id: &str,
+        authority: &EffectiveAuthority,
         permission: Permission,
     ) -> Result<Vec<Approved>, KipError> {
-        let authority = self.authority(space_id, &self.auth).await?;
         let resource = ResourceContext::default();
         let decision = authority.authorize(permission, &resource, &self.auth);
-        self.gate(&authority, &self.auth, vec![decision]).await
+        self.gate(authority, &self.auth, vec![decision]).await
     }
 
     /// Spends approvals only after the operation they authorized succeeded.
@@ -769,6 +744,78 @@ impl Session {
             approved.spend(&self.nexus.store).await?;
         }
         Ok(())
+    }
+
+    /// Runs one control-plane operation, gated and under the write guard.
+    ///
+    /// The ceremony every host call below used to repeat: take the engine's
+    /// write guard, recover a poisoned handle, take the one approval §29 asks
+    /// for, run the operation, and spend the approval **only once it
+    /// succeeded** — an approval is authority to perform the operation, and an
+    /// operation that failed did not perform it.
+    ///
+    /// Writing it once is not only shorter. Each of the three steps fails
+    /// silently when it is forgotten: a missing guard corrupts under
+    /// concurrency, a missing recovery bricks the Nexus after a poisoned
+    /// flush, and an unspent approval stays available for a second use.
+    async fn governed<T>(
+        &self,
+        space_id: &str,
+        permission: Permission,
+        operation: impl AsyncFnOnce() -> Result<T, KipError>,
+    ) -> Result<T, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        self.gated(space_id, permission, operation).await
+    }
+
+    /// The same gate and spend, for a caller that handles the guard itself.
+    ///
+    /// Separate rather than a flag on [`Self::governed`], because taking the
+    /// guard twice deadlocks rather than fails: three callers reach a
+    /// [`CognitiveNexus`] method that guards its own write, and one holds the
+    /// guard across a body that needs the resolved authority.
+    async fn gated<T>(
+        &self,
+        space_id: &str,
+        permission: Permission,
+        operation: impl AsyncFnOnce() -> Result<T, KipError>,
+    ) -> Result<T, KipError> {
+        let authority = self.authority(space_id, &self.auth).await?;
+        self.gated_under(&authority, permission, operation).await
+    }
+
+    /// The same, for a caller that has already resolved the authority.
+    ///
+    /// Resolving one reads the Space row, the caller's Grants, Delegations and
+    /// group memberships and the active policy version; a caller whose body
+    /// needs the authority too must not pay for that twice.
+    async fn gated_under<T>(
+        &self,
+        authority: &EffectiveAuthority,
+        permission: Permission,
+        operation: impl AsyncFnOnce() -> Result<T, KipError>,
+    ) -> Result<T, KipError> {
+        let approvals = self.gate_control_plane(authority, permission).await?;
+        let result = operation().await?;
+        self.spend(approvals).await?;
+        Ok(result)
+    }
+
+    /// Runs one element-level Governance operation under this Space's authority.
+    ///
+    /// No Space-scope gate: these authorize *per element*, inside
+    /// [`governance::element`](crate::governance::element), because reaching
+    /// one element is not reaching the Space.
+    async fn with_authority<T>(
+        &self,
+        space_id: &str,
+        operation: impl AsyncFnOnce(EffectiveAuthority) -> Result<T, KipError>,
+    ) -> Result<T, KipError> {
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.authority(space_id, &self.auth).await?;
+        operation(authority).await
     }
 
     /// Creates a Grant in this Space (§29, `manage_grants`).
@@ -782,41 +829,33 @@ impl Session {
         space_id: &str,
         draft: GrantDraft,
     ) -> Result<GrantRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageGrants)
-            .await?;
-        for action in &draft.actions {
-            Permission::parse(action)?;
-        }
-        let row = self
-            .nexus
-            .governance()
-            .create_grant(
-                GrantDraft {
-                    space_id: space_id.to_string(),
-                    ..draft
-                },
-                &self.auth.principal_id,
-            )
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ManageGrants, async || {
+            for action in &draft.actions {
+                Permission::parse(action)?;
+            }
+            self.nexus
+                .governance()
+                .create_grant(
+                    GrantDraft {
+                        space_id: space_id.to_string(),
+                        ..draft
+                    },
+                    &self.auth.principal_id,
+                )
+                .await
+        })
+        .await
     }
 
     /// Revokes a Grant (§29, `manage_grants`). Revoked, never deleted.
     pub async fn revoke_grant(&self, space_id: &str, id: u64) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageGrants)
-            .await?;
-        self.nexus
-            .governance()
-            .revoke_grant(id, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await
+        self.governed(space_id, Permission::ManageGrants, async || {
+            self.nexus
+                .governance()
+                .revoke_grant(id, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Creates a Delegation (§29).
@@ -832,30 +871,27 @@ impl Session {
         space_id: &str,
         draft: DelegationDraft,
     ) -> Result<DelegationRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
         let permission = if draft.delegator_principal == self.auth.principal_id {
             Permission::Delegate
         } else {
             Permission::ManageDelegation
         };
-        let approvals = self.gate_control_plane(space_id, permission).await?;
-        for action in &draft.actions {
-            Permission::parse(action)?;
-        }
-        let row = self
-            .nexus
-            .governance()
-            .create_delegation(
-                DelegationDraft {
-                    space_id: space_id.to_string(),
-                    ..draft
-                },
-                &self.auth.principal_id,
-            )
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, permission, async || {
+            for action in &draft.actions {
+                Permission::parse(action)?;
+            }
+            self.nexus
+                .governance()
+                .create_delegation(
+                    DelegationDraft {
+                        space_id: space_id.to_string(),
+                        ..draft
+                    },
+                    &self.auth.principal_id,
+                )
+                .await
+        })
+        .await
     }
 
     /// Revokes a Delegation (§29, `manage_delegation`).
@@ -865,16 +901,13 @@ impl Session {
     /// direction, and a caller who could not reach the record could not
     /// withdraw at all.
     pub async fn revoke_delegation(&self, space_id: &str, id: u64) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageDelegation)
-            .await?;
-        self.nexus
-            .governance()
-            .revoke_delegation(id, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await
+        self.governed(space_id, Permission::ManageDelegation, async || {
+            self.nexus
+                .governance()
+                .revoke_delegation(id, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Creates or replaces a Principal group (§29, `manage_membership`).
@@ -883,18 +916,13 @@ impl Session {
         space_id: &str,
         draft: GroupDraft,
     ) -> Result<PrincipalGroupRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageMembership)
-            .await?;
-        let row = self
-            .nexus
-            .governance()
-            .put_group(draft, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ManageMembership, async || {
+            self.nexus
+                .governance()
+                .put_group(draft, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Suspends or restores a Principal (§29, `manage_membership`).
@@ -904,18 +932,13 @@ impl Session {
         principal_id: &str,
         status: &str,
     ) -> Result<PrincipalRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageMembership)
-            .await?;
-        let row = self
-            .nexus
-            .governance()
-            .set_principal_status(principal_id, status, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ManageMembership, async || {
+            self.nexus
+                .governance()
+                .set_principal_status(principal_id, status, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Binds a Principal to a semantic actor (§17, `manage_actor_binding`).
@@ -929,32 +952,24 @@ impl Session {
         space_id: &str,
         draft: ActorBindingDraft,
     ) -> Result<ActorBindingRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageActorBinding)
-            .await?;
-        let row = self
-            .nexus
-            .governance()
-            .create_binding(draft, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ManageActorBinding, async || {
+            self.nexus
+                .governance()
+                .create_binding(draft, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Revokes an ActorBinding (§17, `manage_actor_binding`).
     pub async fn revoke_binding(&self, space_id: &str, id: u64) -> Result<(), KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageActorBinding)
-            .await?;
-        self.nexus
-            .governance()
-            .revoke_binding(id, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await
+        self.governed(space_id, Permission::ManageActorBinding, async || {
+            self.nexus
+                .governance()
+                .revoke_binding(id, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Publishes a Governance Policy version (§29, `manage_policy`).
@@ -963,18 +978,13 @@ impl Session {
         space_id: &str,
         draft: PolicyDraft,
     ) -> Result<GovernancePolicyRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManagePolicy)
-            .await?;
-        let row = self
-            .nexus
-            .governance()
-            .publish_policy(draft, &self.auth.principal_id)
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ManagePolicy, async || {
+            self.nexus
+                .governance()
+                .publish_policy(draft, &self.auth.principal_id)
+                .await
+        })
+        .await
     }
 
     /// Supplies one of the independent approvals a high-risk operation needs
@@ -989,18 +999,13 @@ impl Session {
         id: u64,
         note: &str,
     ) -> Result<ApprovalRow, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ApproveHighRisk)
-            .await?;
-        let row = self
-            .nexus
-            .governance()
-            .approve(id, &self.auth.principal_id, note)
-            .await?;
-        self.spend(approvals).await?;
-        Ok(row)
+        self.governed(space_id, Permission::ApproveHighRisk, async || {
+            self.nexus
+                .governance()
+                .approve(id, &self.auth.principal_id, note)
+                .await
+        })
+        .await
     }
 
     /// Installs a Schema Package artifact (§20, `manage_schema`).
@@ -1014,12 +1019,10 @@ impl Session {
         artifact: &SchemaPackage,
         source: &str,
     ) -> Result<crate::schema::PackageRef, KipError> {
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageSchema)
-            .await?;
-        let package_ref = self.nexus.install_package(artifact, source).await?;
-        self.spend(approvals).await?;
-        Ok(package_ref)
+        self.gated(space_id, Permission::ManageSchema, async || {
+            self.nexus.install_package(artifact, source).await
+        })
+        .await
     }
 
     /// Activates a Schema Lock over the installed artifacts (§20,
@@ -1034,12 +1037,10 @@ impl Session {
         space_id: &str,
         lock: crate::schema::SchemaLock,
     ) -> Result<SchemaEnvironment, KipError> {
-        let approvals = self
-            .gate_control_plane(space_id, Permission::ManageSchema)
-            .await?;
-        let env = self.nexus.activate_schema(space_id, lock).await?;
-        self.spend(approvals).await?;
-        Ok(env)
+        self.gated(space_id, Permission::ManageSchema, async || {
+            self.nexus.activate_schema(space_id, lock).await
+        })
+        .await
     }
 
     /// Accepts another Brain's cognition into a Space (§29, `import`).
@@ -1056,23 +1057,20 @@ impl Session {
         capsule: &anda_kip::Capsule,
         isolate: bool,
     ) -> Result<crate::capsule::ImportReport, KipError> {
-        let approvals = self
-            .gate_control_plane(space_id, Permission::Import)
-            .await?;
-        let guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let report = crate::capsule::import(
-            &self.nexus,
-            capsule,
-            space_id,
-            false,
-            (*self.auth).clone(),
-            isolate,
-        )
-        .await?;
-        drop(guard);
-        self.spend(approvals).await?;
-        Ok(report)
+        self.gated(space_id, Permission::Import, async || {
+            let _guard = self.nexus.lock.write().await;
+            self.nexus.store.reopen_if_poisoned().await?;
+            crate::capsule::import(
+                &self.nexus,
+                capsule,
+                space_id,
+                false,
+                (*self.auth).clone(),
+                isolate,
+            )
+            .await
+        })
+        .await
     }
 
     /// Sets one element's classification (§93, §100).
@@ -1090,17 +1088,17 @@ impl Session {
         element: crate::id::ElementId,
         classification: &str,
     ) -> Result<String, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        crate::governance::element::classify(
-            &self.nexus.store,
-            space_id,
-            element,
-            classification,
-            &authority,
-            &self.auth,
-        )
+        self.with_authority(space_id, async |authority| {
+            crate::governance::element::classify(
+                &self.nexus.store,
+                space_id,
+                element,
+                classification,
+                &authority,
+                &self.auth,
+            )
+            .await
+        })
         .await
     }
 }

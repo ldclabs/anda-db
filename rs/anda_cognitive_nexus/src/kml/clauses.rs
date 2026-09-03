@@ -1617,7 +1617,7 @@ async fn move_element(
             // Neither archive nor tombstone erases anything: references keep
             // resolving (§60.1, §60.2), which is what stops a removal from
             // silently breaking every Assertion that cited the element.
-            set_state(tx.load(id).await?, state);
+            *tx.load(id).await?.state_mut() = state.to_string();
             tx.mark_changed(id, ChangeOp::Lifecycle);
         }
         ts::RETRACTED => {
@@ -2007,14 +2007,14 @@ async fn set_retention(
     let expires = expires_at(&retention)?;
     for id in targets.authorized(tx).await? {
         tx.expect_versions(id, &guards).await?;
-        let current = retention_mut(tx.load(id).await?).0.clone();
+        let current = tx.load(id).await?.retention().clone();
         // The hold gate needs what is recorded, not only what was written: the
         // block replaces rather than patches, so omitting `legal_hold` lifts one.
         require_legal_hold_authority(tx, &current, &retention)?;
         if current == retention {
             continue;
         }
-        let (slot, slot_expires) = retention_mut(tx.load(id).await?);
+        let (slot, slot_expires) = tx.load(id).await?.retention_mut();
         *slot = retention.clone();
         *slot_expires = expires.clone();
         tx.mark_changed(id, ChangeOp::Retention);
@@ -2600,26 +2600,6 @@ pub(crate) fn check_retention(retention: &Json) -> Result<(), KipError> {
     Ok(())
 }
 
-fn set_state(element: &mut Element, to: &str) {
-    match element {
-        Element::Concept(row) => row.state = to.to_string(),
-        Element::Proposition(row) => row.state = to.to_string(),
-        Element::Assertion(row) => row.state = to.to_string(),
-        Element::Evidence(row) => row.state = to.to_string(),
-        Element::Activity(row) => row.state = to.to_string(),
-    }
-}
-
-fn retention_mut(element: &mut Element) -> (&mut Json, &mut String) {
-    match element {
-        Element::Concept(row) => (&mut row.retention, &mut row.expires_at),
-        Element::Proposition(row) => (&mut row.retention, &mut row.expires_at),
-        Element::Assertion(row) => (&mut row.retention, &mut row.expires_at),
-        Element::Evidence(row) => (&mut row.retention, &mut row.expires_at),
-        Element::Activity(row) => (&mut row.retention, &mut row.expires_at),
-    }
-}
-
 async fn assertion_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut AssertionRow, KipError> {
     match tx.load(id).await? {
         Element::Assertion(row) => Ok(row),
@@ -2666,20 +2646,18 @@ pub(crate) async fn check_structural(
 ) -> Result<(), KipError> {
     let (source, structural) = {
         let element = tx.load(id).await?;
-        let kind = element.kind();
-        let (schema_ref, structural) = match element {
-            Element::Concept(row) => (Some(row.schema_ref.clone()), row.structural.clone()),
-            Element::Proposition(row) => (None, row.structural.clone()),
-            Element::Assertion(row) => (None, row.structural.clone()),
-            Element::Evidence(row) => (None, row.structural.clone()),
-            Element::Activity(row) => (None, row.structural.clone()),
+        // Only a Concept is typed by a symbol of its own; the other four are
+        // typed by what they are about, which declares no Profile fields.
+        let schema_ref = match element {
+            Element::Concept(row) => Some(row.schema_ref.clone()).filter(|s| !s.is_empty()),
+            _ => None,
         };
         (
             crate::schema::EndpointFacts::Element {
-                kind,
-                schema_ref: schema_ref.filter(|text| !text.is_empty()),
+                kind: element.kind(),
+                schema_ref,
             },
-            structural,
+            element.structural().clone(),
         )
     };
 

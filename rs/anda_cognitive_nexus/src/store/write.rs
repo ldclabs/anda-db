@@ -16,8 +16,18 @@
 //! **A version bump is a fact, not a courtesy.** `EXPECT VERSION` is the only
 //! optimistic-concurrency primitive KIP has (§81), and it compares against this
 //! counter.
+//!
+//! ## The shared envelope
+//!
+//! All three hold for every element kind, so the write path is generic over
+//! the columns the five rows share rather than written five times.
+//! `envelope_columns!` below is the single list of those columns, and
+//! [`Envelope`] / [`EnvelopeMut`] are the borrowed views of them; `Element`
+//! dispatches to these once, so every consumer of a shared column — the wire
+//! renderer, the plane counters, the retention hook — reads it through one
+//! seam instead of matching on the kind again.
 
-use anda_db_schema::Json;
+use anda_db_schema::{Json, Map};
 use anda_kip::{ElementKind, KipError};
 
 use super::{Store, rows::*};
@@ -25,43 +35,123 @@ use crate::error::db_error;
 use crate::id::ElementId;
 use crate::time::Timestamp;
 
-/// Mutable access to the columns every row shares.
+/// The columns every element row shares, in one list.
 ///
-/// Written by hand once per row through [`impl_row`], so that the generic
-/// write path below exists once instead of five times.
-pub struct EnvelopeMut<'a> {
-    /// The row id; zero until the row is inserted.
-    pub id: &'a mut u64,
-    /// The home MemorySpace.
-    pub space: &'a mut String,
-    /// The engine-level state.
-    pub state: &'a mut String,
-    /// The mutation counter.
-    pub version: &'a mut u64,
-    /// The Space sequence of this change.
-    pub seq: &'a mut u64,
-    /// When the engine first wrote the element.
-    pub created_at: &'a mut String,
-    /// When the engine last wrote it.
-    pub updated_at: &'a mut String,
-    /// The transaction that created it.
-    pub created_tx: &'a mut String,
-    /// The transaction that last updated it.
-    pub updated_tx: &'a mut String,
-    /// Engine origin.
-    pub origin: &'a mut Json,
-    /// The element's own Governance members.
+/// The five row structs repeat these fifteen columns rather than nesting them,
+/// because a B-Tree index is built over a named column (see [`rows`]). This
+/// macro is the other half of that decision: the columns are repeated in
+/// storage and enumerated *once* here, so the code that works on "whatever
+/// element this is" — stamping a write, rendering the wire envelope, reading a
+/// retention hook, bumping a plane counter — exists once instead of five times.
+///
+/// Each entry is `name: type`. The entries after `@readonly` are shared for
+/// *reading* only: [`Envelope`] carries every column, [`EnvelopeMut`] carries
+/// the ones before the marker. `structural` sits after it because Profile
+/// structural fields are writable on a Concept and refused on the other four
+/// kinds ([`kml::update`](crate::kml::update)); a generic `&mut` to it here
+/// would put that rule behind a comment instead of behind the type.
+macro_rules! envelope_columns {
+    ($mac:ident $(, $($prefix:tt)*)?) => {
+        $mac! {
+            $($($prefix)*)?
+            /// The home MemorySpace.
+            space: String,
+            /// The engine-level state.
+            state: String,
+            /// The mutation counter.
+            version: u64,
+            /// The per-plane counters, in the stored wire shape.
+            plane_versions: Json,
+            /// The Space sequence of this change.
+            seq: u64,
+            /// When the engine first wrote the element.
+            created_at: String,
+            /// When the engine last wrote it.
+            updated_at: String,
+            /// The transaction that created it.
+            created_tx: String,
+            /// The transaction that last updated it.
+            updated_tx: String,
+            /// Engine origin.
+            origin: Json,
+            /// The element's own Governance members.
+            ///
+            /// Here rather than only on each row because it is written by
+            /// exactly one generic path — an authorized Governance operation —
+            /// and never by the cognitive stamping below, which leaves it
+            /// untouched.
+            governance: Json,
+            /// The storage-lifecycle hook.
+            retention: Json,
+            /// `retention.expires_at`, lifted out for the retention sweep.
+            expires_at: String,
+            /// Schema-validated Facets, keyed by facet symbol.
+            facets: Map<String, Json>,
+            @readonly
+            /// Profile structural fields: symbol → ordered array of references.
+            structural: Map<String, Json>,
+        }
+    };
+}
+
+macro_rules! declare_envelope {
+    (
+        $($(#[$doc:meta])* $name:ident: $ty:ty,)*
+        @readonly
+        $($(#[$ro_doc:meta])* $ro:ident: $ro_ty:ty,)*
+    ) => {
+        /// Read access to the columns every row shares.
+        ///
+        /// Carries the kind and row id too, so a holder never has to match on
+        /// the element again to learn what it is looking at.
+        ///
+        /// `#[non_exhaustive]`: only this crate builds one, and a column added
+        /// to `envelope_columns!` must not break an external destructure.
+        #[non_exhaustive]
+        pub struct Envelope<'a> {
+            /// Which Core kind this row stores.
+            pub kind: ElementKind,
+            /// The row id; zero until the row is inserted.
+            pub id: u64,
+            $($(#[$doc])* pub $name: &'a $ty,)*
+            $($(#[$ro_doc])* pub $ro: &'a $ro_ty,)*
+        }
+
+        /// Mutable access to the shared columns that are generically writable.
+        ///
+        /// The `@readonly` columns are absent by construction — see
+        /// `envelope_columns!`.
+        #[non_exhaustive]
+        pub struct EnvelopeMut<'a> {
+            /// Which Core kind this row stores.
+            pub kind: ElementKind,
+            /// The row id; zero until the row is inserted.
+            pub id: &'a mut u64,
+            $($(#[$doc])* pub $name: &'a mut $ty,)*
+        }
+    };
+}
+
+envelope_columns!(declare_envelope);
+
+mod sealed {
+    /// Closes [`Row`](super::Row) to this crate's five element rows.
     ///
-    /// Here rather than only on each row because it is written by exactly one
-    /// generic path — an authorized Governance operation — and never by the
-    /// cognitive stamping below, which leaves it untouched.
-    pub governance: &'a mut Json,
+    /// `Row` describes the storage shapes the engine itself defines, not an
+    /// extension point: `Store::elements` maps a kind to a collection, so a
+    /// sixth implementor would have no collection to be written to. Sealing
+    /// says so, and keeps a new required method from breaking a downstream
+    /// crate that could never have implemented it usefully.
+    pub trait Sealed {}
 }
 
 /// A persisted row of one Core element kind.
-pub trait Row: serde::Serialize + Send + Sync {
+pub trait Row: sealed::Sealed + serde::Serialize + Send + Sync {
     /// Which Core kind this row stores.
     const KIND: ElementKind;
+
+    /// Read access to the shared envelope columns.
+    fn envelope(&self) -> Envelope<'_>;
 
     /// Mutable access to the shared envelope columns.
     fn envelope_mut(&mut self) -> EnvelopeMut<'_>;
@@ -71,42 +161,49 @@ pub trait Row: serde::Serialize + Send + Sync {
 }
 
 macro_rules! impl_row {
-    ($($ty:ident => $kind:ident),* $(,)?) => {
-        $(
-            impl Row for $ty {
-                const KIND: ElementKind = ElementKind::$kind;
+    (
+        $ty:ident => $kind:ident,
+        $($(#[$doc:meta])* $name:ident: $column:ty,)*
+        @readonly
+        $($(#[$ro_doc:meta])* $ro:ident: $ro_column:ty,)*
+    ) => {
+        impl sealed::Sealed for $ty {}
 
-                fn id(&self) -> u64 {
-                    self._id
-                }
+        impl Row for $ty {
+            const KIND: ElementKind = ElementKind::$kind;
 
-                fn envelope_mut(&mut self) -> EnvelopeMut<'_> {
-                    EnvelopeMut {
-                        id: &mut self._id,
-                        space: &mut self.space,
-                        state: &mut self.state,
-                        version: &mut self.version,
-                        seq: &mut self.seq,
-                        created_at: &mut self.created_at,
-                        updated_at: &mut self.updated_at,
-                        created_tx: &mut self.created_tx,
-                        updated_tx: &mut self.updated_tx,
-                        origin: &mut self.origin,
-                        governance: &mut self.governance,
-                    }
+            #[inline]
+            fn id(&self) -> u64 {
+                self._id
+            }
+
+            #[inline]
+            fn envelope(&self) -> Envelope<'_> {
+                Envelope {
+                    kind: Self::KIND,
+                    id: self._id,
+                    $($name: &self.$name,)*
+                    $($ro: &self.$ro,)*
                 }
             }
-        )*
+
+            #[inline]
+            fn envelope_mut(&mut self) -> EnvelopeMut<'_> {
+                EnvelopeMut {
+                    kind: Self::KIND,
+                    id: &mut self._id,
+                    $($name: &mut self.$name,)*
+                }
+            }
+        }
     };
 }
 
-impl_row! {
-    ConceptRow => Concept,
-    PropositionRow => Proposition,
-    AssertionRow => Assertion,
-    EvidenceRow => Evidence,
-    ActivityRow => Activity,
-}
+envelope_columns!(impl_row, ConceptRow => Concept,);
+envelope_columns!(impl_row, PropositionRow => Proposition,);
+envelope_columns!(impl_row, AssertionRow => Assertion,);
+envelope_columns!(impl_row, EvidenceRow => Evidence,);
+envelope_columns!(impl_row, ActivityRow => Activity,);
 
 /// The engine truth one transaction stamps on everything it writes.
 ///

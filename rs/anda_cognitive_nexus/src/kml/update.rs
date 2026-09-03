@@ -664,13 +664,7 @@ async fn facets_mut(
     tx: &mut Transaction,
     id: ElementId,
 ) -> Result<&mut Map<String, Json>, KipError> {
-    Ok(match tx.load(id).await? {
-        Element::Concept(row) => &mut row.facets,
-        Element::Proposition(row) => &mut row.facets,
-        Element::Assertion(row) => &mut row.facets,
-        Element::Evidence(row) => &mut row.facets,
-        Element::Activity(row) => &mut row.facets,
-    })
+    Ok(tx.load(id).await?.facets_mut())
 }
 
 async fn structural_mut(

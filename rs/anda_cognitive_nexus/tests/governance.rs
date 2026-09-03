@@ -4189,3 +4189,216 @@ async fn a_high_impact_receipt_explains_what_authorized_it() {
             .is_none_or(|extensions| !extensions.contains_key("governance"))
     );
 }
+
+#[tokio::test]
+async fn a_control_plane_operation_that_failed_does_not_consume_its_approval() {
+    // §40. An approval is authority to *perform* an operation, and an
+    // operation that refused did not perform it. Every control-plane host call
+    // therefore spends after the work succeeds, never before — the reading
+    // that used to differ between `designate_self` and `sweep_expired` on one
+    // side and the nine Grant, Delegation, membership, binding, policy and
+    // schema calls on the other.
+    let nexus = stocked("approval_survives_failure").await;
+    let gov = nexus.governance();
+    let steward = agent(gov, "kip:principal:steward").await;
+    let auditor = agent(gov, "kip:principal:auditor").await;
+    grant(
+        &nexus,
+        &steward,
+        &["read", "create", "manage_policy"],
+        AuthorityScope::default(),
+    )
+    .await;
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:one-eye".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Designating the Space's own identity takes an approval".into(),
+            statements: vec![PolicyStatement {
+                effect: "allow".into(),
+                actions: vec!["manage_policy".into()],
+                obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+                    approvals_required: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:one-eye".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let session = nexus.session(AuthContext::principal(&steward));
+    run_as(
+        &session,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let alice = ElementId::new(anda_kip::ElementKind::Concept, 1);
+
+    // A control-plane operation is gated at Space scope, so its subject is the
+    // permission in this Space rather than any one element.
+    let approval = gov
+        .request_approval(
+            ApprovalDraft {
+                space_id: DEFAULT_SPACE.into(),
+                operation: "manage_policy".into(),
+                subject_digest: anda_cognitive_nexus::governance::approval::subject_digest(
+                    DEFAULT_SPACE,
+                    Permission::ManagePolicy,
+                    &anda_cognitive_nexus::governance::ResourceContext::default(),
+                ),
+                required: 1,
+                ..Default::default()
+            },
+            &steward,
+        )
+        .await
+        .unwrap();
+    gov.approve(approval._id, &auditor, "reviewed")
+        .await
+        .unwrap();
+
+    // Refused *after* the gate, by the check that a self identity must resolve.
+    assert_eq!(
+        session
+            .designate_self(DEFAULT_SPACE, Some("C-9999".parse().unwrap()))
+            .await
+            .unwrap_err()
+            .name(),
+        "NotFoundOrNotVisible",
+    );
+
+    // The approval is still there, because nothing was designated.
+    session
+        .designate_self(DEFAULT_SPACE, Some(alice))
+        .await
+        .unwrap();
+    assert_eq!(
+        nexus
+            .store
+            .get_space(DEFAULT_SPACE)
+            .await
+            .unwrap()
+            .self_concept,
+        alice.to_string()
+    );
+
+    // And now it is spent: the next one needs a new approval.
+    assert_eq!(
+        session
+            .designate_self(DEFAULT_SPACE, None)
+            .await
+            .unwrap_err()
+            .name(),
+        "RequiresApproval",
+        "an approval authorizes one operation, not a standing licence",
+    );
+}
+
+#[tokio::test]
+async fn a_retention_sweep_gates_and_spends_like_every_other_control_plane_call() {
+    // The other half of the same contract. `sweep_expired` is the one caller
+    // that takes the write guard itself and hands the gate to `gated_under`,
+    // so it is the one that could lose the gate — or go back to spending
+    // before the sweep — without any other test noticing.
+    let nexus = stocked("retention_sweep_approval").await;
+    let gov = nexus.governance();
+    let steward = agent(gov, "kip:principal:steward").await;
+    let auditor = agent(gov, "kip:principal:auditor").await;
+    grant(
+        &nexus,
+        &steward,
+        &["read", "create", "update", "archive", "manage_retention"],
+        AuthorityScope::default(),
+    )
+    .await;
+    gov.publish_policy(
+        PolicyDraft {
+            policy_id: "kip:policy:sweep".into(),
+            space_id: DEFAULT_SPACE.into(),
+            description: "Sweeping a Space's lapsed records takes an approval".into(),
+            statements: vec![PolicyStatement {
+                effect: "allow".into(),
+                actions: vec!["manage_retention".into()],
+                obligations: anda_cognitive_nexus::governance::rows::PolicyObligations {
+                    approvals_required: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+    let mut space = nexus.store.get_space(DEFAULT_SPACE).await.unwrap();
+    space.default_policy_id = "kip:policy:sweep".into();
+    nexus.store.put_space(&space).await.unwrap();
+
+    let session = nexus.session(AuthContext::principal(&steward));
+    // Ungated, the sweep is refused — the gate is actually asked.
+    assert_eq!(
+        session
+            .sweep_expired(
+                DEFAULT_SPACE,
+                anda_cognitive_nexus::nexus::RetentionAction::Archive,
+                10,
+            )
+            .await
+            .unwrap_err()
+            .name(),
+        "RequiresApproval",
+    );
+
+    let approval = gov
+        .request_approval(
+            ApprovalDraft {
+                space_id: DEFAULT_SPACE.into(),
+                operation: "manage_retention".into(),
+                subject_digest: anda_cognitive_nexus::governance::approval::subject_digest(
+                    DEFAULT_SPACE,
+                    Permission::ManageRetention,
+                    &anda_cognitive_nexus::governance::ResourceContext::default(),
+                ),
+                required: 1,
+                ..Default::default()
+            },
+            &steward,
+        )
+        .await
+        .unwrap();
+    gov.approve(approval._id, &auditor, "reviewed")
+        .await
+        .unwrap();
+
+    // Nothing has lapsed, so the sweep does nothing — and still spends, because
+    // it ran. "Swept zero" is a completed operation, not a refused one.
+    let report = session
+        .sweep_expired(
+            DEFAULT_SPACE,
+            anda_cognitive_nexus::nexus::RetentionAction::Archive,
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(report.swept.is_empty());
+
+    assert_eq!(
+        session
+            .sweep_expired(
+                DEFAULT_SPACE,
+                anda_cognitive_nexus::nexus::RetentionAction::Archive,
+                10,
+            )
+            .await
+            .unwrap_err()
+            .name(),
+        "RequiresApproval",
+        "an approval authorizes one sweep, not a standing licence",
+    );
+}

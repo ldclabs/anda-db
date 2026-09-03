@@ -23,12 +23,13 @@
 
 use anda_kip::{
     Activity, Assertion, AssertionLifecycle, AssertionMode, AssertionStatus, Concept,
-    ElementEnvelope, ElementKind, Evidence, EvidenceLifecycle, EvidencePayload, EvidenceRef,
-    GovernanceState, Json, Map, Origin, Proposition, Retention, Stance, SystemState, ValidTime,
+    ElementEnvelope, Evidence, EvidenceLifecycle, EvidencePayload, EvidenceRef, GovernanceState,
+    Json, Map, Origin, Proposition, Retention, Stance, SystemState, ValidTime,
 };
 
 use crate::store::Element;
 use crate::store::rows::*;
+use crate::store::write::Row;
 
 /// Renders an element in the raw Core view.
 pub fn render(element: &Element) -> Json {
@@ -112,29 +113,6 @@ pub fn read_path(view: &Json, path: &[anda_kip::PathStep]) -> Json {
     cursor.clone()
 }
 
-/// The envelope columns of one row, named rather than positional.
-///
-/// Fourteen positional arguments would let `created_tx` and `updated_tx` swap
-/// places silently — same type, adjacent, and wrong in a way no test that
-/// checks one of them would catch.
-struct EnvelopeParts<'a> {
-    id: String,
-    kind: ElementKind,
-    space: &'a str,
-    state: &'a str,
-    version: u64,
-    plane_versions: &'a Json,
-    seq: u64,
-    created_at: &'a str,
-    updated_at: &'a str,
-    created_tx: &'a str,
-    updated_tx: &'a str,
-    origin: &'a Json,
-    governance: &'a Json,
-    retention: &'a Json,
-    facets: &'a Map<String, Json>,
-}
-
 /// The Governance block a reader sees (§31.3).
 ///
 /// `authority_class` is filled in rather than left absent: `descriptive` is
@@ -150,10 +128,10 @@ fn governance_state(governance: &Json) -> GovernanceState {
     state
 }
 
-fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
-    let EnvelopeParts {
-        id,
+fn envelope(row: &impl Row) -> ElementEnvelope {
+    let crate::store::write::Envelope {
         kind,
+        id,
         space,
         state,
         version,
@@ -167,7 +145,17 @@ fn envelope(parts: EnvelopeParts<'_>) -> ElementEnvelope {
         governance,
         retention,
         facets,
-    } = parts;
+        // Named rather than swallowed by `..`: a column added to
+        // `envelope_columns!` must fail to compile here, so that whether it
+        // belongs on the wire is decided rather than defaulted to "no".
+        // `expires_at` is a derived index column and `structural` is attached
+        // by `finish` as an additive key (§103 Q1), so neither is an envelope
+        // member.
+        expires_at: _,
+        structural: _,
+    } = row.envelope();
+    let id = crate::id::ElementId::new(kind, id).to_string();
+    let (version, seq) = (*version, *seq);
     ElementEnvelope {
         id,
         kind,
@@ -231,23 +219,7 @@ fn finish<T: serde::Serialize>(
 
 fn concept(row: &ConceptRow) -> Json {
     let value = Concept {
-        envelope: envelope(EnvelopeParts {
-            id: format!("C-{}", row._id),
-            kind: ElementKind::Concept,
-            space: &row.space,
-            state: &row.state,
-            version: row.version,
-            plane_versions: &row.plane_versions,
-            seq: row.seq,
-            created_at: &row.created_at,
-            updated_at: &row.updated_at,
-            created_tx: &row.created_tx,
-            updated_tx: &row.updated_tx,
-            origin: &row.origin,
-            governance: &row.governance,
-            retention: &row.retention,
-            facets: &row.facets,
-        }),
+        envelope: envelope(row),
         schema_ref: some_text(&row.schema_ref),
         key: some_text(&row.key),
         name: some_text(&row.name),
@@ -269,23 +241,7 @@ fn concept(row: &ConceptRow) -> Json {
 
 fn proposition(row: &PropositionRow) -> Json {
     let value = Proposition {
-        envelope: envelope(EnvelopeParts {
-            id: format!("P-{}", row._id),
-            kind: ElementKind::Proposition,
-            space: &row.space,
-            state: &row.state,
-            version: row.version,
-            plane_versions: &row.plane_versions,
-            seq: row.seq,
-            created_at: &row.created_at,
-            updated_at: &row.updated_at,
-            created_tx: &row.created_tx,
-            updated_tx: &row.updated_tx,
-            origin: &row.origin,
-            governance: &row.governance,
-            retention: &row.retention,
-            facets: &row.facets,
-        }),
+        envelope: envelope(row),
         subject: endpoint_view(&row.subject),
         predicate_ref: row.predicate_ref.clone(),
         object: endpoint_view(&row.object),
@@ -313,23 +269,7 @@ fn assertion(row: &AssertionRow) -> Json {
         until: some_text(&row.valid_until),
     };
     let value = Assertion {
-        envelope: envelope(EnvelopeParts {
-            id: format!("A-{}", row._id),
-            kind: ElementKind::Assertion,
-            space: &row.space,
-            state: &row.state,
-            version: row.version,
-            plane_versions: &row.plane_versions,
-            seq: row.seq,
-            created_at: &row.created_at,
-            updated_at: &row.updated_at,
-            created_tx: &row.created_tx,
-            updated_tx: &row.updated_tx,
-            origin: &row.origin,
-            governance: &row.governance,
-            retention: &row.retention,
-            facets: &row.facets,
-        }),
+        envelope: envelope(row),
         // The wire form of a reference is an object, never a bare id string
         // (§8.1, §13.2): a string can spell a local id and nothing else, and a
         // reader cannot tell one that was resolved from one that was guessed.
@@ -396,23 +336,7 @@ fn assertion(row: &AssertionRow) -> Json {
 
 fn evidence(row: &EvidenceRow) -> Json {
     let value = Evidence {
-        envelope: envelope(EnvelopeParts {
-            id: format!("E-{}", row._id),
-            kind: ElementKind::Evidence,
-            space: &row.space,
-            state: &row.state,
-            version: row.version,
-            plane_versions: &row.plane_versions,
-            seq: row.seq,
-            created_at: &row.created_at,
-            updated_at: &row.updated_at,
-            created_tx: &row.created_tx,
-            updated_tx: &row.updated_tx,
-            origin: &row.origin,
-            governance: &row.governance,
-            retention: &row.retention,
-            facets: &row.facets,
-        }),
+        envelope: envelope(row),
         evidence_class: row.evidence_class.clone(),
         payload: Some(EvidencePayload {
             mode: some_text(&row.payload_mode),
@@ -435,23 +359,7 @@ fn evidence(row: &EvidenceRow) -> Json {
 
 fn activity(row: &ActivityRow) -> Json {
     let value = Activity {
-        envelope: envelope(EnvelopeParts {
-            id: format!("X-{}", row._id),
-            kind: ElementKind::Activity,
-            space: &row.space,
-            state: &row.state,
-            version: row.version,
-            plane_versions: &row.plane_versions,
-            seq: row.seq,
-            created_at: &row.created_at,
-            updated_at: &row.updated_at,
-            created_tx: &row.created_tx,
-            updated_tx: &row.updated_tx,
-            origin: &row.origin,
-            governance: &row.governance,
-            retention: &row.retention,
-            facets: &row.facets,
-        }),
+        envelope: envelope(row),
         activity_class: row.activity_class.clone(),
         started_at: some_text(&row.started_at),
         ended_at: some_text(&row.ended_at),

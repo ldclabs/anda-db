@@ -214,7 +214,8 @@ pub fn initial(element: &Element) -> PlaneVersions {
         attributes: u64::from(has_attributes),
         structural: u64::from(has_structural),
         retention: u64::from(has_retention),
-        facets: facets_of(element)
+        facets: element
+            .facets()
             .keys()
             .map(|symbol| (local_name(symbol), 1))
             .collect(),
@@ -226,34 +227,34 @@ pub fn initial(element: &Element) -> PlaneVersions {
 /// Core fields under their plain names, Profile fields under their symbols.
 fn structural_of(element: &Element) -> Map<String, Json> {
     let mut out = Map::new();
-    let mut core = |name: &str, refs: &[Json]| {
-        if !refs.is_empty() {
-            out.insert(name.to_string(), Json::Array(refs.to_vec()));
-        }
-    };
-    let profile = match element {
-        Element::Concept(row) => &row.structural,
-        Element::Proposition(row) => &row.structural,
-        Element::Assertion(row) => {
-            core("evidence", &row.evidence_refs);
-            core("context", &row.context_refs);
-            &row.structural
-        }
-        Element::Evidence(row) => {
-            core("source", &row.source_refs);
-            if !row.generated_by.is_empty() {
-                core("generated_by", &[Json::String(row.generated_by.clone())]);
+    {
+        let mut core = |name: &str, refs: &[Json]| {
+            if !refs.is_empty() {
+                out.insert(name.to_string(), Json::Array(refs.to_vec()));
             }
-            &row.structural
+        };
+        // Only the typed Core edges differ between the kinds; the Profile
+        // fields below are a shared column and are walked once.
+        match element {
+            Element::Concept(_) | Element::Proposition(_) => {}
+            Element::Assertion(row) => {
+                core("evidence", &row.evidence_refs);
+                core("context", &row.context_refs);
+            }
+            Element::Evidence(row) => {
+                core("source", &row.source_refs);
+                if !row.generated_by.is_empty() {
+                    core("generated_by", &[Json::String(row.generated_by.clone())]);
+                }
+            }
+            Element::Activity(row) => {
+                core("inputs", &row.inputs);
+                core("outputs", &row.outputs);
+                core("associated_actors", &row.associated_actors);
+            }
         }
-        Element::Activity(row) => {
-            core("inputs", &row.inputs);
-            core("outputs", &row.outputs);
-            core("associated_actors", &row.associated_actors);
-            &row.structural
-        }
-    };
-    for (field, refs) in profile {
+    }
+    for (field, refs) in element.structural() {
         // An emptied field is the same as an absent one: `UNSET STRUCTURAL`
         // removes the key, and a `[]` left behind must not count as content.
         if refs.as_array().is_some_and(|items| items.is_empty()) {
@@ -262,16 +263,6 @@ fn structural_of(element: &Element) -> Map<String, Json> {
         out.insert(field.clone(), refs.clone());
     }
     out
-}
-
-fn facets_of(element: &Element) -> &Map<String, Json> {
-    match element {
-        Element::Concept(row) => &row.facets,
-        Element::Proposition(row) => &row.facets,
-        Element::Assertion(row) => &row.facets,
-        Element::Evidence(row) => &row.facets,
-        Element::Activity(row) => &row.facets,
-    }
 }
 
 /// What changed between the row a transaction loaded and the row it writes.
@@ -396,15 +387,15 @@ pub fn diff(before: &Element, after: &Element) -> Touched {
 
     // Facets, one counter each, keyed by the local name so two versions of one
     // lineage share it (§20.14).
-    for symbol in keys_that_differ(facets_of(before), facets_of(after)) {
+    for symbol in keys_that_differ(before.facets(), after.facets()) {
         let local = local_name(&symbol);
         touched.paths.push(format!("facets.{local}"));
         touched.facets.push(local);
     }
 
     // Retention: the hook and the column lifted out of it.
-    let (before_retention, before_expires) = retention_of(before);
-    let (after_retention, after_expires) = retention_of(after);
+    let (before_retention, before_expires) = (before.retention(), before.expires_at());
+    let (after_retention, after_expires) = (after.retention(), after.expires_at());
     if before_retention != after_retention || before_expires != after_expires {
         touched.retention = true;
         touched.paths.push("retention".to_string());
@@ -426,16 +417,6 @@ pub fn diff(before: &Element, after: &Element) -> Touched {
     touched.facets.sort();
     touched.facets.dedup();
     touched
-}
-
-fn retention_of(element: &Element) -> (&Json, &str) {
-    match element {
-        Element::Concept(row) => (&row.retention, &row.expires_at),
-        Element::Proposition(row) => (&row.retention, &row.expires_at),
-        Element::Assertion(row) => (&row.retention, &row.expires_at),
-        Element::Evidence(row) => (&row.retention, &row.expires_at),
-        Element::Activity(row) => (&row.retention, &row.expires_at),
-    }
 }
 
 /// The keys whose values differ between two maps, added or removed included.

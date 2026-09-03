@@ -339,23 +339,7 @@ fn decode(row: ElementVersionRow) -> Result<Element, KipError> {
             row.version, row.element
         ))
     };
-    Ok(match kind {
-        ElementKind::Concept => {
-            Element::Concept(Box::new(serde_json::from_value(value).map_err(unreadable)?))
-        }
-        ElementKind::Proposition => {
-            Element::Proposition(Box::new(serde_json::from_value(value).map_err(unreadable)?))
-        }
-        ElementKind::Assertion => {
-            Element::Assertion(Box::new(serde_json::from_value(value).map_err(unreadable)?))
-        }
-        ElementKind::Evidence => {
-            Element::Evidence(Box::new(serde_json::from_value(value).map_err(unreadable)?))
-        }
-        ElementKind::Activity => {
-            Element::Activity(Box::new(serde_json::from_value(value).map_err(unreadable)?))
-        }
-    })
+    Element::from_json(kind, value).map_err(unreadable)
 }
 
 /// A coordinate a read is bound to.
