@@ -6,9 +6,88 @@ All notable changes to this workspace are documented in this file.
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
-unpublished, so this accumulates into the same version).
+unpublished, so this accumulates into the same version),
+`anda_cognitive_nexus_py` 0.6.0.
 
-Two syncs accumulate here. The later one first.
+Three syncs accumulate here. The latest one first.
+
+## The Python binding reaches the runtime surface it was declaring
+
+`anda_cognitive_nexus_py` executed KIP 2.0 through a single-command entry
+point: one command, a `dry_run` flag and parameters. Everything else §71 puts
+in the envelope was unreachable from Python — which meant a Python host was
+answering `DESCRIBE CAPABILITIES` with promises it could not keep. It reported
+`readonly_endpoint: true` with no read-only path a caller could take,
+`per_operation_receipts: true` from a surface that never ran more than one
+operation, and it accepted no `space` at all while §5.5 says a MemorySpace is
+named rather than inferred. §99 asks a KIP-Runtime implementation for the
+request/response envelope and Space resolution as *baseline*, not as the
+extended surface.
+
+The engine behind the binding already implemented all of it. Nothing here is
+new engine behaviour; it is the binding no longer standing between a caller
+and the protocol.
+
+### Added — `anda_kip::execute_request_readonly` (§76)
+
+The envelope counterpart of `execute_readonly`, so a read-only endpoint that
+takes whole envelopes does not have to re-implement the admission rule. Every
+operation is classified before any of them runs, and one state-changing
+operation fails the request instead of running — the reads beside it are not
+served either, so a caller cannot mistake a half-served request for a served
+one. The rule is decided on the parsed command in both entry points, which now
+share one `admits_readonly`; a `language` label still cannot downgrade a write
+(§73.1, §88.3).
+
+`execute_request` now parses each operation once, up front, instead of once
+inside its loop: the gate and the executor must classify the same way, and two
+parses are two chances to disagree.
+
+### Added — the Python surface (`anda_cognitive_nexus_py`)
+
+- **`execute_request(envelope)` / `execute_request_readonly(envelope)`** take
+  the §71 envelope as a dict and return the §81 response — the shape the HTTP
+  server speaks. That reaches, in one addition: `space` (§5.5), several
+  `operations` under `execution.mode` `independent` or `sequence` with `op_id`
+  correlation and per-operation Receipts (§75), `idempotency_key` (§34),
+  `preconditions` (§35.4), `requires` (§67), `ingest` — Evidence minted from
+  the transport envelope instead of re-typed inside model-written KML (§71.1,
+  §88.12) — `request_id` (§72.1) and `options.deadline_ms` (§80.1).
+  A malformed envelope is *answered* with `InvalidRequestEnvelope`, not raised:
+  one recovery path, not two.
+  Unlike `execute_kip` these return the bare envelope with no `"type"` beside
+  it — a request whose operations are a read and a write has no single
+  language.
+- **`execute_kip_readonly(command, parameters)`** is the single-command
+  read-only path, with parameters bound structurally (§74).
+- **`import_capsule(capsule, space_id, isolate)`** (§39, §41). Import is
+  deliberately not a KIP command — KML has no import clause and META is
+  read-only — so before this a Python host could `EXPORT CAPSULE` and had no
+  way to accept one. `isolate=True` imports into quarantine (§39.2).
+- **`install_schema_packages(artifacts, space_id)`** (§20.10). Package
+  installation and activation are protected Schema operations rather than KML,
+  so this was the other thing only a host could do and Python could not. The
+  lock names exactly the packages given, and re-activating an unchanged lock
+  mints no new environment version (§20.8).
+- **`AndaDbConfig.schema_packages`** picks the bootstrap ontology. A host with
+  its own packages previously had to let the bundled profile activate and then
+  replace it, walking the Schema Environment version forward on every restart
+  and invalidating every client pinning the old one.
+- **`kip_version()` / `KIP_VERSION` / `COGNITIVE_MEMORY_PROFILE`** replace the
+  `sum_as_string` demo function, which was the module's only documented
+  "quick check" and taught a reader nothing about KIP.
+
+### Changed — breaking (`anda_cognitive_nexus_py` 0.6.0)
+
+- `sum_as_string` is removed.
+- `AndaDbConfig.__init__` takes a sixth optional argument, `schema_packages`.
+  Existing positional calls are unaffected.
+- `pyproject.toml` declares `requires-python = ">=3.8,<3.13"`. The bindings are
+  built on `pyo3` 0.20 — the last line `pyo3-asyncio` supports — which refuses
+  interpreters newer than 3.12; without the bound, pip resolved the sdist on
+  3.13+ and the build failed inside a Rust build script instead of at
+  resolution. The repository URL in the same file pointed at a repository name
+  that does not exist (`anda_db`).
 
 ## Conformance pass: the gaps the 2026-09-03 review found
 

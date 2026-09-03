@@ -228,3 +228,334 @@ async def test_pyandadb_thread_safety_and_async():
         assert isinstance(res, dict)
         assert "type" in res
         assert "response" in res
+
+# ---------------------------------------------------------------------------
+# The read-only path (§76)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_kip_readonly_refuses_a_write():
+    """A write sent to the read-only path is refused, and does not happen.
+
+    The refusal is decided on what the command parses as, never on a label a
+    caller attached to it (§73.1, §88.3).
+    """
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_readonly"))
+
+    refused = await db.execute_kip_readonly(
+        'CREATE CONCEPT ?c { TYPE "Person" NAME "Mallory" }'
+    )
+    # Classified as the write it is, then refused for being one.
+    assert refused["type"] == PyCommandType.Kml
+    assert refused["response"]["status"] == "failed"
+    assert operation_error(refused["response"])["code"] == "ReadonlyViolation"
+
+    # The state-capable path finds nothing, so nothing was committed.
+    found = await db.execute_kip(
+        'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: "Mallory"} }'
+    )
+    assert found["response"]["results"][0]["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_execute_kip_readonly_serves_reads_with_bound_parameters():
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_readonly_ok"))
+    written = await db.execute_kip(
+        'CREATE CONCEPT ?c { TYPE "Person" NAME :who }', parameters={"who": "Alice"}
+    )
+    assert written["response"]["status"] == "succeeded", written["response"]
+
+    found = await db.execute_kip_readonly(
+        'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: :who} }',
+        parameters={"who": "Alice"},
+    )
+    assert found["type"] == PyCommandType.Kql
+    assert found["response"]["results"][0]["result"] == ["Alice"]
+
+    primer = await db.execute_kip_readonly("DESCRIBE PRIMER")
+    assert primer["type"] == PyCommandType.Meta
+    assert primer["response"]["status"] == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# The request envelope (§71, §75, §81)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_execute_request_carries_space_ingest_and_a_sequence():
+    """The whole envelope reaches the engine.
+
+    A named MemorySpace (§5.5, never inferred), several operations under a
+    declared execution mode (§75), and Evidence minted from the transport
+    envelope rather than re-typed inside KML text (§71.1, §88.12).
+    """
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_envelope"))
+
+    response = await db.execute_request({
+        "kip": "2.0",
+        "request_id": "req-1",
+        "space": {"id": "kip:space:default"},
+        "execution": {"mode": "sequence", "on_error": "stop"},
+        "ingest": {
+            "evidence": [{
+                "key": "msg",
+                "evidence_class": "user_statement",
+                "payload": "I prefer dark mode.",
+                "media_type": "text/plain",
+                "observed_at": "2026-08-14T01:00:00Z",
+            }]
+        },
+        "operations": [
+            {
+                "op_id": "write",
+                "command": """
+                    MUTATE {
+                        CREATE CONCEPT ?alice { TYPE "Person" NAME :who }
+                        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+                        ASSERT ?a (?alice, "prefers", ?dark) {
+                            by: ?alice, mode: "stated", confidence: 0.9, evidence: :msg
+                        }
+                    }
+                """,
+            },
+            {
+                "op_id": "read",
+                "command": 'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person", name: :who} }',
+            },
+        ],
+        "parameters": {"who": "Alice"},
+    })
+
+    # The bare response envelope, with no "type" beside it: a request whose
+    # operations are a read and a write has no single language.
+    assert response["kip"] == "2.0"
+    assert response["request_id"] == "req-1"
+    assert response["status"] == "succeeded", response
+    assert [r["op_id"] for r in response["results"]] == ["write", "read"]
+    # `sequence`: the later operation observed the earlier one's commit.
+    assert response["results"][1]["result"] == ["Alice"]
+    # Each state-changing operation gets its own Receipt; the top-level slot is
+    # reserved for `atomic` (§75.2).
+    assert response["results"][0]["receipt"]["tx_id"]
+
+
+@pytest.mark.asyncio
+async def test_execute_request_readonly_refuses_a_batch_containing_a_write():
+    db = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_envelope_readonly")
+    )
+
+    response = await db.execute_request_readonly({
+        "kip": "2.0",
+        "execution": {"mode": "independent"},
+        "operations": [
+            {"op_id": "read", "command": "DESCRIBE PRIMER"},
+            # Labelled a read; it is a write, and the parse is what decides.
+            {
+                "op_id": "write",
+                "language": "KML",
+                "command": 'CREATE CONCEPT ?c { TYPE "Person" NAME "Mallory" }',
+            },
+        ],
+    })
+
+    assert response["error"]["code"] == "ReadonlyViolation", response
+    # The read beside the write was not served either, so a caller cannot
+    # mistake a half-served request for a served one.
+    assert all(r.get("op_id") is None for r in response["results"])
+
+
+@pytest.mark.asyncio
+async def test_execute_request_answers_a_malformed_envelope():
+    """A protocol question gets a protocol answer, not an exception."""
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_bad_envelope"))
+
+    for envelope, code in [
+        # Not this protocol version.
+        ({"kip": "1.0", "operations": [{"command": "DESCRIBE PRIMER"}]},
+         "UnsupportedProtocolVersion"),
+        # A member no KIP 2.0 envelope has. Accepted silently, it would read as
+        # a setting that took effect.
+        ({"kip": "2.0", "operations": [{"command": "DESCRIBE PRIMER"}], "readonly": True},
+         "InvalidRequestEnvelope"),
+        # Several operations and no declared mode: whether an earlier commit
+        # survives a later failure is not an engine default (§75.4).
+        ({"kip": "2.0", "operations": [
+            {"command": "DESCRIBE PRIMER"}, {"command": "DESCRIBE PROTOCOL"}]},
+         "InvalidRequestEnvelope"),
+    ]:
+        response = await db.execute_request(envelope)
+        assert response["status"] == "failed", envelope
+        assert response["error"]["code"] == code, response
+
+
+@pytest.mark.asyncio
+async def test_atomic_execution_is_refused_rather_than_approximated():
+    """§75.4: a batch is not a transaction, and will not be presented as one."""
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_atomic"))
+
+    response = await db.execute_request({
+        "kip": "2.0",
+        "execution": {"mode": "atomic"},
+        "operations": [
+            {"command": 'CREATE CONCEPT ?a { TYPE "Person" NAME "A" }'},
+            {"command": 'CREATE CONCEPT ?b { TYPE "Person" NAME "B" }'},
+        ],
+    })
+    assert response["error"]["code"] == "UnsupportedCapability", response
+
+
+# ---------------------------------------------------------------------------
+# Host operations: Capsules (§37-§41) and Schema Packages (§20)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_import_capsule_carries_cognition_into_another_nexus():
+    """Export is a META command; import is a host decision, not a KIP one."""
+    source = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_src"))
+    written = await source.execute_kip("""
+        MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            ASSERT ?a (?alice, "prefers", ?dark) {
+                by: ?alice, mode: "stated", confidence: 0.9
+            }
+        }
+    """)
+    assert written["response"]["status"] == "succeeded", written["response"]
+
+    exported = await source.execute_kip('EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }')
+    assert exported["response"]["status"] == "succeeded", exported["response"]
+    capsule = exported["response"]["results"][0]["result"]
+
+    destination = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_dst")
+    )
+    report = await destination.import_capsule(capsule)
+    assert report["imported"] is True
+    # The source-to-destination identity map is what makes a re-import
+    # idempotent rather than a second copy.
+    assert report["identity_map"]
+
+    found = await destination.execute_kip(
+        'FIND(?c.name, ?a.confidence) WHERE {'
+        '  ?c CONCEPT {type: "Person"}'
+        '  ?p PROPOSITION (?c, "prefers", ?pref)'
+        '  ?a ASSERTION {proposition: ?p}'
+        '}'
+    )
+    assert found["response"]["results"][0]["result"] == [["Alice", 0.9]]
+
+
+@pytest.mark.asyncio
+async def test_import_capsule_rejects_something_that_is_not_a_capsule():
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_bad_capsule"))
+    with pytest.raises(RuntimeError):
+        await db.import_capsule({"not": "a capsule"})
+
+
+@pytest.mark.asyncio
+async def test_install_schema_packages_puts_exactly_that_lock_in_force():
+    """§20.9: the Schema Lock names exactly the packages given."""
+    import anda_cognitive_nexus_py as anda
+
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_schema"))
+
+    # Re-activating the lock already in force must not mint a new Schema
+    # Environment version: that would invalidate every client pinning the old
+    # one for no change at all (§20.8, §35.4).
+    first = await db.install_schema_packages([anda.COGNITIVE_MEMORY_PROFILE])
+    second = await db.install_schema_packages([anda.COGNITIVE_MEMORY_PROFILE])
+    assert first["schema_environment_version"] == second["schema_environment_version"]
+    assert "kip://profiles/cognitive-memory" in second["lock"]["packages"]
+
+    # Activating nothing leaves the Core Package alone in force, and Core
+    # declares no Concept types at all.
+    await db.install_schema_packages([])
+    refused = await db.execute_kip('CREATE CONCEPT ?c { TYPE "Person" NAME "Nobody" }')
+    assert refused["response"]["status"] == "failed", refused["response"]
+
+
+@pytest.mark.asyncio
+async def test_a_space_can_be_created_without_the_bundled_profile():
+    """`schema_packages=[]` is a legitimate choice, and an unusable ontology.
+
+    It is what a host picks when it installs its own schema later; a Space with
+    only the Core Package can hold Assertions about types it does not have, and
+    cannot create a Concept.
+    """
+    db = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_no_profile", None, None, [])
+    )
+    refused = await db.execute_kip('CREATE CONCEPT ?c { TYPE "Person" NAME "Nobody" }')
+    assert refused["response"]["status"] == "failed", refused["response"]
+
+
+@pytest.mark.asyncio
+async def test_import_capsule_can_quarantine_instead_of_recalling():
+    """`isolate=True` imports for review, not into ordinary recall (§39.2).
+
+    Quarantine holds cognition out of use without claiming its author took it
+    back, so a flag that failed to route would put unreviewed cognition where a
+    host meant it to be held.
+    """
+    source = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_iso_src")
+    )
+    await source.execute_kip("""
+        MUTATE {
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            ASSERT ?a (?alice, "prefers", ?dark) {
+                by: ?alice, mode: "stated", confidence: 0.9
+            }
+        }
+    """)
+    exported = await source.execute_kip('EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }')
+    capsule = exported["response"]["results"][0]["result"]
+
+    recalled = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_recall")
+    )
+    quarantined = await PyAndaDB.create(
+        AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_quarantine")
+    )
+    await recalled.import_capsule(capsule, isolate=False)
+    await quarantined.import_capsule(capsule, isolate=True)
+
+    read = 'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }'
+    # The ordinary import is in recall; the isolated one is held out of it, so
+    # the two destinations must not answer the same read the same way.
+    assert (await recalled.execute_kip(read))["response"]["results"][0]["result"] == ["Alice"]
+    assert (await quarantined.execute_kip(read))["response"]["results"][0]["result"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_idempotency_key_reaches_the_engine():
+    """§34: the same key on the same work replays instead of writing twice."""
+    db = await PyAndaDB.create(AndaDbConfig(StoreLocationType.InMem, "", "test_db_idempotency"))
+
+    def write():
+        return {
+            "kip": "2.0",
+            "execution": {"mode": "sequence", "idempotency_key": "onboarding:alice"},
+            "operations": [
+                {"command": 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }'},
+            ],
+        }
+
+    first = await db.execute_request(write())
+    assert first["status"] == "succeeded", first
+    # Echoed so a client holding `outcome_unknown` can recover by key (§81).
+    assert first["execution"]["idempotency_key"] == "onboarding:alice"
+
+    second = await db.execute_request(write())
+    assert second["status"] == "succeeded", second
+
+    # One Concept, not two: the second request replayed the first transaction
+    # rather than doing the work again.
+    found = await db.execute_kip('FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }')
+    assert found["response"]["results"][0]["result"] == ["Alice"]
+    assert (
+        first["results"][0]["receipt"]["tx_id"] == second["results"][0]["receipt"]["tx_id"]
+    ), (first["results"][0]["receipt"], second["results"][0]["receipt"])

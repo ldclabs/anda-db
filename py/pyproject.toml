@@ -6,9 +6,16 @@ authors = [
     { name = "LDCLabs", email = "info@ldclabs.com" }
 ]
 license = "MIT"
+# pyo3 0.20 — the last line `pyo3-asyncio` supports — refuses interpreters
+# newer than 3.12. Without this bound, pip resolves the sdist on 3.13+ and the
+# build fails inside a Rust build script instead of at resolution.
+requires-python = ">=3.10,<3.13"
 keywords = ["database", "ai-agent", "knowledge", "memory", "rust", "ffi"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Operating System :: OS Independent",
     "License :: OSI Approved :: MIT License",
@@ -25,5 +32,5 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project.urls]
-Homepage = "https://github.com/ldclabs/anda_db"
-Repository = "https://github.com/ldclabs/anda_db"
+Homepage = "https://github.com/ldclabs/anda-db"
+Repository = "https://github.com/ldclabs/anda-db"

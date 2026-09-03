@@ -130,16 +130,21 @@ pub async fn execute_readonly(
     command: &str,
     dry_run: bool,
 ) -> (CommandType, Response) {
-    execute_one(executor, command, dry_run, |command| {
-        if command.is_mutation() {
-            return Err(KipError::readonly_violation(
-                "this endpoint executes KQL and META only; KML mutations must go through the \
-                 state-capable runtime",
-            ));
-        }
-        Ok(())
-    })
-    .await
+    execute_one(executor, command, dry_run, admits_readonly).await
+}
+
+/// The read-only endpoint's admission rule (§76, §88.3).
+///
+/// Decided on the parsed command, so a `language` label cannot downgrade a
+/// write into read-only semantics (§73.1).
+fn admits_readonly(command: &Command) -> Result<(), KipError> {
+    if command.is_mutation() {
+        return Err(KipError::readonly_violation(
+            "this endpoint executes KQL and META only; KML mutations must go through the \
+             state-capable runtime",
+        ));
+    }
+    Ok(())
 }
 
 /// Parses one command into its own single-operation request and runs it,
@@ -193,6 +198,33 @@ fn single_command_request(command: &str, dry_run: bool) -> Request {
 /// stay durable, which is why the request-level status becomes
 /// [`TopLevelStatus::Partial`] rather than `failed` (§75.2).
 pub async fn execute_request(executor: &impl Executor, request: &Request) -> Response {
+    run_request(executor, request, |_| Ok(())).await
+}
+
+/// Runs a whole request envelope on a read-only path (§76).
+///
+/// The envelope counterpart of [`execute_readonly`]: accepts KQL and META —
+/// `VERIFY`, `VALIDATE`, `PREVIEW`, `HISTORY`, `CHANGES` and `EXPORT CAPSULE`
+/// included — and refuses state-changing semantics.
+///
+/// The refusal is decided on every operation's *parsed* command before any of
+/// them runs, and it fails the request rather than one operation. A caller that
+/// sent a write to the read endpoint has a bug in what it thinks it is doing,
+/// and executing the reads around the write would hide it — while an engine
+/// that ran them would have to be trusted not to have committed anything.
+pub async fn execute_request_readonly(executor: &impl Executor, request: &Request) -> Response {
+    run_request(executor, request, admits_readonly).await
+}
+
+/// Runs an envelope, refusing anything `admits` does not allow.
+///
+/// The two entry points differ only in `admits`, exactly as the two
+/// single-command ones do.
+async fn run_request(
+    executor: &impl Executor,
+    request: &Request,
+    admits: impl Fn(&Command) -> Result<(), KipError>,
+) -> Response {
     if let Err(err) = request.validate() {
         return Response::from(err).with_request_id(request.request_id.clone());
     }
@@ -204,6 +236,19 @@ pub async fn execute_request(executor: &impl Executor, request: &Request) -> Res
              helper runs operations one at a time and will not fake them",
         ))
         .with_request_id(request.request_id.clone());
+    }
+
+    // Parsed once, up front: a read-only endpoint has to refuse a write before
+    // a sibling operation runs, and parsing again inside the loop would let the
+    // classification the gate used drift from the one the executor sees (§73.1).
+    // An operation that does not parse cannot be a mutation; it fails as its
+    // own result below, which is where a caller can correlate it by `op_id`.
+    let parsed: Vec<Result<Command, KipError>> =
+        request.operations.iter().map(Operation::parse).collect();
+    for command in parsed.iter().filter_map(|parsed| parsed.as_ref().ok()) {
+        if let Err(err) = admits(command) {
+            return Response::from(err).with_request_id(request.request_id.clone());
+        }
     }
 
     let on_error = request
@@ -224,7 +269,7 @@ pub async fn execute_request(executor: &impl Executor, request: &Request) -> Res
     let mut snapshot = None;
     let mut outcome_unknown_error = None;
 
-    for operation in &request.operations {
+    for (operation, parsed) in request.operations.iter().zip(parsed) {
         if stopped {
             results.push(
                 OperationResult {
@@ -236,7 +281,7 @@ pub async fn execute_request(executor: &impl Executor, request: &Request) -> Res
             continue;
         }
 
-        let result = match operation.parse() {
+        let result = match parsed {
             Ok(command) => {
                 let response = executor.execute(command, request, operation).await;
                 if response.status == TopLevelStatus::OutcomeUnknown {
@@ -498,6 +543,65 @@ mod tests {
         // A single-command response states its caveats at the request level;
         // here that is the operation level.
         assert_eq!(response.results[0].warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_readonly_envelope_path_rejects_writes_by_semantics() {
+        // The label says KQL; the command is a mutation. §73.1: what it parses
+        // as is what decides, so the declared language cannot talk it through.
+        let request = Request {
+            execution: Some(Execution::new(ExecutionMode::Sequence)),
+            operations: vec![
+                Operation::new("DESCRIBE PRIMER").with_op_id("op-1"),
+                Operation::new(r#"TRANSITION :x TO "tombstoned""#).with_op_id("op-2"),
+            ],
+            ..Default::default()
+        };
+
+        let response = execute_request_readonly(&EchoNexus, &request).await;
+        assert_eq!(response.status, TopLevelStatus::Failed);
+        assert_eq!(
+            response.error.as_ref().unwrap().parsed_code(),
+            Some(KipErrorCode::ReadonlyViolation)
+        );
+        // An envelope failure carries one result mirroring it, not one per
+        // operation: the read beside the write was not executed either, so a
+        // caller cannot mistake a half-served request for a served one.
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].op_id, None);
+    }
+
+    #[tokio::test]
+    async fn the_readonly_envelope_path_serves_reads_and_meta() {
+        let request = Request {
+            execution: Some(Execution::new(ExecutionMode::Independent)),
+            operations: vec![
+                Operation::new("DESCRIBE PRIMER"),
+                Operation::new(r#"EXPORT CAPSULE :out WHERE { ?c {type: "T"} }"#),
+                Operation::new(r#"FIND(?x) WHERE { ?x {type: "T"} }"#),
+            ],
+            ..Default::default()
+        };
+
+        let response = execute_request_readonly(&EchoNexus, &request).await;
+        assert_eq!(response.status, TopLevelStatus::Succeeded, "{response:#?}");
+        assert_eq!(response.results.len(), 3);
+    }
+
+    /// An unparseable operation is not a write, and refusing the whole request
+    /// for it would report a syntax error as a readonly violation.
+    #[tokio::test]
+    async fn an_unparseable_operation_fails_on_its_own_result_on_the_readonly_path() {
+        let response =
+            execute_request_readonly(&EchoNexus, &Request::single("not a command")).await;
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0]
+                .error
+                .as_ref()
+                .and_then(|error| error.parsed_code()),
+            Some(KipErrorCode::InvalidSyntax)
+        );
     }
 
     #[tokio::test]

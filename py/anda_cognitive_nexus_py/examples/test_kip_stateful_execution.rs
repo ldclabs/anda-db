@@ -11,7 +11,9 @@
 //! alive. It also shows the shape of a KIP 2.0 write — Concepts, a Proposition,
 //! and an Assertion that is the only thing claiming anything.
 
-use anda_cognitive_nexus_py::{create_kip_db, execute_kip, AndaDbConfig, StoreLocationType};
+use anda_cognitive_nexus_py::{
+    create_kip_db, execute_kip, execute_kip_readonly, AndaDbConfig, StoreLocationType,
+};
 use anda_kip::{Json, Map, TopLevelStatus};
 
 /// One attributed claim. The types come from the bundled cognitive-memory
@@ -71,6 +73,9 @@ async fn main() {
         db_name: "test_preferences_db".to_string(),
         db_desc: Some("Local file DB for the KIP binding example".to_string()),
         meta_cache_capacity: Some(10000),
+        // The bundled Cognitive Memory Profile, which is what `Person` and
+        // `Preference` below are symbols of.
+        schema_packages: None,
     };
 
     println!("\n1. Recording an attributed claim...");
@@ -142,7 +147,9 @@ async fn main() {
     }
     ORDER BY ?a.confidence DESC
     "#;
-    let (_, response) = execute_kip(nexus.as_ref(), query.to_string(), None, false).await;
+    // Through the read-only path (§76), because this is a read: an endpoint
+    // that could also write is authority a read does not need.
+    let (_, response) = execute_kip_readonly(nexus.as_ref(), query.to_string(), None).await;
     assert_eq!(
         response.status,
         TopLevelStatus::Succeeded,
@@ -164,6 +171,22 @@ async fn main() {
     assert_eq!(rows[0][0], Json::from("Dark mode"));
     assert_eq!(rows[0][1], Json::from(0.9));
     assert_eq!(rows[1][0], Json::from("Light mode"));
+
+    println!("\n4. Sending a write to the read-only path...");
+    // The refusal is decided on what the command parses as, not on a label a
+    // caller attached to it, so nothing in the envelope can talk it through.
+    let (_, refused) = execute_kip_readonly(
+        nexus.as_ref(),
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Mallory" }"#.to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        refused.error.as_ref().and_then(|error| error.parsed_code()),
+        Some(anda_kip::KipErrorCode::ReadonlyViolation),
+        "a write reached the read-only path: {refused:#?}"
+    );
+    println!("Refused, as it should be.");
 
     nexus.close().await.expect("Failed to close the database");
     println!("\n--- Full Stateful KIP Execution Test Passed ---");

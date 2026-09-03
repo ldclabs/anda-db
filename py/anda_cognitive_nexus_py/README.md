@@ -4,7 +4,7 @@ This crate provides the official Python bindings for the Anda engine, allowing P
 
 This bridge is built using [`PyO3`](https://pyo3.rs/) and packaged using [`maturin`](https://www.maturin.rs/), enabling high-performance, in-process communication between Python and the core Rust engine.
 
-It speaks **KIP 2.0**. Two consequences for anyone porting 1.x code:
+It speaks **KIP 2.0**. Three consequences for anyone porting 1.x code:
 
 - **A type is not graph state.** There is no `$ConceptType` node to write before
   using a type: types come from an immutable Schema Package, and
@@ -14,6 +14,10 @@ It speaks **KIP 2.0**. Two consequences for anyone porting 1.x code:
   `{"kip", "status", "results": [{"status", "result", "error"}], "receipt", …}`.
   A command that fails reports on its own result entry; the request-level
   `error` is for a failure of the envelope itself.
+- **A Proposition existing is not the same as it being true.** A read returns
+  raw claims: who asserted what, with what confidence. What is *currently
+  believed* is projected from those Assertions under a named policy
+  (`BELIEF` / `BELIEF SLOT`) and is never stored.
 
 ---
 
@@ -22,10 +26,16 @@ It speaks **KIP 2.0**. Two consequences for anyone porting 1.x code:
 Before you begin, ensure you have the following tools installed on your system:
 
 -   **Rust Toolchain:** Installed via `rustup`. ([Installation Guide](https://www.rust-lang.org/tools/install))
--   **Python:** 3.8 – 3.12. The bindings are built on `pyo3` 0.20 (the last line
+-   **Python:** 3.10 – 3.12. The bindings are built on `pyo3` 0.20 (the last line
     that `pyo3-asyncio` supports), which refuses interpreters newer than 3.12.
-    If the `python3` on your PATH is newer, select a supported one with
-    `PYO3_PYTHON=python3.12`.
+    If the `python3` on your PATH is newer, install a supported one and point
+    the build at it:
+
+    ```bash
+    uv python install 3.12
+    export PYO3_PYTHON="$(uv python find 3.12)"
+    ```
+
 -   **uv:** A fast Python installer and resolver. ([Installation Guide](https://github.com/astral-sh/uv))
 
 ## Rust Lib Verification
@@ -39,8 +49,9 @@ against it, and comment it back out afterwards.
 git clone REPO_URL
 cd anda-db
 # edit Cargo.toml: uncomment "py/anda_cognitive_nexus_py" under [workspace] members
+export PYO3_PYTHON="$(uv python find 3.12)"
 cargo check -p anda_cognitive_nexus_py
-cargo test --package anda_cognitive_nexus_py -- tests::test_execute_kip_in_mem --show-output
+cargo test -p anda_cognitive_nexus_py --lib
 cargo run -p anda_cognitive_nexus_py --example test_kip_stateful_execution
 cargo test -p anda_cognitive_nexus_py --doc
 ```
@@ -58,9 +69,9 @@ All commands should be run from the **root of the `anda` repository**.
 First, create and activate a Python virtual environment. This isolates our dependencies.
 
 ```bash
-cd py/anda_cognitive_nexus_py
-# Create the virtual environment
-uv venv
+cd py
+# Create the virtual environment on a supported interpreter
+uv venv --python 3.12
 
 # Activate the environment (Linux/macOS)
 source .venv/bin/activate
@@ -74,7 +85,7 @@ source .venv/bin/activate
 Next, use `maturin` to build the Rust crate and install it as an editable package in your virtual environment. The `develop` command compiles the Rust code and links it to your environment, so changes in the Rust code are available after recompiling without needing to reinstall.
 
 ```bash
-uv pip install -r tests_py/requirements.txt
+uv pip install -r anda_cognitive_nexus_py/tests_py/requirements.txt
 # This command will compile the Rust code and install the `anda` package
 maturin develop
 ```
@@ -92,68 +103,48 @@ maturin build --profile release-py
 
 Tests for the Python bindings are located in the `tests_py/` directory and use the `pytest` framework.
 
-To run the tests, execute the following command from the project root:
-
 ```bash
 # Make sure your virtual environment is activated
-pytest --cache-clear
-# find . -type d -name "__pycache__" -exec rm -rf {} +
-
-# pytest -s --log-cli-level=INFO tests_py/
-pytest -v tests_py/
+pytest -v anda_cognitive_nexus_py/tests_py/
 
 # Test a single case with debug level log
 export RUST_LOG=debug
 pytest -s -k test_create_success
 ```
 
-You should see an output indicating that all tests have passed.
-
-## Basic Usage Example
-
-To quickly verify your setup, you can run the following Python script:
+## Quick Check
 
 ```python
-# main.py
 import anda_cognitive_nexus_py as anda
 
-# This is the "hello world" function currently implemented
-result = anda.sum_as_string(10, 20)
-
-print(f"Calling the Rust-powered 'sum_as_string(10, 20)' function...")
-print(f"Result: {result}")
-
-assert result == "30"
-
-print("Successfully received a response from the Rust library!")
+# The protocol version a request envelope's `kip` member must carry.
+print(anda.kip_version())  # '2.0'
 ```
 
-Run it with:
-
-```bash
-python main.py
-```
+What the *engine* behind the binding supports is a separate question with its
+own answer — ask it with `DESCRIBE CAPABILITIES`, which reports the conformance
+profiles and capability names as structured data.
 
 ---
 
-## Creating a Database and Executing a KIP Command (New API)
+## Creating a Database and Executing a KIP Command
 
-The API now exposes configuration and enums as Python classes, not dicts or strings. Construct configs using `AndaDbConfig` and `StoreLocationType` directly:
+Configuration and enums are Python classes, not dicts or strings. Construct
+configs using `AndaDbConfig` and `StoreLocationType` directly:
 
 ```python
+import asyncio
 import anda_cognitive_nexus_py as anda
 
-# Construct the config using Python classes (not dicts)
 config = anda.AndaDbConfig(
 	store_location_type=anda.StoreLocationType.InMem,  # Use enum variant as a class attribute
 	store_location="",
 	db_name="test_db",
 	db_desc="Test database",
-	meta_cache_capacity=10000
+	meta_cache_capacity=10000,
+	# schema_packages=None activates the bundled Cognitive Memory Profile.
 )
 
-# Create the database (async)
-import asyncio
 async def main():
 	db = await anda.PyAndaDB.create(config)
 	try:
@@ -195,6 +186,137 @@ asyncio.run(main())
 - `StoreLocationType` and other enums are exposed as Python classes, not as `enum.Enum`. Use `anda.StoreLocationType.InMem` (not a string or dict).
 - Parameters are bound structurally into value positions, never interpolated
   into the command text — `:who` is data, not code.
-- A read returns raw claims. What is *currently believed* is projected from
-  Assertions under a policy (`BELIEF` / `BELIEF SLOT`) and is never stored.
 - See the Python tests in `tests_py/` for more usage examples.
+
+---
+
+## The Read-Only Path
+
+`execute_kip_readonly` accepts KQL and META — including `VERIFY`, `VALIDATE`,
+`PREVIEW`, `HISTORY`, `CHANGES` and `EXPORT CAPSULE` — and refuses anything that
+changes state:
+
+```python
+refused = await db.execute_kip_readonly(
+	'CREATE CONCEPT ?c { TYPE "Person" NAME "Mallory" }'
+)
+refused["response"]["error"]["code"]  # 'ReadonlyViolation'
+```
+
+The refusal is decided on what the command *parses as*, never on a label a
+caller attached to it. That is what makes it safe to hand this method a command
+an untrusted prompt composed: no field in the request can talk a write past the
+boundary.
+
+---
+
+## The Full Request Envelope
+
+`execute_kip` covers one command. Everything else in KIP 2.0's envelope lives on
+`execute_request`, which takes the envelope as a dict and returns the response
+envelope — the same shape the HTTP server speaks:
+
+```python
+response = await db.execute_request({
+	"kip": "2.0",
+	"request_id": "req-1",
+	# A MemorySpace is named, never inferred from conversation context.
+	"space": {"id": "kip:space:default"},
+	"execution": {
+		"mode": "sequence",          # or "independent"
+		"on_error": "stop",
+		"idempotency_key": "onboarding:alice",
+	},
+	# Observed material becomes Evidence straight from the envelope, instead of
+	# being re-typed by a model inside KML text.
+	"ingest": {
+		"evidence": [{
+			"key": "msg",
+			"evidence_class": "user_statement",
+			"payload": "I prefer dark mode.",
+			"observed_at": "2026-08-14T01:00:00Z",
+		}]
+	},
+	"operations": [
+		{"op_id": "write", "command": """
+			ASSERT (:alice, "prefers", :dark_mode) {
+				by: :alice, mode: "stated", evidence: :msg
+			}
+		"""},
+		{"op_id": "read", "command": 'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }'},
+	],
+	"parameters": {"alice": "...", "dark_mode": "..."},
+	"options": {"deadline_ms": 10000},
+})
+
+response["status"]                        # 'succeeded' | 'partial' | 'failed' | 'outcome_unknown'
+[r["op_id"] for r in response["results"]] # ['write', 'read']
+response["results"][0]["receipt"]["tx_id"]
+```
+
+Unlike `execute_kip`, this returns the bare envelope with no `"type"` beside it:
+a request whose operations are a read and a write has no single language, and
+`results[]` correlates by `op_id`.
+
+`execute_request_readonly` is the same thing on the read-only path. One
+state-changing operation fails the whole request; the reads beside it are not
+served either, so a caller cannot mistake a half-served request for a served
+one.
+
+A malformed envelope is *answered*, not raised: the response carries the same
+registered error code an engine would have returned, so a caller needs one
+recovery path rather than two.
+
+---
+
+## Host Operations
+
+Two things are deliberately **not** KIP commands, because letting a prompt reach
+them would be the bug. They are host decisions, and the host is your Python
+process:
+
+```python
+# Importing another Brain's cognition (§39, §41). Capsule bytes are not
+# destination mutation authority: everything is re-validated against this
+# Space's Schema Environment and re-authorized under its Governance.
+report = await db.import_capsule(capsule, isolate=False)
+report["identity_map"]  # source id -> destination id; a re-import is idempotent
+
+# Putting Schema Packages in force (§20.10). The lock names *exactly* these
+# packages, so include the baseline when you still want it.
+env = await db.install_schema_packages([
+	anda.COGNITIVE_MEMORY_PROFILE,
+	my_own_package_json,
+])
+env["schema_environment_version"]  # what a client pins in `preconditions`
+```
+
+`isolate=True` imports into quarantine for review rather than into ordinary
+recall state — cognition held out of use without claiming its author took it
+back.
+
+Export goes the other way and *is* a command, because reading is not the
+dangerous direction: `EXPORT CAPSULE ?a WHERE { ... }` through `execute_kip` or
+`execute_kip_readonly`.
+
+---
+
+## Known Limits
+
+Reported honestly rather than approximated:
+
+- **`execution.mode: "atomic"` is refused** with `UnsupportedCapability`. One
+  transaction, one snapshot, read-your-writes and all-or-none commit are
+  properties this runner cannot provide by running operations one at a time, and
+  faking them would tell a caller their writes were atomic when they were not.
+- **The binding runs as the system Principal.** That is the embedded case: one
+  process, one owner, and the process *is* the owner. It is a real
+  authorization through the same Governance path, not a bypass — a Space whose
+  policy denies something denies it here too. A host serving more than one
+  caller must authenticate them itself and is not served by this binding.
+- **Only the default MemorySpace exists.** `space` in the envelope is honoured
+  and a named Space must already exist; this binding has no API to create
+  another one.
+- The engine's own gaps — semantic `SEARCH`, Capsule signatures, the `restore`
+  import mode, `DESCRIBE TRUST` — are reported by `DESCRIBE CAPABILITIES` as
+  structured data rather than discovered by triggering an error.
