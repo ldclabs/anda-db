@@ -19,11 +19,11 @@
 mod json_schema;
 
 use anda_kip::{
-    ElementReference, Execution, ExecutionMode, IngestContext, IngestEvidence, OnError, Operation,
-    OperationResult, OperationStatus, PolicyIdentity, Preconditions, ReadBinding, Receipt,
-    ReceiptStatus, Request, RequestContext, RequestOptions, Response, ResponseContext,
-    ResponseExecution, ResultContext, SearchContext, SearchMode, SnapshotContext, SpaceSelector,
-    TopLevelStatus, Warning,
+    ChangeEnvelope, ElementReference, Execution, ExecutionMode, IngestContext, IngestEvidence,
+    OnError, Operation, OperationResult, OperationStatus, PolicyIdentity, Preconditions,
+    ReadBinding, Receipt, ReceiptStatus, Request, RequestContext, RequestOptions, Response,
+    ResponseContext, ResponseExecution, ResultContext, SearchContext, SearchMode, SnapshotContext,
+    SpaceSelector, TopLevelStatus, Warning,
 };
 use json_schema::Schema;
 use serde_json::{Value, json};
@@ -34,6 +34,10 @@ fn request_schema() -> Schema {
 
 fn response_schema() -> Schema {
     Schema::new(include_str!("../schemas/kip-response.schema.json"))
+}
+
+fn change_envelope_schema() -> Schema {
+    Schema::new(include_str!("../schemas/kip-change-envelope.schema.json"))
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Value {
@@ -593,4 +597,86 @@ fn every_status_and_mode_spells_itself_the_way_the_schema_does() {
         ..Default::default()
     };
     schema.assert_valid("a response exercising every spelling", &encode(&response));
+}
+
+// ---------------------------------------------------------------------------
+// The Change Envelope (§36.1)
+// ---------------------------------------------------------------------------
+
+/// A Change Envelope using every member the schema defines.
+fn exhaustive_change_envelope() -> Value {
+    json!({
+        "kip": "2.0",
+        "space_id": "kip:space:default",
+        "space_seq": 42,
+        "tx_id": "kip:space:default#42",
+        "committed_at": "2026-09-03T00:00:00.000Z",
+        "transaction_class": "cognitive",
+        "schema_environment_version": 3,
+        "changes": [
+            {
+                "op": "create",
+                "kind": "concept",
+                "id": "C-1",
+                "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person",
+                "new_version": 1,
+                "touched": ["attributes.role"],
+                "planes": {
+                    "attributes": 1,
+                    "structural": 0,
+                    "retention": 0,
+                    "facets": {"MnemonicState": 1}
+                },
+                "extensions": {"kip-do/entry": {"critical": false}}
+            },
+            {
+                "op": "lifecycle",
+                "kind": "assertion",
+                "id": "A-2",
+                "old_version": 1,
+                "new_version": 2,
+                "state": {"from": "active", "to": "retracted"},
+                "refs": {
+                    "proposition": "P-3",
+                    "subject": "C-1",
+                    "predicate_ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
+                    "merged_into": "C-9"
+                }
+            }
+        ],
+        "extensions": {"kip-do/envelope": {"critical": true}}
+    })
+}
+
+#[test]
+fn every_change_envelope_this_crate_builds_matches_the_wire_schema() {
+    // §36.1 is the one artifact two engines hand the same consumer, and the
+    // schema says `additionalProperties: false` — so a member the Rust type
+    // carries and the schema does not define is a field one engine emits and
+    // the other's consumer rejects.
+    let schema = change_envelope_schema();
+    schema.assert_valid(
+        "an exhaustive Change Envelope",
+        &exhaustive_change_envelope(),
+    );
+
+    let decoded: ChangeEnvelope =
+        serde_json::from_value(exhaustive_change_envelope()).expect("decodes");
+    schema.assert_valid("a re-encoded Change Envelope", &encode(&decoded));
+}
+
+#[test]
+fn a_change_envelope_using_every_schema_field_survives_the_rust_types() {
+    let wire = exhaustive_change_envelope();
+    let decoded: ChangeEnvelope =
+        serde_json::from_value(wire.clone()).expect("decodes into ChangeEnvelope");
+    let reencoded = encode(&decoded);
+
+    let mut dropped = Vec::new();
+    dropped_fields(&wire, &reencoded, "", &mut dropped);
+    assert!(
+        dropped.is_empty(),
+        "the Rust Change Envelope types drop wire fields the schema defines:\n  {}",
+        dropped.join("\n  ")
+    );
 }

@@ -252,19 +252,38 @@ describe('KQL', () => {
     })
   })
 
-  it('aggregates over the whole solution set', async () => {
+  it('aggregates over the whole solution set, and per group', async () => {
     await withNexus('aggregate', (nexus) => {
+      // A `FIND` of aggregates alone is one global group.
       expect(
         nexus.query('FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }'),
       ).toEqual([3])
       expect(
         nexus.query('FIND(COUNT(DISTINCT ?c.name)) WHERE { ?c CONCEPT {type: "Person"} }'),
       ).toEqual([2])
-      // Grouped aggregation would return one row where the caller asked for
-      // one per group, so it is refused rather than silently answered.
+      // §44.6: grouping is implicit — the non-aggregated projected
+      // expressions are the key, so a plain variable beside an aggregate is
+      // one row per group rather than one global row.
+      expect(
+        nexus.query('FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: "Person"} }'),
+      ).toEqual([
+        ['Alice', 1],
+        ['Bob', 1],
+      ])
+      // `ORDER BY` may name an aggregate the caller did not project: it
+      // orders the groups, and sorting by the bare variable instead would
+      // answer a question nobody asked.
+      expect(
+        nexus.query(
+          'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY COUNT(?c) DESC',
+        ),
+      ).toEqual(['Alice', 'Bob'])
+      // A key that varies inside a group has no value to sort by.
       expect(() =>
-        nexus.query('FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {} }'),
-      ).toThrowError(/grouped aggregation/)
+        nexus.query(
+          'FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY ?c.attributes.display_name',
+        ),
+      ).toThrowError(/projected columns/)
     })
   })
 

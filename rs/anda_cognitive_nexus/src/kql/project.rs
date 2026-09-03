@@ -14,7 +14,7 @@
 use anda_kip::{
     AggregationFunction, FindClause, FindExpression, Json, KipError, OrderByItem, OrderDirection,
 };
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 
 use super::Context;
 use super::binding::{Binding, Solutions};
@@ -47,44 +47,18 @@ impl Context<'_> {
             (requested, governed) => requested.or(governed),
         };
 
-        // `ORDER BY COUNT(?x)` is a grouped sort: it orders rows by an
-        // aggregate computed per group, which needs the grouping this engine
-        // does not implement. The key is a separate axis from `FIND`, so the
-        // aggregate branch below does not cover it — and dropping the
-        // aggregate would sort by the bare variable instead, answering a
-        // question nobody asked rather than refusing the one they did.
-        if let Some(items) = order_by
-            && let Some(item) = items.iter().find(|item| item.aggregation.is_some())
-        {
-            return Err(KipError::unsupported_capability(format!(
-                "ORDER BY over an aggregate ({}) needs grouping, which this engine does not \
-                 implement yet; order by a projected variable instead",
-                item.variable.var
-            )));
-        }
-
-        let aggregates: Vec<&FindExpression> = find
+        // §44.6: an aggregate anywhere makes this a grouped projection, and
+        // the non-aggregated `FIND` expressions are the grouping key. `ORDER
+        // BY COUNT(?a)` counts too: it orders groups by an aggregate the
+        // caller did not project, and sorting by the bare variable instead
+        // would answer a question nobody asked.
+        let grouped = find
             .expressions
             .iter()
-            .filter(|e| matches!(e, FindExpression::Aggregation { .. }))
-            .collect();
-
-        if !aggregates.is_empty() {
-            if find.expressions.len() != aggregates.len() {
-                return Err(KipError::unsupported_capability(
-                    "mixing aggregates with plain projections needs grouping, which this engine \
-                     does not implement yet; project the aggregates alone",
-                ));
-            }
-            let row = self.aggregate_row(&solutions, find)?;
-            // An aggregate is one row, so `LIMIT` has nothing to page; it can
-            // only be suppressed entirely.
-            let mut rows = vec![row];
-            rows.truncate(limit.unwrap_or(usize::MAX));
-            return Ok(Projected {
-                rows,
-                next_cursor: None,
-            });
+            .any(|e| matches!(e, FindExpression::Aggregation { .. }))
+            || order_by.is_some_and(|items| items.iter().any(|item| item.aggregation.is_some()));
+        if grouped {
+            return self.project_grouped(solutions, find, order_by, limit, offset, pinned_seq);
         }
 
         self.sort(&mut solutions, order_by)?;
@@ -224,41 +198,268 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn aggregate_row(&self, solutions: &Solutions, find: &FindClause) -> Result<Json, KipError> {
-        let mut values = Vec::with_capacity(find.expressions.len());
-        for expression in &find.expressions {
-            let FindExpression::Aggregation {
-                func,
-                var,
-                distinct,
-            } = expression
-            else {
-                unreachable!("checked by the caller");
-            };
-            let mut column: Vec<Json> = solutions
-                .rows
+    /// Projects a `FIND` that carries at least one aggregate (§44.6).
+    ///
+    /// Grouping is implicit: the non-aggregated projected expressions are the
+    /// grouping key, and a `FIND` of aggregates alone is one global group. The
+    /// group order is the key's own ascending order unless `ORDER BY` says
+    /// otherwise, so a paged aggregate reads the same way twice.
+    fn project_grouped(
+        &mut self,
+        solutions: Solutions,
+        find: &FindClause,
+        order_by: Option<&Vec<OrderByItem>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        pinned_seq: u64,
+    ) -> Result<Projected, KipError> {
+        let keys: Vec<&anda_kip::DotPathVar> = find
+            .expressions
+            .iter()
+            .filter_map(|e| match e {
+                FindExpression::Variable(path) => Some(path),
+                FindExpression::Aggregation { .. } => None,
+            })
+            .collect();
+
+        // One group per distinct key tuple, in first-appearance order until
+        // the sort below fixes it. A `FIND` of aggregates alone has an empty
+        // key, which is one group over every solution — the global aggregate.
+        //
+        // Indexed by the key's canonical text rather than scanned for: a
+        // linear scan per solution is quadratic in the result size, and an
+        // aggregate is exactly the query someone runs over everything.
+        let mut groups: Vec<(Vec<Json>, Vec<Vec<Binding>>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for row in &solutions.rows {
+            let key: Vec<Json> = keys
                 .iter()
-                .map(|row| self.read_variable(solutions, row, var))
+                .map(|path| self.read_variable(&solutions, row, path))
                 .collect();
-            if *distinct {
-                let mut seen: Vec<Json> = Vec::new();
-                column.retain(|value| {
-                    if seen.contains(value) {
-                        false
-                    } else {
-                        seen.push(value.clone());
-                        true
+            let token = serde_json::to_string(&key).unwrap_or_default();
+            match index.get(&token) {
+                Some(at) => groups[*at].1.push(row.clone()),
+                None => {
+                    index.insert(token, groups.len());
+                    groups.push((key, vec![row.clone()]));
+                }
+            }
+        }
+        // `COUNT` over an empty result is `0`, not an empty answer (§44.6):
+        // the global group exists even when nothing matched.
+        if groups.is_empty() && keys.is_empty() {
+            groups.push((Vec::new(), Vec::new()));
+        }
+
+        // Every aggregate this projection needs, in one plan: the ones the
+        // caller projected, then the ones only `ORDER BY` asks for.
+        let mut plan: Vec<(AggregationFunction, &anda_kip::DotPathVar, bool)> = find
+            .expressions
+            .iter()
+            .filter_map(|e| match e {
+                FindExpression::Aggregation {
+                    func,
+                    var,
+                    distinct,
+                } => Some((*func, var, *distinct)),
+                FindExpression::Variable(_) => None,
+            })
+            .collect();
+        let projected_aggregates = plan.len();
+        if let Some(items) = order_by {
+            for item in items {
+                let Some(func) = item.aggregation else {
+                    continue;
+                };
+                if !plan.iter().any(|(applied, path, distinct)| {
+                    *applied == func && !*distinct && same_path(path, &item.variable)
+                }) {
+                    plan.push((func, &item.variable, false));
+                }
+            }
+        }
+
+        // Resolved once per group — the sort reads them, and so does the row.
+        let mut resolved: Vec<(Vec<Json>, Vec<Json>)> = Vec::with_capacity(groups.len());
+        for (key, rows) in groups {
+            let group = solutions.with_rows(rows);
+            let mut aggregates = Vec::with_capacity(plan.len());
+            for (func, var, distinct) in &plan {
+                aggregates.push(self.aggregate_column(&group, *func, var, *distinct)?);
+            }
+            resolved.push((key, aggregates));
+        }
+
+        self.sort_groups(&mut resolved, &plan, &keys, order_by)?;
+
+        let offset = offset.unwrap_or(0);
+        let total = resolved.len();
+        let window: Vec<(Vec<Json>, Vec<Json>)> = resolved
+            .into_iter()
+            .skip(offset)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect();
+        let consumed = offset + window.len();
+        let next_cursor = (limit.is_some() && consumed < total).then(|| {
+            crate::store::history::PageCursor {
+                family: crate::store::history::CursorFamily::Query,
+                snapshot_seq: pinned_seq,
+                offset: consumed,
+            }
+            .to_token(&self.space)
+        });
+
+        let mut rows = Vec::with_capacity(window.len());
+        for (key, aggregates) in window {
+            // Back into the order the caller wrote them in: the two lists were
+            // split apart to be computed, and a row that reported them in
+            // computation order would not line up with the `FIND` list.
+            let (mut keys_left, mut aggregates_left) = (
+                key.into_iter(),
+                aggregates.into_iter().take(projected_aggregates),
+            );
+            let mut projected: Vec<Json> = Vec::with_capacity(find.expressions.len());
+            for expression in &find.expressions {
+                projected.push(match expression {
+                    FindExpression::Variable(_) => keys_left.next().unwrap_or(Json::Null),
+                    FindExpression::Aggregation { .. } => {
+                        aggregates_left.next().unwrap_or(Json::Null)
                     }
                 });
             }
-            values.push(aggregate(*func, &column)?);
+            rows.push(if projected.len() == 1 {
+                projected.remove(0)
+            } else {
+                Json::Array(projected)
+            });
         }
-        Ok(if values.len() == 1 {
-            values.remove(0)
-        } else {
-            Json::Array(values)
-        })
+        Ok(Projected { rows, next_cursor })
     }
+
+    /// Orders groups by the projected columns `ORDER BY` names (§44.7).
+    ///
+    /// A key that is neither a projected variable nor a projected aggregate
+    /// has no value per group — it varies *inside* one — so it is refused
+    /// rather than resolved to whichever row happened to come first.
+    fn sort_groups(
+        &self,
+        groups: &mut [(Vec<Json>, Vec<Json>)],
+        aggregates: &[(AggregationFunction, &anda_kip::DotPathVar, bool)],
+        keys: &[&anda_kip::DotPathVar],
+        order_by: Option<&Vec<OrderByItem>>,
+    ) -> Result<(), KipError> {
+        // `ORDER BY` absent: the grouping key's own ascending order, so a
+        // paged aggregate reads the same way twice.
+        let mut plan: Vec<(usize, bool, OrderDirection)> = Vec::new();
+        match order_by {
+            None => {
+                for index in 0..keys.len() {
+                    plan.push((index, false, OrderDirection::Asc));
+                }
+            }
+            Some(items) => {
+                for item in items {
+                    let position = match item.aggregation {
+                        // `!distinct`, matching the plan above: `ORDER BY
+                        // COUNT(?x)` beside a projected `COUNT(DISTINCT ?x)`
+                        // names a different number, and sorting by the
+                        // distinct one would answer a question nobody asked.
+                        Some(func) => aggregates
+                            .iter()
+                            .position(|(applied, path, distinct)| {
+                                *applied == func && !*distinct && same_path(path, &item.variable)
+                            })
+                            .map(|index| (index, true)),
+                        None => keys
+                            .iter()
+                            .position(|path| same_path(path, &item.variable))
+                            .map(|index| (index, false)),
+                    };
+                    let Some((index, is_aggregate)) = position else {
+                        return Err(KipError::constraint_violation(format!(
+                            "ORDER BY ?{} is not one of the projected columns; grouping makes \
+                             the projected expressions the only values a group has, so a sort \
+                             key that varies inside a group has no value to sort by",
+                            item.variable.var
+                        )));
+                    };
+                    plan.push((index, is_aggregate, item.direction));
+                }
+                // The tie-breaker that makes a paged aggregate safe, for the
+                // same reason `sort` appends one: without a total order, two
+                // pages of one query overlap or skip. The grouping key is
+                // unique per group, so appending it in ascending order is one
+                // — and where `ORDER BY` already decided, it changes nothing.
+                for index in 0..keys.len() {
+                    if !plan
+                        .iter()
+                        .any(|(at, is_aggregate, _)| !*is_aggregate && *at == index)
+                    {
+                        plan.push((index, false, OrderDirection::Asc));
+                    }
+                }
+            }
+        }
+
+        groups.sort_by(
+            |(left_keys, left_aggregates), (right_keys, right_aggregates)| {
+                for (index, is_aggregate, direction) in &plan {
+                    let (left, right) = if *is_aggregate {
+                        (&left_aggregates[*index], &right_aggregates[*index])
+                    } else {
+                        (&left_keys[*index], &right_keys[*index])
+                    };
+                    if let Some(ordering) = null_order(left, right) {
+                        if ordering != Ordering::Equal {
+                            return ordering;
+                        }
+                        continue;
+                    }
+                    let ordering = compare_json(left, right);
+                    if ordering != Ordering::Equal {
+                        return match direction {
+                            OrderDirection::Asc => ordering,
+                            OrderDirection::Desc => ordering.reverse(),
+                        };
+                    }
+                }
+                Ordering::Equal
+            },
+        );
+        Ok(())
+    }
+
+    /// One aggregate over one group's rows.
+    fn aggregate_column(
+        &self,
+        group: &Solutions,
+        func: AggregationFunction,
+        var: &anda_kip::DotPathVar,
+        distinct: bool,
+    ) -> Result<Json, KipError> {
+        let mut column: Vec<Json> = group
+            .rows
+            .iter()
+            .map(|row| self.read_variable(group, row, var))
+            .collect();
+        if distinct {
+            let mut seen: Vec<Json> = Vec::new();
+            column.retain(|value| {
+                if seen.contains(value) {
+                    false
+                } else {
+                    seen.push(value.clone());
+                    true
+                }
+            });
+        }
+        aggregate(func, &column)
+    }
+}
+
+/// Whether two projected paths name the same value.
+fn same_path(left: &anda_kip::DotPathVar, right: &anda_kip::DotPathVar) -> bool {
+    left.var == right.var && left.path == right.path
 }
 
 /// Applies one aggregate to a column.

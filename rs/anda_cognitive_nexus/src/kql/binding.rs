@@ -126,6 +126,17 @@ impl Solutions {
         }
     }
 
+    /// The same column layout over a subset of the rows.
+    ///
+    /// One group of a grouped aggregate is exactly this: the same columns, the
+    /// rows that share a grouping key.
+    pub fn with_rows(&self, rows: Vec<Vec<Binding>>) -> Self {
+        Self {
+            vars: self.vars.clone(),
+            rows,
+        }
+    }
+
     /// Whether any solution survives.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()

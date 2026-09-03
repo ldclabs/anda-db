@@ -100,6 +100,48 @@ pub const BELIEF_STATUSES: &[&str] = &[
 /// The baseline SEARCH modes (§66.3).
 pub const SEARCH_MODES: &[&str] = &["keyword", "semantic", "hybrid"];
 
+/// The Core element kinds `kip://core` exports (§20.13).
+pub const CORE_ELEMENT_KINDS: &[&str] = &[
+    "Concept",
+    "Proposition",
+    "Assertion",
+    "Evidence",
+    "Activity",
+];
+
+/// The reserved Core structural fields `kip://core` exports, each with the
+/// Core kind that owns it (§20.13).
+///
+/// Resolved by the source element's Core kind, never through a package alias
+/// — which is why a package field of the same name, carried by the *same*
+/// kind, would change what an Assertion cites without changing any command
+/// that reads it. On a different kind there is nothing to shadow: a Concept
+/// owns no Core structural field, so a Profile `evidence` on a Concept is a
+/// separate plane, addressed the same way every Profile field is.
+pub const CORE_STRUCTURAL_FIELDS: &[(&str, &str)] = &[
+    ("evidence", "Assertion"),
+    ("context", "Assertion"),
+    ("source", "Evidence"),
+    ("generated_by", "Evidence"),
+    ("inputs", "Activity"),
+    ("outputs", "Activity"),
+    ("associated_actors", "Activity"),
+];
+
+/// The Core kind that owns a reserved structural field name, if one does.
+pub fn core_structural_owner(name: &str) -> Option<&'static str> {
+    CORE_STRUCTURAL_FIELDS
+        .iter()
+        .find(|(field, _)| *field == name)
+        .map(|(_, owner)| *owner)
+}
+
+// §20.13: "A Schema Package MUST NOT define or alias a symbol that shadows a
+// reserved Core symbol name in its resolution scope." The two namespaces are
+// checked apart by the engine installing the package: `Assertion` is a shadow
+// as a type name, `inputs` as a structural field. A Predicate called `source`
+// is a claim about origin and shadows nothing.
+
 /// The `DESCRIBE PRIMER` modes (§64).
 pub const PRIMER_MODES: &[&str] = &["compact", "full"];
 
@@ -717,6 +759,66 @@ mod tests {
                 r#"FIND(?x) WHERE { ?x {a: 1} } WITH EPISTEMIC { explanation: "ledger" } LIMIT 5"#
             )
             .is_ok()
+        );
+    }
+
+    /// The registry strings and the typed enums are one vocabulary.
+    ///
+    /// `STANCES` validates a written word; `Stance` serializes a stored one.
+    /// They are spelled in two places, and nothing but this test connects
+    /// them — a variant added to the enum, or a `rename` on it, would leave
+    /// the checker refusing a value the engine can produce. `TRANSITION_STATES`
+    /// needs no row here: it *is* `transition_state::ALL`.
+    #[test]
+    fn the_registry_strings_are_the_enums_own_spellings() {
+        use crate::types::{AssertionMode, AssertionStatus, BeliefStatus, Stance};
+
+        fn spellings<T: serde::Serialize>(values: &[T]) -> Vec<String> {
+            values
+                .iter()
+                .map(|value| {
+                    serde_json::to_value(value)
+                        .expect("a registry enum serializes")
+                        .as_str()
+                        .expect("as a string")
+                        .to_string()
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            spellings(&[Stance::Support, Stance::Reject, Stance::Uncertain]),
+            STANCES
+        );
+        assert_eq!(
+            spellings(&[
+                AssertionMode::Observed,
+                AssertionMode::Stated,
+                AssertionMode::Inferred,
+                AssertionMode::Predicted,
+                AssertionMode::Hypothetical,
+                AssertionMode::Imported,
+            ]),
+            ASSERTION_MODES
+        );
+        assert_eq!(
+            spellings(&[
+                AssertionStatus::Active,
+                AssertionStatus::Retracted,
+                AssertionStatus::Superseded,
+                AssertionStatus::Expired,
+            ]),
+            ASSERTION_LIFECYCLE
+        );
+        assert_eq!(
+            spellings(&[
+                BeliefStatus::Accepted,
+                BeliefStatus::Rejected,
+                BeliefStatus::Contested,
+                BeliefStatus::Uncertain,
+                BeliefStatus::Insufficient,
+            ]),
+            BELIEF_STATUSES
         );
     }
 

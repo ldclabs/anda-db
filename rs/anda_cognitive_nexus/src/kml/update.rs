@@ -56,11 +56,13 @@ pub async fn apply_action(
         UpdateAction::SetFields(assignments) => {
             let b = bindings(tx, request, operation);
             let fields = assignments_to_json(&b, assignments, Some(view))?;
+            claim(tx, id, "fields", &fields)?;
             set_fields(tx, id, fields).await
         }
         UpdateAction::SetAttributes(assignments) => {
             let b = bindings(tx, request, operation);
             let values = assignments_to_json(&b, assignments, Some(view))?;
+            claim(tx, id, "attributes", &values)?;
             let attributes = attributes_mut(tx, id, "SET ATTRIBUTES").await?;
             let mut changed = Applied::default();
             for (key, value) in values {
@@ -112,6 +114,10 @@ async fn set_fields(
         tx.require(Permission::BindCanonicalIdentity)?;
     }
 
+    // Before the kind is even loaded: `_system` is refused the same way on
+    // every element, and refused as protected rather than as unknown.
+    reject_protected_fields(&fields)?;
+
     let element = tx.load(id).await?;
     let Element::Concept(row) = element else {
         return Err(immutable_target(element.kind(), id, "SET FIELDS"));
@@ -157,13 +163,6 @@ async fn set_fields(
                     "retention is storage lifecycle, not content: use SET RETENTION",
                 ));
             }
-            // §31.3, §28.1: the authority class and the classification are
-            // Governance state. Ordinary KML cannot write them, and a field
-            // spelled as if it could is refused as protected rather than as
-            // unknown.
-            ("authority_class", _) | ("classification", _) | ("governance", _) => {
-                return Err(protected_governance(&field));
-            }
             (field, value) => {
                 return Err(KipError::type_mismatch(format!(
                     "a Concept has no mutable Core field `{field}` accepting {value}; \
@@ -197,6 +196,11 @@ async fn set_facet(
     let b = bindings(tx, request, operation);
     let facets = resolve_facets(tx, &b, std::slice::from_ref(assignment), Some(view))?;
     let pinned = facet_contract(tx, &b, &assignment.facet)?;
+    for (facet, value) in &facets {
+        if let Json::Object(members) = value {
+            claim(tx, id, &format!("facets.{facet}"), members)?;
+        }
+    }
 
     // A Facet assignment merges members rather than replacing the Facet:
     // `SET FACET "MnemonicState" {salience: 0.4}` must not silently drop a
@@ -677,6 +681,62 @@ async fn structural_mut(
         Element::Concept(row) => Ok(&mut row.structural),
         other => Err(immutable_target(other.kind(), id, "structural mutation")),
     }
+}
+
+/// Claims every path one assignment map writes, refusing a plan that
+/// specifies two different final values for one of them (§53.4).
+fn claim(
+    tx: &mut Transaction,
+    id: ElementId,
+    plane: &str,
+    values: &Map<String, Json>,
+) -> Result<(), KipError> {
+    for (name, value) in values {
+        tx.claim_assignment(id, format!("{plane}.{name}"), value)?;
+    }
+    Ok(())
+}
+
+/// The envelope members the runtime owns (§6.3, §28.1).
+///
+/// `_system` is what the runtime *observed*, and `space_id` / `space_seq`
+/// where and when the write landed. A command that could set any of them
+/// could launder a claim into engine truth — which is what §28.1 closes.
+const PROTECTED_FIELDS: &[&str] = &["_system", "space_id", "space_seq"];
+
+/// The Governance members a command might try to write as if they were fields
+/// (§31.3).
+const GOVERNANCE_FIELDS: &[&str] = &[
+    "governance",
+    "authority_class",
+    "classification",
+    "authority_lineage",
+];
+
+/// Refuses a `SET FIELDS` map that names a member the control plane owns.
+///
+/// Refused as *protected*, never as unknown: `_system` is not a field this
+/// element lacks, it is one no command writes, and an agent told "no such
+/// field" will keep looking for the right spelling. `ts/kip-do` refuses the
+/// same two sets under the same two codes.
+pub(crate) fn reject_protected_fields(fields: &Map<String, Json>) -> Result<(), KipError> {
+    for name in PROTECTED_FIELDS {
+        if fields.contains_key(*name) {
+            return Err(KipError::new(
+                KipErrorCode::ProtectedSystemField,
+                format!(
+                    "`{name}` is engine state and cognitive content may never write it; it \
+                     records what the runtime observed, not what a command claims (§6.3, §28.1)"
+                ),
+            ));
+        }
+    }
+    for name in GOVERNANCE_FIELDS {
+        if fields.contains_key(*name) {
+            return Err(protected_governance(name));
+        }
+    }
+    Ok(())
 }
 
 /// The refusal for a Governance member spelled as a Core field (§31.3).

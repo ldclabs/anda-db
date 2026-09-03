@@ -104,3 +104,25 @@ export function jsonEquals(a: Json, b: Json): boolean {
     (k) => Object.hasOwn(b, k) && jsonEquals(a[k] as Json, b[k] as Json),
   )
 }
+
+/**
+ * Orders two strings by Unicode code point, the way Rust's `str` orders by
+ * UTF-8 bytes.
+ *
+ * Not `<`, and not `localeCompare`: JavaScript compares strings by UTF-16 code
+ * unit, which disagrees with both for anything past the BMP — a surrogate pair
+ * sorts below `U+E000`, and its code point is above it. The lists this orders
+ * are digested (a Capsule's external refs) or compared across engines (a symbol
+ * listing), so an order only one engine produces reads as tampering or drift.
+ */
+export function compareCodePoints(left: string, right: string): number {
+  const a = [...left]
+  const b = [...right]
+  const shared = Math.min(a.length, b.length)
+  for (let i = 0; i < shared; i += 1) {
+    const x = a[i]!.codePointAt(0)!
+    const y = b[i]!.codePointAt(0)!
+    if (x !== y) return x < y ? -1 : 1
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1
+}

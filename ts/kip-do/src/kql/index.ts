@@ -8,7 +8,7 @@
  * internal field from being a wire change.
  */
 
-import { errors } from '../errors.js'
+import { detailed, errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import type { Json, JsonMap } from '../json.js'
 import type {
@@ -18,6 +18,7 @@ import type {
   FindExpression,
   KqlQuery,
   OrderByItem,
+  PathStep,
   Scalar,
 } from '../kip/ast.js'
 import type { SchemaEnvironment } from '../schema/index.js'
@@ -148,16 +149,33 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
       )
   const expressions = query.find_clause.expressions
 
-  if (expressions.some((e) => 'Aggregation' in e)) {
+  // §44.6: an aggregate anywhere makes this a grouped projection, and the
+  // non-aggregated `FIND` expressions are the grouping key. `ORDER BY
+  // COUNT(?a)` counts too: it orders groups by an aggregate the caller did not
+  // project, and sorting by the bare variable instead would answer a question
+  // nobody asked.
+  const grouped =
+    expressions.some((e) => 'Aggregation' in e) ||
+    (query.order_by ?? []).some((item) => item.aggregation !== null)
+  if (grouped) {
+    // Groups page exactly as rows do — through the same window — so the
+    // cursor carries the offset over the same canonical snapshot and page two
+    // of an aggregate continues page one rather than repeating it.
+    const groups = aggregate(context, expressions, solutions, query.order_by)
+    const paged = page(groups, query, b, context.resultLimit(), cursor)
+    const consumed = paged.offset + paged.rows.length
     return {
-      rows: capResults(
-        aggregate(context, expressions, solutions, b),
-        context.resultLimit(),
-      ),
+      rows: paged.rows,
       snapshotSeq: pinnedSeq,
       validAt,
-      // An aggregate is one row, so there is nothing to page.
-      nextCursor: null,
+      nextCursor:
+        query.limit !== null && consumed < paged.total
+          ? pageToken(cx.space, {
+              family: 'kql',
+              snapshotSeq: pinnedSeq,
+              offset: consumed,
+            })
+          : null,
     }
   }
 
@@ -322,50 +340,200 @@ function project(
 }
 
 /**
- * Aggregation over the whole solution set.
+ * Grouped aggregation (§44.6).
  *
- * Grouped aggregation — a plain variable projected beside an aggregate — is not
- * built yet and is refused rather than silently answered as a global one, which
- * would return a single row where the caller asked for one per group.
+ * Grouping is implicit: the non-aggregated projected expressions are the
+ * grouping key, and a `FIND` of aggregates alone is one global group — which is
+ * why `COUNT` over an empty result is a row carrying `0` rather than no row at
+ * all. The group order is the key's own ascending order unless `ORDER BY` says
+ * otherwise, so a paged aggregate reads the same way twice.
+ *
+ * `ORDER BY` may name an aggregate the caller did not project; it is computed
+ * for the sort and dropped from the row.
+ *
+ * @see rs/anda_cognitive_nexus/src/kql/project.rs — `project_grouped`
  */
 function aggregate(
   cx: Context,
   expressions: readonly FindExpression[],
   solutions: readonly Solution[],
-  _b: ReadBindings,
+  orderBy: readonly OrderByItem[] | null,
 ): Json[] {
-  if (!expressions.every((e) => 'Aggregation' in e)) {
-    throw errors.unsupportedCapability(
-      'grouped aggregation — a plain variable projected beside an aggregate — ' +
-        'is not implemented by this engine yet; see DESCRIBE CAPABILITIES',
+  const keys = expressions.flatMap((e) =>
+    'Aggregation' in e ? [] : [e.Variable],
+  )
+
+  // One group per distinct key tuple, in first-appearance order until the sort
+  // below fixes it.
+  const groups: { key: Json[]; rows: Solution[] }[] = []
+  const index = new Map<string, { key: Json[]; rows: Solution[] }>()
+  for (const solution of solutions) {
+    const key = keys.map((path) =>
+      readVariable(cx, solution, path.var, path.path),
     )
+    const token = JSON.stringify(key)
+    const seen = index.get(token)
+    if (seen === undefined) {
+      const group = { key, rows: [solution] }
+      index.set(token, group)
+      groups.push(group)
+    } else {
+      seen.rows.push(solution)
+    }
+  }
+  if (groups.length === 0 && keys.length === 0) {
+    groups.push({ key: [], rows: [] })
   }
 
-  const values = expressions.map((expression) => {
-    const { func, var: variable, distinct: isDistinct } = (
-      expression as Extract<FindExpression, { Aggregation: unknown }>
-    ).Aggregation
-    let read = solutions.map((solution) =>
-      readVariable(cx, solution, variable.var, variable.path),
+  // Every aggregate this projection needs: the projected ones, then the ones
+  // only `ORDER BY` asks for.
+  const plan = expressions.flatMap((e) =>
+    'Aggregation' in e ? [e.Aggregation] : [],
+  )
+  for (const item of orderBy ?? []) {
+    if (item.aggregation === null) continue
+    // `!distinct`, so `ORDER BY COUNT(?x)` beside a projected
+    // `COUNT(DISTINCT ?x)` gets its own count: the two name different
+    // numbers, and sorting by the distinct one answers a question nobody
+    // asked.
+    const already = plan.some(
+      (entry) =>
+        entry.func === item.aggregation &&
+        !entry.distinct &&
+        samePath(entry.var, item.variable),
     )
-    if (func !== 'Count') {
-      // Only COUNT is defined over an unbound variable: the others need a
-      // value, and a row that has none contributes nothing rather than zero.
-      read = read.filter((value) => value !== null)
+    if (!already) {
+      plan.push({ func: item.aggregation, var: item.variable, distinct: false })
     }
-    if (isDistinct) {
-      const seen = new Set<string>()
-      read = read.filter((value) => {
-        const key = JSON.stringify(value)
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
-    }
-    return reduce(func, read)
-  })
+  }
 
-  return values.length === 1 ? [values[0] as Json] : [values]
+  const resolved = groups.map((group) => ({
+    key: group.key,
+    aggregates: plan.map(({ func, var: variable, distinct: isDistinct }) => {
+      let read = group.rows.map((solution) =>
+        readVariable(cx, solution, variable.var, variable.path),
+      )
+      if (func !== 'Count') {
+        // Only COUNT is defined over an unbound variable: the others need a
+        // value, and a row that has none contributes nothing rather than zero.
+        read = read.filter((value) => value !== null)
+      }
+      if (isDistinct) {
+        const seen = new Set<string>()
+        read = read.filter((value) => {
+          const token = JSON.stringify(value)
+          if (seen.has(token)) return false
+          seen.add(token)
+          return true
+        })
+      }
+      return reduce(func, read)
+    }),
+  }))
+
+  sortGroups(resolved, plan, keys, orderBy)
+
+  return resolved.map(({ key, aggregates }) => {
+    // Back into the order the caller wrote them in.
+    let keyAt = 0
+    let aggregateAt = 0
+    const values = expressions.map((expression) =>
+      'Aggregation' in expression
+        ? (aggregates[aggregateAt++] ?? null)
+        : (key[keyAt++] ?? null),
+    )
+    return values.length === 1 ? (values[0] as Json) : values
+  })
+}
+
+/** Whether two projected paths name the same value. */
+function samePath(
+  left: { var: string; path: readonly PathStep[] },
+  right: { var: string; path: readonly PathStep[] },
+): boolean {
+  return (
+    left.var === right.var &&
+    JSON.stringify(left.path) === JSON.stringify(right.path)
+  )
+}
+
+/**
+ * Orders groups by the projected columns `ORDER BY` names (§44.7).
+ *
+ * A key that is neither a projected variable nor a projected aggregate has no
+ * value per group — it varies *inside* one — so it is refused rather than
+ * resolved to whichever row happened to come first.
+ */
+function sortGroups(
+  groups: { key: Json[]; aggregates: Json[] }[],
+  plan: readonly {
+    func: AggregationFunction
+    var: { var: string; path: readonly PathStep[] }
+    distinct: boolean
+  }[],
+  keys: readonly { var: string; path: readonly PathStep[] }[],
+  orderBy: readonly OrderByItem[] | null,
+): void {
+  const sortPlan: { index: number; isAggregate: boolean; direction: string }[] = []
+  if (orderBy === null || orderBy.length === 0) {
+    // The grouping key's own ascending order, so a paged aggregate reads the
+    // same way twice.
+    keys.forEach((_, index) =>
+      sortPlan.push({ index, isAggregate: false, direction: 'Asc' }),
+    )
+  } else {
+    for (const item of orderBy) {
+      const position =
+        item.aggregation === null
+          ? {
+              index: keys.findIndex((path) => samePath(path, item.variable)),
+              isAggregate: false,
+            }
+          : {
+              index: plan.findIndex(
+                (entry) =>
+                  entry.func === item.aggregation &&
+                  !entry.distinct &&
+                  samePath(entry.var, item.variable),
+              ),
+              isAggregate: true,
+            }
+      if (position.index < 0) {
+        throw errors.constraintViolation(
+          `ORDER BY ?${item.variable.var} is not one of the projected ` +
+            `columns; grouping makes the projected expressions the only ` +
+            `values a group has, so a sort key that varies inside a group has ` +
+            `no value to sort by`,
+        )
+      }
+      sortPlan.push({ ...position, direction: item.direction })
+    }
+    // The tie-breaker that makes a paged aggregate safe, for the same reason
+    // `sort` falls back to `compareSolutions`: without a total order, two
+    // pages of one query overlap or skip. The grouping key is unique per
+    // group, so appending it ascending is one — and where `ORDER BY` already
+    // decided, it changes nothing.
+    keys.forEach((_, index) => {
+      if (!sortPlan.some((at) => !at.isAggregate && at.index === index)) {
+        sortPlan.push({ index, isAggregate: false, direction: 'Asc' })
+      }
+    })
+  }
+
+  groups.sort((a, b) => {
+    for (const { index, isAggregate, direction } of sortPlan) {
+      const left = isAggregate ? a.aggregates[index] : a.key[index]
+      const right = isAggregate ? b.aggregates[index] : b.key[index]
+      const nulls = nullOrder(left as Json, right as Json)
+      if (nulls !== null) {
+        if (nulls !== 0) return nulls
+        continue
+      }
+      const sign = compareValues(left as Json, right as Json)
+      if (sign !== 0) return direction === 'Desc' ? -sign : sign
+    }
+    return 0
+  })
 }
 
 function reduce(func: AggregationFunction, values: readonly Json[]): Json {
@@ -410,13 +578,6 @@ function sort(
     // Documented rather than incidental: a bounded read has to be repeatable,
     // so the fallback order is the same total order the mutation sweeps use.
     return out.sort(compareSolutions)
-  }
-  for (const item of orderBy) {
-    if (item.aggregation !== null) {
-      throw errors.unsupportedCapability(
-        'ORDER BY over an aggregate is not implemented by this engine yet',
-      )
-    }
   }
   return out.sort((a, b) => {
     for (const item of orderBy) {
@@ -467,13 +628,13 @@ function compareValues(left: Json, right: Json): number {
  * canonical snapshot (§44.8) and the family that produced it so a `HISTORY`
  * cursor cannot resume a `FIND` (§102.28).
  */
-function page(
-  solutions: readonly Solution[],
+function page<T>(
+  solutions: readonly T[],
   query: KqlQuery,
   b: ReadBindings,
   governedLimit: number | null,
   cursor: PageCursor | null,
-): { rows: Solution[]; total: number; offset: number } {
+): { rows: T[]; total: number; offset: number } {
   const offset = cursor?.offset ?? 0
   const requested = query.limit === null ? null : count(query.limit, b, 'LIMIT')
   const limit =
@@ -490,9 +651,6 @@ function page(
   }
 }
 
-function capResults(rows: Json[], governedLimit: number | null): Json[] {
-  return governedLimit === null ? rows : rows.slice(0, governedLimit)
-}
 
 /** Reads a `CURSOR` slot as the opaque token this engine issues. */
 function readCursor(
@@ -502,7 +660,13 @@ function readCursor(
 ): PageCursor {
   const value = scalarValue(cursor, b)
   if (typeof value !== 'string') {
-    throw errors.cursorTypeMismatch(
+    // Malformed, not a cross-family reuse: §87's `CursorTypeMismatch` is "the
+    // cursor is for a different result kind", and a value that is not a token
+    // at all is `CursorInvalid` with `details.reason: malformed` — which is
+    // what the reference engine answers and what the retry class needs.
+    throw detailed.cursorInvalid(
+      'kql',
+      'malformed',
       `a CURSOR is the opaque token this engine issued, got ` +
         `${JSON.stringify(value)}`,
     )

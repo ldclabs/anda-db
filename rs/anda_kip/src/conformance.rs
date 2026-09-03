@@ -17,7 +17,7 @@
 //! profile is evaluation, which belongs to the engine. Reporting the two
 //! separately is the difference between "this parses" and "this works".
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::LazyLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +140,40 @@ pub const PROTOCOL_SURFACE: &[ConformanceProfile] = &[
     ConformanceProfile::Meta,
 ];
 
+/// The capability vocabulary every engine in this repository answers (§67.4).
+///
+/// Shipped as `capabilities.json` beside the Specification, and read by the
+/// TypeScript engine through the same file, because the failure this prevents
+/// is cross-engine: a name one engine answers and the other has never heard of
+/// is refused as `UnsupportedCapability` even where the capability is built,
+/// and the caller cannot tell that apart from a real gap.
+static CAPABILITY_NAMES: LazyLock<CapabilityNames> =
+    LazyLock::new(|| serde_json::from_str(include_str!("../capabilities.json")).unwrap());
+
+#[derive(Deserialize)]
+struct CapabilityNames {
+    registry: Vec<String>,
+    engine: Vec<String>,
+}
+
+/// The §67.4 registry names, in the Specification's order.
+///
+/// A runtime MUST NOT rename these and MUST answer for each; it MAY add
+/// namespaced entries of its own.
+pub fn capability_registry_names() -> &'static [String] {
+    &CAPABILITY_NAMES.registry
+}
+
+/// The engine-local capability names every engine here answers, sorted.
+///
+/// Membership is a promise to answer, not a claim of support: an engine
+/// partitions this list into what it implements and what it does not, and
+/// `requires` gets `true` or `false` for every name rather than the
+/// `unrecognized` §67.4 makes a failure.
+pub fn capability_engine_names() -> &'static [String] {
+    &CAPABILITY_NAMES.engine
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +191,46 @@ mod tests {
             );
         }
         assert!(ConformanceProfile::from_name("KIP-Imaginary").is_none());
+    }
+
+    /// The §67.4 registry is the Specification's list, read from the
+    /// Specification.
+    ///
+    /// Transcribing 24 names by hand produces a list that compiles and is
+    /// quietly one rename behind; the spec ships with this crate, so the test
+    /// can read the source instead of a copy of it.
+    #[test]
+    fn the_capability_registry_is_the_one_the_specification_prints() {
+        let spec = include_str!("../SPECIFICATION.md");
+        let section = spec
+            .split("## 67.4 Capability registry")
+            .nth(1)
+            .expect("§67.4 is in the Specification");
+        let listing = section
+            .split("```text")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("§67.4 prints the registry in a text block");
+        let printed: Vec<&str> = listing
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(printed, capability_registry_names());
+    }
+
+    /// The shared engine vocabulary is a set, and reads as one.
+    #[test]
+    fn the_engine_capability_names_are_sorted_and_unique() {
+        let names = capability_engine_names();
+        assert!(!names.is_empty());
+        for pair in names.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{} then {} is out of order",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]

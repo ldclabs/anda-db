@@ -23,6 +23,7 @@ import {
   parseSymbolRef,
   parseVersion,
   predicateDef,
+  rejectCoreShadowing,
   structuralFieldDef,
   symbols,
   checkEndpoint,
@@ -152,6 +153,63 @@ describe('the bundled profile', () => {
       ),
     ).toThrowError(/calls itself/)
     expect(() => parsePackage('not json')).toThrowError(/readable Schema Package/)
+  })
+
+  it('refuses a package that shadows a reserved Core symbol', () => {
+    // §20.13: `kip://core` is implicitly active in every Schema Environment
+    // and cannot be deactivated, replaced, or shadowed. A package defining
+    // `Assertion` as a Concept type, or `evidence` as a structural field, puts
+    // two meanings behind one word in one resolution scope — and the reader
+    // that resolves the wrong one cannot tell.
+    const shadowing = (
+      section: string,
+      name: string,
+      source?: { kinds?: string[]; concept_types?: string[] },
+    ): SchemaPackage => {
+      const artifact = JSON.parse(JSON.stringify(COGNITIVE_MEMORY)) as {
+        definitions: Record<string, Record<string, unknown>>
+      }
+      const entries = artifact.definitions[section] as Record<string, unknown>
+      const [borrowed] = Object.values(entries)
+      const def = JSON.parse(JSON.stringify(borrowed)) as {
+        source?: unknown
+      }
+      if (source !== undefined) def.source = source
+      entries[name] = def
+      return artifact as unknown as SchemaPackage
+    }
+
+    expect(() =>
+      rejectCoreShadowing(shadowing('concept_types', 'Assertion')),
+    ).toThrowError(/Assertion/)
+
+    // A structural field resolves by source kind *and* name, so `inputs` is a
+    // shadow exactly where an Activity could carry it — including a source
+    // that constrains nothing, which admits every kind.
+    expect(() =>
+      rejectCoreShadowing(
+        shadowing('structural_fields', 'inputs', { kinds: ['Activity'] }),
+      ),
+    ).toThrowError(/inputs/)
+    expect(() =>
+      rejectCoreShadowing(shadowing('structural_fields', 'outputs', {})),
+    ).toThrowError(/outputs/)
+
+    // But a Concept owns no Core structural field, so a Profile `evidence`
+    // carried only by Concepts shadows nothing: the two planes stay apart,
+    // which is what `structural-core-fields.json` exists to pin.
+    expect(() =>
+      rejectCoreShadowing(
+        shadowing('structural_fields', 'evidence', { kinds: ['Concept'] }),
+      ),
+    ).not.toThrow()
+
+    // A Predicate named `source` is a claim about origin, not a shadow: the
+    // namespaces are checked apart, and over-refusing would take a perfectly
+    // good predicate name away from every Profile.
+    expect(() =>
+      rejectCoreShadowing(shadowing('predicates', 'source')),
+    ).not.toThrow()
   })
 })
 

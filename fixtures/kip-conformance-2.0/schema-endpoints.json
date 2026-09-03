@@ -127,7 +127,10 @@
           "id": "C-2"
         }
       },
-      "expect": {}
+      "expect": {},
+      "vectors": [
+        "SCHEMA-019"
+      ]
     },
     {
       "name": "an object of the wrong Concept type is refused where the reference is written",

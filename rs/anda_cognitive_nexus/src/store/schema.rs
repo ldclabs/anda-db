@@ -74,6 +74,68 @@ pub fn content_digest(artifact: &Json) -> String {
     )
 }
 
+/// Refuses a package that would shadow a reserved Core symbol (§20.13).
+///
+/// `kip://core` is implicitly active in every Schema Environment and cannot be
+/// deactivated, replaced, or shadowed. A package defining a Concept type named
+/// `Assertion`, or a structural field named `evidence`, would put two meanings
+/// behind one word in the same resolution scope — and the reader that resolved
+/// it to the wrong one would have no way to notice.
+///
+/// The two namespaces are checked apart: `Assertion` shadows as a type name,
+/// `inputs` as a structural field. A Predicate named `source` is a claim about
+/// origin and shadows nothing.
+fn reject_core_shadowing(package: &SchemaPackage) -> Result<(), KipError> {
+    use crate::schema::symbol::SymbolKind;
+
+    let refuse = |kind: SymbolKind, name: &str, detail: &str| {
+        Err(KipError::new(
+            KipErrorCode::ConstraintViolation,
+            format!(
+                "this package defines the {} `{name}`, which is a reserved Core symbol \
+                 (§20.13){detail}: `kip://core` is implicitly active in every Schema \
+                 Environment and cannot be shadowed. Rename it, or address the Core symbol \
+                 you meant",
+                kind.section()
+            ),
+        ))
+    };
+
+    // A type, Facet or Enum resolves by name alone, so any of the Core element
+    // kinds is a shadow wherever it appears.
+    for kind in [SymbolKind::ConceptType, SymbolKind::Facet, SymbolKind::Enum] {
+        for name in package.symbols(kind) {
+            if anda_kip::CORE_ELEMENT_KINDS.contains(&name) {
+                return refuse(kind, name, "");
+            }
+        }
+    }
+
+    // A structural field resolves by *source kind and* name (§8.2): the Core
+    // plane is reached through the source element's own kind. So a Profile
+    // field named `evidence` shadows only where an Assertion could carry it —
+    // on a Concept, which owns no Core structural field, the two planes stay
+    // apart and the name is free.
+    for (name, def) in &package.definitions.structural_fields {
+        let Some(owner) = anda_kip::core_structural_owner(name) else {
+            continue;
+        };
+        let unconstrained = def.source.kinds.is_empty() && def.source.concept_types.is_empty();
+        if unconstrained || def.source.kinds.iter().any(|kind| kind == owner) {
+            return refuse(
+                SymbolKind::StructuralField,
+                name,
+                &format!(
+                    " on {owner}, whose `{name}` the protocol itself defines; a source that \
+                     admits {owner} — or one that constrains nothing, which admits every kind —"
+                ),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 impl Store {
     /// Installs a Schema Package artifact, or confirms it is already installed.
     ///
@@ -89,6 +151,7 @@ impl Store {
         source: &str,
     ) -> Result<PackageRef, KipError> {
         let package_ref = package.package_ref()?;
+        reject_core_shadowing(package)?;
         let artifact = serde_json::to_value(package).map_err(|err| {
             KipError::internal_error(format!("a parsed package failed to re-encode: {err}"))
         })?;

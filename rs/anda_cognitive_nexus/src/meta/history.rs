@@ -244,7 +244,7 @@ pub async fn transaction(cx: &mut Context<'_>, tx_id: &str) -> Result<Json, KipE
             format!("this Nexus has no transaction {tx_id:?}"),
         )
     })?;
-    Ok(entry(&row, None))
+    Ok(described(&row))
 }
 
 /// `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` — the lost-response lookup (§80.4).
@@ -262,7 +262,24 @@ pub async fn transaction_by_key(cx: &mut Context<'_>, key: &str) -> Result<Json,
                 ),
             )
         })?;
-    Ok(entry(&row, None))
+    Ok(described(&row))
+}
+
+/// One transaction, as `DESCRIBE TRANSACTION` answers it.
+///
+/// The Change Envelope shape (§36.1) plus the two facts a *description* is
+/// asked for and a *stream entry* is not: whether it committed, and the
+/// coordinate it was decided against. §80.4's whole use for this command is
+/// "did my write land", and a caller reading the envelope's namespaced
+/// extension to answer that would be reading around the answer rather than at
+/// it. The envelope keeps the schema's shape; this adds to it.
+fn described(row: &TransactionRow) -> Json {
+    let mut described = entry(row, None);
+    if let Some(object) = described.as_object_mut() {
+        object.insert("status".to_string(), Json::from(row.status.clone()));
+        object.insert("snapshot_seq".to_string(), Json::from(row.snapshot_seq));
+    }
+    described
 }
 
 async fn journal(cx: &Context<'_>, filter: Filter) -> Result<Vec<TransactionRow>, KipError> {
@@ -348,16 +365,24 @@ fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
         })
         .filter_map(|change| serde_json::from_value(change.clone()).ok())
         .collect();
+    let mut extensions = anda_kip::Map::new();
+    extensions.insert(
+        anda_kip::CHANGE_TRANSITION_EXTENSION.to_string(),
+        Json::Object(anda_kip::ChangeEnvelope::transition_detail(
+            row.snapshot_seq,
+            &row.status,
+        )),
+    );
     let envelope = anda_kip::ChangeEnvelope {
+        kip: Some("2.0".to_string()),
         space_id: row.space.clone(),
         space_seq: row.seq,
         tx_id: row.tx_id.clone(),
         committed_at: Some(row.committed_at.clone()),
         transaction_class: Some(row.transaction_class.clone()),
-        snapshot_seq: Some(row.snapshot_seq),
-        status: Some(row.status.clone()),
         schema_environment_version: Some(row.schema_environment_version),
         changes,
+        extensions: Some(extensions),
     };
     serde_json::to_value(&envelope).unwrap_or(Json::Null)
 }

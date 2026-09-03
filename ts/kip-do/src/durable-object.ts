@@ -15,7 +15,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import { DIGEST_PROFILE } from './capsule/index.js'
 import { sha3_256Text } from './digest.js'
-import { KipError, type KipErrorJSON } from './errors.js'
+import { KipError, errors, type KipErrorJSON } from './errors.js'
 import { canonicalJson, type Json, type JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import { checkIngest, type IngestContext } from './kml/index.js'
@@ -219,11 +219,20 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     read?: ReadOptions,
     ingest?: IngestContext,
     idempotencyKey?: string,
+    readonly = false,
   ): KipResult {
     try {
       const auth = this.authenticate(context)
       const session = this.nexus.session(auth)
       const parsed = parseKip(command)
+      if (readonly && 'Kml' in parsed) {
+        // §76: the read-only path rejects state-changing *semantics*, not a
+        // declared label — so no envelope field can talk a write past it.
+        throw errors.readonlyViolation(
+          'this endpoint executes KQL and META only; KML mutations must go ' +
+            'through the state-capable runtime',
+        )
+      }
       if ('Kml' in parsed) {
         const outcome = session.mutate(parsed.Kml, params, {
           ingest,
@@ -305,6 +314,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       onError: 'stop',
     },
     ingest?: IngestContext,
+    readonly = false,
   ): KipResult[] {
     const results: KipResult[] = []
     let stopped = false
@@ -326,6 +336,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         read,
         ingest,
         operation.idempotencyKey,
+        readonly,
       )
       if (operation.op_id !== undefined) result.op_id = operation.op_id
       // `independent` isolates failures by definition; only `sequence` with
@@ -347,6 +358,9 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     if (request.method !== 'POST') {
       return new Response('POST a KIP request', { status: 405 })
     }
+    // §76: a dedicated read-only path, so a caller can hand a query to an
+    // endpoint that *cannot* write rather than trusting that it will not.
+    const readonly = new URL(request.url).pathname.endsWith('/readonly')
     let body: unknown
     try {
       body = await request.json()
@@ -356,10 +370,10 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
         400,
       )
     }
-    return this.handle(body)
+    return this.handle(body, readonly)
   }
 
-  private handle(body: unknown): Response {
+  private handle(body: unknown, readonly = false): Response {
     const envelope = (body ?? {}) as KipRequestEnvelope
     const requestId = envelope.request_id
     try {
@@ -393,6 +407,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       envelope.read,
       { mode, onError },
       envelope.ingest,
+      readonly,
     )
     return this.envelope(
       {
@@ -774,6 +789,9 @@ export function receiptOf(outcome: Outcome, auth: AuthContext): KipReceipt {
     ...(outcome.space_seq === null ? {} : { space_seq: outcome.space_seq }),
     ...(outcome.committed_at === null ? {} : { committed_at: outcome.committed_at }),
     transaction_class: 'cognitive',
+    ...(outcome.request_digest === ''
+      ? {}
+      : { request_digest: outcome.request_digest }),
     schema_environment_version: outcome.schema_environment_version,
     origin: {
       principal_id: auth.principal_id,

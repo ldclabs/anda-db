@@ -372,6 +372,95 @@ export function symbols(
   return Object.keys(section(artifact, kind))
 }
 
+/**
+ * The Core element kinds `kip://core` exports (§20.13).
+ *
+ * Mirrors `anda_kip::CORE_ELEMENT_KINDS`.
+ */
+export const CORE_ELEMENT_KINDS: readonly string[] = [
+  'Concept',
+  'Proposition',
+  'Assertion',
+  'Evidence',
+  'Activity',
+]
+
+/**
+ * The reserved Core structural fields `kip://core` exports, each with the Core
+ * kind that owns it (§20.13).
+ *
+ * Mirrors `anda_kip::CORE_STRUCTURAL_FIELDS`. Resolved by the source element's
+ * Core kind, never through a package alias — which is why a package field of
+ * the same name, carried by the *same* kind, would change what an Assertion
+ * cites without changing any command that reads it. On a different kind there
+ * is nothing to shadow: a Concept owns no Core structural field, so a Profile
+ * `evidence` on a Concept is a separate plane.
+ */
+export const CORE_STRUCTURAL_FIELD_OWNERS: Readonly<Record<string, string>> = {
+  evidence: 'Assertion',
+  context: 'Assertion',
+  source: 'Evidence',
+  generated_by: 'Evidence',
+  inputs: 'Activity',
+  outputs: 'Activity',
+  associated_actors: 'Activity',
+}
+
+/**
+ * Refuses a package that would shadow a reserved Core symbol (§20.13).
+ *
+ * `kip://core` is implicitly active in every Schema Environment and cannot be
+ * deactivated, replaced, or shadowed. A package defining a Concept type named
+ * `Assertion`, or an Activity-sourced structural field named `inputs`, would
+ * put two meanings behind one word in one resolution scope — and the reader
+ * that resolved the wrong one could not tell.
+ *
+ * The namespaces are checked apart. A type, Facet or Enum resolves by name
+ * alone, so a Core element kind is a shadow wherever it appears. A structural
+ * field resolves by source kind *and* name (§8.2), so it shadows only where
+ * the kind that owns the Core field could carry it — a source constraining
+ * nothing admits every kind, and therefore shadows. A Predicate named `source`
+ * is a claim about origin and shadows nothing.
+ */
+export function rejectCoreShadowing(artifact: SchemaPackage): void {
+  const refuse = (kind: SymbolKind, name: string, detail: string): never => {
+    throw errors.constraintViolation(
+      `this package defines the ${SECTIONS[kind]} \`${name}\`, which is a ` +
+        `reserved Core symbol (§20.13)${detail}: \`kip://core\` is implicitly ` +
+        `active in every Schema Environment and cannot be shadowed. Rename it, ` +
+        `or address the Core symbol you meant`,
+    )
+  }
+
+  for (const kind of ['ConceptType', 'Facet', 'Enum'] as const) {
+    for (const name of symbols(artifact, kind)) {
+      if (CORE_ELEMENT_KINDS.includes(name)) refuse(kind, name, '')
+    }
+  }
+
+  const fields = artifact.definitions?.structural_fields ?? {}
+  for (const [name, def] of Object.entries(fields)) {
+    const owner = CORE_STRUCTURAL_FIELD_OWNERS[name]
+    if (owner === undefined) continue
+    const kinds = def.source?.kinds ?? []
+    const types = def.source?.concept_types ?? []
+    if (kinds.length === 0 && types.length === 0) {
+      refuse(
+        'StructuralField',
+        name,
+        ` on ${owner}: a source that constrains nothing admits every kind, ${owner} included, and ${owner}'s \`${name}\` is defined by the protocol itself`,
+      )
+    }
+    if (kinds.includes(owner)) {
+      refuse(
+        'StructuralField',
+        name,
+        ` on ${owner}, whose \`${name}\` the protocol itself defines`,
+      )
+    }
+  }
+}
+
 /** The canonical reference for one of this package's local names. */
 export function symbolRefOf(
   artifact: SchemaPackage,

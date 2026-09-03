@@ -70,11 +70,10 @@
       "expect": {
         "result": [
           {
+            "kip": "2.0",
             "space_id": "kip:space:default",
             "space_seq": 1,
             "transaction_class": "cognitive",
-            "status": "committed",
-            "snapshot_seq": 0,
             "schema_environment_version": 1,
             "changes": [
               {
@@ -86,14 +85,19 @@
                   "proposition": "P:<2>"
                 }
               }
-            ]
+            ],
+            "extensions": {
+              "anda/transition": {
+                "snapshot_seq": 0,
+                "status": "committed"
+              }
+            }
           },
           {
+            "kip": "2.0",
             "space_id": "kip:space:default",
             "space_seq": 2,
             "transaction_class": "cognitive",
-            "status": "committed",
-            "snapshot_seq": 1,
             "schema_environment_version": 1,
             "changes": [
               {
@@ -114,7 +118,13 @@
                   "fields.status"
                 ]
               }
-            ]
+            ],
+            "extensions": {
+              "anda/transition": {
+                "snapshot_seq": 1,
+                "status": "committed"
+              }
+            }
           }
         ]
       }
@@ -126,11 +136,10 @@
       "expect": {
         "result": [
           {
+            "kip": "2.0",
             "space_id": "kip:space:default",
             "space_seq": 2,
             "transaction_class": "cognitive",
-            "status": "committed",
-            "snapshot_seq": 1,
             "schema_environment_version": 1,
             "changes": [
               {
@@ -151,7 +160,13 @@
                   "fields.status"
                 ]
               }
-            ]
+            ],
+            "extensions": {
+              "anda/transition": {
+                "snapshot_seq": 1,
+                "status": "committed"
+              }
+            }
           }
         ]
       }
@@ -163,11 +178,10 @@
       "expect": {
         "result": [
           {
+            "kip": "2.0",
             "space_id": "kip:space:default",
             "space_seq": 2,
             "transaction_class": "cognitive",
-            "status": "committed",
-            "snapshot_seq": 1,
             "schema_environment_version": 1,
             "changes": [
               {
@@ -188,7 +202,13 @@
                   "fields.status"
                 ]
               }
-            ]
+            ],
+            "extensions": {
+              "anda/transition": {
+                "snapshot_seq": 1,
+                "status": "committed"
+              }
+            }
           }
         ]
       }
@@ -205,6 +225,47 @@
       "command": "HISTORY ELEMENT \"C-999\"",
       "expect": {
         "error": "NotFoundOrNotVisible"
+      }
+    },
+    {
+      "name": "a write under an idempotency key is recoverable by it",
+      "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Recoverable\" }",
+      "envelope": {
+        "execution": {
+          "mode": "independent",
+          "idempotency_key": "history:recover"
+        }
+      },
+      "expect": {}
+    },
+    {
+      "name": "and the description is the envelope shape plus whether it committed",
+      "command": "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY \"history:recover\"",
+      "expect": {
+        "result": {
+          "kip": "2.0",
+          "space_id": "kip:space:default",
+          "space_seq": 3,
+          "snapshot_seq": 2,
+          "status": "committed",
+          "transaction_class": "cognitive",
+          "schema_environment_version": 1,
+          "extensions": {
+            "anda/transition": {
+              "snapshot_seq": 2,
+              "status": "committed"
+            }
+          },
+          "changes": [
+            {
+              "op": "create",
+              "kind": "concept",
+              "id": "C:<1>",
+              "new_version": 1,
+              "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person"
+            }
+          ]
+        }
       }
     }
   ]

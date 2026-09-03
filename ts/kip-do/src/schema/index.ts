@@ -47,6 +47,8 @@ export {
 } from './symbol.js'
 
 export {
+  CORE_ELEMENT_KINDS,
+  CORE_STRUCTURAL_FIELD_OWNERS,
   conceptTypeDef,
   defines,
   facetDef,
@@ -57,6 +59,7 @@ export {
   predicateDef,
   predicateRules,
   registryValues,
+  rejectCoreShadowing,
   structuralFieldDef,
   symbolRefOf,
   symbolTextOf,

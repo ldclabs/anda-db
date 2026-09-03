@@ -42,7 +42,11 @@
         "result": [
           "insufficient"
         ]
-      }
+      },
+      "vectors": [
+        "EPI-001",
+        "EPI-025"
+      ]
     },
     {
       "name": "an unsupported Proposition has no support and no opposition",
@@ -63,7 +67,10 @@
         "result": [
           "normalized_support_not_probability"
         ]
-      }
+      },
+      "vectors": [
+        "EPI-007"
+      ]
     },
     {
       "name": "a projection reports the policy it ran under",
@@ -118,7 +125,10 @@
             }
           ]
         ]
-      }
+      },
+      "vectors": [
+        "EPI-015"
+      ]
     },
     {
       "name": "two claims relaying one observation score as one",
@@ -127,7 +137,10 @@
         "result": [
           0.6
         ]
-      }
+      },
+      "vectors": [
+        "EPI-018"
+      ]
     },
     {
       "name": "a fully grounded BELIEF about a Proposition nobody created still answers",

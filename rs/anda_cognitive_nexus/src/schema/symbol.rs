@@ -1,12 +1,12 @@
 //! # Schema symbol identity
 //!
-//! A symbol means nothing outside its package and version lineage (Spec §16):
+//! A symbol means nothing outside its package and version lineage (Spec §20.14):
 //!
 //! ```text
 //! kip://<package-path>@<exact-version>[/<symbol>]
 //! ```
 //!
-//! The rule the rest of the engine leans on is §13: **every persisted schema
+//! The rule the rest of the engine leans on is §20.4: **every persisted schema
 //! reference resolves to an exact version.** `Person@latest` stored on an
 //! element would mean the element's meaning changes when someone else
 //! publishes a package — the stored data would say one thing today and another

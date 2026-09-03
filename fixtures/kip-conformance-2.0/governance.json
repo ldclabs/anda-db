@@ -10,7 +10,10 @@
       "command": "UPDATE ?alice SET FIELDS { governance: {classification: \"public\"} } WHERE { ?alice CONCEPT {key: \"person:alice\"} }",
       "expect": {
         "error": "InvalidSyntax"
-      }
+      },
+      "vectors": [
+        "GOV-018"
+      ]
     },
     {
       "name": "and neither is it writable at creation",
@@ -29,7 +32,11 @@
             "descriptive"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "GOV-005",
+        "GOV-018"
+      ]
     },
     {
       "name": "an unclassified element does not thereby read as public",
@@ -49,7 +56,10 @@
             "E:<1>"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "GOV-006"
+      ]
     },
     {
       "name": "erasure refuses by default while anything still references the target",

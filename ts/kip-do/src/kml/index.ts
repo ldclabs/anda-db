@@ -48,6 +48,11 @@ export interface KmlContext {
   operation?: JsonMap
   /** The key that makes a lost response recoverable without writing again. */
   idempotencyKey?: string
+  /**
+   * What that key was spent on (§33.1, §34.4), so a resend under it can be
+   * told apart from a different request reusing it.
+   */
+  requestDigest?: string
   /** Whether this run may become durable. */
   dryRun?: boolean
   /**
@@ -100,7 +105,7 @@ export function executeKml(
     }
   }
 
-  return tx.commit(cx.idempotencyKey ?? '')
+  return tx.commit(cx.idempotencyKey ?? '', cx.requestDigest ?? '')
 }
 
 /**

@@ -213,6 +213,13 @@ pub(super) fn symbol_name(b: &Bindings<'_>, symbol: &AstSymbolRef) -> Result<Str
 struct Fields(Map<String, Json>);
 
 impl Fields {
+    /// Wraps a `SET FIELDS` map, refusing the envelope members no command
+    /// writes (§6.3, §28.1).
+    fn new(map: Map<String, Json>) -> Result<Self, KipError> {
+        crate::kml::update::reject_protected_fields(&map)?;
+        Ok(Fields(map))
+    }
+
     fn take(&mut self, name: &str) -> Option<Json> {
         self.0.remove(name)
     }
@@ -471,18 +478,16 @@ async fn create_concept(
         .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
         .transpose()?
         .unwrap_or_default();
-    if resolve_client_key(store, tx, ElementKind::Concept, &client_key, &clause.handle).await? {
-        return Ok(());
-    }
+    let existing = find_client_key(store, tx, ElementKind::Concept, &client_key).await?;
     let b = bindings(tx, request, operation);
-    let mut fields = Fields(
+    let mut fields = Fields::new(
         clause
             .set_fields
             .as_ref()
             .map(|f| assignments_to_json(&b, f, None))
             .transpose()?
             .unwrap_or_default(),
-    );
+    )?;
     let key = fields.text("key")?;
     let canonical_id = fields.text("canonical_id")?;
     // §5.4, and the same gate `UPDATE ... SET FIELDS` runs: binding a
@@ -498,7 +503,6 @@ async fn create_concept(
     let retention = fields.json("retention");
     require_retention_authority(tx, &retention)?;
     let extra_name = fields.text("name")?;
-    refuse_protected_fields(&fields)?;
     fields.rest("Concept")?;
 
     // Kind only here: the Concept's type symbol is resolved a few lines down by
@@ -543,23 +547,12 @@ async fn create_concept(
         ..Default::default()
     };
     let element = Element::Concept(Box::new(row));
+    if client_key_retry(tx, existing, &clause.handle, &element).await? {
+        return Ok(());
+    }
     tx.authorize_created(&element, Permission::Create)?;
     tx.stage_new(id, element, ChangeOp::Create);
     check_structural(store, tx, id).await
-}
-
-/// Refuses a Governance member spelled as a Core field (§28.1, §31.3).
-///
-/// `authority_class` and `classification` are assigned by Governance and read
-/// under `governance`; a `SET FIELDS` naming one is refused as protected rather
-/// than as unknown, so the caller learns which plane the member lives on.
-fn refuse_protected_fields(fields: &Fields) -> Result<(), KipError> {
-    for protected in ["authority_class", "classification", "governance"] {
-        if fields.0.contains_key(protected) {
-            return Err(update::protected_governance(protected));
-        }
-    }
-    Ok(())
 }
 
 async fn create_record(
@@ -578,18 +571,16 @@ async fn create_record(
         .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
         .transpose()?
         .unwrap_or_default();
-    if resolve_client_key(store, tx, kind, &client_key, &clause.handle).await? {
-        return Ok(());
-    }
+    let existing = find_client_key(store, tx, kind, &client_key).await?;
     let b = bindings(tx, request, operation);
-    let mut fields = Fields(
+    let mut fields = Fields::new(
         clause
             .set_fields
             .as_ref()
             .map(|f| assignments_to_json(&b, f, None))
             .transpose()?
             .unwrap_or_default(),
-    );
+    )?;
     // A record is not a Concept and has no type to name.
     let facets = apply_facets(
         tx,
@@ -612,7 +603,6 @@ async fn create_record(
     // under a Concept the Space said was the same as another one.
     structural.canonicalize(tx).await?;
 
-    refuse_protected_fields(&fields)?;
     let row = match kind {
         ElementKind::Evidence => {
             let payload = fields.json("payload");
@@ -730,10 +720,15 @@ async fn create_record(
                 associated_actors: structural.values("associated_actors"),
                 parameters_digest: fields.text("parameters_digest")?,
                 status: {
+                    // §16, §20.13: the Activity status registry is Core's, so
+                    // a word outside it is refused here rather than stored —
+                    // the parser only sees a written literal, and a
+                    // `:parameter` status is bound at execution time.
                     let status = fields.text("status")?;
                     if status.is_empty() {
                         "pending".to_string()
                     } else {
+                        check_registry(&status, "status", anda_kip::ACTIVITY_STATUS)?;
                         status
                     }
                 },
@@ -753,6 +748,12 @@ async fn create_record(
         }
     };
     fields.rest(&kind.to_string())?;
+    // §52.1: a key that already names an element either proves this is a retry
+    // — same creation, so nothing is written and the handle points at what the
+    // first attempt made — or names different work, which is a conflict.
+    if client_key_retry(tx, existing, &clause.handle, &row).await? {
+        return Ok(());
+    }
     // §17, §18: which epistemic-mutation permission this needs depends on whom
     // the claim is attributed to, and that is only knowable here. `assert` is
     // the floor for writing any commitment; recording somebody else's claim or
@@ -1134,19 +1135,31 @@ async fn upsert_concept(
         )
     })?;
 
-    // Spec §51: name-only upsert is forbidden. A name is mutable grounding
+    // Spec §54.2, §7.2: name-only upsert is forbidden. A name is mutable grounding
     // state that may be duplicated, so resolving identity through it would
     // merge two different Concepts that happen to share a label.
-    let selector = matcher
+    let selector = match matcher
         .get("id")
         .map(|value| ("id", value))
         .or_else(|| matcher.get("key").map(|value| ("key", value)))
-        .ok_or_else(|| {
-            KipError::identity_selector_required(
-                "UPSERT CONCEPT resolves identity through `id` or `key` only; `name` is mutable \
-                 grounding state and two Concepts may share one",
-            )
-        })?;
+    {
+        Some(selector) => selector,
+        // Its own code, because the two refusals mean different things to a
+        // caller: `name` was offered as identity and is not one, versus no
+        // identity was offered at all. `ts/kip-do` answers the same two.
+        None if matcher.contains_key("name") => {
+            return Err(KipError::new(
+                KipErrorCode::NameIdentityForbidden,
+                "a Concept name is mutable grounding state and several Concepts may share one, \
+                 so it cannot identify an upsert target; use {key: …} or {id: …}",
+            ));
+        }
+        None => {
+            return Err(KipError::identity_selector_required(
+                "UPSERT CONCEPT resolves identity through `id` or `key` only",
+            ));
+        }
+    };
 
     let selector_value = match_text(&b, selector.1, selector.0)?;
 
@@ -1785,11 +1798,10 @@ async fn finalize_activity(
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
 ) -> Result<(), KipError> {
-    let mut fields = Fields(set_fields.cloned().unwrap_or_default());
+    let mut fields = Fields::new(set_fields.cloned().unwrap_or_default())?;
     let started = fields.timestamp("started_at")?;
     let ended = fields.timestamp("ended_at")?;
     let parameters_digest = fields.text("parameters_digest")?;
-    refuse_protected_fields(&fields)?;
     fields.rest("Activity")?;
 
     let structural = match set_structural {
@@ -2261,36 +2273,114 @@ fn is_terminal(status: &str) -> bool {
     anda_kip::ACTIVITY_TERMINAL.contains(&status)
 }
 
-/// Resolves a `CLIENT KEY` to the element an earlier attempt already created.
+/// The element an earlier attempt already created under this `CLIENT KEY`.
 ///
-/// §52.1: a `CREATE` creates a historically distinct element *unless* a
-/// `client_key` proves a retry of the same logical creation. Returns whether
-/// the clause was satisfied by an existing element, in which case the handle
-/// now points at it and nothing is written — a retry writes nothing, which is
-/// what makes it a retry rather than a second creation.
-///
-/// The resolved element is authoritative: this does not compare the incoming
-/// fields against it and quietly rewrite one to match the other. A key that
-/// names two different logical creations is a client bug, and picking a winner
-/// silently would turn it into a data-loss bug.
-async fn resolve_client_key(
+/// Looked up before the clause is built so the build can be skipped when the
+/// answer is "nothing yet", and settled by [`client_key_retry`] once there is
+/// something to compare.
+async fn find_client_key(
     store: &Store,
-    tx: &mut Transaction,
+    tx: &Transaction,
     kind: ElementKind,
     client_key: &str,
-    handle: &str,
-) -> Result<bool, KipError> {
+) -> Result<Option<ElementId>, KipError> {
     if client_key.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    let Some(existing) = store
+    store
         .find_by_client_key(&tx.cx.space, kind, client_key)
-        .await?
-    else {
+        .await
+}
+
+/// Whether this creation proves itself a retry of the one the key already made.
+///
+/// §52.1: a `CREATE` creates a historically distinct element *unless* a
+/// `client_key` proves a retry of the same logical creation. Proving it is the
+/// point — the key alone does not — so the built element is compared with the
+/// one the key already names, over the members a creation fixes:
+///
+/// - **equal** — a retry. The handle points at the existing element, the
+///   caller gets the id its first attempt produced, and nothing is written,
+///   which is what makes it a retry rather than a second creation.
+/// - **different** — `ClientKeyConflict`. Two logical creations under one key
+///   is a client bug, and silently returning the first would leave the second
+///   one's work undone while reporting success.
+async fn client_key_retry(
+    tx: &mut Transaction,
+    existing: Option<ElementId>,
+    handle: &str,
+    element: &Element,
+) -> Result<bool, KipError> {
+    let Some(existing_id) = existing else {
         return Ok(false);
     };
-    tx.rebind(handle, existing);
+    let differing = {
+        let stored = tx.load(existing_id).await?;
+        // Whether the stored element still is what its creation made it. Once
+        // something has legitimately edited it, its mutable state is no longer
+        // evidence about the creation, and comparing it would turn an ordinary
+        // rename into a permanent failure for the bootstrap that re-runs the
+        // same `CLIENT KEY`.
+        let pristine = stored.version() == 1;
+        creation_differs(element, stored, pristine)
+    };
+    if let Some(member) = differing {
+        return Err(KipError::new(
+            KipErrorCode::ClientKeyConflict,
+            format!(
+                "that CLIENT KEY already names {existing_id}, whose `{member}` is not the one \
+                 this creation declares; a key proves a retry of the same logical creation \
+                 (§52.1), so use a fresh key, or address the existing element by id"
+            ),
+        ));
+    }
+    tx.rebind(handle, existing_id);
     Ok(true)
+}
+
+/// The first creation-fixed member two elements disagree about, if any.
+///
+/// Only members a creation fixes and nothing later rewrites, plus — while the
+/// element is still `pristine`, meaning nothing has edited it since — the
+/// mutable ones the creation declared. Comparing state an ordinary `UPDATE`
+/// may have moved would report a legitimate edit as a conflicting retry, and
+/// the bootstrap that re-runs the same `CLIENT KEY` would fail forever. An
+/// Activity's topology is the clearest case — a terminal `TRANSITION`
+/// finalizes it (§52.5) — so only its class is compared.
+fn creation_differs(new: &Element, old: &Element, pristine: bool) -> Option<&'static str> {
+    let differs = |name: &'static str, a: bool| (!a).then_some(name);
+    match (new, old) {
+        (Element::Concept(new), Element::Concept(old)) => differs(
+            "type",
+            crate::schema::symbol::same_lineage(&new.schema_ref, &old.schema_ref),
+        )
+        .or_else(|| differs("key", new.key == old.key))
+        // A Concept's name is mutable grounding state (§7.2), so it is
+        // evidence about the creation only while nothing has edited the
+        // element since.
+        .or_else(|| differs("name", !pristine || new.name == old.name)),
+        (Element::Evidence(new), Element::Evidence(old)) => {
+            differs("evidence_class", new.evidence_class == old.evidence_class)
+                .or_else(|| differs("payload", new.payload_inline == old.payload_inline))
+                // The refs rather than the derived keys, and the key rather
+                // than the raw reference just below: each member is compared
+                // in the one shape *both* engines store, so the two cannot
+                // call the same reuse a retry and a conflict.
+                .or_else(|| differs("source", new.source_refs == old.source_refs))
+        }
+        (Element::Assertion(new), Element::Assertion(old)) => {
+            differs("proposition", new.proposition_id == old.proposition_id)
+                .or_else(|| differs("asserted_by", new.asserted_by_key == old.asserted_by_key))
+                .or_else(|| differs("stance", new.stance == old.stance))
+                .or_else(|| differs("mode", new.mode == old.mode))
+        }
+        (Element::Activity(new), Element::Activity(old)) => {
+            differs("activity_class", new.activity_class == old.activity_class)
+        }
+        // A different kind cannot happen — the lookup is scoped by kind — and
+        // if it ever did, it is the conflict this exists to report.
+        _ => Some("kind"),
+    }
 }
 
 fn require_text(fields: &mut Fields, name: &str, clause: &str) -> Result<String, KipError> {

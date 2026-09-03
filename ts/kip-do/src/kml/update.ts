@@ -98,6 +98,22 @@ function immutableTarget(element: Element, what: string) {
 }
 
 /**
+ * Claims every path one assignment map writes, refusing a plan that specifies
+ * two different final values for one of them (§53.4).
+ */
+function claim(
+  tx: Transaction,
+  element: Element,
+  plane: string,
+  values: JsonMap,
+): void {
+  const id = { kind: element.kind, seq: (element.row as { id: number }).id }
+  for (const [name, value] of Object.entries(values)) {
+    tx.claimAssignment(id, `${plane}.${name}`, value)
+  }
+}
+
+/**
  * Applies one `UPDATE` action to a staged element.
  *
  * Returns whether anything actually changed: a clause computing the state an
@@ -145,9 +161,9 @@ export function applyAction(
     if (element.kind !== 'Concept') {
       throw immutableTarget(element, 'SET FIELDS')
     }
-    for (const [name, value] of Object.entries(
-      assignments(b, action.SetFields, read),
-    )) {
+    const fields = assignments(b, action.SetFields, read)
+    claim(tx, element, 'fields', fields)
+    for (const [name, value] of Object.entries(fields)) {
       switch (name) {
         case 'canonical_id':
           // Setting one and clearing one are the same decision (§5.4).
@@ -188,10 +204,9 @@ export function applyAction(
     if (element.kind !== 'Concept') {
       throw immutableTarget(element, 'SET ATTRIBUTES')
     }
-    Object.assign(
-      element.row.attributes,
-      assignments(b, action.SetAttributes, read),
-    )
+    const values = assignments(b, action.SetAttributes, read)
+    claim(tx, element, 'attributes', values)
+    Object.assign(element.row.attributes, values)
     return
   }
 
@@ -206,14 +221,21 @@ export function applyAction(
   }
 
   if ('SetFacet' in action) {
+    // Resolved and evaluated once. An assignment may read the element it is
+    // writing — `MUL(?m.facets[…].memory_strength, 0.5)` — so evaluating the
+    // map a second time is not merely wasted work, it is a second reading of
+    // state the first one is about to move.
+    const facet = resolveFacetText(tx, b, action.SetFacet.facet)
+    const values = assignments(b, action.SetFacet.values, read)
+    claim(tx, element, `facets.${facet}`, values)
     mergeFacet(
       tx,
       b,
       row.facets,
       action.SetFacet,
-      read,
+      values,
       carrierOf(element),
-      facetMembers(view, resolveFacetText(tx, b, action.SetFacet.facet)),
+      facetMembers(view, facet),
     )
     return
   }
@@ -416,7 +438,7 @@ function mergeFacet(
   b: Bindings,
   facets: JsonMap,
   assignment: FacetAssignment,
-  read: (path: string[]) => Json,
+  values: JsonMap,
   carrier: EndpointFacts,
   before: JsonMap,
 ): void {
@@ -426,7 +448,6 @@ function mergeFacet(
     'write',
   )
   const text = formatSymbolRef(symbol)
-  const values = assignments(b, assignment.values, read)
   const definition = tx.env.definitionPackage(symbol)
   const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
   if (def !== undefined) {

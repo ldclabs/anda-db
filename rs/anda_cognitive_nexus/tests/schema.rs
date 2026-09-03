@@ -104,6 +104,113 @@ async fn installing_a_package_does_not_activate_it() {
 }
 
 #[tokio::test]
+async fn a_package_may_not_shadow_a_reserved_core_symbol() {
+    // Spec §20.13: `kip://core` is implicitly active in every Schema
+    // Environment and cannot be deactivated, replaced, or shadowed. A package
+    // defining `Assertion` as a Concept type, or `evidence` as a structural
+    // field, puts two meanings behind one word in one resolution scope — and
+    // the reader that resolves the wrong one cannot tell.
+    let store = fresh_store("core_shadowing").await;
+
+    // Each variant installs under its own id: a package reference identifies
+    // one content forever, so reusing the Profile's would fail on the digest
+    // rather than on the rule under test.
+    let mut minted = 0;
+    let mut variant = || {
+        minted += 1;
+        let mut package = SchemaPackage::parse(COGNITIVE_MEMORY).unwrap();
+        package.manifest.package_id = format!("kip://test/shadowing-{minted}");
+        package.manifest.package_ref = String::new();
+        package
+    };
+
+    let mut shadows_a_kind = variant();
+    let person = shadows_a_kind.definitions.concept_types["Person"].clone();
+    shadows_a_kind
+        .definitions
+        .concept_types
+        .insert("Assertion".to_string(), person);
+    let err = store
+        .install_package(&shadows_a_kind, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "ConstraintViolation");
+    assert!(err.message.contains("Assertion"), "{}", err.message);
+
+    // A structural field resolves by source kind *and* name, so `inputs` is a
+    // shadow exactly where an Activity could carry it.
+    let borrowed = |package: &SchemaPackage| {
+        package
+            .definitions
+            .structural_fields
+            .values()
+            .next()
+            .cloned()
+            .expect("the profile defines structural fields")
+    };
+
+    let mut shadows_a_field = variant();
+    let mut field = borrowed(&shadows_a_field);
+    field.source.kinds = vec!["Activity".to_string()];
+    field.source.concept_types.clear();
+    shadows_a_field
+        .definitions
+        .structural_fields
+        .insert("inputs".to_string(), field);
+    let err = store
+        .install_package(&shadows_a_field, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "ConstraintViolation");
+    assert!(err.message.contains("inputs"), "{}", err.message);
+
+    // A source that constrains nothing admits every kind, Activity included.
+    let mut unconstrained = variant();
+    let mut field = borrowed(&unconstrained);
+    field.source.kinds.clear();
+    field.source.concept_types.clear();
+    unconstrained
+        .definitions
+        .structural_fields
+        .insert("outputs".to_string(), field);
+    let err = store
+        .install_package(&unconstrained, "test")
+        .await
+        .unwrap_err();
+    assert_eq!(err.name(), "ConstraintViolation");
+
+    // But a Concept owns no Core structural field, so a Profile `evidence`
+    // carried only by Concepts shadows nothing: the two planes stay apart,
+    // which is what `structural-core-fields.json` exists to pin.
+    let mut concept_plane = variant();
+    let mut field = borrowed(&concept_plane);
+    field.source.kinds = vec!["Concept".to_string()];
+    field.source.concept_types.clear();
+    concept_plane
+        .definitions
+        .structural_fields
+        .insert("evidence".to_string(), field);
+    store.install_package(&concept_plane, "test").await.unwrap();
+
+    // A Predicate named `source` is a claim about origin, not a shadow: the
+    // two namespaces are checked apart, and over-refusing would take a
+    // perfectly good predicate name away from every Profile.
+    let mut predicate = variant();
+    let (_, def) = predicate
+        .definitions
+        .predicates
+        .iter()
+        .next()
+        .map(|(name, def)| (name.clone(), def.clone()))
+        .expect("the profile defines predicates");
+    predicate
+        .definitions
+        .predicates
+        .insert("source".to_string(), def);
+    store.install_package(&predicate, "test").await.unwrap();
+}
+
+#[tokio::test]
 async fn a_published_version_cannot_be_replaced_with_different_content() {
     // Spec §20.11, §20.4: the same-version replacement attack. Every element
     // bound to `@2.0.0` would change meaning with no transaction recording it.

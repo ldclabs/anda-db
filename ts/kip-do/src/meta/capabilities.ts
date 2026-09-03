@@ -13,6 +13,7 @@
  */
 
 import type { Json } from '../json.js'
+import { BELIEF_STATUSES } from '../kip/semantics.js'
 import { specRevision, parserVersion } from '../kip/parser.js'
 import { BASELINE_ID } from '../projection/policy.js'
 
@@ -122,6 +123,12 @@ const SUPPORTED_NAMES: readonly string[] = [
   'per_operation_receipts',
   'canonical_matching',
   'symbol_lineage',
+  // §44.6: implicit grouping over the non-aggregated projected expressions,
+  // and ORDER BY over an aggregate.
+  'grouped_aggregation',
+  // §76: POST to `/readonly`, which refuses a mutation on parsed semantics so
+  // no envelope field can talk a write past it.
+  'readonly_endpoint',
 ]
 
 /**
@@ -134,7 +141,6 @@ const SUPPORTED_NAMES: readonly string[] = [
  */
 const UNSUPPORTED_NAMES: readonly string[] = [
   'atomic_batch',
-  'grouped_aggregation',
   'unregistered_permissions',
   'capsule_digest_profiles',
   'capsule_import',
@@ -170,6 +176,19 @@ export function capabilityState(name: string): boolean | undefined {
   return SUPPORTED_NAMES.includes(name) ? true : undefined
 }
 
+/**
+ * The engine-local names this engine answers, sorted — its half of the shared
+ * vocabulary in `rs/anda_kip/capabilities.json` (§67.4).
+ */
+export function answeredCapabilityNames(): string[] {
+  return [...SUPPORTED_NAMES, ...UNSUPPORTED_NAMES].sort()
+}
+
+/** The disclaimed engine-local names, for the drift test. */
+export function disclaimedCapabilityNames(): readonly string[] {
+  return UNSUPPORTED_NAMES
+}
+
 /** The gap names this engine documents, for the drift test. */
 export function unsupportedCapabilityNames(): string[] {
   return [
@@ -188,7 +207,7 @@ export function capabilities(): Json {
     // member here (§68).
     projection: {
       policies: [BASELINE_ID, 'kip:policy:forecast'],
-      statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
+      statuses: [...BELIEF_STATUSES],
       leading: ['support', 'opposition', 'none'],
       score_semantics: 'normalized_support_not_probability',
       explanation: true,
@@ -209,12 +228,13 @@ export function capabilities(): Json {
     },
     // §89 makes declaring the conformance profiles a MUST. A claim, not a
     // wish — each of these is exercised by the shared conformance fixtures both
-    // engines run, and the four §89 names that are absent are absent for a
-    // reason a caller can check in `unsupported`:
+    // engines run, and the three §89 names that are absent are absent for a
+    // reason a caller can check in `unsupported`. `KIP-KQL` is claimed against
+    // §96's own list, which every item of is built; the KQL gaps that remain —
+    // `nested_proposition_endpoint`, `hop_quantifiers`, the projection ledger —
+    // are outside that list and stay in `unsupported`:
     //
-    //   KIP-KQL             §96 requires aggregation, and §44.6 defines it
-    //                       with implicit grouping — see `grouped_aggregation`
-    //   KIP-Transactions    §94 also requires one transaction across several
+    //   KIP-Transactions    §94 requires one transaction across several
     //                       operations — see `atomic_batch`
     //   KIP-Capsule         export and verification are built, import is not
     //   KIP-High-Assurance  this engine signs nothing (§101)
@@ -223,6 +243,7 @@ export function capabilities(): Json {
       'KIP-Schema',
       'KIP-Epistemic',
       'KIP-Governance',
+      'KIP-KQL',
       'KIP-KML',
       'KIP-META',
       'KIP-Runtime',
@@ -583,7 +604,7 @@ export function capabilities(): Json {
       ],
       projection: {
         policies: [BASELINE_ID, 'kip:policy:forecast'],
-        statuses: ['accepted', 'rejected', 'contested', 'uncertain', 'insufficient'],
+        statuses: [...BELIEF_STATUSES],
         score_semantics: 'normalized_support_not_probability',
       },
       search: {
@@ -930,16 +951,6 @@ export function capabilities(): Json {
           'its predicate, which is a wrong answer wearing the shape of a right ' +
           'one. An object endpoint still resolves through {id: …} or ' +
           '{canonical_id: …}. The reference engine has the same gap',
-      },
-      {
-        capability: 'grouped_aggregation',
-        detail: 'FIND(?c.name, COUNT(?x)) and ORDER BY COUNT(?x)',
-        reason:
-          'a plain variable projected beside an aggregate, or an aggregate used ' +
-          'as a sort key, needs grouping. Answering either without it returns ' +
-          'one global row where the caller asked for one per group, or sorts by ' +
-          'the bare variable instead of the aggregate. The reference engine has ' +
-          'the same gap',
       },
       {
         capability: 'capsule_import',

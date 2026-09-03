@@ -1146,7 +1146,15 @@ impl Executor for Session {
                 // attempt produced, rather than writing a second time or being
                 // told its own write is a conflict.
                 match self
-                    .replay(&space, request, operation, &authority, &auth, &permissions)
+                    .replay(
+                        &space,
+                        &statement,
+                        request,
+                        operation,
+                        &authority,
+                        &auth,
+                        &permissions,
+                    )
                     .await
                 {
                     Ok(Some(response)) => return response,
@@ -1297,9 +1305,11 @@ impl Session {
     /// approval authorizes the work, and on a replay the work already happened
     /// — demanding a second one to learn the outcome of the first is what would
     /// make a lost response unrecoverable.
+    #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
         space: &str,
+        statement: &anda_kip::KmlStatement,
         request: &Request,
         operation: &Operation,
         authority: &EffectiveAuthority,
@@ -1322,6 +1332,11 @@ impl Session {
             return Ok(None);
         };
 
+        // Authorized before it answers — a replay is still a read of what
+        // this Space did — and before the conflict below, whose refusal names
+        // the transaction the key already committed: a caller that may not
+        // make this write may not learn that either. `ts/kip-do` orders the
+        // two the same way.
         let resource = ResourceContext::default();
         for permission in permissions {
             let decision = authority.authorize(*permission, &resource, auth);
@@ -1330,6 +1345,26 @@ impl Session {
             }
             decision.into_result()?;
         }
+
+        // §34.4: the same key on different work is a caller bug, not a retry.
+        // Replaying the first outcome would tell the second write it
+        // succeeded, hand back a receipt for a transaction that did something
+        // else, and leave the work it asked for undone — silently, since the
+        // response looks ordinary. An empty stored digest is a transaction
+        // journalled before this check existed; those replay as they did.
+        let digest = crate::kml::request_digest(statement, request, operation);
+        if !row.request_digest.is_empty() && row.request_digest != digest {
+            return Err(anda_kip::KipError::new(
+                anda_kip::KipErrorCode::IdempotencyConflict,
+                format!(
+                    "idempotency key {key:?} already committed transaction {} for a different \
+                     request; a key names one piece of work, and reusing it for another would \
+                     answer this one with that one's receipt",
+                    row.tx_id
+                ),
+            ));
+        }
+
         Ok(Some(crate::kml::replay(&row)))
     }
 
@@ -1395,6 +1430,25 @@ impl Session {
                     )));
                 }
             }
+        }
+
+        // §32.2: weaker isolation must be capability-declared, and a request
+        // for stronger isolation must never be silently satisfied. This engine
+        // serializes every mutation behind one write lock, which is
+        // `serializable` and nothing else — so a name it cannot map onto that
+        // is refused rather than echoed back as if it had been honoured.
+        if let Some(execution) = &request.execution
+            && let Some(isolation) = &execution.isolation
+            && isolation != "serializable"
+        {
+            return Err(anda_kip::KipError::new(
+                anda_kip::KipErrorCode::UnsupportedIsolation,
+                format!(
+                    "this engine commits every mutation under one exclusive write lock, which is \
+                     `serializable`, and offers no other isolation; it will not accept \
+                     {isolation:?} by ignoring it"
+                ),
+            ));
         }
 
         if let Some(options) = &request.options

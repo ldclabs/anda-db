@@ -18,7 +18,10 @@
             "merged"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "CORE-020"
+      ]
     },
     {
       "name": "it forwards to the identity that survived",
@@ -37,7 +40,11 @@
           "al",
           "alice"
         ]
-      }
+      },
+      "vectors": [
+        "CORE-021",
+        "HIST-008"
+      ]
     },
     {
       "name": "two post-merge writes resolve to one canonical Proposition on the survivor",

@@ -4,10 +4,17 @@ import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { parseElementId } from '../src/id.js'
 import {
+  CAPABILITY_REGISTRY,
+  answeredCapabilityNames,
   capabilities,
   capabilityState,
+  disclaimedCapabilityNames,
   unsupportedCapabilityNames,
 } from '../src/meta/capabilities.js'
+import {
+  CAPABILITY_ENGINE_NAMES,
+  CAPABILITY_REGISTRY_NAMES,
+} from '../src/meta/capability-names.generated.js'
 
 /** The thirteen profile names §89 lists, in the order it lists them. */
 const KIP_CONFORMANCE_PROFILES = [
@@ -111,8 +118,28 @@ describe('META', () => {
     for (const name of unsupportedCapabilityNames()) {
       expect(capabilityState(name), name).toBe(false)
     }
+    // And the other direction: a disclaimed name with no entry answers
+    // `requires` correctly and tells the Agent reading `unsupported` nothing
+    // about why, which is the half of §67 that is for a reader.
+    const documented = report.unsupported.map((entry) => entry.capability)
+    for (const name of disclaimedCapabilityNames()) {
+      expect(documented, name).toContain(name)
+    }
     // An unknown name is not "supported by omission".
     expect(capabilityState('read_everything')).toBeUndefined()
+  })
+
+  it('answers for the whole shared capability vocabulary', async () => {
+    // `rs/anda_kip/capabilities.json` is one list both engines answer from.
+    // A name only one of them knows is refused as `UnsupportedCapability` by
+    // the other even where the capability is built (§67.4), and the caller
+    // cannot tell that apart from a real gap — which is what happened to six
+    // names before the list was shared.
+    expect(answeredCapabilityNames()).toEqual([...CAPABILITY_ENGINE_NAMES])
+    // The §67.4 registry is the Specification's list, not this engine's.
+    expect(Object.keys(CAPABILITY_REGISTRY)).toEqual([
+      ...CAPABILITY_REGISTRY_NAMES,
+    ])
   })
 
   it('declares the §89 conformance profiles, by their §89 names', async () => {
@@ -123,8 +150,8 @@ describe('META', () => {
     }
     // Claimed only where it is true. Each absence has an entry in
     // `unsupported` a caller can read the reason from.
+    expect(report.profiles).toContain('KIP-KQL')
     expect(report.profiles).not.toContain('KIP-High-Assurance')
-    expect(report.profiles).not.toContain('KIP-KQL')
     expect(report.profiles).not.toContain('KIP-Transactions')
     expect(report.profiles).not.toContain('KIP-Capsule')
   })
@@ -310,6 +337,7 @@ describe('META', () => {
           state?: { from: string; to: string }
           schema_ref?: string
         }[]
+        extensions?: Record<string, { status?: string; snapshot_seq?: number }>
       }[]
       // §36.1: the normative op vocabulary, with the move itself in `state`.
       expect(element.map((e) => e.changes.map((c) => c.op))).toEqual([
@@ -328,7 +356,10 @@ describe('META', () => {
       for (const envelope of element) {
         expect(envelope.space_id).toBe('kip:space:default')
         expect(envelope.tx_id).not.toBe('')
-        expect(envelope.status).toBe('committed')
+        // §36.1's shape has no slot for the status, and the schema is
+        // `additionalProperties: false`, so it rides in the namespaced
+        // extension both engines spell the same way.
+        expect(envelope.extensions?.['anda/transition']?.status).toBe('committed')
         // Narrowed to the element asked about, not to the whole transition.
         expect(envelope.changes.every((c) => c.id === id)).toBe(true)
       }

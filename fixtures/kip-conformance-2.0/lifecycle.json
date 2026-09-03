@@ -20,14 +20,21 @@
       "params": {},
       "expect": {
         "error": "InvalidRequestEnvelope"
-      }
+      },
+      "vectors": [
+        "CORE-008",
+        "KML-017"
+      ]
     },
     {
       "name": "an Assertion's stance cannot be rewritten in place",
       "command": "UPDATE ?a SET FIELDS { stance: \"reject\" } WHERE { ?a ASSERTION {} }",
       "expect": {
         "error": "InvalidSyntax"
-      }
+      },
+      "vectors": [
+        "CORE-007"
+      ]
     },
     {
       "name": "an archived element leaves ordinary recall",
@@ -48,7 +55,10 @@
             "support"
           ]
         ]
-      }
+      },
+      "vectors": [
+        "X-018"
+      ]
     },
     {
       "name": "an element referenced by a tuple still resolves after archiving",

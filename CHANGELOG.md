@@ -10,6 +10,162 @@ unpublished, so this accumulates into the same version).
 
 Two syncs accumulate here. The later one first.
 
+## Conformance pass: the gaps the 2026-09-03 review found
+
+A review of the three KIP 2.0 libraries against `793af73` closed the
+undeclared cross-engine divergences and three unimplemented MUSTs. Both
+engines run the shared fixtures, so every item below is pinned by one.
+
+### Added — the shared capability vocabulary (`anda_kip`, both engines)
+
+- **`rs/anda_kip/capabilities.json`** is now the one list of §67.4 registry
+  names and of the engine-local names every engine here answers.
+  `anda_kip::capability_registry_names()` / `capability_engine_names()` read
+  it; `ts/kip-do` generates `src/meta/capability-names.generated.ts` from the
+  same file (`pnpm run codegen:capabilities`). Each engine still decides
+  *whether* it supports a name, and still writes its own `unsupported` prose —
+  two engines lack a capability for different reasons.
+  The drift this closes was live: `transition`, `version_planes`,
+  `snapshot_at_time`, `per_operation_receipts`, `canonical_matching` and
+  `symbol_lineage` were answered by `ts/kip-do` alone, so a `requires` block
+  naming one was refused by `anda_cognitive_nexus` — which implements all six.
+- **`readonly_endpoint`** (§76) is declared by both. `ts/kip-do` gained the
+  path: `POST /readonly` refuses a mutation with `ReadonlyViolation`, on
+  parsed semantics rather than on a declared label, matching
+  `anda_kip::execute_readonly`.
+
+### Fixed — protocol MUSTs
+
+- **`IdempotencyConflict` (§34.4).** Both engines journalled an empty
+  `request_digest` and replayed under a key without looking at it, so the same
+  key on *different* work silently returned the first transaction's receipt
+  and left the second's work undone. The digest — sha3-256 over the lowered
+  statement and its parameters, in both engines — is now computed at commit,
+  compared on replay, and reported on the Receipt (§33.2).
+- **Core symbol shadowing (§20.13).** Installing a Schema Package that defines
+  a Concept type, Facet or Enum named after a Core element kind, or a
+  structural field named after a reserved Core one *on the kind that owns it*,
+  is now `ConstraintViolation`. A source that constrains nothing admits every
+  kind and is refused too; a Concept-sourced `evidence` is not, because a
+  Concept owns no Core structural field and the two planes stay apart.
+- **`ClientKeyConflict` (§52.1).** A `CLIENT KEY` naming an existing element
+  no longer reuses it unconditionally. The built element is compared with the
+  stored one over the members a creation fixes — plus, while nothing has
+  edited the element since, the mutable ones the creation declared — and a
+  mismatch is `ClientKeyConflict` rather than a silent reuse.
+- **`UnsupportedIsolation` (§32.2)** in `anda_cognitive_nexus`: an
+  `execution.isolation` other than `serializable` was echoed back and ignored.
+
+### Fixed — cross-engine divergence
+
+- **A `WHERE` on a directly named mutation target is a guard**, in both
+  engines. `ts/kip-do` refused the shape as `InvalidSyntax`; the KML grammar
+  admits it and `anda_cognitive_nexus` executes it, so a statement that ran on
+  one engine was a syntax error on the other. A guard that finds nothing makes
+  the statement do nothing, as it already did for `MERGE CONCEPT`.
+- **`governance` as a written field** is `ProtectedGovernanceField` in both,
+  not `ProtectedSystemField` in one; `anda_cognitive_nexus` refuses `_system`,
+  `space_id` and `space_seq` as `ProtectedSystemField` and a name-only
+  `UPSERT ... MATCH` as `NameIdentityForbidden`, the codes `ts/kip-do`
+  already used, rather than as `TypeMismatch` / `IdentitySelectorRequired`.
+  Both are reachable through the typed API and the `ast` operation form; the
+  text parser still refuses them earlier, as `InvalidSyntax`.
+- **`ts/kip-do` sorts by code point**, not by locale, where
+  `anda_cognitive_nexus` sorts by bytes: a Capsule's `external_refs` (which
+  the digest covers) and the `LIST TYPES` / `PREDICATES` / `FACETS` /
+  `STRUCTURAL FIELDS` answers.
+
+### Added — `KIP-KQL` (§96), claimed by both engines
+
+- **Grouped aggregation** (§44.6). Grouping is implicit: the non-aggregated
+  projected expressions are the key, so `FIND(?c.name, COUNT(?a))` is one row
+  per group where it used to be `UnsupportedCapability`, and a `FIND` of
+  aggregates alone stays one global group. `ORDER BY COUNT(?a)` orders the
+  groups, and may name an aggregate the caller did not project; a sort key
+  that varies *inside* a group is `ConstraintViolation` rather than resolved
+  to whichever row came first. `LIMIT` and the page cursor apply to groups.
+- With it, §96's own list is complete in both engines, so both declare
+  `KIP-KQL`. `nested_proposition_endpoint`, `hop_quantifiers` and the
+  projection ledger are outside that list and stay in `unsupported`.
+
+### Fixed — the Change Envelope against its own schema
+
+`schemas/kip-change-envelope.schema.json` is `additionalProperties: false`,
+and both engines emitted `snapshot_seq` and `status` beside the members §36.1
+defines — so every `CHANGES` and `HISTORY` answer failed the normative schema.
+They now ride in the namespaced extension `anda/transition`
+(`anda_kip::CHANGE_TRANSITION_EXTENSION`), and the envelope carries `kip` and
+envelope-level `extensions`, which the Rust type had no fields for.
+`rs/anda_kip/tests/wire_schema.rs` validates the envelope in both directions
+now, as it already did for the request and the response.
+
+`DESCRIBE TRANSACTION` keeps `status` and `snapshot_seq` at the top level: it
+describes a transaction rather than streaming one, and §80.4's "did my write
+land" should not be answered from inside an extension. Both engines answer the
+same shape now — `ts/kip-do` was returning its raw storage row, whose `seq`,
+`space` and `idempotency_key` are not envelope members at all.
+
+### Fixed — an unregistered Activity status
+
+`CREATE ACTIVITY … SET FIELDS {status: "banana"}` parsed and stored in both
+engines. §16's status registry is Core's, so it is checked at execution, where
+a `:parameter` status is bound.
+
+### Fixed — self-description
+
+- `anda_cognitive_nexus` documents `artifact_store` and `deadlines` in
+  `unsupported`, where it had names with no entry; both engines now test that
+  direction as well as the other.
+- Its `unregistered_permissions` entry says what `approve` is, and counts the
+  four names it lists.
+- `§240.18` in the generated profile header is `§20.12`, in the generator. A
+  test now scans every Rust and TypeScript source for a `§` citation past the
+  Specification's last section, which is the half of that problem a machine can
+  be sure about; an in-range citation pointing at the wrong section reads
+  exactly like a right one, and a script that rewrote those would produce
+  confidently wrong references.
+
+### Added — the §27 invariant coverage matrix
+
+A shared fixture case may now declare the normative vectors it pins
+(`"vectors": ["CORE-001"]`), and `cargo test -p anda_cognitive_nexus --test
+coverage -- --nocapture` prints §102's 38 invariants against them. The registry
+is blunt — *a Core invariant without a vector does not exist* — and nothing in
+this repository had ever said which of its 258 cases pin which of the 83
+vectors that carry an invariant. 20 of 38 are declared covered today; the test
+refuses a vector name the vendored registry does not know, and holds a floor so
+the number cannot quietly fall.
+
+The 331-vector normative suite itself is still not run: it ships as prose plus
+state fixtures and a harness contract (conformance §5), and running it needs an
+out-of-band `seed_fixture` / `set_governance_fixture` path neither engine has.
+The matrix is what makes the size of that gap visible instead of unstated.
+
+### Fixed — §53.4, conflicting mutation specifications
+
+`MUTATE { UPDATE :X SET FIELDS {name:"A"}  UPDATE :X SET FIELDS {name:"B"} }`
+was last-write-wins by clause order in both engines — the hidden behaviour
+§53.4 names. `DuplicateMutationTarget` was registered and never thrown; a plan
+that gives one path two different final values is now refused, plan-wide, the
+way conflicting ordered structural positions already were. Two clauses writing
+the *same* value still agree, and two clauses writing different paths of one
+target still both apply.
+
+### Fixed — toolchain
+
+- `pnpm-workspace.yaml`'s `minimumReleaseAgeExclude` entries were
+  `name@version`; pnpm matches package *names*, so the exclusion did nothing
+  and `make test-ts` failed at the install gate on pnpm 11 while CI, pinned to
+  pnpm 10, did not apply the policy at all. Name only now, and CI moves to
+  pnpm 11 so both halves run the same check.
+
+### Removed
+
+- Three unused `ts/kip-do` exports (`emptySolution`, `extendAll`, `kindTag`,
+  and the `SYMBOL_KINDS` list nothing named); `BELIEF_STATUSES` is now read
+  where `DESCRIBE CAPABILITIES` used to spell the five statuses by hand.
+
+
 ## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
 
 Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the

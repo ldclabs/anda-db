@@ -10,9 +10,13 @@ import { Store } from '../src/store/index.js'
  * class, and answering with a status that disagrees with it tells a client's
  * recovery policy to do the wrong thing.
  */
-async function post(name: string, body: unknown): Promise<Response> {
+async function post(
+  name: string,
+  body: unknown,
+  path = '/',
+): Promise<Response> {
   const stub = env.KIP_DB.getByName(`do-${name}`)
-  return stub.fetch('https://kip.invalid/', {
+  return stub.fetch(`https://kip.invalid${path}`, {
     method: 'POST',
     body: JSON.stringify(body),
   })
@@ -136,6 +140,34 @@ describe('the Durable Object', () => {
     expect(response.status).toBe(400)
     const body = (await response.json()) as KipResponse
     expect(body.error?.code).toBe('UnsupportedIsolation')
+  })
+
+  it('refuses a mutation on the read-only path, and runs a read there', async () => {
+    // §76: the rejection is on parsed semantics, not on a declared label, so
+    // no envelope field can talk a write past the boundary.
+    const refused = await post(
+      'readonly',
+      request('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }'),
+      '/readonly',
+    )
+    const refusedBody = (await refused.json()) as KipResponse
+    expect(refusedBody.results[0]?.status).toBe('failed')
+    expect(refusedBody.results[0]?.error?.code).toBe('ReadonlyViolation')
+
+    const read = await post(
+      'readonly',
+      request('FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }'),
+      '/readonly',
+    )
+    expect((await read.json() as KipResponse).results[0]?.status).toBe('succeeded')
+
+    // And the write path still writes: the endpoint is the boundary, not a
+    // switch this object flipped for everyone.
+    const wrote = await post(
+      'readonly',
+      request('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }'),
+    )
+    expect((await wrote.json() as KipResponse).results[0]?.status).toBe('succeeded')
   })
 
   it('answers a malformed envelope with a code the client can act on', async () => {

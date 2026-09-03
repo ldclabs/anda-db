@@ -18,6 +18,7 @@
 
 import { detailed, errors } from '../errors.js'
 import {
+  ACTIVITY_STATUS,
   ACTIVITY_TERMINAL,
   ASSERTION_MODES,
   EVIDENCE_ROLES,
@@ -76,7 +77,6 @@ import {
   validateStructuralEndpoints,
   type EndpointFacts,
   type StructuralFieldDef,
-  type SymbolKind,
 } from '../schema/index.js'
 import {
   State,
@@ -351,7 +351,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
 
   const clientKey =
     clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
-  if (resolveClientKey(tx, 'Concept', clientKey, clause.handle)) return
+  const existing = findClientKey(tx, 'Concept', clientKey)
 
   const definition = tx.env.definitionPackage(symbol)
   validateAttributes(
@@ -377,6 +377,7 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
     expires_at: expiresAt(retention),
   }
   const element: Element = { kind: 'Concept', row }
+  if (clientKeyRetry(tx, existing, clause.handle, element)) return
   tx.authorizeCreated(element, 'create')
   tx.stageNew(id, element)
   checkStructural(tx, element)
@@ -391,7 +392,7 @@ function createRecord(
   const id = requireHandle(tx, clause.handle)
   const clientKey =
     clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
-  if (resolveClientKey(tx, kind, clientKey, clause.handle)) return
+  const existing = findClientKey(tx, kind, clientKey)
   const fields = new Fields(
     clause.set_fields === null ? {} : assignments(b, clause.set_fields),
   )
@@ -503,7 +504,11 @@ function createRecord(
       break
     }
     case 'Activity': {
+      // §16, §20.13: the Activity status registry is Core's, so a word outside
+      // it is refused here rather than stored — the parser only sees a written
+      // literal, and a `:parameter` status is bound at execution time.
       const status = fields.text('status')
+      if (status !== '') checkRegistry(status, 'status', ACTIVITY_STATUS)
       element = {
         kind,
         row: {
@@ -523,6 +528,7 @@ function createRecord(
     }
   }
   fields.rest(kind)
+  if (clientKeyRetry(tx, existing, clause.handle, element)) return
   // §17, §18: which epistemic-mutation permission a new Assertion needs depends
   // on whom the claim is attributed to, and that is only knowable here. `assert`
   // is the floor for writing any commitment; recording somebody else's claim or
@@ -1352,34 +1358,112 @@ export function versionGuards(
  */
 export const NO_CONFIDENCE = -1
 
-/**
- * Resolves a `CLIENT KEY` to the element an earlier attempt already created.
- *
- * §52.1: a `CREATE` creates a historically distinct element *unless* a
- * `client_key` proves a retry of the same logical creation. Returns whether
- * the clause was satisfied by an existing element, in which case the handle now
- * points at it and nothing is written — a retry writes nothing, which is what
- * makes it a retry rather than a second creation.
- *
- * The resolved element is authoritative: this does not compare the incoming
- * fields against it and quietly rewrite one to match the other. A key that
- * names two different logical creations is a client bug, and picking a winner
- * silently would turn it into a data-loss bug.
- */
-function resolveClientKey(
+/** The element an earlier attempt already created under this `CLIENT KEY`. */
+function findClientKey(
   tx: Transaction,
   kind: ElementKind,
   clientKey: string,
+): Element | null {
+  if (clientKey === '') return null
+  return tx.store.byClientKey(kind, tx.cx.space, clientKey)
+}
+
+/**
+ * Whether this creation proves itself a retry of the one the key already made.
+ *
+ * §52.1: a `CREATE` creates a historically distinct element *unless* a
+ * `client_key` proves a retry of the same logical creation. Proving it is the
+ * point — the key alone does not — so the built element is compared with the
+ * one the key already names, over the members a creation fixes:
+ *
+ * - **equal** — a retry. The handle points at the existing element, the caller
+ *   gets the id its first attempt produced, and nothing is written, which is
+ *   what makes it a retry rather than a second creation.
+ * - **different** — `ClientKeyConflict`. Two logical creations under one key is
+ *   a client bug, and silently returning the first would leave the second's
+ *   work undone while reporting success.
+ */
+function clientKeyRetry(
+  tx: Transaction,
+  existing: Element | null,
   handle: string,
+  element: Element,
 ): boolean {
-  if (clientKey === '') return false
-  const existing = tx.store.byClientKey(kind, tx.cx.space, clientKey)
   if (existing === null) return false
-  tx.rebind(handle, {
+  // Whether the stored element still is what its creation made it. Once
+  // something has legitimately edited it, its mutable state is no longer
+  // evidence about the creation, and comparing it would turn an ordinary
+  // rename into a permanent failure for the bootstrap that re-runs the same
+  // `CLIENT KEY`.
+  const pristine = (existing.row as { version: number }).version === 1
+  const member = creationDiffers(element, existing, pristine)
+  const existingId = {
     kind: existing.kind,
     seq: (existing.row as { id: number }).id,
-  })
+  }
+  if (member !== null) {
+    throw errors.clientKeyConflict(
+      `that CLIENT KEY already names ${formatElementId(existingId)}, whose ` +
+        `\`${member}\` is not the one this creation declares; a key proves a ` +
+        `retry of the same logical creation (§52.1), so use a fresh key, or ` +
+        `address the existing element by id`,
+    )
+  }
+  tx.rebind(handle, existingId)
   return true
+}
+
+/**
+ * The first creation-fixed member two elements disagree about, if any.
+ *
+ * Only members a creation fixes and nothing later rewrites, plus — while the
+ * element is still `pristine` — the mutable ones the creation declared. An
+ * Activity's topology is the clearest exclusion: a terminal `TRANSITION`
+ * finalizes it (§52.5), so only its class is compared.
+ *
+ * Mirrors `creation_differs` in the reference engine, member for member.
+ */
+function creationDiffers(
+  next: Element,
+  old: Element,
+  pristine: boolean,
+): string | null {
+  const differs = (name: string, equal: boolean) => (equal ? null : name)
+  if (next.kind !== old.kind) return 'kind'
+  if (next.kind === 'Concept' && old.kind === 'Concept') {
+    return (
+      differs('type', next.row.lineage === old.row.lineage) ??
+      differs('key', next.row.key === old.row.key) ??
+      // A Concept's name is mutable grounding state (§7.2), so it is evidence
+      // about the creation only while nothing has edited the element since.
+      differs('name', !pristine || next.row.name === old.row.name)
+    )
+  }
+  if (next.kind === 'Evidence' && old.kind === 'Evidence') {
+    return (
+      differs('evidence_class', next.row.evidence_class === old.row.evidence_class) ??
+      differs(
+        'payload',
+        jsonEquals(next.row.payload_inline, old.row.payload_inline),
+      ) ??
+      differs(
+        'source',
+        jsonEquals(next.row.source_refs as Json, old.row.source_refs as Json),
+      )
+    )
+  }
+  if (next.kind === 'Assertion' && old.kind === 'Assertion') {
+    return (
+      differs('proposition', next.row.proposition_id === old.row.proposition_id) ??
+      differs('asserted_by', next.row.asserted_by_key === old.row.asserted_by_key) ??
+      differs('stance', next.row.stance === old.row.stance) ??
+      differs('mode', next.row.mode === old.row.mode)
+    )
+  }
+  if (next.kind === 'Activity' && old.kind === 'Activity') {
+    return differs('activity_class', next.row.activity_class === old.row.activity_class)
+  }
+  return 'kind'
 }
 
 /** Checks one value against a Core registry (§20.13). */
@@ -1815,7 +1899,7 @@ class Fields {
  * granting itself authority — which is precisely the prompt-injection path a
  * Governance plane exists to close.
  */
-const PROTECTED_FIELDS = ['_system', 'governance', 'space_id', 'space_seq']
+const PROTECTED_FIELDS = ['_system', 'space_id', 'space_seq']
 
 /**
  * The Governance members a command might try to write as if they were fields
@@ -1823,7 +1907,12 @@ const PROTECTED_FIELDS = ['_system', 'governance', 'space_id', 'space_seq']
  * how far a memory may influence action, and content that could set it would
  * be granting itself authority — the laundering §28.1 exists to close.
  */
-export const GOVERNANCE_FIELDS = ['authority_class', 'classification', 'authority_lineage']
+export const GOVERNANCE_FIELDS = [
+  'governance',
+  'authority_class',
+  'classification',
+  'authority_lineage',
+]
 
 /** The subset of Concept fields an `UPSERT` may rewrite. */
 function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): void {
@@ -2388,12 +2477,3 @@ function splitPayload(payload: Json): [string, Json, string] {
 
 /** Exposed for the tests that pin the routing table. */
 export const CORE_STRUCTURAL_FIELDS = CORE_STRUCTURAL
-
-/** Exposed so `DESCRIBE CAPABILITIES` can name what is not built yet. */
-export const SYMBOL_KINDS: readonly SymbolKind[] = [
-  'ConceptType',
-  'PredicateType',
-  'Facet',
-  'StructuralField',
-  'Enum',
-]

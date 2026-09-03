@@ -55,7 +55,7 @@ import {
   type ElementId,
   type ElementKind,
 } from './id.js'
-import { jsonEquals, type Json, type JsonMap } from './json.js'
+import { canonicalJson, jsonEquals, type Json, type JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
@@ -181,6 +181,11 @@ export interface Outcome {
    */
   actor_binding_id: string | null
   /**
+   * What the idempotency key was spent on (§33.1), empty when the caller
+   * supplied no key.
+   */
+  request_digest: string
+  /**
    * The access decision that authorized this statement (§33.1).
    *
    * Present only on high-impact statements — an erasure, an export, a
@@ -242,6 +247,7 @@ export class Transaction {
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
   private actorBinding: string | null = null
+  private requestDigest = ''
 
   /**
    * What the caller may do here, resolved once for the whole transaction.
@@ -440,7 +446,39 @@ export class Transaction {
     this.handleMap.set(name, id)
   }
 
+  /**
+   * Records one path's final value, refusing a plan that specifies two.
+   *
+   * §53.4: "Conflicting final mutation specifications for the same existing
+   * target SHOULD fail." Clause source order is not a hidden last-write-wins,
+   * and the alternative to failing is exactly that — the caller reads a
+   * success and gets the value they wrote second, or first, depending on an
+   * ordering the language does not give them.
+   *
+   * Two clauses writing the *same* value are not in conflict: a plan assembled
+   * from parts may legitimately say a thing twice.
+   *
+   * @see rs/anda_cognitive_nexus/src/tx.rs — `claim_assignment`
+   */
+  claimAssignment(id: ElementId, path: string, value: Json): void {
+    const key = `${formatElementId(id)}\u0000${path}`
+    const seen = this.assignments.get(key)
+    const token = canonicalJson(value)
+    if (seen === undefined) {
+      this.assignments.set(key, token)
+      return
+    }
+    if (seen !== token) {
+      throw errors.duplicateMutationTarget(
+        `this mutation block gives ${formatElementId(id)}'s \`${path}\` two ` +
+          `different final values; clause order is not a tie-break (§53.4), ` +
+          `so say it once`,
+      )
+    }
+  }
+
   private readonly structuralPositions = new Map<string, Set<number>>()
+  private readonly assignments = new Map<string, string>()
 
   /** Mints an element with no handle — an anonymous `ENSURE PROPOSITION`. */
   mint(kind: ElementKind): ElementId {
@@ -618,7 +656,8 @@ export class Transaction {
    * nothing must still be able to learn that it changed nothing, rather than
    * being told its key was never seen.
    */
-  commit(idempotencyKey: string): Outcome {
+  commit(idempotencyKey: string, requestDigest = ''): Outcome {
+    this.requestDigest = requestDigest
     const pending = [...this.staged.entries()].filter(
       ([, staged]) => staged.changed,
     )
@@ -637,7 +676,8 @@ export class Transaction {
       // ticks for a no-op makes every `CHANGES SINCE` cursor report a change
       // that is not there.
       this.discardShells()
-      if (idempotencyKey !== '') this.journal(null, null, idempotencyKey, [])
+      if (idempotencyKey !== '')
+        this.journal(null, null, idempotencyKey, [], requestDigest)
       return this.outcome('no_effect', null, null, [])
     }
 
@@ -683,7 +723,7 @@ export class Transaction {
     // half-formed.
     this.discardUnwritten(written)
 
-    this.journal(seq, committedAt, idempotencyKey, changes)
+    this.journal(seq, committedAt, idempotencyKey, changes, requestDigest)
     return this.outcome('committed', seq, committedAt, changes)
   }
 
@@ -736,6 +776,7 @@ export class Transaction {
     committedAt: string | null,
     idempotencyKey: string,
     changes: ChangeEntry[],
+    requestDigest: string,
   ): void {
     this.store.putTransaction({
       tx_id: this.cx.tx_id,
@@ -748,7 +789,7 @@ export class Transaction {
       status: seq === null ? 'no_effect' : 'committed',
       transaction_class: 'cognitive',
       idempotency_key: idempotencyKey,
-      request_digest: '',
+      request_digest: requestDigest,
       semantic_plan_digest: '',
       result_digest: '',
       schema_environment_version: this.env.version,
@@ -894,6 +935,7 @@ export class Transaction {
       changes,
       warnings: this.warnings,
       actor_binding_id: this.actorBinding,
+      request_digest: this.requestDigest,
     }
   }
 }
