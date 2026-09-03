@@ -107,6 +107,32 @@
       "expect": {
         "error": "InvalidSyntax"
       }
+    },
+    {
+      "name": "a CLIENT KEY retry writes nothing and hands back the element the first attempt made",
+      "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Casey\" CLIENT KEY \"person:casey\" }\n}",
+      "expect": {}
+    },
+    {
+      "name": "so the same creation under the same key is a retry, not a second Casey",
+      "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Casey\" CLIENT KEY \"person:casey\" }\n}",
+      "expect": {}
+    },
+    {
+      "name": "and there is one of them",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Casey\"} }",
+      "expect": {
+        "result": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "but a different creation under that key is a conflict, never a silent reuse",
+      "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Someone Else\" CLIENT KEY \"person:casey\" }\n}",
+      "expect": {
+        "error": "ClientKeyConflict"
+      }
     }
   ]
 }

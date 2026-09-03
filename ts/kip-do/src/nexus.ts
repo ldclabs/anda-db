@@ -84,6 +84,7 @@ import {
   packageRefOf,
   formatPackageRef,
   parsePackage,
+  rejectCoreShadowing,
   type SchemaLock,
   type SchemaPackage,
 } from './schema/index.js'
@@ -98,7 +99,7 @@ import {
   type SpaceRow,
 } from './store/index.js'
 import { canonicalJson } from './json.js'
-import { sha256Text } from './digest.js'
+import { sha256Text, sha3_256Text } from './digest.js'
 import { normalizeTime, nowTime } from './time.js'
 import type { Outcome } from './tx.js'
 
@@ -190,6 +191,7 @@ export class CognitiveNexus {
    */
   installPackage(artifact: SchemaPackage, source: string): void {
     const ref = formatPackageRef(packageRefOf(artifact))
+    rejectCoreShadowing(artifact)
     const digest = sha256Text(canonicalJson(artifact))
     const existing = this.store.packageByRef(ref)
     if (existing !== null) {
@@ -680,6 +682,21 @@ export class Session {
           authority.authorize(permission, spaceResource(), this.auth),
         )
       }
+      // §34.4: the same key on different work is a caller bug, not a retry.
+      // Replaying the first outcome would tell the second write it succeeded,
+      // hand back a receipt for a transaction that did something else, and
+      // leave the work it asked for undone — silently, since the response
+      // looks ordinary. An empty stored digest is a transaction journaled
+      // before this check existed; those replay as they did.
+      const digest = requestDigest(statement, params)
+      if (replayed.request_digest !== '' && replayed.request_digest !== digest) {
+        throw errors.idempotencyConflict(
+          `idempotency key ${JSON.stringify(options.idempotencyKey)} already ` +
+            `committed transaction ${replayed.tx_id} for a different request; ` +
+            `a key names one piece of work, and reusing it for another would ` +
+            `answer this one with that one's receipt`,
+        )
+      }
       return replay(replayed)
     }
 
@@ -697,6 +714,10 @@ export class Session {
       ingest: options.ingest,
       operation: options.operation,
       idempotencyKey: options.idempotencyKey,
+      requestDigest:
+        options.idempotencyKey === undefined
+          ? undefined
+          : requestDigest(statement, params),
       dryRun: options.dryRun,
       // After the spread, for the same reason as the read path: identity is not
       // one of the knobs an options object may turn.
@@ -1278,6 +1299,30 @@ export class Session {
  * demanding a second one to learn the outcome of the first is what would make
  * a lost response unrecoverable, which is the failure §33 exists to prevent.
  */
+/**
+ * What the idempotency key was spent on (§33.1, §34.4).
+ *
+ * The digest covers the work the key committed to: the lowered statement and
+ * the parameters it binds. The lowered form rather than the source text, so
+ * that reformatting a resend is still the same request — and so that
+ * `rs/anda_cognitive_nexus`, which digests the same two, decides the same way.
+ *
+ * Ingested Evidence is deliberately outside it: a runtime mints those inside
+ * the transaction (§71.1), so a replay never re-mints and the recovered
+ * Receipt is the first attempt's either way.
+ */
+export function requestDigest(
+  statement: KmlStatement,
+  params: JsonMap,
+): string {
+  return sha3_256Text(
+    canonicalJson({
+      statement: statement as unknown as Json,
+      parameters: Object.keys(params).length === 0 ? null : params,
+    }),
+  )
+}
+
 function requirePermittedForReplay(decision: Authorization): void {
   if (decision.decision === 'require_approval') return
   requirePermitted(decision)
@@ -1307,6 +1352,7 @@ function replay(row: TransactionRow): Outcome {
     space_seq: row.status === 'committed' ? row.seq : null,
     snapshot_seq: row.snapshot_seq,
     committed_at: row.status === 'committed' ? row.committed_at : null,
+    request_digest: row.request_digest,
     schema_environment_version: row.schema_environment_version,
     handles: result.handles ?? {},
     changes: row.changes,

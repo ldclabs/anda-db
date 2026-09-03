@@ -93,23 +93,7 @@ export function resolveTargets(
   const direct = (id: ElementId) => new Targets([id], true, permission)
   if (where === null) {
     if ('Handle' in target) return direct(parseElementId(handleId(b, target.Handle)))
-    if ('Id' in target) return direct(parseElementId(target.Id))
-    const value = parameter(b, target.Param)
-    if (typeof value !== 'string') {
-      throw errors.typeMismatch(
-        `${what} needs an element id, got ${JSON.stringify(value)}`,
-      )
-    }
-    return direct(parseElementId(value))
-  }
-
-  if (!('Handle' in target)) {
-    // A WHERE block binds a variable. An id target with a block would name one
-    // element *and* describe a set, and there is no reading of that which is
-    // not a contradiction.
-    throw errors.invalidSyntax(
-      `${what} names its target directly, so it takes no WHERE block`,
-    )
+    return direct(parseElementId(namedId(b, target, what)))
   }
 
   const cx = new Context(tx.store, tx.env, tx.cx.space, tx.authority, tx.auth)
@@ -119,6 +103,21 @@ export function resolveTargets(
     [new Map()],
     { request: request ?? {}, operation: operation ?? {}, policy: baseline() },
   )
+
+  if (!('Handle' in target)) {
+    // A named target keeps its identity and the block is a **guard**, the way
+    // the KML grammar's note 6b and `MERGE CONCEPT` already read it: no
+    // solution means the clause does nothing, which is what makes
+    // `TRANSITION :x TO "archived" WHERE {...}` a conditional move rather than
+    // a precondition that fails. Refusing the shape instead — as this engine
+    // used to — made a statement the reference engine executes a syntax error
+    // here.
+    const id =
+      'Id' in target ? parseElementId(target.Id) : parseElementId(namedId(b, target, what))
+    return solutions.length === 0
+      ? new Targets([], true, permission)
+      : direct(id)
+  }
 
   const seen = new Map<string, ElementId>()
   for (const solution of solutions) {
@@ -132,6 +131,22 @@ export function resolveTargets(
   const ids = [...seen.values()].sort(compareElementId)
   const cap = limit === null ? null : count(b, limit, `${what} LIMIT`)
   return new Targets(cap === null ? ids : ids.slice(0, cap), false, permission)
+}
+
+/** The element id a `"id"` or `:parameter` target names. */
+function namedId(
+  b: Bindings,
+  target: Exclude<ElementRef, { Handle: string }>,
+  what: string,
+): string {
+  if ('Id' in target) return target.Id
+  const value = parameter(b, target.Param)
+  if (typeof value !== 'string') {
+    throw errors.typeMismatch(
+      `${what} needs an element id, got ${JSON.stringify(value)}`,
+    )
+  }
+  return value
 }
 
 function count(b: Bindings, value: Scalar, what: string): number {

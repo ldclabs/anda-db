@@ -1179,7 +1179,7 @@ fn delegation_digest(chain: &[String]) -> Option<String> {
 }
 
 /// sha3-256 over RFC 8785 canonical JSON, spelled as the Capsule digest is.
-fn digest_of(value: &Json) -> String {
+pub(crate) fn digest_of(value: &Json) -> String {
     use sha3::{Digest, Sha3_256};
     let canonical = anda_kip::canonical_json(value);
     format!(
@@ -1248,7 +1248,7 @@ fn receipt_status_name(status: ReceiptStatus) -> &'static str {
     }
 }
 
-fn none_if_empty(value: String) -> Option<String> {
+pub(crate) fn none_if_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 

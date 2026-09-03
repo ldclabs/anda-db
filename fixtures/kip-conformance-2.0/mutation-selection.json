@@ -143,6 +143,39 @@
       }
     },
     {
+      "name": "a name is not identity, and the language refuses it before an engine sees it",
+      "command": "UPSERT CONCEPT ?c { MATCH {type: \"Person\", name: \"Alice\"} SET FIELDS {name: \"Alice B\"} }",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "name": "and `_system` is engine state no mutation may name",
+      "command": "UPDATE \"person:alice\" SET FIELDS {_system: {version: 99}}",
+      "expect": {
+        "error": "InvalidSyntax"
+      }
+    },
+    {
+      "name": "a WHERE on a directly named target is a guard, and a guard that holds lets the write through",
+      "command": "UPDATE ?t SET FIELDS {name: \"Alice Guarded\"} WHERE { ?t CONCEPT {key: \"person:alice\"} }",
+      "expect": {}
+    },
+    {
+      "name": "a guard that finds nothing makes the statement do nothing, and is not an error",
+      "command": "UPDATE ?t SET FIELDS {name: \"Never\"} WHERE { ?t CONCEPT {key: \"person:alice\"}  FILTER(?t.name == \"Nobody\") }",
+      "expect": {}
+    },
+    {
+      "name": "so the guarded write landed and the unguarded one did not",
+      "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+      "expect": {
+        "result": [
+          "Alice Guarded"
+        ]
+      }
+    },
+    {
       "name": "PURGE refuses by default while anything still references the target",
       "command": "PURGE ?alice WHERE { ?alice CONCEPT {key: \"person:alice\"} } CONFIRM \"PURGE\"",
       "expect": {

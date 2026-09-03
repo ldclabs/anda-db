@@ -122,6 +122,9 @@ const SUPPORTED_NAMES: readonly string[] = [
   'per_operation_receipts',
   'canonical_matching',
   'symbol_lineage',
+  // §76: POST to `/readonly`, which refuses a mutation on parsed semantics so
+  // no envelope field can talk a write past it.
+  'readonly_endpoint',
 ]
 
 /**
@@ -168,6 +171,19 @@ export function capabilityState(name: string): boolean | undefined {
   }
   if (UNSUPPORTED_NAMES.includes(name)) return false
   return SUPPORTED_NAMES.includes(name) ? true : undefined
+}
+
+/**
+ * The engine-local names this engine answers, sorted — its half of the shared
+ * vocabulary in `rs/anda_kip/capabilities.json` (§67.4).
+ */
+export function answeredCapabilityNames(): string[] {
+  return [...SUPPORTED_NAMES, ...UNSUPPORTED_NAMES].sort()
+}
+
+/** The disclaimed engine-local names, for the drift test. */
+export function disclaimedCapabilityNames(): readonly string[] {
+  return UNSUPPORTED_NAMES
 }
 
 /** The gap names this engine documents, for the drift test. */

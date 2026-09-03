@@ -5,7 +5,7 @@
  * themselves vendored from the specification repository. Regenerate with
  * `pnpm run codegen:profiles`.
  *
- * Installing is not activating (§240.18). Bundling the bytes says nothing about
+ * Installing is not activating (§20.12). Bundling the bytes says nothing about
  * which Space may resolve symbols through them.
  */
 

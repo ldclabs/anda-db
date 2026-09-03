@@ -587,19 +587,40 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "detail": "derive, share, manage_trust, approve",
                 "reason": "§29.6 requires a runtime that does not distinguish derived writes to \
                            refuse `derive` where a Grant names it, and the same reasoning covers \
-                           the other two: a permission that is accepted and gates nothing is \
+                           the others: a permission that is accepted and gates nothing is \
                            authority that looks conferred and is not, discovered during an \
-                           incident. So these three are not in the registry at all and a Grant \
+                           incident. So these names are not in the registry at all and a Grant \
                            listing one is rejected where it is written. `share` and \
                            `manage_trust` name operations this engine has no surface for — no \
                            controlled cross-Space view to expose, no trust policy to version, \
-                           see `trust_governance`. `derive` is the one that is a judgement \
+                           see `trust_governance` — and `approve` is what this engine spells \
+                           `approve_high_risk`. `derive` is the one that is a judgement \
                            rather than an absence: §29.6 triggers it on an element recorded as \
                            an output of an Activity that has at least one input, and this engine \
-                           does not make that distinction at the gate yet. Every other \
-                           registered name is asked for by a gate, which is the property this \
-                           entry exists to report the exceptions to. ts/kip-do registers exactly \
-                           the same set"
+                           does not make that distinction at the gate yet; `derive_permission` \
+                           in the §67.4 registry says so. `record_outcome` and \
+                           `manage_legal_hold` are registered because a gate asks for each. \
+                           Every other registered name is asked for by a gate, which is the \
+                           property this entry exists to report the exceptions to. ts/kip-do \
+                           registers exactly the same set"
+            },
+            {
+                "capability": "deadlines",
+                "detail": "options.deadline_ms",
+                "reason": "§80.1's execution window is not enforced: a command runs to \
+                           completion or fails on its own. Accepting the field would be a \
+                           promise, and §80.2 is explicit that a client timeout is not an \
+                           abort — so a request carrying one is refused rather than answered \
+                           as if the window had been honoured"
+            },
+            {
+                "capability": "artifact_store",
+                "detail": "§85 artifact handles: payload_artifact, artifact:// references",
+                "reason": "there is no blob store behind this engine, so a handle could only \
+                           be recorded and never resolved. An Evidence payload is carried \
+                           inline or ingested through the request envelope (§71.1); an \
+                           external URL stays a citation, never something the engine fetches \
+                           (§102 invariant 29)"
             },
             {
                 "capability": "nested_proposition_endpoint",
@@ -843,6 +864,20 @@ const SUPPORTED_NAMES: &[&str] = &[
     "opaque_cursors",
     "payload_purge",
     "list_dependents",
+    // §52.5, §35.1, §68, §33.2, §12.3, §20.14: the vocabulary the 2026-09-02
+    // consolidation added. Every one of them is built here; they are named so
+    // a `requires` block gets `true` rather than the `unrecognized` §67.4
+    // makes a failure.
+    "transition",
+    "version_planes",
+    "snapshot_at_time",
+    "per_operation_receipts",
+    "canonical_matching",
+    "symbol_lineage",
+    // §76: `anda_kip::execute_readonly` is the read-only path in front of this
+    // engine — it refuses a mutation on parsed semantics, so no envelope field
+    // can talk a write past it.
+    "readonly_endpoint",
 ];
 
 /// The capability names this engine reports as *not* implemented.
@@ -964,6 +999,49 @@ mod tests {
                 "{name} is documented as a gap but `requires` does not know it"
             );
         }
+        // And the other direction. A disclaimed name with no entry answers
+        // `requires` correctly and tells the Agent reading `unsupported`
+        // nothing about why — which is the half of §67 that is for a reader.
+        let documented: Vec<&str> = listed
+            .iter()
+            .filter_map(|entry| entry["capability"].as_str())
+            .collect();
+        for name in UNSUPPORTED_NAMES {
+            assert!(
+                documented.contains(name),
+                "{name} is disclaimed with no `unsupported` entry saying why"
+            );
+        }
+    }
+
+    /// The two engines answer for the same vocabulary (§67.4).
+    ///
+    /// `rs/anda_kip/capabilities.json` is the shared list, and this is the
+    /// half of it this engine owns: every name there is answered, and every
+    /// name answered is there. Six names once lived in `ts/kip-do` alone, for
+    /// capabilities this engine had also built, so a client that fail-fast
+    /// checked them here was refused a capability it was standing on.
+    #[test]
+    fn the_shared_capability_vocabulary_is_answered_in_full() {
+        let mut answered: Vec<&str> = SUPPORTED_NAMES
+            .iter()
+            .chain(UNSUPPORTED_NAMES.iter())
+            .copied()
+            .collect();
+        answered.sort_unstable();
+        let shared: Vec<&str> = anda_kip::capability_engine_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(answered, shared);
+
+        // The §67.4 registry is the Specification's, not this engine's.
+        let registry: Vec<&str> = REGISTRY.iter().map(|(name, _, _)| *name).collect();
+        let spec: Vec<&str> = anda_kip::capability_registry_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(registry, spec);
     }
 
     /// §89 makes declaring the profiles a MUST, and the names are §89's.

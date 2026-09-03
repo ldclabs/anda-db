@@ -181,6 +181,11 @@ export interface Outcome {
    */
   actor_binding_id: string | null
   /**
+   * What the idempotency key was spent on (§33.1), empty when the caller
+   * supplied no key.
+   */
+  request_digest: string
+  /**
    * The access decision that authorized this statement (§33.1).
    *
    * Present only on high-impact statements — an erasure, an export, a
@@ -242,6 +247,7 @@ export class Transaction {
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
   private actorBinding: string | null = null
+  private requestDigest = ''
 
   /**
    * What the caller may do here, resolved once for the whole transaction.
@@ -618,7 +624,8 @@ export class Transaction {
    * nothing must still be able to learn that it changed nothing, rather than
    * being told its key was never seen.
    */
-  commit(idempotencyKey: string): Outcome {
+  commit(idempotencyKey: string, requestDigest = ''): Outcome {
+    this.requestDigest = requestDigest
     const pending = [...this.staged.entries()].filter(
       ([, staged]) => staged.changed,
     )
@@ -637,7 +644,8 @@ export class Transaction {
       // ticks for a no-op makes every `CHANGES SINCE` cursor report a change
       // that is not there.
       this.discardShells()
-      if (idempotencyKey !== '') this.journal(null, null, idempotencyKey, [])
+      if (idempotencyKey !== '')
+        this.journal(null, null, idempotencyKey, [], requestDigest)
       return this.outcome('no_effect', null, null, [])
     }
 
@@ -683,7 +691,7 @@ export class Transaction {
     // half-formed.
     this.discardUnwritten(written)
 
-    this.journal(seq, committedAt, idempotencyKey, changes)
+    this.journal(seq, committedAt, idempotencyKey, changes, requestDigest)
     return this.outcome('committed', seq, committedAt, changes)
   }
 
@@ -736,6 +744,7 @@ export class Transaction {
     committedAt: string | null,
     idempotencyKey: string,
     changes: ChangeEntry[],
+    requestDigest: string,
   ): void {
     this.store.putTransaction({
       tx_id: this.cx.tx_id,
@@ -748,7 +757,7 @@ export class Transaction {
       status: seq === null ? 'no_effect' : 'committed',
       transaction_class: 'cognitive',
       idempotency_key: idempotencyKey,
-      request_digest: '',
+      request_digest: requestDigest,
       semantic_plan_digest: '',
       result_digest: '',
       schema_environment_version: this.env.version,
@@ -894,6 +903,7 @@ export class Transaction {
       changes,
       warnings: this.warnings,
       actor_binding_id: this.actorBinding,
+      request_digest: this.requestDigest,
     }
   }
 }

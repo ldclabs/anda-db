@@ -80,8 +80,14 @@ pub async fn execute(
         }
     }
 
+    let key = idempotency_key(request, operation);
     let entry = JournalEntry {
-        idempotency_key: idempotency_key(request, operation),
+        request_digest: if key.is_empty() {
+            String::new()
+        } else {
+            request_digest(statement, request, operation)
+        },
+        idempotency_key: key,
         ..Default::default()
     };
     let schema_environment_version = tx.env.version;
@@ -423,7 +429,10 @@ pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
         space_seq: committed.then_some(row.seq),
         committed_at: committed.then(|| row.committed_at.clone()),
         transaction_class: Some(row.transaction_class.clone()),
-        request_digest: None,
+        // Journalled at commit, so the replayed Receipt is the sealed one
+        // member for member — which is what a caller comparing the two to
+        // learn whether its write landed depends on.
+        request_digest: crate::tx::none_if_empty(row.request_digest.clone()),
         semantic_plan_digest: None,
         result_digest: None,
         schema_environment_version: Some(row.schema_environment_version),
@@ -557,4 +566,38 @@ pub(crate) fn idempotency_key(request: &Request, operation: &Operation) -> Strin
                 .and_then(|execution| execution.idempotency_key.clone())
         })
         .unwrap_or_default()
+}
+
+/// What the idempotency key was spent on (§33.1, §34.4).
+///
+/// The digest covers the work the key committed to: the command as written or
+/// its pre-parsed AST, and the parameters it would be bound with. §34.3 makes
+/// a resend of *the same* request replay; §34.4 makes a resend of a
+/// *different* one fail, and without a record of what the first request was
+/// there is nothing to tell the two apart — the second write would silently
+/// receive the first one's receipt.
+///
+/// Ingested Evidence is deliberately outside it: a runtime mints those inside
+/// the transaction (§71.1), so a replay never re-mints and the recovered
+/// Receipt is the first attempt's either way.
+pub(crate) fn request_digest(
+    statement: &KmlStatement,
+    request: &Request,
+    operation: &Operation,
+) -> String {
+    let parameters = match (&request.parameters, &operation.parameters) {
+        (None, None) => Json::Null,
+        (outer, inner) => {
+            let mut merged = outer.clone().unwrap_or_default();
+            merged.extend(inner.clone().unwrap_or_default());
+            Json::Object(merged)
+        }
+    };
+    // The lowered statement rather than the source text, so that reformatting
+    // a resend is still the same request — and so that `ts/kip-do`, which only
+    // ever sees the AST, decides the same way.
+    crate::tx::digest_of(&serde_json::json!({
+        "statement": statement,
+        "parameters": parameters,
+    }))
 }

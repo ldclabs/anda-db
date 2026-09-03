@@ -1719,6 +1719,39 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
+        "name": "a name is not identity, and the language refuses it before an engine sees it",
+        "command": "UPSERT CONCEPT ?c { MATCH {type: \"Person\", name: \"Alice\"} SET FIELDS {name: \"Alice B\"} }",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "and `_system` is engine state no mutation may name",
+        "command": "UPDATE \"person:alice\" SET FIELDS {_system: {version: 99}}",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "a WHERE on a directly named target is a guard, and a guard that holds lets the write through",
+        "command": "UPDATE ?t SET FIELDS {name: \"Alice Guarded\"} WHERE { ?t CONCEPT {key: \"person:alice\"} }",
+        "expect": {}
+      },
+      {
+        "name": "a guard that finds nothing makes the statement do nothing, and is not an error",
+        "command": "UPDATE ?t SET FIELDS {name: \"Never\"} WHERE { ?t CONCEPT {key: \"person:alice\"}  FILTER(?t.name == \"Nobody\") }",
+        "expect": {}
+      },
+      {
+        "name": "so the guarded write landed and the unguarded one did not",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {key: \"person:alice\"} }",
+        "expect": {
+          "result": [
+            "Alice Guarded"
+          ]
+        }
+      },
+      {
         "name": "PURGE refuses by default while anything still references the target",
         "command": "PURGE ?alice WHERE { ?alice CONCEPT {key: \"person:alice\"} } CONFIRM \"PURGE\"",
         "expect": {
@@ -2025,6 +2058,72 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             2
+          ]
+        }
+      },
+      {
+        "name": "the same key on different work is a caller bug, not a retry",
+        "command": "CREATE CONCEPT ?x { TYPE \"Person\" NAME \"Someone Else\" }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "idempotency_key": "key-1"
+          }
+        },
+        "expect": {
+          "error": "IdempotencyConflict"
+        }
+      },
+      {
+        "name": "so the key still names the work it was spent on",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Someone Else\"} }",
+        "expect": {
+          "result": [
+            0
+          ]
+        }
+      },
+      {
+        "name": "an isolation this engine cannot provide is refused, never accepted by ignoring it",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } LIMIT 1",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "isolation": "snapshot"
+          }
+        },
+        "expect": {
+          "error": "UnsupportedIsolation"
+        }
+      },
+      {
+        "name": "and the one it does provide is accepted",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "execution": {
+            "mode": "independent",
+            "isolation": "serializable"
+          }
+        },
+        "expect": {
+          "result": [
+            3
+          ]
+        }
+      },
+      {
+        "name": "a capability name from the shared vocabulary answers rather than reporting itself unknown",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+        "envelope": {
+          "requires": {
+            "version_planes": true,
+            "transition": true,
+            "symbol_lineage": true
+          }
+        },
+        "expect": {
+          "result": [
+            3
           ]
         }
       },
@@ -2873,6 +2972,32 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "error": "InvalidSyntax"
         }
+      },
+      {
+        "name": "a CLIENT KEY retry writes nothing and hands back the element the first attempt made",
+        "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Casey\" CLIENT KEY \"person:casey\" }\n}",
+        "expect": {}
+      },
+      {
+        "name": "so the same creation under the same key is a retry, not a second Casey",
+        "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Casey\" CLIENT KEY \"person:casey\" }\n}",
+        "expect": {}
+      },
+      {
+        "name": "and there is one of them",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Casey\"} }",
+        "expect": {
+          "result": [
+            1
+          ]
+        }
+      },
+      {
+        "name": "but a different creation under that key is a conflict, never a silent reuse",
+        "command": "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Someone Else\" CLIENT KEY \"person:casey\" }\n}",
+        "expect": {
+          "error": "ClientKeyConflict"
+        }
       }
     ]
   },
@@ -2956,4 +3081,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 235
+export const CASE_COUNT = 249

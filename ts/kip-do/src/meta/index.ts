@@ -719,11 +719,14 @@ function symbolList(env: SchemaEnvironment, kind: SymbolKind): Json[] {
       })
     }
   }
-  return out.sort((a, b) =>
-    String((a as { ref: string }).ref).localeCompare(
-      String((b as { ref: string }).ref),
-    ),
-  )
+  // Code-point order, the way the Rust engine sorts, so the two report one
+  // list in one order. `localeCompare` disagrees with it as soon as two symbol
+  // names differ only in case.
+  return out.sort((a, b) => {
+    const left = String((a as { ref: string }).ref)
+    const right = String((b as { ref: string }).ref)
+    return left < right ? -1 : left > right ? 1 : 0
+  })
 }
 
 /** The package id half of a `package_id@version` reference. */

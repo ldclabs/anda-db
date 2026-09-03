@@ -154,6 +154,72 @@
       }
     },
     {
+      "name": "the same key on different work is a caller bug, not a retry",
+      "command": "CREATE CONCEPT ?x { TYPE \"Person\" NAME \"Someone Else\" }",
+      "envelope": {
+        "execution": {
+          "mode": "independent",
+          "idempotency_key": "key-1"
+        }
+      },
+      "expect": {
+        "error": "IdempotencyConflict"
+      }
+    },
+    {
+      "name": "so the key still names the work it was spent on",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\", name: \"Someone Else\"} }",
+      "expect": {
+        "result": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "an isolation this engine cannot provide is refused, never accepted by ignoring it",
+      "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } LIMIT 1",
+      "envelope": {
+        "execution": {
+          "mode": "independent",
+          "isolation": "snapshot"
+        }
+      },
+      "expect": {
+        "error": "UnsupportedIsolation"
+      }
+    },
+    {
+      "name": "and the one it does provide is accepted",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+      "envelope": {
+        "execution": {
+          "mode": "independent",
+          "isolation": "serializable"
+        }
+      },
+      "expect": {
+        "result": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "a capability name from the shared vocabulary answers rather than reporting itself unknown",
+      "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }",
+      "envelope": {
+        "requires": {
+          "version_planes": true,
+          "transition": true,
+          "symbol_lineage": true
+        }
+      },
+      "expect": {
+        "result": [
+          3
+        ]
+      }
+    },
+    {
       "name": "a source actor is an element reference, never a name: a bare string is refused at the envelope",
       "command": "CREATE CONCEPT ?c { TYPE \"Person\" NAME \"Bob\" }",
       "envelope": {

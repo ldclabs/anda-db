@@ -10,6 +10,81 @@ unpublished, so this accumulates into the same version).
 
 Two syncs accumulate here. The later one first.
 
+## Conformance pass: the gaps the 2026-09-03 review found
+
+A review of the three KIP 2.0 libraries against `793af73` closed the
+undeclared cross-engine divergences and three unimplemented MUSTs. Both
+engines run the shared fixtures, so every item below is pinned by one.
+
+### Added — the shared capability vocabulary (`anda_kip`, both engines)
+
+- **`rs/anda_kip/capabilities.json`** is now the one list of §67.4 registry
+  names and of the engine-local names every engine here answers.
+  `anda_kip::capability_registry_names()` / `capability_engine_names()` read
+  it; `ts/kip-do` generates `src/meta/capability-names.generated.ts` from the
+  same file (`pnpm run codegen:capabilities`). Each engine still decides
+  *whether* it supports a name, and still writes its own `unsupported` prose —
+  two engines lack a capability for different reasons.
+  The drift this closes was live: `transition`, `version_planes`,
+  `snapshot_at_time`, `per_operation_receipts`, `canonical_matching` and
+  `symbol_lineage` were answered by `ts/kip-do` alone, so a `requires` block
+  naming one was refused by `anda_cognitive_nexus` — which implements all six.
+- **`readonly_endpoint`** (§76) is declared by both. `ts/kip-do` gained the
+  path: `POST /readonly` refuses a mutation with `ReadonlyViolation`, on
+  parsed semantics rather than on a declared label, matching
+  `anda_kip::execute_readonly`.
+
+### Fixed — protocol MUSTs
+
+- **`IdempotencyConflict` (§34.4).** Both engines journalled an empty
+  `request_digest` and replayed under a key without looking at it, so the same
+  key on *different* work silently returned the first transaction's receipt
+  and left the second's work undone. The digest — sha3-256 over the lowered
+  statement and its parameters, in both engines — is now computed at commit,
+  compared on replay, and reported on the Receipt (§33.2).
+- **Core symbol shadowing (§20.13).** Installing a Schema Package that defines
+  a Concept type, Facet or Enum named after a Core element kind, or a
+  structural field named after a reserved Core one *on the kind that owns it*,
+  is now `ConstraintViolation`. A source that constrains nothing admits every
+  kind and is refused too; a Concept-sourced `evidence` is not, because a
+  Concept owns no Core structural field and the two planes stay apart.
+- **`ClientKeyConflict` (§52.1).** A `CLIENT KEY` naming an existing element
+  no longer reuses it unconditionally. The built element is compared with the
+  stored one over the members a creation fixes — plus, while nothing has
+  edited the element since, the mutable ones the creation declared — and a
+  mismatch is `ClientKeyConflict` rather than a silent reuse.
+- **`UnsupportedIsolation` (§32.2)** in `anda_cognitive_nexus`: an
+  `execution.isolation` other than `serializable` was echoed back and ignored.
+
+### Fixed — cross-engine divergence
+
+- **A `WHERE` on a directly named mutation target is a guard**, in both
+  engines. `ts/kip-do` refused the shape as `InvalidSyntax`; the KML grammar
+  admits it and `anda_cognitive_nexus` executes it, so a statement that ran on
+  one engine was a syntax error on the other. A guard that finds nothing makes
+  the statement do nothing, as it already did for `MERGE CONCEPT`.
+- **`governance` as a written field** is `ProtectedGovernanceField` in both,
+  not `ProtectedSystemField` in one; `anda_cognitive_nexus` refuses `_system`,
+  `space_id` and `space_seq` as `ProtectedSystemField` and a name-only
+  `UPSERT ... MATCH` as `NameIdentityForbidden`, the codes `ts/kip-do`
+  already used, rather than as `TypeMismatch` / `IdentitySelectorRequired`.
+  Both are reachable through the typed API and the `ast` operation form; the
+  text parser still refuses them earlier, as `InvalidSyntax`.
+- **`ts/kip-do` sorts by code point**, not by locale, where
+  `anda_cognitive_nexus` sorts by bytes: a Capsule's `external_refs` (which
+  the digest covers) and the `LIST TYPES` / `PREDICATES` / `FACETS` /
+  `STRUCTURAL FIELDS` answers.
+
+### Fixed — self-description
+
+- `anda_cognitive_nexus` documents `artifact_store` and `deadlines` in
+  `unsupported`, where it had names with no entry; both engines now test that
+  direction as well as the other.
+- Its `unregistered_permissions` entry says what `approve` is, and counts the
+  four names it lists.
+- `§240.18` in the generated profile header is `§20.12`, in the generator.
+
+
 ## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
 
 Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the

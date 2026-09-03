@@ -142,7 +142,13 @@ export function exportCapsule(
       })
     }
   }
-  externalRefs.sort((a, b2) => String(a.ref).localeCompare(String(b2.ref)))
+  // Code-point order, not locale order: the array is part of the payload the
+  // Capsule digest covers, and `localeCompare` would put two engines' exports
+  // of the same selection in different orders — a digest mismatch that reads
+  // as tampering. The Rust engine sorts by bytes.
+  externalRefs.sort((a, b2) =>
+    String(a.ref) < String(b2.ref) ? -1 : String(a.ref) > String(b2.ref) ? 1 : 0,
+  )
   // A `closed` Capsule promises self-containment, so it fails rather than
   // shipping the promise with a hole in it. §40.3 names the three shapes so a
   // destination can tell them apart; one that claimed `closed` and carried
