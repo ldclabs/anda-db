@@ -18,7 +18,13 @@
 import { sha3_256Text } from '../digest.js'
 import { errors } from '../errors.js'
 import { formatElementId, type ElementId } from '../id.js'
-import { canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
+import {
+  canonicalJson,
+  compareCodePoints,
+  isJsonMap,
+  type Json,
+  type JsonMap,
+} from '../json.js'
 import type { ExportCapsuleCommand } from '../kip/ast.js'
 import { boundValue } from '../kml/value.js'
 import { Context } from '../kql/context.js'
@@ -142,13 +148,11 @@ export function exportCapsule(
       })
     }
   }
-  // Code-point order, not locale order: the array is part of the payload the
-  // Capsule digest covers, and `localeCompare` would put two engines' exports
-  // of the same selection in different orders — a digest mismatch that reads
-  // as tampering. The Rust engine sorts by bytes.
-  externalRefs.sort((a, b2) =>
-    String(a.ref) < String(b2.ref) ? -1 : String(a.ref) > String(b2.ref) ? 1 : 0,
-  )
+  // Code-point order, not locale order and not JavaScript's own `<`: the array
+  // is part of the payload the Capsule digest covers, and an order the Rust
+  // engine — which sorts by UTF-8 bytes — would not produce is a digest
+  // mismatch that reads as tampering.
+  externalRefs.sort((a, b2) => compareCodePoints(String(a.ref), String(b2.ref)))
   // A `closed` Capsule promises self-containment, so it fails rather than
   // shipping the promise with a hole in it. §40.3 names the three shapes so a
   // destination can tell them apart; one that claimed `closed` and carried
