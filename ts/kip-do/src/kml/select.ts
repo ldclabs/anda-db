@@ -112,11 +112,9 @@ export function resolveTargets(
     // a precondition that fails. Refusing the shape instead — as this engine
     // used to — made a statement the reference engine executes a syntax error
     // here.
-    const id =
-      'Id' in target ? parseElementId(target.Id) : parseElementId(namedId(b, target, what))
     return solutions.length === 0
       ? new Targets([], true, permission)
-      : direct(id)
+      : direct(parseElementId(namedId(b, target, what)))
   }
 
   const seen = new Map<string, ElementId>()

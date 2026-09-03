@@ -503,7 +503,6 @@ async fn create_concept(
     let retention = fields.json("retention");
     require_retention_authority(tx, &retention)?;
     let extra_name = fields.text("name")?;
-    refuse_protected_fields(&fields)?;
     fields.rest("Concept")?;
 
     // Kind only here: the Concept's type symbol is resolved a few lines down by
@@ -556,20 +555,6 @@ async fn create_concept(
     check_structural(store, tx, id).await
 }
 
-/// Refuses a Governance member spelled as a Core field (§28.1, §31.3).
-///
-/// `authority_class` and `classification` are assigned by Governance and read
-/// under `governance`; a `SET FIELDS` naming one is refused as protected rather
-/// than as unknown, so the caller learns which plane the member lives on.
-fn refuse_protected_fields(fields: &Fields) -> Result<(), KipError> {
-    for protected in ["authority_class", "classification", "governance"] {
-        if fields.0.contains_key(protected) {
-            return Err(update::protected_governance(protected));
-        }
-    }
-    Ok(())
-}
-
 async fn create_record(
     store: &Store,
     tx: &mut Transaction,
@@ -618,7 +603,6 @@ async fn create_record(
     // under a Concept the Space said was the same as another one.
     structural.canonicalize(tx).await?;
 
-    refuse_protected_fields(&fields)?;
     let row = match kind {
         ElementKind::Evidence => {
             let payload = fields.json("payload");
@@ -1818,7 +1802,6 @@ async fn finalize_activity(
     let started = fields.timestamp("started_at")?;
     let ended = fields.timestamp("ended_at")?;
     let parameters_digest = fields.text("parameters_digest")?;
-    refuse_protected_fields(&fields)?;
     fields.rest("Activity")?;
 
     let structural = match set_structural {
@@ -2293,7 +2276,7 @@ fn is_terminal(status: &str) -> bool {
 /// The element an earlier attempt already created under this `CLIENT KEY`.
 ///
 /// Looked up before the clause is built so the build can be skipped when the
-/// answer is "nothing yet", and settled by [`settle_client_key`] once there is
+/// answer is "nothing yet", and settled by [`client_key_retry`] once there is
 /// something to compare.
 async fn find_client_key(
     store: &Store,

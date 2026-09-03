@@ -784,9 +784,7 @@ impl ChangeEnvelope {
         detail.insert("status".to_string(), Json::from(status));
         detail
     }
-}
 
-impl ChangeEnvelope {
     /// The at-least-once deduplication key (Spec §36.3).
     pub fn dedup_key(&self) -> (&str, u64, &str) {
         (&self.space_id, self.space_seq, &self.tx_id)

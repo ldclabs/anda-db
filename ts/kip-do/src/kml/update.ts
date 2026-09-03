@@ -221,21 +221,21 @@ export function applyAction(
   }
 
   if ('SetFacet' in action) {
+    // Resolved and evaluated once. An assignment may read the element it is
+    // writing — `MUL(?m.facets[…].memory_strength, 0.5)` — so evaluating the
+    // map a second time is not merely wasted work, it is a second reading of
+    // state the first one is about to move.
     const facet = resolveFacetText(tx, b, action.SetFacet.facet)
-    claim(
-      tx,
-      element,
-      `facets.${facet}`,
-      assignments(b, action.SetFacet.values, read),
-    )
+    const values = assignments(b, action.SetFacet.values, read)
+    claim(tx, element, `facets.${facet}`, values)
     mergeFacet(
       tx,
       b,
       row.facets,
       action.SetFacet,
-      read,
+      values,
       carrierOf(element),
-      facetMembers(view, resolveFacetText(tx, b, action.SetFacet.facet)),
+      facetMembers(view, facet),
     )
     return
   }
@@ -438,7 +438,7 @@ function mergeFacet(
   b: Bindings,
   facets: JsonMap,
   assignment: FacetAssignment,
-  read: (path: string[]) => Json,
+  values: JsonMap,
   carrier: EndpointFacts,
   before: JsonMap,
 ): void {
@@ -448,7 +448,6 @@ function mergeFacet(
     'write',
   )
   const text = formatSymbolRef(symbol)
-  const values = assignments(b, assignment.values, read)
   const definition = tx.env.definitionPackage(symbol)
   const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
   if (def !== undefined) {
