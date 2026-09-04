@@ -28,6 +28,7 @@ import {
   coordinateFromToken,
   pageCursorFromToken,
   pageToken,
+  traversalOf,
   type PageCursor,
 } from '../store/index.js'
 import { normalizeTime } from '../time.js'
@@ -112,8 +113,9 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
 
   // The cursor is read before the coordinate is bound, because it *is* one of
   // the things that decides the coordinate.
+  const traversal = traversalOf(query, b.request, b.operation)
   const cursor =
-    query.cursor === null ? null : readCursor(query.cursor, b, cx.space)
+    query.cursor === null ? null : readCursor(query.cursor, b, cx.space, traversal)
   const currentSeq = cx.store.currentSeq(cx.space)
   const named = bindCoordinate(query, cx, b)
   if (cursor !== null && named !== null && named !== cursor.snapshotSeq) {
@@ -215,6 +217,9 @@ function answer<T>(
   render: (row: T) => Json,
 ): KqlAnswer {
   const consumed = paged.offset + paged.rows.length
+  // The same identity the cursor was read under, so the token it issues
+  // continues this traversal and no other.
+  const traversal = traversalOf(query, cx.request ?? {}, cx.operation ?? {})
   return {
     rows: paged.rows.map(render),
     snapshotSeq: pinnedSeq,
@@ -225,6 +230,7 @@ function answer<T>(
             family: 'kql',
             snapshotSeq: pinnedSeq,
             offset: consumed,
+            traversal,
           })
         : null,
   }
@@ -687,6 +693,7 @@ function readCursor(
   cursor: Scalar,
   b: ReadBindings,
   space: string,
+  traversal: string,
 ): PageCursor {
   const value = scalarValue(cursor, b)
   if (typeof value !== 'string') {
@@ -701,7 +708,7 @@ function readCursor(
         `${JSON.stringify(value)}`,
     )
   }
-  return pageCursorFromToken(value, space, 'kql')
+  return pageCursorFromToken(value, space, 'kql', traversal)
 }
 
 export { Context, LIMITS } from './context.js'

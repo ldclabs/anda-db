@@ -117,6 +117,12 @@ const KNOWN_DIVERGENCES: readonly { source: string; why: string }[] = [
 
 const KNOWN = new Set(KNOWN_DIVERGENCES.map((d) => d.source))
 
+// §69.1 dropped `VERIFY BLOB` and `VERIFY CHECKPOINT`; `anda_kip` no longer
+// parses them, and `@ldclabs/kip-lang` follows in 2.3.0. Until that version is
+// published the installed parser still accepts them, and this engine refuses
+// them at execution instead — a different code for the same refusal.
+for (const source of ['VERIFY BLOB "x"', 'VERIFY CHECKPOINT "x"']) KNOWN.add(source)
+
 describe('parser oracle', () => {
   it('has a corpus worth trusting', () => {
     // A shrinking corpus is a silent loss of coverage: the generator walks the

@@ -413,14 +413,72 @@ impl Coordinate {
 /// a `FIND`, even though both count from zero. Without it the two are the same
 /// integer and the engine cannot tell which traversal it is being asked to
 /// resume.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCursor {
-    /// Which operation family issued it.
     pub family: CursorFamily,
-    /// The Space coordinate the traversal is pinned to.
     pub snapshot_seq: u64,
-    /// How many rows of it the caller has already consumed.
     pub offset: usize,
+    /// The traversal this cursor continues: [`traversal_of`] the query or
+    /// command that issued it. A cursor handed to a different query names a
+    /// page of nothing (§44.8), and the token says so rather than answering
+    /// with the wrong query's page.
+    pub traversal: String,
+}
+
+/// The identity of one traversal, for the cursor it issues (§44.8, §88.4).
+///
+/// The lowered command with its `cursor` and `limit` slots blanked, plus the
+/// parameters those slots did not consume: the same query paged with a
+/// different page size continues the same traversal, and the token that
+/// continues it is not part of the identity it continues.
+pub fn traversal_of<T: serde::Serialize>(
+    command: &T,
+    request: Option<&anda_kip::Map<String, anda_kip::Json>>,
+    operation: Option<&anda_kip::Map<String, anda_kip::Json>>,
+) -> String {
+    use sha3::{Digest, Sha3_256};
+    let mut command = serde_json::to_value(command).unwrap_or(anda_kip::Json::Null);
+    let mut consumed = Vec::new();
+    blank_paging(&mut command, &mut consumed);
+    let strip = |params: Option<&anda_kip::Map<String, anda_kip::Json>>| {
+        params.map(|params| {
+            let mut params = params.clone();
+            for name in &consumed {
+                params.remove(name);
+            }
+            anda_kip::Json::Object(params)
+        })
+    };
+    let identity = serde_json::json!({
+        "command": command,
+        "request": strip(request),
+        "operation": strip(operation),
+    });
+    let canonical = anda_kip::canonical_json(&identity);
+    hex::encode(Sha3_256::digest(canonical.as_bytes()))[..16].to_string()
+}
+
+fn blank_paging(value: &mut anda_kip::Json, consumed: &mut Vec<String>) {
+    match value {
+        anda_kip::Json::Object(map) => {
+            for slot in ["cursor", "limit"] {
+                if let Some(taken) = map.remove(slot)
+                    && let Some(name) = taken.get("Param").and_then(anda_kip::Json::as_str)
+                {
+                    consumed.push(name.to_string());
+                }
+            }
+            for child in map.values_mut() {
+                blank_paging(child, consumed);
+            }
+        }
+        anda_kip::Json::Array(items) => {
+            for item in items {
+                blank_paging(item, consumed);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The operation families that issue page cursors (§102.28).
@@ -455,10 +513,11 @@ impl PageCursor {
     /// Opaque by contract rather than by encryption, like a snapshot token: a
     /// client that decoded it would be depending on a shape this engine may
     /// change, and every field inside it is re-checked on the way back in.
-    pub fn to_token(self, space_id: &str) -> String {
+    pub fn to_token(&self, space_id: &str) -> String {
         hex::encode(format!(
-            "kip:cursor:{}:{space_id}:{}:{}",
+            "kip:cursor:{}:{space_id}:{}:{}:{}",
             self.family.tag(),
+            self.traversal,
             self.snapshot_seq,
             self.offset
         ))
@@ -472,7 +531,12 @@ impl PageCursor {
     /// Space and one from another operation family all fail to name a page
     /// of this traversal, and telling them apart would only tell a forger
     /// which part to fix.
-    pub fn from_token(token: &str, space_id: &str, family: CursorFamily) -> Result<Self, KipError> {
+    pub fn from_token(
+        token: &str,
+        space_id: &str,
+        family: CursorFamily,
+        traversal: &str,
+    ) -> Result<Self, KipError> {
         let invalid = || {
             KipError::cursor_invalid(
                 family.tag(),
@@ -492,14 +556,30 @@ impl PageCursor {
             return Err(invalid());
         }
         let (rest, offset) = rest.rsplit_once(':').ok_or_else(invalid)?;
-        let (space, snapshot_seq) = rest.rsplit_once(':').ok_or_else(invalid)?;
+        let (rest, snapshot_seq) = rest.rsplit_once(':').ok_or_else(invalid)?;
+        let (space, issued_for) = rest.rsplit_once(':').ok_or_else(invalid)?;
         if space != space_id {
             return Err(invalid());
         }
+        let offset: usize = offset.parse().map_err(|_| invalid())?;
+        let snapshot_seq: u64 = snapshot_seq.parse().map_err(|_| invalid())?;
+        // §44.8: a cursor continues the traversal that produced it. One from
+        // another query would answer with that query's page, silently.
+        if issued_for != traversal {
+            return Err(KipError::new(
+                anda_kip::KipErrorCode::CursorMismatch,
+                format!(
+                    "this {} cursor was issued by a different query; a cursor continues the \
+                     traversal that produced it, so restart this one from its first page",
+                    family.tag()
+                ),
+            ));
+        }
         Ok(PageCursor {
             family,
-            snapshot_seq: snapshot_seq.parse().map_err(|_| invalid())?,
-            offset: offset.parse().map_err(|_| invalid())?,
+            snapshot_seq,
+            offset,
+            traversal: issued_for.to_string(),
         })
     }
 }

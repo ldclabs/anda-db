@@ -88,6 +88,7 @@ export {
   elementOfVersion,
   pageCursorFromToken,
   pageToken,
+  traversalOf,
   snapshotToken,
   type Coordinate,
   type CursorFamily,

@@ -38,8 +38,6 @@ wire_enum! {
         Governance = "KIP-Governance",
         /// Atomicity, idempotency, receipts, preconditions (§94).
         Transactions = "KIP-Transactions",
-        /// Capsule export, verification, import pipeline (§95).
-        Capsule = "KIP-Capsule",
         /// The read language (§96).
         Kql = "KIP-KQL",
         /// The mutation language (§97).
@@ -48,18 +46,11 @@ wire_enum! {
         Meta = "KIP-META",
         /// The request/response envelope and execution modes (§99).
         Runtime = "KIP-Runtime",
-        /// `AS OF`, history, change cursors (§100).
-        Historical = "KIP-Historical",
-        /// Proofs, signatures, checkpoints (§101).
-        HighAssurance = "KIP-High-Assurance",
-        /// KIP 1.x migration and compatibility, required only of an
-        /// implementation that claims it (§103).
-        Migration1x = "KIP-1-Migration",
     }
 }
 
 impl ConformanceProfile {
-    /// The wire name, e.g. `"KIP-High-Assurance"`.
+    /// The wire name, e.g. `"KIP-Governance"`.
     ///
     /// The spelling a profile is declared under is its name in §89, so this
     /// reads better at call sites than [`Self::as_str`] does; they are the
@@ -182,9 +173,9 @@ mod tests {
 
     #[test]
     fn the_registry_matches_the_specifications_listing() {
-        // §89 lists thirteen; a profile added upstream must be added here
+        // §89 lists nine; a profile added upstream must be added here
         // rather than silently missing from every declaration.
-        assert_eq!(ConformanceProfile::ALL.len(), 13);
+        assert_eq!(ConformanceProfile::ALL.len(), 9);
         let names: Vec<&str> = ConformanceProfile::ALL.iter().map(|p| p.name()).collect();
         assert_eq!(
             names,
@@ -194,14 +185,10 @@ mod tests {
                 "KIP-Epistemic",
                 "KIP-Governance",
                 "KIP-Transactions",
-                "KIP-Capsule",
                 "KIP-KQL",
                 "KIP-KML",
                 "KIP-META",
                 "KIP-Runtime",
-                "KIP-Historical",
-                "KIP-High-Assurance",
-                "KIP-1-Migration",
             ]
         );
     }

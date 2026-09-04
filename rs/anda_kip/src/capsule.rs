@@ -423,7 +423,25 @@ pub fn canonical_json(value: &Json) -> String {
 
 fn write_canonical(value: &Json, out: &mut String) {
     match value {
-        Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_) => {
+        Json::Number(number) => {
+            // JCS writes numbers as ECMAScript does: an integral value has no
+            // fraction, so `1.0` and `1` are one number (§9.6). serde_json
+            // keeps the spelling it parsed, and two engines that digested
+            // `1.0` differently would disagree about every Capsule and
+            // Schema Package that carries one.
+            match number.as_f64() {
+                Some(float)
+                    if number.is_f64()
+                        && float.is_finite()
+                        && float.fract() == 0.0
+                        && float.abs() < 1e21 =>
+                {
+                    write!(out, "{}", float as i128).expect("writing to a String cannot fail");
+                }
+                _ => write!(out, "{number}").expect("writing to a String cannot fail"),
+            }
+        }
+        Json::Null | Json::Bool(_) | Json::String(_) => {
             // serde_json already emits these in the form JCS prescribes.
             write!(out, "{value}").expect("writing to a String cannot fail");
         }

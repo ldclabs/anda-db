@@ -64,6 +64,11 @@ pub async fn execute(
         Ok(cx) => cx,
         Err(err) => return Response::from(err),
     };
+    cx.traversal = crate::store::history::traversal_of(
+        command,
+        request.parameters.as_ref(),
+        operation.parameters.as_ref(),
+    );
     let environment_version = cx.env.version;
 
     match run(&mut cx, command).await {
@@ -106,7 +111,7 @@ pub(crate) fn read_cursor(
     family: crate::store::history::CursorFamily,
 ) -> Result<crate::store::history::PageCursor, KipError> {
     let token = describe::scalar_str(cx, scalar, "CURSOR")?;
-    crate::store::history::PageCursor::from_token(&token, &cx.space, family)
+    crate::store::history::PageCursor::from_token(&token, &cx.space, family, &cx.traversal)
 }
 
 /// Issues the cursor for the next page, when one remains.
@@ -121,6 +126,7 @@ pub(crate) fn next_cursor(
             family,
             snapshot_seq: cx.pinned_seq,
             offset: consumed,
+            traversal: cx.traversal.clone(),
         }
         .to_token(&cx.space)
     })
@@ -162,7 +168,7 @@ async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<
         MetaCommand::Search(search) => inspect::search(cx, search).await,
         MetaCommand::Validate(validate) => inspect::validate(cx, validate),
         MetaCommand::Preview(preview) => inspect::preview(cx, preview).await,
-        MetaCommand::Verify { target, value } => inspect::verify(cx, *target, value),
+        MetaCommand::Verify { target, value } => inspect::verify(cx, *target, value).await,
         MetaCommand::History(history) => history::history(cx, history).await,
         MetaCommand::Changes(changes) => history::changes(cx, changes).await,
         MetaCommand::ExportCapsule(command) => inspect::export_capsule(cx, command).await,
@@ -560,9 +566,12 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "unsupported": [
             {
                 "capability": "atomic_batch",
-                "detail": "execution.mode \"atomic\" over several operations",
-                "reason": "one transaction, one snapshot and all-or-none commit across \
-                           operations are not implemented; a batch runs operation by operation"
+                "detail": "execution.mode \"atomic\" over several operations (§75.3)",
+                "reason": "the §67.4 capability `atomic_batch` is answered false: one transaction across \
+                           several operations is not implemented, and a batch runs operation by \
+                           operation. A request that asks for it is refused rather than run as a \
+                           sequence that looks like one (§75.4); one MUTATE block is already one \
+                           Transaction (§53)"
             },
             {
                 "capability": "capsule_digest_profiles",
@@ -688,34 +697,30 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
 /// The §89 profiles this engine claims.
 ///
 /// A claim, not a wish: each of these is exercised by the shared conformance
-/// fixtures both engines run, and the two §89 names that are absent are absent
-/// for a reason a caller can check in `unsupported`:
-///
-/// ```text
-/// KIP-Transactions    §94 requires one transaction across several
-///                     operations — see `atomic_batch`
-/// KIP-High-Assurance  this engine signs nothing (§101)
-/// ```
+/// fixtures both engines run. §89 lists nine; this engine claims all nine.
+/// `KIP-Transactions` is claimed against §94's own list — one statement or
+/// one MUTATE block is the transaction it means, and several operations in
+/// one transaction is the `atomic_batch` capability this engine answers
+/// false to, not a profile requirement.
 ///
 /// `KIP-KQL` is claimed against §96's own list, which every item of is built.
 /// The two KQL gaps that remain — `nested_proposition_endpoint` and the
 /// projection ledger — are outside that list and stay in `unsupported`, where
 /// a caller can find them.
 ///
-/// `KIP-1-Migration` is present because this engine does migrate a 1.x
-/// database (§103).
+/// Capsule support, historical reads and 1.x migration are capabilities
+/// (`capsule_export` / `capsule_import`, `historical_reads`,
+/// `kip1_migration`), answered in the registry rather than claimed here.
 pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
     anda_kip::ConformanceProfile::Core,
     anda_kip::ConformanceProfile::Schema,
     anda_kip::ConformanceProfile::Epistemic,
     anda_kip::ConformanceProfile::Governance,
-    anda_kip::ConformanceProfile::Capsule,
+    anda_kip::ConformanceProfile::Transactions,
     anda_kip::ConformanceProfile::Kql,
     anda_kip::ConformanceProfile::Kml,
     anda_kip::ConformanceProfile::Meta,
     anda_kip::ConformanceProfile::Runtime,
-    anda_kip::ConformanceProfile::Historical,
-    anda_kip::ConformanceProfile::Migration1x,
 ];
 
 /// What the calling Principal may request, in at least some scope (§67.2).
@@ -778,6 +783,7 @@ pub fn capability_state(name: &str) -> Option<bool> {
 const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     // §32.2: mutations serialize behind one write lock that readers share.
     ("serializable_isolation", true, None),
+    ("atomic_batch", false, None),
     // §34.5: every journalled transaction is kept, so a key never expires.
     (
         "idempotency_retention",
@@ -812,6 +818,7 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ("capsule_signatures", false, None),
     ("derive_permission", false, None),
     ("record_outcome_permission", true, None),
+    ("kip1_migration", true, None),
 ];
 
 /// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4).
@@ -884,7 +891,6 @@ const SUPPORTED_NAMES: &[&str] = &[
 /// Kept beside [`SUPPORTED_NAMES`] so the two cannot drift into claiming and
 /// disclaiming the same thing; the unit test below checks they do not overlap.
 const UNSUPPORTED_NAMES: &[&str] = &[
-    "atomic_batch",
     "unregistered_permissions",
     "capsule_digest_profiles",
     "historical_search",
@@ -1059,9 +1065,9 @@ mod tests {
         }
         // Claimed only where it is true: this engine signs nothing (§101).
         assert!(
-            !profiles
+            profiles
                 .iter()
-                .any(|p| p.as_str() == Some("KIP-High-Assurance"))
+                .any(|p| p.as_str() == Some("KIP-Transactions"))
         );
     }
 }

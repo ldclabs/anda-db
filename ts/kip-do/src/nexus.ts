@@ -12,6 +12,7 @@
  * open; this one gets the property from the platform.
  */
 
+import { scopedIdempotencyKey } from './idempotency.js'
 import { errors, KipError } from './errors.js'
 import { formatElementId } from './id.js'
 
@@ -692,7 +693,7 @@ export class Session {
     const replayed =
       options.idempotencyKey === undefined || options.dryRun === true
         ? null
-        : this.nexus.store.transactionByKey(space, options.idempotencyKey)
+        : this.nexus.store.transactionForKey(space, this.auth.principal_id, options.idempotencyKey)
     if (replayed !== null) {
       for (const permission of needed) {
         requirePermittedForReplay(
@@ -730,7 +731,10 @@ export class Session {
       request: params,
       ingest: options.ingest,
       operation: options.operation,
-      idempotencyKey: options.idempotencyKey,
+      idempotencyKey:
+        options.idempotencyKey === undefined
+          ? undefined
+          : scopedIdempotencyKey(this.auth.principal_id, options.idempotencyKey),
       requestDigest:
         options.idempotencyKey === undefined
           ? undefined

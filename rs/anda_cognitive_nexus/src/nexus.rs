@@ -1321,11 +1321,8 @@ impl Session {
         if key.is_empty() {
             return Ok(None);
         }
-        let Some(row) = self
-            .nexus
-            .store
-            .find_transaction_by_idempotency_key(space, &key)
-            .await?
+        let Some(row) =
+            crate::kml::find_transaction_for_key(&self.nexus.store, space, auth, &key).await?
         else {
             return Ok(None);
         };
@@ -1406,6 +1403,17 @@ impl Session {
             }
         }
 
+        // A `critical` extension is a precondition, not a hint (request schema,
+        // `extensions`): this engine implements no request extensions, so one
+        // it is told it must honor fails the request rather than being ignored.
+        let critical = request.critical_extensions();
+        if !critical.is_empty() {
+            return Err(KipError::unsupported_capability(format!(
+                "this request marks the extension(s) {critical:?} critical, and this engine \
+                 implements no request extensions; a critical extension it cannot honor fails \
+                 the request rather than being silently ignored"
+            )));
+        }
         for (name, wanted) in request.requires.iter().flatten() {
             // A requirement is satisfied only by a capability this engine can
             // name. An unknown one is refused rather than assumed present: a

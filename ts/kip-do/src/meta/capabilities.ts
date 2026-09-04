@@ -44,6 +44,7 @@ export const MAX_DEPENDENTS_DEPTH = 8
  */
 export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   serializable_isolation: true, // §32.2: one Durable Object serializes its callers
+  atomic_batch: false, // §75.3: a batch runs operation by operation; one MUTATE block is one Transaction
   // §34.5: every committed transaction is kept, so a key never expires. The
   // detail rides on the entry rather than in a sibling map, because §67.4
   // shows the value there and a caller that read the two apart could read a
@@ -71,6 +72,7 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   capsule_signatures: false, // §37.8
   derive_permission: false, // §29.6: this engine does not distinguish derived writes
   record_outcome_permission: true, // §29.8
+  kip1_migration: false, // §103: no DESCRIBE COMPATIBILITY, no 1.x conversions
 }
 
 /**
@@ -140,7 +142,6 @@ const SUPPORTED_NAMES: readonly string[] = [
  * answer a `requires` check as *unrecognized* rather than as absent.
  */
 const UNSUPPORTED_NAMES: readonly string[] = [
-  'atomic_batch',
   'unregistered_permissions',
   'capsule_digest_profiles',
   'capsule_import',
@@ -234,20 +235,22 @@ export function capabilities(): Json {
     // `nested_proposition_endpoint`, `hop_quantifiers`, the projection ledger —
     // are outside that list and stay in `unsupported`:
     //
-    //   KIP-Transactions    §94 requires one transaction across several
-    //                       operations — see `atomic_batch`
-    //   KIP-Capsule         export and verification are built, import is not
-    //   KIP-High-Assurance  this engine signs nothing (§101)
+    //   KIP-Transactions    claimed against §94's own list: one statement or one
+    //                       MUTATE block is the transaction it means, and several
+    //                       operations in one is the `atomic_batch` capability
+    //   Capsule import, historical reads and 1.x migration are capabilities
+    //   (`capsule_import`, `historical_reads`, `kip1_migration`), answered in
+    //   the registry rather than claimed as profiles (§89).
     profiles: [
       'KIP-Core',
       'KIP-Schema',
       'KIP-Epistemic',
       'KIP-Governance',
+      'KIP-Transactions',
       'KIP-KQL',
       'KIP-KML',
       'KIP-META',
       'KIP-Runtime',
-      'KIP-Historical',
     ],
     languages: ['KQL', 'KML', 'META'],
     supported: {
@@ -961,6 +964,14 @@ export function capabilities(): Json {
           'and no way to tell',
       },
       {
+        capability: 'kip1_migration',
+        detail: 'DESCRIBE COMPATIBILITY and the §103 conversions',
+        reason:
+          'this engine never held a KIP 1.x database, so there is nothing to ' +
+          'convert and no compatibility model to describe; the reference ' +
+          'engine answers this capability true',
+      },
+      {
         capability: 'capsule_signatures',
         detail: 'signing an exported Capsule and verifying a signed one',
         reason:
@@ -1008,11 +1019,13 @@ export function capabilities(): Json {
       },
       {
         capability: 'atomic_batch',
-        detail: 'execution.mode "atomic" over several operations',
+        detail: 'execution.mode "atomic" over several operations (§75.3)',
         reason:
-          'one transaction across several operations is not implemented; a ' +
-          'batch runs operation by operation, each atomic on its own. Asking ' +
-          'for it is refused rather than run as a sequence that looks like one',
+          'the §67.4 capability `atomic_batch` is answered false: one transaction ' +
+          'across several operations is not implemented, and a batch runs ' +
+          'operation by operation, each atomic on its own. Asking for it is ' +
+          'refused rather than run as a sequence that looks like one (§75.4); ' +
+          'one MUTATE block is already one Transaction (§53)',
       },
       {
         capability: 'artifact_store',

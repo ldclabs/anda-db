@@ -33,6 +33,29 @@ async function tenantPost(name: string, body: unknown): Promise<KipResponse> {
 const CREATE = 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" SET FIELDS {key: "person:alice"} }'
 
 describe('receipts', () => {
+  it('verifies a Receipt it issued, and refuses one altered after sealing', async () => {
+    const committed = await post('verify', { kip: '2.0', operations: [{ command: CREATE }] })
+    const receipt = committed.results[0]?.receipt as unknown as Record<string, unknown>
+    expect(receipt).toBeDefined()
+    const verified = await post('verify', {
+      kip: '2.0',
+      operations: [{ command: 'VERIFY RECEIPT :r', parameters: { r: receipt } }],
+    })
+    const report = verified.results[0]?.result as Record<string, unknown>
+    expect(report.valid).toBe(true)
+    expect(report.receipt_digest).toBe(receipt.receipt_digest)
+    expect(report.attestation).toMatchObject({ checked: true, known: true, matches: true })
+    expect(report.signature).toMatchObject({ checked: false })
+    // Altered after sealing: the content no longer digests to what it declares.
+    const refused = await post('verify', {
+      kip: '2.0',
+      operations: [
+        { command: 'VERIFY RECEIPT :r', parameters: { r: { ...receipt, space_seq: 999 } } },
+      ],
+    })
+    expect(refused.results[0]?.error?.code).toBe('DigestMismatch')
+  })
+
   it('puts a Receipt on every state-changing operation, and none on the envelope', async () => {
     const body = await post('per-operation', {
       kip: '2.0',

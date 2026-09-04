@@ -1200,13 +1200,18 @@ pub(crate) fn op_name(op: ChangeOp) -> &'static str {
 /// — purge, tombstone, every always-audited permission — where an auditor
 /// most needs the two to agree.
 pub fn seal_receipt(mut receipt: Receipt) -> Receipt {
+    receipt.receipt_digest = Some(receipt_digest(&receipt));
+    receipt
+}
+
+/// The digest a Receipt is sealed with, and `VERIFY RECEIPT` recomputes.
+pub(crate) fn receipt_digest(receipt: &Receipt) -> String {
     let mut bare = receipt.clone();
     bare.receipt_digest = None;
     bare.proofs.clear();
     bare.extensions = None;
     let value = serde_json::to_value(&bare).unwrap_or(Json::Null);
-    receipt.receipt_digest = Some(digest_of(&value));
-    receipt
+    digest_of(&value)
 }
 
 /// The digest of a delegation chain, when the request ran under one (§28.5).

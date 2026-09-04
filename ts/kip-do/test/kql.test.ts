@@ -318,6 +318,27 @@ describe('KQL', () => {
     })
   })
 
+  it('continues only the traversal that issued the cursor', async () => {
+    // §44.8, §88.4: a cursor names a page of one traversal. Handed to another
+    // query it is refused, not answered with the first query's page.
+    await withNexus('cursor-binding', (nexus) => {
+      const first = nexus.queryPage(
+        'FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 1',
+      )
+      expect(first.nextCursor).not.toBeNull()
+      // The same traversal paged wider: the page size is not part of its identity.
+      const wider = nexus.queryPage(
+        `FIND(?c.name) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 5 CURSOR "${first.nextCursor}"`,
+      )
+      expect(wider.rows).toHaveLength(2)
+      expect(() =>
+        nexus.query(
+          `FIND(?c) WHERE { ?c CONCEPT {} } ORDER BY ?c.name LIMIT 1 CURSOR "${first.nextCursor}"`,
+        ),
+      ).toThrowError(/different query/)
+    })
+  })
+
   it('projects a belief now that BELIEF is built', async () => {
     await withNexus('belief', (nexus) => {
       // Covered properly in `projection.test.ts`; here only to keep the

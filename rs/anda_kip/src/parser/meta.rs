@@ -286,8 +286,6 @@ fn verify(input: &str) -> VResult<'_, MetaCommand> {
         value(VerifyTarget::SchemaPackage, words(&["SCHEMA", "PACKAGE"])),
         value(VerifyTarget::Capsule, map(word("CAPSULE"), |_| ())),
         value(VerifyTarget::Receipt, map(word("RECEIPT"), |_| ())),
-        value(VerifyTarget::Blob, map(word("BLOB"), |_| ())),
-        value(VerifyTarget::Checkpoint, map(word("CHECKPOINT"), |_| ())),
     ))))
     .parse(input)?;
     let (input, value) = cut(ws(scalar)).parse(input)?;

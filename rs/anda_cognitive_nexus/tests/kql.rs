@@ -611,3 +611,40 @@ async fn an_empty_where_block_is_one_solution_not_zero() {
     let all = ok(&nexus, r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }"#).await;
     assert_eq!(all, json!([4]));
 }
+
+#[tokio::test]
+async fn a_cursor_continues_only_the_traversal_that_issued_it() {
+    // §44.8, §88.4: a cursor names a page of one traversal. Handed to another
+    // query it is refused, not answered with the first query's page.
+    let nexus = seeded("cursor_binding").await;
+    let first = run(
+        &nexus,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY ?c.name LIMIT 1"#,
+    )
+    .await;
+    let cursor = first.next_cursor.clone().expect("more rows remain");
+
+    // The same traversal paged wider: the page size is not part of its identity.
+    let wider = run(
+        &nexus,
+        &format!(
+            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{type: "Person"}} }} ORDER BY ?c.name LIMIT 5 CURSOR "{cursor}""#
+        ),
+    )
+    .await;
+    assert_eq!(wider.status, TopLevelStatus::Succeeded, "{:?}", wider.error);
+    assert_eq!(rows(wider.first_result().unwrap()), &vec![json!("Bob")]);
+
+    let elsewhere = run(
+        &nexus,
+        &format!(
+            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{type: "Preference"}} }} ORDER BY ?c.name LIMIT 1 CURSOR "{cursor}""#
+        ),
+    )
+    .await;
+    assert_eq!(
+        elsewhere.error.as_ref().map(|err| err.code.as_str()),
+        Some("CursorMismatch"),
+        "{elsewhere:?}"
+    );
+}

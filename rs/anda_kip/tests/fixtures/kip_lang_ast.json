@@ -2762,32 +2762,6 @@
    }
   },
   {
-   "command": "VERIFY BLOB :a",
-   "ast": {
-    "Meta": {
-     "Verify": {
-      "target": "Blob",
-      "value": {
-       "Param": "a"
-      }
-     }
-    }
-   }
-  },
-  {
-   "command": "VERIFY CHECKPOINT :a",
-   "ast": {
-    "Meta": {
-     "Verify": {
-      "target": "Checkpoint",
-      "value": {
-       "Param": "a"
-      }
-     }
-    }
-   }
-  },
-  {
    "command": "VALIDATE KQL :a",
    "ast": {
     "Meta": {

@@ -825,16 +825,22 @@ async fn a_committed_transaction_is_recoverable_by_its_idempotency_key() {
     assert_eq!(response.status, TopLevelStatus::Succeeded);
     let tx_id = receipt(&response).unwrap().tx_id.clone().unwrap();
 
-    let recovered = nexus
-        .store
-        .find_transaction_by_idempotency_key(DEFAULT_SPACE, "key-1")
-        .await
-        .unwrap()
-        .expect("the key was journalled");
-    assert_eq!(recovered.tx_id, tx_id);
-    assert_eq!(recovered.status, "committed");
-    assert_eq!(recovered.changed_ids.len(), 1);
-    assert_eq!(recovered.schema_environment_version, 1);
+    // The key is journalled under the caller's own scope (§34.2), so the
+    // lookup a lost response needs goes through META as the caller.
+    let recovered = ok(&nexus, r#"DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "key-1""#).await;
+    assert_eq!(recovered["tx_id"], tx_id);
+    assert_eq!(recovered["status"], "committed");
+    assert_eq!(recovered["changes"].as_array().unwrap().len(), 1);
+    // The bare string is not the journal key any more: another Principal
+    // reusing it finds nothing of this caller's.
+    assert!(
+        nexus
+            .store
+            .find_transaction_by_idempotency_key(DEFAULT_SPACE, "key-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -26,7 +26,13 @@ async function withNexus(
 }
 
 interface Answer {
-  hits: { id: string; kind: string; score: number; element: Record<string, unknown> }[]
+  hits: {
+    id: string
+    kind: string
+    score: number
+    snippet: string
+    element: Record<string, unknown>
+  }[]
   search_context: Record<string, unknown>
   caveat: string
   next_cursor?: string
@@ -92,6 +98,16 @@ describe('SEARCH', () => {
       // and better-is-lower; leaving that sign alone would make `THRESHOLD 0.0`
       // reject every hit there is.
       expect(answer.hits[0]?.score).toBeGreaterThan(0)
+    })
+  })
+
+  it('carries a safe snippet of the matched text beside the element', async () => {
+    // §66.4: the indexed text, windowed around the term, from the redacted view.
+    await withNexus('snippet', (nexus) => {
+      nexus.execute(SETUP)
+      const answer = nexus.describe('SEARCH CONCEPT "Chen"') as unknown as Answer
+      expect(answer.hits[0]?.snippet).toContain('Alice Chen')
+      expect(Array.from(answer.hits[0]?.snippet ?? '').length).toBeLessThanOrEqual(200)
     })
   })
 

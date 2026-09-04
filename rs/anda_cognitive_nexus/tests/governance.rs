@@ -4402,3 +4402,91 @@ async fn a_retention_sweep_gates_and_spends_like_every_other_control_plane_call(
         "an approval authorizes one sweep, not a standing licence",
     );
 }
+
+#[tokio::test]
+async fn an_idempotency_key_belongs_to_the_principal_that_used_it() {
+    // §34.2: the key is scoped to the Principal, so another caller reusing
+    // the same string is doing its own work, not replaying this one's.
+    let nexus = stocked("idempotency_scope").await;
+    let request = serde_json::from_value::<Request>(serde_json::json!({
+        "kip": "2.0",
+        "execution": {"mode": "independent", "idempotency_key": "key-1"},
+        "operations": [{"command": r#"CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }"#}]
+    }))
+    .unwrap();
+    let parsed = request.operations[0].parse().unwrap();
+    let committed = nexus
+        .execute(parsed, &request, &request.operations[0])
+        .await;
+    assert_eq!(
+        committed.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        committed.error
+    );
+
+    let owner = nexus.system_session();
+    let mine = run_as(&owner, r#"DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "key-1""#).await;
+    assert_eq!(mine.status, TopLevelStatus::Succeeded, "{:?}", mine.error);
+
+    let reader = agent(nexus.governance(), "kip:principal:reader").await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.to_string(),
+                grantee_principal: reader.clone(),
+                actions: vec!["discover".into(), "read".into(), "read_history".into()],
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let session = nexus.session(AuthContext::principal(&reader));
+    let theirs = run_as(
+        &session,
+        r#"DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "key-1""#,
+    )
+    .await;
+    assert_eq!(
+        theirs.error.as_ref().map(|err| err.code.as_str()),
+        Some("TransactionUnknown"),
+        "{theirs:?}"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_holds_only_an_active_element_and_leaves_its_status_alone() {
+    // §31.6: quarantine is Governance state over an active element, not a
+    // lifecycle move. An archived element has nothing to be held out of, and
+    // releasing it would have brought it back active.
+    let nexus = stocked("quarantine_active_only").await;
+    let owner = nexus.system_session();
+    run_as(
+        &owner,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Filed" }"#,
+    )
+    .await;
+    let archived = run_as(&owner, r#"TRANSITION "C-1" TO "archived""#).await;
+    assert_eq!(
+        archived.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        archived.error
+    );
+
+    let element = ElementId::new(anda_kip::ElementKind::Concept, 1);
+    let refused = owner
+        .quarantine(DEFAULT_SPACE, element, "review")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.name(), "InvalidLifecycleTransition");
+
+    let still = run_as(
+        &owner,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {state: "archived"} }"#,
+    )
+    .await;
+    assert_eq!(still.status, TopLevelStatus::Succeeded, "{:?}", still.error);
+}

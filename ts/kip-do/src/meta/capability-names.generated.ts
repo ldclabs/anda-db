@@ -14,6 +14,7 @@
 /** The §67.4 registry names, in the Specification's order. */
 export const CAPABILITY_REGISTRY_NAMES: readonly string[] = [
   'serializable_isolation',
+  'atomic_batch',
   'idempotency_retention',
   'historical_reads',
   'historical_search',
@@ -37,12 +38,12 @@ export const CAPABILITY_REGISTRY_NAMES: readonly string[] = [
   'capsule_signatures',
   'derive_permission',
   'record_outcome_permission',
+  'kip1_migration',
 ]
 
 /** The engine-local names every engine in this repository answers. */
 export const CAPABILITY_ENGINE_NAMES: readonly string[] = [
   'artifact_store',
-  'atomic_batch',
   'canonical_matching',
   'capsule_digest_profiles',
   'capsule_export',

@@ -45,7 +45,7 @@
  * @see rs/anda_cognitive_nexus/src/governance/element.rs
  */
 
-import { errors } from '../errors.js'
+import { detailed, errors } from '../errors.js'
 import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import {
@@ -207,6 +207,18 @@ export function quarantine(
   reason: string,
 ): void {
   const element = readable(cx, id)
+  // §31.6: quarantine holds an *active* element out of ordinary use and
+  // leaves its lifecycle status alone; releasing a held archived element
+  // would have brought it back active.
+  if (element.row.state !== State.ACTIVE) {
+    throw detailed.invalidLifecycleTransitionFrom(
+      element.row.state,
+      State.QUARANTINED,
+      `${formatElementId(id)} is ${JSON.stringify(element.row.state)}; quarantine ` +
+        `holds an active element out of ordinary use and leaves its lifecycle ` +
+        `status alone (§31.6), so there is nothing here to hold`,
+    )
+  }
   const resource = resourceOfElement(element)
   const approved = decide(cx, resource, 'quarantine')
   apply(cx, element, 'quarantine', 'quarantine', State.QUARANTINED,

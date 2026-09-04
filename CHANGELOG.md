@@ -9,7 +9,80 @@ All notable changes to this workspace are documented in this file.
 unpublished, so this accumulates into the same version),
 `anda_cognitive_nexus_py` 0.6.0.
 
-Three syncs accumulate here. The latest one first.
+Four changes accumulate here. The latest one first.
+
+## The 2026-09-05 review: a lighter Specification, and four gaps nobody had declared
+
+The 2.0 draft moved with `ldclabs/KIP` — the profile list, the VERIFY targets,
+the Literal model, the permission tiers and the conformance harness were all
+simplified upstream — and the two engines close the four Specification gaps a
+line-by-line review found that neither `DESCRIBE CAPABILITIES` admitted to.
+
+### Changed (breaking) — the Specification
+
+- **Nine conformance profiles (§89).** `KIP-Capsule`, `KIP-Historical`,
+  `KIP-High-Assurance` and `KIP-1-Migration` are no longer profiles; what they
+  covered is advertised through the §67.4 registry, which gains
+  `atomic_batch` (§75.3) and `kip1_migration` (§103). `ConformanceProfile` in
+  `anda_kip` loses the four variants. Both engines now claim
+  `KIP-Transactions`: §94 means one statement or one MUTATE block, and the
+  batch form is `atomic_batch`, answered `false` by both.
+- **`VERIFY` takes `CAPSULE`, `SCHEMA PACKAGE` or `RECEIPT` (§69.1).**
+  `VerifyTarget::Blob` and `::Checkpoint` are gone from the AST and the parser;
+  `VERIFY BLOB` is now a syntax error rather than `UnsupportedCapability`.
+  `@ldclabs/kip-lang` 2.3.0 follows upstream; until it is published, the
+  TypeScript parser still accepts the two spellings and `ts/kip-do` refuses
+  them at execution.
+- **`VERIFY RECEIPT` and `VERIFY SCHEMA PACKAGE` are implemented** on both
+  engines instead of refused. A Receipt is checked against the digest §33.2
+  sealed it with and, where it names a transaction this Space committed and the
+  caller may `read_history`, against the Commit Record field by field. A
+  package is checked against its declared `integrity.content_digest` (§20.11,
+  sha256 over the canonical JSON of every top-level field except `integrity`)
+  and against the artifact installed under the same reference. Neither engine
+  checks signatures, and both say so in the report.
+
+### Changed (breaking) — the engines
+
+- **An idempotency key belongs to the Principal that used it (§34.2).** Both
+  engines journalled the client's key bare, scoped to the Space alone, so a
+  second Principal reusing the string was answered with the first one's Receipt
+  — or told the first one's `tx_id` through `IdempotencyConflict`. The journal
+  key is now scoped to the operation class and the Principal; `DESCRIBE
+  TRANSACTION BY IDEMPOTENCY KEY` and replay look it up the same way. Journals
+  written before this change stay replayable, by the Principal that wrote
+  them and by nobody else.
+- **A page cursor continues only the traversal that issued it (§44.8,
+  §88.4).** The token carries a digest of the lowered query with its `cursor`
+  and `limit` slots blanked, plus the parameters those slots did not consume;
+  a cursor handed to a different query fails `CursorMismatch` instead of
+  silently answering with the other query's page. The same query paged with
+  another `LIMIT` still continues. Cursor tokens change shape; a token issued
+  before this change is refused as malformed.
+- **A `critical` request extension the engine cannot honor fails the request
+  (`UnsupportedCapability`)** on both engines, as the request schema requires.
+  Neither engine implements any request extension, so every critical one
+  fails; a non-critical one is carried past. `anda_kip` already computed
+  `Request::critical_extensions`; nobody was asking it.
+- **Quarantine holds only an active element (§31.6).** Both engines model the
+  hold as engine state, and releasing it returned the element to `active`
+  regardless of what it had been — an archived element quarantined and
+  released came back into ordinary recall. Placing a hold on anything but an
+  active element now fails `InvalidLifecycleTransition`.
+
+### Added
+
+- **Search hits carry a `snippet` (§66.4)**: the indexed text of the redacted
+  view, windowed around the term, the same character-based algorithm on both
+  engines. `element` stays beside it.
+- Two cross-engine fixture cases pin the critical-extension rule
+  (`request-envelope.json`, 264 → 266 cases); the other four fixes are pinned
+  by engine tests on each side, because the fixture harness runs as one
+  Principal and cannot place a hold or forge a cursor.
+- `kip-do` answers `DESCRIBE COMPATIBILITY` with a reason that names
+  `kip1_migration`; the capability is `false` there and `true` on the
+  reference engine.
+
 
 ## The Python binding reaches the runtime surface it was declaring
 

@@ -1426,10 +1426,6 @@ pub enum VerifyTarget {
     SchemaPackage,
     /// `VERIFY RECEIPT`
     Receipt,
-    /// `VERIFY BLOB`
-    Blob,
-    /// `VERIFY CHECKPOINT`
-    Checkpoint,
 }
 
 /// `VALIDATE ...`

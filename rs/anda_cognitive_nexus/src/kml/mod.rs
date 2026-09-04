@@ -87,7 +87,7 @@ pub async fn execute(
         } else {
             request_digest(statement, request, operation)
         },
-        idempotency_key: key,
+        idempotency_key: scoped_idempotency_key(auth, &key),
         ..Default::default()
     };
     let schema_environment_version = tx.env.version;
@@ -555,6 +555,48 @@ fn origin_of(request: &Request, auth: &AuthContext) -> Json {
 /// An operation's own key wins over the request's: a batch that shared one key
 /// across several writes would have the second replay the first, so the
 /// narrower one is the one that means anything.
+/// The journal key a client's idempotency key is stored and looked up under.
+///
+/// §34.2 scopes a key to the Space, the authenticated Principal and the
+/// operation class, so that unrelated callers cannot collide: two Principals
+/// reusing the same string are two pieces of work, and answering the second
+/// with the first's Receipt would hand one caller the other's commit.
+pub(crate) fn scoped_idempotency_key(auth: &AuthContext, key: &str) -> String {
+    if key.is_empty() {
+        String::new()
+    } else {
+        format!("kml\u{1f}{}\u{1f}{key}", auth.principal_id)
+    }
+}
+
+/// The retained transaction a client's key names for this caller, if any.
+///
+/// Journals written before keys were scoped hold the client's key bare; those
+/// stay replayable by the Principal that wrote them and by nobody else.
+pub(crate) async fn find_transaction_for_key(
+    store: &Store,
+    space: &str,
+    auth: &AuthContext,
+    key: &str,
+) -> Result<Option<crate::store::rows::TransactionRow>, KipError> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if let Some(row) = store
+        .find_transaction_by_idempotency_key(space, &scoped_idempotency_key(auth, key))
+        .await?
+    {
+        return Ok(Some(row));
+    }
+    Ok(store
+        .find_transaction_by_idempotency_key(space, key)
+        .await?
+        .filter(|row| {
+            row.origin.get("principal_id").and_then(Json::as_str)
+                == Some(auth.principal_id.as_str())
+        }))
+}
+
 pub(crate) fn idempotency_key(request: &Request, operation: &Operation) -> String {
     operation
         .idempotency_key

@@ -84,6 +84,8 @@ pub struct Context<'a> {
     /// same canonical snapshot rather than over whatever the Space holds by
     /// then.
     pub pinned_seq: u64,
+    /// The identity of this traversal, for the cursors it reads and issues.
+    pub traversal: String,
     /// What the caller may see here, resolved once for the whole read.
     pub authority: &'a EffectiveAuthority,
     /// Who the caller is.
@@ -121,6 +123,7 @@ impl<'a> Context<'a> {
             projected: false,
             as_of: None,
             pinned_seq: store.get_space(space).await?.seq,
+            traversal: String::new(),
             authority,
             auth,
             read_origin: authority
@@ -546,7 +549,7 @@ impl<'a> Context<'a> {
         // Reconstruction is only engaged when the Space has actually moved on.
         // At the current coordinate the version log would rebuild exactly what
         // the live indexes already hold, at the cost of scanning it.
-        let from_cursor = cursor.and_then(|cursor| {
+        let from_cursor = cursor.as_ref().and_then(|cursor| {
             (cursor.snapshot_seq < self.pinned_seq).then_some(cursor.snapshot_seq)
         });
         if let Some(cursor) = cursor {
@@ -815,6 +818,7 @@ fn page_cursor(
         &token,
         space,
         crate::store::history::CursorFamily::Query,
+        &cx.traversal,
     )
 }
 
@@ -836,13 +840,19 @@ async fn run(
         auth,
     )
     .await?;
+    cx.traversal = crate::store::history::traversal_of(
+        query,
+        request.parameters.as_ref(),
+        operation.parameters.as_ref(),
+    );
     // The cursor is read before the coordinate is bound, because it *is* one
     // of the things that decides the coordinate.
     let cursor = match &query.cursor {
         Some(scalar) => Some(page_cursor(&cx, scalar, space)?),
         None => None,
     };
-    cx.bind_read(query.as_of.as_ref(), request, cursor).await?;
+    cx.bind_read(query.as_of.as_ref(), request, cursor.clone())
+        .await?;
     let environment_version = cx.env.version;
 
     if let Some(block) = &query.epistemic {
@@ -895,7 +905,7 @@ async fn run(
         &query.find_clause,
         query.order_by.as_ref(),
         limit,
-        cursor.map(|cursor| cursor.offset),
+        cursor.as_ref().map(|cursor| cursor.offset),
         pinned_seq,
     )?;
     Ok(Answer {

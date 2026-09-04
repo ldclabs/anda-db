@@ -11,6 +11,7 @@
  * and either commit or roll back as a unit.
  */
 
+import { scopedIdempotencyKey } from '../idempotency.js'
 import { errors } from '../errors.js'
 import {
   compareElementId,
@@ -729,6 +730,11 @@ export class Store extends RowStore {
    * This is what makes a lost response recoverable without writing again: the
    * caller replays the key, not the mutation (§80.4).
    */
+  /** The retained transaction a client's key names for one Principal (§34.2). */
+  transactionForKey(space: string, principalId: string, key: string): TransactionRow | null {
+    return this.transactionByKey(space, scopedIdempotencyKey(principalId, key))
+  }
+
   transactionByKey(space: string, key: string): TransactionRow | null {
     if (key === '') return null
     return this.one<TransactionRow>(

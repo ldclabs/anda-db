@@ -142,6 +142,25 @@ describe('the Durable Object', () => {
     expect(body.error?.code).toBe('UnsupportedIsolation')
   })
 
+  it('fails a request that marks an extension critical, and carries a non-critical one', async () => {
+    // The request schema: a critical extension the runtime cannot honor fails
+    // the request rather than being silently dropped.
+    const refused = await post('critical-extension', {
+      kip: '2.0',
+      extensions: { 'acme/redaction': { critical: true, mode: 'strict' } },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(refused.status).toBe(400)
+    const body = (await refused.json()) as KipResponse
+    expect(body.error?.code).toBe('UnsupportedCapability')
+    const carried = await post('critical-extension', {
+      kip: '2.0',
+      extensions: { 'acme/tracing': { critical: false, trace_id: 't-1' } },
+      operations: [{ command: 'DESCRIBE PROTOCOL' }],
+    })
+    expect(carried.status).toBe(200)
+  })
+
   it('refuses a mutation on the read-only path, and runs a read there', async () => {
     // §76: the rejection is on parsed semantics, not on a declared label, so
     // no envelope field can talk a write past the boundary.

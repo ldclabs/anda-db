@@ -16,21 +16,17 @@ import {
   CAPABILITY_REGISTRY_NAMES,
 } from '../src/meta/capability-names.generated.js'
 
-/** The thirteen profile names §89 lists, in the order it lists them. */
+/** The nine profile names §89 lists, in the order it lists them. */
 const KIP_CONFORMANCE_PROFILES = [
   'KIP-Core',
   'KIP-Schema',
   'KIP-Epistemic',
   'KIP-Governance',
   'KIP-Transactions',
-  'KIP-Capsule',
   'KIP-KQL',
   'KIP-KML',
   'KIP-META',
   'KIP-Runtime',
-  'KIP-Historical',
-  'KIP-High-Assurance',
-  'KIP-1-Migration',
 ]
 
 /**
@@ -151,9 +147,40 @@ describe('META', () => {
     // Claimed only where it is true. Each absence has an entry in
     // `unsupported` a caller can read the reason from.
     expect(report.profiles).toContain('KIP-KQL')
-    expect(report.profiles).not.toContain('KIP-High-Assurance')
-    expect(report.profiles).not.toContain('KIP-Transactions')
-    expect(report.profiles).not.toContain('KIP-Capsule')
+    // §94 names one statement or one MUTATE block as the transaction; the
+    // batch form is the `atomic_batch` capability, answered false.
+    expect(report.profiles).toContain('KIP-Transactions')
+    expect(report.profiles).toHaveLength(9)
+  })
+
+  it('verifies a Schema Package against its declared digest and the installed artifact', async () => {
+    await withNexus('verify-package', (nexus) => {
+      const artifact = COGNITIVE_MEMORY as unknown as Record<string, unknown>
+      const report = nexus.describe('VERIFY SCHEMA PACKAGE :p', {
+        p: artifact as never,
+      }) as Record<string, unknown>
+      expect(report.valid).toBe(true)
+      expect(report.package_ref).toBe('kip://profiles/cognitive-memory@2.0.0')
+      expect(report.declared).toMatchObject({ checked: true })
+      expect(report.installed).toEqual({ known: true, matches: true })
+      // A byte changed after sealing fails the declared digest (§20.11).
+      const manifest = artifact.manifest as Record<string, unknown>
+      const tampered: Record<string, unknown> = {
+        ...artifact,
+        manifest: { ...manifest, description: 'edited after sealing' },
+      }
+      expect(() =>
+        nexus.describe('VERIFY SCHEMA PACKAGE :p', { p: tampered as never }),
+      ).toThrowError(/modified after it was published/)
+      // Intact on its own terms, but not the content installed under that name.
+      const { integrity: _integrity, ...unsealed } = tampered
+      const differing = nexus.describe('VERIFY SCHEMA PACKAGE :p', {
+        p: unsealed as never,
+      }) as Record<string, unknown>
+      expect(differing.declared).toMatchObject({ checked: false })
+      expect(differing.installed).toEqual({ known: true, matches: false })
+      expect(differing.valid).toBe(false)
+    })
   })
 
   it('orients an Agent before its first command', async () => {
@@ -447,7 +474,7 @@ describe('META', () => {
       // asking.
       expect(() =>
         nexus.describe('VERIFY SCHEMA PACKAGE "kip://core@2.0.0"'),
-      ).toThrowError(/not implemented by this engine/)
+      ).toThrowError(/does not parse/)
       // An Assertion has no free text, so an empty answer would read as "no
       // such claim exists" rather than "nothing here is searchable".
       expect(() => nexus.describe('SEARCH ASSERTION "Alice"')).toThrowError(

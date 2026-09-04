@@ -2152,7 +2152,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "request-envelope",
-    "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope. `requires` is the third: §67.4 fixes the capability names, so a fail-fast precondition written once must get the same answer from either engine — including for an entry whose value is a detail object rather than a bare `true`, and for a name no registry knows, which fails exactly as an unsupported one does. And an `ingest` block is minted inside the request's transaction, so a request that carries only reads opens no scope to mint into: refused, because minting nothing while answering `succeeded` leaves the caller believing the observation was recorded.",
+    "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope. `requires` is the third: §67.4 fixes the capability names, so a fail-fast precondition written once must get the same answer from either engine — including for an entry whose value is a detail object rather than a bare `true`, and for a name no registry knows, which fails exactly as an unsupported one does. And an `ingest` block is minted inside the request's transaction, so a request that carries only reads opens no scope to mint into: refused, because minting nothing while answering `succeeded` leaves the caller believing the observation was recorded. And `extensions` is the fourth: a block marked `critical` is a precondition the runtime must honor or refuse, never one it may silently drop.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {canonical_id: \"urn:x:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
     ],
@@ -2474,6 +2474,38 @@ export const FIXTURES: readonly Fixture[] = [
         },
         "expect": {
           "error": "InvalidRequestEnvelope"
+        }
+      },
+      {
+        "name": "a critical extension this engine does not implement fails the request rather than being ignored",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "envelope": {
+          "extensions": {
+            "acme/redaction": {
+              "critical": true,
+              "mode": "strict"
+            }
+          }
+        },
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
+      },
+      {
+        "name": "and a non-critical one is carried past without effect",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "envelope": {
+          "extensions": {
+            "acme/tracing": {
+              "critical": false,
+              "trace_id": "t-1"
+            }
+          }
+        },
+        "expect": {
+          "result": [
+            "Alice"
+          ]
         }
       }
     ]
@@ -3385,4 +3417,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 264
+export const CASE_COUNT = 266

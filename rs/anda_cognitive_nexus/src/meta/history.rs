@@ -249,9 +249,7 @@ pub async fn transaction(cx: &mut Context<'_>, tx_id: &str) -> Result<Json, KipE
 
 /// `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` — the lost-response lookup (§80.4).
 pub async fn transaction_by_key(cx: &mut Context<'_>, key: &str) -> Result<Json, KipError> {
-    let row = cx
-        .store
-        .find_transaction_by_idempotency_key(&cx.space, key)
+    let row = crate::kml::find_transaction_for_key(cx.store, &cx.space, cx.auth, key)
         .await?
         .ok_or_else(|| {
             KipError::new(

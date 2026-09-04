@@ -18,7 +18,7 @@
 //! epistemic commitment out of a text match.
 
 use anda_kip::{
-    ElementKind, Json, KipError, KipErrorCode, PreviewCommand, SearchCommand, SearchTarget,
+    ElementKind, Json, KipError, KipErrorCode, PreviewCommand, Scalar, SearchCommand, SearchTarget,
     ValidateCommand, ValidateTarget, VerifyTarget,
 };
 
@@ -191,6 +191,9 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
                     // Assertion would invent an epistemic commitment out of a
                     // text match.
                     "score": score,
+                    // §66.4: a safe snippet — the indexed text of the redacted
+                    // view, windowed around the term — beside the element.
+                    "snippet": snippet_of(kind, rendered.as_ref(), &term),
                     "element": rendered.as_ref(),
                 }),
             ));
@@ -416,10 +419,10 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
 }
 
 /// `VERIFY` — integrity.
-pub fn verify(
+pub async fn verify(
     cx: &mut Context<'_>,
     target: VerifyTarget,
-    value: &anda_kip::Scalar,
+    value: &Scalar,
 ) -> Result<Answer, KipError> {
     match target {
         VerifyTarget::Capsule => {
@@ -427,12 +430,321 @@ pub fn verify(
             let capsule = crate::capsule::parse(&source)?;
             Ok(Answer::whole(crate::capsule::verify(&capsule)?))
         }
-        // Answering `{"valid": true}` without checking anything would be the
-        // worst possible failure here: integrity is exactly the layer a caller
-        // trusts to be paranoid on its behalf.
-        other => Err(KipError::unsupported_capability(format!(
-            "this engine cannot verify a {other:?}: it implements no signature checking for one, \
-             and reporting an unverified artifact as valid would defeat the purpose of asking"
-        ))),
+        VerifyTarget::Receipt => verify_receipt(cx, value).await,
+        VerifyTarget::SchemaPackage => verify_package(cx, value).await,
     }
+}
+
+/// The artifact a `VERIFY` operand names: JSON text, or the object itself
+/// when it arrives bound as a parameter.
+fn artifact_json(cx: &Context<'_>, scalar: &Scalar, what: &str) -> Result<Json, KipError> {
+    let value = match scalar {
+        Scalar::Literal(literal) => Json::from(literal.clone()),
+        Scalar::Param(name) => cx.param_ref(name)?,
+    };
+    match value {
+        Json::String(text) => serde_json::from_str(&text).map_err(|err| {
+            KipError::new(
+                KipErrorCode::ArtifactParseError,
+                format!(
+                    "{what} takes the artifact as JSON text or as an object, and this text does \
+                     not parse: {err}"
+                ),
+            )
+        }),
+        Json::Object(_) => Ok(value),
+        other => Err(KipError::new(
+            KipErrorCode::ArtifactParseError,
+            format!("{what} takes the artifact as JSON text or as an object, got {other}"),
+        )),
+    }
+}
+
+/// `VERIFY RECEIPT` (§69.1): the digest §33.2 seals a Receipt with, recomputed,
+/// and — where the Receipt names a transaction this Space committed — the
+/// Commit Record it describes, compared field by field.
+async fn verify_receipt(cx: &mut Context<'_>, value: &Scalar) -> Result<Answer, KipError> {
+    let artifact = artifact_json(cx, value, "VERIFY RECEIPT")?;
+    let receipt: anda_kip::Receipt = serde_json::from_value(artifact).map_err(|err| {
+        KipError::new(
+            KipErrorCode::ArtifactParseError,
+            format!("this is not a readable Receipt: {err}"),
+        )
+    })?;
+    let Some(declared) = receipt.receipt_digest.clone() else {
+        return Err(KipError::new(
+            KipErrorCode::ArtifactParseError,
+            "a Receipt carries `receipt_digest` (§33.2), and one without it cannot be checked",
+        ));
+    };
+    let recomputed = crate::tx::receipt_digest(&receipt);
+    if declared != recomputed {
+        return Err(KipError::new(
+            KipErrorCode::DigestMismatch,
+            format!(
+                "this Receipt declares the digest {declared} and its content digests to \
+                 {recomputed}; it was modified after it was issued"
+            ),
+        ));
+    }
+    let attestation = attest_receipt(cx, &receipt).await?;
+    let valid = attestation
+        .get("matches")
+        .and_then(Json::as_bool)
+        .unwrap_or(true);
+    Ok(Answer::whole(serde_json::json!({
+        "valid": valid,
+        "receipt_digest": recomputed,
+        "signed": !receipt.proofs.is_empty(),
+        "signature": {
+            "checked": false,
+            "reason": "signed_receipts is not advertised (§33.3); a proof on this Receipt is \
+                       carried, not checked",
+        },
+        "attestation": attestation,
+        "note": "a matching digest means the Receipt is intact; attestation says whether this \
+                 runtime committed what it describes",
+    })))
+}
+
+/// Whether the journal holds the transaction a Receipt describes, and whether
+/// it says the same thing. Reading the journal takes `read_history`; a caller
+/// without it gets the digest check alone, and no hint about which
+/// transactions exist (§30.4).
+async fn attest_receipt(
+    cx: &mut Context<'_>,
+    receipt: &anda_kip::Receipt,
+) -> Result<Json, KipError> {
+    let allowed = cx
+        .authority
+        .authorize(
+            crate::governance::Permission::ReadHistory,
+            &crate::governance::ResourceContext::default(),
+            cx.auth,
+        )
+        .into_result()
+        .is_ok();
+    if !allowed {
+        return Ok(serde_json::json!({
+            "checked": false,
+            "reason": "attestation reads the transaction journal, which takes read_history",
+        }));
+    }
+    let unknown = serde_json::json!({"checked": true, "known": false});
+    let Some(tx_id) = receipt.tx_id.as_deref() else {
+        return Ok(unknown);
+    };
+    let Some(row) = cx.store.find_transaction(tx_id).await? else {
+        return Ok(unknown);
+    };
+    if row.space != cx.space {
+        return Ok(unknown);
+    }
+    let mut mismatched: Vec<&str> = Vec::new();
+    let status = serde_json::to_value(receipt.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if status != row.status {
+        mismatched.push("status");
+    }
+    if receipt
+        .space_id
+        .as_deref()
+        .is_some_and(|id| id != row.space)
+    {
+        mismatched.push("space_id");
+    }
+    if receipt.space_seq.is_some_and(|seq| seq != row.seq) {
+        mismatched.push("space_seq");
+    }
+    if receipt
+        .snapshot_seq
+        .is_some_and(|seq| seq != row.snapshot_seq)
+    {
+        mismatched.push("snapshot_seq");
+    }
+    if receipt
+        .committed_at
+        .as_deref()
+        .is_some_and(|at| at != row.committed_at)
+    {
+        mismatched.push("committed_at");
+    }
+    if receipt
+        .transaction_class
+        .as_deref()
+        .is_some_and(|class| class != row.transaction_class)
+    {
+        mismatched.push("transaction_class");
+    }
+    if receipt
+        .request_digest
+        .as_deref()
+        .is_some_and(|digest| !row.request_digest.is_empty() && digest != row.request_digest)
+    {
+        mismatched.push("request_digest");
+    }
+    if receipt
+        .schema_environment_version
+        .is_some_and(|version| version != row.schema_environment_version)
+    {
+        mismatched.push("schema_environment_version");
+    }
+    Ok(serde_json::json!({
+        "checked": true,
+        "known": true,
+        "tx_id": tx_id,
+        "matches": mismatched.is_empty(),
+        "mismatched": mismatched,
+    }))
+}
+
+/// `VERIFY SCHEMA PACKAGE` (§69.1): the artifact's own declared digest
+/// (§20.11, sha256 over every top-level field except `integrity`), and —
+/// where a package is installed under the same reference — whether it is the
+/// same content.
+async fn verify_package(cx: &mut Context<'_>, value: &Scalar) -> Result<Answer, KipError> {
+    let artifact = artifact_json(cx, value, "VERIFY SCHEMA PACKAGE")?;
+    let text = serde_json::to_string(&artifact).map_err(|err| {
+        KipError::internal_error(format!("a JSON value failed to re-encode: {err}"))
+    })?;
+    let package = crate::schema::SchemaPackage::parse(&text)?;
+    let package_ref = package.package_ref()?.to_string();
+    let integrity = artifact.get("integrity");
+    let declared = integrity
+        .and_then(|integrity| integrity.get("content_digest"))
+        .and_then(Json::as_str)
+        .filter(|digest| !digest.is_empty());
+    let declared = match declared {
+        Some(declared) => {
+            let mut covered = artifact.clone();
+            if let Some(object) = covered.as_object_mut() {
+                object.remove("integrity");
+            }
+            let recomputed = declared_package_digest(&covered);
+            if recomputed != declared {
+                return Err(KipError::new(
+                    KipErrorCode::DigestMismatch,
+                    format!(
+                        "this package declares the digest {declared} and its content digests to \
+                         {recomputed}; it was modified after it was published"
+                    ),
+                ));
+            }
+            serde_json::json!({
+                "checked": true,
+                "content_digest": declared,
+                "covers": "all top-level fields except integrity",
+            })
+        }
+        None => serde_json::json!({
+            "checked": false,
+            "reason": "the artifact declares no integrity.content_digest",
+        }),
+    };
+    let engine_digest =
+        crate::store::schema::content_digest(&serde_json::to_value(&package).unwrap_or(Json::Null));
+    let installed = match cx.store.installed_packages().await?.get(&package_ref) {
+        Some(stored) => {
+            let stored_digest = crate::store::schema::content_digest(
+                &serde_json::to_value(stored.as_ref()).unwrap_or(Json::Null),
+            );
+            serde_json::json!({"known": true, "matches": stored_digest == engine_digest})
+        }
+        None => serde_json::json!({"known": false}),
+    };
+    let valid = installed
+        .get("matches")
+        .and_then(Json::as_bool)
+        .unwrap_or(true);
+    let signatures = integrity
+        .and_then(|integrity| integrity.get("signatures"))
+        .and_then(Json::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Ok(Answer::whole(serde_json::json!({
+        "valid": valid,
+        "package_ref": package_ref,
+        "content_digest": engine_digest,
+        "declared": declared,
+        "signed": signatures > 0,
+        "signature": {
+            "checked": false,
+            "reason": "capsule_signatures is not advertised (§37.8); a signature on this package \
+                       is carried, not checked",
+        },
+        "installed": installed,
+        "note": "a matching digest means the artifact is intact, not that its definitions are \
+                 wanted; VALIDATE SCHEMA PACKAGE and DESCRIBE PACKAGE answer that",
+    })))
+}
+
+/// The digest a published package declares (§20.11): `sha256:` over the RFC
+/// 8785 canonical JSON of the artifact without its `integrity` block, which
+/// is how the Cognitive Memory Profile's own artifact was sealed.
+fn declared_package_digest(covered: &Json) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(anda_kip::canonical_json(covered).as_bytes()))
+    )
+}
+
+/// The characters a search snippet shows.
+const SNIPPET_WIDTH: usize = 200;
+
+/// A safe snippet for a search hit (§66.4): the text the index matched on,
+/// read from the **redacted** view so a masked field stays masked (§88.5),
+/// windowed around the first occurrence of the term.
+fn snippet_of(kind: ElementKind, view: &Json, term: &str) -> String {
+    let fields: &[&str] = match kind {
+        ElementKind::Concept => &["name", "aliases", "attributes"],
+        ElementKind::Proposition => &["predicate_ref"],
+        ElementKind::Evidence => &["payload"],
+        _ => &[],
+    };
+    let mut text = String::new();
+    for field in fields {
+        collect_text(&view[*field], &mut text);
+    }
+    window(&text, term, SNIPPET_WIDTH)
+}
+
+fn collect_text(value: &Json, out: &mut String) {
+    match value {
+        Json::String(text) => {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(text);
+        }
+        Json::Array(items) => items.iter().for_each(|item| collect_text(item, out)),
+        Json::Object(map) => map.values().for_each(|item| collect_text(item, out)),
+        _ => {}
+    }
+}
+
+/// `width` characters of `text` around the first case-insensitive occurrence
+/// of `term`, or from the start when it does not occur as a phrase. Character
+/// based on both engines, so the two produce the same snippet.
+fn window(text: &str, term: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let lower: Vec<char> = chars.iter().map(|c| fold(*c)).collect();
+    let needle: Vec<char> = term.chars().map(fold).collect();
+    let at = (!needle.is_empty())
+        .then(|| {
+            lower
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+        })
+        .flatten();
+    let start = at.map(|i| i.saturating_sub(width / 4)).unwrap_or(0);
+    let end = (start + width).min(chars.len());
+    chars[start..end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string()
 }

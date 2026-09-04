@@ -27,6 +27,7 @@
   ],
   "registry": [
     "serializable_isolation",
+    "atomic_batch",
     "idempotency_retention",
     "historical_reads",
     "historical_search",
@@ -49,11 +50,11 @@
     "capsule_import",
     "capsule_signatures",
     "derive_permission",
-    "record_outcome_permission"
+    "record_outcome_permission",
+  "kip1_migration"
   ],
   "engine": [
     "artifact_store",
-    "atomic_batch",
     "canonical_matching",
     "capsule_digest_profiles",
     "capsule_export",

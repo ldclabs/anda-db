@@ -239,6 +239,21 @@ pub async fn quarantine(
         auth,
     )
     .await?;
+    // §31.6: quarantine holds an *active* element out of ordinary use and
+    // leaves its lifecycle status alone. Holding an archived element and then
+    // releasing it would return it as active, rewriting a status quarantine
+    // is not allowed to touch.
+    if element.state() != state::ACTIVE {
+        return Err(KipError::invalid_lifecycle_transition_from(
+            element.state(),
+            state::QUARANTINED,
+            format!(
+                "{id} is {:?}; quarantine holds an active element out of ordinary use and \
+                 leaves its lifecycle status alone (§31.6), so there is nothing here to hold",
+                element.state()
+            ),
+        ));
+    }
     let reason = reason.to_string();
     let patch =
         |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::from(reason.as_str()));

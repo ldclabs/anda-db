@@ -31,7 +31,9 @@
  * @see rs/anda_cognitive_nexus/src/store/history.rs
  */
 
+import { sha3_256Text } from '../digest.js'
 import { detailed, errors, type CursorFamily as WireCursorFamily } from '../errors.js'
+import { canonicalJson, type Json, type JsonMap } from '../json.js'
 import { formatElementId, kindOfTag, tagOf, type ElementId, type ElementKind } from '../id.js'
 import { decodeRow, type SqlRow } from './codec.js'
 import {
@@ -118,6 +120,54 @@ export interface PageCursor {
   family: CursorFamily
   snapshotSeq: number
   offset: number
+  /**
+   * The traversal this cursor continues: {@link traversalOf} the query or
+   * command that issued it. A cursor handed to a different query names a page
+   * of nothing (§44.8), and the token says so rather than answering with the
+   * wrong query's page.
+   */
+  traversal: string
+}
+
+/**
+ * The identity of one traversal, for the cursor it issues (§44.8, §88.4).
+ *
+ * The lowered command with its `cursor` and `limit` slots blanked, plus the
+ * parameters those slots did not consume: the same query paged with a
+ * different page size continues the same traversal, and the token that
+ * continues it is not part of the identity it continues.
+ */
+export function traversalOf(command: unknown, request?: JsonMap, operation?: JsonMap): string {
+  const consumed = new Set<string>()
+  const blanked = blankPaging(JSON.parse(JSON.stringify(command ?? null)) as Json, consumed)
+  const strip = (params: JsonMap | undefined): Json => {
+    if (params === undefined) return null
+    const out: JsonMap = {}
+    for (const [name, value] of Object.entries(params)) {
+      if (!consumed.has(name)) out[name] = value
+    }
+    return out
+  }
+  const identity = { command: blanked, request: strip(request), operation: strip(operation) }
+  return sha3_256Text(canonicalJson(identity)).slice(0, 16)
+}
+
+function blankPaging(value: Json, consumed: Set<string>): Json {
+  if (Array.isArray(value)) return value.map((item) => blankPaging(item, consumed))
+  if (value === null || typeof value !== 'object') return value
+  const out: JsonMap = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'cursor' || key === 'limit') {
+      const param =
+        child !== null && typeof child === 'object' && !Array.isArray(child)
+          ? (child as JsonMap).Param
+          : undefined
+      if (typeof param === 'string') consumed.add(param)
+      continue
+    }
+    out[key] = blankPaging(child, consumed)
+  }
+  return out
 }
 
 /**
@@ -133,7 +183,7 @@ export type CursorFamily = Extract<WireCursorFamily, 'kql' | 'search' | 'list' |
 /** The opaque token a client passes back to continue. */
 export function pageToken(spaceId: string, cursor: PageCursor): string {
   return hexEncode(
-    `kip:cursor:${cursor.family}:${spaceId}:${cursor.snapshotSeq}:${cursor.offset}`,
+    `kip:cursor:${cursor.family}:${spaceId}:${cursor.traversal}:${cursor.snapshotSeq}:${cursor.offset}`,
   )
 }
 
@@ -145,6 +195,7 @@ export function pageCursorFromToken(
   token: string,
   spaceId: string,
   family: CursorFamily,
+  traversal: string,
 ): PageCursor {
   const invalid = () =>
     detailed.cursorInvalid(
@@ -173,11 +224,23 @@ export function pageCursorFromToken(
   const seqColon = head.lastIndexOf(':')
   if (seqColon < 0) throw invalid()
   const snapshotSeq = Number(head.slice(seqColon + 1))
-  const space = head.slice(0, seqColon)
+  const scoped = head.slice(0, seqColon)
+  const traversalColon = scoped.lastIndexOf(':')
+  if (traversalColon < 0) throw invalid()
+  const issuedFor = scoped.slice(traversalColon + 1)
+  const space = scoped.slice(0, traversalColon)
   if (space !== spaceId) throw invalid()
   if (!Number.isInteger(offset) || offset < 0) throw invalid()
   if (!Number.isInteger(snapshotSeq) || snapshotSeq < 0) throw invalid()
-  return { family, snapshotSeq, offset }
+  // §44.8: a cursor continues the traversal that produced it. One from another
+  // query would answer with that query's page, silently.
+  if (issuedFor !== traversal) {
+    throw errors.cursorMismatch(
+      `this ${family} cursor was issued by a different query; a cursor continues ` +
+        `the traversal that produced it, so restart this one from its first page`,
+    )
+  }
+  return { family, snapshotSeq, offset, traversal: issuedFor }
 }
 
 function hexEncode(text: string): string {

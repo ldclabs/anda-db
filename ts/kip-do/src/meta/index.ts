@@ -45,7 +45,9 @@ import {
   type ElementId,
   type ElementKind,
 } from '../id.js'
-import { compareCodePoints, type Json, type JsonMap } from '../json.js'
+import { sha256Text } from '../digest.js'
+import { canonicalJson, compareCodePoints, isJsonMap, type Json, type JsonMap } from '../json.js'
+import { receiptDigest } from '../receipt.js'
 import type {
   AsOf,
   ChangesCommand,
@@ -56,6 +58,7 @@ import type {
   Scalar,
   SearchCommand,
   ValidateCommand,
+  VerifyTarget,
 } from '../kip/ast.js'
 import { parseKip, parserVersion, specRevision } from '../kip/parser.js'
 import { executeKml } from '../kml/index.js'
@@ -79,6 +82,9 @@ import {
   predicateDef,
   structuralFieldDef,
   symbols,
+  formatPackageRef,
+  packageRefOf,
+  parsePackage,
   type SchemaEnvironment,
   type SymbolKind,
 } from '../schema/index.js'
@@ -87,6 +93,7 @@ import {
   TABLES,
   pageCursorFromToken,
   pageToken,
+  traversalOf,
   searchIndex,
   snapshotToken,
   type ChangeEntry,
@@ -114,6 +121,8 @@ export interface MetaContext {
   env: SchemaEnvironment
   request?: JsonMap
   operation?: JsonMap
+  /** The identity of this command's traversal, for the cursors it reads and issues. */
+  traversal?: string
   /**
    * What the caller may do here, resolved once for the whole command.
    *
@@ -153,6 +162,7 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
     operation: cx.operation ?? {},
     policy: baseline(),
   }
+  cx.traversal = traversalOf(command, b.request, b.operation)
 
   if ('Describe' in command) return describe(command.Describe, cx, b)
   if ('List' in command) return list(command.List, cx, b)
@@ -172,14 +182,7 @@ export function executeMeta(command: MetaCommand, cx: MetaContext): Json {
     return exportCapsule(command.ExportCapsule, cx, b)
   }
   if ('Verify' in command) {
-    if (command.Verify.target !== 'Capsule') {
-      throw errors.unsupportedCapability(
-        `VERIFY ${command.Verify.target} is not implemented by this engine; ` +
-          `reporting an unchecked artifact as valid would cancel the point of ` +
-          `asking`,
-      )
-    }
-    return verifyCapsule(scalarValue(command.Verify.value, b))
+    return verify(command.Verify.target, scalarValue(command.Verify.value, b), cx)
   }
   return search(command.Search, cx, b)
 }
@@ -293,7 +296,7 @@ function describe(
       b,
       'DESCRIBE TRANSACTION BY IDEMPOTENCY KEY',
     )
-    const row = cx.store.transactionByKey(cx.space, key)
+    const row = cx.store.transactionForKey(cx.space, cx.auth.principal_id, key)
     if (row === null) {
       // A key nobody committed under is not an error the caller can fix by
       // retrying differently: it means the write never landed.
@@ -368,7 +371,7 @@ function describe(
   }
   throw errors.unsupportedCapability(
     'DESCRIBE COMPATIBILITY needs a package compatibility model this engine ' +
-      'has not built',
+      'has not built; `kip1_migration` is answered false (§103)',
   )
 }
 
@@ -754,7 +757,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     const offset =
       command.cursor === null
         ? 0
-        : readPageCursor(command.cursor, b, cx.space, 'list').offset
+        : readPageCursor(command.cursor, b, cx.space, 'list', cx.traversal ?? '').offset
     const limit = command.limit === null ? null : readCount(command.limit, b, 'LIMIT')
     const window = items.slice(offset)
     const rows = limit === null ? window : window.slice(0, limit)
@@ -767,6 +770,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
         family: 'list',
         snapshotSeq: cx.store.currentSeq(cx.space),
         offset: consumed,
+        traversal: cx.traversal ?? '',
       })
     }
     return rows as Json
@@ -966,6 +970,7 @@ function readPageCursor(
   b: ReadBindings,
   space: string,
   family: CursorFamily,
+  traversal: string,
 ): PageCursor {
   const value = scalarValue(cursor, b)
   if (typeof value !== 'string') {
@@ -980,7 +985,7 @@ function readPageCursor(
         `${JSON.stringify(value)}`,
     )
   }
-  return pageCursorFromToken(value, space, family)
+  return pageCursorFromToken(value, space, family, traversal)
 }
 
 /**
@@ -1095,7 +1100,7 @@ function history(
     offset:
       paging.cursor === null
         ? 0
-        : readPageCursor(paging.cursor, b, cx.space, 'history').offset,
+        : readPageCursor(paging.cursor, b, cx.space, 'history', cx.traversal ?? '').offset,
   })
   // The continuation a page hands back, when more of the chronology remains.
   const paged = <T>(rows: T[], offset: number, limit: number): T[] => {
@@ -1105,6 +1110,7 @@ function history(
         family: 'history',
         snapshotSeq: cx.store.currentSeq(cx.space),
         offset: offset + window.length,
+        traversal: cx.traversal ?? '',
       })
     }
     return window
@@ -1377,7 +1383,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
   const offset =
     command.cursor === null
       ? 0
-      : readPageCursor(command.cursor, b, cx.space, 'search').offset
+      : readPageCursor(command.cursor, b, cx.space, 'search', cx.traversal ?? '').offset
   // §20.14: a symbol in a search narrows to its lineage, so a hit written
   // under an earlier package version is still a hit.
   const withType =
@@ -1457,6 +1463,9 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
           // Named `score`, never `confidence`: copying this into an Assertion
           // would invent an epistemic commitment out of a text match (§2.10).
           score: row.score,
+          // §66.4: a safe snippet — the indexed text of the redacted view,
+          // windowed around the term — beside the element.
+          snippet: snippetOf(kind, view, term),
           element: view,
         },
       })
@@ -1497,6 +1506,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
             family: 'search',
             snapshotSeq: spaceSeq,
             offset: consumed,
+            traversal: cx.traversal ?? '',
           }),
         }
       : {}),
@@ -1505,3 +1515,232 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
 
 export { capabilities, KIP_VERSION } from './capabilities.js'
 export { KIP_ERROR_CODES }
+
+/** The artifact a `VERIFY` operand names: JSON text, or the object itself. */
+function artifactJson(value: Json, what: string): JsonMap {
+  let parsed: Json
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value) as Json
+    } catch (err) {
+      throw errors.artifactParseError(
+        `${what} takes the artifact as JSON text or as an object, and this text does not ` +
+          `parse: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  } else {
+    parsed = value
+  }
+  if (!isJsonMap(parsed)) {
+    throw errors.artifactParseError(
+      `${what} takes the artifact as JSON text or as an object, got ${JSON.stringify(value)}`,
+    )
+  }
+  return parsed
+}
+
+/**
+ * `VERIFY RECEIPT` (§69.1): the digest §33.2 seals a Receipt with, recomputed,
+ * and — where the Receipt names a transaction this Space committed — the
+ * Commit Record it describes, compared field by field.
+ */
+function verifyReceipt(value: Json, cx: MetaContext): Json {
+  const receipt = artifactJson(value, 'VERIFY RECEIPT')
+  const declared = receipt.receipt_digest
+  if (typeof declared !== 'string' || declared === '') {
+    throw errors.artifactParseError(
+      'a Receipt carries `receipt_digest` (§33.2), and one without it cannot be checked',
+    )
+  }
+  const recomputed = receiptDigest(receipt)
+  if (declared !== recomputed) {
+    throw errors.digestMismatch(
+      `this Receipt declares the digest ${declared} and its content digests to ` +
+        `${recomputed}; it was modified after it was issued`,
+    )
+  }
+  const attestation = attestReceipt(receipt, cx)
+  const matches = attestation.matches
+  return {
+    valid: typeof matches === 'boolean' ? matches : true,
+    receipt_digest: recomputed,
+    signed: Array.isArray(receipt.proofs) && receipt.proofs.length > 0,
+    signature: {
+      checked: false,
+      reason:
+        'signed_receipts is not advertised (§33.3); a proof on this Receipt is carried, not checked',
+    },
+    attestation,
+    note:
+      'a matching digest means the Receipt is intact; attestation says whether this ' +
+      'runtime committed what it describes',
+  } as Json
+}
+
+/**
+ * Whether the journal holds the transaction a Receipt describes, and whether
+ * it says the same thing. Reading the journal takes `read_history`; a caller
+ * without it gets the digest check alone, and no hint about which
+ * transactions exist (§30.4).
+ */
+function attestReceipt(receipt: JsonMap, cx: MetaContext): JsonMap {
+  const allowed = isPermitted(
+    cx.authority.authorize('read_history', spaceResource(), cx.auth).decision,
+  )
+  if (!allowed) {
+    return {
+      checked: false,
+      reason: 'attestation reads the transaction journal, which takes read_history',
+    }
+  }
+  const unknown: JsonMap = { checked: true, known: false }
+  const txId = receipt.tx_id
+  if (typeof txId !== 'string') return unknown
+  const row = cx.store.transaction(txId)
+  if (row === null || row.space !== cx.space) return unknown
+  const mismatched: string[] = []
+  const same = (field: string, given: Json | undefined, stored: Json): void => {
+    if (given !== undefined && given !== null && given !== stored) mismatched.push(field)
+  }
+  same('status', receipt.status, row.status)
+  same('space_id', receipt.space_id, row.space)
+  same('space_seq', receipt.space_seq, row.seq)
+  same('snapshot_seq', receipt.snapshot_seq, row.snapshot_seq)
+  same('committed_at', receipt.committed_at, row.committed_at)
+  same('transaction_class', receipt.transaction_class, row.transaction_class)
+  if (row.request_digest !== '') same('request_digest', receipt.request_digest, row.request_digest)
+  same(
+    'schema_environment_version',
+    receipt.schema_environment_version,
+    row.schema_environment_version,
+  )
+  return { checked: true, known: true, tx_id: txId, matches: mismatched.length === 0, mismatched }
+}
+
+/**
+ * `VERIFY SCHEMA PACKAGE` (§69.1): the artifact's own declared digest (§20.11,
+ * sha256 over every top-level field except `integrity`), and — where a
+ * package is installed under the same reference — whether it is the same
+ * content.
+ */
+function verifySchemaPackage(value: Json, cx: MetaContext): Json {
+  const artifact = artifactJson(value, 'VERIFY SCHEMA PACKAGE')
+  const parsed = parsePackage(artifact)
+  const ref = formatPackageRef(packageRefOf(parsed))
+  const integrity = isJsonMap(artifact.integrity) ? artifact.integrity : null
+  const declaredDigest =
+    integrity !== null &&
+    typeof integrity.content_digest === 'string' &&
+    integrity.content_digest !== ''
+      ? integrity.content_digest
+      : null
+  let declared: JsonMap
+  if (declaredDigest !== null) {
+    const { integrity: _integrity, ...covered } = artifact
+    const recomputed = `sha256:${sha256Text(canonicalJson(covered))}`
+    if (recomputed !== declaredDigest) {
+      throw errors.digestMismatch(
+        `this package declares the digest ${declaredDigest} and its content digests ` +
+          `to ${recomputed}; it was modified after it was published`,
+      )
+    }
+    declared = {
+      checked: true,
+      content_digest: declaredDigest,
+      covers: 'all top-level fields except integrity',
+    }
+  } else {
+    declared = { checked: false, reason: 'the artifact declares no integrity.content_digest' }
+  }
+  const engineDigest = sha256Text(canonicalJson(parsed))
+  const row = cx.store.packageByRef(ref)
+  const installed: JsonMap =
+    row === null ? { known: false } : { known: true, matches: row.content_digest === engineDigest }
+  const signatures =
+    integrity !== null && Array.isArray(integrity.signatures) ? integrity.signatures.length : 0
+  return {
+    valid: installed.matches === undefined ? true : installed.matches,
+    package_ref: ref,
+    content_digest: engineDigest,
+    declared,
+    signed: signatures > 0,
+    signature: {
+      checked: false,
+      reason:
+        'capsule_signatures is not advertised (§37.8); a signature on this package is ' +
+        'carried, not checked',
+    },
+    installed,
+    note:
+      'a matching digest means the artifact is intact, not that its definitions are ' +
+      'wanted; VALIDATE SCHEMA PACKAGE and DESCRIBE PACKAGE answer that',
+  } as Json
+}
+
+/** The characters a search snippet shows. */
+const SNIPPET_WIDTH = 200
+
+/**
+ * A safe snippet for a search hit (§66.4): the text the index matched on,
+ * read from the **redacted** view so a masked field stays masked (§88.5),
+ * windowed around the first occurrence of the term. Character based, and the
+ * same algorithm as the reference engine, so the two produce the same snippet.
+ */
+function snippetOf(kind: ElementKind, view: JsonMap, term: string): string {
+  const fields =
+    kind === 'Concept'
+      ? ['name', 'aliases', 'attributes']
+      : kind === 'Proposition'
+        ? ['predicate_ref']
+        : kind === 'Evidence'
+          ? ['payload']
+          : []
+  let text = ''
+  const collect = (value: unknown): void => {
+    if (typeof value === 'string') {
+      text = text === '' ? value : `${text} ${value}`
+    } else if (Array.isArray(value)) {
+      value.forEach(collect)
+    } else if (value !== null && typeof value === 'object') {
+      Object.values(value as Record<string, unknown>).forEach(collect)
+    }
+  }
+  for (const field of fields) collect(view[field])
+  return windowOf(text, term, SNIPPET_WIDTH)
+}
+
+function windowOf(text: string, term: string, width: number): string {
+  const chars = Array.from(text)
+  const fold = (c: string): string => Array.from(c.toLowerCase())[0] ?? c
+  const lower = chars.map(fold)
+  const needle = Array.from(term).map(fold)
+  let at = -1
+  if (needle.length > 0) {
+    outer: for (let i = 0; i + needle.length <= lower.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (lower[i + j] !== needle[j]) continue outer
+      }
+      at = i
+      break
+    }
+  }
+  const start = at < 0 ? 0 : Math.max(0, at - Math.floor(width / 4))
+  const end = Math.min(chars.length, start + width)
+  return chars.slice(start, end).join('').trim()
+}
+
+/** `VERIFY` (§69.1): integrity, digest and attestation — never trust or truth. */
+function verify(target: VerifyTarget, source: Json, cx: MetaContext): Json {
+  switch (target) {
+    case 'Capsule':
+      return verifyCapsule(source)
+    case 'Receipt':
+      return verifyReceipt(source, cx)
+    case 'SchemaPackage':
+      return verifySchemaPackage(source, cx)
+    default:
+      throw errors.unsupportedCapability(
+        `VERIFY ${String(target)} is not a target §69.1 names`,
+      )
+  }
+}

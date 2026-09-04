@@ -81,6 +81,7 @@ impl Context<'_> {
                 family: crate::store::history::CursorFamily::Query,
                 snapshot_seq: pinned_seq,
                 offset: consumed,
+                traversal: self.traversal.clone(),
             }
             .to_token(&self.space)
         });
@@ -305,6 +306,7 @@ impl Context<'_> {
                 family: crate::store::history::CursorFamily::Query,
                 snapshot_seq: pinned_seq,
                 offset: consumed,
+                traversal: self.traversal.clone(),
             }
             .to_token(&self.space)
         });

@@ -355,27 +355,163 @@ async fn verify_refuses_rather_than_reporting_an_unchecked_artifact_as_valid() {
         "ArtifactParseError"
     );
 
-    // The kinds this engine cannot check say so rather than answering.
-    for command in [
-        r#"VERIFY RECEIPT "x""#,
-        r#"VERIFY BLOB "x""#,
-        r#"VERIFY SCHEMA PACKAGE "x""#,
-    ] {
+    // The other two kinds are checked too, and an unreadable one is a parse
+    // failure rather than a pass.
+    for command in [r#"VERIFY RECEIPT "x""#, r#"VERIFY SCHEMA PACKAGE "x""#] {
         let response = run(&nexus, command).await;
         assert_eq!(
             response.error.as_ref().unwrap().code.as_str(),
-            "UnsupportedCapability",
+            "ArtifactParseError",
             "for {command}"
         );
-        assert!(
-            response
-                .error
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("defeat the purpose")
-        );
     }
+    // §69.1 names three targets; the two the draft once listed beside them
+    // are gone from the grammar.
+    assert!(anda_kip::parse_kip(r#"VERIFY BLOB "x""#).is_err());
+    assert!(anda_kip::parse_kip(r#"VERIFY CHECKPOINT "x""#).is_err());
+}
+
+async fn run_with(nexus: &CognitiveNexus, command: &str, params: Json) -> anda_kip::Response {
+    let request: Request = serde_json::from_value(json!({
+        "kip": "2.0",
+        "operations": [{"command": command, "parameters": params}]
+    }))
+    .unwrap();
+    let parsed = request.operations[0].parse().unwrap();
+    nexus
+        .execute(parsed, &request, &request.operations[0])
+        .await
+}
+
+#[tokio::test]
+async fn verify_receipt_recomputes_the_digest_and_attests_the_journal() {
+    // §69.1 / §33.2: intact is one question, "did this runtime commit it" is
+    // another, and the answer says which it is answering.
+    let nexus = fresh("verify_receipt").await;
+    let committed = run(
+        &nexus,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }"#,
+    )
+    .await;
+    let receipt = committed.results[0]
+        .receipt
+        .clone()
+        .expect("a state-changing operation carries a Receipt");
+    let receipt_json = serde_json::to_value(&receipt).unwrap();
+
+    let verified = run_with(&nexus, "VERIFY RECEIPT :r", json!({"r": receipt_json})).await;
+    assert_eq!(
+        verified.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        verified.error
+    );
+    let report = verified.results[0].result.clone().unwrap();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["receipt_digest"], receipt_json["receipt_digest"]);
+    assert_eq!(report["attestation"]["known"], true);
+    assert_eq!(report["attestation"]["matches"], true);
+    assert_eq!(report["signature"]["checked"], false);
+
+    // The artifact text form is the same artifact.
+    let as_text = run_with(
+        &nexus,
+        "VERIFY RECEIPT :r",
+        json!({"r": receipt_json.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        as_text.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        as_text.error
+    );
+
+    // Altered after sealing: the content no longer digests to what it declares.
+    let mut tampered = receipt_json.clone();
+    tampered["space_seq"] = json!(999);
+    let refused = run_with(&nexus, "VERIFY RECEIPT :r", json!({"r": tampered})).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "DigestMismatch"
+    );
+
+    // Intact, but naming a transaction this journal never saw.
+    let other = fresh("verify_receipt_other").await;
+    run(&other, r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Bob" }"#).await;
+    let second = run(
+        &other,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Carol" }"#,
+    )
+    .await;
+    let foreign = serde_json::to_value(second.results[0].receipt.as_ref().unwrap()).unwrap();
+    let unattested = run_with(&nexus, "VERIFY RECEIPT :r", json!({"r": foreign})).await;
+    let report = unattested.results[0].result.clone().unwrap();
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["attestation"]["known"], false);
+}
+
+#[tokio::test]
+async fn verify_schema_package_checks_the_declared_digest_and_the_installed_artifact() {
+    let nexus = fresh("verify_package").await;
+    let verified = run_with(
+        &nexus,
+        "VERIFY SCHEMA PACKAGE :p",
+        json!({"p": COGNITIVE_MEMORY}),
+    )
+    .await;
+    assert_eq!(
+        verified.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        verified.error
+    );
+    let report = verified.results[0].result.clone().unwrap();
+    assert_eq!(report["valid"], true);
+    assert_eq!(
+        report["package_ref"],
+        "kip://profiles/cognitive-memory@2.0.0"
+    );
+    assert_eq!(report["declared"]["checked"], true);
+    assert_eq!(report["installed"]["known"], true);
+    assert_eq!(report["installed"]["matches"], true);
+
+    // A byte changed after sealing fails the declared digest (§20.11).
+    let tampered = COGNITIVE_MEMORY.replacen("\"description\"", "\"description \"", 1);
+    assert_ne!(tampered, COGNITIVE_MEMORY);
+    let refused = run_with(&nexus, "VERIFY SCHEMA PACKAGE :p", json!({"p": tampered})).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code.as_str(),
+        "DigestMismatch"
+    );
+
+    // Intact on its own terms, but not the content installed under that name.
+    let mut artifact: Json = serde_json::from_str(COGNITIVE_MEMORY).unwrap();
+    artifact.as_object_mut().unwrap().remove("integrity");
+    artifact["manifest"]["description"] = json!("a different package under the same reference");
+    let differing = run_with(&nexus, "VERIFY SCHEMA PACKAGE :p", json!({"p": artifact})).await;
+    assert_eq!(
+        differing.status,
+        TopLevelStatus::Succeeded,
+        "{:?}",
+        differing.error
+    );
+    let report = differing.results[0].result.clone().unwrap();
+    assert_eq!(report["declared"]["checked"], false);
+    assert_eq!(report["installed"]["known"], true);
+    assert_eq!(report["installed"]["matches"], false);
+    assert_eq!(report["valid"], false);
+}
+
+#[tokio::test]
+async fn search_hits_carry_a_snippet_of_the_matched_text() {
+    // §66.4: a safe snippet beside the element, windowed around the term.
+    let nexus = seeded("search_snippet").await;
+    let result = ok(&nexus, r#"SEARCH CONCEPT "Anderson""#).await;
+    let hit = &result["hits"][0];
+    let snippet = hit["snippet"].as_str().expect("a snippet");
+    assert!(snippet.contains("Anderson"), "{snippet}");
+    assert!(snippet.chars().count() <= 200);
 }
 
 #[tokio::test]

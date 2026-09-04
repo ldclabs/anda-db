@@ -27,6 +27,7 @@ import {
 } from './governance/index.js'
 import { capabilityState, KIP_VERSION } from './meta/capabilities.js'
 import { CognitiveNexus, type NexusOptions, type ReadOptions } from './nexus.js'
+import { receiptDigest } from './receipt.js'
 import {
   BUNDLED_PACKAGES,
   COGNITIVE_MEMORY,
@@ -570,6 +571,19 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       }
     }
 
+    // A `critical` extension is a precondition, not a hint (request schema,
+    // `extensions`): this engine implements no request extensions, so one it
+    // is told it must honor fails the request rather than being ignored.
+    const critical = criticalExtensions(envelope)
+    if (critical.length > 0) {
+      throw new KipError(
+        'UnsupportedCapability',
+        `this request marks the extension(s) ${JSON.stringify(critical)} critical, ` +
+          `and this engine implements no request extensions; a critical extension ` +
+          `it cannot honor fails the request rather than being silently ignored`,
+      )
+    }
+
     // §67: a fail-fast capability check. Running a command that needed
     // ingestion and answering it from re-typed command text is a wrong answer
     // wearing a success status — and a requirement nobody recognized must not
@@ -716,6 +730,41 @@ interface KipRequestEnvelope {
   context?: RequestContext
   requires?: Record<string, boolean>
   options?: { deadline_ms?: number }
+  extensions?: JsonMap
+}
+
+/**
+ * The namespaced extensions a request marks `critical`, across every block
+ * that may carry an `extensions` map: the envelope, `execution`, `read`,
+ * `preconditions`, `context`, `options`, `ingest`, and each operation.
+ */
+function criticalExtensions(envelope: KipRequestEnvelope): string[] {
+  const blocks: unknown[] = [
+    envelope,
+    envelope.execution,
+    envelope.read,
+    envelope.preconditions,
+    envelope.context,
+    envelope.options,
+    envelope.ingest,
+    ...(envelope.operations ?? []),
+  ]
+  const names = new Set<string>()
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue
+    const extensions = (block as { extensions?: unknown }).extensions
+    if (extensions === null || typeof extensions !== 'object') continue
+    for (const [name, value] of Object.entries(extensions as Record<string, unknown>)) {
+      if (
+        value !== null &&
+        typeof value === 'object' &&
+        (value as { critical?: unknown }).critical === true
+      ) {
+        names.add(name)
+      }
+    }
+  }
+  return [...names].sort()
 }
 
 /**
@@ -812,7 +861,7 @@ export function receiptOf(outcome: Outcome, auth: AuthContext): KipReceipt {
   }
   return {
     ...unsigned,
-    receipt_digest: `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(unsigned))}`,
+    receipt_digest: receiptDigest(unsigned as unknown as JsonMap),
   }
 }
 

@@ -1,5 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
+import { parseKip } from '../src/kip/parser.js'
 import {
   ALL_PERMISSIONS,
   authStrength,
@@ -1972,6 +1973,54 @@ describe('classification and influence authority', () => {
       expect(() => session.releaseQuarantine(parseElementId('C-1'))).toThrowError(
         /not quarantined/,
       )
+    })
+  })
+
+  it('holds only an active element in quarantine, leaving its status alone', async () => {
+    // §31.6: quarantine is Governance state over an active element, not a
+    // lifecycle move; releasing a held archived element would have brought
+    // it back active.
+    await withNexus('quarantine-active-only', (nexus) => {
+      const session = nexus.systemSession()
+      session.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Filed" }')
+      session.execute('TRANSITION "C-1" TO "archived"')
+      expect(() => session.quarantine(parseElementId('C-1'), 'review')).toThrowError(
+        /nothing here to hold/,
+      )
+      expect(
+        nexus.query('FIND(?c.name) WHERE { ?c CONCEPT {state: "archived"} }'),
+      ).toEqual(['Filed'])
+    })
+  })
+
+  it('scopes an idempotency key to the Principal that used it', async () => {
+    // §34.2: another caller reusing the same string is doing its own work,
+    // not replaying this one's.
+    await withNexus('idempotency-scope', (nexus) => {
+      const statement = parseKip('CREATE CONCEPT ?x { TYPE "Person" NAME "Alice" }')
+      if (!('Kml' in statement)) throw new Error('a KML statement')
+      const committed = nexus.mutate(statement.Kml, {}, { idempotencyKey: 'key-1' })
+      expect(committed.status).toBe('committed')
+      expect(
+        nexus.describe('DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "key-1"'),
+      ).toMatchObject({ tx_id: committed.tx_id })
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:reader' })
+      gov.createGrant(
+        {
+          space_id: nexus.space,
+          grantee_principal: 'kip:principal:reader',
+          actions: ['discover', 'read', 'read_history'],
+          delegation_allowed: false,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+      const reader = nexus.session(principalAuth('kip:principal:reader'))
+      expect(() =>
+        reader.describe('DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "key-1"'),
+      ).toThrowError(/idempotency key/)
+      // The bare string is not the journal key any more.
+      expect(nexus.store.transactionByKey(nexus.space, 'key-1')).toBeNull()
     })
   })
 
