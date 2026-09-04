@@ -87,7 +87,7 @@ const ASSERT_MEMBERS: &[&str] = &[
 
 /// Parses a KML statement: a `MUTATE` block, or a single mutation that is still
 /// a one-clause transaction.
-pub fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
+pub(crate) fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
     if let Ok((rest, _)) = ws(word("MUTATE")).parse(input) {
         let (rest, groups) = cut(braced(many0(ws(spanned(mutation_clause))))).parse(rest)?;
         if groups.is_empty() {
@@ -1397,7 +1397,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
 /// KML and META selection blocks parse in the exact flavor: no `BELIEF`, and no
 /// raw predicate paths. A virtual Projection is never a mutation target or an
 /// export selector, and a path never resolves to one Proposition to write.
-pub fn validate_exact_patterns(clauses: &[WhereClause]) -> Result<(), KipError> {
+pub(crate) fn validate_exact_patterns(clauses: &[WhereClause]) -> Result<(), KipError> {
     for clause in clauses {
         match clause {
             WhereClause::Belief { .. } | WhereClause::BeliefSlot { .. } => {
@@ -1481,7 +1481,7 @@ fn validate_exact_match_value(value: &crate::ast::MatchValue) -> Result<(), KipE
 }
 
 /// Checks the invariants that only the whole mutation plan can decide.
-pub fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
+pub(crate) fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
     if statement.clauses.is_empty() {
         return Err(KipError::invalid_syntax(
             "a KML transaction must carry at least one mutation",

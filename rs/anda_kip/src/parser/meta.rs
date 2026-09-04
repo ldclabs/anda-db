@@ -23,7 +23,7 @@ use crate::ast::{
 };
 
 /// Parses one META command.
-pub fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
+pub(crate) fn parse_meta_command(input: &str) -> VResult<'_, MetaCommand> {
     alt((
         map(describe, MetaCommand::Describe),
         map(list, MetaCommand::List),

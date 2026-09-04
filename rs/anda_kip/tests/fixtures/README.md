@@ -33,3 +33,16 @@ node -e '
 Run it from `packages/kip-lang`, pointing `FIXTURE` at this file. Add new
 commands to `cases` first with any `ast`; the regeneration overwrites it with
 the reference output. Then run `cargo test -p anda_kip --test kip_lang_parity`.
+
+## `public_surface.txt`
+
+Every top-level `pub` item under `src/`, one per line, as `tests/surface.rs`
+lists them. `lib.rs` re-exports each module wholesale, so this file *is* the
+crate's public API. A test failure here means the surface changed; if that
+was the intent, regenerate with
+
+```bash
+UPDATE_SURFACE=1 cargo test -p anda_kip --test surface
+```
+
+and commit the file with the change that widened or narrowed it.

@@ -33,17 +33,17 @@ use crate::ast::{
     Term, UpdateExpr, UpdateFunction, WhereClause,
 };
 
-pub use super::json::{quoted_string, ws};
+pub(crate) use super::json::{quoted_string, ws};
 
 /// The parser's result type over `&str` with source-anchored errors.
-pub type VResult<'a, T> = nom::IResult<&'a str, T, VerboseError<&'a str>>;
+pub(crate) type VResult<'a, T> = nom::IResult<&'a str, T, VerboseError<&'a str>>;
 
 /// Which surface a shared rule is being parsed for.
 ///
 /// The two reviewed divergences travel together: only KQL walks raw predicate
 /// paths, and only KQL projects belief.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Flavor {
+pub(crate) enum Flavor {
     /// KQL — raw predicate paths and BELIEF patterns are admitted.
     Kql,
     /// KML and META — exact predicates only, no BELIEF.
@@ -65,10 +65,10 @@ impl Flavor {
 /// These are top-level field names. The members inside `_system` are
 /// [`crate::types::PROTECTED_SYSTEM_FIELDS`]; nothing may write either, but
 /// only this list is reachable from a command's syntax.
-pub const PROTECTED_FIELDS: &[&str] = &["_system", "governance", "space_id", "space_seq"];
+pub(crate) const PROTECTED_FIELDS: &[&str] = &["_system", "governance", "space_id", "space_seq"];
 
 /// True when a mutation may not write this field name.
-pub fn is_protected_field(name: &str) -> bool {
+pub(crate) fn is_protected_field(name: &str) -> bool {
     PROTECTED_FIELDS.contains(&name)
 }
 
@@ -81,7 +81,7 @@ pub fn is_protected_field(name: &str) -> bool {
 /// `Failure` rather than `Error`: these are rule violations, not a wrong branch
 /// of an `alt`, so backtracking into a worse-fitting rule would only bury the
 /// real diagnosis.
-pub fn fail<'a, T>(input: &'a str, ctx: &'static str) -> VResult<'a, T> {
+pub(crate) fn fail<'a, T>(input: &'a str, ctx: &'static str) -> VResult<'a, T> {
     Err(nom::Err::Failure(VerboseError {
         errors: vec![(input, VerboseErrorKind::Context(ctx))],
     }))
@@ -97,7 +97,7 @@ pub fn fail<'a, T>(input: &'a str, ctx: &'static str) -> VResult<'a, T> {
 /// identifier character (`FIND` must not match the prefix of `FINDX`), to a
 /// variable (`INTO?b`), or to a quoted string (`WITH TYPE"Drug"`) — each of
 /// those is two tokens in the grammar.
-pub fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
+pub(crate) fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
     not(verify(anychar, |c: &char| {
         c.is_alphanumeric() || matches!(c, '_' | '?' | '"')
     }))
@@ -110,7 +110,7 @@ pub fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseE
 /// `status` all appear as ordinary field names in the Spec's own examples. That
 /// falls out of scannerless parsing — a keyword is only a keyword where a rule
 /// asks for one.
-pub fn word<'a>(
+pub(crate) fn word<'a>(
     w: &'static str,
 ) -> impl Parser<&'a str, Output = &'a str, Error = VerboseError<&'a str>> {
     terminated(tag_no_case(w), word_boundary())
@@ -125,7 +125,7 @@ fn trivia1(input: &str) -> VResult<'_, ()> {
 
 /// Matches a sequence of keywords separated by mandatory whitespace or comments,
 /// e.g. `ORDER BY`, `LIST STRUCTURAL FIELDS`.
-pub fn words<'a>(
+pub(crate) fn words<'a>(
     kws: &'static [&'static str],
 ) -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
     move |mut input: &'a str| {
@@ -145,7 +145,7 @@ pub fn words<'a>(
 }
 
 /// Runs `f` only when the keyword sequence is present, consuming neither on miss.
-pub fn opt_after<'a, O, F>(
+pub(crate) fn opt_after<'a, O, F>(
     kws: &'static [&'static str],
     f: F,
 ) -> impl Parser<&'a str, Output = Option<O>, Error = VerboseError<&'a str>>
@@ -160,7 +160,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Parses `{ f }`.
-pub fn braced<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
+pub(crate) fn braced<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
 where
     F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
 {
@@ -168,7 +168,7 @@ where
 }
 
 /// Parses `( f )`.
-pub fn parenthesized<'a, O, F>(
+pub(crate) fn parenthesized<'a, O, F>(
     f: F,
 ) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
 where
@@ -182,7 +182,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// `identifier = identifier_start, { identifier_continue }`
-pub fn identifier(input: &str) -> VResult<'_, &str> {
+pub(crate) fn identifier(input: &str) -> VResult<'_, &str> {
     context(
         "an identifier (a letter or underscore, then letters, digits, underscores)",
         json_identifier(),
@@ -191,7 +191,7 @@ pub fn identifier(input: &str) -> VResult<'_, &str> {
 }
 
 /// `variable = "?", identifier` — returns the bare name, without the sigil.
-pub fn variable(input: &str) -> VResult<'_, String> {
+pub(crate) fn variable(input: &str) -> VResult<'_, String> {
     context(
         "a variable such as ?name",
         map(preceded(char('?'), cut(identifier)), |s| s.to_string()),
@@ -200,7 +200,7 @@ pub fn variable(input: &str) -> VResult<'_, String> {
 }
 
 /// `parameter = ":", identifier` — returns the bare name, without the sigil.
-pub fn parameter(input: &str) -> VResult<'_, String> {
+pub(crate) fn parameter(input: &str) -> VResult<'_, String> {
     context(
         "a parameter such as :name",
         map(preceded(char(':'), cut(identifier)), |s| s.to_string()),
@@ -209,7 +209,7 @@ pub fn parameter(input: &str) -> VResult<'_, String> {
 }
 
 /// `field_name = identifier | string_literal`
-pub fn field_name(input: &str) -> VResult<'_, String> {
+pub(crate) fn field_name(input: &str) -> VResult<'_, String> {
     alt((quoted_string, map(identifier, |s| s.to_string()))).parse(input)
 }
 
@@ -217,7 +217,7 @@ pub fn field_name(input: &str) -> VResult<'_, String> {
 ///
 /// `true` / `false` / `null` are JSON literals, not protocol keywords, so unlike
 /// keywords they stay case-sensitive.
-pub fn literal(input: &str) -> VResult<'_, KipValue> {
+pub(crate) fn literal(input: &str) -> VResult<'_, KipValue> {
     context(
         "a literal: a string, a number, true, false or null",
         alt((
@@ -238,7 +238,7 @@ pub fn literal(input: &str) -> VResult<'_, KipValue> {
 }
 
 /// `scalar_value` / `scalar_or_parameter` / `meta_value` = `parameter | literal`
-pub fn scalar(input: &str) -> VResult<'_, Scalar> {
+pub(crate) fn scalar(input: &str) -> VResult<'_, Scalar> {
     context(
         "a literal or a :parameter",
         alt((map(parameter, Scalar::Param), map(literal, Scalar::Literal))),
@@ -247,7 +247,7 @@ pub fn scalar(input: &str) -> VResult<'_, Scalar> {
 }
 
 /// `schema_symbol = string_literal | parameter`
-pub fn symbol_ref(input: &str) -> VResult<'_, SymbolRef> {
+pub(crate) fn symbol_ref(input: &str) -> VResult<'_, SymbolRef> {
     context(
         "a quoted schema symbol or a :parameter",
         alt((
@@ -259,7 +259,7 @@ pub fn symbol_ref(input: &str) -> VResult<'_, SymbolRef> {
 }
 
 /// `target_ref = variable | parameter | string_literal`
-pub fn element_ref(input: &str) -> VResult<'_, ElementRef> {
+pub(crate) fn element_ref(input: &str) -> VResult<'_, ElementRef> {
     context(
         "a ?handle, a :parameter or a quoted element id",
         alt((
@@ -272,12 +272,12 @@ pub fn element_ref(input: &str) -> VResult<'_, ElementRef> {
 }
 
 /// `handle = variable`
-pub fn handle(input: &str) -> VResult<'_, String> {
+pub(crate) fn handle(input: &str) -> VResult<'_, String> {
     variable(input)
 }
 
 /// `field_access = variable, { field_step }`
-pub fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
+pub(crate) fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
     let (input, var) = variable(input)?;
     let (input, path) = many0(alt((
         map(preceded(char('.'), cut(identifier)), |s| {
@@ -302,7 +302,7 @@ pub fn dot_path_var(input: &str) -> VResult<'_, DotPathVar> {
 // ---------------------------------------------------------------------------
 
 /// `predicate_atom = string_literal | parameter | variable`
-pub fn pred_atom(input: &str) -> VResult<'_, PredAtom> {
+pub(crate) fn pred_atom(input: &str) -> VResult<'_, PredAtom> {
     context(
         "a quoted predicate, a :parameter or a ?variable",
         alt((
@@ -387,7 +387,7 @@ fn id_key(input: &str) -> VResult<'_, ()> {
 }
 
 /// `proposition_tuple = "(" term "," predicate "," term ")" | "(" "id" ":" scalar ")"`
-pub fn proposition_matcher(input: &str, flavor: Flavor) -> VResult<'_, PropositionMatcher> {
+pub(crate) fn proposition_matcher(input: &str, flavor: Flavor) -> VResult<'_, PropositionMatcher> {
     let (input, _) = ws(char('(')).parse(input)?;
 
     // `(id: ...)` and `(subject, ...)` are told apart by the literal `id:`.
@@ -415,7 +415,7 @@ pub fn proposition_matcher(input: &str, flavor: Flavor) -> VResult<'_, Propositi
 }
 
 /// `term = variable | parameter | literal | object_pattern | proposition_tuple`
-pub fn term(input: &str, flavor: Flavor) -> VResult<'_, Term> {
+pub(crate) fn term(input: &str, flavor: Flavor) -> VResult<'_, Term> {
     alt((
         map(variable, Term::Variable),
         map(parameter, Term::Param),
@@ -430,7 +430,7 @@ pub fn term(input: &str, flavor: Flavor) -> VResult<'_, Term> {
 }
 
 /// A Proposition subject is always an Element reference, never a Literal.
-pub fn proposition_subject(input: &str, flavor: Flavor) -> VResult<'_, Term> {
+pub(crate) fn proposition_subject(input: &str, flavor: Flavor) -> VResult<'_, Term> {
     let (rest, subject) = term(input, flavor)?;
     if matches!(subject, Term::Literal(_)) {
         return fail(
@@ -442,7 +442,7 @@ pub fn proposition_subject(input: &str, flavor: Flavor) -> VResult<'_, Term> {
 }
 
 /// `object_pattern = "{" [ pattern_member { "," pattern_member } ] "}"`
-pub fn object_matcher(input: &str, flavor: Flavor) -> VResult<'_, ObjectMatcher> {
+pub(crate) fn object_matcher(input: &str, flavor: Flavor) -> VResult<'_, ObjectMatcher> {
     let (rest, entries) = delimited(
         ws(char('{')),
         terminated(
@@ -504,7 +504,7 @@ fn match_value(input: &str, flavor: Flavor) -> VResult<'_, MatchValue> {
 /// A bare `?x` is a **handle** here: in a value position a variable names an
 /// element the plan created. `?x.field` is a read of that element's own field,
 /// which is a different thing and keeps its path.
-pub fn bound_value(input: &str) -> VResult<'_, BoundValue> {
+pub(crate) fn bound_value(input: &str) -> VResult<'_, BoundValue> {
     alt((
         map(parameter, BoundValue::Param),
         map(dot_path_var, |path| {
@@ -571,7 +571,7 @@ fn bound_entries(input: &str) -> VResult<'_, Vec<(String, BoundValue)>> {
 }
 
 /// `object_literal` in a position that wants a keyed block, e.g. `WITH {...}`.
-pub fn bound_object(input: &str) -> VResult<'_, BoundObject> {
+pub(crate) fn bound_object(input: &str) -> VResult<'_, BoundObject> {
     let (rest, entries) = bound_entries(input)?;
     Ok((rest, entries.into_iter().collect()))
 }
@@ -614,7 +614,7 @@ fn collapse_object(entries: Vec<(String, BoundValue)>) -> BoundValue {
 }
 
 /// `mutation_value` — a `data_value`, or a deterministic update expression.
-pub fn mutation_value(input: &str) -> VResult<'_, MutationValue> {
+pub(crate) fn mutation_value(input: &str) -> VResult<'_, MutationValue> {
     alt((
         map(update_function_call, MutationValue::Expr),
         map(bound_value, MutationValue::from),
@@ -652,7 +652,7 @@ fn update_function_call(input: &str) -> VResult<'_, UpdateExpr> {
 /// An update expression may read only the element being updated; which element
 /// that is depends on the statement, so the check happens once the whole
 /// `UPDATE` is known (see `kml::validate`).
-pub fn update_expr(input: &str) -> VResult<'_, UpdateExpr> {
+pub(crate) fn update_expr(input: &str) -> VResult<'_, UpdateExpr> {
     alt((
         update_function_call,
         map(parameter, UpdateExpr::Param),
@@ -701,7 +701,7 @@ fn negated_number(input: &str) -> VResult<'_, Number> {
 ///
 /// Rejects duplicate keys and engine-owned field names wherever assignments
 /// appear, not only inside `UPDATE`.
-pub fn assignments(input: &str) -> VResult<'_, Assignments> {
+pub(crate) fn assignments(input: &str) -> VResult<'_, Assignments> {
     let (rest, entries) = delimited(
         ws(char('{')),
         terminated(
@@ -740,7 +740,7 @@ pub fn assignments(input: &str) -> VResult<'_, Assignments> {
 }
 
 /// `unset_field_set = "{" [ unset_field { "," unset_field } ] "}"`
-pub fn unset_field_set(input: &str) -> VResult<'_, Vec<String>> {
+pub(crate) fn unset_field_set(input: &str) -> VResult<'_, Vec<String>> {
     let (rest, entries) = delimited(
         ws(char('{')),
         terminated(
@@ -785,7 +785,7 @@ const FILTER_TOO_DEEP: &str = "a filter expression within the nesting budget: `!
 /// and, for the iterative `&&`/`||` chains, the recursive `Drop` of the tree
 /// they build — exhausts the stack, which aborts the process rather than
 /// failing the one request.
-pub fn filter_expression(input: &str) -> VResult<'_, FilterExpression> {
+pub(crate) fn filter_expression(input: &str) -> VResult<'_, FilterExpression> {
     filter_or(input, 0)
 }
 
@@ -974,7 +974,7 @@ fn bound_object_literal_only(input: &str) -> VResult<'_, KipValue> {
 // ---------------------------------------------------------------------------
 
 /// `where_block = "{" { where_clause } "}"`
-pub fn where_block(input: &str, flavor: Flavor) -> VResult<'_, Vec<WhereClause>> {
+pub(crate) fn where_block(input: &str, flavor: Flavor) -> VResult<'_, Vec<WhereClause>> {
     braced(many0(ws(|i| where_clause(i, flavor)))).parse(input)
 }
 
@@ -1202,7 +1202,7 @@ fn belief_target(input: &str, flavor: Flavor) -> VResult<'_, crate::ast::BeliefT
 ///
 /// Filter operands carry a [`DotPathVar`] rather than a bare name and are
 /// deliberately skipped: reading `?x.score` inside a FILTER does not bind `?x`.
-pub fn collect_where_variables(clauses: &[WhereClause], out: &mut BTreeSet<String>) {
+pub(crate) fn collect_where_variables(clauses: &[WhereClause], out: &mut BTreeSet<String>) {
     for clause in clauses {
         match clause {
             WhereClause::Concept { variable, matcher }
@@ -1319,7 +1319,7 @@ fn collect_pred_atom_variable(atom: &PredAtom, out: &mut BTreeSet<String>) {
 }
 
 /// Collects every `?handle` a value tree references.
-pub fn collect_bound_value_handles(value: &BoundValue, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_bound_value_handles(value: &BoundValue, out: &mut BTreeSet<String>) {
     match value {
         BoundValue::Handle(name) => {
             out.insert(name.clone());
@@ -1339,7 +1339,7 @@ pub fn collect_bound_value_handles(value: &BoundValue, out: &mut BTreeSet<String
 }
 
 /// Collects every `?handle` a mutation right-hand side references.
-pub fn collect_mutation_value_handles(value: &MutationValue, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_mutation_value_handles(value: &MutationValue, out: &mut BTreeSet<String>) {
     match value {
         MutationValue::Handle(name) => {
             out.insert(name.clone());
@@ -1362,14 +1362,14 @@ pub fn collect_mutation_value_handles(value: &MutationValue, out: &mut BTreeSet<
 }
 
 /// Collects every `?handle` an option block references.
-pub fn collect_bound_object_handles(object: &BoundObject, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_bound_object_handles(object: &BoundObject, out: &mut BTreeSet<String>) {
     for value in object.values() {
         collect_bound_value_handles(value, out);
     }
 }
 
 /// Collects the variables an update expression reads.
-pub fn collect_update_expr_paths<'a>(expr: &'a UpdateExpr, out: &mut Vec<&'a DotPathVar>) {
+pub(crate) fn collect_update_expr_paths<'a>(expr: &'a UpdateExpr, out: &mut Vec<&'a DotPathVar>) {
     match expr {
         UpdateExpr::Variable(path) => out.push(path),
         UpdateExpr::Function { args, .. } => {
@@ -1382,7 +1382,7 @@ pub fn collect_update_expr_paths<'a>(expr: &'a UpdateExpr, out: &mut Vec<&'a Dot
 }
 
 /// Collects the variables a mutation right-hand side reads.
-pub fn collect_mutation_value_paths<'a>(value: &'a MutationValue, out: &mut Vec<&'a DotPathVar>) {
+pub(crate) fn collect_mutation_value_paths<'a>(value: &'a MutationValue, out: &mut Vec<&'a DotPathVar>) {
     match value {
         MutationValue::Variable(path) => out.push(path),
         MutationValue::Expr(expr) => collect_update_expr_paths(expr, out),
@@ -1423,7 +1423,7 @@ fn collect_bound_value_paths<'a>(value: &'a BoundValue, out: &mut Vec<&'a DotPat
 
 /// Wraps a parser so it also yields the input slice where its match starts,
 /// which is what anchors a duplicate-key error at the offending key.
-pub fn spanned<'a, O, F>(
+pub(crate) fn spanned<'a, O, F>(
     mut f: F,
 ) -> impl Parser<&'a str, Output = (&'a str, O), Error = VerboseError<&'a str>>
 where

@@ -29,7 +29,6 @@ mod kml;
 mod kql;
 mod meta;
 
-pub use common::PROTECTED_FIELDS;
 
 /// Maximum accepted length (in bytes) of a single KIP command string.
 ///
@@ -102,8 +101,12 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 ///
 /// # Examples
 ///
+/// The gate is not a public function: a transported tree reaches it through
+/// [`Operation::parse`](crate::Operation::parse), which is where every
+/// operation — text or tree — is admitted.
+///
 /// ```rust
-/// use anda_kip::{validate_command, Command};
+/// use anda_kip::{Command, Operation};
 ///
 /// // A tree that names the same handle twice never parsed from text.
 /// let injected: Command = serde_json::from_str(
@@ -114,9 +117,12 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 ///           "set_fields":null,"set_attributes":null,"set_facets":[],"set_structural":null}}]}}"#,
 /// )
 /// .unwrap();
-/// assert!(validate_command(&injected).is_err());
+/// let mut operation = Operation::new("");
+/// operation.command = None;
+/// operation.ast = Some(injected);
+/// assert!(operation.parse().is_err());
 /// ```
-pub fn validate_command(command: &Command) -> Result<(), KipError> {
+pub(crate) fn validate_command(command: &Command) -> Result<(), KipError> {
     match command {
         Command::Kql(query) => validate_query(query),
         Command::Kml(statement) => validate_statement(statement),

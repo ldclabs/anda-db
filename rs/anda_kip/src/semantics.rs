@@ -230,44 +230,22 @@ pub fn analyze(command: &Command) -> Vec<Diagnostic> {
     out
 }
 
-/// Fails on the first [`Severity::Error`] finding, ignoring warnings.
-///
-/// The parser reaches these checks through its own per-surface gate, which
-/// calls [`check_kql`], [`check_kml`] or [`check_meta`] — this is the same
-/// pass over a [`Command`] whose surface is not known yet, and it is why a
-/// command whose `stance` is misspelled is rejected before parsing returns
-/// rather than half-way through an engine's transaction.
-///
-/// # Examples
-///
-/// ```rust
-/// use anda_kip::parse_kip;
-///
-/// // `maybe` is not one of support | reject | uncertain (Spec §20.13).
-/// assert!(parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", stance: "maybe" }"#).is_err());
-/// // Nor is a confidence outside [0,1] (Spec §13.6).
-/// assert!(parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", confidence: 5 }"#).is_err());
-/// ```
-pub fn check(command: &Command) -> Result<(), KipError> {
-    first_error(analyze(command))
-}
-
 /// [`check`] for a query that was parsed on its own.
-pub fn check_kql(query: &KqlQuery) -> Result<(), KipError> {
+pub(crate) fn check_kql(query: &KqlQuery) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_kql(query, &mut out);
     first_error(out)
 }
 
 /// [`check`] for a mutation that was parsed on its own.
-pub fn check_kml(statement: &KmlStatement) -> Result<(), KipError> {
+pub(crate) fn check_kml(statement: &KmlStatement) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_kml(statement, &mut out);
     first_error(out)
 }
 
 /// [`check`] for a META command that was parsed on its own.
-pub fn check_meta(meta: &MetaCommand) -> Result<(), KipError> {
+pub(crate) fn check_meta(meta: &MetaCommand) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_meta(meta, &mut out);
     first_error(out)

@@ -24,16 +24,16 @@ use crate::{Json, Map, Number};
 /// - Allow identifier as map key (starts with a letter or underscore, followed by any combination of letters, digits, or underscores)
 /// - Allow line comment (starting with //).
 /// - Allow trailing comma
-pub fn json_value<'a>() -> impl Parser<&'a str, Output = Json, Error = VerboseError<&'a str>> {
+pub(crate) fn json_value<'a>() -> impl Parser<&'a str, Output = Json, Error = VerboseError<&'a str>> {
     JsonParser
 }
 
 /// Parses a double-quoted string, handling escaped quotes.
-pub fn quoted_string(input: &str) -> IResult<&str, String, VerboseError<&str>> {
+pub(crate) fn quoted_string(input: &str) -> IResult<&str, String, VerboseError<&str>> {
     string().parse(input)
 }
 
-pub fn parse_number(input: &str) -> IResult<&str, Number, VerboseError<&str>> {
+pub(crate) fn parse_number(input: &str) -> IResult<&str, Number, VerboseError<&str>> {
     map_res(recognize_float, |literal: &str| {
         let number = Number::from_str(literal).map_err(|err| err.to_string())?;
         if !is_integer_literal(literal) || number.is_i64() || number.is_u64() {
@@ -67,7 +67,7 @@ fn is_integer_literal(literal: &str) -> bool {
     !literal.contains(['.', 'e', 'E'])
 }
 
-pub fn ws<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
+pub(crate) fn ws<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
 where
     F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
 {
@@ -260,7 +260,7 @@ fn unicode_escape<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseEr
     )
 }
 
-pub fn character<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>> {
+pub(crate) fn character<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>> {
     context(
         "JSON string character",
         alt((

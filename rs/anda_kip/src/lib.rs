@@ -19,6 +19,17 @@
 //! commitment about it, with a stance, a mode, a confidence and its Evidence.
 //! What is *currently believed* is projected from those, never stored.
 //!
+//! ## What is public
+//!
+//! `pub` means API. Each module is re-exported wholesale at the crate root,
+//! so an item is either part of the contract this crate keeps or it is
+//! `pub(crate)`; the nom combinators, the raw single-surface sub-parsers, the
+//! validation gates behind [`Operation::parse`] and the semantic checks the
+//! parsers apply are the latter. `tests/surface.rs` lists every public item
+//! from the sources and compares the list with
+//! `tests/fixtures/public_surface.txt`, so widening or narrowing the surface
+//! is a change to that file, made on purpose.
+//!
 //! ## What this crate is
 //!
 //! The protocol half: parse, classify, validate. Everything that needs state —

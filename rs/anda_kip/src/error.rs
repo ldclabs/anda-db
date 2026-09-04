@@ -735,7 +735,7 @@ impl Display for ErrorObject {
 }
 
 /// Formats a nom parsing error into a [`KipError`] with source context.
-pub fn format_nom_error(input: &str, err: nom::Err<VerboseError<&str>>) -> KipError {
+pub(crate) fn format_nom_error(input: &str, err: nom::Err<VerboseError<&str>>) -> KipError {
     let message = match err {
         nom::Err::Incomplete(needed) => {
             format!("parse incomplete, need more input: {needed:?}")

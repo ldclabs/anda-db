@@ -21,7 +21,7 @@ use crate::ast::{
 };
 
 /// Parses a whole `FIND ... WHERE ...` query.
-pub fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
+pub(crate) fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
     let (input, _) = ws(word("FIND")).parse(input)?;
     let (input, expressions) = cut(parenthesized(separated_list1(
         ws(char(',')),
@@ -65,7 +65,7 @@ pub fn parse_kql_query(input: &str) -> VResult<'_, KqlQuery> {
 /// AT TIME`), so the read itself names the coordinate it ran against. Shared
 /// with META, which uses the same clause on `DESCRIBE SNAPSHOT`, `DESCRIBE
 /// SCHEMA ENVIRONMENT` and `EXPORT CAPSULE`.
-pub fn as_of_clause(input: &str) -> VResult<'_, AsOf> {
+pub(crate) fn as_of_clause(input: &str) -> VResult<'_, AsOf> {
     let (after, _) = ws(words(&["AS", "OF"])).parse(input)?;
     let Ok((after, _)) = ws(word("SEQ")).parse(after) else {
         return fail(

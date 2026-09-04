@@ -11,6 +11,36 @@ unpublished, so this accumulates into the same version),
 
 Four changes accumulate here. The latest one first.
 
+## `anda_kip` narrows what it exports
+
+### Changed (breaking) — `anda_kip`
+
+The public surface goes from 277 items to 217. `lib.rs` still re-exports
+every module wholesale; what changed is that the items no consumer could
+sensibly depend on are `pub(crate)` now, and `tests/surface.rs` pins the
+result. Gone from the surface:
+
+- the nom combinators and grammar pieces under `parser::common` and
+  `parser::json` (`word`, `ws`, `braced`, `object_matcher`, `term`,
+  `filter_expression`, … — 45 items) and `Flavor`;
+- the raw single-surface sub-parsers (`parse_kql_query`,
+  `parse_kml_statement`, `parse_meta_command`, `as_of_clause`), which parsed
+  without the validation gate the four public entry points apply — a caller
+  reaching for them got a more lenient parser than `parse_kql` / `parse_kml`
+  / `parse_meta`;
+- the validation gates themselves (`validate_command`, `validate_plan`,
+  `validate_exact_patterns`), reachable for a transported `ast` through
+  `Operation::parse`, and the semantic check gates
+  (`semantics::check_kql` / `check_kml` / `check_meta`; the unused
+  `semantics::check` is deleted) — `semantics::analyze` stays, as the
+  diagnostic API;
+- `format_nom_error`, `PROTECTED_FIELDS` and `is_protected_field`.
+
+Every item the two engines, the HTTP server, the Python binding, the WASM
+oracle and the five sibling repositories that depend on this crate use is
+still public, and so are the wire types, the §20.13 registries, the parser
+limits, the bundled prompts and the Capsule model.
+
 ## The 2026-09-05 review, second half: the shapes the code repeated
 
 No behaviour changes. Each item states once what the code had been saying
