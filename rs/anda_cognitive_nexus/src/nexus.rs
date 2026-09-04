@@ -1118,126 +1118,125 @@ impl Executor for Session {
         if let Err(err) = self.check_envelope(&space, request).await {
             return Response::from(err);
         }
-        // The envelope contributes a purpose and a client label and nothing
-        // else. Identity, strength and delegation come from the host (§10).
         let auth = self.auth.merged_with_request(request);
-
+        let call = Call {
+            space: &space,
+            request,
+            operation,
+            auth: &auth,
+        };
         match command {
-            Command::Kml(statement) => {
-                // Exclusive: readers must not observe a partly-written
-                // transaction, and `anda_db` cannot make the multi-row write
-                // atomic on its own.
-                let _guard = self.nexus.lock.write().await;
-                if let Err(err) = self.nexus.store.reopen_if_poisoned().await {
-                    return Response::from(err);
-                }
-                // Resolved under the write lock, so a Grant revoked while this
-                // request was queued is already gone when it is read (§28.6).
-                let authority = match self.authority(&space, &auth).await {
-                    Ok(authority) => authority,
-                    Err(err) => return Response::from(err),
-                };
-                let permissions = gate::kml_permissions(&statement);
+            Command::Kml(statement) => self.run_write(&call, &statement).await,
+            Command::Kql(query) => self.run_read(&call, Read::Kql(&query)).await,
+            Command::Meta(command) => self.run_read(&call, Read::Meta(&command)).await,
+        }
+    }
+}
 
-                // §26, §33: a timeout is not an abort. A client that lost its
-                // response resends the same key and gets the outcome its first
-                // attempt produced, rather than writing a second time or being
-                // told its own write is a conflict.
-                match self
-                    .replay(
-                        &space,
-                        &statement,
-                        request,
-                        operation,
-                        &authority,
-                        &auth,
-                        &permissions,
-                    )
-                    .await
-                {
-                    Ok(Some(response)) => return response,
-                    Ok(None) => {}
-                    Err(err) => return Response::from(err),
-                }
+impl Session {
+    /// The write lane (§32): one exclusive lock, the replay a retried key is
+    /// owed, the gate, and the reopen a poisoned handle needs afterwards.
+    async fn run_write(&self, call: &Call<'_>, statement: &anda_kip::KmlStatement) -> Response {
+        let _guard = self.nexus.lock.write().await;
+        if let Err(err) = self.nexus.store.reopen_if_poisoned().await {
+            return Response::from(err);
+        }
+        let authority = match self.authority(call.space, call.auth).await {
+            Ok(authority) => authority,
+            Err(err) => return Response::from(err),
+        };
+        let permissions = gate::kml_permissions(statement);
+        match self.replay(call, statement, &authority, &permissions).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(err) => return Response::from(err),
+        }
+        let base = base_authorizations(&authority, call.auth, permissions);
+        let decisions = match self.gate(&authority, call.auth, base).await {
+            Ok(decisions) => decisions,
+            Err(err) => return Response::from(err),
+        };
+        let response = crate::kml::execute(
+            &self.nexus.store,
+            call.space,
+            statement,
+            call.request,
+            call.operation,
+            &authority,
+            call.auth,
+        )
+        .await;
+        let response = self.settle(response, decisions).await;
+        if self.nexus.store.has_poisoned_handle() {
+            let _ = self.nexus.store.reopen().await;
+        }
+        response
+    }
 
-                // No approval guard here: the exclusive write lock above
-                // already serializes everything that could spend an approval.
-                let base = base_authorizations(&authority, &auth, permissions);
-                let decisions = match self.gate(&authority, &auth, base).await {
-                    Ok(decisions) => decisions,
-                    Err(err) => return Response::from(err),
-                };
-                let response = crate::kml::execute(
+    /// The read lane, which KQL and META share: a shared lock, the gate, and
+    /// an approval a read may satisfy but never spends (§63.2).
+    async fn run_read(&self, call: &Call<'_>, read: Read<'_>) -> Response {
+        let _guard = self.nexus.lock.read().await;
+        let authority = match self.authority(call.space, call.auth).await {
+            Ok(authority) => authority,
+            Err(err) => return Response::from(err),
+        };
+        let base = base_authorizations(&authority, call.auth, read.permissions());
+        let _approval_guard = self.approval_guard(&base).await;
+        let decisions = match self.gate(&authority, call.auth, base).await {
+            Ok(decisions) => decisions,
+            Err(err) => return Response::from(err),
+        };
+        let response = match read {
+            Read::Kql(query) => {
+                crate::kql::execute(
                     &self.nexus.store,
-                    &space,
-                    &statement,
-                    request,
-                    operation,
+                    call.space,
+                    query,
+                    call.request,
+                    call.operation,
                     &authority,
-                    &auth,
+                    call.auth,
                 )
-                .await;
-                let response = self.settle(response, decisions).await;
-                // A poison event costs no further command: the next mutation
-                // would be rejected outright, so recovery happens here rather
-                // than being deferred to the caller's next attempt.
-                if self.nexus.store.has_poisoned_handle() {
-                    let _ = self.nexus.store.reopen().await;
-                }
-                response
+                .await
             }
-            Command::Kql(query) => {
-                // Shared: readers may run concurrently, but none of them
-                // overlaps a commit.
-                let _guard = self.nexus.lock.read().await;
-                let authority = match self.authority(&space, &auth).await {
-                    Ok(authority) => authority,
-                    Err(err) => return Response::from(err),
-                };
-                let base = base_authorizations(&authority, &auth, gate::kql_permissions(&query));
-                let _approval_guard = self.approval_guard(&base).await;
-                let decisions = match self.gate(&authority, &auth, base).await {
-                    Ok(decisions) => decisions,
-                    Err(err) => return Response::from(err),
-                };
-                let response = crate::kql::execute(
+            Read::Meta(command) => {
+                crate::meta::execute(
                     &self.nexus.store,
-                    &space,
-                    &query,
-                    request,
-                    operation,
+                    call.space,
+                    command,
+                    call.request,
+                    call.operation,
                     &authority,
-                    &auth,
+                    call.auth,
                 )
-                .await;
-                self.settle(response, decisions).await
+                .await
             }
-            Command::Meta(command) => {
-                // META is semantically read-only (§63.2), so it shares the
-                // lock with KQL rather than taking it exclusively.
-                let _guard = self.nexus.lock.read().await;
-                let authority = match self.authority(&space, &auth).await {
-                    Ok(authority) => authority,
-                    Err(err) => return Response::from(err),
-                };
-                let base = base_authorizations(&authority, &auth, gate::meta_permissions(&command));
-                let _approval_guard = self.approval_guard(&base).await;
-                let decisions = match self.gate(&authority, &auth, base).await {
-                    Ok(decisions) => decisions,
-                    Err(err) => return Response::from(err),
-                };
-                let response = crate::meta::execute(
-                    &self.nexus.store,
-                    &space,
-                    &command,
-                    request,
-                    operation,
-                    &authority,
-                    &auth,
-                )
-                .await;
-                self.settle(response, decisions).await
-            }
+        };
+        self.settle(response, decisions).await
+    }
+}
+
+/// One operation's coordinates: the Space it runs in, the envelope and the
+/// operation it arrived in, and the identity it runs as.
+struct Call<'a> {
+    space: &'a str,
+    request: &'a Request,
+    operation: &'a Operation,
+    auth: &'a AuthContext,
+}
+
+/// The two read languages, which run through one lane.
+enum Read<'a> {
+    Kql(&'a anda_kip::KqlQuery),
+    Meta(&'a anda_kip::MetaCommand),
+}
+
+impl Read<'_> {
+    fn permissions(&self) -> Vec<Permission> {
+        match self {
+            Read::Kql(query) => gate::kql_permissions(query),
+            Read::Meta(command) => gate::meta_permissions(command),
         }
     }
 }
@@ -1303,51 +1302,36 @@ impl Session {
     /// approval authorizes the work, and on a replay the work already happened
     /// — demanding a second one to learn the outcome of the first is what would
     /// make a lost response unrecoverable.
-    #[allow(clippy::too_many_arguments)]
     async fn replay(
         &self,
-        space: &str,
+        call: &Call<'_>,
         statement: &anda_kip::KmlStatement,
-        request: &Request,
-        operation: &Operation,
         authority: &EffectiveAuthority,
-        auth: &AuthContext,
         permissions: &[Permission],
     ) -> Result<Option<Response>, KipError> {
-        if request.is_dry_run() {
+        if call.request.is_dry_run() {
             return Ok(None);
         }
-        let key = crate::kml::idempotency_key(request, operation);
+        let key = crate::kml::idempotency_key(call.request, call.operation);
         if key.is_empty() {
             return Ok(None);
         }
         let Some(row) =
-            crate::kml::find_transaction_for_key(&self.nexus.store, space, auth, &key).await?
+            crate::kml::find_transaction_for_key(&self.nexus.store, call.space, call.auth, &key)
+                .await?
         else {
             return Ok(None);
         };
-
-        // Authorized before it answers — a replay is still a read of what
-        // this Space did — and before the conflict below, whose refusal names
-        // the transaction the key already committed: a caller that may not
-        // make this write may not learn that either. `ts/kip-do` orders the
-        // two the same way.
         let resource = ResourceContext::default();
         for permission in permissions {
-            let decision = authority.authorize(*permission, &resource, auth);
+            let decision = authority.authorize(*permission, &resource, call.auth);
             if decision.decision == crate::governance::Decision::RequireApproval {
                 continue;
             }
             decision.into_result()?;
         }
-
-        // §34.4: the same key on different work is a caller bug, not a retry.
-        // Replaying the first outcome would tell the second write it
-        // succeeded, hand back a receipt for a transaction that did something
-        // else, and leave the work it asked for undone — silently, since the
-        // response looks ordinary. An empty stored digest is a transaction
-        // journalled before this check existed; those replay as they did.
-        let digest = crate::kml::request_digest(statement, request, operation);
+        // Journals written before the digest existed replay as they did.
+        let digest = crate::kml::request_digest(statement, call.request, call.operation);
         if !row.request_digest.is_empty() && row.request_digest != digest {
             return Err(anda_kip::KipError::new(
                 anda_kip::KipErrorCode::IdempotencyConflict,
@@ -1359,28 +1343,10 @@ impl Session {
                 ),
             ));
         }
-
         Ok(Some(crate::kml::replay(&row)))
     }
 
-    /// Checks the envelope fields that decide whether a command may run at all.
-    ///
-    /// `anda_kip::Executor` asks an implementation to honor every applicable
-    /// request field "or fail explicitly", and these three are the ones where
-    /// ignoring them changes what the caller gets rather than merely what it is
-    /// told:
-    ///
-    /// - **`preconditions`** (§35.4) is the caller's optimistic-concurrency guard.
-    ///   Executing past a stale `space_seq` commits the write the guard existed to
-    ///   stop, and the caller has no way to notice.
-    /// - **`requires`** (§67) is a fail-fast capability check. Running a command
-    ///   that needed semantic search and answering it with keyword results is a
-    ///   wrong answer wearing a success status.
-    /// - **`options.deadline_ms`** (§80.1) is the caller's execution window.
-    ///   Accepting a deadline this engine cannot enforce would be a promise, and
-    ///   §80.2 is explicit that a client timeout is not an abort — so the honest
-    ///   move is to say so rather than to imply a cancellation that will not
-    ///   happen.
+    /// Every envelope invariant this engine can check before anything runs.
     async fn check_envelope(&self, space: &str, request: &Request) -> Result<(), KipError> {
         if let Some(preconditions) = &request.preconditions {
             let row = self.nexus.store.get_space(space).await?;

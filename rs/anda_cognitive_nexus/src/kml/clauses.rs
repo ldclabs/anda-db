@@ -603,144 +603,16 @@ async fn create_record(
     // under a Concept the Space said was the same as another one.
     structural.canonicalize(tx).await?;
 
+    let draft = Draft {
+        id,
+        client_key,
+        facets,
+        retention,
+    };
     let row = match kind {
-        ElementKind::Evidence => {
-            let payload = fields.json("payload");
-            let (payload_mode, payload_inline, content_ref) = split_payload(payload)?;
-            let source_refs = structural.values("source");
-            let evidence_class = require_text(&mut fields, "evidence_class", "CREATE EVIDENCE")?;
-            let row = EvidenceRow {
-                _id: id.seq,
-                evidence_class,
-                payload_mode,
-                payload_inline,
-                content_ref,
-                content_digest: fields.text("content_digest")?,
-                media_type: fields.text("media_type")?,
-                observed_at: fields.timestamp("observed_at")?,
-                source_keys: source_refs.iter().map(endpoint_key).collect(),
-                source_refs,
-                generated_by: structural
-                    .one("generated_by")
-                    .map(|value| reference_id(&value))
-                    .unwrap_or_default(),
-                status: "active".to_string(),
-                client_key,
-                facets,
-                structural: structural.profile,
-                expires_at: expires_at(&retention)?,
-                retention,
-                ..Default::default()
-            };
-            Element::Evidence(Box::new(row))
-        }
-        ElementKind::Assertion => {
-            let proposition = require_reference(&mut fields, "proposition", "CREATE ASSERTION")?;
-            // The semantic actor is a reference like any other, and a merged
-            // one has to resolve to the surviving identity or the actor's own
-            // claims split across two Concepts the Space calls one (§11.3).
-            let asserted_by = canonicalize_reference(tx, fields.json("asserted_by")).await?;
-            // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be
-            // resolved is recorded as Evidence, not asserted — an Assertion is
-            // one actor's commitment, and one with no actor commits nobody.
-            let asserted_by_key = endpoint_key(&asserted_by);
-            if asserted_by_key.is_empty() {
-                return Err(KipError::constraint_violation(
-                    "CREATE ASSERTION requires `asserted_by`, the semantic actor whose commitment \
-                     this is (§13.3); a claim with no resolvable actor is recorded as Evidence, \
-                     not asserted",
-                ));
-            }
-            // Each citation keeps the role it was cited in: Core records that
-            // this Assertion cites E *as supporting*, and never that E proves
-            // anything — that judgement belongs to the Projection (§8.4).
-            let evidence: Vec<Json> = structural
-                .take("evidence")
-                .into_iter()
-                .map(|(value, options)| {
-                    // Stored in the wire shape §13.2 fixes — `{id, role}` —
-                    // so the view renders it without a rename, and one place
-                    // fewer can drift from the other.
-                    let mut citation = Map::new();
-                    citation.insert("id".into(), Json::String(reference_id(&value)));
-                    if let Some(role) = options.get("role") {
-                        // §20.13 fixes the Evidence roles, and a citation
-                        // whose role nobody can read is a citation whose
-                        // meaning is lost: `challenge` and `support` are the
-                        // difference between corroboration and dissent.
-                        let role = role.as_str().ok_or_else(|| {
-                            KipError::type_mismatch(format!(
-                                "an Evidence citation `role` must be a string, got {role}"
-                            ))
-                        })?;
-                        check_registry(role, "role", EVIDENCE_ROLES)?;
-                        citation.insert("role".into(), Json::String(role.to_string()));
-                    }
-                    Ok(Json::Object(citation))
-                })
-                .collect::<Result<Vec<Json>, KipError>>()?;
-            let valid_time = fields.json("valid_time");
-            let row = AssertionRow {
-                _id: id.seq,
-                proposition_id: proposition.to_string(),
-                asserted_by_key,
-                asserted_by,
-                stance: require_registry(&mut fields, "stance", STANCES, "CREATE ASSERTION")?,
-                mode: require_registry(&mut fields, "mode", ASSERTION_MODES, "CREATE ASSERTION")?,
-                confidence: read_confidence(&mut fields)?,
-                asserted_at: fields.timestamp("asserted_at")?,
-                valid_from: valid_time_part(&valid_time, "from")?,
-                valid_until: valid_time_part(&valid_time, "until")?,
-                evidence_ids: evidence.iter().filter_map(evidence_id).collect(),
-                evidence_refs: evidence,
-                context_refs: structural.values("context"),
-                status: "active".to_string(),
-                client_key,
-                facets,
-                structural: structural.profile,
-                expires_at: expires_at(&retention)?,
-                retention,
-                ..Default::default()
-            };
-            Element::Assertion(Box::new(row))
-        }
-        ElementKind::Activity => {
-            let inputs = structural.values("inputs");
-            let outputs = structural.values("outputs");
-            let activity_class = require_text(&mut fields, "activity_class", "CREATE ACTIVITY")?;
-            let row = ActivityRow {
-                _id: id.seq,
-                activity_class,
-                started_at: fields.timestamp("started_at")?,
-                ended_at: fields.timestamp("ended_at")?,
-                input_keys: inputs.iter().map(endpoint_key).collect(),
-                inputs,
-                output_keys: outputs.iter().map(endpoint_key).collect(),
-                outputs,
-                associated_actors: structural.values("associated_actors"),
-                parameters_digest: fields.text("parameters_digest")?,
-                status: {
-                    // §16, §20.13: the Activity status registry is Core's, so
-                    // a word outside it is refused here rather than stored —
-                    // the parser only sees a written literal, and a
-                    // `:parameter` status is bound at execution time.
-                    let status = fields.text("status")?;
-                    if status.is_empty() {
-                        "pending".to_string()
-                    } else {
-                        check_registry(&status, "status", anda_kip::ACTIVITY_STATUS)?;
-                        status
-                    }
-                },
-                client_key,
-                facets,
-                structural: structural.profile,
-                expires_at: expires_at(&retention)?,
-                retention,
-                ..Default::default()
-            };
-            Element::Activity(Box::new(row))
-        }
+        ElementKind::Evidence => evidence_row(draft, &mut fields, &mut structural)?,
+        ElementKind::Assertion => assertion_row(tx, draft, &mut fields, &mut structural).await?,
+        ElementKind::Activity => activity_row(draft, &mut fields, &mut structural)?,
         other => {
             return Err(KipError::internal_error(format!(
                 "{other} has no record-create form"
@@ -780,6 +652,187 @@ async fn create_record(
     require_outcome_authority(tx, &row)?;
     tx.stage_new(id, row, ChangeOp::Create);
     check_structural(store, tx, id).await
+}
+
+/// What every record clause settles before its kind-specific row is built.
+struct Draft {
+    id: ElementId,
+    client_key: String,
+    facets: Map<String, Json>,
+    retention: Json,
+}
+
+/// The Evidence row a `CREATE EVIDENCE` clause describes (§15.3).
+fn evidence_row(
+    draft: Draft,
+    fields: &mut Fields,
+    structural: &mut Structural,
+) -> Result<Element, KipError> {
+    let Draft {
+        id,
+        client_key,
+        facets,
+        retention,
+    } = draft;
+    let payload = fields.json("payload");
+    let (payload_mode, payload_inline, content_ref) = split_payload(payload)?;
+    let source_refs = structural.values("source");
+    let evidence_class = require_text(fields, "evidence_class", "CREATE EVIDENCE")?;
+    let row = EvidenceRow {
+        _id: id.seq,
+        evidence_class,
+        payload_mode,
+        payload_inline,
+        content_ref,
+        content_digest: fields.text("content_digest")?,
+        media_type: fields.text("media_type")?,
+        observed_at: fields.timestamp("observed_at")?,
+        source_keys: source_refs.iter().map(endpoint_key).collect(),
+        source_refs,
+        generated_by: structural
+            .one("generated_by")
+            .map(|value| reference_id(&value))
+            .unwrap_or_default(),
+        status: "active".to_string(),
+        client_key,
+        facets,
+        structural: std::mem::take(&mut structural.profile),
+        expires_at: expires_at(&retention)?,
+        retention,
+        ..Default::default()
+    };
+    Ok(Element::Evidence(Box::new(row)))
+}
+
+/// The Assertion row a `CREATE ASSERTION` clause describes (§13.2).
+async fn assertion_row(
+    tx: &mut Transaction,
+    draft: Draft,
+    fields: &mut Fields,
+    structural: &mut Structural,
+) -> Result<Element, KipError> {
+    let Draft {
+        id,
+        client_key,
+        facets,
+        retention,
+    } = draft;
+    let proposition = require_reference(fields, "proposition", "CREATE ASSERTION")?;
+    // The semantic actor is a reference like any other, and a merged one has
+    // to resolve to the surviving identity or the actor's own claims split
+    // across two Concepts the Space calls one (§11.3).
+    let asserted_by = canonicalize_reference(tx, fields.json("asserted_by")).await?;
+    // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be resolved
+    // is recorded as Evidence, not asserted — an Assertion is one actor's
+    // commitment, and one with no actor commits nobody.
+    let asserted_by_key = endpoint_key(&asserted_by);
+    if asserted_by_key.is_empty() {
+        return Err(KipError::constraint_violation(
+            "CREATE ASSERTION requires `asserted_by`, the semantic actor whose commitment this \
+             is (§13.3); a claim with no resolvable actor is recorded as Evidence, not asserted",
+        ));
+    }
+    // Each citation keeps the role it was cited in: Core records that this
+    // Assertion cites E *as supporting*, and never that E proves anything —
+    // that judgement belongs to the Projection (§8.4).
+    let evidence: Vec<Json> = structural
+        .take("evidence")
+        .into_iter()
+        .map(|(value, options)| {
+            // Stored in the wire shape §13.2 fixes — `{id, role}` — so the
+            // view renders it without a rename, and one place fewer can drift
+            // from the other.
+            let mut citation = Map::new();
+            citation.insert("id".into(), Json::String(reference_id(&value)));
+            if let Some(role) = options.get("role") {
+                // §20.13 fixes the Evidence roles, and a citation whose role
+                // nobody can read is a citation whose meaning is lost:
+                // `challenge` and `support` are the difference between
+                // corroboration and dissent.
+                let role = role.as_str().ok_or_else(|| {
+                    KipError::type_mismatch(format!(
+                        "an Evidence citation `role` must be a string, got {role}"
+                    ))
+                })?;
+                check_registry(role, "role", EVIDENCE_ROLES)?;
+                citation.insert("role".into(), Json::String(role.to_string()));
+            }
+            Ok(Json::Object(citation))
+        })
+        .collect::<Result<Vec<Json>, KipError>>()?;
+    let valid_time = fields.json("valid_time");
+    let row = AssertionRow {
+        _id: id.seq,
+        proposition_id: proposition.to_string(),
+        asserted_by_key,
+        asserted_by,
+        stance: require_registry(fields, "stance", STANCES, "CREATE ASSERTION")?,
+        mode: require_registry(fields, "mode", ASSERTION_MODES, "CREATE ASSERTION")?,
+        confidence: read_confidence(fields)?,
+        asserted_at: fields.timestamp("asserted_at")?,
+        valid_from: valid_time_part(&valid_time, "from")?,
+        valid_until: valid_time_part(&valid_time, "until")?,
+        evidence_ids: evidence.iter().filter_map(evidence_id).collect(),
+        evidence_refs: evidence,
+        context_refs: structural.values("context"),
+        status: "active".to_string(),
+        client_key,
+        facets,
+        structural: std::mem::take(&mut structural.profile),
+        expires_at: expires_at(&retention)?,
+        retention,
+        ..Default::default()
+    };
+    Ok(Element::Assertion(Box::new(row)))
+}
+
+/// The Activity row a `CREATE ACTIVITY` clause describes (§16.3).
+fn activity_row(
+    draft: Draft,
+    fields: &mut Fields,
+    structural: &mut Structural,
+) -> Result<Element, KipError> {
+    let Draft {
+        id,
+        client_key,
+        facets,
+        retention,
+    } = draft;
+    let inputs = structural.values("inputs");
+    let outputs = structural.values("outputs");
+    let activity_class = require_text(fields, "activity_class", "CREATE ACTIVITY")?;
+    let row = ActivityRow {
+        _id: id.seq,
+        activity_class,
+        started_at: fields.timestamp("started_at")?,
+        ended_at: fields.timestamp("ended_at")?,
+        input_keys: inputs.iter().map(endpoint_key).collect(),
+        inputs,
+        output_keys: outputs.iter().map(endpoint_key).collect(),
+        outputs,
+        associated_actors: structural.values("associated_actors"),
+        parameters_digest: fields.text("parameters_digest")?,
+        status: {
+            // §16, §20.13: the Activity status registry is Core's, so a word
+            // outside it is refused here rather than stored — the parser only
+            // sees a written literal, and a `:parameter` status is bound at
+            // execution time.
+            let status = fields.text("status")?;
+            if status.is_empty() {
+                "pending".to_string()
+            } else {
+                check_registry(&status, "status", anda_kip::ACTIVITY_STATUS)?;
+                status
+            }
+        },
+        client_key,
+        facets,
+        structural: std::mem::take(&mut structural.profile),
+        expires_at: expires_at(&retention)?,
+        retention,
+        ..Default::default()
+    };
+    Ok(Element::Activity(Box::new(row)))
 }
 
 /// The Evidence class that is the consequence channel (§15.7).
@@ -876,11 +929,13 @@ async fn purge(
         let targets = select::targets(
             store,
             tx,
-            "PURGE",
-            Permission::Purge,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
+            &select::Selection {
+                what: "PURGE",
+                permission: Permission::Purge,
+                target: &clause.target,
+                where_clauses: clause.where_clauses.as_ref(),
+                limit: clause.limit.as_ref(),
+            },
             &b,
         )
         .await?;
@@ -936,11 +991,13 @@ async fn purge_payload(
         let targets = select::targets(
             store,
             tx,
-            "PURGE PAYLOAD",
-            Permission::Purge,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
+            &select::Selection {
+                what: "PURGE PAYLOAD",
+                permission: Permission::Purge,
+                target: &clause.target,
+                where_clauses: clause.where_clauses.as_ref(),
+                limit: clause.limit.as_ref(),
+            },
             &b,
         )
         .await?;
@@ -1380,11 +1437,13 @@ async fn update_elements(
         let targets = select::targets(
             store,
             tx,
-            "UPDATE",
-            Permission::Update,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
+            &select::Selection {
+                what: "UPDATE",
+                permission: Permission::Update,
+                target: &clause.target,
+                where_clauses: clause.where_clauses.as_ref(),
+                limit: clause.limit.as_ref(),
+            },
             &b,
         )
         .await?;
@@ -1475,11 +1534,13 @@ async fn transition(
         let targets = select::targets(
             store,
             tx,
-            "TRANSITION",
-            permission,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
+            &select::Selection {
+                what: "TRANSITION",
+                permission,
+                target: &clause.target,
+                where_clauses: clause.where_clauses.as_ref(),
+                limit: clause.limit.as_ref(),
+            },
             &b,
         )
         .await?;
@@ -1506,13 +1567,15 @@ async fn transition(
         move_element(
             store,
             tx,
-            id,
-            &state,
-            by,
-            set_fields.as_ref(),
-            clause.set_structural.as_ref(),
-            request,
-            operation,
+            &LifecycleMove {
+                id,
+                state: &state,
+                by,
+                set_fields: set_fields.as_ref(),
+                set_structural: clause.set_structural.as_ref(),
+                request,
+                operation,
+            },
         )
         .await?;
     }
@@ -1535,54 +1598,42 @@ fn element_permission(state: &str) -> Option<Permission> {
     })
 }
 
-/// Moves one element to one lifecycle state (§52.5, §57.2–§57.4, §60).
-///
-/// The legality table, by state and current lifecycle word:
-///
-/// ```text
-/// retracted     Assertion   from active
-/// superseded    Assertion   from active, BY an Assertion about the same Proposition
-/// corrected     Evidence    from active, BY new Evidence
-/// running       Activity    from pending
-/// completed |   Activity    from pending or running; from a terminal state the
-/// failed |                  refusal is ActivityTerminal, because the provenance
-/// cancelled                 topology is frozen (§16.6)
-/// archived      any         from active (engine state)
-/// tombstoned    any         from active or archived (engine state)
-/// ```
-///
-/// A move to the state already held returns without staging anything, so the
-/// transaction reports `no_effect` for it (§32.8).
-#[allow(clippy::too_many_arguments)]
+/// One `TRANSITION` target and the clause members that apply to it (§52.5).
+struct LifecycleMove<'a> {
+    id: ElementId,
+    state: &'a str,
+    by: Option<ElementId>,
+    set_fields: Option<&'a Map<String, Json>>,
+    set_structural: Option<&'a Vec<anda_kip::StructuralEdge>>,
+    request: Option<&'a Map<String, Json>>,
+    operation: Option<&'a Map<String, Json>>,
+}
+
+/// The refusal every illegal move is: from where the element is, to where the
+/// clause asked, for a kind that has no such move (§52.5).
+fn refuse_move(id: ElementId, kind: ElementKind, from: &str, to: &str) -> KipError {
+    KipError::invalid_lifecycle_transition_from(
+        from,
+        to,
+        format!("{id} is {from:?}, and a {kind} cannot move from there to {to:?} (§52.5)"),
+    )
+}
+
 async fn move_element(
     store: &Store,
     tx: &mut Transaction,
-    id: ElementId,
-    state: &str,
-    by: Option<ElementId>,
-    set_fields: Option<&Map<String, Json>>,
-    set_structural: Option<&Vec<anda_kip::StructuralEdge>>,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
+    mv: &LifecycleMove<'_>,
 ) -> Result<(), KipError> {
     use transition_state as ts;
-
     let (kind, current, engine_state) = {
-        let element = tx.load(id).await?;
+        let element = tx.load(mv.id).await?;
         (
             element.kind(),
             planes::lifecycle_state(element),
             element.state().to_string(),
         )
     };
-    let refuse = |from: &str| {
-        KipError::invalid_lifecycle_transition_from(
-            from,
-            state,
-            format!("{id} is {from:?}, and a {kind} cannot move from there to {state:?} (§52.5)"),
-        )
-    };
-    let fits = match state {
+    let fits = match mv.state {
         ts::RETRACTED | ts::SUPERSEDED => kind == ElementKind::Assertion,
         ts::CORRECTED => kind == ElementKind::Evidence,
         ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => kind == ElementKind::Activity,
@@ -1590,224 +1641,252 @@ async fn move_element(
         _ => false,
     };
     if !fits {
-        return Err(refuse(&current));
+        return Err(refuse_move(mv.id, kind, &current, mv.state));
     }
-
-    match state {
+    match mv.state {
         ts::ARCHIVED | ts::TOMBSTONED => {
-            if engine_state == state {
-                return Ok(());
-            }
-            let legal = engine_state == state::ACTIVE
-                || (state == ts::TOMBSTONED && engine_state == state::ARCHIVED);
-            if !legal {
-                return Err(refuse(&current));
-            }
-            // §14.1, §29: administratively excluding somebody else's claim is
-            // a different act from tidying one's own, and only the first is
-            // moderation. Asked for on top of `archive`/`tombstone`, never
-            // instead of it, so a Grant listing only `moderate_assertion`
-            // confers nothing.
-            if let Element::Assertion(row) = tx.load(id).await? {
-                let row = row.clone();
-                if !tx.may_represent_assertion(&row) {
-                    tx.require(Permission::ModerateAssertion)?;
-                }
-            }
-            // Neither archive nor tombstone erases anything: references keep
-            // resolving (§60.1, §60.2), which is what stops a removal from
-            // silently breaking every Assertion that cited the element.
-            *tx.load(id).await?.state_mut() = state.to_string();
-            tx.mark_changed(id, ChangeOp::Lifecycle);
+            shelve(tx, mv.id, kind, mv.state, &current, &engine_state).await
         }
-        ts::RETRACTED => {
-            if current == ts::RETRACTED {
-                return Ok(());
-            }
-            if current != state::ACTIVE {
-                return Err(refuse(&current));
-            }
-            require_representation(tx, id, "TRANSITION ... TO \"retracted\"").await?;
-            // §57.3: retraction preserves the historical payload. The
-            // Assertion goes on existing, so the record of what was once
-            // believed — and by whom — survives.
-            let at = tx.cx.at.clone();
-            let row = assertion_mut(tx, id).await?;
-            row.status = ts::RETRACTED.to_string();
-            row.retracted_at = at;
-            tx.mark_changed(id, ChangeOp::Lifecycle);
-        }
-        ts::SUPERSEDED => {
-            let new = by.ok_or_else(|| {
-                KipError::invalid_syntax(
-                    "TRANSITION ... TO \"superseded\" names the newer Assertion with BY",
-                )
-            })?;
-            // §52.5 makes the current lifecycle state the first thing the
-            // engine validates: from `retracted` no replacement is legal, so
-            // the answer is `InvalidLifecycleTransition` whatever BY names.
-            // Checking the operand first would report a mismatch between two
-            // Assertions when the move was never available in the first place.
-            //
-            // `no_effect` only when this very supersession is already
-            // recorded. Superseded by *another* Assertion is a second revision
-            // and `superseded` is not a state one is legal from (§57.4);
-            // answering `no_effect` there would tell the caller its lineage was
-            // recorded when nothing was written.
-            if current == ts::SUPERSEDED {
-                let already = assertion_mut(tx, id)
-                    .await?
-                    .superseded_by
-                    .contains(&new.to_string());
-                if already {
-                    return Ok(());
-                }
-            }
-            if current != state::ACTIVE {
-                return Err(refuse(&current));
-            }
-            if new == id {
-                return Err(KipError::new(
-                    KipErrorCode::SupersessionMismatch,
-                    "an Assertion cannot supersede itself",
-                ));
-            }
-            tx.authorize_element(new, Permission::SupersedeOwn).await?;
-            require_representation(tx, id, "TRANSITION ... TO \"superseded\"").await?;
-
-            // Supersession is belief revision within one lineage, so the
-            // replacement must be about the same Proposition. Two claims
-            // about different tuples are a contradiction, and a contradiction
-            // is not a supersession (§57.4).
-            let proposition = assertion_mut(tx, id).await?.proposition_id.clone();
-            let new_row = assertion_mut(tx, new).await?;
-            if new_row.proposition_id != proposition {
-                return Err(KipError::new(
-                    KipErrorCode::SupersessionMismatch,
-                    format!(
-                        "{new} is about {}, not about {proposition}",
-                        new_row.proposition_id
-                    ),
-                ));
-            }
-            if !new_row.supersedes.contains(&id.to_string()) {
-                new_row.supersedes.push(id.to_string());
-                tx.mark_changed(new, ChangeOp::Update);
-            }
-            let old_row = assertion_mut(tx, id).await?;
-            old_row.status = ts::SUPERSEDED.to_string();
-            if !old_row.superseded_by.contains(&new.to_string()) {
-                old_row.superseded_by.push(new.to_string());
-            }
-            tx.mark_changed(id, ChangeOp::Lifecycle);
-        }
-        ts::CORRECTED => {
-            let new = by.ok_or_else(|| {
-                KipError::invalid_syntax(
-                    "TRANSITION ... TO \"corrected\" names the new Evidence with BY",
-                )
-            })?;
-            // The move is judged before the operand, as supersession judges
-            // it, and by the same rule: already corrected by this very record
-            // is `no_effect`, corrected by another is a second correction and
-            // `corrected` is not a state one is legal from (§57.2).
-            if current == ts::CORRECTED {
-                let already = evidence_mut(tx, id)
-                    .await?
-                    .corrected_by
-                    .contains(&new.to_string());
-                if already {
-                    return Ok(());
-                }
-            }
-            if current != state::ACTIVE {
-                return Err(refuse(&current));
-            }
-            if new == id {
-                return Err(KipError::new(
-                    KipErrorCode::EvidenceCorrectionConflict,
-                    "an Evidence record cannot correct itself",
-                ));
-            }
-            tx.authorize_element(new, Permission::Maintain).await?;
-            // §57.2: wrong Evidence is corrected, never rewritten. The
-            // original observation stays exactly as observed, because what a
-            // source said is a historical fact even when it was wrong.
-            let new_row = evidence_mut(tx, new).await?;
-            if !new_row.corrects.contains(&id.to_string()) {
-                new_row.corrects.push(id.to_string());
-                tx.mark_changed(new, ChangeOp::Update);
-            }
-            let old_row = evidence_mut(tx, id).await?;
-            old_row.status = ts::CORRECTED.to_string();
-            if !old_row.corrected_by.contains(&new.to_string()) {
-                old_row.corrected_by.push(new.to_string());
-            }
-            tx.mark_changed(id, ChangeOp::Lifecycle);
-        }
+        ts::RETRACTED => retract(tx, mv.id, kind, &current).await,
+        ts::SUPERSEDED => supersede(tx, mv.id, kind, &current, mv.by).await,
+        ts::CORRECTED => correct(tx, mv.id, kind, &current, mv.by).await,
         ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => {
-            if current == state {
-                return Ok(());
-            }
-            // §16.6: a terminal Activity's provenance topology is immutable.
-            // Once it has ended, what it consumed and produced is a
-            // historical record.
-            if is_terminal(&current) {
-                return Err(KipError::activity_terminal(format!(
-                    "{id} is already {current:?}; a finished Activity's provenance is immutable"
-                )));
-            }
-            if engine_state != state::ACTIVE {
-                return Err(refuse(&current));
-            }
-            let legal = match state {
-                ts::RUNNING => current == "pending",
-                _ => current == "pending" || current == ts::RUNNING,
-            };
-            if !legal {
-                return Err(refuse(&current));
-            }
-            finalize_activity(
-                store,
-                tx,
-                id,
-                state,
-                set_fields,
-                set_structural,
-                request,
-                operation,
-            )
-            .await?;
-            tx.mark_changed(id, ChangeOp::Lifecycle);
+            move_activity(store, tx, mv, kind, &current, &engine_state).await
         }
-        _ => return Err(refuse(&current)),
+        _ => Err(refuse_move(mv.id, kind, &current, mv.state)),
     }
+}
+
+/// `archived` and `tombstoned` (§60): out of ordinary recall, history kept.
+async fn shelve(
+    tx: &mut Transaction,
+    id: ElementId,
+    kind: ElementKind,
+    state: &str,
+    current: &str,
+    engine_state: &str,
+) -> Result<(), KipError> {
+    use transition_state as ts;
+    if engine_state == state {
+        return Ok(());
+    }
+    let legal = engine_state == state::ACTIVE
+        || (state == ts::TOMBSTONED && engine_state == state::ARCHIVED);
+    if !legal {
+        return Err(refuse_move(id, kind, current, state));
+    }
+    if let Element::Assertion(row) = tx.load(id).await? {
+        let row = row.clone();
+        if !tx.may_represent_assertion(&row) {
+            tx.require(Permission::ModerateAssertion)?;
+        }
+    }
+    *tx.load(id).await?.state_mut() = state.to_string();
+    tx.mark_changed(id, ChangeOp::Lifecycle);
     Ok(())
 }
 
-/// Moves an Activity's status, finalizing the fields and topology the same
-/// statement carries (§52.5, §16.6).
-#[allow(clippy::too_many_arguments)]
+/// `retracted` (§57.3): the assertor withdraws the claim.
+async fn retract(
+    tx: &mut Transaction,
+    id: ElementId,
+    kind: ElementKind,
+    current: &str,
+) -> Result<(), KipError> {
+    use transition_state as ts;
+    if current == ts::RETRACTED {
+        return Ok(());
+    }
+    if current != state::ACTIVE {
+        return Err(refuse_move(id, kind, current, ts::RETRACTED));
+    }
+    require_representation(tx, id, "TRANSITION ... TO \"retracted\"").await?;
+    let at = tx.cx.at.clone();
+    let row = row_mut::<AssertionRow>(tx, id).await?;
+    row.status = ts::RETRACTED.to_string();
+    row.retracted_at = at;
+    tx.mark_changed(id, ChangeOp::Lifecycle);
+    Ok(())
+}
+
+/// What `superseded` and `corrected` share: a revision names its replacement
+/// with `BY`, and the replacement is linked both ways (§14.2, §57.2).
+struct Revision {
+    state: &'static str,
+    /// The permission the replacement is authorized with.
+    by_permission: Permission,
+    by_message: &'static str,
+    self_reference: KipErrorCode,
+    self_message: &'static str,
+}
+
+/// The replacement a revision links, after the checks every revision makes:
+/// `BY` is present, the same replacement already linked is a no-op (`None`),
+/// the record is still active, it is not replacing itself, and the caller may
+/// act on the replacement.
+async fn revision_target<R: Revisable>(
+    tx: &mut Transaction,
+    id: ElementId,
+    kind: ElementKind,
+    current: &str,
+    by: Option<ElementId>,
+    revision: &Revision,
+) -> Result<Option<ElementId>, KipError> {
+    let new = by.ok_or_else(|| KipError::invalid_syntax(revision.by_message))?;
+    if current == revision.state
+        && row_mut::<R>(tx, id)
+            .await?
+            .revised_by()
+            .contains(&new.to_string())
+    {
+        return Ok(None);
+    }
+    if current != state::ACTIVE {
+        return Err(refuse_move(id, kind, current, revision.state));
+    }
+    if new == id {
+        return Err(KipError::new(
+            revision.self_reference,
+            revision.self_message,
+        ));
+    }
+    tx.authorize_element(new, revision.by_permission).await?;
+    Ok(Some(new))
+}
+
+/// Links a revision both ways and records the move.
+async fn link_revision<R: Revisable>(
+    tx: &mut Transaction,
+    id: ElementId,
+    new: ElementId,
+    state: &str,
+) -> Result<(), KipError> {
+    let new_row = row_mut::<R>(tx, new).await?;
+    if !new_row.revises().contains(&id.to_string()) {
+        new_row.revises().push(id.to_string());
+        tx.mark_changed(new, ChangeOp::Update);
+    }
+    let old_row = row_mut::<R>(tx, id).await?;
+    *old_row.status_mut() = state.to_string();
+    if !old_row.revised_by().contains(&new.to_string()) {
+        old_row.revised_by().push(new.to_string());
+    }
+    tx.mark_changed(id, ChangeOp::Lifecycle);
+    Ok(())
+}
+
+/// `superseded` (§57.4): the claim was wrong, and a newer Assertion about the
+/// same Proposition says what is right.
+async fn supersede(
+    tx: &mut Transaction,
+    id: ElementId,
+    kind: ElementKind,
+    current: &str,
+    by: Option<ElementId>,
+) -> Result<(), KipError> {
+    const REVISION: Revision = Revision {
+        state: transition_state::SUPERSEDED,
+        by_permission: Permission::SupersedeOwn,
+        by_message: "TRANSITION ... TO \"superseded\" names the newer Assertion with BY",
+        self_reference: KipErrorCode::SupersessionMismatch,
+        self_message: "an Assertion cannot supersede itself",
+    };
+    let Some(new) = revision_target::<AssertionRow>(tx, id, kind, current, by, &REVISION).await?
+    else {
+        return Ok(());
+    };
+    require_representation(tx, id, "TRANSITION ... TO \"superseded\"").await?;
+    let proposition = row_mut::<AssertionRow>(tx, id)
+        .await?
+        .proposition_id
+        .clone();
+    let replacement = row_mut::<AssertionRow>(tx, new)
+        .await?
+        .proposition_id
+        .clone();
+    if replacement != proposition {
+        return Err(KipError::new(
+            KipErrorCode::SupersessionMismatch,
+            format!("{new} is about {replacement}, not about {proposition}"),
+        ));
+    }
+    link_revision::<AssertionRow>(tx, id, new, REVISION.state).await
+}
+
+/// `corrected` (§57.2): the record was wrong, and a new Evidence record
+/// carries the correction.
+async fn correct(
+    tx: &mut Transaction,
+    id: ElementId,
+    kind: ElementKind,
+    current: &str,
+    by: Option<ElementId>,
+) -> Result<(), KipError> {
+    const REVISION: Revision = Revision {
+        state: transition_state::CORRECTED,
+        by_permission: Permission::Maintain,
+        by_message: "TRANSITION ... TO \"corrected\" names the new Evidence with BY",
+        self_reference: KipErrorCode::EvidenceCorrectionConflict,
+        self_message: "an Evidence record cannot correct itself",
+    };
+    let Some(new) = revision_target::<EvidenceRow>(tx, id, kind, current, by, &REVISION).await?
+    else {
+        return Ok(());
+    };
+    link_revision::<EvidenceRow>(tx, id, new, REVISION.state).await
+}
+
+/// An Activity's status moves (§16): forward from `pending`, and a finished
+/// Activity's provenance is immutable (§16.6).
+async fn move_activity(
+    store: &Store,
+    tx: &mut Transaction,
+    mv: &LifecycleMove<'_>,
+    kind: ElementKind,
+    current: &str,
+    engine_state: &str,
+) -> Result<(), KipError> {
+    use transition_state as ts;
+    if current == mv.state {
+        return Ok(());
+    }
+    if is_terminal(current) {
+        return Err(KipError::activity_terminal(format!(
+            "{} is already {current:?}; a finished Activity's provenance is immutable",
+            mv.id
+        )));
+    }
+    if engine_state != state::ACTIVE {
+        return Err(refuse_move(mv.id, kind, current, mv.state));
+    }
+    let legal = match mv.state {
+        ts::RUNNING => current == "pending",
+        _ => current == "pending" || current == ts::RUNNING,
+    };
+    if !legal {
+        return Err(refuse_move(mv.id, kind, current, mv.state));
+    }
+    finalize_activity(store, tx, mv).await?;
+    tx.mark_changed(mv.id, ChangeOp::Lifecycle);
+    Ok(())
+}
+
 async fn finalize_activity(
     store: &Store,
     tx: &mut Transaction,
-    id: ElementId,
-    state: &str,
-    set_fields: Option<&Map<String, Json>>,
-    set_structural: Option<&Vec<anda_kip::StructuralEdge>>,
-    request: Option<&Map<String, Json>>,
-    operation: Option<&Map<String, Json>>,
+    mv: &LifecycleMove<'_>,
 ) -> Result<(), KipError> {
-    let mut fields = Fields::new(set_fields.cloned().unwrap_or_default())?;
+    let id = mv.id;
+    let mut fields = Fields::new(mv.set_fields.cloned().unwrap_or_default())?;
     let started = fields.timestamp("started_at")?;
     let ended = fields.timestamp("ended_at")?;
     let parameters_digest = fields.text("parameters_digest")?;
     fields.rest("Activity")?;
 
-    let structural = match set_structural {
+    let structural = match mv.set_structural {
         Some(edges) => {
             let mut structural = {
-                let b = bindings(tx, request, operation);
+                let b = bindings(tx, mv.request, mv.operation);
                 collect_structural(tx, &b, Some(edges), core_fields(ElementKind::Activity))?
             };
             // §11.3: a reference added now resolves through whatever merges
@@ -1819,7 +1898,7 @@ async fn finalize_activity(
     };
 
     let at = tx.cx.at.clone();
-    let row = activity_mut(tx, id).await?;
+    let row = row_mut::<ActivityRow>(tx, id).await?;
     if !started.is_empty() {
         row.started_at = started;
     }
@@ -1860,10 +1939,10 @@ async fn finalize_activity(
         }
     }
 
-    row.status = state.to_string();
+    row.status = mv.state.to_string();
     if !ended.is_empty() {
         row.ended_at = ended;
-    } else if is_terminal(state) && row.ended_at.is_empty() {
+    } else if is_terminal(mv.state) && row.ended_at.is_empty() {
         // Terminal outputs freeze with the end time, so a transition that
         // forgot to give one still records when the freeze happened. Only when
         // the Activity has none: an `ended_at` the caller already recorded is
@@ -1871,7 +1950,7 @@ async fn finalize_activity(
         // lose the observation to a clock the caller never asked about.
         row.ended_at = at;
     }
-    if set_structural.is_some() {
+    if mv.set_structural.is_some() {
         check_structural(store, tx, id).await?;
     }
     Ok(())
@@ -1892,7 +1971,7 @@ async fn require_representation(
     id: ElementId,
     what: &str,
 ) -> Result<(), KipError> {
-    let row = assertion_mut(tx, id).await?.clone();
+    let row = row_mut::<AssertionRow>(tx, id).await?.clone();
     if tx.may_represent_assertion(&row) {
         return Ok(());
     }
@@ -1986,11 +2065,13 @@ async fn set_retention(
         let targets = select::targets(
             store,
             tx,
-            "SET RETENTION",
-            Permission::ManageRetention,
-            &clause.target,
-            clause.where_clauses.as_ref(),
-            clause.limit.as_ref(),
+            &select::Selection {
+                what: "SET RETENTION",
+                permission: Permission::ManageRetention,
+                target: &clause.target,
+                where_clauses: clause.where_clauses.as_ref(),
+                limit: clause.limit.as_ref(),
+            },
             &b,
         )
         .await?;
@@ -2146,8 +2227,19 @@ async fn one_operand(
     where_clauses: Option<&Vec<anda_kip::WhereClause>>,
     b: &Bindings<'_>,
 ) -> Result<Option<Targets>, KipError> {
-    let targets: Targets =
-        select::targets(store, tx, what, permission, target, where_clauses, None, b).await?;
+    let targets: Targets = select::targets(
+        store,
+        tx,
+        &select::Selection {
+            what,
+            permission,
+            target,
+            where_clauses,
+            limit: None,
+        },
+        b,
+    )
+    .await?;
     match targets.len() {
         0 => Ok(None),
         1 => Ok(Some(targets)),
@@ -2600,30 +2692,81 @@ pub(crate) fn check_retention(retention: &Json) -> Result<(), KipError> {
     Ok(())
 }
 
-async fn assertion_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut AssertionRow, KipError> {
-    match tx.load(id).await? {
-        Element::Assertion(row) => Ok(row),
-        _ => Err(KipError::structural_reference_invalid(format!(
-            "{id} is not an Assertion"
-        ))),
+/// A row type behind one [`Element`] variant, so a clause can ask for "the
+/// Assertion at this id" once instead of matching the variant at every site.
+trait ElementRow: Sized + 'static {
+    /// What the row is called when the id turns out to hold something else.
+    const WHAT: &'static str;
+    fn of(element: &mut Element) -> Option<&mut Self>;
+}
+
+impl ElementRow for AssertionRow {
+    const WHAT: &'static str = "an Assertion";
+    fn of(element: &mut Element) -> Option<&mut Self> {
+        match element {
+            Element::Assertion(row) => Some(row),
+            _ => None,
+        }
     }
 }
 
-async fn evidence_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut EvidenceRow, KipError> {
-    match tx.load(id).await? {
-        Element::Evidence(row) => Ok(row),
-        _ => Err(KipError::structural_reference_invalid(format!(
-            "{id} is not an Evidence record"
-        ))),
+impl ElementRow for EvidenceRow {
+    const WHAT: &'static str = "an Evidence record";
+    fn of(element: &mut Element) -> Option<&mut Self> {
+        match element {
+            Element::Evidence(row) => Some(row),
+            _ => None,
+        }
     }
 }
 
-async fn activity_mut(tx: &mut Transaction, id: ElementId) -> Result<&mut ActivityRow, KipError> {
-    match tx.load(id).await? {
-        Element::Activity(row) => Ok(row),
-        _ => Err(KipError::structural_reference_invalid(format!(
-            "{id} is not an Activity"
-        ))),
+impl ElementRow for ActivityRow {
+    const WHAT: &'static str = "an Activity";
+    fn of(element: &mut Element) -> Option<&mut Self> {
+        match element {
+            Element::Activity(row) => Some(row),
+            _ => None,
+        }
+    }
+}
+
+/// The row of kind `R` at `id`, or the reference error a mismatched kind is.
+async fn row_mut<R: ElementRow>(tx: &mut Transaction, id: ElementId) -> Result<&mut R, KipError> {
+    let element = tx.load(id).await?;
+    R::of(element)
+        .ok_or_else(|| KipError::structural_reference_invalid(format!("{id} is not {}", R::WHAT)))
+}
+
+/// A record a newer one can replace (§14.2, §57.2): the lineage it links.
+trait Revisable: ElementRow {
+    /// The newer records that replaced this one.
+    fn revised_by(&mut self) -> &mut Vec<String>;
+    /// The older records this one replaces.
+    fn revises(&mut self) -> &mut Vec<String>;
+    fn status_mut(&mut self) -> &mut String;
+}
+
+impl Revisable for AssertionRow {
+    fn revised_by(&mut self) -> &mut Vec<String> {
+        &mut self.superseded_by
+    }
+    fn revises(&mut self) -> &mut Vec<String> {
+        &mut self.supersedes
+    }
+    fn status_mut(&mut self) -> &mut String {
+        &mut self.status
+    }
+}
+
+impl Revisable for EvidenceRow {
+    fn revised_by(&mut self) -> &mut Vec<String> {
+        &mut self.corrected_by
+    }
+    fn revises(&mut self) -> &mut Vec<String> {
+        &mut self.corrects
+    }
+    fn status_mut(&mut self) -> &mut String {
+        &mut self.status
     }
 }
 

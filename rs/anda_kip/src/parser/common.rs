@@ -1038,47 +1038,34 @@ fn where_clause(input: &str, flavor: Flavor) -> VResult<'_, WhereClause> {
 fn variable_led_clause(input: &str, flavor: Flavor) -> VResult<'_, WhereClause> {
     let (rest, var) = ws(variable).parse(input)?;
 
-    // `?v CONCEPT {...}` and `?v {...}` mean the same thing; the keyword is
-    // optional exactly here (Spec §43.1).
-    if let Ok((rest, _)) = ws(word("CONCEPT")).parse(rest) {
-        let (rest, matcher) = cut(ws(|i| object_matcher(i, flavor))).parse(rest)?;
-        return Ok((
-            rest,
-            WhereClause::Concept {
-                variable: var,
-                matcher,
-            },
-        ));
-    }
-    if let Ok((rest, _)) = ws(word("ASSERTION")).parse(rest) {
-        let (rest, matcher) = cut(ws(|i| object_matcher(i, flavor))).parse(rest)?;
-        return Ok((
-            rest,
-            WhereClause::Assertion {
-                variable: var,
-                matcher,
-            },
-        ));
-    }
-    if let Ok((rest, _)) = ws(word("EVIDENCE")).parse(rest) {
-        let (rest, matcher) = cut(ws(|i| object_matcher(i, flavor))).parse(rest)?;
-        return Ok((
-            rest,
-            WhereClause::Evidence {
-                variable: var,
-                matcher,
-            },
-        ));
-    }
-    if let Ok((rest, _)) = ws(word("ACTIVITY")).parse(rest) {
-        let (rest, matcher) = cut(ws(|i| object_matcher(i, flavor))).parse(rest)?;
-        return Ok((
-            rest,
-            WhereClause::Activity {
-                variable: var,
-                matcher,
-            },
-        ));
+    // `?v CONCEPT {...}`, `?v ASSERTION {...}`, `?v EVIDENCE {...}` and
+    // `?v ACTIVITY {...}`: one keyword, one object matcher, one clause kind.
+    // `?v {...}` with no keyword is a Concept pattern too (Spec §43.1) — the
+    // keyword is optional exactly there — and that form is read last.
+    type Keyed = fn(String, ObjectMatcher) -> WhereClause;
+    const KEYED: [(&str, Keyed); 4] = [
+        ("CONCEPT", |variable, matcher| WhereClause::Concept {
+            variable,
+            matcher,
+        }),
+        ("ASSERTION", |variable, matcher| WhereClause::Assertion {
+            variable,
+            matcher,
+        }),
+        ("EVIDENCE", |variable, matcher| WhereClause::Evidence {
+            variable,
+            matcher,
+        }),
+        ("ACTIVITY", |variable, matcher| WhereClause::Activity {
+            variable,
+            matcher,
+        }),
+    ];
+    for (keyword, build) in KEYED {
+        if let Ok((rest, _)) = ws(word(keyword)).parse(rest) {
+            let (rest, matcher) = cut(ws(|i| object_matcher(i, flavor))).parse(rest)?;
+            return Ok((rest, build(var, matcher)));
+        }
     }
     if let Ok((rest, _)) = ws(word("STRUCTURAL")).parse(rest) {
         let (rest, (subject, field, object)) = cut(|i| structural_tuple(i, flavor)).parse(rest)?;

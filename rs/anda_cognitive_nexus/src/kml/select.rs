@@ -98,17 +98,32 @@ impl Targets {
 ///
 /// `WHERE` absent: the statement names its target, and `LIMIT` has nothing to
 /// bound.
-#[allow(clippy::too_many_arguments)]
+/// What a mutation selects: the statement's target, the block that binds or
+/// guards it, and the bound the sweep accepts (§52.7).
+#[derive(Clone, Copy)]
+pub struct Selection<'a> {
+    /// The statement, for its refusals.
+    pub what: &'a str,
+    /// The permission each selected element is authorized with.
+    pub permission: Permission,
+    pub target: &'a ElementRef,
+    pub where_clauses: Option<&'a Vec<WhereClause>>,
+    pub limit: Option<&'a Scalar>,
+}
+
 pub async fn targets(
     store: &Store,
     tx: &Transaction,
-    what: &str,
-    permission: Permission,
-    target: &ElementRef,
-    where_clauses: Option<&Vec<WhereClause>>,
-    limit: Option<&Scalar>,
+    selection: &Selection<'_>,
     b: &Bindings<'_>,
 ) -> Result<Targets, KipError> {
+    let Selection {
+        what,
+        permission,
+        target,
+        where_clauses,
+        limit,
+    } = *selection;
     let Some(clauses) = where_clauses else {
         return Ok(Targets {
             ids: vec![b.element_ref(target)?],

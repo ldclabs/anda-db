@@ -1,0 +1,72 @@
+[
+  {
+    "capability": "atomic_batch",
+    "detail": "execution.mode \"atomic\" over several operations (§75.3)",
+    "reason": "the §67.4 capability `atomic_batch` is answered false: one transaction across several operations is not implemented, and a batch runs operation by operation. A request that asks for it is refused rather than run as a sequence that looks like one (§75.4); one MUTATE block is already one Transaction (§53)"
+  },
+  {
+    "capability": "capsule_digest_profiles",
+    "detail": "verifying a Capsule digested under an algorithm other than sha3-256",
+    "reason": "this engine digests a Capsule as sha3-256 over RFC 8785 canonical JSON, and so does ts/kip-do — the two interoperate, and each pins the algorithm with a literal in its own tests. An artifact from somewhere else under another profile is refused as an unsupported profile rather than reported as a digest mismatch, because the second is an accusation of tampering and the first is the truth"
+  },
+  {
+    "capability": "unregistered_permissions",
+    "detail": "derive, share, manage_trust, approve",
+    "reason": "§29.6 requires a runtime that does not distinguish derived writes to refuse `derive` where a Grant names it, and the same reasoning covers the others: a permission that is accepted and gates nothing is authority that looks conferred and is not, discovered during an incident. So these names are not in the registry at all and a Grant listing one is rejected where it is written. `share` and `manage_trust` name operations this engine has no surface for — no controlled cross-Space view to expose, no trust policy to version, see `trust_governance` — and `approve` is what this engine spells `approve_high_risk`. `derive` is the one that is a judgement rather than an absence: §29.6 triggers it on an element recorded as an output of an Activity that has at least one input, and this engine does not make that distinction at the gate yet; `derive_permission` in the §67.4 registry says so. `record_outcome` and `manage_legal_hold` are registered because a gate asks for each. Every other registered name is asked for by a gate, which is the property this entry exists to report the exceptions to. ts/kip-do registers exactly the same set"
+  },
+  {
+    "capability": "deadlines",
+    "detail": "options.deadline_ms",
+    "reason": "§80.1's execution window is not enforced: a command runs to completion or fails on its own. Accepting the field would be a promise, and §80.2 is explicit that a client timeout is not an abort — so a request carrying one is refused rather than answered as if the window had been honoured"
+  },
+  {
+    "capability": "artifact_store",
+    "detail": "§85 artifact handles: payload_artifact, artifact:// references",
+    "reason": "there is no blob store behind this engine, so a handle could only be recorded and never resolved. An Evidence payload is carried inline or ingested through the request envelope (§71.1); an external URL stays a citation, never something the engine fetches (§102 invariant 29)"
+  },
+  {
+    "capability": "nested_proposition_endpoint",
+    "detail": "?meta (?p, \"contradicts\", (id: :other_proposition_id))",
+    "reason": "§43.2 makes the id form usable wherever a triple is, including as a tuple endpoint — which is how a statement about a statement names an existing Proposition. Not built here. Refused rather than ignored: an endpoint nobody constrained matches every tuple under its predicate, which is a wrong answer wearing the shape of a right one. An object endpoint still resolves through {id: …} or {canonical_id: …}. ts/kip-do has the same gap"
+  },
+  {
+    "capability": "search_over_assertions_and_activities",
+    "detail": "SEARCH ASSERTION | ACTIVITY",
+    "reason": "an Assertion carries a stance, a mode and a number, and an Activity a class and two timestamps — neither has free text to index. Refusing says so; an empty answer would read as 'no such claim exists'. Reach them through the Proposition or Evidence they are about. ts/kip-do has the same gap"
+  },
+  {
+    "capability": "historical_search",
+    "detail": "SEARCH ... AS OF SEQ",
+    "reason": "the search index reflects the present only; a historical SEARCH would report today's matches as if they were then's. FIND ... AS OF reads the past exactly"
+  },
+  {
+    "capability": "semantic_search",
+    "detail": "SEARCH ... MODE \"semantic\" | \"hybrid\"",
+    "reason": "no embedding model is configured; keyword search is the only mode"
+  },
+  {
+    "capability": "trust_model",
+    "detail": "source trust and evidence-quality evaluation in the projection",
+    "reason": "not implemented; every eligible corroboration group counts equally, and every projection says so"
+  },
+  {
+    "capability": "trust_governance",
+    "detail": "DESCRIBE TRUST",
+    "reason": "the trust policy binding is Governance state, but this engine evaluates no source trust, so there is no trust judgement to report"
+  },
+  {
+    "capability": "capsule_restore_mode",
+    "detail": "the \"restore\" import mode (§39.4)",
+    "reason": "restore is same-Brain recovery, whose whole point is mapping a source autobiographical self onto the destination's. That mapping is the one thing a Capsule import must never do by resemblance, and verifying it needs identity continuity this engine does not model"
+  },
+  {
+    "capability": "capsule_signatures",
+    "detail": "signing an exported Capsule and verifying a signed one",
+    "reason": "no signing keys; an exported Capsule is unsigned, and its stated source is a claim a destination cannot check"
+  },
+  {
+    "capability": "retention_policy",
+    "detail": "Space-level retention defaults by kind, type or classification (§19.1)",
+    "reason": "retention is set per element and enforced per element; a Space cannot yet declare that raw Experiences expire in 90 days and audit records in 7 years"
+  }
+]

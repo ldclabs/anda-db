@@ -121,16 +121,20 @@ pub async fn classify(
     let op = if lowering { "declassify" } else { "classify" };
     let patch = |governance: &Json| set_member(governance, "classification", Json::from(label));
     apply(
-        store,
-        space_id,
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
         element,
-        op,
-        op,
-        None,
+        Change {
+            op,
+            audit_op: op,
+            new_state: None,
+        },
         patch,
         |version| serde_json::json!({"from": current, "to": label, "version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(current)
@@ -193,23 +197,27 @@ pub async fn elevate_authority(
     let op = if raising { "elevate" } else { "downgrade" };
     let patch = |governance: &Json| set_member(governance, AUTHORITY_KEY, Json::from(class));
     apply(
-        store,
-        space_id,
-        element,
-        op,
-        if raising {
-            "elevate_authority"
-        } else {
-            "downgrade_authority"
+        &Governed {
+            store,
+            space_id,
+            auth,
         },
-        None,
+        element,
+        Change {
+            op,
+            audit_op: if raising {
+                "elevate_authority"
+            } else {
+                "downgrade_authority"
+            },
+            new_state: None,
+        },
         patch,
         // §31.5: an elevation record names the artifact, both ceilings, who
         // decided, and when. The transaction and the audit entry supply the
         // rest between them.
         |version| serde_json::json!({"from": current, "to": class, "version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(current)
@@ -258,16 +266,20 @@ pub async fn quarantine(
     let patch =
         |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::from(reason.as_str()));
     apply(
-        store,
-        space_id,
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
         element,
-        "quarantine",
-        "quarantine",
-        Some(state::QUARANTINED),
+        Change {
+            op: "quarantine",
+            audit_op: "quarantine",
+            new_state: Some(state::QUARANTINED),
+        },
         patch,
         |version| serde_json::json!({"reason": reason, "version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(())
@@ -301,19 +313,23 @@ pub async fn release(
     .await?;
     let patch = |governance: &Json| set_member(governance, QUARANTINE_KEY, Json::Null);
     apply(
-        store,
-        space_id,
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
         element,
-        "release",
-        // `release_quarantine`, matching the reference engine: `HISTORY
-        // ELEMENT` returns this verb, so a name only one engine uses is a wire
-        // divergence.
-        "release_quarantine",
-        Some(state::ACTIVE),
+        Change {
+            op: "release",
+            // `release_quarantine`, matching the reference engine: `HISTORY
+            // ELEMENT` returns this verb, so a name only one engine uses is a
+            // wire divergence.
+            audit_op: "release_quarantine",
+            new_state: Some(state::ACTIVE),
+        },
         patch,
         |version| serde_json::json!({"version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(())
@@ -347,26 +363,50 @@ async fn decide(
 /// In that order, and in one place, because the order is the rule: an approval
 /// buys a completed operation, not an attempt at one. Every governed element
 /// operation ends here so that a fifth one cannot end differently.
-#[allow(clippy::too_many_arguments)]
-async fn apply<F, R>(
-    store: &Store,
-    space_id: &str,
-    element: Element,
+/// Where a governed element operation runs, and as whom.
+struct Governed<'a> {
+    store: &'a Store,
+    space_id: &'a str,
+    auth: &'a AuthContext,
+}
+
+/// What a governed element operation records: the verb the transaction
+/// carries, the verb the audit trail carries, and the state it moves to.
+struct Change<'a> {
     op: &'static str,
     audit_op: &'static str,
-    new_state: Option<&str>,
+    new_state: Option<&'a str>,
+}
+
+async fn apply<F, R>(
+    gov: &Governed<'_>,
+    element: Element,
+    change: Change<'_>,
     patch: F,
     record: R,
     approved: Approved,
-    auth: &AuthContext,
 ) -> Result<u64, KipError>
 where
     F: Fn(&Json) -> Json,
     R: FnOnce(u64) -> Json,
 {
+    let Governed {
+        store,
+        space_id,
+        auth,
+    } = *gov;
     let id = element.id();
-    let version = commit(store, space_id, element, op, new_state, patch, auth).await?;
-    audit(store, space_id, id, audit_op, record(version), auth).await?;
+    let version = commit(
+        store,
+        space_id,
+        element,
+        change.op,
+        change.new_state,
+        patch,
+        auth,
+    )
+    .await?;
+    audit(store, space_id, id, change.audit_op, record(version), auth).await?;
     approved.spend(store).await?;
     Ok(version)
 }
@@ -657,7 +697,6 @@ pub async fn tombstone_expired(
 }
 
 /// The shared body of the retention sweep's two actions.
-#[allow(clippy::too_many_arguments)]
 async fn expire(
     store: &Store,
     space_id: &str,
@@ -680,16 +719,20 @@ async fn expire(
     let patch =
         |governance: &Json| set_member(governance, RETENTION_LAPSED_KEY, Json::from("expired"));
     apply(
-        store,
-        space_id,
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
         element,
-        "retention_expiry",
-        "retention_expiry",
-        Some(new_state),
+        Change {
+            op: "retention_expiry",
+            audit_op: "retention_expiry",
+            new_state: Some(new_state),
+        },
         patch,
         |version| serde_json::json!({"state": new_state, "version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(())
@@ -748,16 +791,20 @@ pub async fn expire_assertion(
         row.status = "expired".to_string();
     }
     apply(
-        store,
-        space_id,
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
         expired,
-        "expire",
-        "expire_assertion",
-        None,
+        Change {
+            op: "expire",
+            audit_op: "expire_assertion",
+            new_state: None,
+        },
         |governance| governance.clone(),
         |version| serde_json::json!({"version": version}),
         approved,
-        auth,
     )
     .await?;
     Ok(true)

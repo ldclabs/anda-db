@@ -11,6 +11,63 @@ unpublished, so this accumulates into the same version),
 
 Four changes accumulate here. The latest one first.
 
+## The 2026-09-05 review, second half: the shapes the code repeated
+
+No behaviour changes. Each item states once what the code had been saying
+two or three times, and pins what it exposes.
+
+### Changed — `anda_cognitive_nexus`
+
+- **One lifecycle move per state.** `TRANSITION` ran through a 234-line
+  `move_element` whose `superseded` and `corrected` arms were the same
+  algorithm with different row types. It is now `shelve`, `retract`,
+  `supersede`, `correct` and `move_activity` over a `LifecycleMove` input;
+  the two revisions share `revision_target` / `link_revision`, generic over
+  a `Revisable` row. The refusals and their messages are unchanged.
+- **One row accessor.** `assertion_mut` / `evidence_mut` / `activity_mut`
+  are `row_mut::<R>()` over an `ElementRow` trait.
+- **One row builder per record kind.** `create_record` settles the clause
+  once into a `Draft` and hands it to `evidence_row`, `assertion_row` or
+  `activity_row`, instead of a 140-line `match` inside one function.
+- **Two lanes in `Session::execute`.** KQL and META ran the same
+  lock → authority → gate → run → settle sequence in two copies beside the
+  KML copy; they are `run_read` over a `Read` enum now, with `run_write`
+  keeping the replay and poison handling only a write needs. The
+  operation's coordinates travel as one `Call`.
+- **No `#[allow(clippy::too_many_arguments)]` left**: `select::targets`
+  takes a `Selection`, the governed element operations take a `Governed`
+  context and a `Change`, and `replay` takes the `Call`.
+- **The `unsupported` prose is data.** `DESCRIBE CAPABILITIES` reads it from
+  `src/meta/unsupported.json` (14 entries) instead of a page of string
+  literals; the drift tests against `UNSUPPORTED_NAMES` are unchanged.
+  `meta/mod.rs` is 106 lines shorter.
+
+### Changed — `anda_kip`
+
+- `variable_led_clause` reads the four `?v KIND {...}` patterns from one
+  keyword table instead of four copies of the same branch.
+- `ASSERT` desugaring reads its members once into `AssertMembers`, which
+  builds the `SET FIELDS` and the Evidence edges; the same three clauses come
+  out, and the parser oracle's 1062 commands and the `kip_lang_ast` parity
+  fixture agree.
+- **The public surface is pinned.** `lib.rs` glob-re-exports nine modules, so
+  every top-level `pub` item is API; `tests/surface.rs` lists them from the
+  sources and compares with `tests/fixtures/public_surface.txt` (277 items).
+  Changing the surface means changing the snapshot on purpose
+  (`UPDATE_SURFACE=1 cargo test -p anda_kip --test surface`). Narrowing the
+  surface remains a separate, breaking decision.
+
+### Changed — `@ldclabs/kip-do`
+
+- **The envelope check is a pure function.** `checkEnvelope` (300 lines
+  inside the Durable Object class) is `src/request.ts`, over the envelope and
+  the Space it names, with its own tests in `test/request.test.ts`; the
+  Durable Object calls it. It now also holds `compatibility_profile` to a
+  non-empty string, as `anda_kip::Request::validate` does.
+- `createRecord` settles the clause once into a `Draft` and builds the row
+  in `evidenceRow`, `assertionRow` or `activityRow`, mirroring the reference
+  engine.
+
 ## The 2026-09-05 review: a lighter Specification, and four gaps nobody had declared
 
 The 2.0 draft moved with `ldclabs/KIP` — the profile list, the VERIFY targets,

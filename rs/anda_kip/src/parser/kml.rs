@@ -614,62 +614,12 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
         Ok(triple) => triple,
         Err(ctx) => return fail(input, ctx),
     };
-
     let (rest, members) = cut(ws(assignments)).parse(members_at)?;
-    for (key, _) in &members {
-        if !ASSERT_MEMBERS.contains(&key.as_str()) {
-            return fail(
-                members_at,
-                "an ASSERT member: by, mode, stance, confidence, at, valid, evidence or key",
-            );
-        }
-    }
-
-    let lookup = |name: &str| members.iter().find(|(k, _)| k == name).map(|(_, v)| v);
-
-    // `by` names whose stance this is, and `mode` says how it was arrived at.
-    // Neither has a safe default: guessing the actor would forge attribution,
-    // and guessing the mode would turn hearsay into observation.
-    let Some(by) = lookup("by").cloned() else {
-        return fail(
-            members_at,
-            "by: <semantic actor> — an Assertion without an assertor has no epistemic owner",
-        );
+    let members = match AssertMembers::read(members) {
+        Ok(members) => members,
+        Err(expected) => return fail(members_at, expected),
     };
-    let Some(mode) = lookup("mode").cloned() else {
-        return fail(
-            members_at,
-            "mode: one of observed, stated, inferred, predicted, hypothetical or imported",
-        );
-    };
-
-    let stance = lookup("stance")
-        .cloned()
-        .unwrap_or(MutationValue::Value(KipValue::String("support".into())));
-    let confidence = lookup("confidence").cloned();
-    let asserted_at = lookup("at").cloned();
-    let valid_time = lookup("valid").cloned();
-    let evidence = lookup("evidence").cloned();
-
-    let client_key = match lookup("key") {
-        Some(MutationValue::Param(name)) => Some(Scalar::Param(name.clone())),
-        Some(MutationValue::Value(value @ (KipValue::String(_) | KipValue::Number(_)))) => {
-            Some(Scalar::Literal(value.clone()))
-        }
-        Some(MutationValue::Value(value @ (KipValue::Bool(_) | KipValue::Null))) => {
-            Some(Scalar::Literal(value.clone()))
-        }
-        Some(_) => {
-            return fail(
-                members_at,
-                "a literal or :parameter for the ASSERT key member",
-            );
-        }
-        None => None,
-    };
-
     let (rest, superseding) = opt_after(&["SUPERSEDING"], ws(element_ref)).parse(rest)?;
-
     Ok((
         rest,
         Box::new(move |seq: usize| {
@@ -679,56 +629,10 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             // clause position rules out the second.
             let assertion_handle = written_handle.unwrap_or_else(|| format!("#assert{seq}"));
             let proposition_handle = format!("{assertion_handle}#proposition");
-
-            let mut set_fields: Assignments = vec![
-                (
-                    "proposition".into(),
-                    MutationValue::Handle(proposition_handle.clone()),
-                ),
-                ("asserted_by".into(), by),
-                ("mode".into(), mode),
-                // The normative expansion carries a stance even when the source
-                // omitted one, so the default is materialized here rather than
-                // left for the engine to re-derive.
-                ("stance".into(), stance),
-            ];
-            if let Some(value) = confidence {
-                set_fields.push(("confidence".into(), value));
-            }
-            if let Some(value) = asserted_at {
-                set_fields.push(("asserted_at".into(), value));
-            }
-            if let Some(value) = valid_time {
-                set_fields.push(("valid_time".into(), value));
-            }
-
-            // `evidence` is a reserved Core *structural* field, not a plain one:
-            // the normative desugaring emits `("evidence", ref) {role: "support"}`.
-            // An array cites several artifacts, so it becomes one role-qualified
-            // edge each.
-            let edges: Vec<StructuralEdge> = evidence
-                .map(|value| {
-                    evidence_refs(value)
-                        .into_iter()
-                        .map(|value| StructuralEdge {
-                            field: SymbolRef::Name("evidence".into()),
-                            value,
-                            options: Some(
-                                [(
-                                    "role".to_string(),
-                                    BoundValue::Value(KipValue::String("support".into())),
-                                )]
-                                .into_iter()
-                                .collect(),
-                            ),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
+            let edges = members.evidence_edges();
             let mut clauses = vec![
                 MutationClause::EnsureProposition(EnsureProposition {
-                    handle: Some(proposition_handle),
+                    handle: Some(proposition_handle.clone()),
                     subject: triple.0,
                     predicate: triple.1,
                     object: triple.2,
@@ -736,13 +640,12 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
                 }),
                 MutationClause::CreateAssertion(RecordCreate {
                     handle: assertion_handle.clone(),
-                    client_key,
-                    set_fields: Some(set_fields),
+                    client_key: members.client_key.clone(),
+                    set_fields: Some(members.set_fields(proposition_handle)),
                     set_facets: Vec::new(),
                     set_structural: (!edges.is_empty()).then_some(edges),
                 }),
             ];
-
             // `SUPERSEDING :old` is revision (§14.2): the old claim was wrong.
             // It desugars to the one lifecycle statement, `BY` the new
             // Assertion (§55.1).
@@ -761,6 +664,118 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
             clauses
         }),
     ))
+}
+
+/// The members an `ASSERT` block may carry (§55.1), read once.
+struct AssertMembers {
+    by: MutationValue,
+    mode: MutationValue,
+    stance: MutationValue,
+    confidence: Option<MutationValue>,
+    asserted_at: Option<MutationValue>,
+    valid_time: Option<MutationValue>,
+    evidence: Option<MutationValue>,
+    client_key: Option<Scalar>,
+}
+
+impl AssertMembers {
+    /// Reads the block, or says what was expected where it was not.
+    fn read(members: Assignments) -> Result<Self, &'static str> {
+        for (key, _) in &members {
+            if !ASSERT_MEMBERS.contains(&key.as_str()) {
+                return Err(
+                    "an ASSERT member: by, mode, stance, confidence, at, valid, evidence or key",
+                );
+            }
+        }
+        let take = |name: &str| {
+            members
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        // `by` names whose stance this is, and `mode` says how it was arrived
+        // at. Neither has a safe default: guessing the actor would forge
+        // attribution, and guessing the mode would turn hearsay into
+        // observation.
+        let by = take("by").ok_or(
+            "by: <semantic actor> — an Assertion without an assertor has no epistemic owner",
+        )?;
+        let mode = take("mode").ok_or(
+            "mode: one of observed, stated, inferred, predicted, hypothetical or imported",
+        )?;
+        let client_key = match take("key") {
+            None => None,
+            Some(MutationValue::Param(name)) => Some(Scalar::Param(name)),
+            Some(MutationValue::Value(
+                value @ (KipValue::String(_)
+                | KipValue::Number(_)
+                | KipValue::Bool(_)
+                | KipValue::Null),
+            )) => Some(Scalar::Literal(value)),
+            Some(_) => return Err("a literal or :parameter for the ASSERT key member"),
+        };
+        Ok(Self {
+            by,
+            mode,
+            stance: take("stance")
+                .unwrap_or(MutationValue::Value(KipValue::String("support".into()))),
+            confidence: take("confidence"),
+            asserted_at: take("at"),
+            valid_time: take("valid"),
+            evidence: take("evidence"),
+            client_key,
+        })
+    }
+
+    /// The `SET FIELDS` of the desugared `CREATE ASSERTION`. The normative
+    /// expansion carries a stance even when the source omitted one, so the
+    /// default is materialized here rather than left for the engine.
+    fn set_fields(&self, proposition_handle: String) -> Assignments {
+        let mut fields: Assignments = vec![
+            (
+                "proposition".into(),
+                MutationValue::Handle(proposition_handle),
+            ),
+            ("asserted_by".into(), self.by.clone()),
+            ("mode".into(), self.mode.clone()),
+            ("stance".into(), self.stance.clone()),
+        ];
+        for (name, value) in [
+            ("confidence", &self.confidence),
+            ("asserted_at", &self.asserted_at),
+            ("valid_time", &self.valid_time),
+        ] {
+            if let Some(value) = value {
+                fields.push((name.into(), value.clone()));
+            }
+        }
+        fields
+    }
+
+    /// `evidence` is a reserved Core *structural* field, not a plain one: the
+    /// normative desugaring emits `("evidence", ref) {role: "support"}`, one
+    /// role-qualified edge per cited artifact.
+    fn evidence_edges(&self) -> Vec<StructuralEdge> {
+        let Some(value) = self.evidence.clone() else {
+            return Vec::new();
+        };
+        evidence_refs(value)
+            .into_iter()
+            .map(|value| StructuralEdge {
+                field: SymbolRef::Name("evidence".into()),
+                value,
+                options: Some(
+                    [(
+                        "role".to_string(),
+                        BoundValue::Value(KipValue::String("support".into())),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            })
+            .collect()
+    }
 }
 
 /// Splits an `evidence:` member into one citation per artifact.

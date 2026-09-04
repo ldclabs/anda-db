@@ -404,129 +404,14 @@ function createRecord(
   const structural = collectStructural(tx, b, clause.set_structural, CORE_STRUCTURAL[kind])
   const retention = fields.json('retention')
   authorizeRetention(tx, retention)
-  const envelope = { ...blank(id), facets, structural: structural.profile, retention, expires_at: expiresAt(retention) }
+  const draft: Draft = { envelope: envelopeOf(id, facets, structural, retention), clientKey }
 
-  let element: Element
-  switch (kind) {
-    case 'Evidence': {
-      const [payloadMode, payloadInline, contentRef] = splitPayload(
-        fields.value('payload'),
-      )
-      const sources = structural.values('source')
-      const row: EvidenceRow = {
-        ...envelope,
-        client_key: clientKey,
-        evidence_class: fields.required('evidence_class', 'CREATE EVIDENCE'),
-        payload_mode: payloadMode,
-        payload_inline: payloadInline,
-        content_ref: contentRef,
-        content_digest: fields.text('content_digest'),
-        media_type: fields.text('media_type'),
-        observed_at: fields.timestamp('observed_at'),
-        source_refs: sources,
-        generated_by: referenceId(structural.one('generated_by') ?? null),
-        status: 'active',
-        corrects: [],
-        corrected_by: [],
-      }
-      element = { kind, row }
-      break
-    }
-    case 'Assertion': {
-      const proposition = fields.reference('proposition', 'CREATE ASSERTION')
-      // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be named
-      // is recorded as Evidence, not asserted — an Assertion nobody made is
-      // not a weaker commitment, it is no commitment at all. A bare id string
-      // in this slot is a reference, as it is for `proposition`.
-      const actor = fields.value('asserted_by')
-      if (actor === null || (isJsonMap(actor) && Object.keys(actor).length === 0)) {
-        throw errors.constraintViolation(
-          'CREATE ASSERTION needs `asserted_by`: an Assertion is one actor\'s ' +
-            'commitment (§13.3), and a claim whose actor cannot be resolved is ' +
-            'recorded as Evidence, not asserted',
-        )
-      }
-      // §11.3: a claim recorded now is attributed to the identity that
-      // survived the merge, or the two would never meet again.
-      const assertedBy = canonicalizeReference(tx, referenceValue(actor, 'asserted_by'))
-      // Each citation keeps the role it was cited in: Core records that this
-      // Assertion cites E *as supporting*, and never that E proves anything —
-      // that judgement belongs to the Projection (§8.4).
-      const evidence = structural.take('evidence').map(([value, opts]) => {
-        // Stored in the wire shape §13.2 fixes — `{id, role}` — so the
-        // view renders it without a rename, and one place fewer can drift
-        // from the other.
-        const citation: JsonMap = { id: referenceId(value) }
-        // §20.13 fixes the citation roles. `challenge` and `support` are the
-        // difference between dissent and corroboration, so a role no reader
-        // can interpret is refused rather than stored.
-        if (opts.role !== undefined && opts.role !== null) {
-          if (typeof opts.role !== 'string') {
-            throw errors.typeMismatch(
-              'an Evidence citation `role` must be a string, got ' +
-                JSON.stringify(opts.role),
-            )
-          }
-          checkRegistry(opts.role, 'role', EVIDENCE_ROLES)
-          citation.role = opts.role
-        }
-        return citation as unknown as { id: string; role?: string }
-      })
-      const validTime = fields.json('valid_time')
-      const confidence = fields.confidence()
-      const row: AssertionRow = {
-        ...envelope,
-        client_key: clientKey,
-        proposition_id: formatElementId(
-          parseElementIdOfKind(proposition, 'Proposition'),
-        ),
-        asserted_by: assertedBy,
-        // An Assertion with no actor is a claim nobody made; the column stays
-        // empty rather than being keyed as a malformed endpoint.
-        asserted_by_key:
-          Object.keys(assertedBy).length === 0
-            ? ''
-            : endpointKey(endpointFromJson(assertedBy)),
-        stance: fields.registry('stance', STANCES, 'CREATE ASSERTION'),
-        mode: fields.registry('mode', ASSERTION_MODES, 'CREATE ASSERTION'),
-        confidence,
-        asserted_at: fields.timestamp('asserted_at'),
-        valid_from: validTimePart(validTime, 'from'),
-        valid_until: validTimePart(validTime, 'until'),
-        evidence_refs: evidence,
-        context_refs: structural.values('context'),
-        status: 'active',
-        supersedes: [],
-        superseded_by: [],
-        retracted_at: '',
-      }
-      element = { kind, row }
-      break
-    }
-    case 'Activity': {
-      // §16, §20.13: the Activity status registry is Core's, so a word outside
-      // it is refused here rather than stored — the parser only sees a written
-      // literal, and a `:parameter` status is bound at execution time.
-      const status = fields.text('status')
-      if (status !== '') checkRegistry(status, 'status', ACTIVITY_STATUS)
-      element = {
-        kind,
-        row: {
-          ...envelope,
-          client_key: clientKey,
-          activity_class: fields.required('activity_class', 'CREATE ACTIVITY'),
-          started_at: fields.timestamp('started_at'),
-          ended_at: fields.timestamp('ended_at'),
-          inputs: structural.values('inputs'),
-          outputs: structural.values('outputs'),
-          associated_actors: structural.values('associated_actors'),
-          parameters_digest: fields.text('parameters_digest'),
-          status: status === '' ? 'pending' : status,
-        },
-      }
-      break
-    }
-  }
+  const element =
+    kind === 'Evidence'
+      ? evidenceRow(draft, fields, structural)
+      : kind === 'Assertion'
+        ? assertionRow(tx, draft, fields, structural)
+        : activityRow(draft, fields, structural)
   fields.rest(kind)
   if (clientKeyRetry(tx, existing, clause.handle, element)) return
   // §17, §18: which epistemic-mutation permission a new Assertion needs depends
@@ -553,6 +438,161 @@ function createRecord(
   }
   tx.stageNew(id, element)
   checkStructural(tx, element)
+}
+
+/** What every record clause settles before its kind-specific row is built. */
+function envelopeOf(
+  id: Parameters<typeof blank>[0],
+  facets: ReturnType<typeof resolveFacets>,
+  structural: ReturnType<typeof collectStructural>,
+  retention: ReturnType<Fields['json']>,
+) {
+  return {
+    ...blank(id),
+    facets,
+    structural: structural.profile,
+    retention,
+    expires_at: expiresAt(retention),
+  }
+}
+
+interface Draft {
+  envelope: ReturnType<typeof envelopeOf>
+  clientKey: string
+}
+
+/** The Evidence row a `CREATE EVIDENCE` clause describes (§15.3). */
+function evidenceRow(
+  draft: Draft,
+  fields: Fields,
+  structural: ReturnType<typeof collectStructural>,
+): Element {
+  const [payloadMode, payloadInline, contentRef] = splitPayload(
+    fields.value('payload'),
+  )
+  const sources = structural.values('source')
+  const row: EvidenceRow = {
+    ...draft.envelope,
+    client_key: draft.clientKey,
+    evidence_class: fields.required('evidence_class', 'CREATE EVIDENCE'),
+    payload_mode: payloadMode,
+    payload_inline: payloadInline,
+    content_ref: contentRef,
+    content_digest: fields.text('content_digest'),
+    media_type: fields.text('media_type'),
+    observed_at: fields.timestamp('observed_at'),
+    source_refs: sources,
+    generated_by: referenceId(structural.one('generated_by') ?? null),
+    status: 'active',
+    corrects: [],
+    corrected_by: [],
+  }
+  return { kind: 'Evidence', row }
+}
+
+/** The Assertion row a `CREATE ASSERTION` clause describes (§13.2). */
+function assertionRow(
+  tx: Transaction,
+  draft: Draft,
+  fields: Fields,
+  structural: ReturnType<typeof collectStructural>,
+): Element {
+  const proposition = fields.reference('proposition', 'CREATE ASSERTION')
+  // §13.3: `asserted_by` is REQUIRED. A claim whose actor cannot be named
+  // is recorded as Evidence, not asserted — an Assertion nobody made is
+  // not a weaker commitment, it is no commitment at all. A bare id string
+  // in this slot is a reference, as it is for `proposition`.
+  const actor = fields.value('asserted_by')
+  if (actor === null || (isJsonMap(actor) && Object.keys(actor).length === 0)) {
+    throw errors.constraintViolation(
+      'CREATE ASSERTION needs `asserted_by`: an Assertion is one actor\'s ' +
+        'commitment (§13.3), and a claim whose actor cannot be resolved is ' +
+        'recorded as Evidence, not asserted',
+    )
+  }
+  // §11.3: a claim recorded now is attributed to the identity that
+  // survived the merge, or the two would never meet again.
+  const assertedBy = canonicalizeReference(tx, referenceValue(actor, 'asserted_by'))
+  // Each citation keeps the role it was cited in: Core records that this
+  // Assertion cites E *as supporting*, and never that E proves anything —
+  // that judgement belongs to the Projection (§8.4).
+  const evidence = structural.take('evidence').map(([value, opts]) => {
+    // Stored in the wire shape §13.2 fixes — `{id, role}` — so the
+    // view renders it without a rename, and one place fewer can drift
+    // from the other.
+    const citation: JsonMap = { id: referenceId(value) }
+    // §20.13 fixes the citation roles. `challenge` and `support` are the
+    // difference between dissent and corroboration, so a role no reader
+    // can interpret is refused rather than stored.
+    if (opts.role !== undefined && opts.role !== null) {
+      if (typeof opts.role !== 'string') {
+        throw errors.typeMismatch(
+          'an Evidence citation `role` must be a string, got ' +
+            JSON.stringify(opts.role),
+        )
+      }
+      checkRegistry(opts.role, 'role', EVIDENCE_ROLES)
+      citation.role = opts.role
+    }
+    return citation as unknown as { id: string; role?: string }
+  })
+  const validTime = fields.json('valid_time')
+  const confidence = fields.confidence()
+  const row: AssertionRow = {
+    ...draft.envelope,
+    client_key: draft.clientKey,
+    proposition_id: formatElementId(
+      parseElementIdOfKind(proposition, 'Proposition'),
+    ),
+    asserted_by: assertedBy,
+    // An Assertion with no actor is a claim nobody made; the column stays
+    // empty rather than being keyed as a malformed endpoint.
+    asserted_by_key:
+      Object.keys(assertedBy).length === 0
+        ? ''
+        : endpointKey(endpointFromJson(assertedBy)),
+    stance: fields.registry('stance', STANCES, 'CREATE ASSERTION'),
+    mode: fields.registry('mode', ASSERTION_MODES, 'CREATE ASSERTION'),
+    confidence,
+    asserted_at: fields.timestamp('asserted_at'),
+    valid_from: validTimePart(validTime, 'from'),
+    valid_until: validTimePart(validTime, 'until'),
+    evidence_refs: evidence,
+    context_refs: structural.values('context'),
+    status: 'active',
+    supersedes: [],
+    superseded_by: [],
+    retracted_at: '',
+  }
+  return { kind: 'Assertion', row }
+}
+
+/** The Activity row a `CREATE ACTIVITY` clause describes (§16.3). */
+function activityRow(
+  draft: Draft,
+  fields: Fields,
+  structural: ReturnType<typeof collectStructural>,
+): Element {
+  // §16, §20.13: the Activity status registry is Core's, so a word outside
+  // it is refused here rather than stored — the parser only sees a written
+  // literal, and a `:parameter` status is bound at execution time.
+  const status = fields.text('status')
+  if (status !== '') checkRegistry(status, 'status', ACTIVITY_STATUS)
+  return {
+    kind: 'Activity',
+    row: {
+      ...draft.envelope,
+      client_key: draft.clientKey,
+      activity_class: fields.required('activity_class', 'CREATE ACTIVITY'),
+      started_at: fields.timestamp('started_at'),
+      ended_at: fields.timestamp('ended_at'),
+      inputs: structural.values('inputs'),
+      outputs: structural.values('outputs'),
+      associated_actors: structural.values('associated_actors'),
+      parameters_digest: fields.text('parameters_digest'),
+      status: status === '' ? 'pending' : status,
+    },
+  }
 }
 
 /** Whether a new record is part of the consequence channel (§15.7, §29.8). */
