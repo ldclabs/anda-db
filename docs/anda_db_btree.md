@@ -118,9 +118,14 @@ In memory, each bucket carries packing metadata:
 
 ### 2.3 Identifiers
 
-- `bucket_id: u32` — dense, monotonically-assigned; bucket 0 always exists.
-- `max_bucket_id: AtomicU32` — upper bound used during load. May transiently
-  exceed the actual largest populated bucket during concurrent inserts.
+- `bucket_id: u32` — assigned monotonically between compactions (ids may be
+  sparse after concurrent migrations); `compact_buckets` renumbers densely
+  from 0. Bucket 0 always exists.
+- `max_bucket_id: AtomicU32` — upper bound used during legacy load. May
+  transiently exceed the actual largest populated bucket during concurrent
+  inserts, and is reset by `compact_buckets`; durable objects are addressed
+  by `(bucket_id, generation)`, so a reused id never collides with a retired
+  object.
 
 ---
 
@@ -291,7 +296,12 @@ releases has no manifest; the loader falls back to scanning bucket ids
 `0..=max_bucket_id` at generation `0` (the legacy un-suffixed objects), and
 the first flush upgrades the durable layout to the manifest format. Missing
 objects are tolerated (the callback returns `Ok(None)`) for read-only partial
-loads; a partially loaded index must not be flushed. When the same field
+loads: with a manifest the omission is logged as a warning, and the
+placeholder that `load_metadata` registered for every manifest bucket keeps
+the entry alive so a later flush does not retire the object. A partially
+loaded index still must not be mutated and flushed, and an index whose
+buckets were never loaded refuses to flush. A legacy `max_bucket_id` beyond
+`1 << 20` is rejected as corrupted instead of being probed. When the same field
 value appears in multiple legacy bucket files (a leftover of the old
 multi-phase flush), later bucket ids win: the loader reconciles the older
 bucket's in-memory `field_values` list and marks that bucket dirty, allowing
@@ -335,13 +345,16 @@ Every query accepts a callback `f(key, ids)` returning `(continue, Vec<R>)`:
 
 ### 6.3 Ordering Semantics
 
-| Variant                                              | Emit order                                                                                                                      |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `Gt`, `Ge`, `Between`, `Include`, `And`, `Or`, `Not` | ascending key order                                                                                                             |
-| `Lt`, `Le`                                           | **ascending** final order, but iteration is *descending* internally so early termination keeps the keys nearest the upper bound |
+Every variant emits its results in **ascending** key order. Which end of a
+range a bounded scan keeps is decided by the method, never by the query
+shape: `range_query_with` walks upwards from the smallest matching key, so
+early termination keeps the smallest matches; `range_query_rev_with` walks
+downwards from the largest and keeps the largest matches (its output is
+still ascending, with each key's own posting order preserved).
 
-This matters when combining with `take(N)`: for `Lt(date) limit 2`, you get
-the two largest keys strictly less than `date`, returned ascending.
+This matters when combining with a limit: for `Lt(date)` with a limit of 2,
+`range_query_with` returns the two *smallest* keys below `date` and
+`range_query_rev_with` the two *largest*, both ascending.
 
 ### 6.4 Logical Combinators
 
@@ -380,8 +393,11 @@ pub struct BTreeConfig {
 | `allow_duplicates`     | if `false`, enforces uniqueness of `field_value`: a second `doc_id` on the same value returns `BTreeError::AlreadyExists` | Set for unique indexes (PK, unique columns)                                                                |
 
 Bucket overflow is a *soft* limit: the first posting that would cross the
-threshold triggers spilling to a fresh bucket. Postings larger than the limit
-still fit (they just end up alone in their bucket).
+threshold triggers spilling to a fresh bucket. An existing posting that grows
+past the limit is moved out of a *shared* bucket into a fresh one, so a hot
+posting ends up isolated instead of forcing its neighbours to be rewritten on
+every flush; once it fills a bucket by itself it grows in place. Postings
+larger than the limit therefore always fit (alone in their bucket).
 
 ---
 
@@ -486,6 +502,11 @@ pub async fn flush_owned_with<M, MFut, F, FFut>(
 
 pub fn compact_buckets(&self) -> (usize /*old*/, usize /*new*/);
 ```
+
+`new` may be **larger** than `old`: compaction merges fragmented buckets and
+also splits one that grew past the limit while holding several postings. Any
+difference means the layout was rebuilt and every bucket is dirty, so a caller
+deciding whether to persist must test `new != old`, never `new < old`.
 
 ### 8.6 Types
 
@@ -650,13 +671,17 @@ memory and schedules it for repair on the next flush.
 
 ### 10.3 Compaction
 
-`compact_buckets()` re-bins every posting using **first-fit-decreasing**
+`compact_buckets()` re-bins every posting using **best-fit-decreasing**
 bin packing. This is intended for **offline** repair (e.g. after replaying a
-legacy index whose buckets were over-split by an older bug). The procedure:
+legacy index whose buckets were over-split by an older bug), and also splits
+a single bucket that reached the limit while holding several postings — so
+the returned `new` count can exceed `old`. The procedure:
 
 1. Estimates the serialized size of each posting.
 2. Sorts descending by size.
-3. Places each posting into the first bucket that still has room.
+3. Places each posting into the open bucket with the tightest remaining
+   capacity (buckets are indexed by remaining capacity, so a placement costs
+   O(log buckets) rather than a scan over every bucket).
 4. Clears `buckets`, rewrites bucket ids `0..=max`, marks all dirty.
 
 The next `flush` will rewrite every bucket file. Concurrent writers are safe:

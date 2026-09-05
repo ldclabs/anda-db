@@ -9,7 +9,68 @@ All notable changes to this workspace are documented in this file.
 unpublished, so this accumulates into the same version),
 `anda_cognitive_nexus_py` 0.6.0.
 
-Six changes accumulate here. The latest one first.
+Seven changes accumulate here. The latest one first.
+
+## The 2026-09-06 review of `anda_db_btree`
+
+`anda_db_btree` (still 0.11.1) and `anda_db` (still 0.11.1); the version
+bumps are left to the release.
+
+### Fixed — `anda_db_btree`
+
+- **A hot posting no longer spawns a bucket per append.** `insert` migrated
+  an existing posting out of a full bucket even when that posting was the
+  bucket's only occupant, so once a single posting outgrew
+  `bucket_overload_size` every further append moved it into a fresh bucket
+  and left an empty one behind (2000 appends produced 1968 buckets, each
+  persisted as an empty object and kept in the manifest forever). A posting
+  that fills a bucket by itself now grows in place; it still leaves a
+  *shared* bucket once it outgrows it. `insert_array`, which never moved an
+  existing posting and therefore let a hot posting drag its cold neighbours
+  into every rewrite, applies the same rule.
+- `RangeQuery`'s docs (and §6.3 of `docs/anda_db_btree.md`) still described
+  `Lt` / `Le` as scanning downwards so that a limit kept the keys nearest the
+  upper bound. The scan direction is the method's: `range_query_with` keeps
+  the smallest matches, `range_query_rev_with` the largest.
+- `load_buckets` logs a warning for every manifest-referenced bucket object
+  the loader could not read. The placeholder for such a bucket is now
+  registered by `load_metadata` for every manifest bucket, so a later flush
+  carries the entry forward. Flushing an index whose buckets were never
+  loaded (`load_metadata` without `load_buckets`) is refused instead of
+  retiring every committed object; `compact_buckets` is a no-op on such an
+  index.
+- A pre-manifest `max_bucket_id` beyond `1 << 20` is rejected as corrupted
+  metadata instead of being probed bucket by bucket.
+- `flush` calls `Write::flush` on the metadata writer after `write_all`, so
+  a buffered writer cannot hold the commit back.
+
+### Changed — `anda_db_btree`
+
+- `compact_buckets` packs with best-fit-decreasing over a capacity index
+  (`O(keys × log buckets)` instead of the first-fit `O(keys × buckets)`
+  scan) and also splits a single bucket that outgrew the limit while holding
+  several postings; a single bucket within its limit is left untouched.
+- `has_dirty_buckets` checks an atomic hint before scanning the bucket map,
+  so pollers pay for the scan only after a mutation dirtied a bucket.
+- `remove_array` takes the btree write lock once per batch, through the same
+  helper `remove` uses; the sole-occupant grow-in-place rule is one predicate
+  both `insert` and `insert_array` call; `keys` and
+  `prefix_query_with` (no more per-call `String` allocation) are single
+  range expressions; the range walk is a helper instead of a macro; the two
+  identical "detach the superseded posting" blocks in `load_buckets` are one
+  function; bucket size arithmetic saturates everywhere the comments said it
+  did.
+- `dashmap`'s `serde` feature is a dev-dependency (only the test-only bucket
+  serializer used it); the README's dependency snippet says `0.11`.
+
+### Fixed — `anda_db`
+
+- **`BTree::compact` committed nothing when compaction split a bucket.** The
+  wrapper treated any non-decreasing bucket count as "compaction did
+  nothing", but `compact_buckets` now repacks in either direction, so a split
+  (1 bucket becomes N) returned `Ok(())` with the rebuilt layout, every dirty
+  mark and the bumped version left uncommitted. It commits whenever the count
+  changed.
 
 ## The 2026-09-05 review of `anda_db_schema` and `anda_db_derive`
 

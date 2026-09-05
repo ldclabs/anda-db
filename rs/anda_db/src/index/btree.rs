@@ -1009,7 +1009,13 @@ where
     async fn compact(&self) -> Result<(), DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
-        if new_bucket_count >= old_bucket_count {
+        // Compaction repacks in *either* direction: it merges fragmented
+        // buckets, and it splits one that grew past the limit while holding
+        // several postings. Any change to the count means the layout was
+        // rebuilt and every bucket is dirty, so it must be committed —
+        // testing for a decrease alone would leave a split uncommitted while
+        // reporting success.
+        if new_bucket_count == old_bucket_count {
             return Ok(());
         }
 
@@ -1709,11 +1715,15 @@ mod tests {
             .await
             .unwrap();
 
+        // `anchor` shares bucket 0 so that `apple` migrates once the bucket
+        // is full instead of growing in place as a sole occupant would.
+        tree.insert(1, &Fv::Text("anchor".into()), now).unwrap();
         tree.insert(1, &Fv::Text("apple".into()), now).unwrap();
         tree.flush(now + 1).await.unwrap();
 
         let mut next_id = 2;
         while tree.stats().max_bucket_id == 0 {
+            assert!(next_id < 200, "apple never migrated out of bucket 0");
             tree.insert(next_id, &Fv::Text("apple".into()), now + 2)
                 .unwrap();
             next_id += 1;

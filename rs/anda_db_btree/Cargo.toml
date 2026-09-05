@@ -13,7 +13,7 @@ license.workspace = true
 [dependencies]
 anda_db_utils = { version = "0.11", path = "../anda_db_utils" }
 cbor2 = { workspace = true }
-dashmap = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,6 +22,8 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+# `serde` only backs the test-only `BucketRef` serializer.
+dashmap = { workspace = true, features = ["serde"] }
 futures = { workspace = true, features = ["alloc", "executor"] }
 hex = { workspace = true }
 proptest = { workspace = true }
