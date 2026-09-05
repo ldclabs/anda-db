@@ -9,7 +9,141 @@ All notable changes to this workspace are documented in this file.
 unpublished, so this accumulates into the same version),
 `anda_cognitive_nexus_py` 0.6.0.
 
-Four changes accumulate here. The latest one first.
+Six changes accumulate here. The latest one first.
+
+## The 2026-09-05 review of `anda_db_schema` and `anda_db_derive`
+
+`anda_db_schema` and `anda_db_derive` (both still 0.11.0; the version bump
+is left to the release).
+
+### Fixed — `anda_db_schema`
+
+- **`Vec<u8>` / `[u8; N]` map keys.** The derive inferred
+  `BTreeMap<Vec<u8>, T>` as `Map<Bytes, T>`, but serde writes such keys as
+  CBOR integer arrays and `FieldKey`'s `TryFrom<cbor2::Value>` accepted only
+  byte strings, so `Document::try_from` failed with `invalid map key`. The
+  conversion now accepts an array of `0..=255` — the shape
+  `FieldValue::bytes_from` already took for values — and the derive infers
+  `[u8; N]` keys as bytes too.
+- **Integers for float fields.** `F64` / `F32` fields rejected an integer
+  (`expected F64, got 1`). JSON has one number type — `JSON.stringify(1.0)`
+  is `1` — so every JavaScript client tripped over it on `coerce`,
+  `set_field` and `Document::try_from(&json)`. `f64_from` / `f32_from`,
+  `validate`, `normalize` and the `TryFrom<FieldValue>` impls for `f64` /
+  `f32` accept `I64` / `U64` now, converting the way serde does (`as f64`,
+  exact up to 2^53).
+- **Legacy lineages and the allocation watermark.** A schema persisted by
+  0.10 (no `next_idx` on disk) whose highest-idx field had been removed under
+  that version made every older document unreadable in 0.11: the stale values
+  sat at `max(idx) + 1`, exactly where the watermark fallback ends, and were
+  rejected as "foreign or corrupt data". Such a schema is now a *legacy
+  lineage* (`Schema::has_allocation_watermark()` is `false`): undeclared
+  indexes are dropped on read as before 0.11, and the status is kept through
+  `upgrade_with` and re-serialization because the lineage's history cannot be
+  reconstructed. Lineages created by 0.11 keep the strict check.
+- `Document::set_field` runs `FieldEntry::coerce` — the CBOR coercion
+  `Document::try_from` applies — instead of `normalize` + `validate`, so a
+  field accepts the same shapes on create and on update (`Collection::update`
+  used to reject the `[1, 2, 3]` a `Bytes` field had accepted on add). One
+  shape stops being accepted: a `Bytes` / `Vector` value on a `Json` field,
+  which the create path always rejected.
+
+### Changed — `anda_db_schema`
+
+- `FieldType::validate_declaration` (new) rejects `Option<Option<T>>`, a
+  `Map` that mixes a wildcard key with other keys, and nesting beyond
+  `MAX_CONVERSION_DEPTH`. `FieldEntry::new` and `Schema` deserialization run
+  it, and `SchemaError::FieldType` — never constructed before — carries the
+  result.
+- `FieldType::is_compatible_upgrade_of`, hence `Schema::upgrade_with`,
+  accepts `T` → `Option<T>` at the top level and inside composites: stored
+  values are non-null and still validate. The reverse stays incompatible.
+- `Schema` equality compares the declaration (fields and version), not the
+  allocation watermark, so a legacy schema loaded from disk equals the same
+  schema built from code.
+- `FieldType::normalize` rebuilds a `Json` field's payload directly from the
+  read-back `Map` / `Array` / primitive shape instead of cloning it and
+  round-tripping through CBOR and serde.
+- `FieldKey::is_wildcard()` (new) recognises the wildcard sentinels;
+  `as_wildcard_map` matches the single entry's key with it instead of doing
+  three lookups. The `TEXT_WILDCARD_KEY` / `BYTES_WILDCARD_KEY` /
+  `I64_WILDCARD_KEY` statics stay.
+- `SchemaBuilder::build` drops a field-count check `add_field` already
+  makes; it keeps its `Result` signature.
+
+### Changed — `anda_db_derive`
+
+- Inference covers tuples (`(A, B)` → the tuple-like `Array([A, B])`),
+  `VecDeque` / `LinkedList` / `BinaryHeap`, and `[u8; N]` map keys; it
+  rejects `Option<Option<T>>` and `u128` / `i128` with targeted errors
+  instead of an E0599 on the derive.
+- The `#[field_type]` DSL accepts the Rust spellings (`String`, `u64`,
+  `i32`, `f64`, `bool`, …) as synonyms of the `FieldType` names for values,
+  as it already did for map keys, and rejects `Option<Option<T>>`.
+
+## `anda_db_tfs` review: leaner postings, one `NOT` guard, no dead migration
+
+`anda_db_tfs` needs a minor bump at release (its public surface changes);
+`anda_db` only consumes it through unchanged signatures.
+
+### Changed (breaking) — `anda_db_tfs`
+
+- `PostingValue` is `(u32, Vec<(u64, usize)>)`: the posting list was a
+  `UniqueVec` keyed by the whole `(doc, tf)` pair, which enforced nothing
+  the scorer relied on (a document could still appear twice with different
+  frequencies) while storing every entry twice. Same CBOR encoding on disk.
+- `QueryType::Or` / `QueryType::And` hold `Vec<QueryType>`; the `Box` per
+  element was redundant.
+- `QueryType::may_materialize_not_complement` is gone. The `NOT` complement
+  guard now lives in the executor, at the point where the complement would be
+  built, instead of in a predicate that had to mirror the executor's
+  branching. `try_search_advanced` reports the same condition as before; an
+  `AND` that short-circuits to empty before reaching the `NOT` is no longer
+  rejected.
+- `collect_tokens` / `flat_full_text_search` return `FxHashMap` (and take it
+  for `inclusive`) — the hot path was hashing with SipHash.
+- `BM25Index<T>` no longer spells `+ Clone`; `Tokenizer` already implies it.
+
+### Fixed — `anda_db_tfs`
+
+- `insert` re-reads which bucket owns an existing token instead of trusting
+  the id read before the bucket lock: a concurrent insert migrating the same
+  token could otherwise list it in two buckets and skew both buckets'
+  accounting. Existing tokens are now only charged, never re-placed; the
+  "remove from the old bucket" branch of the migration was unreachable
+  outside that race and is gone, as is the spurious dirty mark on a full
+  bucket that ended up receiving nothing.
+- A bucket's `size` estimate and `doc_ids` hint are made exact by every
+  flush (from the serialized payload) and the estimate now includes the
+  per-document token counts the object carries — it excluded them before,
+  while a reload counted them, so the same bucket looked half as full before
+  a restart as after it.
+- `load_metadata` seeds a placeholder for every bucket in the manifest, so a
+  flush of a metadata-only shell carries the committed manifest forward
+  instead of reporting every durable bucket obsolete.
+- `NOT NOT a` parses as `Not(Not(a))`; it used to become `Not(Or(not, a))`
+  and exclude documents containing the word "not". The nesting budget bounds
+  a `NOT` flood the way it bounds parentheses.
+- `remove` drops a document's entries from a posting in one `retain` pass
+  instead of rescanning the list per removed entry.
+- `BM25Error`'s `Display` prints the source error's `Display`, not its
+  `Debug`; `TokenizeFailed` carries at most 256 bytes of the document text.
+
+### Changed — `anda_db_tfs`
+
+- `search_advanced("quick fox")` scores an `OR` made only of words in one
+  pass, exactly like `search("quick fox")`: one tokenizer clone and one score
+  map instead of one of each per word. A word repeated in the query is scored
+  once (it was summed per occurrence).
+- The Jieba merge filter moves token text out of the inner streams instead
+  of cloning it.
+- Documented the one design limit the review found and did not change: the
+  bucket size limit applies only when a token is placed, so the buckets that
+  hold very frequent terms grow with the corpus and are rewritten whole by
+  every flush touching them. Stop-word filtering in the tokenizer chain is
+  the remedy. `docs/anda_db_tfs.md` also stops describing `insert_array` /
+  `remove_array` (never existed) and no longer claims `compact_buckets`
+  prunes stale postings (a reload does).
 
 ## `anda_kip` narrows what it exports
 

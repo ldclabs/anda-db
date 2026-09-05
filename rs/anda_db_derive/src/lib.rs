@@ -35,9 +35,9 @@ mod schema;
 ///   accepts a small DSL: primitives (`Bytes`, `Text`, `U64`, ...), as well
 ///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>`,
 ///   `Map<I64, T>` and `Map<Bytes, T>` (where `T` is itself any supported
-///   type, including nested wrappers). For the map key, the Rust spellings
-///   `i8` / `i16` / `i32` / `i64` / `isize` are accepted as synonyms of
-///   `I64`.
+///   type, including nested wrappers). The Rust spellings (`String`, `u64`,
+///   `i32`, `f64`, `bool`, ...) are accepted as synonyms of the `FieldType`
+///   names, for values and map keys alike. `Option<Option<T>>` is rejected.
 /// - `#[cbor(key = N)]` -- for nested structs that also derive
 ///   `cbor2::Cbor`, use the integer CBOR map key as the generated
 ///   `FieldKey` instead of the serde text name.
@@ -69,10 +69,14 @@ mod schema;
 /// - integers / floats / `bool` -> their numeric `FieldType`
 /// - `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteBuf`, `ByteArray`, `*B64` -> `Bytes`
 /// - `Vec<bf16>`, `[bf16; N]` -> `Vector`
-/// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `Vec<T>` / `VecDeque<T>` / `LinkedList<T>` / `BinaryHeap<T>` /
+///   `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `(A, B, ...)` -> the tuple-like `Array([A, B, ...])`
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` (string-, signed integer-, or
-///   bytes-like key) -> `Map`
-/// - `Option<T>` -> `Option(T)`
+///   bytes-like key, `[u8; N]` included) -> `Map`
+/// - `Option<T>` -> `Option(T)`; `Option<Option<T>>` is a compile error
+///   (serde serializes `Some(None)` and `None` identically)
+/// - `u128` / `i128` are a compile error: AndaDB integers are 64-bit
 /// - `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` -> the inner `T` (serde
 ///   serializes these wrappers transparently)
 /// - `serde_json::Value`, `Json` -> `Json`

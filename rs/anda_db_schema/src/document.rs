@@ -126,17 +126,24 @@ impl Document {
     /// or above the watermark means the bytes belong to a different schema
     /// lineage — corrupt data, the wrong collection, or a newer writer — and
     /// silently deleting such data on the next rewrite would be destructive.
+    ///
+    /// A legacy lineage without a watermark (see
+    /// [`Schema::has_allocation_watermark`]) cannot tell the two apart, so
+    /// it keeps the pre-watermark behaviour: every undeclared index is
+    /// dropped.
     fn drop_retired_fields(
         schema: &Schema,
         fields: &mut IndexedFieldValues,
     ) -> Result<(), SchemaError> {
-        let allocated_end = schema.allocated_idx_end();
-        if let Some(idx) = fields.keys().find(|idx| **idx >= allocated_end) {
-            return Err(SchemaError::Validation(format!(
-                "document contains field index {idx} that this schema \
-                 (allocation watermark {allocated_end}) never declared; \
-                 refusing to silently drop foreign or corrupt data"
-            )));
+        if schema.has_allocation_watermark() {
+            let allocated_end = schema.allocated_idx_end();
+            if let Some(idx) = fields.keys().find(|idx| **idx >= allocated_end) {
+                return Err(SchemaError::Validation(format!(
+                    "document contains field index {idx} that this schema \
+                     (allocation watermark {allocated_end}) never declared; \
+                     refusing to silently drop foreign or corrupt data"
+                )));
+            }
         }
         fields.retain(|idx, _| schema.contains_idx(*idx));
         Ok(())
@@ -365,9 +372,13 @@ impl Document {
 
     /// Sets a field value by name.
     ///
-    /// Read-back value shapes (e.g. a non-negative `I64` observed as `U64`)
-    /// are normalized into the field's canonical variant before being
-    /// stored, mirroring [`Document::try_from_doc`].
+    /// The value goes through [`FieldEntry::coerce`](crate::FieldEntry::coerce)
+    /// — the same CBOR coercion [`Document::try_from`] applies when a
+    /// document is created — so a field accepts the same shapes whether it
+    /// is written or updated: a `Bytes` field takes an array of `0..=255`,
+    /// a float field takes an integer, an `I64` field takes a non-negative
+    /// `U64`, a `Vector` field takes an array of bf16 bit patterns, and so
+    /// on. The stored value is always the field's canonical variant.
     ///
     /// # Arguments
     /// * `name` - The name of the field to set
@@ -375,17 +386,11 @@ impl Document {
     ///
     /// # Returns
     /// * `Result<(), SchemaError>` - Success or an error
-    pub fn set_field(&mut self, name: &str, mut value: Fv) -> Result<&mut Self, SchemaError> {
-        if let Some(field) = self.schema.get_field(name) {
-            field.r#type().normalize(&mut value);
-            field.validate(&value)?;
-            self.fields.insert(field.idx(), value);
-            return Ok(self);
-        }
-
-        Err(SchemaError::Validation(format!(
-            "field {name:?} not found in schema"
-        )))
+    pub fn set_field(&mut self, name: &str, value: Fv) -> Result<&mut Self, SchemaError> {
+        let field = self.schema.get_field_or_err(name)?;
+        let value = field.coerce(value)?;
+        self.fields.insert(field.idx(), value);
+        Ok(self)
     }
 
     /// Removes a field value by name.
@@ -489,7 +494,10 @@ impl Serialize for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AndaDBSchema, FieldTyped, Fv, Resource, Vector, vector_from_f32};
+    use crate::{
+        AndaDBSchema, Fe, FieldKey, FieldTyped, Ft, Fv, Json, Resource, Vector, bf16,
+        vector_from_f32,
+    };
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
@@ -1355,5 +1363,110 @@ mod tests {
         assert_eq!(user.tags, None);
         assert_eq!(user.meta, None);
         assert_eq!(user.picture, None);
+    }
+
+    #[test]
+    fn legacy_schema_drops_stale_values_above_its_fallback_watermark() {
+        // A 0.10 lineage: the schema was persisted without `next_idx`, and
+        // the field with the highest idx was removed under that version. Its
+        // stale values sit at `max(idx) + 1`, exactly where the watermark
+        // fallback ends; a legacy lineage must drop them, not reject them.
+        let opt = || Ft::Option(Box::new(Ft::Text));
+        let mut builder = Schema::builder();
+        builder
+            .add_field(Fe::new("a".into(), opt()).unwrap())
+            .unwrap();
+        builder
+            .add_field(Fe::new("b".into(), opt()).unwrap())
+            .unwrap();
+        builder
+            .add_field(Fe::new("c".into(), opt()).unwrap())
+            .unwrap();
+        let v1 = builder.build().unwrap();
+
+        let mut doc = Document::new(Arc::new(v1.clone()));
+        doc.set_id(1);
+        doc.set_field("c", Fv::Text("stale".into())).unwrap();
+        let owned = DocumentOwned::from(doc);
+
+        let mut value = serde_json::to_value(&v1).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("next_idx");
+        object["fields"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|f| f["n"] != "c");
+        let legacy: Schema = serde_json::from_value(value).unwrap();
+        assert!(!legacy.has_allocation_watermark());
+        assert_eq!(legacy.allocated_idx_end(), 3);
+
+        let doc = Document::try_from_doc(Arc::new(legacy.clone()), owned.clone()).unwrap();
+        assert!(!doc.fields().contains_key(&3));
+        let mut doc = Document::new(Arc::new(legacy));
+        doc.set_doc(owned).unwrap();
+        assert!(!doc.fields().contains_key(&3));
+
+        // A watermarked lineage still rejects the same index as foreign.
+        let mut v2 = Schema::builder();
+        v2.add_field(Fe::new("a".into(), opt()).unwrap()).unwrap();
+        v2.add_field(Fe::new("b".into(), opt()).unwrap()).unwrap();
+        let v2 = v2.build().unwrap();
+        assert!(v2.has_allocation_watermark());
+        let mut fields = IndexedFieldValues::new();
+        fields.insert(0, Fv::U64(1));
+        fields.insert(3, Fv::Text("foreign".into()));
+        assert!(Document::try_from_doc(Arc::new(v2), DocumentOwned { fields }).is_err());
+    }
+
+    #[test]
+    fn set_field_coerces_like_document_creation() {
+        #[derive(Debug, Serialize, Deserialize, AndaDBSchema)]
+        struct Row {
+            _id: u64,
+            blob: Vec<u8>,
+            score: f64,
+            ratio: f32,
+            count: i64,
+            embedding: Vector,
+            meta: Json,
+        }
+
+        let mut doc = Document::new(Arc::new(Row::schema().unwrap()));
+        doc.set_id(1);
+        doc.set_field("blob", Fv::Array(vec![Fv::U64(1), Fv::U64(2)]))
+            .unwrap();
+        assert_eq!(doc.get_field("blob"), Some(&Fv::Bytes(vec![1, 2])));
+        doc.set_field("score", Fv::U64(3)).unwrap();
+        assert_eq!(doc.get_field("score"), Some(&Fv::F64(3.0)));
+        doc.set_field("ratio", Fv::I64(-2)).unwrap();
+        assert_eq!(doc.get_field("ratio"), Some(&Fv::F32(-2.0)));
+        doc.set_field("count", Fv::U64(9)).unwrap();
+        assert_eq!(doc.get_field("count"), Some(&Fv::I64(9)));
+        let bits = bf16::from_f32(1.0).to_bits();
+        doc.set_field("embedding", Fv::Array(vec![Fv::U64(bits.into())]))
+            .unwrap();
+        assert_eq!(
+            doc.get_field("embedding"),
+            Some(&Fv::Vector(vec![bf16::from_f32(1.0)]))
+        );
+        doc.set_field(
+            "meta",
+            Fv::Map(BTreeMap::from([(FieldKey::from("k"), Fv::U64(1))])),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.get_field("meta"),
+            Some(&Fv::Json(serde_json::json!({"k": 1})))
+        );
+
+        // Shapes creation rejects are rejected here too.
+        assert!(
+            doc.set_field("blob", Fv::Array(vec![Fv::U64(256)]))
+                .is_err()
+        );
+        assert!(doc.set_field("meta", Fv::Bytes(vec![1])).is_err());
+        assert!(doc.set_field("count", Fv::F64(1.0)).is_err());
+        assert!(doc.set_field("count", Fv::Null).is_err());
+        assert!(doc.set_field("missing", Fv::Null).is_err());
     }
 }

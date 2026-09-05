@@ -221,8 +221,9 @@ type and produce a `FieldType` token stream.
 
 | Rust type                                               | `FieldType`       |
 | ------------------------------------------------------- | ----------------- |
-| `Vec<T>`, `HashSet<T>`, `BTreeSet<T>`                   | `Array(T)`        |
+| `Vec<T>`, `VecDeque<T>`, `LinkedList<T>`, `BinaryHeap<T>`, `HashSet<T>`, `BTreeSet<T>` | `Array(T)` |
 | `[T; N]` (with `T` a supported non-byte/non-bf16 type)  | `Array(T)`        |
+| `(A, B, …)` (non-empty tuple)                           | `Array([A, B, …])` — the tuple-like, fixed-length form |
 | `HashMap<K, V>`, `BTreeMap<K, V>`, `serde_json::Map<…>` | `Map({"*" => V})` |
 
 For maps the key `K` must be one of:
@@ -230,16 +231,21 @@ For maps the key `K` must be one of:
 - a string-like type (`String`, `&str`) → wildcard text key `"*"`
 - a signed integer type (`i8`, `i16`, `i32`, `i64`, `isize`) → wildcard
   integer key `i64::MIN`
-- a bytes-like type (`Vec<u8>`, `Bytes`, `ByteArray`, `ByteBuf`, `*B64`) →
-  wildcard bytes key `b"*"`
+- a bytes-like type (`Vec<u8>`, `[u8; N]`, `Bytes`, `ByteArray`, `ByteBuf`,
+  `*B64`) → wildcard bytes key `b"*"`
 
-Any other key type is a compile error.
+Any other key type is a compile error. `Vec<u8>` and `[u8; N]` keys reach
+CBOR as integer arrays (serde has no byte-string specialization for them);
+the schema side coerces that shape into `Bytes` keys, just as it does for
+values.
 
 ### 4.5 Optionality, smart pointers and user-defined types
 
 | Rust type                                  | `FieldType`                                          |
 | ------------------------------------------ | ---------------------------------------------------- |
 | `Option<T>`                                | `Option(T)`                                          |
+| `Option<Option<T>>`                        | **compile error** — serde serializes `Some(None)` and `None` identically |
+| `u128` / `i128`                            | **compile error** — AndaDB integers are 64-bit       |
 | `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` | the inner `T` (serde serializes these transparently) |
 | Any other path `Foo` (incl. `Foo<G>`)      | `<Foo>::field_type()` — **must** derive `FieldTyped` |
 
@@ -267,9 +273,9 @@ type        := primitive | array | option | map
 primitive   := "Bytes" | "Text" | "U64" | "I64"
              | "F64"   | "F32"  | "Bool" | "Json" | "Vector"
 array       := "Array<" type ">"
-option      := "Option<" type ">"
+option      := "Option<" type ">"          -- type must not itself be an option
 map         := "Map<" map_key "," type ">"
-map_key     := "String" | "Text" | "I64" | "Bytes"
+map_key     := "String" | "Text" | "I64" | "i8" | "i16" | "i32" | "i64" | "isize" | "Bytes"
 ```
 
 ### 5.1 String / Text equivalence
@@ -292,6 +298,13 @@ Signed integer map keys use `I64` and expand to the integer wildcard key
 #[field_type = "Map<I64, Text>"]
 ```
 
+The Rust spellings of the scalar types are accepted everywhere in the DSL as
+synonyms of the `FieldType` names — `String` / `str` for `Text`, `u8` … `u64`
+/ `usize` for `U64`, `i8` … `i64` / `isize` for `I64`, plus `f32`, `f64` and
+`bool` — so an override can mirror the field's own type, e.g.
+`#[field_type = "Option<Array<u64>>"]`. `Option<Option<T>>` is rejected:
+serde serializes `Some(None)` and `None` identically.
+
 ### 5.2 Examples
 
 | DSL string                  | `FieldType`                  |
@@ -312,7 +325,8 @@ Unrecognised input produces a `compile_error!` at the original macro span:
 ```text
 Unsupported field type: '...'. Supported types: Bytes, Text, U64, I64,
 F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>,
-Map<Text, T>, Map<I64, T>, Map<Bytes, T>
+Map<Text, T>, Map<I64, T>, Map<Bytes, T> (Rust spellings such as u64, i64,
+f64, bool and String are accepted as synonyms)
 ```
 
 ```text
@@ -514,7 +528,7 @@ impl User {
 ### 8.1 Compile-time errors
 
 All messages are spanned at the offending field, type or attribute. Types in
-messages are rendered as Rust source (e.g. `(u64, u64)`), not as AST dumps.
+messages are rendered as Rust source (e.g. `fn() -> u64`), not as AST dumps.
 
 | Message                                                                            | Cause                                                                          |
 | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -533,11 +547,13 @@ messages are rendered as Rust source (e.g. `(u64, u64)`), not as AST dumps.
 | `Unsupported field type: '...'. Supported types: …`                                 | DSL string in `#[field_type]` was not recognised.                              |
 | `Unsupported Map key type: '...'. Expected 'String', 'Text', 'I64' or 'Bytes'.`     | Unsupported key in `Map<K, V>` DSL.                                            |
 | `Invalid Map field type: '...'. Expected 'Map<KeyType, ValueType>'.`                | DSL `Map<…>` string lacks a comma-separated key/value pair.                    |
-| `Unsupported type: \`...\`. Consider: …`                                            | Inference failed (tuples, trait objects, etc.).                                |
-| `Unable to determine Vec element type for: ...`                                     | Generic argument missing on a `Vec` / `HashSet` / `BTreeSet`.                  |
+| `Unsupported type: \`...\`. Consider: …`                                            | Inference failed (unit `()`, trait objects, bare functions, etc.).             |
+| `Option<Option<T>> cannot be described: …` / `Invalid field type: '...'. Option<Option<T>> is not supported: …` | Nested `Option` in a Rust type or in the DSL; serde cannot represent the inner level. |
+| `\`u128\` is not representable: AndaDB integers are 64-bit …`                       | `u128` / `i128` field without an override.                                     |
+| `Unable to determine element type for: ...`                                         | Generic argument missing on a `Vec` / `VecDeque` / `LinkedList` / `BinaryHeap` / `HashSet` / `BTreeSet`. |
 | `Unable to determine Option element type`                                           | Generic argument missing on an `Option`.                                       |
 | `Unable to determine the inner type of: ...`                                        | Generic argument missing on a `Box` / `Arc` / `Rc` / `Cow`.                    |
-| `Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: …` | `HashMap`/`BTreeMap` key inferred as something neither string-, signed integer-, nor bytes-like. |
+| `Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, [u8; N], ByteArray, ByteBuf), found: …` | `HashMap`/`BTreeMap` key inferred as something neither string-, signed integer-, nor bytes-like. |
 | `Standalone \`bf16\` is not supported as a field type. Use \`Vec<bf16>\` …`         | Bare `bf16` field without `Vec`/override.                                      |
 
 ### 8.2 Runtime errors

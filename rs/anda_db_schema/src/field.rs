@@ -123,7 +123,7 @@ fn check_conversion_depth(depth: usize) -> Result<(), SchemaError> {
 /// - [`FieldType::Map`] declares per-key types. A wildcard map
 ///   (`{ "*": T }`, `{ i64::MIN: T }`, or `{ b"*": T }`) matches any key with
 ///   values of type `T`. See [`TEXT_WILDCARD_KEY`] / [`BYTES_WILDCARD_KEY`] /
-///   [`I64_WILDCARD_KEY`].
+///   [`I64_WILDCARD_KEY`], [`FieldKey::is_wildcard`] and [`as_wildcard_map`].
 /// - [`FieldType::Option`] makes a field nullable.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
@@ -179,6 +179,69 @@ impl FieldType {
     /// [`Option`](FieldType::Option) variant.
     pub fn allows_null(&self) -> bool {
         matches!(self, FieldType::Option(_))
+    }
+
+    /// Checks that this type is a well-formed *declaration*.
+    ///
+    /// The shapes rejected here either cannot be told apart from another
+    /// declaration once serialized, or make the wildcard rule ambiguous:
+    ///
+    /// - `Option<Option<T>>`: serde writes `Some(None)` and `None` both as
+    ///   `null`, so the inner level can never be observed;
+    /// - a `Map` that mixes a wildcard key (`"*"`, `b"*"`, `i64::MIN`; see
+    ///   [`FieldKey::is_wildcard`]) with other keys: a wildcard map has
+    ///   exactly one entry, so the extra keys would silently turn the
+    ///   sentinel into an ordinary key;
+    /// - container nesting deeper than [`MAX_CONVERSION_DEPTH`].
+    ///
+    /// An empty `Map` is allowed and means "any map" — the shape
+    /// `#[derive(FieldTyped)]` emits for a struct without serialized fields.
+    ///
+    /// [`FieldEntry::new`] and `Schema` deserialization run this check, so
+    /// every type that reaches a [`Schema`](crate::Schema) is well-formed.
+    ///
+    /// # Errors
+    /// Returns [`SchemaError::FieldType`] describing the first violation.
+    pub fn validate_declaration(&self) -> Result<(), SchemaError> {
+        self.validate_declaration_at(0)
+    }
+
+    fn validate_declaration_at(&self, depth: usize) -> Result<(), SchemaError> {
+        if depth > MAX_CONVERSION_DEPTH {
+            return Err(SchemaError::FieldType(format!(
+                "type exceeds maximum nesting depth {MAX_CONVERSION_DEPTH}"
+            )));
+        }
+
+        match self {
+            FieldType::Array(types) => types
+                .iter()
+                .try_for_each(|ft| ft.validate_declaration_at(depth + 1)),
+            FieldType::Map(types) => {
+                if types.len() > 1
+                    && let Some(key) = types.keys().find(|k| k.is_wildcard())
+                {
+                    return Err(SchemaError::FieldType(format!(
+                        "wildcard key {key:?} must be the only key of a Map, found {} keys",
+                        types.len()
+                    )));
+                }
+                types
+                    .values()
+                    .try_for_each(|ft| ft.validate_declaration_at(depth + 1))
+            }
+            FieldType::Option(inner) => {
+                if inner.allows_null() {
+                    return Err(SchemaError::FieldType(
+                        "Option<Option<T>> is not allowed: serde serializes Some(None) and None identically"
+                            .to_string(),
+                    ));
+                }
+                // `Option` wrapping is type-level nesting only.
+                inner.validate_declaration_at(depth)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Coerce a CBOR value into a [`FieldValue`] that conforms to this type.
@@ -241,7 +304,10 @@ impl FieldType {
     ///   range,
     /// - `F32` accepts an [`F64`](FieldValue::F64) that a stored `f32` can
     ///   produce when read back through CBOR (exact widening) or JSON
-    ///   (shortest-decimal round trip); see `is_f32_read_back`.
+    ///   (shortest-decimal round trip); see `is_f32_read_back`,
+    /// - `F64` and `F32` accept an integer ([`I64`](FieldValue::I64) /
+    ///   [`U64`](FieldValue::U64)): JSON has a single number type, so `1.0`
+    ///   reaches a float field as `1`.
     ///
     /// Use [`FieldType::normalize`] to fold accepted read-back shapes into
     /// the canonical variant.
@@ -284,6 +350,9 @@ impl FieldType {
             // without type information; only the values such read-backs can
             // produce are accepted (see `is_f32_read_back`).
             (FieldType::F32, FieldValue::F64(v)) if is_f32_read_back(*v) => Ok(()),
+            // JSON has a single number type: `1.0` reaches a float field as
+            // the integer `1`. Accepted (and normalized) for both float types.
+            (FieldType::F64 | FieldType::F32, FieldValue::I64(_) | FieldValue::U64(_)) => Ok(()),
             (FieldType::Bytes, FieldValue::Bytes(_)) => Ok(()),
             (FieldType::Text, FieldValue::Text(_)) => Ok(()),
             (FieldType::Json, _) => Ok(()),
@@ -319,14 +388,8 @@ impl FieldType {
                         )));
                     }
 
-                    for (i, ft) in types.iter().enumerate() {
-                        if let Some(fv) = values.get(i) {
-                            ft.validate_inner(fv)?;
-                        } else {
-                            return Err(SchemaError::FieldValue(format!(
-                                "no value at array[{i}], expected type {ft:?}",
-                            )));
-                        }
+                    for (ft, fv) in types.iter().zip(values) {
+                        ft.validate_inner(fv)?;
                     }
                     Ok(())
                 }
@@ -351,6 +414,8 @@ impl FieldType {
     ///   `i64` range becomes [`FieldValue::I64`],
     /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
     ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`],
+    /// - an `F64` / `F32` field observed as an integer ([`FieldValue::I64`] /
+    ///   [`FieldValue::U64`]) becomes the float — JSON writes `1.0` as `1`,
     /// - a `Vector` field observed as an array of U64 bf16 bit patterns becomes
     ///   [`FieldValue::Vector`],
     /// - a `Json` field observed as the `Map` / `Array` / primitive shape of
@@ -382,13 +447,19 @@ impl FieldType {
                     *value = FieldValue::I64(*v as i64);
                 }
             }
-            FieldType::F32 => {
-                if let FieldValue::F64(v) = value
-                    && is_f32_read_back(*v)
-                {
+            FieldType::F64 => match value {
+                FieldValue::I64(i) => *value = FieldValue::F64(*i as f64),
+                FieldValue::U64(u) => *value = FieldValue::F64(*u as f64),
+                _ => {}
+            },
+            FieldType::F32 => match value {
+                FieldValue::F64(v) if is_f32_read_back(*v) => {
                     *value = FieldValue::F32(*v as f32);
                 }
-            }
+                FieldValue::I64(i) => *value = FieldValue::F32(*i as f32),
+                FieldValue::U64(u) => *value = FieldValue::F32(*u as f32),
+                _ => {}
+            },
             FieldType::Vector => {
                 if let FieldValue::Array(values) = value {
                     let vector = values
@@ -424,16 +495,15 @@ impl FieldType {
             }
             FieldType::Json => {
                 // A `Json` payload is stored as its plain CBOR/JSON shape, so
-                // it reads back as a `Map`, an `Array` or a primitive. Going
-                // back through CBOR — the same path `FieldType::extract`
-                // takes — rebuilds the declared variant. Shapes that have no
+                // it reads back as a `Map`, an `Array` or a primitive.
+                // `field_value_to_json` rebuilds the declared variant in one
+                // pass — no clone, no CBOR round trip. Shapes that have no
                 // JSON representation (e.g. `Bytes`) are left unchanged, and
                 // so are values too deeply nested for the bounded conversion.
                 if !matches!(value, FieldValue::Json(_))
-                    && let Ok(cbor) = value.clone().try_into_cbor()
-                    && let Ok(json) = FieldValue::json_from(cbor)
+                    && let Some(json) = field_value_to_json(value, depth)
                 {
-                    *value = json;
+                    *value = FieldValue::Json(json);
                 }
             }
             FieldType::Map(types) => {
@@ -533,20 +603,25 @@ impl FieldType {
     /// Returns `true` when a field previously declared as `old` may be
     /// re-declared as `self` without rewriting the documents already stored.
     ///
-    /// Types must match exactly, with one exception that mirrors the
-    /// *top-level* evolution rule enforced by [`Schema::upgrade_with`](crate::Schema::upgrade_with)
-    /// (a new field must be optional, a removed field is tolerated on read):
-    /// a non-wildcard [`FieldType::Map`] — the shape `#[derive(FieldTyped)]`
-    /// emits for a nested struct — may
+    /// Types must match exactly, with two exceptions that keep every stored
+    /// value readable:
     ///
-    /// - **gain** a key, provided the new key is optional, so documents
-    ///   written before the upgrade (which lack it) still validate; and
-    /// - **lose** a key: stored values keep the stale entry, which
-    ///   [`FieldType::prune_undeclared`] drops on read.
+    /// - a required type may become optional (`T` → `Option<T>`), at the top
+    ///   level or anywhere inside a composite: stored values are non-null and
+    ///   still match `T`. The reverse (`Option<T>` → `T`) stays incompatible,
+    ///   because stored nulls would fail validation;
+    /// - mirroring the *top-level* evolution rule enforced by
+    ///   [`Schema::upgrade_with`](crate::Schema::upgrade_with) (a new field
+    ///   must be optional, a removed field is tolerated on read), a
+    ///   non-wildcard [`FieldType::Map`] — the shape `#[derive(FieldTyped)]`
+    ///   emits for a nested struct — may **gain** a key, provided the new key
+    ///   is optional, so documents written before the upgrade (which lack it)
+    ///   still validate; and **lose** a key: stored values keep the stale
+    ///   entry, which [`FieldType::prune_undeclared`] drops on read.
     ///
-    /// A key whose type changed, a new *required* key, and any change of the
-    /// wildcard-ness or key variant of a map remain incompatible, as do all
-    /// other type changes.
+    /// A key whose type changed otherwise, a new *required* key, and any
+    /// change of the wildcard-ness or key variant of a map remain
+    /// incompatible, as do all other type changes.
     pub fn is_compatible_upgrade_of(&self, old: &FieldType) -> bool {
         match (self, old) {
             (FieldType::Array(new_types), FieldType::Array(old_types)) => {
@@ -576,6 +651,10 @@ impl FieldType {
             (FieldType::Option(new_ft), FieldType::Option(old_ft)) => {
                 new_ft.is_compatible_upgrade_of(old_ft)
             }
+            // Making a type optional is read-safe: every stored value is
+            // non-null and still matches the inner type. The reverse is not,
+            // so it falls through to the exact-match arm and fails.
+            (FieldType::Option(new_ft), old) => new_ft.is_compatible_upgrade_of(old),
             (new, old) => new == old,
         }
     }
@@ -649,6 +728,21 @@ pub static I64_WILDCARD_KEY: std::sync::LazyLock<FieldKey> =
     std::sync::LazyLock::new(|| FieldKey::I64(i64::MIN));
 
 impl FieldKey {
+    /// Returns `true` when this key is the wildcard sentinel of its variant:
+    /// `"*"` for text, `b"*"` for bytes and `i64::MIN` for integers.
+    ///
+    /// A [`FieldType::Map`] whose *only* entry carries a wildcard key is a
+    /// homogeneous map (`Map<Text, T>`, `Map<Bytes, T>`, `Map<I64, T>`): any
+    /// key of that variant is accepted and every value must have type `T`.
+    /// See [`as_wildcard_map`].
+    pub fn is_wildcard(&self) -> bool {
+        match self {
+            FieldKey::Text(s) => s == "*",
+            FieldKey::I64(i) => *i == i64::MIN,
+            FieldKey::Bytes(b) => b.as_slice() == b"*",
+        }
+    }
+
     /// Returns the [`FieldType`] that the key itself uses
     /// ([`FieldType::Text`] for `Text`, [`FieldType::I64`] for `I64`,
     /// [`FieldType::Bytes`] for `Bytes`).
@@ -761,8 +855,12 @@ impl TryFrom<Value> for FieldKey {
                 SchemaError::FieldValue(format!("expected I64 map key, got {v:?}"))
             })?)),
             Value::Bytes(b) => Ok(FieldKey::Bytes(b)),
+            // `Vec<u8>` / `[u8; N]` map keys reach CBOR as an integer array
+            // (serde has no byte-string specialization for them) — the same
+            // shape `FieldValue::bytes_from` accepts for values.
+            Value::Array(arr) => Ok(FieldKey::Bytes(u8_array_from(arr)?)),
             _ => Err(SchemaError::FieldValue(format!(
-                "expected Text, I64 or Bytes, got {value:?}"
+                "expected Text, I64, Bytes or an array of 0..=255 as map key, got {value:?}"
             ))
             .into()),
         }
@@ -1110,6 +1208,9 @@ impl TryFrom<FieldValue> for f64 {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F64(v) => Ok(v),
+            // JSON integer for a float field (see `FieldType::validate`).
+            FieldValue::I64(v) => Ok(v as f64),
+            FieldValue::U64(v) => Ok(v as f64),
             _ => Err(SchemaError::FieldValue(format!("expected F64, got {value:?}")).into()),
         }
     }
@@ -1121,6 +1222,9 @@ impl<'a> TryFrom<&'a FieldValue> for f64 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::F64(v) => Ok(*v),
+            // JSON integer for a float field (see `FieldType::validate`).
+            FieldValue::I64(v) => Ok(*v as f64),
+            FieldValue::U64(v) => Ok(*v as f64),
             _ => Err(SchemaError::FieldValue(format!("expected F64, got {value:?}")).into()),
         }
     }
@@ -1135,6 +1239,9 @@ impl TryFrom<FieldValue> for f32 {
             // Read-back shape: an F32 comes back as an F64 through generic
             // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
             FieldValue::F64(v) if is_f32_read_back(v) => Ok(v as f32),
+            // JSON integer for a float field (see `FieldType::validate`).
+            FieldValue::I64(v) => Ok(v as f32),
+            FieldValue::U64(v) => Ok(v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -1149,6 +1256,9 @@ impl<'a> TryFrom<&'a FieldValue> for f32 {
             // Read-back shape: an F32 comes back as an F64 through generic
             // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
             FieldValue::F64(v) if is_f32_read_back(*v) => Ok(*v as f32),
+            // JSON integer for a float field (see `FieldType::validate`).
+            FieldValue::I64(v) => Ok(*v as f32),
+            FieldValue::U64(v) => Ok(*v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -1541,6 +1651,10 @@ impl FieldValue {
 
     /// Create an F64 FieldValue from a CBOR value
     ///
+    /// CBOR integers are accepted as well: JSON has a single number type, so
+    /// `1.0` arrives as the integer `1`. The conversion is serde's own
+    /// (`as f64`) — exact up to 2^53, rounded beyond.
+    ///
     /// # Arguments
     /// * `value` - The CBOR value to convert
     ///
@@ -1549,6 +1663,7 @@ impl FieldValue {
     pub fn f64_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
             Cbor::Float(f) if !f.is_nan() => Ok(FieldValue::F64(f)),
+            Cbor::Integer(i) => Ok(FieldValue::F64(integer_to_f64(i))),
             v => Err(SchemaError::FieldValue(format!("expected F64, got {v:?}"))),
         }
     }
@@ -1557,7 +1672,9 @@ impl FieldValue {
     ///
     /// Precision truncation (f64 → f32) is accepted, but a finite value
     /// outside the f32 range is rejected instead of silently becoming
-    /// infinite. Explicit infinities pass through unchanged.
+    /// infinite. Explicit infinities pass through unchanged. CBOR integers
+    /// are accepted like in [`FieldValue::f64_from`]; every `i64` / `u64`
+    /// fits the f32 range, so only precision can be lost.
     ///
     /// # Arguments
     /// * `value` - The CBOR value to convert
@@ -1565,18 +1682,18 @@ impl FieldValue {
     /// # Returns
     /// * `Result<Self, SchemaError>` - The converted FieldValue or an error message
     pub fn f32_from(value: Cbor) -> Result<Self, SchemaError> {
-        match value {
-            Cbor::Float(f) if !f.is_nan() => {
-                let v = f as f32;
-                if v.is_infinite() && f.is_finite() {
-                    return Err(SchemaError::FieldValue(format!(
-                        "expected F32, got out-of-range F64 {f:?}"
-                    )));
-                }
-                Ok(FieldValue::F32(v))
-            }
-            v => Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
+        let f = match value {
+            Cbor::Float(f) if !f.is_nan() => f,
+            Cbor::Integer(i) => integer_to_f64(i),
+            v => return Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
+        };
+        let v = f as f32;
+        if v.is_infinite() && f.is_finite() {
+            return Err(SchemaError::FieldValue(format!(
+                "expected F32, got out-of-range F64 {f:?}"
+            )));
         }
+        Ok(FieldValue::F32(v))
     }
 
     /// Create a Bytes FieldValue from a CBOR value
@@ -1595,24 +1712,7 @@ impl FieldValue {
     pub fn bytes_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
             Cbor::Bytes(b) => Ok(FieldValue::Bytes(b)),
-            Cbor::Array(arr) => {
-                let mut bytes = Vec::with_capacity(arr.len());
-                for v in arr {
-                    match v {
-                        Cbor::Integer(i) => bytes.push(u8::try_from(i).map_err(|v| {
-                            SchemaError::FieldValue(format!(
-                                "expected Bytes, got array element {v:?} outside u8 range"
-                            ))
-                        })?),
-                        v => {
-                            return Err(SchemaError::FieldValue(format!(
-                                "expected Bytes, got array element {v:?}"
-                            )));
-                        }
-                    }
-                }
-                Ok(FieldValue::Bytes(bytes))
-            }
+            Cbor::Array(arr) => Ok(FieldValue::Bytes(u8_array_from(arr)?)),
             v => Err(SchemaError::FieldValue(format!(
                 "expected Bytes, got {v:?}"
             ))),
@@ -1808,7 +1908,7 @@ impl FieldValue {
                 if !types.is_empty() && wildcard_map.is_none() {
                     for (k, ft) in types {
                         if !vals.contains_key(k) {
-                            ft.validate(&FieldValue::Null).map_err(|err| {
+                            ft.validate_inner(&FieldValue::Null).map_err(|err| {
                                 SchemaError::FieldValue(format!(
                                     "invalid map value at key {k:?}, error: {err}"
                                 ))
@@ -1970,9 +2070,12 @@ impl FieldEntry {
     /// * `r#type` - Field type
     ///
     /// # Returns
-    /// * `Result<Self, SchemaError>` - The created field entry or an error message
+    /// * `Result<Self, SchemaError>` - The created field entry, or an error
+    ///   when the name violates [`validate_field_name`] or the type is not a
+    ///   well-formed declaration (see [`FieldType::validate_declaration`])
     pub fn new(name: String, r#type: FieldType) -> Result<Self, SchemaError> {
         validate_field_name(&name)?;
+        r#type.validate_declaration()?;
         Ok(Self {
             name,
             r#type,
@@ -2107,6 +2210,7 @@ impl FieldEntry {
     /// takes [`FieldValue`]s from a client must go through this function, or
     /// creating a document and updating the same field accept different
     /// shapes and a client can write a document it cannot then update.
+    /// [`Document::set_field`](crate::Document::set_field) does.
     ///
     /// # Arguments
     /// * `value` - The field value to coerce
@@ -2218,11 +2322,89 @@ fn json_to_cbor_at(value: Json, depth: usize, strict: bool) -> Result<Cbor, Sche
     })
 }
 
+/// Converts a CBOR array of integers in `0..=255` — the shape serde gives
+/// `Vec<u8>` and `[u8; N]`, which have no byte-string specialization — into
+/// bytes. Shared by [`FieldValue::bytes_from`] (values) and the
+/// `TryFrom<Value>` impl of [`FieldKey`] (map keys).
+fn u8_array_from(arr: Vec<Cbor>) -> Result<Vec<u8>, SchemaError> {
+    let mut bytes = Vec::with_capacity(arr.len());
+    for v in arr {
+        match v {
+            Cbor::Integer(i) => bytes.push(u8::try_from(i).map_err(|v| {
+                SchemaError::FieldValue(format!(
+                    "expected Bytes, got array element {v:?} outside u8 range"
+                ))
+            })?),
+            v => {
+                return Err(SchemaError::FieldValue(format!(
+                    "expected Bytes, got array element {v:?}"
+                )));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// Converts a CBOR integer into the `f64` an `F64` / `F32` field stores for
+/// it: the plain `as` conversion serde applies when a JSON integer token
+/// meets a float field — exact up to 2^53, rounded beyond.
+fn integer_to_f64(i: cbor2::value::Integer) -> f64 {
+    i128::from(i) as f64
+}
+
+/// Rebuilds the [`Json`] payload of a `Json`-typed field from the plain
+/// `Map` / `Array` / primitive shape it reads back as, in one borrowing pass
+/// (no clone of the tree, no CBOR round trip).
+///
+/// Mirrors what [`FieldValue::json_from`] produces for the CBOR encoding of
+/// the same value: a non-finite float becomes JSON `null`, a `Vector` becomes
+/// the array of its bf16 bit patterns. Returns `None` for shapes that have no
+/// JSON representation — `Bytes`, and maps with non-text keys — which are
+/// left to validation, and for values nested beyond [`MAX_CONVERSION_DEPTH`].
+fn field_value_to_json(value: &FieldValue, depth: usize) -> Option<Json> {
+    check_conversion_depth(depth).ok()?;
+
+    Some(match value {
+        FieldValue::Null => Json::Null,
+        FieldValue::Bool(b) => Json::Bool(*b),
+        FieldValue::I64(i) => Json::Number((*i).into()),
+        FieldValue::U64(u) => Json::Number((*u).into()),
+        FieldValue::F64(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+        FieldValue::F32(f) => {
+            serde_json::Number::from_f64(f64::from(*f)).map_or(Json::Null, Json::Number)
+        }
+        FieldValue::Text(s) => Json::String(s.clone()),
+        FieldValue::Json(json) => json.clone(),
+        FieldValue::Vector(vector) => Json::Array(
+            vector
+                .iter()
+                .map(|f| Json::Number(f.to_bits().into()))
+                .collect(),
+        ),
+        FieldValue::Array(values) => Json::Array(
+            values
+                .iter()
+                .map(|v| field_value_to_json(v, depth + 1))
+                .collect::<Option<_>>()?,
+        ),
+        FieldValue::Map(values) => {
+            let mut object = serde_json::Map::with_capacity(values.len());
+            for (key, v) in values {
+                let FieldKey::Text(key) = key else {
+                    return None;
+                };
+                object.insert(key.clone(), field_value_to_json(v, depth + 1)?);
+            }
+            Json::Object(object)
+        }
+        FieldValue::Bytes(_) => return None,
+    })
+}
+
 /// If `m` describes a *wildcard* map — i.e. it has exactly one entry whose
-/// key is [`TEXT_WILDCARD_KEY`], [`BYTES_WILDCARD_KEY`], or
-/// [`I64_WILDCARD_KEY`] — return that entry: the sentinel key, whose variant
-/// is the declared key type, and the value type every entry must have.
-/// Otherwise return `None`.
+/// key [`is_wildcard`](FieldKey::is_wildcard) (`"*"`, `b"*"` or `i64::MIN`)
+/// — return that entry: the sentinel key, whose variant is the declared key
+/// type, and the value type every entry must have. Otherwise return `None`.
 ///
 /// Every other `Map` declares its keys explicitly (this is what
 /// `#[derive(FieldTyped)]` emits for a nested struct), so it is homogeneous in
@@ -2231,13 +2413,10 @@ fn json_to_cbor_at(value: Json, depth: usize, strict: bool) -> Result<Cbor, Sche
 /// it with a one-entry check, or the two layers disagree about which maps are
 /// wildcards.
 pub fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<(&FieldKey, &FieldType)> {
-    match m.len() {
-        1 => m
-            .get_key_value(&TEXT_WILDCARD_KEY)
-            .or_else(|| m.get_key_value(&BYTES_WILDCARD_KEY))
-            .or_else(|| m.get_key_value(&I64_WILDCARD_KEY)),
-        _ => None,
+    if m.len() != 1 {
+        return None;
     }
+    m.iter().next().filter(|(key, _)| key.is_wildcard())
 }
 
 /// Returns an error when `key` is not the key variant that the wildcard
@@ -3045,9 +3224,11 @@ mod tests {
         assert!(!wild_text.is_compatible_upgrade_of(&v1));
         assert!(!v1.is_compatible_upgrade_of(&wild_text));
 
-        // Unrelated types never become one another.
+        // Unrelated types never become one another. Making a type optional
+        // is read-safe and allowed; the reverse is not.
         assert!(!Ft::Text.is_compatible_upgrade_of(&Ft::U64));
-        assert!(!Ft::Option(Box::new(Ft::Text)).is_compatible_upgrade_of(&Ft::Text));
+        assert!(Ft::Option(Box::new(Ft::Text)).is_compatible_upgrade_of(&Ft::Text));
+        assert!(!Ft::Text.is_compatible_upgrade_of(&Ft::Option(Box::new(Ft::Text))));
     }
 
     #[test]
@@ -3374,8 +3555,15 @@ mod tests {
             FieldKey::I64(-42)
         );
         assert!(FieldKey::try_from(Value::Bool(true)).is_err());
+        assert_eq!(*TEXT_WILDCARD_KEY, FieldKey::Text("*".to_string()));
         assert_eq!(*BYTES_WILDCARD_KEY, FieldKey::Bytes(b"*".to_vec()));
         assert_eq!(*I64_WILDCARD_KEY, FieldKey::I64(i64::MIN));
+        assert!(TEXT_WILDCARD_KEY.is_wildcard());
+        assert!(BYTES_WILDCARD_KEY.is_wildcard());
+        assert!(I64_WILDCARD_KEY.is_wildcard());
+        assert!(!FieldKey::from("**").is_wildcard());
+        assert!(!FieldKey::from(b"").is_wildcard());
+        assert!(!FieldKey::from(0_i64).is_wildcard());
 
         let wildcard_type = FieldType::Map(BTreeMap::from([(
             FieldKey::from(b"*".as_slice()),
@@ -3397,7 +3585,7 @@ mod tests {
         );
 
         let wildcard_type = FieldType::Map(BTreeMap::from([(
-            FieldKey::from(i64::MIN),
+            I64_WILDCARD_KEY.clone(),
             FieldType::Text,
         )]));
         let wildcard_value = FieldValue::Map(BTreeMap::from([
@@ -3947,5 +4135,203 @@ mod tests {
         // JSON is bounded by serde_json's recursion limit (128).
         let deep_json = format!("{}true{}", "[".repeat(2000), "]".repeat(2000));
         assert!(serde_json::from_str::<Fv>(&deep_json).is_err());
+    }
+
+    #[test]
+    fn field_key_from_cbor_accepts_u8_arrays_like_bytes_from() {
+        // `Vec<u8>` / `[u8; N]` map keys serialize as integer arrays.
+        assert_eq!(
+            FieldKey::try_from(Value::Array(vec![
+                Value::Integer(1.into()),
+                Value::Integer(2.into()),
+            ]))
+            .unwrap(),
+            FieldKey::Bytes(vec![1, 2])
+        );
+        assert!(FieldKey::try_from(Value::Array(vec![Value::Integer(256.into())])).is_err());
+        assert!(FieldKey::try_from(Value::Array(vec![Value::Text("x".into())])).is_err());
+
+        let types = BTreeMap::from([(BYTES_WILDCARD_KEY.clone(), Ft::U64)]);
+        let value = Cbor::Map(vec![(
+            Cbor::Array(vec![Cbor::Integer(1.into()), Cbor::Integer(2.into())]),
+            Cbor::Integer(7.into()),
+        )]);
+        assert_eq!(
+            FieldValue::map_from(value, &types).unwrap(),
+            Fv::Map(BTreeMap::from([(FieldKey::Bytes(vec![1, 2]), Fv::U64(7))]))
+        );
+    }
+
+    #[test]
+    fn float_fields_accept_integers() {
+        // JSON writes `1.0` as `1`: extract, validate, normalize and the
+        // typed conversions all accept an integer for a float field.
+        assert_eq!(
+            FieldType::F64.extract(Cbor::Integer(1.into())).unwrap(),
+            Fv::F64(1.0)
+        );
+        assert_eq!(
+            FieldType::F64.extract(Cbor::Integer((-2).into())).unwrap(),
+            Fv::F64(-2.0)
+        );
+        assert_eq!(
+            FieldType::F32.extract(Cbor::Integer(3.into())).unwrap(),
+            Fv::F32(3.0)
+        );
+        assert_eq!(
+            FieldType::F64
+                .extract(Cbor::Integer(u64::MAX.into()))
+                .unwrap(),
+            Fv::F64(u64::MAX as f64)
+        );
+
+        FieldType::F64.validate(&Fv::U64(1)).unwrap();
+        FieldType::F64.validate(&Fv::I64(-1)).unwrap();
+        FieldType::F32.validate(&Fv::U64(1)).unwrap();
+        FieldType::F32.validate(&Fv::I64(i64::MIN)).unwrap();
+
+        let mut v = Fv::U64(1);
+        FieldType::F64.normalize(&mut v);
+        assert_eq!(v, Fv::F64(1.0));
+        let mut v = Fv::I64(-5);
+        FieldType::F32.normalize(&mut v);
+        assert_eq!(v, Fv::F32(-5.0));
+        let mut v = Fv::Array(vec![Fv::U64(1), Fv::F64(2.5)]);
+        FieldType::Array(vec![FieldType::F64]).normalize(&mut v);
+        assert_eq!(v, Fv::Array(vec![Fv::F64(1.0), Fv::F64(2.5)]));
+
+        assert_eq!(f64::try_from(Fv::U64(4)).unwrap(), 4.0);
+        assert_eq!(f64::try_from(&Fv::I64(-4)).unwrap(), -4.0);
+        assert_eq!(f32::try_from(Fv::U64(4)).unwrap(), 4.0);
+        assert_eq!(f32::try_from(&Fv::I64(-4)).unwrap(), -4.0);
+
+        // Integer fields still reject floats.
+        assert!(FieldType::U64.validate(&Fv::F64(1.0)).is_err());
+        assert!(FieldType::I64.extract(Cbor::Float(1.0)).is_err());
+    }
+
+    #[test]
+    fn validate_declaration_rejects_ambiguous_types() {
+        let text_opt = FieldType::Option(Box::new(FieldType::Text));
+        text_opt.validate_declaration().unwrap();
+        FieldType::Array(vec![text_opt.clone(), FieldType::U64])
+            .validate_declaration()
+            .unwrap();
+        FieldType::Map(BTreeMap::new())
+            .validate_declaration()
+            .unwrap();
+        FieldType::Map(BTreeMap::from([(
+            TEXT_WILDCARD_KEY.clone(),
+            FieldType::U64,
+        )]))
+        .validate_declaration()
+        .unwrap();
+        FieldType::Map(BTreeMap::from([
+            (FieldKey::from("a"), FieldType::U64),
+            (FieldKey::from("b"), text_opt.clone()),
+        ]))
+        .validate_declaration()
+        .unwrap();
+
+        let nested_option = FieldType::Option(Box::new(text_opt.clone()));
+        let err = nested_option.validate_declaration().unwrap_err();
+        assert!(matches!(err, SchemaError::FieldType(_)), "{err}");
+        assert!(
+            FieldType::Array(vec![nested_option.clone()])
+                .validate_declaration()
+                .is_err()
+        );
+        assert!(
+            FieldType::Map(BTreeMap::from([(FieldKey::from("k"), nested_option)]))
+                .validate_declaration()
+                .is_err()
+        );
+
+        let mixed = FieldType::Map(BTreeMap::from([
+            (TEXT_WILDCARD_KEY.clone(), FieldType::U64),
+            (FieldKey::from("a"), FieldType::U64),
+        ]));
+        let err = mixed.validate_declaration().unwrap_err();
+        assert!(err.to_string().contains("wildcard"), "{err}");
+        assert!(
+            FieldType::Map(BTreeMap::from([
+                (I64_WILDCARD_KEY.clone(), FieldType::U64),
+                (FieldKey::from(1_i64), FieldType::U64),
+            ]))
+            .validate_declaration()
+            .is_err()
+        );
+
+        let mut deep = FieldType::Text;
+        for _ in 0..=MAX_CONVERSION_DEPTH {
+            deep = FieldType::Array(vec![deep]);
+        }
+        assert!(deep.validate_declaration().is_err());
+
+        // `FieldEntry::new` runs the check.
+        assert!(FieldEntry::new("f".to_string(), FieldType::Option(Box::new(text_opt))).is_err());
+    }
+
+    #[test]
+    fn compatible_upgrade_allows_making_types_optional() {
+        let opt = |ft: FieldType| FieldType::Option(Box::new(ft));
+        assert!(opt(Ft::Text).is_compatible_upgrade_of(&Ft::Text));
+        assert!(!Ft::Text.is_compatible_upgrade_of(&opt(Ft::Text)));
+        assert!(!opt(Ft::U64).is_compatible_upgrade_of(&Ft::Text));
+
+        // Nested: a required key may become optional, not the reverse.
+        let old = Ft::Map(BTreeMap::from([(FieldKey::from("a"), Ft::U64)]));
+        let new = Ft::Map(BTreeMap::from([(FieldKey::from("a"), opt(Ft::U64))]));
+        assert!(new.is_compatible_upgrade_of(&old));
+        assert!(!old.is_compatible_upgrade_of(&new));
+        assert!(
+            Ft::Array(vec![opt(Ft::Text)]).is_compatible_upgrade_of(&Ft::Array(vec![Ft::Text]))
+        );
+    }
+
+    #[test]
+    fn json_normalize_rebuilds_payload_without_cbor_round_trip() {
+        let mut v = Fv::Map(BTreeMap::from([
+            (
+                FieldKey::from("a"),
+                Fv::Array(vec![
+                    Fv::U64(1),
+                    Fv::I64(-1),
+                    Fv::F64(1.5),
+                    Fv::F32(0.5),
+                    Fv::Null,
+                    Fv::Bool(true),
+                ]),
+            ),
+            (FieldKey::from("s"), Fv::Text("txt".into())),
+            (FieldKey::from("v"), Fv::Vector(vec![bf16::from_f32(1.0)])),
+            (FieldKey::from("j"), Fv::Json(serde_json::json!({"x": 1}))),
+        ]));
+        FieldType::Json.normalize(&mut v);
+        assert_eq!(
+            v,
+            Fv::Json(serde_json::json!({
+                "a": [1, -1, 1.5, 0.5, null, true],
+                "s": "txt",
+                "v": [bf16::from_f32(1.0).to_bits()],
+                "j": {"x": 1},
+            }))
+        );
+
+        // Mirrors the CBOR path: a non-finite float becomes JSON null.
+        let mut v = Fv::F64(f64::INFINITY);
+        FieldType::Json.normalize(&mut v);
+        assert_eq!(v, Fv::Json(Json::Null));
+
+        // Shapes with no JSON representation are left for validation.
+        for mut v in [
+            Fv::Bytes(vec![1]),
+            Fv::Map(BTreeMap::from([(FieldKey::from(1_i64), Fv::U64(1))])),
+            Fv::Array(vec![Fv::Bytes(vec![1])]),
+        ] {
+            let before = v.clone();
+            FieldType::Json.normalize(&mut v);
+            assert_eq!(v, before);
+        }
     }
 }

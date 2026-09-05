@@ -556,15 +556,22 @@ pub fn find_field_type_attr(
 /// type        := primitive | array | option | map
 /// primitive   := "Bytes" | "Text" | "U64" | "I64"
 ///              | "F64"   | "F32"  | "Bool" | "Json" | "Vector"
+///              | rust_scalar
+/// rust_scalar := "String" | "str" | "bool" | "f32" | "f64"
+///              | "u8" | "u16" | "u32" | "u64" | "usize"
+///              | "i8" | "i16" | "i32" | "i64" | "isize"
 /// array       := "Array<" type ">"
-/// option      := "Option<" type ">"
+/// option      := "Option<" type ">"          -- `type` must not be an option
 /// map         := "Map<" map_key "," type ">"
-/// map_key     := "String" | "Text" | "Bytes"
+/// map_key     := "String" | "Text" | "I64" | "i8" | "i16" | "i32" | "i64"
+///              | "isize" | "Bytes"
 /// ```
 ///
-/// `String` and `Text` are accepted as synonymous map keys: `FieldType` only
-/// has a `Text` variant, but `Map<String, T>` reads more naturally and is
-/// kept for backwards compatibility.
+/// The Rust spellings are synonyms of the `FieldType` names, so an override
+/// can mirror the field's own type: `String` and `Text` both mean `Text`
+/// (for values and for map keys), `u64` means `U64`, and so on.
+/// `Option<Option<T>>` is rejected: serde serializes `Some(None)` and `None`
+/// identically, so the inner level can never be observed.
 ///
 /// Unrecognised input produces an error spanned at `span` (the attribute's
 /// string literal) so that the user gets a precise diagnostic.
@@ -575,14 +582,15 @@ pub fn parse_field_type_str(
 ) -> syn::Result<TokenStream> {
     let normalized: String = type_str.chars().filter(|ch| !ch.is_whitespace()).collect();
     match normalized.as_str() {
-        // Primitive types.
+        // Primitive types. The Rust spellings are accepted as synonyms so an
+        // override can mirror the field's own type (`u64`, `String`, ...).
         "Bytes" => Ok(quote! { #root::FieldType::Bytes }),
-        "Text" => Ok(quote! { #root::FieldType::Text }),
-        "U64" => Ok(quote! { #root::FieldType::U64 }),
-        "I64" => Ok(quote! { #root::FieldType::I64 }),
-        "F64" => Ok(quote! { #root::FieldType::F64 }),
-        "F32" => Ok(quote! { #root::FieldType::F32 }),
-        "Bool" => Ok(quote! { #root::FieldType::Bool }),
+        "Text" | "String" | "str" => Ok(quote! { #root::FieldType::Text }),
+        "U64" | "u8" | "u16" | "u32" | "u64" | "usize" => Ok(quote! { #root::FieldType::U64 }),
+        "I64" | "i8" | "i16" | "i32" | "i64" | "isize" => Ok(quote! { #root::FieldType::I64 }),
+        "F64" | "f64" => Ok(quote! { #root::FieldType::F64 }),
+        "F32" | "f32" => Ok(quote! { #root::FieldType::F32 }),
+        "Bool" | "bool" => Ok(quote! { #root::FieldType::Bool }),
         "Json" => Ok(quote! { #root::FieldType::Json }),
         "Vector" => Ok(quote! { #root::FieldType::Vector }),
 
@@ -592,7 +600,16 @@ pub fn parse_field_type_str(
             Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
         s if s.starts_with("Option<") && s.ends_with('>') => {
-            let inner_type = parse_field_type_str(&s[7..s.len() - 1], span, root)?;
+            let inner = &s[7..s.len() - 1];
+            if inner.starts_with("Option<") {
+                return Err(syn::Error::new(
+                    span,
+                    format!(
+                        "Invalid field type: '{type_str}'. Option<Option<T>> is not supported: serde serializes Some(None) and None identically, so the inner level can never be observed."
+                    ),
+                ));
+            }
+            let inner_type = parse_field_type_str(inner, span, root)?;
             Ok(quote! { #root::FieldType::Option(::std::boxed::Box::new(#inner_type)) })
         }
 
@@ -654,7 +671,7 @@ pub fn parse_field_type_str(
         _ => Err(syn::Error::new(
             span,
             format!(
-                "Unsupported field type: '{type_str}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Text, T>, Map<I64, T>, Map<Bytes, T>"
+                "Unsupported field type: '{type_str}'. Supported types: Bytes, Text, U64, I64, F64, F32, Bool, Json, Vector, Array<T>, Option<T>, Map<String, T>, Map<Text, T>, Map<I64, T>, Map<Bytes, T> (Rust spellings such as u64, i64, f64, bool and String are accepted as synonyms)"
             ),
         )),
     }
@@ -668,12 +685,16 @@ pub fn parse_field_type_str(
 ///
 /// - `Vec<u8>` / `[u8; N]` / `Bytes` / `ByteArray` / `ByteBuf` -> `Bytes`
 /// - `Vec<bf16>` / `[bf16; N]` -> `Vector`
-/// - `Vec<T>` / `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `Vec<T>` / `VecDeque<T>` / `LinkedList<T>` / `BinaryHeap<T>` /
+///   `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
+/// - `(A, B, …)` -> the tuple-like `Array([A, B, …])`, one type per position
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` -> `Map({*: V})` (key must be a
-///   string-, signed integer-, or bytes-like type)
-/// - `Option<T>` -> `Option(T)`
+///   string-, signed integer-, or bytes-like type, `[u8; N]` included)
+/// - `Option<T>` -> `Option(T)`; `Option<Option<T>>` is rejected because
+///   serde serializes `Some(None)` and `None` identically
 /// - `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` -> the inner `T` (serde
 ///   serializes these wrappers transparently)
+/// - `u128` / `i128` are rejected: AndaDB integers are 64-bit
 /// - `serde_json::Value`, `serde_bytes::*` recognised by full path
 /// - Any other path type is treated as a user-defined struct and resolved by
 ///   calling its `field_type()` associated function (i.e. it must derive
@@ -743,6 +764,12 @@ pub fn determine_field_type(
             match type_name.as_str() {
                 "Option" => {
                     if let Some(inner_type) = first_type_argument(segment) {
+                        if is_option_type(inner_type) {
+                            return Err(syn::Error::new_spanned(
+                                ty,
+                                "Option<Option<T>> cannot be described: serde serializes Some(None) and None identically, so the inner level can never be observed. Flatten it to Option<T>, or add #[field_type = \"...\"]",
+                            ));
+                        }
                         let inner_field_type = determine_field_type(inner_type, root, type_params)?;
                         return Ok(quote! {
                             #root::FieldType::Option(::std::boxed::Box::new(#inner_field_type))
@@ -754,7 +781,7 @@ pub fn determine_field_type(
                     ))
                 }
                 "String" | "str" => Ok(quote! { #root::FieldType::Text }),
-                "Vec" | "HashSet" | "BTreeSet" => {
+                "Vec" | "VecDeque" | "LinkedList" | "BinaryHeap" | "HashSet" | "BTreeSet" => {
                     if let Some(inner_type) = first_type_argument(segment) {
                         if is_u8_type(inner_type) {
                             return Ok(quote! { #root::FieldType::Bytes });
@@ -768,7 +795,7 @@ pub fn determine_field_type(
                     }
                     Err(syn::Error::new_spanned(
                         ty,
-                        format!("Unable to determine Vec element type for: {type_name}"),
+                        format!("Unable to determine element type for: {type_name}"),
                     ))
                 }
                 // serde serializes smart pointers transparently, so the
@@ -783,6 +810,12 @@ pub fn determine_field_type(
                     ))
                 }
                 "bool" => Ok(quote! { #root::FieldType::Bool }),
+                "u128" | "i128" => Err(syn::Error::new_spanned(
+                    ty,
+                    format!(
+                        "`{type_name}` is not representable: AndaDB integers are 64-bit (FieldType::U64 / FieldType::I64). Use a 64-bit integer, or add #[field_type = \"...\"] to declare the stored shape"
+                    ),
+                )),
                 "i8" | "i16" | "i32" | "i64" | "isize" => Ok(quote! { #root::FieldType::I64 }),
                 "u8" | "u16" | "u32" | "u64" | "usize" => Ok(quote! { #root::FieldType::U64 }),
                 "f32" => Ok(quote! { #root::FieldType::F32 }),
@@ -811,7 +844,7 @@ pub fn determine_field_type(
                             return Err(syn::Error::new_spanned(
                                 key_ty,
                                 format!(
-                                    "Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, ByteArray, ByteBuf), found: {}",
+                                    "Map key type must be String, signed integer, or bytes (e.g., Vec<u8>, [u8; N], ByteArray, ByteBuf), found: {}",
                                     type_to_string(key_ty)
                                 ),
                             ));
@@ -857,8 +890,18 @@ pub fn determine_field_type(
             let inner_type = determine_field_type(&array.elem, root, type_params)?;
             Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
+        // A tuple serializes as a fixed-length sequence, which is exactly the
+        // tuple-like `Array` shape: one element type per position.
+        Type::Tuple(tuple) if !tuple.elems.is_empty() => {
+            let elems = tuple
+                .elems
+                .iter()
+                .map(|elem| determine_field_type(elem, root, type_params))
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok(quote! { #root::FieldType::Array(::std::vec![#(#elems),*]) })
+        }
         _ => {
-            // Tuple, trait object, bare function, etc. -- not representable.
+            // Unit `()`, trait object, bare function, etc. -- not representable.
             Err(syn::Error::new_spanned(
                 ty,
                 format!(
@@ -955,13 +998,18 @@ pub fn is_signed_integer_type(ty: &Type) -> bool {
 
 /// Returns `true` if `ty` is one of the supported byte container types.
 ///
-/// Recognised types: `Vec<u8>`, `Bytes`, `ByteBuf`, `ByteArray`,
+/// Recognised types: `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteBuf`, `ByteArray`,
 /// `BytesB64`, `ByteBufB64`, `ByteArrayB64`.
 ///
-/// Note: bare `[u8; N]` arrays are intentionally **not** treated as bytes
-/// here for `Map` keys -- prefer `ByteArray` / `ByteArrayB64` instead.
+/// `Vec<u8>` and `[u8; N]` reach CBOR as an integer array (serde has no
+/// byte-string specialization for them); the schema side coerces that shape
+/// into `Bytes` for values and map keys alike.
 pub fn is_bytes_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = peel_type(ty)
+    let ty = peel_type(ty);
+    if let Type::Array(array) = ty {
+        return is_u8_type(&array.elem);
+    }
+    if let Type::Path(type_path) = ty
         && let Some(segment) = type_path.path.segments.last()
     {
         // Vec<u8>
@@ -1001,6 +1049,28 @@ pub fn is_u64_type(ty: &Type) -> bool {
         return segment.ident == "u64";
     }
     false
+}
+
+/// Returns `true` if `ty` is `Option<...>` (judged by its last path segment,
+/// like serde), looking through the wrappers serde serializes transparently
+/// (`Box`, `Arc`, `Rc`, `Cow`, references, parentheses and groups).
+pub fn is_option_type(ty: &Type) -> bool {
+    match peel_type(ty) {
+        Type::Reference(reference) => is_option_type(&reference.elem),
+        Type::Path(type_path) => match type_path.path.segments.last() {
+            Some(segment) if segment.ident == "Option" => true,
+            Some(segment)
+                if matches!(
+                    segment.ident.to_string().as_str(),
+                    "Box" | "Arc" | "Rc" | "Cow"
+                ) =>
+            {
+                first_type_argument(segment).is_some_and(is_option_type)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1273,9 +1343,25 @@ mod tests {
             ("Bool", ":: anda_db_schema :: FieldType :: Bool"),
             ("Json", ":: anda_db_schema :: FieldType :: Json"),
             ("Vector", ":: anda_db_schema :: FieldType :: Vector"),
+            // Rust spellings are synonyms.
+            ("String", ":: anda_db_schema :: FieldType :: Text"),
+            ("str", ":: anda_db_schema :: FieldType :: Text"),
+            ("u64", ":: anda_db_schema :: FieldType :: U64"),
+            ("u8", ":: anda_db_schema :: FieldType :: U64"),
+            ("i32", ":: anda_db_schema :: FieldType :: I64"),
+            ("f64", ":: anda_db_schema :: FieldType :: F64"),
+            ("f32", ":: anda_db_schema :: FieldType :: F32"),
+            ("bool", ":: anda_db_schema :: FieldType :: Bool"),
         ] {
             assert_eq!(tokens(parse_ft(input).unwrap()), expected);
         }
+
+        let err = parse_ft("Option<Option<Text>>").unwrap_err().to_string();
+        assert!(err.contains("Option<Option<T>>"), "{err}");
+        let err = parse_ft("Array<Option< Option<u64> >>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Option<Option<T>>"), "{err}");
 
         let array = tokens(parse_ft("Array<Option<Text>>").unwrap());
         assert!(array.contains(":: anda_db_schema :: FieldType :: Array"));
@@ -1367,7 +1453,7 @@ mod tests {
             dft(&ty)
                 .unwrap_err()
                 .to_string()
-                .contains("Unable to determine Vec element type")
+                .contains("Unable to determine element type")
         );
 
         let ty: Type = parse_quote!(BTreeMap<String, Vec<u8>>);
@@ -1389,10 +1475,17 @@ mod tests {
         let ty: Type = parse_quote!(HashMap<String, u64, RandomState>);
         assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: U64"));
 
+        // `[u8; N]` keys reach CBOR as integer arrays, which the schema side
+        // coerces into `Bytes` keys, so they infer to the bytes wildcard.
         let ty: Type = parse_quote!(HashMap<[u8; 4], String>);
+        assert!(
+            tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldKey :: from (b\"*\")")
+        );
+
+        let ty: Type = parse_quote!(HashMap<f64, String>);
         let err = dft(&ty).unwrap_err().to_string();
         assert!(err.contains("Map key type must be String, signed integer, or bytes"));
-        assert!(err.contains("[u8 ; 4]"));
+        assert!(err.contains("f64"));
 
         let ty: Type = parse_quote!(HashMap<String>);
         assert!(
@@ -1600,11 +1693,63 @@ mod tests {
         let ty: Type = parse_quote!([String; 2]);
         assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
 
-        let ty: Type = parse_quote!((u64, u64));
+        let ty: Type = parse_quote!(());
+        let err = dft(&ty).unwrap_err().to_string();
+        assert!(err.contains("Unsupported type"));
+
+        let ty: Type = parse_quote!(fn(u64) -> u64);
         let err = dft(&ty).unwrap_err().to_string();
         assert!(err.contains("Unsupported type"));
         // The message shows the Rust type, not an AST debug dump.
-        assert!(err.contains("u64 , u64"));
+        assert!(err.contains("fn (u64) -> u64"));
+    }
+
+    #[test]
+    fn determine_field_type_rejects_nested_options_and_128_bit_integers() {
+        let ty: Type = parse_quote!(Option<Option<u64>>);
+        let err = dft(&ty).unwrap_err().to_string();
+        assert!(err.contains("Option<Option<T>>"), "{err}");
+        let ty: Type = parse_quote!(Option<Box<Option<u64>>>);
+        assert!(dft(&ty).is_err());
+        // An option *inside* a container is fine.
+        let ty: Type = parse_quote!(Option<Vec<Option<u64>>>);
+        assert!(tokens(dft(&ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
+
+        let types: [Type; 2] = [parse_quote!(u128), parse_quote!(i128)];
+        for ty in &types {
+            let err = dft(ty).unwrap_err().to_string();
+            assert!(err.contains("64-bit"), "{err}");
+        }
+    }
+
+    #[test]
+    fn determine_field_type_covers_more_sequence_containers_and_tuples() {
+        let types: [Type; 3] = [
+            parse_quote!(VecDeque<String>),
+            parse_quote!(LinkedList<u64>),
+            parse_quote!(BinaryHeap<i32>),
+        ];
+        for ty in &types {
+            assert!(tokens(dft(ty).unwrap()).contains(":: anda_db_schema :: FieldType :: Array"));
+        }
+        let ty: Type = parse_quote!(VecDeque<u8>);
+        assert_eq!(
+            tokens(dft(&ty).unwrap()),
+            ":: anda_db_schema :: FieldType :: Bytes"
+        );
+
+        let ty: Type = parse_quote!((u64, String, Option<bool>));
+        let tuple = tokens(dft(&ty).unwrap());
+        assert!(
+            tuple.contains(":: anda_db_schema :: FieldType :: Array"),
+            "{tuple}"
+        );
+        assert!(
+            tuple.contains(
+                ":: anda_db_schema :: FieldType :: U64 , :: anda_db_schema :: FieldType :: Text , :: anda_db_schema :: FieldType :: Option"
+            ),
+            "{tuple}"
+        );
     }
 
     #[test]
@@ -1630,7 +1775,18 @@ mod tests {
         assert!(!is_signed_integer_type(&u64_ty));
         assert!(is_bytes_type(&vec_u8_ty));
         assert!(is_bytes_type(&bytes_ty));
+        let u8_array_ty: Type = parse_quote!([u8; 4]);
+        assert!(is_bytes_type(&u8_array_ty));
+        let u64_array_ty: Type = parse_quote!([u64; 4]);
+        assert!(!is_bytes_type(&u64_array_ty));
         assert!(!is_bytes_type(&tuple_ty));
+        let option_ty: Type = parse_quote!(Option<u8>);
+        let arc_option_ty: Type = parse_quote!(Arc<Option<u8>>);
+        let ref_option_ty: Type = parse_quote!(&Option<u8>);
+        assert!(is_option_type(&option_ty));
+        assert!(is_option_type(&arc_option_ty));
+        assert!(is_option_type(&ref_option_ty));
+        assert!(!is_option_type(&vec_u8_ty));
         assert!(is_bf16_type(&bf16_ty));
         assert!(!is_bf16_type(&string_ty));
     }

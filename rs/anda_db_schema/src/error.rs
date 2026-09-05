@@ -16,8 +16,9 @@ pub enum SchemaError {
     #[error("Invalid schema: {0}")]
     Schema(String),
 
-    /// A `FieldType` declaration is malformed (e.g. an unsupported nested
-    /// type, an invalid `Map` key type, …).
+    /// A `FieldType` declaration is malformed — `Option<Option<T>>`, a `Map`
+    /// mixing a wildcard key with other keys, or excessive nesting. See
+    /// [`FieldType::validate_declaration`](crate::FieldType::validate_declaration).
     #[error("Invalid field type: {0}")]
     FieldType(String),
 

@@ -603,6 +603,43 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_map_keys_round_trip() {
+        // `Vec<u8>` / `[u8; N]` map keys serialize as integer arrays; the
+        // schema side must accept them as `Bytes` keys on the way in and
+        // hand them back to serde on the way out.
+        #[derive(Debug, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+        struct ByteKeyed {
+            _id: u64,
+            by_vec: BTreeMap<Vec<u8>, u64>,
+            by_arr: BTreeMap<[u8; 2], String>,
+        }
+
+        let schema = std::sync::Arc::new(ByteKeyed::schema().unwrap());
+        for name in ["by_vec", "by_arr"] {
+            let FieldType::Map(types) = schema.get_field(name).unwrap().r#type() else {
+                panic!("{name} must be a map");
+            };
+            assert!(types.contains_key(&FieldKey::from(b"*")), "{name}");
+        }
+
+        let value = ByteKeyed {
+            _id: 1,
+            by_vec: BTreeMap::from([(vec![1, 2], 7)]),
+            by_arr: BTreeMap::from([([3, 4], "x".to_string())]),
+        };
+        let doc = Document::try_from(schema, &value).unwrap();
+        assert_eq!(
+            doc.get_field("by_vec"),
+            Some(&Fv::Map(BTreeMap::from([(
+                FieldKey::Bytes(vec![1, 2]),
+                Fv::U64(7)
+            )])))
+        );
+        let round: ByteKeyed = doc.try_into().unwrap();
+        assert_eq!(round, value);
+    }
+
+    #[test]
     fn test_skip_serializing_if_on_non_option_field_semantics() {
         // Pins the documented semantics: `skip_serializing_if` on a
         // non-Option field keeps the field *required* in the schema (the

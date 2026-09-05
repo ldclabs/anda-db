@@ -143,8 +143,11 @@ shape:
 supports two shapes:
 
 - **Wildcard map** — exactly one entry whose key is the wildcard
-  (`"*"` for text, `i64::MIN` for integer keys, `b"*"` for bytes). Any key is
-  allowed at runtime, and every value must match the wildcard's value type.
+  (`"*"` for text, `i64::MIN` for integer keys, `b"*"` for bytes; see
+  `FieldKey::is_wildcard`). Any key of that variant is allowed at runtime,
+  and every value must match the wildcard's value type. A wildcard key mixed
+  with other keys is a malformed declaration
+  (`FieldType::validate_declaration`).
 - **Schema-bound map** — the keys present in the type are the only legal
   keys in the value. Required keys are those whose value type is *not*
   `Option`.
@@ -187,8 +190,14 @@ pub static I64_WILDCARD_KEY:   LazyLock<FieldKey>; // i64::MIN
 pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey>; // b"*"
 ```
 
+`FieldKey::is_wildcard()` recognises these sentinels, and
+`as_wildcard_map(&BTreeMap<FieldKey, FieldType>)` returns the single
+wildcard entry of a homogeneous map type, if it is one.
+
 Convertible from `String`, `&str`, signed integer types up to `i64`,
-`Vec<u8>`, `[u8; N]`, `&[u8]`, and `cbor2::Value` (text, integer or bytes).
+`Vec<u8>`, `[u8; N]`, `&[u8]`, and `cbor2::Value` (text, integer, bytes, or
+an array of integers in `0..=255` — the shape serde gives `Vec<u8>` /
+`[u8; N]` map keys, coerced into a `Bytes` key).
 
 ### 2.5 Field name rules
 
@@ -206,8 +215,12 @@ crate (assigned `idx = 0` and `unique`).
 | Method                   | Purpose                                              |
 | :----------------------- | :--------------------------------------------------- |
 | `FieldType::allows_null` | Returns `true` for `Option(_)` only.                 |
+| `FieldType::validate_declaration` | Checks that `self` is a well-formed declaration: no `Option<Option<T>>`, no wildcard key mixed with other keys, bounded nesting. Run by `FieldEntry::new` and `Schema` deserialization. |
 | `FieldType::extract`     | CBOR → `FieldValue`, requiring CBOR to match `self`. |
-| `FieldType::validate`    | Checks an existing `FieldValue` against `self`.      |
+| `FieldType::validate`    | Checks an existing `FieldValue` against `self`, accepting the read-back shapes listed in §3.3. |
+| `FieldType::normalize`   | Folds read-back shapes into the canonical variant.   |
+| `FieldType::prune_undeclared` | Drops nested-map entries the type does not declare (removed nested fields). |
+| `FieldType::is_compatible_upgrade_of` | Whether a stored field may be re-declared as `self` (§5.4). |
 
 `extract` is type-driven (used when parsing structured input), while
 `FieldValue::try_from` is shape-driven (used when reading untyped CBOR).
@@ -279,6 +292,13 @@ reference, plus several collection forms:
 | `Vec<bf16>` / `[bf16; N]`              | `Vector`                                |
 | `Vec<T>`                               | `Array` (when `T: TryFrom<FieldValue>`) |
 | `BTreeMap<FieldKey, T>`                | `Map`                                   |
+
+Read-back shapes are accepted where generic deserialization cannot restore
+the declared variant: `i64` also takes a non-negative `U64`, `f32` takes an
+`F64` a stored `f32` can read back as, `Vec<bf16>` takes an array of bf16 bit
+patterns, and `f64` / `f32` take an `I64` / `U64` — JSON has a single number
+type, so `1.0` arrives as `1`. `FieldType::validate` applies the same rules
+and `FieldType::normalize` folds these shapes into the canonical variant.
 
 For arbitrary `DeserializeOwned` types, use:
 
@@ -360,6 +380,14 @@ optional `validate` step, and `FieldEntry::validate` enforces:
 1. `Null` is only legal for `Option(_)` types.
 2. The value must satisfy `FieldType::validate`.
 
+`FieldEntry::coerce(value)` is the entry point for a `FieldValue` that did
+not arrive as CBOR (a JSON API payload, say): it runs the value through the
+same CBOR coercion `Document::try_from` applies — a `Bytes` field accepts an
+array of `0..=255`, a float field an integer, an `I64` field a non-negative
+`U64`, a `Vector` field an array of bf16 bit patterns — and then enforces the
+complexity budget. `Document::set_field` goes through it, so creating and
+updating a document accept the same shapes.
+
 ---
 
 ## 5. Schemas and migration
@@ -423,13 +451,27 @@ new_schema.upgrade_with(&old_schema)?;
 `upgrade_with` rules:
 
 1. `new.version > old.version` is required.
-2. **Existing fields** keep their old `idx`; their `FieldType` must be
-   unchanged (type changes are explicitly rejected).
-3. **New fields** get fresh indexes starting at `max(old.idx) + 1`, so
-   the indexes of removed fields are *never* reused.
+2. **Existing fields** keep their old `idx` and `unique` flag. Their
+   `FieldType` may only change in ways that keep every stored value
+   readable (`FieldType::is_compatible_upgrade_of`): a type may become
+   optional (`T` → `Option<T>`, at the top level or inside a composite),
+   and a nested struct (`Map` with explicit keys) may gain an optional key
+   or lose a key. Everything else is rejected.
+3. **New fields** must be optional and get fresh indexes from the old
+   schema's *allocation watermark* (`Schema::allocated_idx_end`), so the
+   indexes of removed fields are *never* reused.
 
 This guarantees that any record persisted under the old schema can still
-be read after the upgrade.
+be read after the upgrade. On read, values stored under a removed field's
+index are dropped; an index at or above the watermark marks foreign or
+corrupt data and is rejected.
+
+Schemas persisted before the watermark existed (0.10 and earlier: no
+`next_idx` on disk) form a **legacy lineage**:
+`Schema::has_allocation_watermark()` is `false`, every undeclared index is
+dropped on read instead of being rejected, and the status is kept across
+`upgrade_with` and re-serialization, because the lineage's history of
+removed indexes cannot be reconstructed.
 
 ### 5.5 `IndexedFieldValues`
 
@@ -480,14 +522,14 @@ let title: String = doc.get_field_as("title")?;
 let user:  TestUser = doc.try_into()?;        // consumes the Document
 ```
 
-`try_into` rebuilds a CBOR map from the document — substituting CBOR
-`Null` for absent optional fields — and lets serde do the rest.
+`try_into` rebuilds a name-keyed CBOR map from the document — omitting
+absent fields so `#[serde(default)]` applies — and lets serde do the rest.
 
 ### 6.4 Mutating
 
 ```rust
 doc.set_id(42);
-doc.set_field("title", Fv::Text("Hi".into()))?;       // checks the type
+doc.set_field("title", Fv::Text("Hi".into()))?;       // coerces like try_from, then stores
 doc.set_field_as("views", &123u64)?;                  // serialize-then-store
 doc.remove_field("title");                            // Option<Fv>
 doc.set_doc(owned_doc)?;                              // bulk replace
@@ -678,7 +720,7 @@ shape on disk.
 ```rust
 pub enum SchemaError {
     Schema(String),       // schema-level invariant violated
-    FieldType(String),    // malformed FieldType
+    FieldType(String),    // malformed FieldType declaration (validate_declaration)
     FieldValue(String),   // value does not satisfy its FieldType
     FieldName(String),    // illegal field name
     Validation(String),   // document fails Schema::validate
@@ -728,18 +770,20 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 ```rust
 pub fn validate_field_name(s: &str) -> Result<(), SchemaError>;
+pub fn as_wildcard_map(m: &BTreeMap<FieldKey, FieldType>) -> Option<(&FieldKey, &FieldType)>;
 pub fn vector_from_f32(v: Vec<f32>) -> Vector;
 pub fn vector_from_f64(v: Vec<f64>) -> Vector;
 ```
 
 ### 11.4 Constants and statics
 
-| Item                 | Value                   |
-| :------------------- | :---------------------- |
-| `Schema::ID_KEY`     | `"_id"`                 |
-| `TEXT_WILDCARD_KEY`  | `FieldKey::Text("*")`   |
-| `I64_WILDCARD_KEY`   | `FieldKey::I64(i64::MIN)` |
-| `BYTES_WILDCARD_KEY` | `FieldKey::Bytes(b"*")` |
+| Item                   | Value                                                        |
+| :--------------------- | :----------------------------------------------------------- |
+| `Schema::ID_KEY`       | `"_id"`                                                      |
+| `MAX_CONVERSION_DEPTH` | `128` — nesting bound of the CBOR ⇄ `FieldValue` conversions |
+| `TEXT_WILDCARD_KEY`    | `FieldKey::Text("*")`                                        |
+| `I64_WILDCARD_KEY`     | `FieldKey::I64(i64::MIN)`                                    |
+| `BYTES_WILDCARD_KEY`   | `FieldKey::Bytes(b"*")`                                      |
 
 ---
 

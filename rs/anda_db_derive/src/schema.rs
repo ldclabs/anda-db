@@ -483,7 +483,7 @@ mod tests {
         let bad_type: DeriveInput = parse_quote! {
             struct BadType {
                 _id: u64,
-                value: (u64, u64),
+                value: fn() -> u64,
             }
         };
         assert!(tokens(expand_anda_db_schema_derive(bad_type)).contains("Unsupported type"));
