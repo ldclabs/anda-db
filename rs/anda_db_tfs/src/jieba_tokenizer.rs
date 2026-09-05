@@ -158,9 +158,14 @@ impl<T: Tokenizer> Tokenizer for JiebaMergeTokenizer<T> {
             }
 
             if !handle_cjk {
-                // Only the text is moved out: the inner stream clears it
-                // before its next token anyway, and its position counter,
-                // which the stream advances in place, is left untouched.
+                // Only the text is moved out. Nothing outside this loop can
+                // observe the emptied token: a `TokenStream` is consumed in a
+                // single forward pass and this one is dropped at the end of
+                // it, so whether the inner stream refills `text` on the next
+                // `advance` (tantivy's built-in chain does) or holds a
+                // pre-built `Vec<Token>` (as `MergedTokenStream` below does)
+                // makes no difference. The position counter, which the stream
+                // advances in place, is left untouched.
                 tokens.push(Token {
                     offset_from: token.offset_from,
                     offset_to: token.offset_to,

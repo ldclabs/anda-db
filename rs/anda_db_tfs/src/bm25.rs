@@ -170,6 +170,14 @@ pub struct BM25Index<T: Tokenizer> {
     /// they only take the shared side — and this is the first lock a mutation
     /// acquires, so it never nests inside a DashMap shard guard.
     mutation_gate: RwLock<()>,
+
+    /// `false` for an index built by [`BM25Index::load_metadata`] alone: the
+    /// manifest is known but the postings behind it are still on disk, so the
+    /// in-memory bucket map does not mirror the committed layout. Flushing or
+    /// compacting such a shell would rebuild the manifest from placeholders
+    /// and retire every committed bucket object, so both refuse until
+    /// [`BM25Index::load_buckets`] has run.
+    buckets_loaded: bool,
 }
 
 #[derive(Default)]
@@ -324,6 +332,13 @@ impl Default for BM25Config {
 /// the same id; scoring keys by document id so such a duplicate is scored
 /// once, [`BM25Index::remove`] drops every entry of the id, and a reload
 /// prunes entries whose document is gone.
+///
+/// Duplicates of a *live* document are not pruned, though: repeating that
+/// cycle appends one entry per round, for good. Nothing de-duplicates them
+/// because the only cheap place to do so is the `insert` hot path, where the
+/// scan would be linear in the posting length — the cost `UniqueVec` used to
+/// pay, in storage, on every posting. Callers that cannot supply the original
+/// text should use [`BM25Index::purge_ids`], which needs none.
 pub type PostingValue = (u32, Vec<(u64, usize)>);
 
 /// Index metadata.
@@ -459,6 +474,8 @@ where
             search_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
             mutation_gate: RwLock::new(()),
+            // A fresh index has no committed layout to mirror.
+            buckets_loaded: true,
         }
     }
 
@@ -498,9 +515,12 @@ where
     ///
     /// Every bucket the manifest references gets an empty, clean placeholder,
     /// so a flush of the shell carries the committed manifest forward instead
-    /// of dropping the durable buckets. The shell is still not safe to
-    /// *mutate and flush*: an insert lands its new tokens in the tail bucket,
-    /// whose durable content is not in memory and would be replaced.
+    /// of dropping the durable buckets. Mutating such a shell and flushing it
+    /// *would* replace those buckets — an insert lands its new tokens in the
+    /// tail bucket, whose durable content is not in memory — so
+    /// [`flush_with`](Self::flush_with) refuses a dirty flush until
+    /// [`load_buckets`](Self::load_buckets) has run, and
+    /// [`compact_buckets`](Self::compact_buckets) is a no-op on it.
     pub fn load_metadata<R: Read>(tokenizer: T, r: R) -> Result<Self, BM25Error> {
         let index: BM25IndexOwned =
             cbor2::from_reader(r).map_err(|err| BM25Error::Serialization {
@@ -541,6 +561,9 @@ where
             // with an empty `doc_tokens` until then.
             total_tokens: AtomicU64::new(0),
             mutation_gate: RwLock::new(()),
+            // The manifest is known, the postings behind it are not: the
+            // bucket map is placeholders until `load_buckets` runs.
+            buckets_loaded: false,
         })
     }
 
@@ -729,6 +752,10 @@ where
         let total_tokens: usize = self.doc_tokens.iter().map(|r| *r.value()).sum();
         self.total_tokens
             .store(total_tokens as u64, Ordering::Relaxed);
+
+        // From here the bucket map mirrors the committed layout, so rebuilding
+        // the manifest from it is safe.
+        self.buckets_loaded = true;
 
         if legacy && !loaded_bucket_ids.is_empty() {
             // Record in memory where each loaded bucket's durable object
@@ -1811,6 +1838,22 @@ where
             return Ok(FlushOutcome::default());
         }
 
+        // A metadata-only shell carries the committed manifest forward
+        // untouched (its placeholders are clean), which is exactly what makes
+        // a metadata commit safe on it. A *dirty* bucket there can only come
+        // from a mutation, and serializing it would write a bucket object
+        // holding just that mutation over a durable one whose content was
+        // never loaded.
+        if !self.buckets_loaded && has_dirty {
+            return Err(BM25Error::Generic {
+                name: self.name.clone(),
+                source: "buckets were never loaded (load_metadata without load_buckets); \
+                         flushing a mutation would replace committed bucket objects \
+                         whose content is not in memory"
+                    .into(),
+            });
+        }
+
         // A bucket object only becomes reachable through the manifest, so
         // dirty buckets always require a metadata commit. Loading can mark
         // buckets dirty (stale-entry pruning) without bumping the stats
@@ -1975,7 +2018,10 @@ where
         let _mutation_guard = self.mutation_gate.write();
 
         let old_count = self.buckets.len();
-        if old_count <= 1 {
+        // The postings are still on disk; the bucket map is placeholders, so
+        // there is nothing to repack and rebuilding it would drop every
+        // committed bucket from the manifest.
+        if !self.buckets_loaded || old_count <= 1 {
             return (old_count, old_count);
         }
 
@@ -4528,6 +4574,62 @@ mod tests {
         let outcome = flush_to(&shell, &mut store, 3).await;
         assert!(outcome.saved);
         assert!(outcome.obsolete.is_empty());
+        let reloaded = load_from(&store).await;
+        assert_eq!(reloaded.len(), 4);
+        assert_eq!(reloaded.search("fox", 10, None).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_only_shell_refuses_destructive_writes() {
+        // A small overload size so the corpus spreads over several buckets:
+        // with a single one, `compact_buckets`'s `old_count <= 1` early
+        // return would hide the guard under test.
+        let index = BM25Index::new(
+            "shell".to_string(),
+            default_tokenizer(),
+            Some(BM25Config {
+                bucket_overload_size: 64,
+                ..Default::default()
+            }),
+        );
+        index
+            .insert(1, "The quick brown fox jumps over the lazy dog", 0)
+            .unwrap();
+        index
+            .insert(2, "A fast brown fox runs past the lazy dog", 0)
+            .unwrap();
+        index.insert(3, "The lazy dog sleeps all day", 0).unwrap();
+        index
+            .insert(4, "Quick brown foxes are rare in the wild", 0)
+            .unwrap();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        let committed = index.metadata().buckets;
+        assert!(committed.len() > 1, "need several buckets to exercise this");
+
+        // Compaction rebuilds the bucket map from `postings`, which a shell
+        // has not loaded: without the guard it would clear every placeholder
+        // and the next flush would retire every committed object.
+        let shell = BM25Index::load_metadata(default_tokenizer(), &store.metadata[..]).unwrap();
+        assert_eq!(
+            shell.compact_buckets(),
+            (committed.len(), committed.len()),
+            "compaction must be a no-op on a shell"
+        );
+        assert_eq!(shell.metadata().buckets, committed);
+
+        // A mutation on a shell writes a bucket object holding only that
+        // mutation over one whose content was never loaded, so the flush is
+        // refused rather than silently destructive.
+        let shell = BM25Index::load_metadata(default_tokenizer(), &store.metadata[..]).unwrap();
+        shell.insert(99, "a brand new document", 0).unwrap();
+        let err = shell
+            .flush_with(2, async |_| Ok(()), async |_, _| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("never loaded"), "{err}");
+
+        // The durable index is untouched.
         let reloaded = load_from(&store).await;
         assert_eq!(reloaded.len(), 4);
         assert_eq!(reloaded.search("fox", 10, None).len(), 3);

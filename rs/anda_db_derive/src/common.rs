@@ -687,7 +687,9 @@ pub fn parse_field_type_str(
 /// - `Vec<bf16>` / `[bf16; N]` -> `Vector`
 /// - `Vec<T>` / `VecDeque<T>` / `LinkedList<T>` / `BinaryHeap<T>` /
 ///   `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
-/// - `(A, B, …)` -> the tuple-like `Array([A, B, …])`, one type per position
+/// - `(A, B, …)` -> the tuple-like `Array([A, B, …])`, one type per
+///   position; a one-element tuple is rejected, `Array` with one inner type
+///   already means a homogeneous array of any length
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` -> `Map({*: V})` (key must be a
 ///   string-, signed integer-, or bytes-like type, `[u8; N]` included)
 /// - `Option<T>` -> `Option(T)`; `Option<Option<T>>` is rejected because
@@ -891,7 +893,14 @@ pub fn determine_field_type(
             Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
         // A tuple serializes as a fixed-length sequence, which is exactly the
-        // tuple-like `Array` shape: one element type per position.
+        // tuple-like `Array` shape: one element type per position. A
+        // one-element tuple has no such shape -- `Array` with a single inner
+        // type means *homogeneous, any length*, so `(T,)` would silently
+        // declare `Vec<T>` and stop enforcing the arity the Rust type has.
+        Type::Tuple(tuple) if tuple.elems.len() == 1 => Err(syn::Error::new_spanned(
+            ty,
+            "A one-element tuple cannot be described: `FieldType::Array` with a single inner type is a homogeneous array of any length, not a fixed-length one. Use the element type itself, or a longer tuple",
+        )),
         Type::Tuple(tuple) if !tuple.elems.is_empty() => {
             let elems = tuple
                 .elems
@@ -1737,6 +1746,13 @@ mod tests {
             tokens(dft(&ty).unwrap()),
             ":: anda_db_schema :: FieldType :: Bytes"
         );
+
+        // A one-element tuple has no `Array` spelling: one inner type means
+        // "homogeneous, any length", so it is rejected rather than silently
+        // dropping the arity.
+        let ty: Type = parse_quote!((u64,));
+        let err = dft(&ty).unwrap_err().to_string();
+        assert!(err.contains("one-element tuple"), "{err}");
 
         let ty: Type = parse_quote!((u64, String, Option<bool>));
         let tuple = tokens(dft(&ty).unwrap());

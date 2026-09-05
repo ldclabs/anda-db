@@ -30,8 +30,11 @@ is left to the release).
   is `1` — so every JavaScript client tripped over it on `coerce`,
   `set_field` and `Document::try_from(&json)`. `f64_from` / `f32_from`,
   `validate`, `normalize` and the `TryFrom<FieldValue>` impls for `f64` /
-  `f32` accept `I64` / `U64` now, converting the way serde does (`as f64`,
-  exact up to 2^53).
+  `f32` accept `I64` / `U64` now. `F64` takes any integer, converting the way
+  serde does (`as f64`, exact up to 2^53); `F32` takes only the integers an
+  `f32` holds exactly, because it already rejects the `F64` spelling of a
+  value no `f32` can hold — otherwise `16777217` would be silently rounded
+  while `16777217.0` errored, the choice between them being `JSON.stringify`'s.
 - **Legacy lineages and the allocation watermark.** A schema persisted by
   0.10 (no `next_idx` on disk) whose highest-idx field had been removed under
   that version made every older document unreadable in 0.11: the stale values
@@ -41,6 +44,13 @@ is left to the release).
   indexes are dropped on read as before 0.11, and the status is kept through
   `upgrade_with` and re-serialization because the lineage's history cannot be
   reconstructed. Lineages created by 0.11 keep the strict check.
+
+  Only the *leniency* is legacy. The watermark itself is persisted and
+  advances for such a lineage too (a new `legacy` flag on the wire carries
+  the status, so `next_idx` no longer doubles as the marker): removing a
+  legacy lineage's highest field would otherwise let the next upgrade hand
+  that index to a new field and read the removed field's stale bytes as the
+  new field's value.
 - `Document::set_field` runs `FieldEntry::coerce` — the CBOR coercion
   `Document::try_from` applies — instead of `normalize` + `validate`, so a
   field accepts the same shapes on create and on update (`Collection::update`
@@ -54,7 +64,10 @@ is left to the release).
   `Map` that mixes a wildcard key with other keys, and nesting beyond
   `MAX_CONVERSION_DEPTH`. `FieldEntry::new` and `Schema` deserialization run
   it, and `SchemaError::FieldType` — never constructed before — carries the
-  result.
+  result. Deserialization *repairs* a nested `Option` instead of rejecting
+  it: the derive used to infer `Option<Option<T>>`, the two shapes are
+  indistinguishable once serialized, and failing the load would leave every
+  document of that collection unreachable.
 - `FieldType::is_compatible_upgrade_of`, hence `Schema::upgrade_with`,
   accepts `T` → `Option<T>` at the top level and inside composites: stored
   values are non-null and still validate. The reverse stays incompatible.
@@ -73,13 +86,17 @@ is left to the release).
 
 ### Changed — `anda_db_derive`
 
-- Inference covers tuples (`(A, B)` → the tuple-like `Array([A, B])`),
-  `VecDeque` / `LinkedList` / `BinaryHeap`, and `[u8; N]` map keys; it
-  rejects `Option<Option<T>>` and `u128` / `i128` with targeted errors
-  instead of an E0599 on the derive.
-- The `#[field_type]` DSL accepts the Rust spellings (`String`, `u64`,
-  `i32`, `f64`, `bool`, …) as synonyms of the `FieldType` names for values,
-  as it already did for map keys, and rejects `Option<Option<T>>`.
+- Inference covers tuples of two or more elements (`(A, B)` → the tuple-like
+  `Array([A, B])`), `VecDeque` / `LinkedList` / `BinaryHeap`, and `[u8; N]`
+  map keys; it rejects `Option<Option<T>>`, `u128` / `i128` and one-element
+  tuples with targeted errors instead of an E0599 on the derive. `(T,)` has
+  no `FieldType`: `Array` with a single inner type is a homogeneous array of
+  any length, so it would drop the arity the Rust type guarantees.
+- The `#[field_type]` DSL accepts the Rust spellings (`String`, `str`, `u64`,
+  `i32`, `f64`, `bool`, …) as synonyms of the `FieldType` names for value
+  types, and rejects `Option<Option<T>>`. Map *keys* keep their narrower set
+  (`String` / `Text` / `Bytes` / `I64` plus `i8` … `isize`), the only key
+  variants `FieldKey` has.
 
 ## `anda_db_tfs` review: leaner postings, one `NOT` guard, no dead migration
 
@@ -120,7 +137,14 @@ is left to the release).
   a restart as after it.
 - `load_metadata` seeds a placeholder for every bucket in the manifest, so a
   flush of a metadata-only shell carries the committed manifest forward
-  instead of reporting every durable bucket obsolete.
+  instead of reporting every durable bucket obsolete. The shell is now also
+  defended where those placeholders are *not* the committed content:
+  `compact_buckets` is a no-op on it (it rebuilds the bucket map from
+  `postings`, which the shell never loaded, and would clear every
+  placeholder), and `flush_with` refuses a flush with a dirty bucket (a
+  mutation there would write a bucket object holding only that mutation over
+  one whose content is not in memory). A clean metadata commit still works.
+  This mirrors `anda_db_btree`.
 - `NOT NOT a` parses as `Not(Not(a))`; it used to become `Not(Or(not, a))`
   and exclude documents containing the word "not". The nesting budget bounds
   a `NOT` flood the way it bounds parentheses.
@@ -136,7 +160,14 @@ is left to the release).
   map instead of one of each per word. A word repeated in the query is scored
   once (it was summed per occurrence).
 - The Jieba merge filter moves token text out of the inner streams instead
-  of cloning it.
+  of cloning it. Nothing outside the merge loop can observe the emptied
+  token: a `TokenStream` is consumed in a single forward pass.
+- Dropping `UniqueVec` also drops the one case it de-duplicated: a `remove`
+  with non-original text followed by a re-insert of the same id now appends
+  a duplicate entry every round, and a reload prunes only entries whose
+  document is gone. De-duplicating would put a scan linear in the posting
+  length on the `insert` hot path; `purge_ids` needs no text and is the
+  supported way to erase a document whose text the caller lost.
 - Documented the one design limit the review found and did not change: the
   bucket size limit applies only when a token is placed, so the buckets that
   hold very frequent terms grow with the corpus and are rewritten whole by

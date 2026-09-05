@@ -297,8 +297,12 @@ Read-back shapes are accepted where generic deserialization cannot restore
 the declared variant: `i64` also takes a non-negative `U64`, `f32` takes an
 `F64` a stored `f32` can read back as, `Vec<bf16>` takes an array of bf16 bit
 patterns, and `f64` / `f32` take an `I64` / `U64` — JSON has a single number
-type, so `1.0` arrives as `1`. `FieldType::validate` applies the same rules
-and `FieldType::normalize` folds these shapes into the canonical variant.
+type, so `1.0` arrives as `1`. `f64` takes any integer (`as f64`: exact to
+2^53, rounded beyond); `f32` takes only the integers an `f32` holds exactly,
+so that a value like `16777217` is rejected in both its integer and its float
+spelling rather than being rounded in one of them. `FieldType::validate`
+applies the same rules and `FieldType::normalize` folds these shapes into the
+canonical variant.
 
 For arbitrary `DeserializeOwned` types, use:
 
@@ -472,6 +476,12 @@ Schemas persisted before the watermark existed (0.10 and earlier: no
 dropped on read instead of being rejected, and the status is kept across
 `upgrade_with` and re-serialization, because the lineage's history of
 removed indexes cannot be reconstructed.
+
+Only the *leniency* is legacy. `Schema::allocated_idx_end()` still advances
+monotonically for such a lineage and is written back on every save, so rule
+3 above holds there too: removing a lineage's highest field never lets a
+later upgrade hand that index to a new field, which would read the removed
+field's stale bytes as the new field's value.
 
 ### 5.5 `IndexedFieldValues`
 

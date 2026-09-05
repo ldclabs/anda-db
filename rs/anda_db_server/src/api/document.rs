@@ -239,7 +239,12 @@ async fn add_validated_document(
 }
 
 /// Validates the requested field updates and returns them in the canonical
-/// shape the engine stores, so callers coerce exactly once.
+/// shape the engine stores.
+///
+/// `Document::set_field` coerces too, so this is not what makes the write
+/// well-formed; it is what turns a bad wire value into one `invalid_input`
+/// naming the field, before the read-modify-write and the unique-conflict
+/// preflight run against it.
 fn coerce_update_fields(
     schema: &Schema,
     fields: &BTreeMap<String, Fv>,
@@ -527,8 +532,11 @@ pub async fn update(db: &AndaDB, params: UpdateParams) -> Result<Fv, ApiError> {
     }
     let mut fields = params.fields;
     coerce_vector_fields(&collection.schema(), &mut fields)?;
-    // Coerce once; `proposed_update`'s `set_field` normalizes but does not
-    // coerce, so it must receive the canonical values.
+    // Reject a malformed value here, so the client gets one `invalid_input`
+    // naming the field instead of a failure from inside the update. The
+    // canonical values then flow through the preflight and into
+    // `Collection::update`, whose `set_field` coerces them again -- a no-op
+    // on values already in canonical shape.
     let fields = coerce_update_fields(&collection.schema(), &fields)?;
     let prospective = proposed_update(collection.get(params._id).await?, &fields)?;
     if let Some(index) = find_unique_conflict(&collection, &prospective, Some(params._id))? {

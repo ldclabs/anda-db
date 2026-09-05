@@ -35,9 +35,11 @@ mod schema;
 ///   accepts a small DSL: primitives (`Bytes`, `Text`, `U64`, ...), as well
 ///   as `Array<T>`, `Option<T>`, `Map<String, T>`, `Map<Text, T>`,
 ///   `Map<I64, T>` and `Map<Bytes, T>` (where `T` is itself any supported
-///   type, including nested wrappers). The Rust spellings (`String`, `u64`,
-///   `i32`, `f64`, `bool`, ...) are accepted as synonyms of the `FieldType`
-///   names, for values and map keys alike. `Option<Option<T>>` is rejected.
+///   type, including nested wrappers). For a *value*, the Rust spellings
+///   (`String`, `str`, `u64`, `i32`, `f64`, `bool`, ...) are accepted as
+///   synonyms of the `FieldType` names; a *map key* stays limited to
+///   `String` / `Text` / `Bytes` / `I64` plus `i8` ... `isize`, the only key
+///   variants `FieldKey` has. `Option<Option<T>>` is rejected.
 /// - `#[cbor(key = N)]` -- for nested structs that also derive
 ///   `cbor2::Cbor`, use the integer CBOR map key as the generated
 ///   `FieldKey` instead of the serde text name.
@@ -71,7 +73,9 @@ mod schema;
 /// - `Vec<bf16>`, `[bf16; N]` -> `Vector`
 /// - `Vec<T>` / `VecDeque<T>` / `LinkedList<T>` / `BinaryHeap<T>` /
 ///   `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`
-/// - `(A, B, ...)` -> the tuple-like `Array([A, B, ...])`
+/// - `(A, B, ...)` -> the tuple-like `Array([A, B, ...])`; a one-element
+///   tuple is a compile error (`Array` with one inner type is a homogeneous
+///   array of any length)
 /// - `HashMap<K, V>` / `BTreeMap<K, V>` (string-, signed integer-, or
 ///   bytes-like key, `[u8; N]` included) -> `Map`
 /// - `Option<T>` -> `Option(T)`; `Option<Option<T>>` is a compile error

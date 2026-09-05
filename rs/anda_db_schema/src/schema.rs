@@ -50,13 +50,19 @@ pub struct Schema {
     /// stale values of removed fields (silently droppable) from foreign or
     /// corrupt indexes (an error).
     ///
-    /// `0` marks a *legacy* lineage: one persisted by a version that had no
-    /// watermark. Its history of removed indexes is unknown, so it keeps the
-    /// pre-watermark behaviour — allocation continues from `max(idx) + 1`
-    /// and undeclared indexes are dropped on read, never rejected — and the
-    /// `0` is carried through upgrades and re-serialization so the lineage
-    /// stays lenient. See [`Schema::has_allocation_watermark`].
+    /// It is always persisted and only ever grows, `legacy_lineage` or not:
+    /// a watermark that went backwards would re-allocate the index of a
+    /// removed field to a new one.
     next_idx: usize,
+    /// `true` for a lineage first persisted by a version that had no
+    /// watermark (no `next_idx` on the wire). Its history of removed indexes
+    /// is unknown, so `next_idx` is only a *cursor* there — it says where
+    /// allocation continues, not which indexes were never allocated — and
+    /// document decoding keeps the lenient pre-watermark behaviour: every
+    /// undeclared index is dropped on read, never rejected as foreign. The
+    /// status is sticky: it survives [`Schema::upgrade_with`] and
+    /// re-serialization. See [`Schema::has_allocation_watermark`].
+    legacy_lineage: bool,
 }
 
 impl PartialEq for Schema {
@@ -189,16 +195,15 @@ impl Schema {
         }
 
         // Rebuild the idx set from the updated fields and carry the
-        // allocation watermark forward. A legacy lineage stays legacy: its
-        // unknown history makes any watermark a guess, and a guessed one
-        // would turn the stale values of fields removed before the upgrade
-        // into "foreign data" errors on read.
+        // allocation watermark forward. The watermark advances for a legacy
+        // lineage too — otherwise removing the highest field would let the
+        // next upgrade hand its index to a new field — while the *leniency*
+        // of a legacy lineage stays: its unknown history means an index above
+        // the cursor cannot be called foreign, so the stale values of fields
+        // removed before the upgrade must keep being dropped, not rejected.
         self.idx = self.fields.values().map(|f| f.idx()).collect();
-        self.next_idx = if old.has_allocation_watermark() {
-            next_idx
-        } else {
-            0
-        };
+        self.next_idx = next_idx;
+        self.legacy_lineage = old.legacy_lineage;
         Ok(())
     }
 
@@ -241,10 +246,11 @@ impl Schema {
     ///
     /// An undeclared index below this bound belonged to a since-removed
     /// field (its stale values are droppable); an index at or above it was
-    /// never allocated and marks foreign or corrupt data. A legacy lineage
-    /// (see [`Schema::has_allocation_watermark`]) falls back to
-    /// `max(declared idx) + 1`, which is only an allocation cursor there —
-    /// document decoding does not treat higher indexes as foreign for it.
+    /// never allocated and marks foreign or corrupt data. For a legacy
+    /// lineage (see [`Schema::has_allocation_watermark`]) it is only an
+    /// allocation cursor — new fields are still assigned from here, so a
+    /// removed index is never reused, but document decoding does not treat
+    /// higher indexes as foreign.
     pub fn allocated_idx_end(&self) -> usize {
         self.next_idx
             .max(self.idx.last().map_or(0, |last| last + 1))
@@ -258,10 +264,13 @@ impl Schema {
     /// the index of a field it once removed from foreign data. Document
     /// decoding therefore keeps the lenient pre-watermark behaviour for it
     /// (every undeclared index is dropped) instead of rejecting indexes at
-    /// or above [`Schema::allocated_idx_end`]. The legacy status is sticky:
-    /// it survives [`Schema::upgrade_with`] and re-serialization.
+    /// or above [`Schema::allocated_idx_end`]. Only the *leniency* is
+    /// legacy: [`Schema::allocated_idx_end`] still advances monotonically
+    /// for such a lineage, so a removed field's index is never handed to a
+    /// new field. The status is sticky: it survives
+    /// [`Schema::upgrade_with`] and re-serialization.
     pub fn has_allocation_watermark(&self) -> bool {
-        self.next_idx != 0
+        !self.legacy_lineage
     }
 
     /// Gets a field by name.
@@ -339,6 +348,10 @@ struct SchemaRef<'a> {
     fields: Vec<&'a FieldEntry>,
     version: u64,
     next_idx: usize,
+    /// Only written for a legacy lineage, so the encoding of every schema
+    /// created by this version is byte-identical to before the flag existed.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    legacy: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,10 +359,17 @@ struct SchemaOwned {
     fields: Vec<FieldEntry>,
     #[serde(default)]
     version: u64,
-    /// Missing (read as `0`) in schemas persisted by older versions, which
-    /// marks the lineage as legacy; see `Schema::has_allocation_watermark`.
+    /// Missing in schemas persisted by versions that had no watermark, which
+    /// is what marks the lineage legacy; see
+    /// `Schema::has_allocation_watermark`. Once loaded, the watermark is
+    /// always written back (as `max(idx) + 1` at worst), so it can only grow.
     #[serde(default)]
     next_idx: usize,
+    /// Set by this version for a legacy lineage. Absent for a schema
+    /// persisted before the flag existed, where `next_idx == 0` (missing, or
+    /// the `0` briefly written for a legacy lineage) says the same thing.
+    #[serde(default)]
+    legacy: bool,
 }
 
 impl Serialize for Schema {
@@ -360,13 +380,12 @@ impl Serialize for Schema {
         let val = SchemaRef {
             fields: self.fields.values().collect(),
             version: self.version,
-            // A legacy lineage keeps `0` so it stays lenient after the round
-            // trip (see `Schema::has_allocation_watermark`).
-            next_idx: if self.has_allocation_watermark() {
-                self.allocated_idx_end()
-            } else {
-                0
-            },
+            // Always the real high-water mark, legacy or not: it is what the
+            // next upgrade allocates from. The `legacy` flag, not a missing
+            // or zeroed watermark, is what keeps the lineage lenient after
+            // the round trip (see `Schema::has_allocation_watermark`).
+            next_idx: self.allocated_idx_end(),
+            legacy: self.legacy_lineage,
         };
         val.serialize(serializer)
     }
@@ -384,9 +403,15 @@ impl<'de> Deserialize<'de> for Schema {
         let mut idx = BTreeSet::<usize>::new();
         let mut fields = BTreeMap::<String, FieldEntry>::new();
 
-        for f in val.fields.into_iter() {
+        for mut f in val.fields.into_iter() {
             crate::validate_field_name(f.name()).map_err(serde::de::Error::custom)?;
-            f.r#type()
+            // A schema persisted before `validate_declaration` existed may
+            // carry `Option<Option<T>>`, which the derive used to infer.
+            // That shape is indistinguishable from `Option<T>` on the wire,
+            // so repair it instead of rejecting the schema — the alternative
+            // is a collection nobody can open. Everything else still fails.
+            f.repair_declaration()
+                .r#type()
                 .validate_declaration()
                 .map_err(|err| serde::de::Error::custom(format!("field {:?}: {err}", f.name())))?;
 
@@ -447,6 +472,10 @@ impl<'de> Deserialize<'de> for Schema {
             fields,
             version: val.version,
             next_idx: val.next_idx,
+            // A schema persisted without a watermark (`next_idx` missing, or
+            // the `0` a previous build wrote for such a lineage) is legacy;
+            // once flagged, the flag itself carries the status forward.
+            legacy_lineage: val.legacy || val.next_idx == 0,
         })
     }
 }
@@ -566,6 +595,7 @@ impl SchemaBuilder {
             idx,
             fields: self.fields,
             version: self.version,
+            legacy_lineage: false,
         })
     }
 }
@@ -1213,6 +1243,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_lineage_never_reuses_the_index_of_a_removed_field() {
+        // Leniency and allocation are separate concerns: a legacy lineage
+        // keeps dropping undeclared indexes, but its watermark still has to
+        // advance across the removal of its *highest* field, or the next
+        // upgrade would hand that index to a new field and read the removed
+        // field's stale bytes as the new field's value.
+        let opt = || Ft::Option(Box::new(Ft::Text));
+        let build = |names: &[&str], version: u64| {
+            let mut b = Schema::builder();
+            for name in names {
+                b.add_field(Fe::new((*name).into(), opt()).unwrap()).unwrap();
+            }
+            b.with_version(version);
+            b.build().unwrap()
+        };
+        // Persist and reload, the way a collection does between upgrades.
+        let reload = |schema: &Schema| -> Schema {
+            serde_json::from_value(serde_json::to_value(schema).unwrap()).unwrap()
+        };
+
+        let v0 = build(&["a", "b", "c"], 0);
+        assert_eq!(v0.get_field("c").unwrap().idx(), 3);
+        let mut value = serde_json::to_value(&v0).unwrap();
+        value.as_object_mut().unwrap().remove("next_idx");
+        let v0: Schema = serde_json::from_value(value).unwrap();
+        assert!(!v0.has_allocation_watermark());
+
+        // v1 removes the highest field.
+        let mut v1 = build(&["a", "b"], 1);
+        v1.upgrade_with(&v0).unwrap();
+        let v1 = reload(&v1);
+        assert!(!v1.has_allocation_watermark(), "leniency is still sticky");
+        assert_eq!(v1.allocated_idx_end(), 4, "the watermark must not go back");
+
+        // v2 adds a field: it gets a fresh index, not `c`'s.
+        let mut v2 = build(&["a", "b", "d"], 2);
+        v2.upgrade_with(&v1).unwrap();
+        assert_eq!(v2.get_field("d").unwrap().idx(), 4);
+        assert!(!reload(&v2).has_allocation_watermark());
+    }
+
+    #[test]
     fn upgrade_with_allows_making_a_field_optional() {
         let mut old = Schema::builder();
         old.add_field(Fe::new("name".into(), Ft::Text).unwrap())
@@ -1243,15 +1315,46 @@ mod tests {
             .add_field(Fe::new("a".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
             .unwrap();
         let schema = builder.build().unwrap();
-        let mut value = serde_json::to_value(&schema).unwrap();
-        let field = value["fields"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|f| f["n"] == "a")
-            .unwrap();
-        field["t"] = json!({"Option": {"Option": "Text"}});
-        let err = serde_json::from_value::<Schema>(value).unwrap_err();
-        assert!(err.to_string().contains("Option<Option<T>>"), "{err}");
+        let with_type = |t: serde_json::Value| {
+            let mut value = serde_json::to_value(&schema).unwrap();
+            let field = value["fields"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|f| f["n"] == "a")
+                .unwrap();
+            field["t"] = t;
+            value
+        };
+
+        // A nested `Option` is what the derive used to infer, so a persisted
+        // schema can carry one. It is indistinguishable from a single
+        // `Option` on the wire and is repaired, not rejected: rejecting it
+        // would make every document of that collection unreachable.
+        let repaired: Schema =
+            serde_json::from_value(with_type(json!({"Option": {"Option": "Text"}}))).unwrap();
+        assert_eq!(
+            repaired.get_field("a").unwrap().r#type(),
+            &Ft::Option(Box::new(Ft::Text))
+        );
+        let repaired: Schema = serde_json::from_value(with_type(
+            json!({"Array": [{"Option": {"Option": {"Option": "Text"}}}]}),
+        ))
+        .unwrap();
+        assert_eq!(
+            repaired.get_field("a").unwrap().r#type(),
+            &Ft::Array(vec![Ft::Option(Box::new(Ft::Text))])
+        );
+
+        // Shapes with no lossless repair still fail the load.
+        let mixed = Ft::Map(BTreeMap::from([
+            (crate::FieldKey::from("*"), Ft::U64),
+            (crate::FieldKey::from("k"), Ft::U64),
+        ]));
+        let err =
+            serde_json::from_value::<Schema>(with_type(serde_json::to_value(&mixed).unwrap()))
+                .unwrap_err();
+        assert!(err.to_string().contains("wildcard"), "{err}");
     }
 }
+

@@ -206,6 +206,41 @@ impl FieldType {
         self.validate_declaration_at(0)
     }
 
+    /// Collapses every `Option<Option<T>>` chain into a single `Option<T>`,
+    /// recursing into `Array` elements and `Map` values.
+    ///
+    /// The two shapes are indistinguishable once serialized — serde writes
+    /// `Some(None)` and `None` both as `null` — so this is lossless. It
+    /// exists for schemas persisted before [`FieldType::validate_declaration`]
+    /// did: the derive used to infer `Option<Option<T>>`, and rejecting such
+    /// a schema on load would make every document in its collection
+    /// unreachable. Declarations coming from code still fail in
+    /// [`FieldEntry::new`], where the nesting is a bug worth reporting.
+    pub(crate) fn flatten_nested_options(&mut self) {
+        match self {
+            FieldType::Array(types) => {
+                types.iter_mut().for_each(FieldType::flatten_nested_options);
+            }
+            FieldType::Map(types) => {
+                types
+                    .values_mut()
+                    .for_each(FieldType::flatten_nested_options);
+            }
+            FieldType::Option(inner) => {
+                inner.flatten_nested_options();
+                // The recursive call leaves at most one `Option` level
+                // inside, so a single unwrap collapses the whole chain.
+                if matches!(**inner, FieldType::Option(_)) {
+                    let taken = std::mem::replace(inner, Box::new(FieldType::Bool));
+                    if let FieldType::Option(nested) = *taken {
+                        *inner = nested;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn validate_declaration_at(&self, depth: usize) -> Result<(), SchemaError> {
         if depth > MAX_CONVERSION_DEPTH {
             return Err(SchemaError::FieldType(format!(
@@ -305,9 +340,10 @@ impl FieldType {
     /// - `F32` accepts an [`F64`](FieldValue::F64) that a stored `f32` can
     ///   produce when read back through CBOR (exact widening) or JSON
     ///   (shortest-decimal round trip); see `is_f32_read_back`,
-    /// - `F64` and `F32` accept an integer ([`I64`](FieldValue::I64) /
-    ///   [`U64`](FieldValue::U64)): JSON has a single number type, so `1.0`
-    ///   reaches a float field as `1`.
+    /// - `F64` accepts any integer ([`I64`](FieldValue::I64) /
+    ///   [`U64`](FieldValue::U64)) and `F32` accepts the integers an `f32`
+    ///   holds exactly: JSON has a single number type, so `1.0` reaches a
+    ///   float field as `1`.
     ///
     /// Use [`FieldType::normalize`] to fold accepted read-back shapes into
     /// the canonical variant.
@@ -351,8 +387,19 @@ impl FieldType {
             // produce are accepted (see `is_f32_read_back`).
             (FieldType::F32, FieldValue::F64(v)) if is_f32_read_back(*v) => Ok(()),
             // JSON has a single number type: `1.0` reaches a float field as
-            // the integer `1`. Accepted (and normalized) for both float types.
-            (FieldType::F64 | FieldType::F32, FieldValue::I64(_) | FieldValue::U64(_)) => Ok(()),
+            // the integer `1`. `F64` takes any integer, converting the way
+            // serde does (`as f64`: exact to 2^53, rounded beyond), because
+            // it accepts every non-NaN `F64` anyway. `F32` takes only the
+            // integers it stores exactly, mirroring `is_f32_read_back` —
+            // otherwise `16777217` would be silently rounded to `16777216`
+            // while the same value written as `16777217.0` is rejected.
+            (FieldType::F64, FieldValue::I64(_) | FieldValue::U64(_)) => Ok(()),
+            (FieldType::F32, FieldValue::I64(v)) if exact_f32_from_integer(*v as i128).is_some() => {
+                Ok(())
+            }
+            (FieldType::F32, FieldValue::U64(v)) if exact_f32_from_integer(*v as i128).is_some() => {
+                Ok(())
+            }
             (FieldType::Bytes, FieldValue::Bytes(_)) => Ok(()),
             (FieldType::Text, FieldValue::Text(_)) => Ok(()),
             (FieldType::Json, _) => Ok(()),
@@ -414,8 +461,9 @@ impl FieldType {
     ///   `i64` range becomes [`FieldValue::I64`],
     /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
     ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`],
-    /// - an `F64` / `F32` field observed as an integer ([`FieldValue::I64`] /
-    ///   [`FieldValue::U64`]) becomes the float — JSON writes `1.0` as `1`,
+    /// - an `F64` field observed as any integer ([`FieldValue::I64`] /
+    ///   [`FieldValue::U64`]), and an `F32` field observed as one an `f32`
+    ///   holds exactly, become the float — JSON writes `1.0` as `1`,
     /// - a `Vector` field observed as an array of U64 bf16 bit patterns becomes
     ///   [`FieldValue::Vector`],
     /// - a `Json` field observed as the `Map` / `Array` / primitive shape of
@@ -456,8 +504,16 @@ impl FieldType {
                 FieldValue::F64(v) if is_f32_read_back(*v) => {
                     *value = FieldValue::F32(*v as f32);
                 }
-                FieldValue::I64(i) => *value = FieldValue::F32(*i as f32),
-                FieldValue::U64(u) => *value = FieldValue::F32(*u as f32),
+                FieldValue::I64(i) => {
+                    if let Some(f) = exact_f32_from_integer(*i as i128) {
+                        *value = FieldValue::F32(f);
+                    }
+                }
+                FieldValue::U64(u) => {
+                    if let Some(f) = exact_f32_from_integer(*u as i128) {
+                        *value = FieldValue::F32(f);
+                    }
+                }
                 _ => {}
             },
             FieldType::Vector => {
@@ -1239,9 +1295,10 @@ impl TryFrom<FieldValue> for f32 {
             // Read-back shape: an F32 comes back as an F64 through generic
             // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
             FieldValue::F64(v) if is_f32_read_back(v) => Ok(v as f32),
-            // JSON integer for a float field (see `FieldType::validate`).
-            FieldValue::I64(v) => Ok(v as f32),
-            FieldValue::U64(v) => Ok(v as f32),
+            // JSON integer for a float field, only when it is exact (see
+            // `FieldType::validate`).
+            FieldValue::I64(v) if exact_f32_from_integer(v as i128).is_some() => Ok(v as f32),
+            FieldValue::U64(v) if exact_f32_from_integer(v as i128).is_some() => Ok(v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -1256,9 +1313,10 @@ impl<'a> TryFrom<&'a FieldValue> for f32 {
             // Read-back shape: an F32 comes back as an F64 through generic
             // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
             FieldValue::F64(v) if is_f32_read_back(*v) => Ok(*v as f32),
-            // JSON integer for a float field (see `FieldType::validate`).
-            FieldValue::I64(v) => Ok(*v as f32),
-            FieldValue::U64(v) => Ok(*v as f32),
+            // JSON integer for a float field, only when it is exact (see
+            // `FieldType::validate`).
+            FieldValue::I64(v) if exact_f32_from_integer(*v as i128).is_some() => Ok(*v as f32),
+            FieldValue::U64(v) if exact_f32_from_integer(*v as i128).is_some() => Ok(*v as f32),
             _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
         }
     }
@@ -1672,9 +1730,11 @@ impl FieldValue {
     ///
     /// Precision truncation (f64 → f32) is accepted, but a finite value
     /// outside the f32 range is rejected instead of silently becoming
-    /// infinite. Explicit infinities pass through unchanged. CBOR integers
-    /// are accepted like in [`FieldValue::f64_from`]; every `i64` / `u64`
-    /// fits the f32 range, so only precision can be lost.
+    /// infinite. Explicit infinities pass through unchanged. A CBOR integer
+    /// is accepted only when an `f32` holds it exactly (see
+    /// `exact_f32_from_integer`) — unlike [`FieldValue::f64_from`], which
+    /// takes any integer, because `F32` also rejects the `F64` spelling of a
+    /// value no `f32` can hold.
     ///
     /// # Arguments
     /// * `value` - The CBOR value to convert
@@ -1682,18 +1742,26 @@ impl FieldValue {
     /// # Returns
     /// * `Result<Self, SchemaError>` - The converted FieldValue or an error message
     pub fn f32_from(value: Cbor) -> Result<Self, SchemaError> {
-        let f = match value {
-            Cbor::Float(f) if !f.is_nan() => f,
-            Cbor::Integer(i) => integer_to_f64(i),
-            v => return Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
-        };
-        let v = f as f32;
-        if v.is_infinite() && f.is_finite() {
-            return Err(SchemaError::FieldValue(format!(
-                "expected F32, got out-of-range F64 {f:?}"
-            )));
+        match value {
+            Cbor::Float(f) if !f.is_nan() => {
+                let v = f as f32;
+                if v.is_infinite() && f.is_finite() {
+                    return Err(SchemaError::FieldValue(format!(
+                        "expected F32, got out-of-range F64 {f:?}"
+                    )));
+                }
+                Ok(FieldValue::F32(v))
+            }
+            Cbor::Integer(i) => {
+                let i = i128::from(i);
+                exact_f32_from_integer(i).map(FieldValue::F32).ok_or_else(|| {
+                    SchemaError::FieldValue(format!(
+                        "expected F32, got integer {i} that no f32 holds exactly"
+                    ))
+                })
+            }
+            v => Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
         }
-        Ok(FieldValue::F32(v))
     }
 
     /// Create a Bytes FieldValue from a CBOR value
@@ -2133,6 +2201,14 @@ impl FieldEntry {
         self
     }
 
+    /// Repairs the one malformed declaration older versions could persist:
+    /// see [`FieldType::flatten_nested_options`]. Run by `Schema`
+    /// deserialization before [`FieldType::validate_declaration`].
+    pub(crate) fn repair_declaration(&mut self) -> &mut Self {
+        self.r#type.flatten_nested_options();
+        self
+    }
+
     /// Get the field name
     ///
     /// # Returns
@@ -2350,6 +2426,19 @@ fn u8_array_from(arr: Vec<Cbor>) -> Result<Vec<u8>, SchemaError> {
 /// meets a float field — exact up to 2^53, rounded beyond.
 fn integer_to_f64(i: cbor2::value::Integer) -> f64 {
     i128::from(i) as f64
+}
+
+/// Returns the `f32` that holds the integer `v` exactly, or `None` when the
+/// conversion would round.
+///
+/// An `F32` field accepts a JSON integer only under this rule, so that it
+/// answers the same way whichever spelling a client sends: `16777217` and
+/// `16777217.0` are one value, and only `JSON.stringify` decides which one
+/// arrives. The `F64` shape of the same value is already gated by
+/// [`is_f32_read_back`], which rejects it for the same reason.
+fn exact_f32_from_integer(v: i128) -> Option<f32> {
+    let f = v as f32;
+    (f as i128 == v).then_some(f)
 }
 
 /// Rebuilds the [`Json`] payload of a `Json`-typed field from the plain
@@ -4208,6 +4297,31 @@ mod tests {
         // Integer fields still reject floats.
         assert!(FieldType::U64.validate(&Fv::F64(1.0)).is_err());
         assert!(FieldType::I64.extract(Cbor::Float(1.0)).is_err());
+
+        // `F32` answers the same way whichever spelling of a value arrives:
+        // 2^24 + 1 is not an f32, so both the integer and the float form are
+        // rejected rather than one being silently rounded to 2^24.
+        let inexact = 16_777_217u64;
+        assert!(!is_f32_read_back(inexact as f64));
+        assert!(FieldType::F32.validate(&Fv::F64(inexact as f64)).is_err());
+        assert!(FieldType::F32.validate(&Fv::U64(inexact)).is_err());
+        assert!(FieldType::F32.validate(&Fv::I64(-(inexact as i64))).is_err());
+        assert!(FieldType::F32.extract(Cbor::Integer(inexact.into())).is_err());
+        assert!(f32::try_from(Fv::U64(inexact)).is_err());
+        assert!(f32::try_from(&Fv::I64(-(inexact as i64))).is_err());
+        let mut v = Fv::U64(inexact);
+        FieldType::F32.normalize(&mut v);
+        assert_eq!(v, Fv::U64(inexact), "an inexact integer is left for validate");
+
+        // Exact ones — every |v| <= 2^24, and larger powers of two — pass.
+        FieldType::F32.validate(&Fv::U64(1 << 24)).unwrap();
+        FieldType::F32.validate(&Fv::I64(i64::MIN)).unwrap();
+        assert_eq!(
+            FieldType::F32.extract(Cbor::Integer((1u64 << 24).into())).unwrap(),
+            Fv::F32((1u64 << 24) as f32)
+        );
+        // `F64` keeps taking any integer: it accepts every non-NaN f64 too.
+        FieldType::F64.validate(&Fv::U64(u64::MAX)).unwrap();
     }
 
     #[test]
@@ -4335,3 +4449,4 @@ mod tests {
         }
     }
 }
+

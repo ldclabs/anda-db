@@ -223,7 +223,8 @@ type and produce a `FieldType` token stream.
 | ------------------------------------------------------- | ----------------- |
 | `Vec<T>`, `VecDeque<T>`, `LinkedList<T>`, `BinaryHeap<T>`, `HashSet<T>`, `BTreeSet<T>` | `Array(T)` |
 | `[T; N]` (with `T` a supported non-byte/non-bf16 type)  | `Array(T)`        |
-| `(A, B, …)` (non-empty tuple)                           | `Array([A, B, …])` — the tuple-like, fixed-length form |
+| `(A, B, …)` (two or more elements)                      | `Array([A, B, …])` — the tuple-like, fixed-length form |
+| `(T,)` (one element)                                    | **compile error** — one inner type already means a homogeneous array of any length |
 | `HashMap<K, V>`, `BTreeMap<K, V>`, `serde_json::Map<…>` | `Map({"*" => V})` |
 
 For maps the key `K` must be one of:
@@ -298,12 +299,15 @@ Signed integer map keys use `I64` and expand to the integer wildcard key
 #[field_type = "Map<I64, Text>"]
 ```
 
-The Rust spellings of the scalar types are accepted everywhere in the DSL as
-synonyms of the `FieldType` names — `String` / `str` for `Text`, `u8` … `u64`
-/ `usize` for `U64`, `i8` … `i64` / `isize` for `I64`, plus `f32`, `f64` and
-`bool` — so an override can mirror the field's own type, e.g.
-`#[field_type = "Option<Array<u64>>"]`. `Option<Option<T>>` is rejected:
-serde serializes `Some(None)` and `None` identically.
+The Rust spellings of the scalar types are accepted for every *value* type
+in the DSL as synonyms of the `FieldType` names — `String` / `str` for
+`Text`, `u8` … `u64` / `usize` for `U64`, `i8` … `i64` / `isize` for `I64`,
+plus `f32`, `f64` and `bool` — so an override can mirror the field's own
+type, e.g. `#[field_type = "Option<Array<u64>>"]`. Map *keys* keep the
+narrower set of the `map_key` rule above (`String`, `Text`, `Bytes`, `I64`
+and `i8` … `isize`), because those are the only key variants `FieldKey` has:
+`Map<str, T>` and `Map<u64, T>` are compile errors. `Option<Option<T>>` is
+rejected: serde serializes `Some(None)` and `None` identically.
 
 ### 5.2 Examples
 
