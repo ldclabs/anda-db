@@ -4,7 +4,6 @@
 //! index that backs the crate. See the crate-level documentation for a
 //! high-level overview.
 
-use anda_db_utils::UniqueVec;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -22,6 +21,9 @@ use crate::tokenizer::*;
 
 const MAX_NOT_COMPLEMENT_DOCS: usize = 10_000;
 
+/// Longest document prefix copied into [`BM25Error::TokenizeFailed`].
+const MAX_ERROR_TEXT_BYTES: usize = 256;
+
 /// Estimates the CBOR-serialized size of `value`.
 ///
 /// The result only drives the bucket-packing heuristic
@@ -34,6 +36,28 @@ fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
         .ok()
         .and_then(|size| usize::try_from(size).ok())
         .unwrap_or(0)
+}
+
+/// Estimated serialized size of one `doc_tokens` entry of a bucket object.
+///
+/// A bucket object carries the token count of every document its postings
+/// reference (see [`BucketRef`]), so the entry is charged to a bucket the
+/// first time a document lands in it and refunded when the document leaves.
+fn doc_entry_size(doc_id: u64, token_count: usize) -> usize {
+    cbor_serialized_size(&(doc_id, token_count))
+}
+
+/// Copies at most [`MAX_ERROR_TEXT_BYTES`] of `text` into an error value,
+/// cutting at a char boundary and noting the original length.
+fn truncate_error_text(text: &str) -> String {
+    if text.len() <= MAX_ERROR_TEXT_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_ERROR_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes total]", &text[..end], text.len())
 }
 
 /// Identifies one durable bucket object.
@@ -98,7 +122,7 @@ struct BucketSnapshot {
 ///
 /// [`flush`]: Self::flush
 /// [`flush_with`]: Self::flush_with
-pub struct BM25Index<T: Tokenizer + Clone> {
+pub struct BM25Index<T: Tokenizer> {
     /// Index name
     name: String,
 
@@ -154,11 +178,15 @@ struct Bucket {
     dirty_version: u64,
     /// Version that was last successfully persisted
     saved_version: u64,
-    // Current size of the bucket in bytes
+    /// Estimated serialized size of the bucket object: postings plus the
+    /// per-document token counts it carries. Accumulated from estimates
+    /// between flushes; exact right after a flush or a reload.
     size: usize,
-    // List of tokens stored in this bucket
-    tokens: UniqueVec<String>,
-    // Set of document IDs associated with this bucket
+    /// Tokens whose posting this bucket owns and serializes.
+    tokens: FxHashSet<String>,
+    /// Documents whose token count the bucket's durable object may carry: a
+    /// superset hint used to mark the bucket dirty when one of them is
+    /// removed. Made exact by every flush.
     doc_ids: FxHashSet<u64>,
 }
 
@@ -254,6 +282,17 @@ impl BM25Params {
 ///   bucket past this limit the token is routed to a fresh bucket instead.
 ///   Smaller values produce more, smaller buckets (cheaper incremental flushes
 ///   but more I/O per full reload); larger values do the opposite.
+///
+/// The limit is enforced only when a token is *placed*: a token stays in the
+/// bucket that first received it, and that bucket keeps growing by one
+/// posting entry for every later document containing the token. Very
+/// frequent terms therefore make their buckets grow with the corpus (a term
+/// present in every document costs about ten bytes per document), and each
+/// of those buckets is rewritten whole by every flush that touches it. With
+/// a tokenizer that keeps stop words this is the dominant flush cost on large
+/// corpora; stop-word filtering in the tokenizer chain is the effective
+/// remedy, and [`BM25Index::compact_buckets`] repacks whole tokens but never
+/// splits one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BM25Config {
     /// BM25 scoring parameters used for all query scoring.
@@ -278,7 +317,14 @@ impl Default for BM25Config {
 /// Type alias for posting values: (bucket id, Vec<(document_id, token_frequency)>)
 /// - bucket_id: The bucket where this posting is stored
 /// - Vec<(document_id, token_frequency)>: List of documents and their term frequencies
-pub type PostingValue = (u32, UniqueVec<(u64, usize)>);
+///
+/// The list is a plain `Vec`: one entry per `insert`, with no uniqueness
+/// enforced on it. A document can appear more than once only after a
+/// [`BM25Index::remove`] with non-original text followed by a re-insert of
+/// the same id; scoring keys by document id so such a duplicate is scored
+/// once, [`BM25Index::remove`] drops every entry of the id, and a reload
+/// prunes entries whose document is gone.
+pub type PostingValue = (u32, Vec<(u64, usize)>);
 
 /// Index metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,13 +387,13 @@ pub struct BM25Stats {
 }
 
 /// Serializable BM25 index structure (owned version).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct BM25IndexOwned {
     // postings: DashMap<String, PostingValue>,
     metadata: BM25Metadata,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct BM25IndexRef<'a> {
     // postings: &'a DashMap<String, PostingValue>,
     metadata: &'a BM25Metadata,
@@ -375,7 +421,7 @@ struct BucketRef<'a> {
 
 impl<T> BM25Index<T>
 where
-    T: Tokenizer + Clone,
+    T: Tokenizer,
 {
     /// Creates a new empty BM25 index with the given tokenizer and optional config.
     ///
@@ -449,6 +495,12 @@ where
     /// id watermarks, but no postings or `doc_tokens`. Call
     /// [`load_buckets`](Self::load_buckets) afterwards to populate the inverted
     /// index (possibly on demand, or only for a subset of buckets).
+    ///
+    /// Every bucket the manifest references gets an empty, clean placeholder,
+    /// so a flush of the shell carries the committed manifest forward instead
+    /// of dropping the durable buckets. The shell is still not safe to
+    /// *mutate and flush*: an insert lands its new tokens in the tail bucket,
+    /// whose durable content is not in memory and would be replaced.
     pub fn load_metadata<R: Read>(tokenizer: T, r: R) -> Result<Self, BM25Error> {
         let index: BM25IndexOwned =
             cbor2::from_reader(r).map_err(|err| BM25Error::Serialization {
@@ -460,13 +512,24 @@ where
         let search_count = AtomicU64::new(index.metadata.stats.search_count);
         let last_saved_version = AtomicU64::new(index.metadata.stats.version);
 
+        // A flush rebuilds the manifest from the in-memory bucket map, so
+        // every referenced bucket needs a placeholder that keeps its
+        // committed generation until `load_buckets` replaces it.
+        let buckets: DashMap<u32, Bucket> = index
+            .metadata
+            .buckets
+            .keys()
+            .map(|bucket_id| (*bucket_id, Bucket::default()))
+            .chain([(0, Bucket::default())])
+            .collect();
+
         Ok(BM25Index {
             name: index.metadata.name.clone(),
             tokenizer,
             config: index.metadata.config.clone(),
             doc_tokens: DashMap::new(),
             postings: DashMap::new(),
-            buckets: DashMap::from_iter([(0, Bucket::default())]),
+            buckets,
             metadata: RwLock::new(index.metadata),
             max_bucket_id,
             max_document_id,
@@ -559,7 +622,7 @@ where
                     ..Default::default()
                 };
                 if !bucket.doc_tokens.is_empty() {
-                    b.doc_ids = bucket.doc_tokens.keys().cloned().collect();
+                    b.doc_ids = bucket.doc_tokens.keys().copied().collect();
                     for (doc_id, token_count) in bucket.doc_tokens {
                         doc_token_lengths.insert(doc_id, token_count);
                     }
@@ -577,10 +640,7 @@ where
                             if previous_bucket_id != i
                                 && let Some(mut previous_bucket) =
                                     self.buckets.get_mut(&previous_bucket_id)
-                                && previous_bucket
-                                    .tokens
-                                    .swap_remove_if(|k| &token == k)
-                                    .is_some()
+                                && previous_bucket.tokens.remove(&token)
                             {
                                 let previous_size = cbor_serialized_size(&(&token, &previous)) + 2;
                                 previous_bucket.size =
@@ -589,7 +649,7 @@ where
                             }
                         }
 
-                        b.tokens.push(token);
+                        b.tokens.insert(token);
                     }
                 }
 
@@ -641,7 +701,7 @@ where
         for (bucket_id, token) in empty_tokens {
             self.postings.remove(&token);
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.tokens.swap_remove_if(|k| k == &token);
+                bucket.tokens.remove(&token);
             }
         }
 
@@ -746,10 +806,14 @@ where
     ///
     /// The text is tokenized with a clone of the index's tokenizer; token
     /// frequencies and the document length (total token count) are then used
-    /// to update the posting list and the `total_tokens` counter that the
-    /// average document length is derived from. Updates to buckets are staged
-    /// and then applied in a second phase so that at most one bucket is marked
-    /// dirty per affected bucket.
+    /// to update the posting lists and the `total_tokens` counter that the
+    /// average document length is derived from.
+    ///
+    /// Bucket bookkeeping happens in two steps. A token that already has a
+    /// posting stays in the bucket that owns it: the bucket is only charged
+    /// for the new entry. Brand-new tokens are placed in the tail bucket
+    /// (`max_bucket_id`); those that do not fit under
+    /// [`BM25Config::bucket_overload_size`] open a fresh tail bucket.
     ///
     /// # Arguments
     ///
@@ -776,20 +840,15 @@ where
             collect_tokens(&mut tokenizer, text, None)
         };
 
-        // Count token frequencies
         if token_freqs.is_empty() {
             return Err(BM25Error::TokenizeFailed {
                 name: self.name.clone(),
                 id,
-                text: text.to_string(),
+                text: truncate_error_text(text),
             });
         }
 
-        // Phase 1: Update the postings collection
-        let bucket_id = self.max_bucket_id.load(Ordering::Acquire);
         let tokens: usize = token_freqs.values().sum();
-        // buckets_to_update: FxHashMap<bucketid, FxHashMap<token, size_increase>>
-        let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
         match self.doc_tokens.entry(id) {
             dashmap::Entry::Occupied(_) => {
                 return Err(BM25Error::AlreadyExists {
@@ -799,121 +858,79 @@ where
             }
             dashmap::Entry::Vacant(v) => {
                 v.insert(tokens);
-                let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
+            }
+        }
+        let _ = self.max_document_id.fetch_max(id, Ordering::Relaxed);
+        // The document's tokens are counted right after its `doc_tokens`
+        // entry is published, so the two only disagree inside this window;
+        // the average document length is derived from them at read time and
+        // needs no separate synchronization.
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
 
-                // The document's tokens are counted right after its
-                // `doc_tokens` entry is published, so the two only disagree
-                // inside this window; the average document length is derived
-                // from them at read time and needs no separate synchronization.
-                self.total_tokens
-                    .fetch_add(tokens as u64, Ordering::Relaxed);
-
-                // Update inverted index
-                for (token, freq) in token_freqs {
-                    match self.postings.entry(token.clone()) {
-                        dashmap::Entry::Occupied(mut entry) => {
-                            let val = (id, freq);
-                            let e = entry.get_mut();
-                            // `push` is a no-op when the exact (doc, freq) pair is
-                            // already present (a stale entry left by a remove() with
-                            // non-original text). Don't count its size again, but
-                            // still mark the bucket dirty below so the refreshed
-                            // doc_tokens snapshot gets persisted.
-                            let size_increase = if e.1.push(val) {
-                                cbor_serialized_size(&val) + 2
-                            } else {
-                                0
-                            };
-                            let b = buckets_to_update.entry(e.0).or_default();
-                            b.insert(token, size_increase);
-                        }
-                        dashmap::Entry::Vacant(entry) => {
-                            // Create new posting
-                            let val = (bucket_id, vec![(id, freq)].into());
-                            let size_increase =
-                                cbor_serialized_size(&(&token, (bucket_id, &[(id, freq)]))) + 2;
-                            entry.insert(val);
-                            let b = buckets_to_update.entry(bucket_id).or_default();
-                            b.insert(token, size_increase);
-                        }
-                    };
+        // Phase 1: update the inverted index. `existing` collects the tokens
+        // that already had a posting, with the size of the entry appended to
+        // it; `created` collects brand-new tokens, with the size of the whole
+        // posting, created in the tail bucket and placed in phase 3.
+        let tail_bucket_id = self.max_bucket_id.load(Ordering::Acquire);
+        let mut existing: Vec<(String, usize)> = Vec::new();
+        let mut created: Vec<(String, usize)> = Vec::new();
+        for (token, freq) in token_freqs {
+            let val = (id, freq);
+            if let Some(mut posting) = self.postings.get_mut(&token) {
+                posting.1.push(val);
+                existing.push((token, cbor_serialized_size(&val) + 2));
+                continue;
+            }
+            match self.postings.entry(token) {
+                // Created by a concurrent insert between the probe and here.
+                dashmap::Entry::Occupied(mut entry) => {
+                    entry.get_mut().1.push(val);
+                    existing.push((entry.key().clone(), cbor_serialized_size(&val) + 2));
+                }
+                dashmap::Entry::Vacant(entry) => {
+                    let size = cbor_serialized_size(&(entry.key(), (tail_bucket_id, &[val]))) + 2;
+                    let token = entry.key().clone();
+                    entry.insert((tail_bucket_id, vec![val]));
+                    created.push((token, size));
                 }
             }
         }
 
-        // Phase 2: Update bucket states
-        // tokens_to_migrate: (old_bucket_id, token, size)
-        let mut tokens_to_migrate: Vec<(u32, String, usize)> = Vec::new();
-        for (bid, val) in buckets_to_update {
-            let mut bucket = self.buckets.entry(bid).or_default();
-            // Mark as dirty, needs to be persisted
+        // Phase 2: charge the new entries of existing tokens to the bucket
+        // that owns each posting *now*. Ownership is re-read here instead of
+        // being taken from phase 1 because a concurrent insert may be placing
+        // the token at this very moment; an existing token is only ever
+        // charged, never (re-)listed, so no bucket can end up listing a token
+        // it does not own.
+        let doc_entry = doc_entry_size(id, tokens);
+        let mut charges: FxHashMap<u32, usize> = FxHashMap::default();
+        for (token, size) in existing {
+            if let Some(owner) = self.postings.get(&token).map(|posting| posting.0) {
+                *charges.entry(owner).or_default() += size;
+            }
+        }
+        for (bucket_id, size) in charges {
+            let mut bucket = self.buckets.entry(bucket_id).or_default();
+            bucket.size += size;
+            if bucket.doc_ids.insert(id) {
+                bucket.size += doc_entry;
+            }
             bucket.mark_dirty();
-            let mut bucket_contains_doc = false;
-            for (token, size) in val {
-                if bucket.tokens.contains(&token) {
-                    // Token already tracked in this bucket; just account for the new posting entry.
-                    bucket.size += size;
-                    bucket_contains_doc = true;
-                } else if bucket.tokens.is_empty()
-                    || bucket.size + size < self.config.bucket_overload_size
-                {
-                    bucket.tokens.push(token);
-                    bucket.size += size;
-                    bucket_contains_doc = true;
-                } else {
-                    tokens_to_migrate.push((bid, token, size));
-                }
-            }
-            if bucket_contains_doc {
-                bucket.doc_ids.insert(id);
-            }
         }
 
-        // Phase 3: Create new buckets if needed
-        if !tokens_to_migrate.is_empty() {
-            let mut next_bucket_id = self.max_bucket_id.fetch_add(1, Ordering::Release) + 1;
-
-            for (old_bucket_id, token, size) in tokens_to_migrate {
-                if let Some(mut posting) = self.postings.get_mut(&token) {
-                    posting.0 = next_bucket_id;
-                }
-
-                if let Some(mut ob) = self.buckets.get_mut(&old_bucket_id)
-                    && ob.tokens.swap_remove_if(|k| &token == k).is_some()
-                {
-                    ob.size = ob.size.saturating_sub(size);
-                    ob.mark_dirty();
-                }
-
-                let mut next_new_bucket = false;
-                {
-                    let mut nb = self.buckets.entry(next_bucket_id).or_default();
-
-                    if nb.tokens.is_empty() || nb.size + size < self.config.bucket_overload_size {
-                        // Bucket has enough space, update directly
-                        nb.mark_dirty();
-                        nb.size += size;
-                        nb.tokens.push(token.clone());
-                        nb.doc_ids.insert(id);
-                    } else {
-                        // Bucket doesn't have enough space, need to migrate to the next bucket
-                        next_new_bucket = true;
-                    }
-                }
-
-                if next_new_bucket {
-                    next_bucket_id = self.max_bucket_id.fetch_add(1, Ordering::Release) + 1;
-                    // update the posting's bucket_id again
-                    if let Some(mut posting) = self.postings.get_mut(&token) {
-                        posting.0 = next_bucket_id;
-                    }
-                    let mut nb = self.buckets.entry(next_bucket_id).or_default();
-                    nb.mark_dirty();
-                    nb.size += size;
-                    nb.tokens.push(token.clone());
-                    nb.doc_ids.insert(id);
+        // Phase 3: place the brand-new tokens in the tail bucket; whatever
+        // does not fit opens a fresh tail bucket. A fresh bucket accepts at
+        // least one token, so this terminates.
+        let mut pending = self.place_tokens(tail_bucket_id, id, doc_entry, created);
+        while !pending.is_empty() {
+            let bucket_id = self.max_bucket_id.fetch_add(1, Ordering::Release) + 1;
+            for (token, _) in &pending {
+                if let Some(mut posting) = self.postings.get_mut(token) {
+                    posting.0 = bucket_id;
                 }
             }
+            pending = self.place_tokens(bucket_id, id, doc_entry, pending);
         }
 
         self.update_metadata(|m| {
@@ -923,6 +940,39 @@ where
         });
 
         Ok(())
+    }
+
+    /// Lists brand-new `tokens` (with their size estimates) in `bucket_id`
+    /// while the bucket stays under [`BM25Config::bucket_overload_size`], and
+    /// returns the tokens that did not fit. An empty bucket accepts its first
+    /// token whatever the size.
+    fn place_tokens(
+        &self,
+        bucket_id: u32,
+        doc_id: u64,
+        doc_entry: usize,
+        tokens: Vec<(String, usize)>,
+    ) -> Vec<(String, usize)> {
+        let limit = self.config.bucket_overload_size;
+        let mut bucket = self.buckets.entry(bucket_id).or_default();
+        let mut overflow = Vec::new();
+        let mut placed = false;
+        for (token, size) in tokens {
+            if bucket.tokens.is_empty() || bucket.size + size < limit {
+                bucket.size += size;
+                bucket.tokens.insert(token);
+                placed = true;
+            } else {
+                overflow.push((token, size));
+            }
+        }
+        if placed {
+            if bucket.doc_ids.insert(doc_id) {
+                bucket.size += doc_entry;
+            }
+            bucket.mark_dirty();
+        }
+        overflow
     }
 
     /// Removes a document from the index.
@@ -966,6 +1016,10 @@ where
             self.total_tokens
                 .fetch_sub(removed_tokens as u64, Ordering::Relaxed);
         }
+        // Refund of the document's token-count entry from every bucket that
+        // listed it. On a replay the count is unknown; the few bytes of
+        // difference are within the estimate's tolerance.
+        let doc_entry = doc_entry_size(id, removed_tokens.unwrap_or(0));
 
         // Tokenize the document
         let token_freqs = {
@@ -979,13 +1033,18 @@ where
         let mut maybe_empty_tokens: Vec<String> = Vec::new();
         for (token, _) in token_freqs {
             if let Some(mut posting) = self.postings.get_mut(&token) {
-                // Remove every entry for this document. Duplicates can exist
-                // when a previous remove() was given non-original text and the
-                // document was re-inserted afterwards.
+                // Remove every entry for this document in one pass. Duplicates
+                // can exist when a previous remove() was given non-original
+                // text and the document was re-inserted afterwards.
                 let mut removed_vals: Vec<(u64, usize)> = Vec::new();
-                while let Some(val) = posting.1.swap_remove_if(|&(idx, _)| idx == id) {
-                    removed_vals.push(val);
-                }
+                posting.1.retain(|entry| {
+                    if entry.0 == id {
+                        removed_vals.push(*entry);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 if removed_vals.is_empty() {
                     continue;
                 }
@@ -1037,11 +1096,13 @@ where
                             None => true,
                         };
                         if remove_from_bucket {
-                            b.tokens.swap_remove_if(|k| &token == k);
+                            b.tokens.remove(&token);
                         }
                     }
                 }
-                b.doc_ids.remove(&id);
+                if b.doc_ids.remove(&id) {
+                    b.size = b.size.saturating_sub(doc_entry);
+                }
             }
         }
 
@@ -1059,6 +1120,7 @@ where
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id)
                 && bucket.doc_ids.remove(&id)
             {
+                bucket.size = bucket.size.saturating_sub(doc_entry);
                 bucket.mark_dirty();
             }
         }
@@ -1141,10 +1203,12 @@ where
         // token counter follows the `doc_tokens` entries it accounts for.
         let mut removed_docs = 0usize;
         let mut removed_tokens = 0u64;
+        let mut token_counts: FxHashMap<u64, usize> = FxHashMap::default();
         for id in ids {
             if let Some((_, tokens)) = self.doc_tokens.remove(id) {
                 removed_docs += 1;
                 removed_tokens += tokens as u64;
+                token_counts.insert(*id, tokens);
             }
         }
         if removed_tokens > 0 {
@@ -1226,7 +1290,7 @@ where
                 None => true,
             };
             if unlist && let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.tokens.swap_remove_if(|k| k == &token);
+                bucket.tokens.remove(&token);
             }
         }
 
@@ -1245,9 +1309,15 @@ where
         purged_postings |= !stale_buckets.is_empty();
         for bucket_id in stale_buckets {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                let before = bucket.doc_ids.len();
-                bucket.doc_ids.retain(|id| !ids.contains(id));
-                if bucket.doc_ids.len() != before {
+                let mut changed = false;
+                for id in ids {
+                    if bucket.doc_ids.remove(id) {
+                        let count = token_counts.get(id).copied().unwrap_or(0);
+                        bucket.size = bucket.size.saturating_sub(doc_entry_size(*id, count));
+                        changed = true;
+                    }
+                }
+                if changed {
                     bucket.mark_dirty();
                 }
             }
@@ -1300,6 +1370,10 @@ where
     /// parentheses. Operator precedence is `OR < AND < NOT`; multiple bare
     /// terms default to `OR`.
     ///
+    /// Any error of [`try_search_advanced`](Self::try_search_advanced) — the
+    /// parser's size budget or the `NOT` complement guard — yields an empty
+    /// result here; use `try_search_advanced` to observe it.
+    ///
     /// # Arguments
     ///
     /// * `query` — e.g. `"(hello AND world) OR (rust AND NOT java)"`.
@@ -1320,6 +1394,15 @@ where
     }
 
     /// Searches the index with a boolean query expression and resource guards.
+    ///
+    /// # Errors
+    ///
+    /// * the query exceeds the parser's size or complexity budget (see
+    ///   [`QueryType::try_parse`]);
+    /// * a `NOT` operand would have to be complemented against more than
+    ///   10 000 documents — a top-level `NOT`, a `NOT` inside an `OR`, or an
+    ///   `AND` made only of `NOT`s. `a AND NOT b` never builds a complement
+    ///   and is always accepted.
     pub fn try_search_advanced(
         &self,
         query: &str,
@@ -1334,22 +1417,12 @@ where
             name: self.name.clone(),
             source: source.into(),
         })?;
-        if query_expr.may_materialize_not_complement()
-            && self.doc_tokens.len() > MAX_NOT_COMPLEMENT_DOCS
-        {
-            return Err(BM25Error::Generic {
-                name: self.name.clone(),
-                source: format!(
-                    "logical NOT complement over {} documents exceeds maximum {}",
-                    self.doc_tokens.len(),
-                    MAX_NOT_COMPLEMENT_DOCS
-                )
-                .into(),
-            });
-        }
 
         let params = params.as_ref().unwrap_or(&self.config.bm25);
-        let scored_docs = self.execute_query(&query_expr, params, false);
+        // A `NOT` that has to materialize the complement of its operand is
+        // rejected by `score_not` itself, at the point where the executor
+        // would build it, so the guard cannot drift from the evaluation.
+        let scored_docs = self.execute_query(&query_expr, params, false)?;
         // Count only queries that actually reached scoring: `top_k == 0`,
         // parse failures and rejected NOT complements all return above,
         // matching the HNSW index's search_count semantics.
@@ -1399,9 +1472,9 @@ where
         query: &QueryType,
         params: &BM25Params,
         negated_not: bool,
-    ) -> FxHashMap<u64, f32> {
+    ) -> Result<FxHashMap<u64, f32>, BM25Error> {
         match query {
-            QueryType::Term(term) => self.score_term(term, params),
+            QueryType::Term(term) => Ok(self.score_term(term, params)),
             QueryType::And(subqueries) => self.score_and(subqueries, params),
             QueryType::Or(subqueries) => self.score_or(subqueries, params),
             QueryType::Not(subquery) => self.score_not(subquery, params, negated_not),
@@ -1478,31 +1551,58 @@ where
     }
 
     /// Scores an OR query
-    fn score_or(&self, subqueries: &[Box<QueryType>], params: &BM25Params) -> FxHashMap<u64, f32> {
+    fn score_or(
+        &self,
+        subqueries: &[QueryType],
+        params: &BM25Params,
+    ) -> Result<FxHashMap<u64, f32>, BM25Error> {
         if subqueries.is_empty() {
-            return FxHashMap::default();
+            return Ok(FxHashMap::default());
         }
         if subqueries.len() == 1 {
             return self.execute_query(&subqueries[0], params, false);
         }
 
+        // Bare words (`foo bar`, the parser's implicit OR) score in one pass
+        // over the joined text, exactly like `search` does: one tokenizer
+        // clone and one score map instead of one of each per word. A word
+        // repeated in the query is therefore scored once, not once per
+        // occurrence.
+        let mut words = Vec::with_capacity(subqueries.len());
+        for subquery in subqueries {
+            match subquery {
+                QueryType::Term(term) => words.push(term.as_str()),
+                _ => {
+                    words.clear();
+                    break;
+                }
+            }
+        }
+        if !words.is_empty() {
+            return Ok(self.score_term(&words.join(" "), params));
+        }
+
         // Execute all subqueries and merge results
         let mut result = FxHashMap::default();
         for subquery in subqueries {
-            let sub_result = self.execute_query(subquery, params, false);
+            let sub_result = self.execute_query(subquery, params, false)?;
 
             for (doc_id, score) in sub_result {
                 *result.entry(doc_id).or_insert(0.0) += score;
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Scores an AND query
-    fn score_and(&self, subqueries: &[Box<QueryType>], params: &BM25Params) -> FxHashMap<u64, f32> {
+    fn score_and(
+        &self,
+        subqueries: &[QueryType],
+        params: &BM25Params,
+    ) -> Result<FxHashMap<u64, f32>, BM25Error> {
         if subqueries.is_empty() {
-            return FxHashMap::default();
+            return Ok(FxHashMap::default());
         }
         if subqueries.len() == 1 {
             return self.execute_query(&subqueries[0], params, false);
@@ -1514,23 +1614,22 @@ where
         // order-independent (intersection then subtraction).
         let (positives, negatives): (Vec<&QueryType>, Vec<&QueryType>) = subqueries
             .iter()
-            .map(|q| q.as_ref())
             .partition(|q| !matches!(q, QueryType::Not(_)));
 
         let mut result = if let Some((&first, _)) = positives.split_first() {
-            self.execute_query(first, params, false)
+            self.execute_query(first, params, false)?
         } else {
             // All subqueries are NOT: start from the complement of the first
             // and subtract the rest below.
-            self.execute_query(negatives[0], params, false)
+            self.execute_query(negatives[0], params, false)?
         };
 
         // Intersect the remaining positive subqueries, merging scores.
         for &subquery in positives.iter().skip(1) {
             if result.is_empty() {
-                return result;
+                return Ok(result);
             }
-            let sub_result = self.execute_query(subquery, params, false);
+            let sub_result = self.execute_query(subquery, params, false)?;
 
             // Keep only documents present in both results, summing their scores
             // in a single pass over the (already intersected, smaller) result.
@@ -1548,15 +1647,15 @@ where
         let skip_negatives = if positives.is_empty() { 1 } else { 0 };
         for &subquery in negatives.iter().skip(skip_negatives) {
             if result.is_empty() {
-                return result;
+                return Ok(result);
             }
-            let excluded = self.execute_query(subquery, params, true);
+            let excluded = self.execute_query(subquery, params, true)?;
             for doc_id in excluded.keys() {
                 result.remove(doc_id);
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Scores a NOT query.
@@ -1566,15 +1665,32 @@ where
     /// (the AND caller subtracts them) or their complement. Evaluating the
     /// subquery with the parent's negation flag would mis-handle double
     /// negation such as `a AND NOT (NOT b)`.
+    ///
+    /// Materializing the complement touches every document, so it is refused
+    /// above [`MAX_NOT_COMPLEMENT_DOCS`] documents. The check lives here,
+    /// where the complement is built, rather than in a predicate over the
+    /// AST that would have to mirror the executor's branching.
     fn score_not(
         &self,
         subquery: &QueryType,
         params: &BM25Params,
         negated_not: bool,
-    ) -> FxHashMap<u64, f32> {
-        let exclude = self.execute_query(subquery, params, false);
+    ) -> Result<FxHashMap<u64, f32>, BM25Error> {
+        if !negated_not && self.doc_tokens.len() > MAX_NOT_COMPLEMENT_DOCS {
+            return Err(BM25Error::Generic {
+                name: self.name.clone(),
+                source: format!(
+                    "logical NOT complement over {} documents exceeds maximum {}",
+                    self.doc_tokens.len(),
+                    MAX_NOT_COMPLEMENT_DOCS
+                )
+                .into(),
+            });
+        }
+
+        let exclude = self.execute_query(subquery, params, false)?;
         if negated_not {
-            return exclude;
+            return Ok(exclude);
         }
 
         let mut result = FxHashMap::default();
@@ -1584,7 +1700,7 @@ where
                 result.insert(doc_id, 0.0);
             }
         }
-        result
+        Ok(result)
     }
 
     /// Persists metadata and every currently-dirty bucket.
@@ -1950,13 +2066,23 @@ where
                 }
             }
 
+            // Token sizes drove the packing; the per-document token counts
+            // the bucket object also carries are added here so `size` keeps
+            // estimating the whole object, as `insert` and a reload do.
+            let mut size = size;
+            for doc_id in &doc_ids {
+                if let Some(count) = self.doc_tokens.get(doc_id) {
+                    size += doc_entry_size(*doc_id, *count);
+                }
+            }
+
             self.buckets.insert(
                 bucket_id,
                 Bucket {
                     dirty_version: 1,
                     saved_version: 0,
                     size,
-                    tokens: tokens.into(),
+                    tokens: tokens.into_iter().collect(),
                     doc_ids,
                 },
             );
@@ -1985,8 +2111,14 @@ where
     /// so no lock is held across the caller's async persistence call.
     /// Returns `Ok(None)` when the bucket no longer exists or is no longer
     /// dirty and should be skipped.
+    ///
+    /// The serialized content is also the truth for two pieces of bucket
+    /// bookkeeping that are only estimated between flushes: `size` becomes
+    /// the payload's exact length (what a reload sets it to as well) and
+    /// `doc_ids` becomes exactly the set of documents whose token count the
+    /// payload carries.
     fn serialize_bucket(&self, bucket_id: u32) -> Result<Option<Vec<u8>>, BM25Error> {
-        let bucket = match self.buckets.get(&bucket_id) {
+        let mut bucket = match self.buckets.get_mut(&bucket_id) {
             Some(b) if b.is_dirty() => b,
             _ => return Ok(None),
         };
@@ -2024,6 +2156,10 @@ where
             name: self.name.clone(),
             source: err.into(),
         })?;
+        drop(postings);
+
+        bucket.doc_ids = doc_tokens.into_keys().collect();
+        bucket.size = buf.len();
         Ok(Some(buf))
     }
 
@@ -2276,7 +2412,7 @@ mod tests {
         .unwrap();
 
         let mut newer_postings = FxHashMap::default();
-        newer_postings.insert("alpha".to_string(), (1, vec![(1, 1)].into()));
+        newer_postings.insert("alpha".to_string(), (1, vec![(1, 1)]));
         let newer_bucket1 = encode_bucket_owned(newer_postings, FxHashMap::from_iter([(1, 1)]));
 
         let legacy_store = MemStore {
@@ -2301,14 +2437,7 @@ mod tests {
         let loaded = load_from(&legacy_store).await;
 
         assert_eq!(loaded.postings.get("alpha").unwrap().0, 1);
-        assert!(
-            !loaded
-                .buckets
-                .get(&0)
-                .unwrap()
-                .tokens
-                .contains(&"alpha".to_string())
-        );
+        assert!(!loaded.buckets.get(&0).unwrap().tokens.contains("alpha"));
         assert!(loaded.has_dirty_buckets());
 
         // The first manifest flush persists the repaired layout and reports
@@ -3583,7 +3712,7 @@ mod tests {
             // insert's phase 2 would only bump this bucket's accounting.
             index
                 .postings
-                .insert("alpha".to_string(), (0, vec![(2u64, 1usize)].into()));
+                .insert("alpha".to_string(), (0, vec![(2u64, 1usize)]));
             index.doc_tokens.insert(2, 1);
             index.total_tokens.fetch_add(1, Ordering::Relaxed);
             bucket0.doc_ids.insert(2);
@@ -4204,7 +4333,7 @@ mod tests {
             .postings
             .iter()
             .map(|entry| {
-                let mut docs: Vec<(u64, usize)> = entry.value().1.iter().copied().collect();
+                let mut docs: Vec<(u64, usize)> = entry.value().1.to_vec();
                 docs.sort_unstable();
                 (entry.key().clone(), docs)
             })
@@ -4378,5 +4507,109 @@ mod tests {
         let reloaded = load_from(&store).await;
         assert_matches_reference(&reloaded, &[1, 3, 5, 6]);
         assert!(!reloaded.has_dirty_buckets());
+    }
+    #[tokio::test]
+    async fn test_metadata_only_shell_flush_keeps_manifest() {
+        let index = create_test_index();
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        let committed = index.metadata().buckets;
+        assert!(!committed.is_empty());
+
+        // A shell that only loaded the metadata must not drop the durable
+        // buckets when flushed: the manifest is carried forward unchanged.
+        let shell = BM25Index::load_metadata(default_tokenizer(), &store.metadata[..]).unwrap();
+        assert_eq!(shell.metadata().buckets, committed);
+        let outcome = flush_to(&shell, &mut store, 2).await;
+        assert!(!outcome.saved, "nothing is dirty in a freshly loaded shell");
+
+        // Even a forced metadata commit keeps every committed bucket.
+        shell.update_metadata(|m| m.stats.version += 1);
+        let outcome = flush_to(&shell, &mut store, 3).await;
+        assert!(outcome.saved);
+        assert!(outcome.obsolete.is_empty());
+        let reloaded = load_from(&store).await;
+        assert_eq!(reloaded.len(), 4);
+        assert_eq!(reloaded.search("fox", 10, None).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_flush_makes_bucket_size_and_doc_ids_exact() {
+        let index = create_test_index();
+        // A wrong-text removal leaves doc 3 behind in the postings.
+        assert!(index.remove(3, "nothing here", 0));
+        let mut store = MemStore::default();
+        flush_to(&index, &mut store, 1).await;
+        for (bucket_id, generation) in index.metadata().buckets {
+            let data = &store.buckets[&BucketObject {
+                bucket_id,
+                generation,
+            }];
+            let bucket = index.buckets.get(&bucket_id).unwrap();
+            assert_eq!(bucket.size, data.len(), "bucket {bucket_id} size");
+            let owned: BucketOwned = cbor2::from_reader(&data[..]).unwrap();
+            let expected: FxHashSet<u64> = owned.doc_tokens.keys().copied().collect();
+            assert_eq!(bucket.doc_ids, expected, "bucket {bucket_id} doc_ids");
+            assert!(!bucket.doc_ids.contains(&3));
+        }
+
+        // Without stale entries to prune, a reload sees the same sizes the
+        // writer had, so the estimate does not jump across a restart.
+        let clean = create_test_index();
+        let mut store = MemStore::default();
+        flush_to(&clean, &mut store, 1).await;
+        let reloaded = load_from(&store).await;
+        for (bucket_id, _) in clean.metadata().buckets {
+            assert_eq!(
+                reloaded.buckets.get(&bucket_id).unwrap().size,
+                clean.buckets.get(&bucket_id).unwrap().size
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_word_or_scores_like_search() {
+        let index = create_test_index();
+        assert_eq!(
+            index.search_advanced("quick fox dog", 10, None),
+            index.search("quick fox dog", 10, None)
+        );
+        // A repeated word is scored once, as `search` does.
+        assert_eq!(
+            index.search_advanced("fox fox", 10, None),
+            index.search("fox", 10, None)
+        );
+        // A mixed OR still merges per subquery.
+        let mixed = index.search_advanced("sleeps OR (fox AND dog)", 10, None);
+        let mut ids: Vec<u64> = mixed.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_top_level_double_negation() {
+        let index = create_test_index();
+        let mut ids: Vec<u64> = index
+            .search_advanced("NOT NOT fox", 10, None)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn test_tokenize_failed_truncates_text() {
+        let index = BM25Index::new("truncate".to_string(), default_tokenizer(), None);
+        // Single-byte tokens are dropped, so this text yields no token.
+        let text = "a ".repeat(1000);
+        match index.insert(1, &text, 0) {
+            Err(BM25Error::TokenizeFailed { text: kept, .. }) => {
+                assert!(kept.len() < 320, "{}", kept.len());
+                assert!(kept.starts_with("a a a "));
+                assert!(kept.ends_with("[2000 bytes total]"), "{kept}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

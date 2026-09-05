@@ -8,7 +8,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Error, Debug)]
 pub enum BM25Error {
     /// Index-related errors.
-    #[error("BM25 index {name:?}, error: {source:?}")]
+    #[error("BM25 index {name:?}, error: {source}")]
     Generic {
         /// Name of the BM25 index that raised the error.
         name: String,
@@ -17,7 +17,7 @@ pub enum BM25Error {
     },
 
     /// CBOR serialization/deserialization errors
-    #[error("BM25 index {name:?}, CBOR serialization error: {source:?}")]
+    #[error("BM25 index {name:?}, CBOR serialization error: {source}")]
     Serialization {
         /// Name of the BM25 index whose serialized state failed to encode or decode.
         name: String,
@@ -25,7 +25,10 @@ pub enum BM25Error {
         source: BoxError,
     },
 
-    /// Error when a token is not found.
+    /// Error when a document is not found.
+    ///
+    /// Never raised by this crate; reserved for callers that layer
+    /// idempotent lookups on top of the index.
     #[error("BM25 index {name:?}, document {id} not found")]
     NotFound {
         /// Name of the BM25 index that was searched.
@@ -50,7 +53,8 @@ pub enum BM25Error {
         name: String,
         /// Document id whose text could not be tokenized into searchable terms.
         id: u64,
-        /// Source text that produced no tokens.
+        /// Source text that produced no tokens, cut to its first 256 bytes
+        /// (at a char boundary) with the original length appended.
         text: String,
     },
 }

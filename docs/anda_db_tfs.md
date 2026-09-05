@@ -45,7 +45,7 @@ BM25Index
 └── atomic counters  max_bucket_id, max_document_id, total_tokens, ...
 ```
 
-- **Posting `(bucket_id, UniqueVec<(doc_id, tf)>)`**: `bucket_id` identifies the bucket currently owning the token; `UniqueVec` guarantees uniqueness for `(doc_id, tf)` and supports constant-time deletion through `swap_remove_if`.
+- **Posting `(bucket_id, Vec<(doc_id, tf)>)`**: `bucket_id` identifies the bucket currently owning the token; the list holds one entry per `insert`. A document appears twice only after a `remove` with non-original text followed by a re-insert of the same id — scoring keys by `doc_id` so the duplicate is scored once, `remove` drops every entry of the id in one pass, and a reload prunes entries whose document is gone.
 - **Bucket**: a serializable unit containing a group of tokens and the `doc_ids` they cover. A bucket tracks dirty state with dual version counters:
 
   | Field           | Meaning                                           |
@@ -62,16 +62,15 @@ BM25Index
 
 ## 4. Bucket Sharding Strategy
 
-`BM25Config.bucket_overload_size` is the **soft upper limit** for the serialized size of a single bucket, defaulting to `512 KiB`. For each posting that needs to be added to a bucket:
+`BM25Config.bucket_overload_size` is the **soft upper limit** for the serialized size of a single bucket object, defaulting to `512 KiB`. On `insert`:
 
-1. If the bucket already owns the token, only `size` is increased.
-2. If the bucket is empty, or the bucket remains `< limit` after adding the token, the token is appended.
-3. Otherwise, **migration** is triggered:
-   - Increment `max_bucket_id` to obtain `next_bucket_id`.
-   - Remove the token from the old bucket and update `bucket_id = next_bucket_id` in `postings`.
-   - If the next bucket is still too full, continue advancing until placement succeeds.
+1. A token that already has a posting stays in the bucket that owns it; that bucket is only charged for the appended entry (and, the first time the document lands in it, for the document's token-count entry).
+2. Brand-new tokens are created in the tail bucket (`max_bucket_id`). Each one is listed there if the bucket is empty or stays `< limit` after adding it.
+3. The tokens that do not fit open a fresh tail bucket (`max_bucket_id + 1`) and are listed there; a fresh bucket always accepts at least one token, so placement always terminates.
 
-Note: a token that is **already registered in a bucket** is not migrated again on the next `insert`. This is a key invariant that avoids the degenerate case where every insertion creates a new bucket. The regression test `test_no_excessive_small_buckets` covers this behavior.
+Between flushes `size` is an estimate accumulated from those charges. Every flush and every reload replaces it with the exact length of the serialized bucket object — which includes the per-document token counts the object carries — so the estimate cannot drift for long. The same flush makes the bucket's `doc_ids` hint exact.
+
+Note: a token that is **already registered in a bucket** is never moved by a later `insert`. This avoids the degenerate case where every insertion creates a new bucket (regression test `test_no_excessive_small_buckets`), but it also means the limit only applies at placement time: a bucket keeps growing by one entry for every later document that contains one of its tokens. Very frequent terms — stop words, with a tokenizer that keeps them — make their buckets grow with the corpus, and every flush that touches such a bucket rewrites it whole. Stop-word filtering in the tokenizer chain is the effective remedy; `compact_buckets` repacks whole tokens and never splits one.
 
 ### 4.1 Defragmentation: `compact_buckets()`
 
@@ -90,7 +89,7 @@ The return value `(old_count, new_count)` is useful for monitoring. Concurrent `
 - All shared state is stored in `DashMap`, `RwLock`, and atomic counters, so **concurrent `insert` / `remove` / `search` can freely overlap across threads** without an outer lock.
 - In `insert` and `remove`, the critical regions involving bucket sizing and splitting use fine-grained entry locks via `DashMap::entry().or_default()`, avoiding holding a lock across `.await`.
 - Average document length is **derived, never cached**. There is no `avg_doc_tokens` field: the value is computed as `total_tokens / doc_tokens.len()` at its two read sites — `score_term` (once per query, not per document) and `refresh_live_stats` (once per `stats()` call). A cached quotient had to be resynchronized on every `insert` / `remove`, disagreed with its own inputs in between, and was wrong outright after a `load_metadata` that had not yet loaded any documents. Deriving it makes the reported value exactly consistent with the counters it comes from — there is no convergence window.
-- **`compact_buckets` is exclusive with mutations, and the crate enforces that.** `insert` / `insert_array` / `remove` / `remove_array` / `purge_ids` take an internal `mutation_gate` **shared** (so they still run concurrently with each other) and `compact_buckets` takes it **exclusively**, because it rebuilds the bucket map non-atomically: a posting created after compaction snapshotted `postings` would otherwise be re-binned into nothing and silently dropped by the next flush. The gate is the first lock a mutation acquires, so it never nests inside a `DashMap` shard guard. Callers do **not** need to serialize compaction against writes.
+- **`compact_buckets` is exclusive with mutations, and the crate enforces that.** `insert` / `remove` / `purge_ids` take an internal `mutation_gate` **shared** (so they still run concurrently with each other) and `compact_buckets` takes it **exclusively**, because it rebuilds the bucket map non-atomically: a posting created after compaction snapshotted `postings` would otherwise be re-binned into nothing and silently dropped by the next flush. The gate is the first lock a mutation acquires, so it never nests inside a `DashMap` shard guard. Callers do **not** need to serialize compaction against writes.
 - **Coordinating `flush` / `flush_with` against mutations, against compaction, and against another flush is the caller's responsibility** (`anda_db`'s `Collection` holds an exclusive operation gate across every flush). A single writer per durable index is a deployment contract; the crate does not defend against a second writer.
 - `flush` serializes every dirty bucket and the metadata into owned buffers before the first `.await`. It never holds a `DashMap` `Ref` across `.await`, which avoids deadlocks.
 - `top_k_results` uses `select_nth_unstable_by` for partial sorting (`O(n + k log k)`), then performs a final `sort` on the top-k tail, making queries significantly faster on large result sets.
@@ -181,15 +180,17 @@ let idx = BM25Index::load_all(tokenizer, metadata_reader, async |object| {
 expr     := or_expr
 or_expr  := and_expr ( " OR " and_expr )*
 and_expr := not_expr ( " AND " not_expr )*
-not_expr := "NOT " term | term
+not_expr := "NOT " not_expr | term
 term     := "(" or_expr ")" | word ( whitespace word )*
 ```
 
-Precedence is `OR < AND < NOT`. Key properties:
+Precedence is `OR < AND < NOT`. The operators are case-sensitive and must stand between spaces (`NOT` followed by a space): `a and b` is three search words, and `NOT NOT a` nests two negations. Key properties:
 
 - **Multi-term queries default to OR**: `"quick fox"` and `"quick OR fox"` return the same results in `search` and `search_advanced`.
 - **Score merging**: `AND` sums the BM25 scores of its subqueries; `OR` does the same; `NOT` produces a zero-scored placeholder set used only for filtering, and in an `AND` context it **removes** matching items from the result set.
-- **Robust parsing**: unbalanced parentheses do not panic. They are treated as ordinary characters, which makes direct forwarding of user input safe.
+- **Robust parsing**: unbalanced parentheses do not panic. They are treated as ordinary characters, which makes direct forwarding of user input safe. An empty group is an empty `OR` that matches nothing, so `a AND ()` returns nothing.
+- **Bare words score in one pass**: an `OR` made only of words (the implicit `OR` of `"quick fox"`) is scored exactly like `search("quick fox")`, in a single pass with one tokenizer clone; a word repeated in the query is scored once.
+- **`NOT` complement guard**: `try_search_advanced` fails when a `NOT` has to complement its operand against more than 10 000 documents — a top-level `NOT`, a `NOT` inside an `OR`, or an `AND` made only of `NOT`s. `a AND NOT b` never builds a complement. The check runs where the executor would build the complement, so it cannot drift from the evaluation. `search_advanced` turns that error (and a parse-budget error) into an empty result.
 - **Multi-byte safe**: the delimiters `" AND "` and `" OR "` are ASCII, so byte-wise scanning remains safe under UTF-8. Mixed CJK text does not require extra handling.
 
 Example:
@@ -241,7 +242,7 @@ pub enum BM25Error {
 }
 ```
 
-`Generic` is used for errors returned by I/O closures; `Serialization` wraps `cbor2` failures; `AlreadyExists` and `TokenizeFailed` occur during `insert`; `NotFound` is left to upper-layer APIs for idempotent validation.
+`Generic` is used for errors returned by I/O closures and by the query guards of `try_search_advanced`; `Serialization` wraps `cbor2` failures; `AlreadyExists` and `TokenizeFailed` occur during `insert` (`TokenizeFailed` carries at most the first 256 bytes of the document text); `NotFound` is never raised by the crate and is left to upper-layer APIs for idempotent validation.
 
 ---
 
@@ -344,7 +345,7 @@ let idx = BM25Index::load_all(default_tokenizer(), metadata, async |object| {
 
 ## 13. Usage Notes
 
-1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. Historical misuse does not affect search correctness, but it may leave redundant postings that can be cleaned up with `compact_buckets()`. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
+1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. Historical misuse does not affect search correctness — scoring only counts documents present in `doc_tokens` — but it leaves stale posting entries behind; they are pruned the next time the index is loaded (`load_buckets`), not by `compact_buckets()`, which repacks buckets without inspecting their entries. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
 3. **Flush coordination**: the crate does not serialize flushes internally. The caller must ensure a flush never overlaps mutations, compaction, or another flush (`anda_db`'s `Collection` already guarantees this); a single writer per durable index is a deployment contract.
 4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.

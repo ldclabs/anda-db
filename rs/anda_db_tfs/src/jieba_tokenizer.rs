@@ -136,24 +136,38 @@ impl<T: Tokenizer> Tokenizer for JiebaMergeTokenizer<T> {
         let mut tokens = Vec::new();
         let mut needs_sort = false;
 
-        while let Some(token) = inner_stream.next() {
+        while inner_stream.advance() {
+            let token = inner_stream.token_mut();
             let mut handle_cjk = false;
             if detect_script(&token.text) == Script::Cjk {
                 needs_sort = true;
                 let mut jieba_stream = self.tokenizer.token_stream(&token.text);
-                while let Some(jieba_token) = jieba_stream.next() {
-                    let mut new_token = jieba_token.clone();
-                    new_token.offset_from += token.offset_from;
-                    new_token.offset_to += token.offset_from;
-                    new_token.position = token.position;
-                    new_token.position_length = token.position_length;
+                while jieba_stream.advance() {
+                    // The Jieba stream never reuses a token, so its text can
+                    // be moved out instead of cloned.
+                    let jieba_token = jieba_stream.token_mut();
                     handle_cjk = true;
-                    tokens.push(new_token);
+                    tokens.push(Token {
+                        offset_from: jieba_token.offset_from + token.offset_from,
+                        offset_to: jieba_token.offset_to + token.offset_from,
+                        position: token.position,
+                        text: std::mem::take(&mut jieba_token.text),
+                        position_length: token.position_length,
+                    });
                 }
             }
 
             if !handle_cjk {
-                tokens.push(token.clone());
+                // Only the text is moved out: the inner stream clears it
+                // before its next token anyway, and its position counter,
+                // which the stream advances in place, is left untouched.
+                tokens.push(Token {
+                    offset_from: token.offset_from,
+                    offset_to: token.offset_to,
+                    position: token.position,
+                    text: std::mem::take(&mut token.text),
+                    position_length: token.position_length,
+                });
             }
         }
 

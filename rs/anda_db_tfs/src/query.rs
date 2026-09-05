@@ -8,15 +8,21 @@
 /// expr    := or_expr
 /// or_expr := and_expr ( " OR " and_expr )*
 /// and_expr := not_expr ( " AND " not_expr )*
-/// not_expr := "NOT " term | term
+/// not_expr := "NOT " not_expr | term
 /// term    := "(" or_expr ")" | word ( whitespace word )*
 /// ```
 ///
 /// Whitespace-separated words at the `term` level default to an implicit `OR`
 /// between them, matching the behaviour of [`BM25Index::search`].
 ///
+/// The operators are case-sensitive and must stand between spaces (`NOT`
+/// followed by a space): `a and b` is three search words. Each `NOT` nests
+/// one negation, so `NOT NOT a` parses as `Not(Not(a))`.
+///
 /// The parser is intentionally lenient: unbalanced parentheses are treated as
 /// part of the surrounding text so that user input never causes a parse error.
+/// An empty group is an empty `OR`, which matches nothing — inside an `AND`
+/// (`a AND ()`) it empties the whole conjunction.
 ///
 /// # Examples
 ///
@@ -33,10 +39,10 @@ pub enum QueryType {
     Term(String),
 
     /// A logical OR query that requires at least one subquery to match
-    Or(Vec<Box<QueryType>>),
+    Or(Vec<QueryType>),
 
     /// A logical AND query that requires all subqueries to match
-    And(Vec<Box<QueryType>>),
+    And(Vec<QueryType>),
 
     /// A logical NOT query that negates the result of its subquery
     Not(Box<QueryType>),
@@ -90,11 +96,6 @@ impl QueryType {
         Ok(query)
     }
 
-    /// Returns true when executing this AST may materialize a NOT complement.
-    pub fn may_materialize_not_complement(&self) -> bool {
-        may_materialize_not_complement(self, false)
-    }
-
     fn validate_complexity(&self) -> Result<(), String> {
         let mut stats = QueryStats::default();
         validate_ast(self, 0, &mut stats)
@@ -116,9 +117,9 @@ impl QueryType {
             return Self::parse_and_expression(parts[0], depth);
         }
 
-        let subqueries: Vec<Box<QueryType>> = parts
+        let subqueries: Vec<QueryType> = parts
             .into_iter()
-            .map(|p| Box::new(Self::parse_and_expression(p, depth)))
+            .map(|p| Self::parse_and_expression(p, depth))
             .collect();
 
         QueryType::Or(subqueries)
@@ -140,9 +141,9 @@ impl QueryType {
             return Self::parse_not_expression(parts[0], depth);
         }
 
-        let subqueries: Vec<Box<QueryType>> = parts
+        let subqueries: Vec<QueryType> = parts
             .into_iter()
-            .map(|p| Box::new(Self::parse_not_expression(p, depth)))
+            .map(|p| Self::parse_not_expression(p, depth))
             .collect();
 
         QueryType::And(subqueries)
@@ -158,13 +159,26 @@ impl QueryType {
     ///
     /// A QueryType representing the parsed NOT expression
     fn parse_not_expression(query: &str, depth: usize) -> Self {
-        let query = query.trim();
+        let mut rest = query.trim();
 
-        if let Some(stripped) = query.strip_prefix("NOT ") {
-            return QueryType::Not(Box::new(Self::parse_term(stripped, depth)));
+        // Every `NOT` nests one more level. Counting them iteratively and
+        // stopping at the nesting budget keeps the parser stack-safe and the
+        // resulting tree shallow enough to execute (and drop) recursively;
+        // past the budget the remaining `NOT`s degrade to plain words, like
+        // parentheses do in `parse_term`.
+        let mut negations = 0usize;
+        while depth + negations < MAX_LOGICAL_QUERY_DEPTH
+            && let Some(stripped) = rest.strip_prefix("NOT ")
+        {
+            negations += 1;
+            rest = stripped.trim_start();
         }
 
-        Self::parse_term(query, depth)
+        let mut expr = Self::parse_term(rest, depth + negations);
+        for _ in 0..negations {
+            expr = QueryType::Not(Box::new(expr));
+        }
+        expr
     }
 
     /// Parses a term or parenthesized expression, which has the highest precedence.
@@ -211,9 +225,9 @@ impl QueryType {
         // Handle multiple terms (default to OR relationship)
         let terms: Vec<&str> = query.split_whitespace().collect();
         if terms.len() > 1 {
-            let subqueries: Vec<Box<QueryType>> = terms
+            let subqueries: Vec<QueryType> = terms
                 .into_iter()
-                .map(|t| Box::new(QueryType::Term(t.to_lowercase())))
+                .map(|t| QueryType::Term(t.to_lowercase()))
                 .collect();
             return QueryType::Or(subqueries);
         }
@@ -307,47 +321,6 @@ impl QueryType {
 
         result.push(s[start..].trim());
         result
-    }
-}
-
-fn may_materialize_not_complement(query: &QueryType, negated_not: bool) -> bool {
-    match query {
-        QueryType::Term(_) => false,
-        QueryType::Not(subquery) => !negated_not || may_materialize_not_complement(subquery, false),
-        QueryType::Or(subqueries) => subqueries
-            .iter()
-            .any(|query| may_materialize_not_complement(query, false)),
-        QueryType::And(subqueries) => {
-            if subqueries.is_empty() {
-                return false;
-            }
-            if subqueries.len() == 1 {
-                return may_materialize_not_complement(&subqueries[0], false);
-            }
-
-            let has_positive = subqueries
-                .iter()
-                .any(|query| !matches!(query.as_ref(), QueryType::Not(_)));
-            if has_positive {
-                return subqueries
-                    .iter()
-                    .filter(|query| !matches!(query.as_ref(), QueryType::Not(_)))
-                    .any(|query| may_materialize_not_complement(query, false))
-                    || subqueries
-                        .iter()
-                        .filter(|query| matches!(query.as_ref(), QueryType::Not(_)))
-                        .any(|query| may_materialize_not_complement(query, true));
-            }
-
-            let mut negatives = subqueries.iter();
-            if let Some(first) = negatives.next()
-                && may_materialize_not_complement(first, false)
-            {
-                return true;
-            }
-
-            negatives.any(|query| may_materialize_not_complement(query, true))
-        }
     }
 }
 
@@ -453,8 +426,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("hello AND world"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Term("world".to_string()))
+                QueryType::Term("hello".to_string()),
+                QueryType::Term("world".to_string())
             ])
         );
     }
@@ -465,8 +438,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("hello OR world"),
             QueryType::Or(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Term("world".to_string()))
+                QueryType::Term("hello".to_string()),
+                QueryType::Term("world".to_string())
             ])
         );
     }
@@ -486,16 +459,14 @@ mod tests {
         assert_eq!(
             QueryType::parse("(hello AND world) OR (rust AND NOT java)"),
             QueryType::Or(vec![
-                Box::new(QueryType::And(vec![
-                    Box::new(QueryType::Term("hello".to_string())),
-                    Box::new(QueryType::Term("world".to_string()))
-                ])),
-                Box::new(QueryType::And(vec![
-                    Box::new(QueryType::Term("rust".to_string())),
-                    Box::new(QueryType::Not(Box::new(QueryType::Term(
-                        "java".to_string()
-                    ))))
-                ]))
+                QueryType::And(vec![
+                    QueryType::Term("hello".to_string()),
+                    QueryType::Term("world".to_string())
+                ]),
+                QueryType::And(vec![
+                    QueryType::Term("rust".to_string()),
+                    QueryType::Not(Box::new(QueryType::Term("java".to_string())))
+                ])
             ])
         );
     }
@@ -507,8 +478,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("(hello AND world"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Term("world".to_string()))
+                QueryType::Term("hello".to_string()),
+                QueryType::Term("world".to_string())
             ])
         );
 
@@ -516,8 +487,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("hello AND world)"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Term("world".to_string()))
+                QueryType::Term("hello".to_string()),
+                QueryType::Term("world".to_string())
             ])
         );
 
@@ -525,11 +496,11 @@ mod tests {
         assert_eq!(
             QueryType::parse("(hello AND (world OR rust)"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Or(vec![
-                    Box::new(QueryType::Term("world".to_string())),
-                    Box::new(QueryType::Term("rust".to_string()))
-                ]))
+                QueryType::Term("hello".to_string()),
+                QueryType::Or(vec![
+                    QueryType::Term("world".to_string()),
+                    QueryType::Term("rust".to_string())
+                ])
             ])
         );
     }
@@ -547,8 +518,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("巨蟹 AND rust"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("巨蟹".to_string())),
-                Box::new(QueryType::Term("rust".to_string()))
+                QueryType::Term("巨蟹".to_string()),
+                QueryType::Term("rust".to_string())
             ])
         );
 
@@ -556,8 +527,8 @@ mod tests {
         assert_eq!(
             QueryType::parse("巨蟹 OR 天蝎"),
             QueryType::Or(vec![
-                Box::new(QueryType::Term("巨蟹".to_string())),
-                Box::new(QueryType::Term("天蝎".to_string()))
+                QueryType::Term("巨蟹".to_string()),
+                QueryType::Term("天蝎".to_string())
             ])
         );
 
@@ -565,11 +536,11 @@ mod tests {
         assert_eq!(
             QueryType::parse("(巨蟹 AND 座) OR 天蝎"),
             QueryType::Or(vec![
-                Box::new(QueryType::And(vec![
-                    Box::new(QueryType::Term("巨蟹".to_string())),
-                    Box::new(QueryType::Term("座".to_string()))
-                ])),
-                Box::new(QueryType::Term("天蝎".to_string()))
+                QueryType::And(vec![
+                    QueryType::Term("巨蟹".to_string()),
+                    QueryType::Term("座".to_string())
+                ]),
+                QueryType::Term("天蝎".to_string())
             ])
         );
 
@@ -583,9 +554,9 @@ mod tests {
         assert_eq!(
             QueryType::parse("巨蟹 天蝎 双鱼"),
             QueryType::Or(vec![
-                Box::new(QueryType::Term("巨蟹".to_string())),
-                Box::new(QueryType::Term("天蝎".to_string())),
-                Box::new(QueryType::Term("双鱼".to_string()))
+                QueryType::Term("巨蟹".to_string()),
+                QueryType::Term("天蝎".to_string()),
+                QueryType::Term("双鱼".to_string())
             ])
         );
     }
@@ -643,15 +614,15 @@ mod tests {
         assert_eq!(
             QueryType::parse("hello AND world))"),
             QueryType::And(vec![
-                Box::new(QueryType::Term("hello".to_string())),
-                Box::new(QueryType::Term("world".to_string()))
+                QueryType::Term("hello".to_string()),
+                QueryType::Term("world".to_string())
             ])
         );
         assert_eq!(
             QueryType::parse("a) OR b)"),
             QueryType::Or(vec![
-                Box::new(QueryType::Term("a".to_string())),
-                Box::new(QueryType::Term("b".to_string()))
+                QueryType::Term("a".to_string()),
+                QueryType::Term("b".to_string())
             ])
         );
         assert_eq!(
@@ -664,20 +635,38 @@ mod tests {
     }
 
     #[test]
-    fn not_complement_detection_distinguishes_and_not_filter() {
-        let query = QueryType::try_parse("hello AND NOT world").unwrap();
-        assert!(!query.may_materialize_not_complement());
-
-        let query = QueryType::try_parse("hello OR NOT world").unwrap();
-        assert!(query.may_materialize_not_complement());
-
-        let query = QueryType::try_parse("hello AND NOT (world AND NOT rust)").unwrap();
-        assert!(!query.may_materialize_not_complement());
-
-        let query = QueryType::try_parse("hello AND NOT (world OR NOT rust)").unwrap();
-        assert!(query.may_materialize_not_complement());
-
-        let query = QueryType::try_parse("hello AND NOT (NOT world)").unwrap();
-        assert!(query.may_materialize_not_complement());
+    fn parse_not_chains_nest_one_negation_per_not() {
+        assert_eq!(
+            QueryType::parse("NOT a"),
+            QueryType::Not(Box::new(QueryType::Term("a".to_string())))
+        );
+        assert_eq!(
+            QueryType::parse("NOT NOT a"),
+            QueryType::Not(Box::new(QueryType::Not(Box::new(QueryType::Term(
+                "a".to_string()
+            )))))
+        );
+        assert_eq!(
+            QueryType::parse("b AND NOT NOT a"),
+            QueryType::And(vec![
+                QueryType::Term("b".to_string()),
+                QueryType::Not(Box::new(QueryType::Not(Box::new(QueryType::Term(
+                    "a".to_string()
+                )))))
+            ])
+        );
+        // Operators are case-sensitive: a lowercase `not` is a search word.
+        assert_eq!(
+            QueryType::parse("not a"),
+            QueryType::Or(vec![
+                QueryType::Term("not".to_string()),
+                QueryType::Term("a".to_string())
+            ])
+        );
+        // A NOT flood is bounded like a parenthesis flood: parsing stays
+        // total and the tree stays shallow enough to validate and drop.
+        let flood = "NOT ".repeat(100_000) + "a";
+        let query = QueryType::parse(&flood);
+        assert!(query.validate_complexity().is_err());
     }
 }

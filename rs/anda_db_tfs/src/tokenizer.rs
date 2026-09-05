@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 pub use tantivy_tokenizer_api::*;
 
@@ -132,15 +132,15 @@ pub fn default_tokenizer() -> TokenizerChain {
 ///
 /// # Returns
 ///
-/// A HashMap of tokens and their counts.
+/// A map of tokens and their counts.
 /// The keys are the token strings and the values are their counts.
 pub fn collect_tokens<T: Tokenizer>(
     tokenizer: &mut T,
     text: &str,
-    inclusive: Option<&HashMap<String, usize>>,
-) -> HashMap<String, usize> {
+    inclusive: Option<&FxHashMap<String, usize>>,
+) -> FxHashMap<String, usize> {
     let mut stream = tokenizer.token_stream(text);
-    let mut tokens = HashMap::new();
+    let mut tokens = FxHashMap::default();
     while let Some(token) = stream.next() {
         // See "Token length filter" above: byte length, deliberately.
         if token.text.len() <= 1 {
@@ -168,13 +168,13 @@ pub fn collect_tokens<T: Tokenizer>(
 ///
 /// # Returns
 ///
-/// A HashMap of matching tokens and their counts.
+/// A map of matching tokens and their counts.
 /// The keys are the token strings and the values are their counts.
 pub fn flat_full_text_search<T: Tokenizer>(
     tokenizer: &mut T,
     query: &str,
     text: &str,
-) -> HashMap<String, usize> {
+) -> FxHashMap<String, usize> {
     let tokens = collect_tokens(tokenizer, query, None);
     collect_tokens(tokenizer, text, Some(&tokens))
 }
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(tokens.get("fox"), Some(&1));
 
         // 测试过滤分词
-        let inclusive = HashMap::from([("quick".to_string(), 1), ("fox".to_string(), 1)]);
+        let inclusive = FxHashMap::from_iter([("quick".to_string(), 1), ("fox".to_string(), 1)]);
         let tokens = collect_tokens(
             &mut tokenizer,
             "The quick brown fox, foxes",
