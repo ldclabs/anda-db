@@ -172,9 +172,25 @@ fn test_config_validation_normalization_and_accessors() {
         index.get_node_with(42, |node| node.id),
         Err(HnswError::NotFound { id: 42, .. })
     ));
+    assert!(matches!(
+        index.get_vector_with(42, |vector| vector.len()),
+        Err(HnswError::NotFound { id: 42, .. })
+    ));
     assert_eq!(
         index.search_f32(&[0.0, 0.0], 3).unwrap(),
         Vec::<(u64, f32)>::new()
+    );
+    index
+        .insert(42, vec![bf16::from_f32(1.0), bf16::from_f32(2.0)], 1)
+        .unwrap();
+    assert_eq!(
+        index
+            .get_vector_with(42, |vector| vector
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>())
+            .unwrap(),
+        vec![1.0, 2.0]
     );
 }
 

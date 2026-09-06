@@ -94,6 +94,37 @@ impl Schema {
             })
     }
 
+    /// Whether documents created under `source` can be rebound to this
+    /// schema without changing the meaning of any stored field index.
+    ///
+    /// This is broader than [`Self::has_same_field_mapping`]: a compatible
+    /// older schema may lack newly added optional fields, retain fields this
+    /// schema retired, or use a type that this schema upgraded compatibly
+    /// (for example `Text` to `Option<Text>`). Shared names must still use the
+    /// same stable index, and a source-only field must not collide with a
+    /// current field. A watermarked lineage also rejects indexes it never
+    /// allocated.
+    pub fn accepts_documents_from(&self, source: &Self) -> bool {
+        let source_fields_fit = source.fields.iter().all(|(name, source_field)| {
+            if let Some(field) = self.fields.get(name) {
+                return field.idx() == source_field.idx()
+                    && field
+                        .r#type()
+                        .is_compatible_upgrade_of(source_field.r#type());
+            }
+
+            !self.contains_idx(source_field.idx())
+                && (!self.has_allocation_watermark()
+                    || source_field.idx() < self.allocated_idx_end())
+        });
+
+        source_fields_fit
+            && self
+                .fields
+                .iter()
+                .all(|(name, field)| source.fields.contains_key(name) || !field.required())
+    }
+
     /// The key name for the ID field. it is a special u64 field used as an internal unique identifier in a collection. It is always present in the schema with idx 0.
     pub const ID_KEY: &str = "_id";
 

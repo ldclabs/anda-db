@@ -7,8 +7,8 @@
 
 | 验证 | 结果 |
 | --- | --- |
-| 工作区 `cargo test --workspace --all-features` | **1,618 passed，0 failed，1 ignored**（手动夹具生成） |
-| 正式审查回归 | **23 个测试通过**，含更新/删除提交前后中断、独立唯一键并发、布尔分页参考集合与 schema 映射 |
+| 工作区 `cargo test --workspace --all-features` | **1,621 passed，0 failed，1 ignored**（手动夹具生成） |
+| 正式审查回归 | **25 个测试通过**，含更新/删除提交前后中断、独立唯一键并发、布尔分页参考集合与 schema 映射 |
 | Core、Schema、TFS 严格 Clippy（all-targets / all-features / -D warnings） | 通过 |
 | 独立 Rust 消费者，object_store 0.14，真实文件后端 | 创建、写入、关闭、重开、Jieba 检索通过 |
 | v0_8 / v0_11 存储夹具 | 保持可读，未重新生成夹具 |
@@ -29,7 +29,7 @@ CRUD 使用类型化撤销记录，B-Tree/BM25 共用条件元数据提交和过
 独立接入验证额外修正了 S04 的本地文件示例：原生 LocalFileSystem 0.14 不支持条件更新，
 现已统一使用 MetaStore 包装；README、技术文档、CLAUDE/AGENTS 和本地 skill 均已对齐。
 
-性能数据、原始结果和复跑命令见 [基准报告](/Users/zensh/git/github.com/ldclabs/anda-db/docs/benchmarks/anda_db_core_2026-09-06/README.md)。
+性能数据、原始结果和复跑命令见 [基准报告](benchmarks/anda_db_core_2026-09-06/README.md)。
 有界 OR / 主键布尔计算、选择率排序、候选集下推和有界恢复 I/O 已落地。
 没有声称所有路径都加速：单路 BM25 的中位延迟未显著改善，本地文件日志清理仍受后端同步成本影响。
 大块 codec 有线程切换成本，详见基准中的串行与并发对照。
@@ -59,11 +59,11 @@ CRUD 使用类型化撤销记录，B-Tree/BM25 共用条件元数据提交和过
 | 本次专项复现 | 16/16 确认当前行为：15 项问题，1 项压实优化依据 |
 | 云对象存储、真实断电、性能吞吐基准 | 本次未执行；不声称有相应验证或提升百分比 |
 
-修复前的 [异常探针](/Users/zensh/git/github.com/ldclabs/anda-db/docs/anda_db_review_repros.rs)
-作为历史证据保留。当前运行入口改为永久的 [回归套件](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/tests/review_regressions.rs)：
+修复前的 [异常探针](anda_db_review_repros.rs)
+作为历史证据保留。当前运行入口改为永久的 [回归套件](../rs/anda_db/tests/review_regressions.rs)：
 
 ```bash
-bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.sh --nocapture
+bash docs/run_anda_db_review_repros.sh --nocapture
 ```
 
 **现在通过表示修复后的行为成立。** 下文保留原问题的触发过程与实施建议；勾选表示该工作项已处理。
@@ -72,7 +72,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B01：让唯一键的占用持续到文档提交完成。**
 
-  位置：[crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)、[btree.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/index/btree.rs)。当前更新先改变索引，再异步写文档；按文档 ID 分条带的锁不能保护其他文档对旧唯一键的抢占。
+  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)、[btree.rs](../rs/anda_db/src/index/btree.rs)。当前更新先改变索引，再异步写文档；按文档 ID 分条带的锁不能保护其他文档对旧唯一键的抢占。
 
   已复现：A 的唯一键是 `x`，更新为 `y` 的文档 PUT 尚未执行时，B 成功插入 `x`；中断 A 的更新并重开后，A、B 的持久化文档都为 `x`，但唯一索引只返回其中一个。失效句柄和重放日志不能修复这个跨文档约束冲突。
 
@@ -82,7 +82,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B02：所有元数据写入路径都必须遵守“索引先持久化、引用后发布”。**
 
-  位置：[persistence.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/persistence.rs)、[extensions.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/extensions.rs)、[index_ops.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/index_ops.rs)。`flush_inner` 的顺序已经正确，但 `store_metadata_unclaimed` 写的是包含未提交索引注册信息的完整元数据。
+  位置：[persistence.rs](../rs/anda_db/src/collection/persistence.rs)、[extensions.rs](../rs/anda_db/src/collection/extensions.rs)、[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)。`flush_inner` 的顺序已经正确，但 `store_metadata_unclaimed` 写的是包含未提交索引注册信息的完整元数据。
 
   已复现：已有文档且 checkpoint 已推进；打开回调创建 B-Tree 索引、调用 `save_extension`、随后返回错误。再次打开时索引已登记，`_nx` 不再回填，而磁盘索引还是空的；文档能 get，却无法通过索引找到。删除另一个索引也会走同一元数据发布入口。
 
@@ -92,7 +92,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B03：恢复扫描遇到临时读取失败时，不得跨过失败 ID 提交 checkpoint。**
 
-  位置：[recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)。`auto_repair_indexes` 将 NotFound 以外的错误也记录后跳过；后续正常文档触发 flush，checkpoint 会越过读取失败的文档。
+  位置：[recovery.rs](../rs/anda_db/src/collection/recovery.rs)。`auto_repair_indexes` 将 NotFound 以外的错误也记录后跳过；后续正常文档触发 flush，checkpoint 会越过读取失败的文档。
 
   已复现：两个已成功 add、尚未 checkpoint 的文档，恢复时仅让 `data/1.cbor` 的 GET 临时失败一次。打开成功且 checkpoint 变成 2；再次打开仍只能看到文档 2，而文档 1 的对象完好存在。必须手动 `reconcile_storage` 才找回。
 
@@ -102,7 +102,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B04：重开时将用户设置的分词器应用到已加载的 BM25 索引。**
 
-  位置：[lifecycle.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/lifecycle.rs)、[index_ops.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/index_ops.rs)、[collection.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection.rs)。索引先使用默认分词器 bootstrap，随后回调中的 `set_tokenizer` 只替换 Collection 字段，不更新 BM25 内部的分词器。
+  位置：[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)、[collection.rs](../rs/anda_db/src/collection.rs)。索引先使用默认分词器 bootstrap，随后回调中的 `set_tokenizer` 只替换 Collection 字段，不更新 BM25 内部的分词器。
 
   已复现：按官方示例的方式设置 Jieba、创建索引、插入“南京市长江大桥”。重开前可搜索，重开并再次设置 Jieba 后，同样的全文查询为空；`collection.tokenize` 却仍显示正确分词。
 
@@ -112,7 +112,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B05：迁移/恢复数据库前缀后，所有集合路径必须跟随打开路径。**
 
-  位置：[database.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/database.rs)、[lifecycle.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/lifecycle.rs)、[database.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/database.rs)。Storage 已采用调用方的新路径，但 AndaDB 的 `name` 仍取自旧 `db_meta.cbor`；集合使用 `db.name()` 拼接路径。
+  位置：[database.rs](../rs/anda_db/src/database.rs)、[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[database.rs](../rs/anda_db/src/database.rs)。Storage 已采用调用方的新路径，但 AndaDB 的 `name` 仍取自旧 `db_meta.cbor`；集合使用 `db.name()` 拼接路径。
 
   已复现：把 `reviewdb/` 完整复制到 `restored/` 后，以 `restored` 打开并新增文档，实际写入 `reviewdb/docs/data/2.cbor`。若旧前缀不存在，集合打不开；若旧前缀仍存在，会读写原库。删除路径也依赖同一旧名称。
 
@@ -122,7 +122,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B06：`create_btree_index_nx` 只忽略“目标索引确实已存在”。**
 
-  位置：[index_ops.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/index_ops.rs)。它无条件吞掉整个创建过程返回的 `DBError::AlreadyExists`，但唯一索引回填冲突使用同一种错误。
+  位置：[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)。它无条件吞掉整个创建过程返回的 `DBError::AlreadyExists`，但唯一索引回填冲突使用同一种错误。
 
   已复现：先存两个相同 key 的文档，再执行 `_nx` 创建唯一索引；调用返回成功，实际没有注册索引，第三个重复 key 仍可插入。组合唯一索引也受这一错误分类方式影响。
 
@@ -134,55 +134,55 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **B07：区分文档大小上限与意图日志大小上限。**
 
-  位置：[recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)、[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)。日志同时保存旧、新两份完整文档，却走同一个 `max_small_object_size` 检查。默认上限实际为 2,048,000 字节（配置注释称为 2 MiB）。1,100,000 字符的 body 可以插入，但仅修改短 key 就会因日志超过上限而失败。
+  位置：[recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[storage.rs](../rs/anda_db/src/storage.rs)。日志同时保存旧、新两份完整文档，却走同一个 `max_small_object_size` 检查。默认上限实际为 2,048,000 字节（配置注释称为 2 MiB）。1,100,000 字符的 body 可以插入，但仅修改短 key 就会因日志超过上限而失败。
 
   执行：为内部意图定义足够且受控的独立限额，或保存差量/索引前后映像；同时考虑 CBOR 包装开销与兼容格式。验收：接近文档上限的合法文档仍可更新、删除并恢复。探针：`repro_accepted_large_document_cannot_be_updated`。
 
 - [x] **B08：开放业务回调前，先保证 ID 分配器不会碰到未恢复对象。**
 
-  位置：[lifecycle.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/lifecycle.rs)、[lifecycle.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/lifecycle.rs)。回调发生在 replay/repair 之前，分配器从旧 metadata max 起步，而不是从尚待扫描的持久化水位以上开始。
+  位置：[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)。回调发生在 replay/repair 之前，分配器从旧 metadata max 起步，而不是从尚待扫描的持久化水位以上开始。
 
   已复现：文档 1 add 成功后进程结束，重开回调里添加另一文档，错误地再次分配 ID 1 并报 AlreadyExists，导致打开失败。执行：至少将回调可用的分配器推进到已持久化预留水位；更完整的 API 可拆分配置阶段和恢复后的业务阶段，同时保证 hooks 先于重放生效。验收：带未 checkpoint 新增的重开回调仍可安全 add，且原有文档完整恢复。探针：`repro_open_callback_add_runs_before_allocator_recovery`。
 
 - [x] **B09：维护性删除也要留下可恢复的按 ID 清理记录。**
 
-  位置：[crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)。只有能正常构造 Document 时才记录删除日志；dead ID 或 schema 无法解码的文档走直接扫索引分支。
+  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)。只有能正常构造 Document 时才记录删除日志；dead ID 或 schema 无法解码的文档走直接扫索引分支。
 
   已复现：已 checkpoint 文档的对象丢失，`remove` 成功清理内存后进程结束；重开时旧 bitmap 与唯一键占用恢复，替代文档仍被拒绝。执行：添加不依赖前映像的 purge-by-id 意图，恢复时扫除相应索引和 bitmap，checkpoint 后才删除该记录。验收：dead ID 和 schema-invalid 对象的删除在任意中断点可重试且不会恢复幽灵唯一键。探针：`repro_dead_id_removal_has_no_replay_record`。
 
 - [x] **B10：扩展元数据的未知提交结果也必须令句柄失效。**
 
-  位置：[persistence.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/persistence.rs)、[extensions.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/extensions.rs)。`guarded` 在 future 返回 Err 时也会解除保护；这里只有取消保护，没有对应的未知存储结果处理。
+  位置：[persistence.rs](../rs/anda_db/src/collection/persistence.rs)、[extensions.rs](../rs/anda_db/src/collection/extensions.rs)。`guarded` 在 future 返回 Err 时也会解除保护；这里只有取消保护，没有对应的未知存储结果处理。
 
   已复现：meta PUT 实际成功但丢失响应，`save_extension` 返回错误后 state 仍为 Active；`open_collection` 返回同一个旧句柄，后续扩展写入因旧 CAS token 持续失败。执行：在元数据持久化边界分类错误，未知结果和 CAS 冲突触发 poison；序列化/本地大小预检失败保留可恢复的健康状态。同步覆盖 remove_extension、删除索引与 compaction 的错误出口。验收：ErrorAfter 后直接重开得到新句柄，后续写入成功。探针：`repro_unknown_extension_commit_does_not_poison`。
 
 - [x] **B11：HNSW bootstrap 的清理应尊重只读模式。**
 
-  位置：[hnsw.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/index/hnsw.rs)。bootstrap 无条件运行 `purge_orphan_node_blobs`，而上层只在打开完成后判断是否允许 flush。
+  位置：[hnsw.rs](../rs/anda_db/src/index/hnsw.rs)。bootstrap 无条件运行 `purge_orphan_node_blobs`，而上层只在打开完成后判断是否允许 flush。
 
   已复现：在未引用的节点对象存在时，只读 open 仍发出 DELETE。执行：将清理移到可写维护阶段，或显式传入只读打开策略。验收：只读打开的整个存储调用日志中没有 PUT/DELETE/COPY；可写重开仍能清理真实崩溃遗留对象。探针：`repro_read_only_open_deletes_orphan_hnsw_blobs`。
 
 - [x] **B12：流式写入成功的数据必须能按约定读回。**
 
-  位置：[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)、[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)。读取以 `max(压缩后大小×16, 小对象上限×16)` 作为解压限额，流式写入却没有相应约束。
+  位置：[storage.rs](../rs/anda_db/src/storage.rs)、[storage.rs](../rs/anda_db/src/storage.rs)。读取以 `max(压缩后大小×16, 小对象上限×16)` 作为解压限额，流式写入却没有相应约束。
 
   已复现：小对象上限 1 KiB 时，64 KiB 重复文本可流式写入并 shutdown 成功，但只读出 16 KiB 就报超限。默认配置下，高压缩率且大于 32,768,000 字节的数据也会碰到该条件。执行：定义独立的流式明文大小预算，并在写端验证；或使用受验证的原始长度元数据。不能只由压缩比推断正常数据是否过大。验收：分别测试重复文本、零字节、不可压缩数据、限额前后边界，成功写入的对象应能完整 round-trip。探针：`repro_stream_writer_reader_rejects_compressible_roundtrip`。
 
 - [x] **B13：压缩头识别不能依赖第一次缓冲至少有 4 字节。**
 
-  位置：[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)。`object_chunk_size=1..3` 合法进入构造，第一次 `fill_buf` 不足以识别 zstd magic，流式读取会直接返回压缩内容。
+  位置：[storage.rs](../rs/anda_db/src/storage.rs)。`object_chunk_size=1..3` 合法进入构造，第一次 `fill_buf` 不足以识别 zstd magic，流式读取会直接返回压缩内容。
 
   执行：在不丢失前缀的前提下读取完整 magic，或在初始化验证并约束块大小；对 0 也明确拒绝。验收：块大小 1、2、3、4、默认值下，压缩与未压缩对象的 buffered/stream 结果一致，或小块配置明确报错。探针：`repro_stream_reader_small_chunk_does_not_sniff_zstd`。
 
 - [x] **B14：遍历 JSON 数组时逐个检查元素。**
 
-  位置：[index/mod.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/index/mod.rs)。只在首元素是字符串或对象时进入 JSON 数组，因此 `[0, "searchable", ["nested"]]` 的两个文本都被遗漏；首元素为嵌套数组时也不会递归。
+  位置：[index/mod.rs](../rs/anda_db/src/index/mod.rs)。只在首元素是字符串或对象时进入 JSON 数组，因此 `[0, "searchable", ["nested"]]` 的两个文本都被遗漏；首元素为嵌套数组时也不会递归。
 
   执行：移除首元素筛选，对所有元素使用现有迭代栈与复杂度预算，非文本元素自然跳过。验收：混合数组、嵌套数组和空数组语义一致；重建索引使历史遗漏文本可搜索。探针：`repro_json_text_extraction_depends_on_first_array_element`。
 
 - [x] **B15：`add(Document)` 应验证 Document 的字段编号映射与集合一致。**
 
-  位置：[crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)。集合验证按自己的字段编号检查值，索引 hooks 却按传入 Document 自带的 schema 查字段名；两者不一定是同一套映射。
+  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)。集合验证按自己的字段编号检查值，索引 hooks 却按传入 Document 自带的 schema 查字段名；两者不一定是同一套映射。
 
   已复现：两个 schema 都有文本字段 a/b，但注册顺序相反；add 接受外部 Document 后，查询 a=`A` 返回该 ID，get 却显示 a=`B`。执行：拒绝不兼容的字段编号映射，或按字段名显式转换后再统一验证和索引；不能只比较 Arc 指针。验收：独立构造但等价的 schema 可接受；编号不兼容的 schema 明确拒绝或按名转换，立即读取与重开前后的索引一致。探针：`repro_foreign_document_schema_yields_wrong_index_values`。
 
@@ -192,14 +192,14 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 | 完成 | 编号 | 可执行改动 | 位置与依据 | 验收方式 |
 | --- | --- | --- | --- | --- |
-| [x] | P01 | 对布尔过滤实施有界集合计算和候选集下推 | [query.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/query.rs)：Or/And 子树以 limit=0 展开；限额 1,000 只限制最终输出，复杂过滤仍可分配 O(N) 中间集合。Not 即使候选集很小也求全量排除集。 | 用 reference set 验证所有等价表达式与双向分页；记录高匹配率、嵌套过滤下的峰值分配、p95。Or 的每个分支可保留同方向前 K 个再合并：被分支排除的 ID 已有至少 K 个更靠前的并集成员；And 不能直接套这个截断规则。 |
-| [x] | P02 | 对恢复读取、意图读取与清理使用有界并发；把垃圾回收与提交边界分开建模 | [recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)、[recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)、[recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)：每个对象串行 await，日志删除又处于独占 operation_gate 内。 | 用 1/10/50 ms 存储延迟、64/1,000 条待恢复记录测重开与写入阻塞时间；并发保持可配置上限。串行部分约为 N×单次请求延迟，不应按 CPU 优化处理。必须先修 B03，任何并行化都不能吞掉恢复失败。 |
-| [x] | P03 | 缩减在内存中保留的意图内容；评估索引映像或差量日志 | [recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)、[recovery.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/recovery.rs)：每次更新持有两份完整文档，重开还 clone 整张 intent map。正常 flush 主要需要路径/sequence 来清理。 | 测同一大文档重复更新 1,000 次、checkpoint 前后的 RSS、编码字节数和恢复时间；保持多次更新与部分 checkpoint 的重放正确性。内存中可只保留序号，磁盘格式优化单独实施。 |
-| [x] | P04 | 让 BM25 compaction 按 changed/dirty 状态决定持久化，避免相同桶数反复重排 | [bm25.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/index/bm25.rs)：底层即使桶数不变也重建并标脏，wrapper 因 new_count >= old_count 直接返回。现有文档确实只承诺桶数减少时持久化，因此列为优化。 | 探针 `repro_bm25_compaction_same_bucket_count_does_not_flush` 已确认相同桶数压实后仍 dirty；参考 B-Tree 的 CompactionOutcome。第一次必要压实提交，紧接第二次无变化调用应为 no-op。 |
-| [x] | P05 | 给单路检索提供直接返回路径，删除 RRF 后重复去重 | [query.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/query.rs)、[query.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/query.rs)：即使只有一个排名列表也建 hash map、排序，再转 UniqueVec；RRF 的 map 已保证输出 ID 唯一。 | 对单 BM25、单 HNSW、混合与多同类索引比较结果顺序、边界值和分配数；多路 top-K 可进一步评估有界堆，避免无必要全排序。 |
-| [x] | P06 | 测量同步计算对异步执行器的占用，按阈值做有界 CPU 调度 | [crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)、[query.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/query.rs)、[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)：验证、tokenization、HNSW、CBOR 与 zstd 直接在 async 调用里同步执行。 | 同时运行短查询和大文档写入，测短请求 p99/执行器调度延迟。大任务可批量 offload，保留小任务快速路径；spawn_blocking 的任务不会随外层取消自动停止，必须保留操作租约和结束追踪。另对工作区 release 的 opt-level=z 与速度配置做实测比较。 |
-| [x] | P07 | 建立按字节的缓存预算，测量固定 256 个失效条带的碰撞成本 | [storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)、[storage.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/storage.rs)：默认每集合 10,000 个对象、每对象最多约 2 MB；大量写入会间接淘汰同条带的其他热对象。 | 用大文档、多集合及读写混合负载测实际 RSS、命中率和后端 GET 数。优先明确 cache_max_bytes；条带数、路径 generation 方案以测量选择，不能把既有 entry-count 配置静默改成字节语义。 |
-| [x] | P08 | 为高选择性过滤提供可调的检索候选策略 | [query.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/query.rs)：目前先取每索引 min(limit×10,4096) 候选再过滤，命中可能不足。该上限已有文档，是召回/成本取舍，不计作此次 bug。 | 测租户/时间过滤选择率 0.1%、1%、10% 的 recall@K 与延迟；评估先过滤、小集合精算或自适应扩候选，保留资源上限和近似检索语义。 |
+| [x] | P01 | 对布尔过滤实施有界集合计算和候选集下推 | [query.rs](../rs/anda_db/src/collection/query.rs)：Or/And 子树以 limit=0 展开；限额 1,000 只限制最终输出，复杂过滤仍可分配 O(N) 中间集合。Not 即使候选集很小也求全量排除集。 | 用 reference set 验证所有等价表达式与双向分页；记录高匹配率、嵌套过滤下的峰值分配、p95。Or 的每个分支可保留同方向前 K 个再合并：被分支排除的 ID 已有至少 K 个更靠前的并集成员；And 不能直接套这个截断规则。 |
+| [x] | P02 | 对恢复读取、意图读取与清理使用有界并发；把垃圾回收与提交边界分开建模 | [recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)：每个对象串行 await，日志删除又处于独占 operation_gate 内。 | 用 1/10/50 ms 存储延迟、64/1,000 条待恢复记录测重开与写入阻塞时间；并发保持可配置上限。串行部分约为 N×单次请求延迟，不应按 CPU 优化处理。必须先修 B03，任何并行化都不能吞掉恢复失败。 |
+| [x] | P03 | 缩减在内存中保留的意图内容；评估索引映像或差量日志 | [recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)：每次更新持有两份完整文档，重开还 clone 整张 intent map。正常 flush 主要需要路径/sequence 来清理。 | 测同一大文档重复更新 1,000 次、checkpoint 前后的 RSS、编码字节数和恢复时间；保持多次更新与部分 checkpoint 的重放正确性。内存中可只保留序号，磁盘格式优化单独实施。 |
+| [x] | P04 | 让 BM25 compaction 按 changed/dirty 状态决定持久化，避免相同桶数反复重排 | [bm25.rs](../rs/anda_db/src/index/bm25.rs)：底层即使桶数不变也重建并标脏，wrapper 因 new_count >= old_count 直接返回。现有文档确实只承诺桶数减少时持久化，因此列为优化。 | 探针 `repro_bm25_compaction_same_bucket_count_does_not_flush` 已确认相同桶数压实后仍 dirty；参考 B-Tree 的 CompactionOutcome。第一次必要压实提交，紧接第二次无变化调用应为 no-op。 |
+| [x] | P05 | 给单路检索提供直接返回路径，删除 RRF 后重复去重 | [query.rs](../rs/anda_db/src/collection/query.rs)、[query.rs](../rs/anda_db/src/query.rs)：即使只有一个排名列表也建 hash map、排序，再转 UniqueVec；RRF 的 map 已保证输出 ID 唯一。 | 对单 BM25、单 HNSW、混合与多同类索引比较结果顺序、边界值和分配数；多路 top-K 可进一步评估有界堆，避免无必要全排序。 |
+| [x] | P06 | 测量同步计算对异步执行器的占用，按阈值做有界 CPU 调度 | [crud.rs](../rs/anda_db/src/collection/crud.rs)、[query.rs](../rs/anda_db/src/collection/query.rs)、[storage.rs](../rs/anda_db/src/storage.rs)：验证、tokenization、HNSW、CBOR 与 zstd 直接在 async 调用里同步执行。 | 同时运行短查询和大文档写入，测短请求 p99/执行器调度延迟。大任务可批量 offload，保留小任务快速路径；spawn_blocking 的任务不会随外层取消自动停止，必须保留操作租约和结束追踪。另对工作区 release 的 opt-level=z 与速度配置做实测比较。 |
+| [x] | P07 | 建立按字节的缓存预算，测量固定 256 个失效条带的碰撞成本 | [storage.rs](../rs/anda_db/src/storage.rs)、[storage.rs](../rs/anda_db/src/storage.rs)：默认每集合 10,000 个对象、每对象最多约 2 MB；大量写入会间接淘汰同条带的其他热对象。 | 用大文档、多集合及读写混合负载测实际 RSS、命中率和后端 GET 数。优先明确 cache_max_bytes；条带数、路径 generation 方案以测量选择，不能把既有 entry-count 配置静默改成字节语义。 |
+| [x] | P08 | 为高选择性过滤提供可调的检索候选策略 | [query.rs](../rs/anda_db/src/collection/query.rs)：目前先取每索引 min(limit×10,4096) 候选再过滤，命中可能不足。该上限已有文档，是召回/成本取舍，不计作此次 bug。 | 测租户/时间过滤选择率 0.1%、1%、10% 的 recall@K 与延迟；评估先过滤、小集合精算或自适应扩候选，保留资源上限和近似检索语义。 |
 
 - [x] **S01：把 Collection 按职责拆分，但保持锁与提交不变量集中。**
 
@@ -207,7 +207,7 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **S02：用类型化撤销记录替换三套 CRUD 中多张 HashMap。**
 
-  [crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)、[crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)、[crud.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/collection/crud.rs)。这些容器用于追踪操作历史，不需要按 index 哈希查找。可使用 `Vec<UndoEntry>`，明确记录已经完成的阶段并逆序回滚，统一回滚失败的 poison 策略。必须在 B01 的跨文档隔离修复后实施；重构撤销记录本身不能解决唯一键竞争。
+  [crud.rs](../rs/anda_db/src/collection/crud.rs)、[crud.rs](../rs/anda_db/src/collection/crud.rs)、[crud.rs](../rs/anda_db/src/collection/crud.rs)。这些容器用于追踪操作历史，不需要按 index 哈希查找。可使用 `Vec<UndoEntry>`，明确记录已经完成的阶段并逆序回滚，统一回滚失败的 poison 策略。必须在 B01 的跨文档隔离修复后实施；重构撤销记录本身不能解决唯一键竞争。
 
 - [x] **S03：把元数据快照、提交与回收的状态表达清楚。**
 
@@ -215,9 +215,9 @@ bash /Users/zensh/git/github.com/ldclabs/anda-db/docs/run_anda_db_review_repros.
 
 - [x] **S04：消除文档与实际契约的矛盾，修复上手依赖版本。**
 
-  [error.rs](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/src/error.rs) 及多处注释声称非 Active 句柄拒绝所有操作，但 get/search/query 实际允许读取；[技术文档](/Users/zensh/git/github.com/ldclabs/anda-db/docs/anda_db.md:419) 又明确说明 poisoned 句柄仍可读。由于已有这一明确约定，本报告未把“缺少读取生命周期检查”计入 15 项 bug。应统一说明可读、可写、可恢复状态，以及读取旧句柄可能落后于存储的范围。
+  [error.rs](../rs/anda_db/src/error.rs) 及多处注释声称非 Active 句柄拒绝所有操作，但 get/search/query 实际允许读取；[技术文档](anda_db.md#L419) 又明确说明 poisoned 句柄仍可读。由于已有这一明确约定，本报告未把“缺少读取生命周期检查”计入 15 项 bug。应统一说明可读、可写、可恢复状态，以及读取旧句柄可能落后于存储的范围。
 
-  [README.md:33](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/README.md:33) 仍建议 `object_store=0.13`，而 crate 已依赖 0.14；照此接入会产生不同版本的 ObjectStore trait 不兼容，应更新并增加独立消费者编译验证。另外，`reconcile_storage` 仍描述“连续 missing 后停止”的旧恢复启发式，现已是水位有界扫描；清理这些会误导维护者的注释。
+  [README.md:33](../rs/anda_db/README.md#L33) 仍建议 `object_store=0.13`，而 crate 已依赖 0.14；照此接入会产生不同版本的 ObjectStore trait 不兼容，应更新并增加独立消费者编译验证。另外，`reconcile_storage` 仍描述“连续 missing 后停止”的旧恢复启发式，现已是水位有界扫描；清理这些会误导维护者的注释。
 
 **建议实施顺序与验收门槛**
 

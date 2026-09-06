@@ -57,13 +57,19 @@ impl Collection {
     }
 
     pub(super) async fn add_impl(&self, mut doc: Document) -> Result<DocumentId, DBError> {
-        if !Arc::ptr_eq(&self.schema, doc.schema())
-            && !self.schema.has_same_field_mapping(doc.schema())
-        {
-            return Err(DBError::Schema {
-                name: self.name.clone(),
-                source: "document schema does not match the collection's field mapping".into(),
-            });
+        if !Arc::ptr_eq(&self.schema, doc.schema()) {
+            if !self.schema.accepts_documents_from(doc.schema()) {
+                return Err(DBError::Schema {
+                    name: self.name.clone(),
+                    source: "document schema is not compatible with the collection's field mapping"
+                        .into(),
+                });
+            }
+            // Rebind values to the collection schema before validation and
+            // index hooks run. This normalizes compatible type upgrades and
+            // drops values of fields retired by this schema, while ensuring
+            // every subsequent name lookup uses the collection's mapping.
+            doc = Document::try_from_doc(self.schema(), doc.into())?;
         }
         self.schema.validate(doc.fields())?;
         // Flush holds the exclusive `operation_gate` while this add holds a

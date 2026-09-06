@@ -625,7 +625,12 @@ impl Storage {
         } else {
             try_decompress(bytes, max_decompress_size)
         };
-        let bytes = decoded.map_err(|err| DBError::Storage {
+        // A zstd frame was fetched successfully; failure from this point is
+        // deterministic corruption (or a decompression-budget violation),
+        // not a transient object-store failure. Keep that distinction so
+        // recovery can quarantine this object without checkpointing past a
+        // temporary GET/read error.
+        let bytes = decoded.map_err(|err| DBError::Serialization {
             name: path.to_string(),
             source: err.into(),
         })?;
@@ -994,6 +999,7 @@ impl Storage {
             limit: max_bytes,
             completing: None,
             completed: false,
+            failed: false,
         })
     }
 
@@ -1263,6 +1269,19 @@ struct StreamWriter {
     /// In-flight bookkeeping future, polled to completion by `poll_shutdown`.
     completing: Option<BoxFuture<'static, ()>>,
     completed: bool,
+    /// Once any write/flush fails, the multipart upload must never be
+    /// committed by a later `shutdown` call. The inner writer is eventually
+    /// dropped without publishing its buffered or multipart state.
+    failed: bool,
+}
+
+impl StreamWriter {
+    fn failed_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "stream for {} previously failed and cannot be published",
+            self.path
+        ))
+    }
 }
 
 impl tokio::io::AsyncWrite for StreamWriter {
@@ -1272,6 +1291,9 @@ impl tokio::io::AsyncWrite for StreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(this.failed_error()));
+        }
         if this.completed || this.completing.is_some() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1279,25 +1301,44 @@ impl tokio::io::AsyncWrite for StreamWriter {
             )));
         }
         if buf.len() as u64 > this.limit.saturating_sub(this.written) {
-            return Poll::Ready(Err(io::Error::other(
-                "stream exceeds plaintext byte budget",
-            )));
+            this.failed = true;
+            return Poll::Ready(Err(io::Error::other(format!(
+                "stream for {} exceeds plaintext byte budget of {} bytes",
+                this.path, this.limit
+            ))));
         }
         match this.inner.as_mut().poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
                 this.written += n as u64;
                 Poll::Ready(Ok(n))
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                this.failed = true;
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().inner.as_mut().poll_flush(cx)
+        let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(this.failed_error()));
+        }
+        match this.inner.as_mut().poll_flush(cx) {
+            Poll::Ready(Err(err)) => {
+                this.failed = true;
+                Poll::Ready(Err(err))
+            }
+            other => other,
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(this.failed_error()));
+        }
         if this.completed {
             return Poll::Ready(Ok(()));
         }
@@ -1308,7 +1349,11 @@ impl tokio::io::AsyncWrite for StreamWriter {
             // pre-write bytes after the invalidation.
             match this.inner.as_mut().poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => {}
-                other => return other,
+                Poll::Ready(Err(err)) => {
+                    this.failed = true;
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => return Poll::Pending,
             }
 
             let storage = this.storage.clone();

@@ -3,7 +3,14 @@ use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::{fmt::Debug, hash::Hash, sync::Arc};
+use std::{
+    fmt::Debug,
+    hash::Hash,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 pub use anda_db_hnsw::{HnswConfig, HnswMetadata, HnswStats};
 
@@ -31,6 +38,9 @@ pub struct Hnsw {
     metadata_version: Arc<RwLock<ObjectVersion>>,
     ids_version: Arc<RwLock<ObjectVersion>>,
     node_versions: Arc<RwLock<FxHashMap<u64, ObjectVersion>>>,
+    /// A read-only bootstrap defers its storage-mutating orphan sweep until
+    /// the first writable flush.
+    orphan_cleanup_pending: AtomicBool,
 }
 
 impl Debug for Hnsw {
@@ -72,7 +82,7 @@ impl Hnsw {
         for &id in ids {
             match self
                 .index
-                .get_node_with(id, |node| metric.compute_mixed(query, &node.vector))
+                .get_vector_with(id, |vector| metric.compute_mixed(query, vector))
             {
                 Ok(distance) => results.push((id, distance?)),
                 Err(HnswError::NotFound { .. }) => {}
@@ -137,6 +147,7 @@ impl Hnsw {
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
             node_versions: Arc::new(RwLock::new(FxHashMap::default())),
+            orphan_cleanup_pending: AtomicBool::new(false),
         })
     }
 
@@ -187,10 +198,16 @@ impl Hnsw {
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
             node_versions,
+            orphan_cleanup_pending: AtomicBool::new(!cleanup),
         };
+        // Loading tombstone versions is read-only and is required if this
+        // handle later becomes writable: a reused id must update its existing
+        // node blob with the observed CAS token instead of attempting Create.
+        this.load_tombstone_versions().await?;
         if cleanup {
-            this.load_tombstone_versions().await?;
-            this.purge_orphan_node_blobs().await;
+            let (complete, _) = this.purge_orphan_node_blobs().await;
+            this.orphan_cleanup_pending
+                .store(!complete, Ordering::Release);
         }
         Ok(this)
     }
@@ -235,7 +252,7 @@ impl Hnsw {
     /// space leak, and vector data lingering longer than intended. Bootstrap
     /// already pays O(nodes) to fetch every referenced blob, so one listing
     /// of the index directory to sweep unreferenced ones is proportional.
-    async fn purge_orphan_node_blobs(&self) {
+    async fn purge_orphan_node_blobs(&self) -> (bool, bool) {
         let referenced: std::collections::BTreeSet<u64> = self
             .index
             .node_ids()
@@ -249,8 +266,8 @@ impl Hnsw {
         while let Some(meta) = stream.next().await {
             let Ok(meta) = meta else {
                 // Listing failures must not fail bootstrap; the sweep is
-                // retried on the next open.
-                return;
+                // retained as pending and retried on a writable flush.
+                return (false, false);
             };
             if let Some(id) = meta
                 .location
@@ -264,10 +281,13 @@ impl Hnsw {
             }
         }
 
+        let mut complete = true;
+        let mut deleted = false;
         for id in orphans {
             let path = Hnsw::node_path(&self.name, id);
             match self.storage.delete(&path).await {
-                Ok(()) | Err(DBError::NotFound { .. }) => {
+                Ok(()) => {
+                    deleted = true;
                     self.node_versions.write().remove(&id);
                     log::warn!(
                         action = "Hnsw::purge_orphan_node_blobs",
@@ -276,7 +296,11 @@ impl Hnsw {
                         "Deleted orphan HNSW node blob left by a crash",
                     );
                 }
+                Err(DBError::NotFound { .. }) => {
+                    self.node_versions.write().remove(&id);
+                }
                 Err(err) => {
+                    complete = false;
                     log::warn!(
                         action = "Hnsw::purge_orphan_node_blobs",
                         index = self.name,
@@ -286,6 +310,7 @@ impl Hnsw {
                 }
             }
         }
+        (complete, deleted)
     }
 
     /// Persists one versioned artifact with a single conditional PUT: the
@@ -344,6 +369,15 @@ impl Hnsw {
     ///
     /// Returns `true` when any object was written or deleted.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
+        let orphans_deleted = if self.orphan_cleanup_pending.load(Ordering::Acquire) {
+            let (complete, deleted) = self.purge_orphan_node_blobs().await;
+            if complete {
+                self.orphan_cleanup_pending.store(false, Ordering::Release);
+            }
+            deleted
+        } else {
+            false
+        };
         let had_removed = self.index.has_removed_nodes();
         let node_name = Arc::new(self.name.clone());
         let node_storage = Arc::new(self.storage.clone());
@@ -405,13 +439,16 @@ impl Hnsw {
             })
             .await?;
 
-        Ok(saved || had_removed)
+        Ok(orphans_deleted || saved || had_removed)
     }
 
     /// Returns whether metadata, nodes, or removed-node tombstones have
     /// in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
-        if self.index.has_dirty_nodes() || self.index.has_removed_nodes() {
+        if self.orphan_cleanup_pending.load(Ordering::Acquire)
+            || self.index.has_dirty_nodes()
+            || self.index.has_removed_nodes()
+        {
             return true;
         }
 

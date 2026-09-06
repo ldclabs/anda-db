@@ -180,6 +180,39 @@ async fn recovery_read_failure_does_not_advance_checkpoint() {
 }
 
 #[tokio::test]
+async fn corrupt_zstd_document_is_quarantined_during_recovery() {
+    let store = Arc::new(InMemory::new());
+    {
+        let db = AndaDB::connect(store.clone(), cfg()).await.unwrap();
+        let c = plain(&db).await;
+        c.add_from(&doc("corrupt", "frame")).await.unwrap();
+        // Leave the add above the durable checkpoint, then replace only its
+        // object bytes with a deterministic malformed zstd frame.
+        store
+            .put(
+                &Path::from("reviewdb/docs/data/1.cbor"),
+                b"\x28\xb5\x2f\xfdinvalid".to_vec().into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let db = AndaDB::connect(store, cfg()).await.unwrap();
+    let c = db
+        .open_collection("docs".into(), async |_| Ok(()))
+        .await
+        .expect("deterministically corrupt documents must not brick collection open");
+    assert!(c.is_empty());
+    let issues = c.recovery_issues();
+    assert!(
+        issues
+            .get(&1)
+            .is_some_and(|issue| issue.contains("Serialization error")),
+        "the corrupt object must remain visible through recovery diagnostics"
+    );
+}
+
+#[tokio::test]
 async fn accepted_large_document_can_be_updated_and_recovered() {
     let store = Arc::new(InMemory::new());
     {
@@ -306,7 +339,7 @@ async fn regression_dead_id_removal_has_no_replay_record() {
 }
 
 #[tokio::test]
-async fn regression_read_only_open_deletes_orphan_hnsw_blobs() {
+async fn read_only_open_defers_orphan_hnsw_cleanup_until_writable_flush() {
     let store = Arc::new(InMemory::new());
     let db = AndaDB::connect(store.clone(), cfg()).await.unwrap();
     db.open_or_create_collection(Doc::schema().unwrap(), cc(), async |c| {
@@ -325,12 +358,22 @@ async fn regression_read_only_open_deletes_orphan_hnsw_blobs() {
     let orphan = Path::from("reviewdb/docs/hnsw_indexes/embedding/n_999.cbor");
     store.put(&orphan, vec![0u8].into()).await.unwrap();
     db.set_read_only(true);
-    db.open_collection("docs".into(), async |_| Ok(()))
+    let c = db
+        .open_collection("docs".into(), async |_| Ok(()))
         .await
         .unwrap();
     assert!(
         store.head(&orphan).await.is_ok(),
         "read-only open must preserve orphan storage objects"
+    );
+    db.set_read_only(false);
+    assert!(
+        c.flush(unix_ms()).await.unwrap(),
+        "the deferred cleanup must make a writable flush do work"
+    );
+    assert!(
+        store.head(&orphan).await.is_err(),
+        "the first writable flush must retire the deferred orphan"
     );
 }
 
@@ -560,6 +603,54 @@ async fn regression_foreign_document_schema_yields_wrong_index_values() {
 }
 
 #[tokio::test]
+async fn add_accepts_documents_from_a_compatible_older_schema() {
+    use anda_db::schema::{Fe, Ft, Schema};
+
+    let mut old = Schema::builder();
+    old.add_field(Fe::new("title".into(), Ft::Text).unwrap())
+        .unwrap();
+    old.add_field(Fe::new("retired".into(), Ft::Text).unwrap())
+        .unwrap();
+    let old = old.build().unwrap();
+
+    let mut current = Schema::builder();
+    current
+        .add_field(Fe::new("title".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
+        .unwrap();
+    current
+        .add_field(Fe::new("added".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
+        .unwrap();
+    current.with_version(old.version() + 1);
+    let mut current = current.build().unwrap();
+    current.upgrade_with(&old).unwrap();
+
+    let db = AndaDB::connect(Arc::new(InMemory::new()), cfg())
+        .await
+        .unwrap();
+    let c = db
+        .create_collection(current, cc(), async |_| Ok(()))
+        .await
+        .unwrap();
+    let mut older_doc = Document::new(Arc::new(old));
+    older_doc.set_id(0);
+    older_doc
+        .set_field("title", Fv::Text("compatible".into()))
+        .unwrap();
+    older_doc
+        .set_field("retired", Fv::Text("drop me".into()))
+        .unwrap();
+
+    let id = c.add(older_doc).await.unwrap();
+    let stored = c.get(id).await.unwrap();
+    assert_eq!(
+        stored.get_field("title"),
+        Some(&Fv::Text("compatible".into()))
+    );
+    assert_eq!(stored.get_field("added"), None);
+    assert_eq!(stored.get_field("retired"), None);
+}
+
+#[tokio::test]
 async fn bounded_boolean_pages_match_a_reference_set() {
     let db = AndaDB::connect(Arc::new(InMemory::new()), cfg())
         .await
@@ -708,9 +799,16 @@ async fn selective_search_finds_matches_beyond_the_global_candidate_window() {
 #[tokio::test]
 async fn stream_budgets_are_explicit_and_symmetric() {
     let store = Arc::new(InMemory::new());
-    let storage = Storage::connect("limits".into(), store.clone(), StorageConfig::default())
-        .await
-        .unwrap();
+    let storage = Storage::connect(
+        "limits".into(),
+        store.clone(),
+        StorageConfig {
+            object_chunk_size: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     for compressed in [false, true] {
         let storage = if compressed {
             storage.clone()
@@ -720,6 +818,7 @@ async fn stream_budgets_are_explicit_and_symmetric() {
                 store.clone(),
                 StorageConfig {
                     compress_level: 0,
+                    object_chunk_size: 2,
                     ..Default::default()
                 },
             )
@@ -741,8 +840,26 @@ async fn stream_budgets_are_explicit_and_symmetric() {
             .await
             .unwrap();
         assert!(reader.read_to_end(&mut Vec::new()).await.is_err());
-        let mut writer = storage.stream_writer_with_limit("too_large", 1023);
-        assert!(writer.write_all(&vec![b'x'; 1024]).await.is_err());
+        storage
+            .put_bytes(
+                "too_large",
+                b"original".to_vec().into(),
+                anda_db::storage::PutMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        let mut writer = storage.stream_writer_with_limit("too_large", 4);
+        writer.write_all(b"abc").await.unwrap();
+        assert!(writer.write_all(b"de").await.is_err());
+        assert!(
+            writer.shutdown().await.is_err(),
+            "shutdown after a limit failure must not publish the accepted prefix"
+        );
+        drop(writer);
+        assert_eq!(
+            storage.fetch_bytes("too_large").await.unwrap().0.as_ref(),
+            b"original"
+        );
     }
     assert!(
         Storage::connect(

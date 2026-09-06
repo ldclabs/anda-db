@@ -337,6 +337,22 @@ impl HnswIndex {
             })
     }
 
+    /// Borrows a node's stored vector and applies `f` without materializing a
+    /// public node or cloning its vector and neighbor layers.
+    pub fn get_vector_with<R, F>(&self, id: u64, f: F) -> Result<R, HnswError>
+    where
+        F: FnOnce(&[bf16]) -> R,
+    {
+        self.nodes
+            .pin()
+            .get(&id)
+            .map(|node| f(node.vector.as_ref()))
+            .ok_or_else(|| HnswError::NotFound {
+                name: self.name.clone(),
+                id,
+            })
+    }
+
     /// Inserts a vector.
     ///
     /// Complexity: O(log N) expected; the exact cost is dominated by
