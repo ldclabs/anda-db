@@ -4,7 +4,7 @@
 
 基准使用计数分配器，会对两边增加测量开销；机器未进行性能隔离。因此这些是可复现的工程测量，不能直接当作生产容量承诺。
 
-[完整 CSV](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/benches/results/review-20260906.csv) · [环境与比较说明](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/benches/results/review-20260906.json) · [运行方法](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/benches/README.md)
+[完整 CSV](../rs/anda_db_hnsw/benches/results/review-20260906.csv) · [环境与比较说明](../rs/anda_db_hnsw/benches/results/review-20260906.json) · [运行方法](../rs/anda_db_hnsw/benches/README.md)
 
 **默认连接数下的比较**
 

@@ -39,7 +39,8 @@ Use `HnswIndex::try_new` for validated configuration. Search requests above
 Persistence calls must be serialized by the caller. Prefer
 `flush_with_options` for explicit completion status and bounded parallel I/O,
 then purge committed deletions. Fixed-key objects support recovery of partial
-progress, not multi-object transactions. The technical reference explains
+progress when node, IDs and metadata replacements use backend conditional writes;
+they are not multi-object transactions. The technical reference explains
 generation markers, numeric limits and legacy-format loading.
 
 For repeatable performance measurements, see [the benchmark guide](benches/README.md).

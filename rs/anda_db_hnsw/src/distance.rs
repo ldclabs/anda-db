@@ -76,10 +76,19 @@ impl DistanceMetric {
         finite_distance(self.wide(a, b))
     }
 
-    /// Inputs have already passed the index's dimension/numeric validation.
-    pub(crate) fn stored(&self, a: &[bf16], b: &[bf16]) -> f32 {
-        self.validated(a, b)
-            .expect("validated stored vector bounds guarantee finite distances")
+    /// Computes a distance that can be represented by the persisted `bf16`
+    /// edge format. Modern inserts validate this invariant up front; the
+    /// fallible result also keeps legacy snapshots from panicking during
+    /// migration when their vectors predate those bounds.
+    pub(crate) fn stored(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
+        let value = self.validated(a, b)?;
+        if bf16::from_f32(value).is_finite() {
+            Ok(value)
+        } else {
+            Err(numeric_error(
+                "distance cannot be represented by the stored edge format",
+            ))
+        }
     }
 
     fn wide<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> f64 {

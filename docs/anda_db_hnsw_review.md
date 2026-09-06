@@ -1,34 +1,34 @@
 **anda_db_hnsw 审查清单完成记录**
 
-2026-09-06。18 项均已处理；实现、回归测试、主库适配、示例和文档已落地。未使用 subagents；本次提交仅包含 HNSW 及相应的主库适配、测试和文档，其他任务的 BM25/TFS、utils/object_store 修改不纳入此次提交。
+2026-09-06。18 项及提交 `8bc6d8b` 的复审问题均已处理；实现、回归测试、主库适配、示例和文档已落地。未使用 subagents；本次工作仅包含 HNSW 及相应的主库适配、测试和文档，其他任务的 BM25/TFS、utils/object_store 修改不纳入此次提交。
 
 审查基线为 ac19bc06d4e5fac8a3a569e4764d6a3eb0605186 下的 HNSW 代码。原有 HnswNode 公开字段及旧数据读取能力保留；需要迁移注意的行为见下文。
 
 **正确性与恢复**
 
-- [x] **R1：修复 ID 复用的旧边和重复邻居。** 按“目标节点＋层”维护完整反向引用，删除清除所有入边；邻接列表按 ID 排序、去重，反向边更新采用 upsert。多轮重插、两种策略、两种删除模式及主库更新/重开均有回归。[实现](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/src/hnsw.rs:670) · [回归](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/tests/regressions.rs:237)
+- [x] **R1：修复 ID 复用的旧边和重复邻居。** 按“目标节点＋层”维护完整反向引用，删除清除所有入边；邻接列表按 ID 排序、去重，反向边更新采用 upsert。多轮重插、两种策略、两种删除模式及主库更新/重开均有回归。[实现](../rs/anda_db_hnsw/src/hnsw.rs#L670) · [回归](../rs/anda_db_hnsw/tests/regressions.rs#L237)
 
-- [x] **R2：修复数值溢出和平方下溢。** 普通值保留 f32 路径，边界使用宽精度计算；公开距离接口拒绝非有限输入及不可表示结果。入库前按距离类型检查向量幅值，保证成功入库的节点间边距离可用 bf16 表示。覆盖四种距离、极大值、极小值、零向量、失败时状态不变及保存重开。[距离实现](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/src/distance.rs)
+- [x] **R2：修复数值溢出和平方下溢。** 普通值保留 f32 路径，边界使用宽精度计算；公开距离接口拒绝非有限输入及不可表示结果。入库前按距离类型检查向量幅值，保证成功入库的节点间边距离可用 bf16 表示。旧快照中的有限向量仍可加载；不可表示的遗留边会移除并等待重写。覆盖四种距离、极大值、极小值、零向量、失败时状态不变及保存重开。[距离实现](../rs/anda_db_hnsw/src/distance.rs)
 
-- [x] **R3：修复缓冲写入错误被忽略。** writer 接口检查 write_all 和 Write::flush 后才确认成功；异步回调确认后端结果。metadata_bytes 提供不推进水位的纯序列化。新增 metadata/IDs 的缓冲写入及 flush 故障回归。[持久化实现](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/src/hnsw/persistence.rs)
+- [x] **R3：修复缓冲写入错误被忽略。** writer 接口检查 write_all 和 Write::flush 后才确认成功；异步回调确认后端结果。并行节点写在返回错误或停止状态前排空所有已启动任务。metadata_bytes 提供不推进水位的纯序列化。新增 metadata/IDs 的缓冲写入及 flush 故障回归。[持久化实现](../rs/anda_db_hnsw/src/hnsw/persistence.rs)
 
 - [x] **R4：明确 flush 完成状态和墓碑资格。** 新增 FlushOutcome；旧 bool 接口中途停止返回错误。墓碑只有在完整快照确认其确切删除实例后才可清理，单独保存 metadata 不授予清理资格。覆盖跨 I/O 删除、停止、取消、重插及新删除不能被旧确认消费。
 
-- [x] **R5：提供可检测的部分写入恢复。** 节点对象与 IDs 增加兼容的代际标记；标记不一致时从已加载 IDs 引用的向量重建。无标记的旧图也检查可达性。完整、代际一致的新图保留原图，包括正常近似裁剪产生的断连，避免每次重开无谓重建。RecoveryReport 暴露修复情况；覆盖各写入边界的失败/结果丢失。[故障矩阵](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/tests/regressions.rs:508)
+- [x] **R5：提供可检测的部分写入恢复。** 节点对象带兼容的代际标记；节点代际领先元数据时从 IDs 引用的向量重建，删除中断则由 IDs、节点引用和元数据统计差异修复。IDs 保持单一 CBOR 字节串。主库对每个固定节点对象使用 Create/Update CAS，异步结果丢失后旧 token 会冲突，不能用迟到写覆盖新节点。合法断连图不因缺少旧代际标记而全量重建。RecoveryReport 暴露修复情况；覆盖各写入边界的失败/结果丢失。[故障矩阵](../rs/anda_db_hnsw/tests/regressions.rs#L508)
 
 - [x] **R6：完善加载校验与入口修复。** 严格验证持久化配置、节点 ID、维度、层数、度数、数值域；修复自环、重复边、失效引用及错误层级，迁移时重算旧边距离。入口和最高层按实际节点修复。最高层有多个替代节点时按 ID 确定性选择。
 
 - [x] **R7：分步加载重试保持一致。** IDs 先暂存，节点在独立表中构建；只有全部验证/恢复成功后替换现有状态。失败、取消及重试期间节点消失不会留下幽灵节点或不同步的 IDs。
 
-- [x] **R8：修复测试丢弃错误。** 并发测试检查 JoinError 和任务内 HnswError 两层结果，并验证最终节点数。新增 17 项子库回归及 1 项真实 Collection 更新/保存/重开测试。[主库回归](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db/tests/hnsw_updates.rs)
+- [x] **R8：修复测试丢弃错误。** 并发测试检查 JoinError 和任务内 HnswError 两层结果，并验证最终节点数。新增子库回归及真实 Collection 更新/保存/重开测试。[主库回归](../rs/anda_db/tests/hnsw_updates.rs)
 
-- [x] **R9：统一查询边界。** 两种输入在 top_k=0 时均无条件返回空结果；超过 4,096 明确报错；SearchOptions 支持按查询配置 ef，并校验范围。[查询接口](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/src/hnsw/search.rs:49)
+- [x] **R9：统一查询边界。** 两种输入在 top_k=0 时均无条件返回空结果；超过 4,096 明确报错；SearchOptions 支持按查询配置 ef，并校验范围。[查询接口](../rs/anda_db_hnsw/src/hnsw/search.rs#L49)
 
 **性能**
 
 - [x] **O1：去掉非入口删除的全表扫描。** 最高层仍有入口时直接保留层级，仅删除入口需要寻找替代节点。提供单层稀疏图基准验证规模增长。
 
-- [x] **O2：紧凑邻接存储。** 内部改用按实际容量配置的 Vec，消除每层 1,040 字节的固定内联数组；对有序邻接做线性差异合并来维护反向引用，避免每次更新构造两份临时哈希集合。公开 HnswNode 的 SmallVec 类型保持兼容。[内部节点](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/src/node.rs)
+- [x] **O2：紧凑邻接存储。** 内部改用按实际容量配置的 Vec，消除每层 1,040 字节的固定内联数组；对有序邻接做线性差异合并来维护反向引用，避免每次更新构造两份临时哈希集合。公开 HnswNode 的 SmallVec 类型保持兼容。[内部节点](../rs/anda_db_hnsw/src/node.rs)
 
 - [x] **O3：共享不可变向量。** 修边只复制邻接，向量使用 Arc 共享；加载也直接解码为内部表示，避免 Serde flatten 中间树及公共 SmallVec 的临时分配。get_node_with 为兼容旧类型会物化公开节点，适用于检查/导出，搜索热路径使用内部视图。
 
@@ -36,7 +36,7 @@
 
 - [x] **O5：减少搜索分配和重复计算。** 上层使用专门的贪心路径，线程局部/调用方工作区复用堆与集合，查询范数只准备一次，存储范数缓存。欧氏距离仍保持原单位；平方 L2 方案已评估，本轮未启用，避免混用旧边缓存单位。没有未经测量地加入平台专用 SIMD。
 
-- [x] **O6：建立并执行基准。** 实测包括 1,000、10,000、100,000 节点及全部距离类型；固定数据及图层种子，覆盖距离、构建、查询、保存、加载、删除、重插；记录延迟分位数、吞吐、分配、堆内存、序列化字节及独立 f64 oracle 的召回。支持全部参数矩阵和实际 embedding CSV 输入。[基准说明](/Users/zensh/git/github.com/ldclabs/anda-db/rs/anda_db_hnsw/benches/README.md) · [测量记录](/Users/zensh/git/github.com/ldclabs/anda-db/docs/anda_db_hnsw_benchmarks.md)
+- [x] **O6：建立并执行基准。** 实测包括 1,000、10,000、100,000 节点及全部距离类型；固定数据及图层种子，覆盖距离、构建、查询、保存、加载、删除、重插；记录延迟分位数、吞吐、分配、堆内存、序列化字节及独立 f64 oracle 的召回。支持全部参数矩阵和实际 embedding CSV 输入。[基准说明](../rs/anda_db_hnsw/benches/README.md) · [测量记录](anda_db_hnsw_benchmarks.md)
 
 **简化与维护**
 
@@ -44,23 +44,23 @@
 
 - [x] **S2：按职责拆分。** 原 hnsw.rs 从 4,566 行降为1,146 行；配置、公开/内部节点、查询、持久化和单元测试分别成模块。复用层容量计算和候选清理逻辑。增加的恢复及回归代码保留在对应模块。
 
-- [x] **S3：同步文档、示例和随机测试。** 更新 README 依赖版本、内存估算、并发/持久化/数值/查询契约；移除不存在的锁及分层 tracker 描述。示例执行实际删除、提交、purge 和重开，使用原子替换而非提前截断已有目标。图层和距离测试采用固定种子，分布测试采用统计容差。[技术文档](/Users/zensh/git/github.com/ldclabs/anda-db/docs/anda_db_hnsw.md)
+- [x] **S3：同步文档、示例和随机测试。** 更新 README 依赖版本、内存估算、并发/持久化/数值/查询契约；移除不存在的锁及分层 tracker 描述。示例通过 `anda_object_store::MetaStore` 包装 `object_store::LocalFileSystem`，执行跨平台原子对象替换、条件提交、删除、purge 和重开。图层和距离测试采用固定种子，分布测试采用统计容差。[技术文档](anda_db_hnsw.md)
 
 **验证结果**
 
-- 子库：50 项单元测试、6 项召回测试、17 项新增回归全部通过；示例和基准均可编译。
-- 主库：7 项 HNSW 适配器测试、Collection 向量更新回归、4 项崩溃恢复测试、历史格式兼容测试通过。
-- 全 Rust 工作区 all-features：1,584 项测试通过，0 失败；1 项生成历史快照的测试按设计忽略。后续入口定序调整另经子库回归验证。
+- 子库：50 项单元测试、6 项召回测试、22 项回归全部通过；示例和基准均可编译。
+- 主库：8 项 HNSW 适配器测试、Collection 向量更新回归、4 项崩溃恢复测试、历史格式兼容测试通过。
+- `8bc6d8b` 初次提交时全 Rust 工作区 all-features 共 1,584 项测试通过，0 失败；复审修复后重新执行上述相关套件。
 - Clippy：子库 all-targets、-D warnings 通过。
 - 技术文档中的 3 个 Rust 示例编译测试通过；Rustdoc 链接检查通过。
-- 文件示例插入 1,000 条、删除 100 条，清理墓碑后重开 900 条并正常搜索。
+- 文件示例以 `MetaStore<LocalFileSystem>` 插入 1,000 条、删除 100 条，清理墓碑后重开 900 条并正常搜索。
 - 使用本次改动前的子库代码，成功读取新示例生成的全部 900 个节点并搜索，验证旧 Rust reader 对新代际扩展的兼容性。
-- 未修改或重新生成已有历史数据快照；旧快照仍作为兼容输入保留。未运行与本次 Rust 改动无关的 TypeScript 套件。
+- 重新生成当前 `v0_11` 的 HNSW 节点对象以覆盖 `g` 字段；更早的历史快照保持不变并继续作为兼容输入。未运行与本次 Rust 改动无关的 TypeScript 套件。
 
 **兼容性及取舍**
 
 1. 持久化提供可恢复的部分进度，不承诺跨对象原子事务或回滚到上次完整快照。主库仍依靠文档意图重放恢复业务状态。
-2. 新节点增加可忽略的 g 字段；IDs 是原 CBOR 字节串加可选 u64 代际尾项。旧 AndaDB reader 已验证可读；自定义“必须恰好一个 CBOR 项”的解析器需要支持尾项。
+2. 新节点增加可忽略的 `g` 字段；IDs 仍是恰好一个 CBOR 字节串，旧 reader 和严格单项 CBOR 校验器均可读取。
 3. 超限 top_k、非法持久化配置及超出安全幅值的向量现在明确拒绝；旧 bool flush 中途停止现在报错。调用方应采用显式完成状态。
 4. 完整入边维护和恢复校验有成本：没有宣称所有操作都变快。默认稠密图的部分构建/删除/加载路径比旧实现更重；查询分配、快照内存、特定删除规模及有延迟的并行上传有实测收益。详见基准记录。
 5. 基准框架支持建议矩阵，但不声称穷举所有组合；真实 embedding 未由用户提供，当前记录区分合成数据与真实业务数据。

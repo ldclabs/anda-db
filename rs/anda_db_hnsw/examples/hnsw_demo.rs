@@ -1,12 +1,23 @@
-//! Single-writer demo: atomic per-object writes and recovery of partial progress.
+//! Single-writer demo: cross-platform atomic object replacement and recovery
+//! of partial progress. Local filesystem writes request fsync durability where
+//! the platform supports it.
 //! Optional first argument: a fresh directory. Default: a new temporary directory.
 use anda_db_hnsw::{BoxError, FlushOptions, FlushOutcome, HnswConfig, HnswIndex};
+use anda_object_store::MetaStoreBuilder;
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, local::LocalFileSystem,
+    path::Path as ObjectPath,
+};
 use rand::{RngExt, SeedableRng};
 use std::{
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::AsyncWriteExt;
+
+type ObjectVersions = Arc<Mutex<BTreeMap<String, UpdateVersion>>>;
+type Store = Arc<dyn ObjectStore>;
 
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -15,21 +26,59 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-async fn atomic_write(path: PathBuf, bytes: Vec<u8>) -> Result<(), BoxError> {
-    let temporary = path.with_extension("cbor.tmp");
-    let mut file = tokio::fs::File::create(&temporary).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&temporary, &path).await?;
-    tokio::fs::File::open(path.parent().expect("object directory"))
-        .await?
-        .sync_all()
+async fn put_object(
+    store: Store,
+    versions: ObjectVersions,
+    path: String,
+    bytes: Vec<u8>,
+) -> Result<(), BoxError> {
+    // LocalFileSystem stages and atomically publishes conditional object
+    // writes on every supported platform, including Windows.
+    let mode = versions
+        .lock()
+        .expect("version map")
+        .get(&path)
+        .cloned()
+        .map(PutMode::Update)
+        .unwrap_or(PutMode::Create);
+    let result = store
+        .put_opts(
+            &ObjectPath::from(path.clone()),
+            bytes.into(),
+            PutOptions {
+                mode,
+                ..Default::default()
+            },
+        )
         .await?;
+    versions.lock().expect("version map").insert(
+        path,
+        UpdateVersion {
+            e_tag: result.e_tag,
+            version: result.version,
+        },
+    );
     Ok(())
 }
 
-async fn save(index: &HnswIndex, dir: &Path) -> Result<FlushOutcome, BoxError> {
+async fn read_object(
+    store: &dyn ObjectStore,
+    path: impl Into<ObjectPath>,
+) -> Result<Vec<u8>, BoxError> {
+    Ok(store.get(&path.into()).await?.bytes().await?.to_vec())
+}
+
+async fn save_with_versions(
+    index: &HnswIndex,
+    store: Store,
+    versions: ObjectVersions,
+) -> Result<FlushOutcome, BoxError> {
+    let node_store = store.clone();
+    let ids_store = store.clone();
+    let metadata_store = store;
+    let node_versions = versions.clone();
+    let ids_versions = versions.clone();
+    let metadata_versions = versions;
     Ok(index
         .flush_with_options(
             unix_ms(),
@@ -37,15 +86,23 @@ async fn save(index: &HnswIndex, dir: &Path) -> Result<FlushOutcome, BoxError> {
                 node_concurrency: 8,
                 ..Default::default()
             },
-            |id, bytes| {
-                let path = dir.join(format!("node_{id}.cbor"));
+            move |id, bytes| {
+                let store = node_store.clone();
+                let versions = node_versions.clone();
                 async move {
-                    atomic_write(path, bytes).await?;
+                    put_object(store, versions, format!("node_{id}.cbor"), bytes).await?;
                     Ok(true)
                 }
             },
-            |bytes| atomic_write(dir.join("ids.cbor"), bytes),
-            |bytes| atomic_write(dir.join("metadata.cbor"), bytes),
+            move |bytes| put_object(ids_store, ids_versions, "ids.cbor".into(), bytes),
+            move |bytes| {
+                put_object(
+                    metadata_store,
+                    metadata_versions,
+                    "metadata.cbor".into(),
+                    bytes,
+                )
+            },
         )
         .await?)
 }
@@ -64,10 +121,12 @@ async fn main() -> Result<(), BoxError> {
             ))
         });
     tokio::fs::create_dir_all(&dir).await?;
-    let metadata_path = dir.join("metadata.cbor");
-    if metadata_path.try_exists()? {
+    if std::fs::read_dir(&dir)?.next().transpose()?.is_some() {
         return Err("The demo requires a fresh directory; existing data was left untouched".into());
     }
+    let local = LocalFileSystem::new_with_prefix(&dir)?.with_fsync(true);
+    let store: Store = Arc::new(MetaStoreBuilder::new(local, 10_000).build());
+    let versions = Arc::new(Mutex::new(BTreeMap::new()));
     const DIM: usize = 384;
     const N: u64 = 1000;
     let index = HnswIndex::try_new_seeded(
@@ -88,38 +147,58 @@ async fn main() -> Result<(), BoxError> {
         )?;
     }
     println!("Inserted {N} vectors in {:?}", start.elapsed());
-    assert_eq!(save(&index, &dir).await?, FlushOutcome::Committed);
+    assert_eq!(
+        save_with_versions(&index, store.clone(), versions.clone()).await?,
+        FlushOutcome::Committed
+    );
 
     // Commit deletions before purging blobs, then save the cleared tombstones.
     for id in (0..N).step_by(10) {
         assert!(index.remove(id, unix_ms()));
     }
-    save(&index, &dir).await?;
+    save_with_versions(&index, store.clone(), versions.clone()).await?;
+    let purge_store = store.clone();
+    let purge_versions = versions.clone();
     index
-        .purge_removed_nodes(async |id| {
-            match tokio::fs::remove_file(dir.join(format!("node_{id}.cbor"))).await {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        .purge_removed_nodes(async move |id| {
+            let path = ObjectPath::from(format!("node_{id}.cbor"));
+            match purge_store.delete(&path).await {
+                Ok(()) => {
+                    purge_versions
+                        .lock()
+                        .expect("version map")
+                        .remove(path.as_ref());
+                    Ok(true)
+                }
+                Err(object_store::Error::NotFound { .. }) => {
+                    purge_versions
+                        .lock()
+                        .expect("version map")
+                        .remove(path.as_ref());
+                    Ok(true)
+                }
                 Err(error) => Err(error.into()),
             }
         })
         .await?;
-    save(&index, &dir).await?;
-    assert_eq!(save(&index, &dir).await?, FlushOutcome::NoChanges);
+    save_with_versions(&index, store.clone(), versions.clone()).await?;
+    assert_eq!(
+        save_with_versions(&index, store.clone(), versions).await?,
+        FlushOutcome::NoChanges
+    );
 
-    let metadata = tokio::fs::read(&metadata_path).await?;
-    let ids = tokio::fs::read(dir.join("ids.cbor")).await?;
-    let loaded =
-        HnswIndex::load_all(
-            metadata.as_slice(),
-            ids.as_slice(),
-            async |id| match tokio::fs::read(dir.join(format!("node_{id}.cbor"))).await {
-                Ok(bytes) => Ok(Some(bytes)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error.into()),
-            },
-        )
-        .await?;
+    let metadata = read_object(&store, "metadata.cbor").await?;
+    let ids = read_object(&store, "ids.cbor").await?;
+    let load_store = store.clone();
+    let loaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async move |id| {
+        let path = ObjectPath::from(format!("node_{id}.cbor"));
+        match load_store.get(&path).await {
+            Ok(result) => Ok(Some(result.bytes().await?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await?;
     assert_eq!(loaded.len(), 900);
     assert!(!loaded.has_removed_nodes());
     let query: Vec<f32> = (0..DIM).map(|_| random.random::<f32>()).collect();

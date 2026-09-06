@@ -2,6 +2,7 @@ use anda_db_hnsw::{FlushOptions, FlushOutcome, HnswError, HnswIndex};
 use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 pub use anda_db_hnsw::{HnswConfig, HnswMetadata, HnswStats};
@@ -18,8 +19,8 @@ use crate::{
 /// id lists, and graph nodes while delegating search behavior to
 /// `anda_db_hnsw::HnswIndex`.
 ///
-/// The metadata/ids CAS tokens are the last defense against a second writer,
-/// which the single-writer deployment contract forbids. A `Precondition`
+/// Per-node, metadata and IDs CAS tokens are the last defense against a second
+/// writer, which the single-writer deployment contract forbids. A `Precondition`
 /// conflict (or a cancelled flush) is never reconciled in place: the error
 /// propagates, the collection poisons its handle and reopening rebuilds this
 /// wrapper from the durable objects.
@@ -29,6 +30,7 @@ pub struct Hnsw {
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
     metadata_version: Arc<RwLock<ObjectVersion>>,
     ids_version: Arc<RwLock<ObjectVersion>>,
+    node_versions: Arc<RwLock<FxHashMap<u64, ObjectVersion>>>,
 }
 
 impl Debug for Hnsw {
@@ -75,25 +77,26 @@ impl Hnsw {
         now_ms: u64,
     ) -> Result<Self, DBError> {
         let name = field.name().to_string();
+        // Collection metadata has not published this index yet, so any
+        // objects under its path belong to an interrupted earlier creation.
+        // Remove them before node writes begin using create-only CAS.
+        storage.drop_prefix(&Hnsw::dir_path(&name)).await?;
         let index = HnswIndex::try_new(name.clone(), Some(config))?;
         let mut metadata = Vec::new();
         let mut ids = Vec::new();
         index
             .flush(&mut metadata, &mut ids, now_ms, async |_, _| Ok(true))
             .await?;
-        // The collection metadata is the source of truth for which indexes
-        // exist, so overwrite any leftover files from a crashed creation or a
-        // previously removed index instead of failing with AlreadyExists.
         // Publish the id set before the metadata commit record, matching the
         // steady-state crash contract used by `flush` below.
         let ids_version = storage
-            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Overwrite)
+            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Create)
             .await?;
         let metadata_version = storage
             .put_bytes(
                 &Hnsw::metadata_path(&name),
                 metadata.into(),
-                PutMode::Overwrite,
+                PutMode::Create,
             )
             .await?;
         Ok(Self {
@@ -102,6 +105,7 @@ impl Hnsw {
             storage,
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
+            node_versions: Arc::new(RwLock::new(FxHashMap::default())),
         })
     }
 
@@ -122,10 +126,15 @@ impl Hnsw {
         let (ids, ids_version) = storage.fetch_bytes(&Hnsw::ids_path(&name)).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
+        let node_versions = Arc::new(RwLock::new(FxHashMap::default()));
+        let loaded_node_versions = node_versions.clone();
         let index = HnswIndex::load_all(&metadata[..], &ids[..], async move |id: u64| {
             let path = Hnsw::node_path(n.clone().as_str(), id);
             match s.clone().fetch_bytes(&path).await {
-                Ok((data, _)) => Ok(Some(data.into())),
+                Ok((data, version)) => {
+                    loaded_node_versions.write().insert(id, version);
+                    Ok(Some(data.into()))
+                }
                 Err(DBError::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.into()),
             }
@@ -138,9 +147,42 @@ impl Hnsw {
             storage,
             metadata_version: Arc::new(RwLock::new(metadata_version)),
             ids_version: Arc::new(RwLock::new(ids_version)),
+            node_versions,
         };
+        this.load_tombstone_versions().await?;
         this.purge_orphan_node_blobs().await;
         Ok(this)
+    }
+
+    /// Captures the CAS tokens for committed tombstone blobs. Live-node tokens
+    /// are collected by the load callback above. A missing tombstone blob is
+    /// valid (a previous purge may already have deleted it).
+    async fn load_tombstone_versions(&self) -> Result<(), DBError> {
+        let name = Arc::new(self.name.clone());
+        let storage = Arc::new(self.storage.clone());
+        let versions = self.node_versions.clone();
+        let mut stream = futures::stream::iter(self.index.removed_node_ids())
+            .map(move |id| {
+                let name = name.clone();
+                let storage = storage.clone();
+                let versions = versions.clone();
+                async move {
+                    let path = Hnsw::node_path(name.as_str(), id);
+                    match storage.fetch_bytes(&path).await {
+                        Ok((_, version)) => {
+                            versions.write().insert(id, version);
+                            Ok(())
+                        }
+                        Err(DBError::NotFound { .. }) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .buffer_unordered(16);
+        while let Some(result) = stream.next().await {
+            result?;
+        }
+        Ok(())
     }
 
     /// Best-effort deletion of node blobs that neither the committed id set
@@ -185,6 +227,7 @@ impl Hnsw {
             let path = Hnsw::node_path(&self.name, id);
             match self.storage.delete(&path).await {
                 Ok(()) | Err(DBError::NotFound { .. }) => {
+                    self.node_versions.write().remove(&id);
                     log::warn!(
                         action = "Hnsw::purge_orphan_node_blobs",
                         index = self.name,
@@ -223,12 +266,39 @@ impl Hnsw {
         Ok(())
     }
 
+    /// Persists a fixed-key node with an object-store precondition. `Create`
+    /// protects the first publication and `Update` protects every replacement.
+    /// If the backend committed but the result was lost, the local token stays
+    /// stale and a retry conflicts instead of overwriting newer durable bytes.
+    async fn persist_node(
+        storage: Storage,
+        name: Arc<String>,
+        versions: Arc<RwLock<FxHashMap<u64, ObjectVersion>>>,
+        id: u64,
+        data: Vec<u8>,
+    ) -> Result<bool, BoxError> {
+        let mode = versions
+            .read()
+            .get(&id)
+            .cloned()
+            .map(|version| PutMode::Update(version.into()))
+            .unwrap_or(PutMode::Create);
+        let path = Hnsw::node_path(name.as_str(), id);
+        let version = storage
+            .put_bytes(&path, Bytes::from(data), mode)
+            .await
+            .map_err(BoxError::from)?;
+        versions.write().insert(id, version);
+        Ok(true)
+    }
+
     /// Persists one coherent graph snapshot, then deletes removed-node blobs.
     ///
-    /// Node uploads are bounded to eight in flight, followed by conditional
-    /// IDs and metadata writes. These are recoverable partial progress, not a
-    /// multi-object transaction: generation markers let bootstrap rebuild a
-    /// mixed graph, and Collection replays authoritative document intents.
+    /// Node uploads are bounded to eight in flight and use per-object CAS,
+    /// followed by conditional IDs and metadata writes. This provides
+    /// recoverable partial progress, not a multi-object transaction: generation
+    /// markers let bootstrap recover a mixed graph, and Collection replays
+    /// authoritative document intents.
     /// The owning Collection serializes persistence and excludes mutations.
     ///
     /// Returns `true` when any object was written or deleted.
@@ -236,6 +306,7 @@ impl Hnsw {
         let had_removed = self.index.has_removed_nodes();
         let node_name = Arc::new(self.name.clone());
         let node_storage = Arc::new(self.storage.clone());
+        let node_versions = self.node_versions.clone();
         let ids_path = Hnsw::ids_path(&self.name);
         let ids_storage = self.storage.clone();
         let ids_version = self.ids_version.clone();
@@ -253,14 +324,8 @@ impl Hnsw {
                 move |id, data| {
                     let name = node_name.clone();
                     let storage = node_storage.clone();
-                    async move {
-                        let path = Hnsw::node_path(name.as_str(), id);
-                        storage
-                            .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
-                            .await
-                            .map_err(BoxError::from)?;
-                        Ok(true)
-                    }
+                    let versions = node_versions.clone();
+                    Self::persist_node((*storage).clone(), name, versions, id, data)
                 },
                 move |data| Self::persist_versioned(ids_storage, ids_path, ids_version, data),
                 move |data| {
@@ -285,11 +350,15 @@ impl Hnsw {
         // would leak forever. "Not found" is success (already deleted).
         let n = Arc::new(self.name.clone());
         let s = Arc::new(self.storage.clone());
+        let versions = self.node_versions.clone();
         self.index
             .purge_removed_nodes(async move |id| {
                 let path = Hnsw::node_path(n.clone().as_str(), id);
                 match s.clone().delete(&path).await {
-                    Ok(()) | Err(DBError::NotFound { .. }) => Ok(true),
+                    Ok(()) | Err(DBError::NotFound { .. }) => {
+                        versions.write().remove(&id);
+                        Ok(true)
+                    }
                     Err(err) => Err(err.into()),
                 }
             })
@@ -681,11 +750,8 @@ mod tests {
                 .0,
             old_metadata
         );
-        let crashed = Hnsw::bootstrap("embedding".to_string(), storage.clone())
-            .await
-            .unwrap();
-        assert!(crashed.search(&[1.0, 1.0], 1).is_empty());
-
+        // Retry on the same writer before opening another wrapper: the node
+        // PUT succeeded and its CAS token was observed, while IDs did not.
         assert_retry_recovers(&index, &storage).await;
     }
 
@@ -727,17 +793,46 @@ mod tests {
 
     #[tokio::test]
     async fn crash_after_node_put_reopens_previous_commit() {
-        let (index, storage) = assert_crash_after_put("n_1.cbor", &["n_1.cbor"], false).await;
-        // Node blobs use overwrite mode: no CAS token went stale, so this
-        // writer can still retry and complete the generation in place.
-        index
-            .insert(2, vec![bf16::from_f32(2.0), bf16::from_f32(2.0)], 4)
+        let (index, storage, object_store) = fault_index().await;
+        object_store.crash_after_next_put("n_1.cbor");
+        assert!(index.flush(3).await.is_err());
+        assert_eq!(object_store.put_suffixes().len(), 1);
+        assert!(object_store.put_suffixes()[0].ends_with("n_1.cbor"));
+
+        // The create became durable but its result was lost. The writer did
+        // not learn a token, so retry must conflict instead of overwriting it.
+        assert!(index.flush(4).await.is_err());
+        let recovered = Hnsw::bootstrap("embedding".to_string(), storage.clone())
+            .await
             .unwrap();
-        assert_retry_recovers(&index, &storage).await;
+        assert!(recovered.search(&[1.0, 1.0], 1).is_empty());
+        assert!(matches!(
+            storage.fetch_bytes(&Hnsw::node_path("embedding", 1)).await,
+            Err(DBError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn crash_after_node_update_cannot_be_overwritten_by_a_stale_retry() {
+        let (index, storage, object_store) = fault_index().await;
+        assert!(index.flush(3).await.unwrap());
+        object_store.clear_puts();
+        assert!(index.remove(1, 4));
+        index
+            .insert(1, vec![bf16::from_f32(9.0), bf16::from_f32(9.0)], 5)
+            .unwrap();
+
+        object_store.crash_after_next_put("n_1.cbor");
+        assert!(index.flush(6).await.is_err());
+        assert!(
+            index.flush(7).await.is_err(),
+            "the stale node token must conflict"
+        );
+
         let recovered = Hnsw::bootstrap("embedding".to_string(), storage)
             .await
             .unwrap();
-        assert_eq!(recovered.search(&[2.0, 2.0], 1), vec![(2, 0.0)]);
+        assert_eq!(recovered.search(&[9.0, 9.0], 1), vec![(1, 0.0)]);
     }
 
     #[tokio::test]

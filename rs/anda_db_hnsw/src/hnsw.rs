@@ -55,8 +55,8 @@ use crate::{
 /// The caller must serialize all flush/store/purge calls. Bootstrap loaders require
 /// exclusive ownership and publish a replacement graph only after validation.
 ///
-/// Persistence separates metadata, a versioned IDs bitmap, and node blobs.
-/// Generation markers detect partial progress; bootstrap rebuilds mixed images.
+/// Persistence separates metadata, an IDs bitmap, and generation-marked node blobs.
+/// Generation markers detect partial progress; bootstrap recovers mixed images.
 /// See [`Self::flush_with_options`] for callback, byte-budget and commit semantics.
 pub struct HnswIndex {
     /// Human-readable name of the index; propagated into error variants.
@@ -89,8 +89,6 @@ pub struct HnswIndex {
     /// Optional deterministic construction stream. Not part of the wire configuration.
     layer_rng: Mutex<Option<rand::rngs::StdRng>>,
 
-    /// Generation read from the optional IDs CBOR sequence trailer.
-    loaded_ids_generation: Option<u64>,
     pending_ids: Option<Treemap>,
     full_saved_version: AtomicU64,
 
@@ -245,7 +243,6 @@ impl HnswIndex {
             nodes: CoHashMap::new(),
             incoming: Mutex::new(FxHashMap::default()),
             layer_rng: Mutex::new(None),
-            loaded_ids_generation: None,
             pending_ids: None,
             full_saved_version: AtomicU64::new(0),
             recovery: RecoveryReport::default(),
@@ -951,7 +948,7 @@ impl HnswIndex {
                                     let dist = self
                                         .config
                                         .distance_metric
-                                        .stored(&cand_node.vector, &sel_node.vector);
+                                        .stored(&cand_node.vector, &sel_node.vector)?;
                                     entry.insert(dist);
                                     dist
                                 } else {
@@ -1042,7 +1039,7 @@ pub struct RecoveryReport {
     pub missing_nodes: usize,
     /// Loaded adjacency lists or entry-point metadata repaired.
     pub repaired_nodes: usize,
-    /// A mixed-generation or disconnected image was rebuilt from its vectors.
+    /// A mixed-generation image was rebuilt from its vectors.
     pub rebuilt: bool,
 }
 

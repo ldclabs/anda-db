@@ -12,7 +12,10 @@ pub enum FlushOutcome {
 /// Upload limits for the owned-buffer callback API.
 #[derive(Debug, Clone, Copy)]
 pub struct FlushOptions {
+    /// Maximum number of node callbacks running at once.
     pub node_concurrency: usize,
+    /// Maximum aggregate bytes owned by concurrent node callbacks, and the
+    /// maximum size of each later IDs or metadata callback payload.
     pub max_in_flight_bytes: usize,
 }
 impl Default for FlushOptions {
@@ -73,36 +76,21 @@ impl HnswIndex {
         Ok(index)
     }
 
-    /// Stages an IDs image without changing the live graph. Legacy images contain
-    /// one CBOR byte string; new images append a CBOR u64 generation as a sequence.
-    /// Old readers can still decode the first byte string.
-    pub fn load_ids<R: Read>(&mut self, mut r: R) -> Result<(), HnswError> {
-        let bytes: Vec<u8> = cbor2::from_reader(&mut r).map_err(|e| self.serialization_error(e))?;
+    /// Stages an IDs image without changing the live graph. The image remains
+    /// exactly one CBOR byte string so generic CBOR validators and legacy
+    /// readers agree on its framing.
+    pub fn load_ids<R: Read>(&mut self, r: R) -> Result<(), HnswError> {
+        let bytes: Vec<u8> = cbor2::from_reader(r).map_err(|e| self.serialization_error(e))?;
         let ids = Treemap::try_deserialize::<Portable>(&bytes)
             .ok_or_else(|| self.operation_error("Invalid IDs bitmap"))?;
-        let mut trailer = Vec::new();
-        r.take(10)
-            .read_to_end(&mut trailer)
-            .map_err(|e| self.serialization_error(e))?;
-        let generation = if trailer.is_empty() {
-            None
-        } else {
-            let mut reader = std::io::Cursor::new(&trailer);
-            let generation: u64 =
-                cbor2::from_reader(&mut reader).map_err(|e| self.serialization_error(e))?;
-            if reader.position() != trailer.len() as u64 || trailer.len() > 9 {
-                return Err(self.operation_error("Invalid IDs generation trailer"));
-            }
-            Some(generation)
-        };
         self.pending_ids = Some(ids);
-        self.loaded_ids_generation = generation;
         Ok(())
     }
 
     /// Transactionally builds a fresh node table. Missing blobs are dropped and
     /// malformed topology is repaired; invalid vectors or excessive degree fail.
-    /// Mixed-generation images are rebuilt from the vectors referenced by IDs.
+    /// Mixed-generation images are rebuilt or repaired from the vectors
+    /// referenced by IDs.
     /// This is recovery of partial progress, not rollback to an atomic snapshot.
     pub async fn load_nodes<F>(&mut self, f: F) -> Result<(), HnswError>
     where
@@ -154,16 +142,18 @@ impl HnswIndex {
         let max_generation = loaded
             .values()
             .map(|(_, generation)| *generation)
-            .chain(self.loaded_ids_generation)
             .max()
             .unwrap_or(0)
             .max(saved_version);
-        let mixed = self
-            .loaded_ids_generation
-            .is_some_and(|g| g != saved_version)
-            || loaded
-                .values()
-                .any(|(_, generation)| *generation > saved_version);
+        let mixed = loaded
+            .values()
+            .any(|(_, generation)| *generation > saved_version);
+        let rebuild_safe = loaded.values().all(|(node, _)| {
+            self.config
+                .distance_metric
+                .validate_stored(&node.vector, &self.name)
+                .is_ok()
+        });
         let layers: FxHashMap<_, _> = loaded.iter().map(|(&id, (n, _))| (id, n.layer)).collect();
         let vectors: FxHashMap<_, _> = loaded
             .iter()
@@ -183,17 +173,25 @@ impl HnswIndex {
                     keep
                 });
             }
-            // Old snapshots may contain stale distances after ID reuse. Repair
-            // this once on migration; new snapshots carry pass generations.
-            if *generation == 0 {
-                for (target, distance) in node.neighbors.iter_mut().flatten() {
-                    let fresh = bf16::from_f32(
-                        self.config
+            // Old snapshots may contain stale distances after ID reuse. A
+            // mixed image containing a legacy-range vector cannot safely use
+            // normal insertion to rebuild, so repair all of its edges here.
+            if *generation == 0 || (mixed && !rebuild_safe) {
+                for edges in &mut node.neighbors {
+                    edges.retain_mut(|(target, distance)| {
+                        let Ok(fresh) = self
+                            .config
                             .distance_metric
-                            .stored(&node.vector, &vectors[target]),
-                    );
-                    changed |= *distance != fresh;
-                    *distance = fresh;
+                            .stored(&node.vector, &vectors[target])
+                            .map(bf16::from_f32)
+                        else {
+                            changed = true;
+                            return false;
+                        };
+                        changed |= *distance != fresh;
+                        *distance = fresh;
+                        true
+                    });
                 }
             }
             for edges in &mut node.neighbors {
@@ -226,11 +224,13 @@ impl HnswIndex {
             replacement.repair_entry_point();
         }
         let entry_changed = old_entry != *replacement.entry_point.read();
-        // A coherent modern image can legitimately be disconnected after cheap
-        // deletion or approximate pruning. Preserve its graph on round-trip.
-        // Legacy images lack pass markers, so reachability is a recovery hint.
-        let mut rebuilt =
-            mixed || (self.loaded_ids_generation.is_none() && !replacement.base_reachable());
+        // A coherent image can legitimately be disconnected after cheap
+        // deletion or approximate pruning. Preserve both modern and legacy
+        // graphs on round-trip; only a node generation newer than metadata is
+        // proof of an interrupted flush. Rebuild when every vector satisfies
+        // current insertion bounds; otherwise the edge pass above provides a
+        // compatible in-place repair for historical large finite vectors.
+        let mut rebuilt = mixed && rebuild_safe;
 
         if rebuilt && !loaded.is_empty() {
             replacement = Self::try_new_seeded(self.name.clone(), Some(self.config.clone()), 0)?;
@@ -240,7 +240,7 @@ impl HnswIndex {
             // Approximate pruning can isolate duplicate-vector nodes. A single
             // reserved ring edge per node provides reachability after recovery.
             if !replacement.base_reachable() {
-                replacement.add_recovery_ring();
+                replacement.add_recovery_ring()?;
             }
             let nodes = replacement.nodes.pin();
             for (&id, (old, _)) in &loaded {
@@ -257,6 +257,7 @@ impl HnswIndex {
         replacement.rebuild_incoming();
         let max_layer = replacement.entry_point.read().1;
         let changed = rebuilt
+            || mixed
             || missing > 0
             || !repaired.is_empty()
             || entry_changed
@@ -326,7 +327,13 @@ impl HnswIndex {
                 got: node.vector.len(),
             });
         }
-        config.distance_metric.validate_stored(&node.vector, name)?;
+        // Historical snapshots accepted every finite bf16 vector. Keep that
+        // read contract even after a repaired legacy node is saved with a new
+        // generation marker. New inserts still enforce the stricter pairwise
+        // edge-range invariant before they can mutate the graph.
+        if node.vector.iter().any(|value| !value.is_finite()) {
+            return Err(invalid("vector contains NaN or infinity"));
+        }
         if node.layer >= config.max_layers || node.neighbors.len() != node.layer as usize + 1 {
             return Err(invalid("invalid layer count"));
         }
@@ -362,10 +369,10 @@ impl HnswIndex {
         seen.len() == nodes.len()
     }
 
-    fn add_recovery_ring(&self) {
+    fn add_recovery_ring(&self) -> Result<(), HnswError> {
         let ids = self.node_ids();
         if ids.len() < 2 {
-            return;
+            return Ok(());
         }
         let nodes = self.nodes.pin();
         for (position, &id) in ids.iter().enumerate() {
@@ -375,7 +382,7 @@ impl HnswIndex {
             let distance = self
                 .config
                 .distance_metric
-                .stored(&node.vector, &target.vector);
+                .stored(&node.vector, &target.vector)?;
             let neighbors = &mut node.neighbors[0];
             neighbors.retain(|&(id, _)| id != next);
             neighbors.truncate(self.config.layer_capacity(0) - 1);
@@ -383,6 +390,7 @@ impl HnswIndex {
             neighbors.sort_unstable_by_key(|edge| edge.0);
             nodes.insert(id, Arc::new(node));
         }
+        Ok(())
     }
 
     fn operation_error(&self, source: impl Into<BoxError>) -> HnswError {
@@ -445,7 +453,7 @@ impl HnswIndex {
         Ok(bytes)
     }
 
-    fn encode_ids(&self, mut ids: Treemap, generation: u64) -> Result<Vec<u8>, HnswError> {
+    fn encode_ids(&self, mut ids: Treemap) -> Result<Vec<u8>, HnswError> {
         ids.run_optimize();
         let mut bytes = Vec::new();
         cbor2::to_writer(
@@ -453,7 +461,6 @@ impl HnswIndex {
             &mut bytes,
         )
         .map_err(|e| self.serialization_error(e))?;
-        cbor2::to_writer(&generation, &mut bytes).map_err(|e| self.serialization_error(e))?;
         Ok(bytes)
     }
 
@@ -509,14 +516,15 @@ impl HnswIndex {
     }
 
     /// Persists nodes, then the IDs image, then metadata. Callbacks confirm
-    /// durability; use atomic writes and metadata CAS in production.
+    /// durability; use atomic writes plus node/metadata CAS (or immutable node
+    /// generation paths) in production.
     ///
     /// The caller MUST serialize all persistence/purge calls. Structural
     /// mutations may overlap; later mutations remain pending. A stopped node
     /// callback returns an error here; use flush_with_options for explicit status.
     ///
     /// Fixed-key objects are recoverable partial progress, not atomic snapshots:
-    /// generation markers let bootstrap rebuild a mixed image from live vectors.
+    /// generation markers let bootstrap recover a mixed image from live vectors.
     pub async fn flush_with<N, NF, I, IF, M, MF>(
         &self,
         now_ms: u64,
@@ -538,8 +546,10 @@ impl HnswIndex {
         self.legacy_outcome(outcome)
     }
 
-    /// Explicit flush status and bounded node upload concurrency/byte budget.
-    /// Errors, cancellation and Stopped leave the entire snapshot retryable.
+    /// Explicit flush status and bounded upload concurrency/serialized-payload
+    /// budget. Errors, cancellation and Stopped leave the entire snapshot
+    /// retryable. Before an error or Stopped result is returned, every node
+    /// callback already created by this method is awaited to completion.
     pub async fn flush_with_options<N, NF, I, IF, M, MF>(
         &self,
         now_ms: u64,
@@ -564,28 +574,43 @@ impl HnswIndex {
             return Ok(FlushOutcome::NoChanges);
         };
         let generation = snapshot.metadata.stats.version;
+        let node_sizes = snapshot
+            .nodes
+            .iter()
+            .map(|node| node.encoded_size(generation))
+            .collect::<Result<Vec<_>, _>>()?;
+        if node_sizes
+            .iter()
+            .any(|&size| size > options.max_in_flight_bytes)
+        {
+            return Err(self.operation_error("A node exceeds the configured flush byte budget"));
+        }
         let mut pending = FuturesUnordered::new();
         let mut offset = 0;
         let mut in_flight_bytes = 0;
-        let mut next_size = None;
+        let mut first_error = None;
+        let mut stopped = false;
         while offset < snapshot.nodes.len() || !pending.is_empty() {
-            while offset < snapshot.nodes.len() && pending.len() < options.node_concurrency {
+            if (first_error.is_some() || stopped) && pending.is_empty() {
+                break;
+            }
+            while first_error.is_none()
+                && !stopped
+                && offset < snapshot.nodes.len()
+                && pending.len() < options.node_concurrency
+            {
                 let node = &snapshot.nodes[offset];
-                let size = match next_size {
-                    Some(size) => size,
-                    None => node.encoded_size(generation)?,
-                };
-                if size > options.max_in_flight_bytes {
-                    return Err(
-                        self.operation_error("A node exceeds the configured flush byte budget")
-                    );
-                }
+                let size = node_sizes[offset];
                 if size > options.max_in_flight_bytes - in_flight_bytes {
-                    next_size = Some(size);
                     break;
                 }
-                next_size = None;
-                let bytes = node.encode_sized(generation, size)?;
+                let bytes = match node.encode_sized(generation, size) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        first_error = Some(error);
+                        break;
+                    }
+                };
                 debug_assert_eq!(bytes.len(), size);
                 let future = node_f(node.id, bytes);
                 pending.push(async move { (size, future.await) });
@@ -594,18 +619,41 @@ impl HnswIndex {
             }
             if let Some((size, result)) = pending.next().await {
                 in_flight_bytes -= size;
-                if !result.map_err(|e| self.operation_error(e))? {
-                    return Ok(FlushOutcome::Stopped);
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => stopped = true,
+                    Err(error) if first_error.is_none() => {
+                        first_error = Some(self.operation_error(error));
+                    }
+                    Err(_) => {}
                 }
             }
         }
-        let ids = self.encode_ids(snapshot.ids.clone(), generation)?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if stopped {
+            return Ok(FlushOutcome::Stopped);
+        }
+
+        let ids = self.encode_ids(snapshot.ids.clone())?;
+        if ids.len() > options.max_in_flight_bytes {
+            return Err(
+                self.operation_error("The IDs image exceeds the configured flush byte budget")
+            );
+        }
+        ids_f(ids).await.map_err(|e| self.operation_error(e))?;
+
         let metadata = self.encode_metadata(
             &snapshot.metadata,
             snapshot.entry_point,
             snapshot.removed.keys().copied().collect(),
         )?;
-        ids_f(ids).await.map_err(|e| self.operation_error(e))?;
+        if metadata.len() > options.max_in_flight_bytes {
+            return Err(
+                self.operation_error("The metadata image exceeds the configured flush byte budget")
+            );
+        }
         metadata_f(metadata)
             .await
             .map_err(|e| self.operation_error(e))?;
@@ -656,7 +704,7 @@ impl HnswIndex {
                 return Ok(FlushOutcome::Stopped);
             }
         }
-        let id_bytes = self.encode_ids(snapshot.ids.clone(), generation)?;
+        let id_bytes = self.encode_ids(snapshot.ids.clone())?;
         let metadata_bytes = self.encode_metadata(
             &snapshot.metadata,
             snapshot.entry_point,
@@ -784,13 +832,13 @@ impl HnswIndex {
         Ok(true)
     }
 
-    /// Writes the IDs CBOR sequence and checks the writer flush.
+    /// Writes the single-item IDs CBOR image and checks the writer flush.
     pub fn store_ids<W: Write>(&self, mut w: W) -> Result<(), HnswError> {
-        let (ids, generation) = {
+        let ids = {
             let _gate = self.structural_lock.lock();
-            (self.ids.read().clone(), self.metadata.read().stats.version)
+            self.ids.read().clone()
         };
-        let bytes = self.encode_ids(ids, generation)?;
+        let bytes = self.encode_ids(ids)?;
         w.write_all(&bytes)
             .and_then(|_| w.flush())
             .map_err(|e| self.serialization_error(e))

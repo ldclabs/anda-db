@@ -193,15 +193,19 @@ match outcome {
 ```
 
 The placeholders above illustrate callback contracts; the complete
-[filesystem demo](../rs/anda_db_hnsw/examples/hnsw_demo.rs) performs actual
-temporary-file writes, file sync, rename and directory sync.
+[filesystem demo](../rs/anda_db_hnsw/examples/hnsw_demo.rs) uses
+`anda_object_store::MetaStore` over `object_store::LocalFileSystem` for
+generation-backed CAS and staged cross-platform replacement, and requests
+fsync durability where the platform supports it.
 
-Upload concurrency is 1–64, and the encoded buffers in flight stay within the
-configured byte budget. A single node larger than the budget is an error.
-Exact encoded sizes use cbor2::serialized_size. IDs are written only after all
-node callbacks succeed; metadata is written last. A node callback returning
-false stops without committing. Error/cancellation can leave individual object
-writes durable, but dirty evidence is retained for recovery/retry.
+Upload concurrency is 1–64. The aggregate node callback buffers in flight and
+each later IDs/metadata callback buffer stay within the configured byte budget.
+A single payload larger than the budget is an error. Exact node sizes use
+cbor2::serialized_size. IDs are written only after all node callbacks succeed;
+metadata is written last. A node callback returning false stops without
+committing. On an error or stop, every node callback already started by the
+flush is awaited before the method returns. Cancellation can still leave an
+individual backend write durable, so dirty evidence is retained for recovery.
 
 Compatibility `flush_with` returns true only for a committed pass and false
 for no changes; an early stop is now an error. `flush_outcome` gives the same
@@ -250,28 +254,36 @@ tombstones. `has_pending_flush` includes nodes, metadata/IDs and tombstones.
 
 The existing metadata fields and public node fields remain readable.
 New node objects add an optional `g` field containing the pass generation.
-The IDs object is a CBOR sequence: the original byte string containing the
-Portable Roaring treemap, followed by a u64 generation. Older AndaDB readers
-decode the first item; new readers also accept legacy one-item IDs objects.
-Custom decoders that require exactly one CBOR item must accept the trailer.
+The IDs object remains exactly one CBOR byte string containing the Portable
+Roaring treemap. Older AndaDB readers and strict single-item CBOR validators
+therefore read the same framing.
 
-Each backend must atomically replace individual objects. The sequence
-nodes → IDs → metadata plus metadata CAS is **recoverable partial progress**,
-not a multi-object transaction or a promise to reopen the previous snapshot.
+Each backend must atomically replace individual objects. Fixed-key node and
+metadata replacements must also use backend conditional writes (CAS), or node
+objects must use immutable generation-specific paths. This prevents an old
+request whose result arrives late from replacing a newer committed object. The
+sequence nodes → IDs → metadata is **recoverable partial progress**, not a
+multi-object transaction or a promise to reopen the previous snapshot.
+The AndaDB adapter retains one backend `ObjectVersion` token per live node (and
+per unpurged tombstone); purging a blob removes its token.
 
 Bootstrap proceeds transactionally in memory:
 
 1. Validate metadata/config and stage IDs without changing a live graph.
 2. Fetch/validate node objects with bounded concurrency, up to 32 in flight.
 3. Remove missing references, duplicate edges, self-loops and invalid layer
-   edges; repair the entry point and maximum layer. Reject invalid numeric
-   data, invalid node IDs/layer shapes and excessive degree.
-4. Recompute legacy cached distances once during migration.
-5. If pass markers disagree, or an unversioned legacy graph is disconnected, rebuild from
-   vectors referenced by the loaded IDs. If pruning still isolates nodes,
-   reserve one bounded ring edge per node in that rebuilt graph. A coherent
-   modern image retains its original graph, even if approximate pruning or
-   cheap deletion left it disconnected.
+   edges; repair the entry point and maximum layer. Reject non-finite numeric
+   data, invalid node IDs/layer shapes and excessive degree. Persisted finite
+   vectors that predate current insertion bounds remain loadable after later
+   repair passes and saves.
+4. Recompute legacy cached distances once during migration. Drop a legacy edge
+   whose distance cannot be represented by the persisted `bf16` edge format.
+5. If a node pass marker is newer than committed metadata, rebuild from vectors
+   referenced by the loaded IDs. When a historical vector exceeds current
+   insertion bounds, normalize topology and cached distances in place instead.
+   If pruning still isolates nodes, reserve one bounded ring edge per node in a
+   rebuilt graph. Coherent modern and legacy images retain their original graph,
+   even if approximate pruning or cheap deletion left it disconnected.
 6. Publish the replacement only after success; mark repairs dirty.
 
 The loaded IDs object defines which vectors recovery retains. A failed pass can

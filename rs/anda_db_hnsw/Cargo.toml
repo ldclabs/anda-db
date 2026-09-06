@@ -26,6 +26,8 @@ log = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+anda_object_store = { path = "../anda_object_store", version = "0.11" }
+object_store = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["full"] }
 structured-logger = { workspace = true }
 

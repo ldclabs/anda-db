@@ -140,12 +140,32 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::ready,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
+
+struct NoEofReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl Read for NoEofReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.offset == self.bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the framed CBOR item ended without closing the stream",
+            ));
+        }
+        let count = buffer.len().min(self.bytes.len() - self.offset);
+        buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
 
 fn config() -> HnswConfig {
     HnswConfig {
@@ -333,6 +353,200 @@ async fn accepted_large_vectors_round_trip_and_out_of_range_inserts_are_atomic()
             .compute_f32(&[f32::INFINITY, 0.0], &[0.0, 0.0])
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn legacy_finite_vectors_outside_new_insert_bounds_still_load() {
+    let seed = index();
+    seed.insert_f32(1, vec![1.0, 0.0], 0).unwrap();
+    let metadata = seed.metadata_bytes().unwrap();
+    let mut ids = Vec::new();
+    seed.store_ids(&mut ids).unwrap();
+    let mut legacy = node(1, 0, vec![vec![]]);
+    legacy.vector = vec![bf16::from_f32(1e38), bf16::ZERO];
+    let blob = serialize_node(&legacy);
+
+    let loaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async |id| {
+        assert_eq!(id, 1);
+        Ok(Some(blob.clone()))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(loaded.node_ids(), vec![1]);
+    let result = loaded.search_f32(&[1e38, 0.0], 1).unwrap();
+    assert_eq!(result[0].0, 1);
+    assert!(result[0].1.is_finite());
+    assert!(!loaded.recovery_report().rebuilt);
+
+    // A later graph mutation can rewrite the legacy node with a modern pass
+    // marker. That must not revoke its read compatibility on the next open.
+    loaded.insert_f32(2, vec![0.0, 0.0], 1).unwrap();
+    let disk = Disk::default();
+    disk.flush(&loaded).await;
+    assert_eq!(disk.load().await.node_ids(), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn valid_disconnected_legacy_graph_does_not_trigger_full_rebuild() {
+    let seed = index();
+    seed.insert_f32(1, vec![1.0, 0.0], 0).unwrap();
+    seed.insert_f32(2, vec![2.0, 0.0], 0).unwrap();
+    let metadata = seed.metadata_bytes().unwrap();
+    let mut ids = Vec::new();
+    seed.store_ids(&mut ids).unwrap();
+    let blobs = BTreeMap::from([
+        (1, serialize_node(&node(1, 0, vec![vec![]]))),
+        (2, serialize_node(&node(2, 0, vec![vec![]]))),
+    ]);
+
+    let loaded = HnswIndex::load_all(metadata.as_slice(), ids.as_slice(), async |id| {
+        Ok(blobs.get(&id).cloned())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(loaded.node_ids(), vec![1, 2]);
+    assert!(!loaded.recovery_report().rebuilt);
+    assert!(!loaded.has_dirty_nodes());
+}
+
+#[test]
+fn ids_are_one_framed_cbor_item_and_loading_does_not_wait_for_eof() {
+    let source = index();
+    source.insert_f32(1, vec![1.0, 0.0], 0).unwrap();
+    let mut ids = Vec::new();
+    source.store_ids(&mut ids).unwrap();
+    cbor2::validate_slice(&ids).unwrap();
+
+    let mut target = index();
+    target
+        .load_ids(NoEofReader {
+            bytes: &ids,
+            offset: 0,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn flush_waits_for_started_node_callbacks_after_an_error() {
+    let index = index();
+    for id in 0..4 {
+        index.insert_f32(id, vec![id as f32, 0.0], 0).unwrap();
+    }
+    let started = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let ids_called = AtomicBool::new(false);
+    let metadata_called = AtomicBool::new(false);
+    let result = index
+        .flush_with_options(
+            1,
+            FlushOptions {
+                node_concurrency: 4,
+                ..Default::default()
+            },
+            |id, _| {
+                let started = started.clone();
+                let completed = completed.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if id == 0 {
+                        return Err::<bool, BoxError>("injected node error".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+            |_| {
+                ids_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+            |_| {
+                metadata_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+    assert_eq!(completed.load(Ordering::SeqCst), 3);
+    assert!(!ids_called.load(Ordering::SeqCst));
+    assert!(!metadata_called.load(Ordering::SeqCst));
+    assert!(index.has_pending_flush());
+}
+
+#[tokio::test]
+async fn byte_budget_covers_ids_and_metadata_payloads() {
+    let many = index();
+    for id in 0..64 {
+        many.insert_f32(id * (u32::MAX as u64 + 1), vec![id as f32, 0.0], 0)
+            .unwrap();
+    }
+    many.store_dirty_nodes(async |_, _| Ok(true)).await.unwrap();
+    let mut ids = Vec::new();
+    many.store_ids(&mut ids).unwrap();
+    let nodes_called = AtomicBool::new(false);
+    let ids_called = AtomicBool::new(false);
+    let metadata_called = AtomicBool::new(false);
+    let result = many
+        .flush_with_options(
+            1,
+            FlushOptions {
+                node_concurrency: 1,
+                max_in_flight_bytes: ids.len() - 1,
+            },
+            |_, _| {
+                nodes_called.store(true, Ordering::SeqCst);
+                ready(Ok::<bool, BoxError>(true))
+            },
+            |_| {
+                ids_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+            |_| {
+                metadata_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(!nodes_called.load(Ordering::SeqCst));
+    assert!(!ids_called.load(Ordering::SeqCst));
+    assert!(!metadata_called.load(Ordering::SeqCst));
+
+    let empty = index();
+    let mut empty_ids = Vec::new();
+    empty.store_ids(&mut empty_ids).unwrap();
+    assert!(empty.metadata_bytes().unwrap().len() > empty_ids.len());
+    let ids_called = AtomicBool::new(false);
+    let metadata_called = AtomicBool::new(false);
+    let nodes_called = AtomicBool::new(false);
+    let result = empty
+        .flush_with_options(
+            1,
+            FlushOptions {
+                node_concurrency: 1,
+                max_in_flight_bytes: empty_ids.len(),
+            },
+            |_, _| {
+                nodes_called.store(true, Ordering::SeqCst);
+                ready(Ok::<bool, BoxError>(true))
+            },
+            |_| {
+                ids_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+            |_| {
+                metadata_called.store(true, Ordering::SeqCst);
+                ready(Ok::<(), BoxError>(()))
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(!nodes_called.load(Ordering::SeqCst));
+    assert!(ids_called.load(Ordering::SeqCst));
+    assert!(!metadata_called.load(Ordering::SeqCst));
 }
 
 struct FailingWriter {
@@ -664,10 +878,7 @@ async fn legacy_topology_and_entry_layers_are_repaired() {
     .unwrap();
     let mut ids = Vec::new();
     seed.store_ids(&mut ids).unwrap();
-    // Strip the optional generation trailer to exercise the legacy bitmap.
-    let bytes: Vec<u8> = cbor2::from_reader(ids.as_slice()).unwrap();
-    ids.clear();
-    cbor2::to_writer(&cbor2::Value::Bytes(bytes), &mut ids).unwrap();
+    cbor2::validate_slice(&ids).unwrap();
     let blobs = BTreeMap::from([
         (
             1,
