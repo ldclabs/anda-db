@@ -226,7 +226,9 @@ long keys can have several copies. Larger postings have an auxiliary PK map;
 small postings avoid it. Hash-table capacity and membership structures are
 material memory costs.
 
-Run `cargo bench -p anda_db_btree --bench workloads`. The harness reports
+Run `ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads`.
+The explicit opt-in keeps harness-free benchmarks out of release-mode
+`cargo test --all-targets` runs. The harness reports
 median/p95/p99, throughput, allocation counts/bytes, peak extra live heap and
 serialized bytes. It covers high/low cardinality, large posting deletion,
 first/last pages, multi-threaded reads/writes and 4 KiB keys. Flush fixtures

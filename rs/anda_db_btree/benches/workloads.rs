@@ -1,4 +1,4 @@
-//! Instrumented workload benchmark. Run cargo bench -p anda_db_btree --bench workloads.
+//! Instrumented workload benchmark. Run with `ANDA_BTREE_RUN_BENCH=1`.
 //! ANDA_BTREE_BENCH_SAMPLES controls the default 100 samples. Output is JSON.
 use anda_db_btree::{BTreeConfig, BTreeIndex, RangeQuery};
 use futures::executor::block_on;
@@ -120,7 +120,10 @@ fn seeded(n: u64) -> BTreeIndex<u64, u64> {
     index
 }
 fn main() {
-    if cfg!(debug_assertions) || std::env::args().any(|arg| arg == "--test") {
+    // A harness-free bench is also executed by `cargo test --release
+    // --all-targets`, without a distinguishing argument. Keep expensive work
+    // explicit so test commands only perform tests.
+    if std::env::var_os("ANDA_BTREE_RUN_BENCH").is_none() {
         return;
     }
     // Warm CPU execution before comparing sub-microsecond paths. Keep the

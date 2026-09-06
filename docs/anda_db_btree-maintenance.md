@@ -69,8 +69,8 @@ cargo test -p anda_db_btree -p anda_db --all-features
 cargo test -p anda_db_btree --all-targets --all-features
 cargo clippy -p anda_db_btree -p anda_db --all-targets --all-features -- -D warnings
 cargo fmt -p anda_db_btree -p anda_db -- --check
-cargo bench -p anda_db_btree --bench workloads
-ANDA_BTREE_BENCH_NO_IO_DELAY=1 cargo bench -p anda_db_btree --bench workloads
+ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads
+ANDA_BTREE_RUN_BENCH=1 ANDA_BTREE_BENCH_NO_IO_DELAY=1 cargo bench -p anda_db_btree --bench workloads
 ```
 
 Rust 全工作区验证通过 1,512 个测试，fixture 生成测试按项目设置忽略。随后增加的两个加载边界回归以及最终查询分配优化，由受影响两 crate 的完整测试再次验证。受影响模块的最终测试、Clippy 和格式检查通过。本次未涉及 TS 引擎或生成文件。

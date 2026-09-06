@@ -46,7 +46,7 @@ Deep technical documentation for this crate lives in:
 
 ```sh
 cargo test -p anda_db_btree --all-targets --all-features
-cargo bench -p anda_db_btree --bench workloads
+ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads
 ```
 
 The [maintenance report](../../docs/anda_db_btree-maintenance.md) records the

@@ -67,13 +67,17 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
             Some(positions) => *positions.get(id)?,
             None => self.ids.iter().position(|candidate| candidate == id)?,
         };
-        if let Some(positions) = &mut self.positions {
+        // Work on the position map out of place. If a user-defined Hash/Eq
+        // implementation panics below, unwinding drops the map and leaves the
+        // still-unchanged id vector as the authoritative linear fallback.
+        if let Some(mut positions) = self.positions.take() {
             positions.remove(id);
             if index + 1 != self.ids.len() {
                 *positions
                     .get_mut(self.ids.last().expect("nonempty posting"))
                     .expect("position exists") = index;
             }
+            self.positions = Some(positions);
         }
         let removed = self.ids.swap_remove(index);
         // Hysteresis avoids repeatedly building/dropping the map at the cutoff.
@@ -133,5 +137,55 @@ impl<PK: Serialize> Serialize for PostingList<PK> {
 impl<'de, PK: Eq + Hash + Clone + Deserialize<'de>> Deserialize<'de> for PostingList<PK> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Vec::<PK>::deserialize(d).map(Self::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        cell::Cell,
+        hash::{Hash, Hasher},
+    };
+
+    thread_local! {
+        static HASH_PANIC_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Key(u8);
+
+    impl Hash for Key {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            HASH_PANIC_AFTER.with(|countdown| {
+                if let Some(remaining) = countdown.get() {
+                    if remaining == 0 {
+                        countdown.set(None);
+                        panic!("intentional hash panic");
+                    }
+                    countdown.set(Some(remaining - 1));
+                }
+            });
+            self.0.hash(state);
+        }
+    }
+
+    #[test]
+    fn hash_panic_during_remove_falls_back_to_the_id_vector() {
+        let mut posting = PostingList::from((0..10).map(Key).collect::<Vec<_>>());
+        HASH_PANIC_AFTER.with(|countdown| countdown.set(Some(2)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            posting.remove(&Key(3));
+        }));
+        HASH_PANIC_AFTER.with(|countdown| countdown.set(None));
+
+        assert!(result.is_err());
+        assert!(posting.positions.is_none());
+        assert_eq!(posting.ids, (0..10).map(Key).collect::<Vec<_>>());
+        assert!(
+            !posting.push(Key(3)),
+            "the existing id must not be duplicated"
+        );
+        assert_eq!(posting.remove(&Key(3)), Some(Key(3)));
     }
 }
