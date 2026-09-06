@@ -1,0 +1,3 @@
+{"elapsed_ms":781.524625,"get_put_delete_list":[172,3,100,1],"latency_ms":1,"workload":"recover_100_intents"}
+{"elapsed_ms":3633.164958,"get_put_delete_list":[172,3,100,1],"latency_ms":10,"workload":"recover_100_intents"}
+{"elapsed_ms":14617.329417,"get_put_delete_list":[172,3,100,1],"latency_ms":50,"workload":"recover_100_intents"}

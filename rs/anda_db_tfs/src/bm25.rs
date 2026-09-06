@@ -441,6 +441,12 @@ mod search;
 mod tests;
 
 impl<T: Tokenizer> BM25Index<T> {
+    /// Reinstalls the tokenizer used to build this index when opening it.
+    /// Changing tokenization policy requires rebuilding existing postings.
+    pub fn set_tokenizer(&mut self, tokenizer: T) {
+        self.tokenizer = tokenizer;
+    }
+
     /// Creates a new empty BM25 index with the given tokenizer and optional config.
     ///
     /// # Arguments

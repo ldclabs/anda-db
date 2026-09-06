@@ -5,6 +5,7 @@ use std::borrow::Cow;
 mod bm25;
 mod btree;
 mod hnsw;
+mod persistence;
 
 pub use bm25::*;
 pub use btree::*;
@@ -166,10 +167,7 @@ fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
                     stack.push(Item::Json(val, depth + 1));
                 }
             }
-            Item::Json(Json::Array(arr), depth)
-                if depth < MAX_SEARCHABLE_TEXT_DEPTH
-                    && (arr.is_empty() || matches!(arr[0], Json::String(_) | Json::Object(_))) =>
-            {
+            Item::Json(Json::Array(arr), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
                 stack.extend(arr.iter().rev().map(|val| Item::Json(val, depth + 1)));
             }
             _ => {}

@@ -45,6 +45,10 @@ async fn main() -> Result<(), DBError> {
     // init structured logger
     structured_logger::init();
 
+    std::fs::create_dir_all("./debug/metastore").map_err(|source| DBError::Storage {
+        name: "./debug/metastore".into(),
+        source: source.into(),
+    })?;
     // let object_store = InMemory::new();
     let object_store = MetaStoreBuilder::new(
         LocalFileSystem::new_with_prefix("./debug/metastore")?.with_fsync(true),
@@ -56,7 +60,8 @@ async fn main() -> Result<(), DBError> {
         name: "anda_db_demo".to_string(),
         description: "Anda DB demo".to_string(),
         storage: StorageConfig {
-            compress_level: 0, // no compression
+            compress_level: 0,                       // no compression
+            cache_max_bytes: Some(64 * 1024 * 1024), // explicit 64 MiB cache budget
             ..Default::default()
         },
         lock: None, // no lock for demo

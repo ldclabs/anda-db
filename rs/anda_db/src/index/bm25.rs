@@ -12,7 +12,7 @@ pub use anda_db_tfs::{
 
 use crate::{
     error::DBError,
-    schema::{BoxError, DocumentId},
+    schema::DocumentId,
     storage::{ObjectVersion, PutMode, Storage},
     unix_ms,
 };
@@ -59,6 +59,23 @@ impl Hash for &BM25 {
 }
 
 impl BM25 {
+    pub(crate) fn search_in_ids(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+        logical: bool,
+    ) -> Result<Vec<(u64, f32)>, DBError> {
+        Ok(self
+            .index
+            .try_search_in_ids(query, top_k, params, ids, logical)?)
+    }
+
+    pub(crate) fn set_tokenizer(&mut self, tokenizer: TokenizerChain) {
+        self.index.set_tokenizer(tokenizer);
+    }
+
     pub(crate) fn dir_path(name: &str) -> String {
         format!("bm25_indexes/{name}/")
     }
@@ -196,18 +213,13 @@ impl BM25 {
                     // recovery happens on reopen.
                     let metadata_path = metadata_path.clone();
                     async move {
-                        let expected = { self.metadata_version.read().clone() };
-                        let version = self
-                            .storage
-                            .put_bytes(
-                                &metadata_path,
-                                Bytes::from(data),
-                                PutMode::Update(expected.into()),
-                            )
-                            .await
-                            .map_err(BoxError::from)?;
-                        *self.metadata_version.write() = version;
-                        Ok(())
+                        super::persistence::commit_metadata(
+                            &self.storage,
+                            &metadata_path,
+                            &self.metadata_version,
+                            data,
+                        )
+                        .await
                     }
                 },
                 |object: BucketObject, data: Vec<u8>| async move {
@@ -225,21 +237,15 @@ impl BM25 {
         // longer references. A failed deletion only leaks storage space and
         // never affects loads: the manifest is the loader's single source of
         // truth.
-        for object in &outcome.obsolete {
-            let path = BM25::bucket_path(&self.name, *object);
-            match self.storage.delete(&path).await {
-                Ok(()) | Err(DBError::NotFound { .. }) => {}
-                Err(err) => {
-                    log::warn!(
-                        action = "BM25::flush",
-                        index = self.name,
-                        bucket = object.bucket_id,
-                        generation = object.generation;
-                        "Failed to delete obsolete bucket object: {err:?}",
-                    );
-                }
-            }
-        }
+        super::persistence::retire_objects(
+            &self.storage,
+            &self.name,
+            outcome
+                .obsolete
+                .into_iter()
+                .map(|object| BM25::bucket_path(&self.name, object)),
+        )
+        .await;
 
         Ok(outcome.saved)
     }
@@ -254,7 +260,7 @@ impl BM25 {
     pub async fn compact_index(&self) -> Result<(), DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
         let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
-        if new_bucket_count >= old_bucket_count {
+        if !self.has_pending_flush() {
             return Ok(());
         }
 

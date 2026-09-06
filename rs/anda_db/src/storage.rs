@@ -33,7 +33,11 @@ use crate::error::DBError;
 ///
 /// A fixed-size table avoids an unbounded per-path generation map. Hash
 /// collisions only cause an extra cache miss; they cannot serve stale data.
-const CACHE_WRITE_SEQ_STRIPES: usize = 256;
+const CACHE_WRITE_SEQ_STRIPES: usize = 4096;
+
+/// Default plaintext budget shared by the streaming reader and writer.
+/// Call the `*_with_limit` variants to use a different explicit budget.
+pub const DEFAULT_STREAM_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// Cached object bytes bound to the write generation observed by their fetch.
 struct CachedObject {
@@ -70,6 +74,41 @@ struct InnerStorage {
     /// cache coherency uses the path-hash generations above so an unrelated
     /// write does not invalidate every cached object.
     write_seq: AtomicU64,
+}
+
+/// Only large owned codec buffers cross a blocking-task boundary. No storage
+/// mutation or borrowed collection state can outlive a cancelled caller here.
+const CODEC_OFFLOAD_THRESHOLD: usize = 256 * 1024;
+static CODEC_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+        ))
+    });
+
+async fn run_codec<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, DBError> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Ok(work());
+    }
+    let permit = CODEC_SLOTS
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|source| DBError::Storage {
+            name: "codec".into(),
+            source: source.into(),
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|source| DBError::Storage {
+        name: "codec".into(),
+        source: source.into(),
+    })
 }
 
 /// Configuration for the object store storage layer.
@@ -120,6 +159,15 @@ impl Default for StorageConfig {
             max_small_object_size: 2000 * 1024, // Default max small object size (2 MiB)
             bucket_overload_size: 1024 * 1024,  // Default bucket overload size (1 MiB)
         }
+    }
+}
+
+impl StorageConfig {
+    /// Explicit byte budget for a new storage namespace. Existing persisted
+    /// configurations retain their original entry-count/byte semantics.
+    pub fn with_cache_max_bytes(mut self, bytes: u64) -> Self {
+        self.cache_max_bytes = Some(bytes);
+        self
     }
 }
 
@@ -432,6 +480,12 @@ impl Storage {
         metadata: StorageMetadata,
         with_cache: bool,
     ) -> Result<Storage, DBError> {
+        if metadata.config.object_chunk_size == 0 {
+            return Err(DBError::Storage {
+                name: metadata.path.clone(),
+                source: "object_chunk_size must be greater than zero".into(),
+            });
+        }
         // The cache capacity semantics follow the configuration (see
         // `StorageConfig`): `cache_max_bytes`, when set, bounds the total
         // cached bytes with a size weigher; otherwise `cache_max_capacity`
@@ -560,7 +614,18 @@ impl Storage {
         // max_small_object_size, so normal data always fits within this limit.
         let max_decompress_size =
             (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
-        let bytes = try_decompress(bytes, max_decompress_size).map_err(|err| DBError::Storage {
+        let large = zstd_compressed(&bytes)
+            && (bytes.len() >= CODEC_OFFLOAD_THRESHOLD
+                || zstd_safe::find_decompressed_size(&bytes)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|n| n >= CODEC_OFFLOAD_THRESHOLD as u64));
+        let decoded = if large {
+            run_codec(move || try_decompress(bytes, max_decompress_size)).await?
+        } else {
+            try_decompress(bytes, max_decompress_size)
+        };
+        let bytes = decoded.map_err(|err| DBError::Storage {
             name: path.to_string(),
             source: err.into(),
         })?;
@@ -664,11 +729,22 @@ impl Storage {
     /// # Errors
     ///
     /// Returns `DBError` if fetching the object metadata fails. The returned
-    /// reader fails with an I/O error if a compressed object expands beyond
-    /// the same decompression-bomb bound `inner_fetch` applies.
+    /// reader fails if the plaintext exceeds [`DEFAULT_STREAM_LIMIT`]. Use
+    /// [`Self::stream_reader_with_limit`] for another explicit budget.
     pub async fn stream_reader(
         &self,
         doc_path: &str,
+    ) -> Result<Pin<Box<dyn tokio::io::AsyncRead + Send>>, DBError> {
+        self.stream_reader_with_limit(doc_path, DEFAULT_STREAM_LIMIT)
+            .await
+    }
+
+    /// Streams an object subject to an explicit plaintext byte budget. The
+    /// budget applies equally to compressed and uncompressed objects.
+    pub async fn stream_reader_with_limit(
+        &self,
+        doc_path: &str,
+        max_bytes: u64,
     ) -> Result<Pin<Box<dyn tokio::io::AsyncRead + Send>>, DBError> {
         let path = self.full_path(doc_path);
         let meta = self
@@ -680,7 +756,7 @@ impl Storage {
         let mut reader = BufReader::with_capacity(
             self.inner.object_store.clone(),
             &meta,
-            self.inner.metadata.config.object_chunk_size,
+            self.inner.metadata.config.object_chunk_size.max(4),
         );
 
         // `fill_buf` peeks at the head of the stream without consuming it, so
@@ -698,26 +774,20 @@ impl Storage {
         // Coerce both branches to the same trait-object type to avoid
         // concrete-type mismatches between `ZstdDecoder` and `BufReader`.
         if compressed {
-            // The bomb bound must scale with the object actually stored:
-            // `stream_writer` compresses inputs of any size, so an absolute
-            // cap of `max_small_object_size * 16` (the buffered-fetch bound,
-            // sound there because buffered inputs never exceed
-            // `max_small_object_size`) would make every streamed object
-            // larger than that cap unreadable through its own read path.
-            // Bounding by 16x the on-disk size still rejects the
-            // tiny-input/huge-output shape that defines a decompression bomb.
-            let max_decompress_size = meta
-                .size
-                .saturating_mul(16)
-                .max((self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16));
+            // Plaintext size has an explicit budget independent of compression
+            // ratio, shared with stream_writer_with_limit.
             let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(BoundedReader::new(
                 Box::pin(ZstdDecoder::new(reader)),
-                max_decompress_size,
+                max_bytes,
                 path.to_string(),
             ));
             Ok(r)
         } else {
-            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(reader);
+            let r: Pin<Box<dyn tokio::io::AsyncRead + Send>> = Box::pin(BoundedReader::new(
+                Box::pin(reader),
+                max_bytes,
+                path.to_string(),
+            ));
             Ok(r)
         }
     }
@@ -748,6 +818,30 @@ impl Storage {
         })?;
 
         self.inner.put(path, buf.into(), PutMode::Create).await
+    }
+
+    /// An intent may contain two individually valid documents plus its
+    /// envelope. Keep that internal budget separate from public document PUTs.
+    pub(crate) async fn create_intent<T: Serialize>(
+        &self,
+        doc_path: &str,
+        intent: &T,
+    ) -> Result<ObjectVersion, DBError> {
+        let mut buf = Vec::new();
+        to_writer(intent, &mut buf).map_err(|source| DBError::Serialization {
+            name: self.inner.base_path.to_string(),
+            source: source.into(),
+        })?;
+        let limit = self
+            .inner
+            .metadata
+            .config
+            .max_small_object_size
+            .saturating_mul(2)
+            .saturating_add(1024);
+        self.inner
+            .put_with_limit(self.full_path(doc_path), buf.into(), PutMode::Create, limit)
+            .await
     }
 
     /// Puts (creates or overwrites/updates) a document in the object store.
@@ -849,7 +943,9 @@ impl Storage {
     /// Creates an asynchronous writer (`AsyncWrite`) for streaming large objects.
     ///
     /// Data is written in chunks using the underlying object store's multipart upload or equivalent.
-    /// Handles compression automatically if enabled.
+    /// Handles compression automatically if enabled. Plaintext is limited to
+    /// [`DEFAULT_STREAM_LIMIT`]; use [`Self::stream_writer_with_limit`] to opt
+    /// into another budget and read it with the matching reader budget.
     ///
     /// The object becomes visible when the writer is shut down; that is also
     /// when the write is accounted in [`StorageStats`] and the path is
@@ -861,6 +957,17 @@ impl Storage {
     ///
     /// * `doc_path` - The relative path of the object.
     pub fn stream_writer(&self, doc_path: &str) -> Pin<Box<dyn tokio::io::AsyncWrite + Send>> {
+        self.stream_writer_with_limit(doc_path, DEFAULT_STREAM_LIMIT)
+    }
+
+    /// Creates a streaming writer with the same explicit plaintext budget
+    /// accepted by [`Self::stream_reader_with_limit`]. Oversized writes fail
+    /// before shutdown can publish the object.
+    pub fn stream_writer_with_limit(
+        &self,
+        doc_path: &str,
+        max_bytes: u64,
+    ) -> Pin<Box<dyn tokio::io::AsyncWrite + Send>> {
         let path = self.full_path(doc_path);
         let writer = BufWriter::with_capacity(
             self.inner.object_store.clone(),
@@ -884,6 +991,7 @@ impl Storage {
             path,
             inner,
             written: 0,
+            limit: max_bytes,
             completing: None,
             completed: false,
         })
@@ -1064,19 +1172,35 @@ impl InnerStorage {
 
     /// Internal helper to put bytes, handling compression, size checks, cache invalidation, and stats updates.
     async fn put(&self, path: Path, data: Bytes, mode: PutMode) -> Result<ObjectVersion, DBError> {
+        self.put_with_limit(path, data, mode, self.metadata.config.max_small_object_size)
+            .await
+    }
+
+    async fn put_with_limit(
+        &self,
+        path: Path,
+        data: Bytes,
+        mode: PutMode,
+        limit: usize,
+    ) -> Result<ObjectVersion, DBError> {
         // Check original (pre-compression) size to ensure the decompression path
         // can always recover the data within the same limit.
         let original_len = data.len();
-        if data.len() > self.metadata.config.max_small_object_size {
+        if data.len() > limit {
             return Err(DBError::PayloadTooLarge {
                 path: path.to_string(),
                 size: original_len,
-                limit: self.metadata.config.max_small_object_size,
+                limit,
             });
         }
 
         let data = if self.metadata.config.compress_level > 0 {
-            try_compress(data, self.metadata.config.compress_level)
+            let level = self.metadata.config.compress_level;
+            if data.len() >= CODEC_OFFLOAD_THRESHOLD {
+                run_codec(move || try_compress(data, level)).await?
+            } else {
+                try_compress(data, level)
+            }
         } else {
             data
         };
@@ -1135,6 +1259,7 @@ struct StreamWriter {
     /// Bytes handed to this writer (pre-compression), mirroring the
     /// `original_len` accounting of `InnerStorage::put`.
     written: u64,
+    limit: u64,
     /// In-flight bookkeeping future, polled to completion by `poll_shutdown`.
     completing: Option<BoxFuture<'static, ()>>,
     completed: bool,
@@ -1147,6 +1272,17 @@ impl tokio::io::AsyncWrite for StreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.completed || this.completing.is_some() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream is shutting down",
+            )));
+        }
+        if buf.len() as u64 > this.limit.saturating_sub(this.written) {
+            return Poll::Ready(Err(io::Error::other(
+                "stream exceeds plaintext byte budget",
+            )));
+        }
         match this.inner.as_mut().poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
                 this.written += n as u64;
@@ -1198,11 +1334,8 @@ impl tokio::io::AsyncWrite for StreamWriter {
     }
 }
 
-/// Caps how many bytes a decompressing stream may produce.
-///
-/// The buffered path (`try_decompress`) refuses to expand an object beyond
-/// `max_small_object_size * 16`; without an equivalent bound a crafted object
-/// could stream unbounded data into the caller's buffer.
+/// Caps how many plaintext bytes a stream may produce, regardless of whether
+/// its input is compressed. The streaming writer uses the same explicit limit.
 struct BoundedReader {
     inner: Pin<Box<dyn tokio::io::AsyncRead + Send>>,
     remaining: u64,
@@ -1228,6 +1361,10 @@ impl tokio::io::AsyncRead for BoundedReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         if this.remaining == 0 {
             // The budget is spent. Probe for one more byte to tell "the stream
@@ -2682,7 +2819,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut reader = storage.stream_reader("bomb").await.unwrap();
+        let mut reader = storage
+            .stream_reader_with_limit("bomb", 16 * 1024)
+            .await
+            .unwrap();
         let mut out = Vec::new();
         let err = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
             .await

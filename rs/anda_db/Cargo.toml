@@ -11,7 +11,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anda_db_utils = { version = "0.11", path = "../anda_db_utils" }
 anda_db_schema = { path = "../anda_db_schema", version = "0.11" }
 anda_db_hnsw = { path = "../anda_db_hnsw", version = "0.11" }
 anda_db_btree = { path = "../anda_db_btree", version = "0.11" }
@@ -26,6 +25,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = [
   "macros",
+  "rt",
   "sync",
   "parking_lot",
   "io-util",
@@ -61,3 +61,7 @@ required-features = ["full"]
 
 [lib]
 doctest = false
+
+[[bench]]
+name = "core_workloads"
+harness = false

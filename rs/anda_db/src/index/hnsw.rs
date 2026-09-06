@@ -53,6 +53,37 @@ impl Hash for &Hnsw {
 }
 
 impl Hnsw {
+    /// Exact scoring of a bounded external candidate set. This does not walk
+    /// the graph, so it does not increment graph-search statistics.
+    pub(crate) fn search_in_ids(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, f32)>, DBError> {
+        if query.len() != self.dimension() || query.iter().any(|v| !v.is_finite()) {
+            return Err(DBError::Index {
+                name: self.name.clone(),
+                source: "invalid query vector dimension or non-finite value".into(),
+            });
+        }
+        let metric = self.index.metadata().config.distance_metric;
+        let mut results = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match self
+                .index
+                .get_node_with(id, |node| metric.compute_mixed(query, &node.vector))
+            {
+                Ok(distance) => results.push((id, distance?)),
+                Err(HnswError::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        results.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        results.truncate(top_k);
+        Ok(results)
+    }
+
     pub(crate) fn dir_path(name: &str) -> String {
         format!("hnsw_indexes/{name}/")
     }
@@ -122,6 +153,14 @@ impl Hnsw {
 
     /// Loads an existing HNSW index from metadata, id list, and node objects.
     pub async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {
+        Self::bootstrap_with_cleanup(name, storage, true).await
+    }
+
+    pub(crate) async fn bootstrap_with_cleanup(
+        name: String,
+        storage: Storage,
+        cleanup: bool,
+    ) -> Result<Self, DBError> {
         let (metadata, metadata_version) = storage.fetch_bytes(&Hnsw::metadata_path(&name)).await?;
         let (ids, ids_version) = storage.fetch_bytes(&Hnsw::ids_path(&name)).await?;
         let n = Arc::new(name.clone());
@@ -149,8 +188,10 @@ impl Hnsw {
             ids_version: Arc::new(RwLock::new(ids_version)),
             node_versions,
         };
-        this.load_tombstone_versions().await?;
-        this.purge_orphan_node_blobs().await;
+        if cleanup {
+            this.load_tombstone_versions().await?;
+            this.purge_orphan_node_blobs().await;
+        }
         Ok(this)
     }
 

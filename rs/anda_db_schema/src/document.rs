@@ -67,6 +67,11 @@ impl From<Document> for DocumentOwned {
 }
 
 impl Document {
+    /// The schema that maps this document's stored field numbers to names.
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
     /// Creates a new Document with the specified schema and ID.
     ///
     /// # Arguments

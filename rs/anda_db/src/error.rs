@@ -9,8 +9,10 @@ use crate::schema::{BoxError, SchemaError};
 
 /// Lifecycle state of a [`Collection`](crate::collection::Collection) handle.
 ///
-/// A handle in any state other than [`Active`](Self::Active) rejects every
-/// operation. The rejection is a [`DBError::Generic`] whose `source` carries
+/// A handle in any state other than [`Active`](Self::Active) rejects mutations.
+/// Reads and inspection remain available as best-effort observations of that
+/// handle's generation; they may lag storage after poisoning or retirement.
+/// A mutation rejection is a [`DBError::Generic`] whose `source` carries
 /// the state as a [`CollectionStateError`]; recover it with
 /// [`DBError::collection_state`] instead of matching on the message text,
 /// which is not part of the API.

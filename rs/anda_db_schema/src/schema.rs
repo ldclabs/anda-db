@@ -82,6 +82,18 @@ impl PartialEq for Schema {
 impl Eq for Schema {}
 
 impl Schema {
+    /// Whether field names resolve to the same encoded numbers and types.
+    /// Descriptions, version counters and uniqueness policy do not change the
+    /// document layout; a destination collection enforces its own policy.
+    pub fn has_same_field_mapping(&self, other: &Self) -> bool {
+        self.fields.len() == other.fields.len()
+            && self.fields.iter().all(|(name, field)| {
+                other.fields.get(name).is_some_and(|other| {
+                    field.idx() == other.idx() && field.r#type() == other.r#type()
+                })
+            })
+    }
+
     /// The key name for the ID field. it is a special u64 field used as an internal unique identifier in a collection. It is always present in the schema with idx 0.
     pub const ID_KEY: &str = "_id";
 

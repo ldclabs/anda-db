@@ -140,6 +140,7 @@ Add the core dependencies to your `Cargo.toml`.
 ```toml
 [dependencies]
 anda_db = { version = "0.11", features = ["full"] }
+anda_object_store = "0.11"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -156,6 +157,7 @@ use anda_db::{
     schema::{AndaDBSchema, Vector, vector_from_f32},
     storage::StorageConfig,
 };
+use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -170,7 +172,13 @@ struct Memory {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?);
+    std::fs::create_dir_all("./db")?;
+    let store = Arc::new(
+        MetaStoreBuilder::new(
+            LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
+            10000,
+        ).build(),
+    );
 
     let db = AndaDB::connect(
         store,

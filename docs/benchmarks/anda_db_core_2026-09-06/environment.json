@@ -1,0 +1,39 @@
+{
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "arch": "arm64",
+  "macos": "26.6.2",
+  "binaries": {
+    "before": {
+      "bytes": 2986992
+    },
+    "after": {
+      "bytes": 3037008
+    },
+    "speed": {
+      "bytes": 5021344
+    }
+  },
+  "cases": {
+    "core": {
+      "ANDA_BENCH_DOCS": "10000",
+      "ANDA_BENCH_ITERATIONS": "100"
+    },
+    "io": {
+      "ANDA_BENCH_IO": "1"
+    },
+    "cache": {
+      "ANDA_BENCH_CACHE": "1"
+    },
+    "scheduler": {
+      "ANDA_BENCH_SCHEDULER": "1"
+    },
+    "filesystem": {
+      "ANDA_BENCH_BACKEND": "fs",
+      "ANDA_BENCH_DOCS": "1000",
+      "ANDA_BENCH_ITERATIONS": "20"
+    }
+  },
+  "default_profile": "release, opt-level=z, lto=true",
+  "speed_profile": "release-speed, opt-level=3, lto=true",
+  "scheduler_harness_version": 3
+}

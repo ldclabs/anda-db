@@ -21,6 +21,7 @@ use anda_db::{
     schema::{AndaDBSchema, Vector, vector_from_f32},
     storage::StorageConfig,
 };
+use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -35,7 +36,13 @@ struct Memory {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
+    std::fs::create_dir_all("./db")?;
+    let store = Arc::new(
+        MetaStoreBuilder::new(
+            LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
+            10000,
+        ).build(),
+    );
 
     let db = AndaDB::connect(
         store,
@@ -104,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```toml
 [dependencies]
 anda_db = { version = "0.11", features = ["full"] }
+anda_object_store = "0.11"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -113,7 +121,6 @@ Add direct low-level crates only when using their public APIs directly:
 
 ```toml
 anda_db_hnsw = "0.11"       # e.g. DistanceMetric
-anda_object_store = "0.11" # MetaStoreBuilder / EncryptedStoreBuilder
 cbor2 = "1"               # direct CBOR values, readers, writers, size
 ```
 
@@ -134,10 +141,11 @@ cbor2 = "1"               # direct CBOR values, readers, writers, size
 - Never wrap mutating calls (`add*`, `update`, `remove`, `flush`, `close`,
   extension writes) in `tokio::select!`/`timeout`: dropping such a future
   mid-operation poisons the collection handle (cancellation is treated as a
-  crash). A poisoned handle rejects every further operation; reopen it via
+  crash). A poisoned handle rejects further mutations; reads can lag storage. Reopen it via
   `db.open_collection(...)`, which discards the poisoned handle and recovers
   from storage. Storage failures with unknown outcomes poison the handle the
   same way.
+- Wrap `LocalFileSystem` with `MetaStoreBuilder`: the native 0.14 backend does not implement conditional PUT updates.
 - Local deployments needing durable writes should enable `LocalFileSystem::with_fsync(true)`. In object_store 0.14.1 this does not cover standalone deletes; do not claim complete host-power-loss durability from this setting alone.
 - One live writer process per database: this is a deployment contract. A
   `Precondition` error from flush means a second writer touched the storage.
@@ -218,7 +226,8 @@ c.create_bm25_index_nx(&["title", "body"]).await?;
 ```
 
 For Chinese tokenization, pass `anda_db::index::jieba_tokenizer()` to
-`Collection::set_tokenizer` before creating the BM25 index — it is always
+`Collection::set_tokenizer` at the start of every open callback, before any
+query, mutation or index creation triggers recovery — it is always
 available and needs no cargo feature. See `rs/anda_db/examples/db_demo.rs`
 (the example itself requires `--features full`, which only enables
 `object_store/fs`).

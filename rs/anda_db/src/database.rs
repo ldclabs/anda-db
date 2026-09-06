@@ -261,7 +261,11 @@ impl AndaDB {
         .await?;
 
         match storage.fetch::<DBMetadata>(Self::METADATA_PATH).await {
-            Ok((metadata, _)) => {
+            Ok((mut metadata, _)) => {
+                // Storage adopts the requested prefix on relocation. Keep
+                // collection paths on that same prefix, never the old name.
+                let relocated = metadata.config.name != config.name;
+                metadata.config.name = config.name.clone();
                 let set_lock = match (&metadata.config.lock, config.lock) {
                     (None, Some(lock)) => Some(lock),
                     (Some(existing_lock), lock) => {
@@ -282,7 +286,7 @@ impl AndaDB {
                         object_store,
                         storage,
                         metadata: RwLock::new(metadata),
-                        metadata_version: AtomicU64::new(0),
+                        metadata_version: AtomicU64::new(u64::from(relocated)),
                         saved_metadata_version: AtomicU64::new(0),
                         metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
                         collections: RwLock::new(BTreeMap::new()),

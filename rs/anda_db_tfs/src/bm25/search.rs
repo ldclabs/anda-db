@@ -1,6 +1,42 @@
 use super::*;
 
 impl<T: Tokenizer> BM25Index<T> {
+    /// Scores only the supplied document ids, retaining global document
+    /// frequencies and average length. Useful for selective external filters.
+    pub fn try_search_in_ids(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+        logical: bool,
+    ) -> Result<Vec<(u64, f32)>, BM25Error> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let scope: Scores = ids
+            .iter()
+            .copied()
+            .filter(|id| self.doc_tokens.contains_key(id))
+            .map(|id| (id, 0.0))
+            .collect();
+        let params = params.as_ref().unwrap_or(&self.config.bm25);
+        let mut context = QueryContext::new(self, params);
+        let scores = if logical {
+            let expr = QueryType::try_parse(query).map_err(|source| BM25Error::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+            let plan = QueryPlan::prepare(&expr, &mut self.tokenizer.clone());
+            self.execute_query(&plan, &mut context, Some(&scope))?
+        } else {
+            let tokens = query_tokens(&mut self.tokenizer.clone(), query.trim());
+            self.score_tokens(&tokens, &mut context, Some(&scope))
+        };
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        Ok(Self::top_k_results(scores, top_k))
+    }
+
     /// Searches the index and returns the highest-scoring documents.
     ///
     /// The query is tokenized with the index's tokenizer. Multiple tokens are

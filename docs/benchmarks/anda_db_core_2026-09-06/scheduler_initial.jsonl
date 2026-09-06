@@ -1,0 +1,3 @@
+{"elapsed_ms": 62.781875, "p95_ms": 0.013791999999999999, "p99_ms": 0.022875, "workload": "codec_scheduler", "variant": "before", "case": "scheduler"}
+{"elapsed_ms": 38.060583, "p95_ms": 0.019333, "p99_ms": 0.048666, "workload": "codec_scheduler", "variant": "after", "case": "scheduler"}
+{"elapsed_ms": 27.617083, "p95_ms": 0.018875000000000003, "p99_ms": 0.046458, "workload": "codec_scheduler", "variant": "speed", "case": "scheduler"}

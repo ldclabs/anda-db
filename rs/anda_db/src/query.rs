@@ -34,6 +34,33 @@ pub struct Query {
     pub limit: Option<usize>,
 }
 
+/// Resource and recall controls for `Collection::search*_with_options`.
+/// The original query wire format is unchanged. Bounds are clamped by the
+/// collection; setting `prefilter_limit` to zero disables exact subset search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchOptions {
+    /// Initial candidates per result, at least one.
+    pub oversample: usize,
+    /// Per-index recall cap, clamped between the result limit and 4096.
+    pub max_candidates: usize,
+    /// Largest estimated matching set to score exactly (0 disables it).
+    pub prefilter_limit: usize,
+    /// Expand candidates up to the cap when post-filtering leaves too few hits.
+    pub adaptive: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            oversample: 10,
+            max_candidates: 4096,
+            prefilter_limit: 4096,
+            adaptive: true,
+        }
+    }
+}
+
 impl Query {
     /// Validates query-side structural complexity before recursive execution.
     pub fn validate_complexity(&self) -> Result<(), String> {

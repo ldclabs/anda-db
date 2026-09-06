@@ -1,0 +1,1 @@
+{"backend_gets":20,"cold_writes":1000,"elapsed_ms":49.48575,"reads":64000,"workload":"cache_mixed"}

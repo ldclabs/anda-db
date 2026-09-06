@@ -287,6 +287,22 @@ This makes it possible to express compound constraints such as:
 
 Internally, hybrid search may fetch more than the final limit before filtering so that ranking and filtering still produce useful final results. The public limit remains the final output contract.
 
+`search_with_options` and `search_ids_with_options` accept `query::SearchOptions`
+without changing the existing Query/Search wire format. Defaults are 10x
+oversampling, a 4096-candidate cap, exact scoring for selective subsets of at
+most 4096 ids, and adaptive expansion when post-filtering leaves too few hits.
+Subset BM25 keeps global term statistics; subset vectors use exact distances.
+Fusion then ranks within the selected subset. To retain global-ranking-first
+behavior, set `prefilter_limit: 0`; disable expansion with `adaptive: false`.
+Exact subset vector scoring does not increment graph-walk statistics.
+
+OR pages retain only the requested end of each branch's union. AND evaluates
+cheap selective operands first, and candidate-relative NOT stays within that
+scope. Composite primary-key ranges test the predicate while walking ordered
+ids instead of materializing full intersections or complements. General broad
+non-primary-key intersections can still require O(number of matches) working
+memory; the final result limit is not a universal memory limit for every plan.
+
 ## Storage Layer
 
 The storage module implements persistence on top of `object_store`.
@@ -305,6 +321,11 @@ This means the same AndaDB application can be wired to different storage backend
 - HTTP/WebDAV-compatible object storage
 
 This portability matters for AI memory systems because it lets the same collection, indexing, and flush logic move across local development, self-hosted environments, and cloud object storage without redesigning the database layer.
+
+For local files, `object_store` 0.14 does not implement `PutMode::Update`.
+Wrap `LocalFileSystem` in `anda_object_store::MetaStoreBuilder` to provide the
+conditional-write semantics AndaDB needs. The quick start and bundled example
+use this adapter.
 
 It is also important that `object_store` models object-store semantics rather than POSIX filesystem semantics. In practice, this gives AndaDB a better foundation for durable metadata and index persistence, because the underlying abstraction supports capabilities such as conditional reads and writes, multipart upload, bulk deletion, and buffered adapters that map directly onto modern cloud storage systems.
 
@@ -353,7 +374,12 @@ The cache is intended for:
 - small document reads
 - repeated access patterns in agent loops
 
-Cache size is configured with `cache_max_capacity`.
+Cache size can be configured by entry count (`cache_max_capacity`) or explicitly
+by bytes (`cache_max_bytes`). For new deployments, prefer an explicit byte
+budget, for example `StorageConfig::default().with_cache_max_bytes(64 * 1024 *
+1024)`. Persisted entry-count configurations keep their historical semantics.
+Cache coherence uses 4096 fixed generation stripes (32 KiB per Storage):
+unrelated-path collisions can cause a cache miss but cannot serve stale data.
 
 ### Versioned Updates
 
@@ -364,6 +390,14 @@ These versions are used for conditional updates so the library can:
 - avoid silent clobbering of newer state
 - detect precondition failures
 - coordinate metadata and index flushes safely
+
+Streaming I/O has a separate, explicit plaintext budget: 256 MiB by default,
+with `stream_reader_with_limit` and `stream_writer_with_limit` for another
+budget. Reading uses a plaintext cap independent of compression ratio, and
+zero-size chunks are rejected. Buffered document PUTs retain their small-object
+limit; internal update intents allow two documents plus envelope overhead.
+Large owned compression/decompression buffers (at least 256 KiB) run in a
+bounded blocking pool; no collection mutation is detached from its lease.
 
 ## Flush, Durability, and Recovery
 
@@ -398,6 +432,8 @@ On reopening a collection, the library:
 - loads collection metadata
 - loads the persisted document-id bitmap
 - loads persisted indexes
+- lets the open callback install deterministic hooks and the original tokenizer;
+  its first query, mutation or index creation completes recovery before running
 - replays durable mutation intents (the update/remove write-ahead records)
 - runs a repair scan over the exact id window bounded by the persisted
   checkpoint and the allocation watermark, recovering documents that were
@@ -411,15 +447,16 @@ AndaDB's durability design rests on three explicit rules:
 
 1. **Single writer per database.** Only one live process may mutate a given
    database prefix. `DBConfig::lock` is an application-level password, not an
-   OS-level fence; the last line of defense is a conditional PUT on every
-   metadata object — a `Precondition` conflict means a second writer and is
+   OS-level fence; a last line of defense is a conditional PUT on collection
+   and index metadata objects — a `Precondition` conflict means a second writer and is
    never reconciled in place.
 2. **Cancellation is a crash.** Mutating futures (`add`, `update`, `remove`,
    `flush`, `close`, extension writes, compactions) must be polled to
    completion. If one is dropped mid-operation — or a storage write fails
    with an unknown outcome — the collection handle becomes **poisoned**:
-   every further operation returns an error naming the state. Reads on a
-   poisoned handle still serve the in-memory state, but it may lag storage.
+   further mutations return an error naming the state. Reads on a poisoned or
+   retired handle remain best-effort observations of that generation and may
+   lag storage. Reopen before relying on a recovered view.
 3. **Recovery happens only on reopen.** Re-opening the collection (for
    example via `AndaDB::open_collection`, which transparently discards a
    poisoned handle and loads a fresh generation) replays the write-ahead
@@ -441,6 +478,27 @@ enumerate exactly the ids that may need recovery — no probabilistic scan
 heuristics, and only one extra small PUT per 64 adds. Updates and removes
 still write durable intents, because a scan cannot cheaply detect changed or
 deleted content.
+
+Unique-key writes reserve both their old and new native index keys until the
+document PUT/DELETE and any rollback finish. Locks are acquired in stable
+stripe order; unrelated keys can still commit concurrently. Recovery fails on
+unique conflicts instead of silently omitting index entries. Dead-id removals
+carry an id-only purge intent. Live handles retain only pending intent sequence
+numbers, not full document copies.
+
+Recovery reads and intent retirement use bounded I/O concurrency (default 8,
+configurable per handle with `set_io_concurrency(1..=64)`). A transient read
+failure aborts recovery without advancing the checkpoint. `recovery_issues()`
+reports corrupt or schema-invalid document objects skipped by that handle.
+Maintenance `reconcile_storage` performs a full scan under an exclusive lease.
+
+Metadata-only extension writes may publish removal of an index reference, but
+never publish a newly staged index. Full checkpointing persists index data
+before registering it. An unknown metadata PUT outcome poisons the handle so
+reopening refreshes its CAS token.
+
+Opening a relocated database adopts the requested prefix for database and
+collection paths; the persisted old database name cannot redirect operations.
 
 ## Read-Only Mode and Safety Controls
 
@@ -510,6 +568,7 @@ use anda_db::{
 	schema::{AndaDBSchema, Fv, vector_from_f32},
 	storage::StorageConfig,
 };
+use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -525,7 +584,13 @@ struct Memory {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let store = Arc::new(LocalFileSystem::new_with_prefix("./data")?);
+	std::fs::create_dir_all("./data")?;
+	let store = Arc::new(
+	    MetaStoreBuilder::new(
+	        LocalFileSystem::new_with_prefix("./data")?.with_fsync(true),
+	        10000,
+	    ).build(),
+	);
 	let db = AndaDB::connect(
 		store,
 		DBConfig {
@@ -620,6 +685,12 @@ When the application already has Rust structs for memories or knowledge objects,
 ### Tune Storage for Payload Shape
 
 If documents and index objects are mostly small, caching and small-object writes are effective defaults. If payloads are large, revisit compression and chunk sizing in `StorageConfig`.
+
+Production Collection code is split under `src/collection/` into lifecycle,
+persistence, recovery, index operations, CRUD, query execution and extensions.
+The public `collection::Collection` path is unchanged. Typed reverse-order undo
+records centralize rollback; index wrappers share conditional metadata commit
+and obsolete-object retirement helpers while HNSW keeps its graph protocol.
 
 ## Module Reference
 

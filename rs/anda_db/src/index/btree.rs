@@ -152,6 +152,30 @@ where
 }
 
 impl BTree {
+    /// Lock identities use exactly the native key conversion used by insert,
+    /// including non-negative I64/U64 aliases, arrays and wildcard map keys.
+    pub(crate) fn lock_stripes(&self, value: &Fv, stripes: usize) -> Result<Vec<usize>, DBError> {
+        use std::hash::Hasher;
+        let values = match value {
+            Fv::Null => return Ok(Vec::new()),
+            Fv::Array(values) => values.clone(),
+            Fv::Map(values) => values.keys().cloned().map(Fv::from).collect(),
+            scalar => vec![scalar.clone()],
+        };
+        with_typed_inner!(self, |btree, Key| {
+            Ok(self
+                .convert_array_values::<Key, _>(values)?
+                .into_iter()
+                .map(|value| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    btree.name.hash(&mut hasher);
+                    value.hash(&mut hasher);
+                    hasher.finish() as usize % stripes
+                })
+                .collect())
+        })
+    }
+
     pub(crate) fn dir_path(name: &str) -> String {
         format!("btree_indexes/{name}/")
     }
@@ -859,17 +883,13 @@ where
                     // remaining second-writer defense; a `Precondition`
                     // conflict propagates and the collection poisons its
                     // handle (recovery is a reopen).
-                    let expected = { metadata_version.read().clone() };
-                    let version = metadata_storage
-                        .put_bytes(
-                            &metadata_path,
-                            Bytes::from(data),
-                            PutMode::Update(expected.into()),
-                        )
-                        .await
-                        .map_err(BoxError::from)?;
-                    *metadata_version.write() = version;
-                    Ok(())
+                    super::persistence::commit_metadata(
+                        &metadata_storage,
+                        &metadata_path,
+                        &metadata_version,
+                        data,
+                    )
+                    .await
                 },
                 move |object, data: Vec<u8>| {
                     let storage = bucket_storage.clone();
@@ -889,21 +909,15 @@ where
         // longer references. A failed deletion only leaks storage space and
         // never affects loads: the manifest is the loader's single source of
         // truth.
-        for object in &outcome.obsolete {
-            let path = BTree::bucket_path(&self.name, *object);
-            match self.storage.delete(&path).await {
-                Ok(()) | Err(DBError::NotFound { .. }) => {}
-                Err(err) => {
-                    log::warn!(
-                        action = "BTree::flush",
-                        index = self.name,
-                        bucket = object.bucket_id,
-                        generation = object.generation;
-                        "Failed to delete obsolete bucket object: {err:?}",
-                    );
-                }
-            }
-        }
+        super::persistence::retire_objects(
+            &self.storage,
+            &self.name,
+            outcome
+                .obsolete
+                .into_iter()
+                .map(|object| BTree::bucket_path(&self.name, object)),
+        )
+        .await;
 
         Ok(outcome.saved)
     }

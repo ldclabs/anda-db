@@ -30,10 +30,15 @@ Add the crate to your project:
 ```toml
 [dependencies]
 anda_db = { version = "0.11", features = ["full"] }
-object_store = { version = "0.13", features = ["fs"] }
+anda_object_store = "0.11"
+object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
+
+For local files, wrap `LocalFileSystem` in `anda_object_store::MetaStoreBuilder`;
+the native backend does not support the conditional updates the database uses.
+The bundled example includes this adapter.
 
 For a complete runnable example, see:
 

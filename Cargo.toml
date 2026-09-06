@@ -143,3 +143,9 @@ panic = "abort"
 [profile.release-py]
 inherits = "release"
 panic = "unwind"
+
+# Optional throughput-oriented build; the default release profile still
+# prioritizes binary size. Compare using the core_workloads benchmark.
+[profile.release-speed]
+inherits = "release"
+opt-level = 3

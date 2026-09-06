@@ -72,7 +72,7 @@ impl<T: Tokenizer> BM25Index<T> {
         }
 
         // Step 2: Sort by size descending for better packing.
-        token_sizes.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
+        token_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Step 3: Best-fit-decreasing bin packing in O(n log n).
         // `by_remaining` maps remaining-capacity -> bin indices. We pick the bin with the
@@ -111,6 +111,25 @@ impl<T: Tokenizer> BM25Index<T> {
                     by_remaining.entry(new_remaining).or_default().push(idx);
                 }
             }
+        }
+
+        // Stable packing is idempotent: do not mark an already canonical
+        // layout dirty on every maintenance call.
+        let same_layout = self.buckets.len() == bins.len()
+            && bins.iter().enumerate().all(|(id, (_, tokens))| {
+                self.buckets.get(&(id as u32)).is_some_and(|bucket| {
+                    bucket.tokens.len() == tokens.len()
+                        && tokens.iter().all(|token| {
+                            bucket.tokens.contains(token)
+                                && self
+                                    .postings
+                                    .get(token)
+                                    .is_some_and(|posting| posting.0 == id as u32)
+                        })
+                })
+            });
+        if same_layout {
+            return (old_count, bins.len());
         }
 
         // Step 4: Rebuild buckets.

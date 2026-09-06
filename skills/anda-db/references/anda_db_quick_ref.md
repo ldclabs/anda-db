@@ -35,6 +35,7 @@ use anda_db::{
     },
     storage::StorageConfig,
 };
+use anda_object_store::MetaStoreBuilder;
 use object_store::local::LocalFileSystem;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -47,7 +48,13 @@ Use `anda_db_hnsw::DistanceMetric` only when you need to override
 ## Database Lifecycle
 
 ```rust
-let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
+std::fs::create_dir_all("./db")?;
+let store = Arc::new(
+    MetaStoreBuilder::new(
+        LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
+        10000,
+    ).build(),
+);
 let config = DBConfig {
     name: "agent_memory".into(),
     description: "Embedded AI memory".into(),
@@ -69,7 +76,8 @@ db.auto_flush(cancel_token, Duration::from_secs(30)).await;
 ```
 
 The object store argument is `Arc<dyn object_store::ObjectStore>`. For local
-files, use `LocalFileSystem::new_with_prefix`.
+files, wrap `LocalFileSystem::new_with_prefix` in `MetaStoreBuilder`: the
+native filesystem backend does not implement conditional PUT updates.
 
 ## Collection Lifecycle
 
@@ -272,10 +280,22 @@ StorageConfig {
                                         // overrides cache_max_capacity; Some(0) disables it
     compress_level: 3,                  // zstd level; 0 disables compression
     object_chunk_size: 256 * 1024,      // 256 KiB
-    max_small_object_size: 2000 * 1024, // 2 MiB
+    max_small_object_size: 2000 * 1024, // 2000 KiB
     bucket_overload_size: 1024 * 1024,  // 1 MiB
 }
 ```
+
+For new deployments, set `cache_max_bytes: Some(64 * 1024 * 1024)` explicitly
+(or use `StorageConfig::default().with_cache_max_bytes(...)`). Existing stored
+entry-count configurations retain their original semantics. Streaming reads
+and writes default to a 256 MiB plaintext limit; their `*_with_limit` variants
+accept a matching explicit budget.
+
+Install the tokenizer and deterministic index hooks at the beginning of an
+open callback. Its first query/mutation/index creation performs recovery.
+`Collection::set_io_concurrency(8)` sets the runtime per-phase I/O concurrency
+(valid range 1–64). `recovery_issues()` reports skipped corrupt/schema-invalid
+objects; transient I/O failures abort recovery and can be retried by reopening.
 
 ## Error Handling
 
@@ -312,7 +332,8 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 
 let memory_store = Arc::new(InMemory::new());
-let local_store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
+std::fs::create_dir_all("./db")?;
+let local_store = Arc::new(anda_object_store::MetaStoreBuilder::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true), 10000).build());
 ```
 
 Other backends such as S3, GCS, Azure Blob, and HTTP are available through
