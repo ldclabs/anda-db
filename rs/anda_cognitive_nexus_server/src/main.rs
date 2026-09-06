@@ -478,7 +478,7 @@ fn build_object_store(ty: String) -> Result<Arc<dyn ObjectStore>, BoxError> {
     match ty.as_str() {
         "" | "memory" | "in_memory" => Ok(Arc::new(InMemory::new())),
         path => {
-            let os = LocalFileSystem::new_with_prefix(path)?;
+            let os = LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
             let os = MetaStoreBuilder::new(os, 100000).build();
             Ok(Arc::new(os))
         }

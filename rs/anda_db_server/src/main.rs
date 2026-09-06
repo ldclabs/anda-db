@@ -118,7 +118,7 @@ async fn main() -> Result<(), BoxError> {
     let object_store: Arc<dyn ObjectStore> = match cli.command {
         None | Some(Commands::Memory) => Arc::new(InMemory::new()),
         Some(Commands::Local { path }) => {
-            let store = LocalFileSystem::new_with_prefix(path)?;
+            let store = LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
             // The local filesystem backend needs the metadata wrapper for
             // conditional-put support used by the storage layer.
             Arc::new(MetaStoreBuilder::new(store, 100_000).build())

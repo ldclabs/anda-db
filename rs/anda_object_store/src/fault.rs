@@ -1,99 +1,116 @@
-//! Fault-injection wrapper for any [`ObjectStore`], used for crash-consistency
-//! and chaos testing.
+//! Deterministic failure injection for object-store tests.
 //!
-//! [`FaultStore`] forwards every operation to the wrapped store while a shared
-//! [`FaultHandle`] lets tests inject failures at precise points:
-//!
-//! - **Power failure** ([`FaultHandle::crash_after_mutations`]): the first `n`
-//!   mutating operations (put / delete / copy / rename / multipart) succeed,
-//!   then the store "loses power" — every subsequent operation fails until
-//!   [`FaultHandle::reset`] is called. Iterating `n` over the mutation count of
-//!   a clean run simulates a crash at every possible point of a workload,
-//!   which is the standard crash-consistency model for object storage: each
-//!   individual put is atomic, but a sequence of puts can be interrupted
-//!   anywhere.
-//! - **Targeted faults** ([`FaultRule`]): fail the Nth operation whose path
-//!   contains a given substring, or tear a write so that only a prefix of the
-//!   payload reaches the backend (simulating non-atomic backends).
-//!
-//! The handle also records a log of all mutations that reached the wrapped
-//! store, so tests can assert on write ordering (e.g. "the ids bitmap is
-//! persisted after the metadata object").
-//!
-//! This module is intended for tests and chaos engineering. It has no effect
-//! on the data path unless faults are injected.
+//! Mutation budgets count attempted puts, deletes, copies, renames and each
+//! multipart stage. Already admitted requests may finish after another request
+//! triggers a simulated crash; this models operation boundaries, not disk fsync.
+//! The legacy mutation log records admitted requests, including backend failures.
+//! The event log distinguishes backend success, response failure and cancellation.
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream, task::AtomicWaker};
 use object_store::{path::Path, *};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-/// The operation categories a [`FaultRule`] can match.
+/// Operation matched by a fault rule. Put also matches MultipartStart for
+/// compatibility with existing rules; the other multipart stages are explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultOp {
-    /// `put_opts` and `put_multipart_opts`.
     Put,
-    /// `get_opts` and `get_ranges` (also covers `head`, which `object_store`
-    /// routes through `get_opts`).
     Get,
-    /// Each path processed by `delete_stream` (also covers `delete`).
     Delete,
-    /// `list`, `list_with_offset` and `list_with_delimiter`.
     List,
-    /// `copy_opts`.
     Copy,
-    /// `rename_opts`.
     Rename,
+    MultipartStart,
+    MultipartPart,
+    MultipartComplete,
+    MultipartAbort,
 }
-
 impl FaultOp {
     fn is_mutation(self) -> bool {
-        matches!(
-            self,
-            FaultOp::Put | FaultOp::Delete | FaultOp::Copy | FaultOp::Rename
-        )
+        !matches!(self, Self::Get | Self::List)
     }
 }
 
-/// What happens when a [`FaultRule`] fires.
+#[derive(Debug, Default)]
+struct Signal {
+    set: AtomicBool,
+    waker: AtomicWaker,
+}
+impl Signal {
+    fn fire(&self) {
+        self.set.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+    async fn wait(&self) {
+        futures::future::poll_fn(|cx| {
+            self.waker.register(cx.waker());
+            if self.set.load(Ordering::Acquire) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+/// One-shot gate for one intercepted request and one waiting test/controller.
+/// Drop the suspended request to test cancellation, or call release to resume it.
+#[derive(Debug, Clone, Default)]
+pub struct FaultGate {
+    entered: Arc<Signal>,
+    released: Arc<Signal>,
+}
+impl FaultGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub async fn wait_entered(&self) {
+        self.entered.wait().await;
+    }
+    pub fn release(&self) {
+        self.released.fire();
+    }
+    async fn pause(&self) {
+        self.entered.fire();
+        self.released.wait().await;
+    }
+}
+
+/// Effect of a matching rule.
 #[derive(Debug, Clone)]
 pub enum FaultKind {
-    /// The operation fails and nothing reaches the wrapped store.
+    /// Reject before calling the backend.
     Error,
-    /// The store loses power: this operation and every following one fail
-    /// until [`FaultHandle::reset`].
+    /// Reject this and future requests until reset.
     Crash,
-    /// Only the first `keep_bytes` bytes of the payload are written, then the
-    /// operation reports failure. Applies to `put_opts` only; for other
-    /// operations it behaves like [`FaultKind::Error`].
-    TornWrite {
-        /// Number of payload bytes that reach the wrapped store.
-        keep_bytes: usize,
-    },
+    /// Persist a prefix, then report an error. Only supported for ordinary Put;
+    /// on every other operation (including MultipartStart) this is Error.
+    TornWrite { keep_bytes: usize },
+    /// Let the backend succeed, then lose the acknowledgement.
+    ErrorAfter,
+    /// Suspend before invoking the backend.
+    PauseBefore(FaultGate),
+    /// Suspend after the backend succeeds and before returning its result.
+    PauseAfter(FaultGate),
 }
 
-/// A targeted fault: fires on operations matching `op` and `path_contains`,
-/// after skipping the first `skip` matches, for at most `times` occurrences.
+/// Fire on matching operations after skip matches, at most times times.
 #[derive(Debug, Clone)]
 pub struct FaultRule {
-    /// Operation category to match.
     pub op: FaultOp,
-    /// Substring the object path must contain; `None` matches every path.
+    /// Matches either source or destination for copy/rename.
     pub path_contains: Option<String>,
-    /// Number of matching operations to let through before firing.
     pub skip: u64,
-    /// Number of matches to fire on once active.
     pub times: u64,
-    /// The fault to inject.
     pub kind: FaultKind,
 }
-
 impl FaultRule {
-    /// A rule that fails the first operation of `op` whose path contains `path`.
     pub fn fail_once(op: FaultOp, path: impl Into<String>) -> Self {
         Self {
             op,
@@ -105,502 +122,451 @@ impl FaultRule {
     }
 }
 
+/// BackendSucceeded means the backend returned Ok, not that disk fsync occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultOutcome {
+    Attempted,
+    BackendSucceeded,
+    BackendFailed,
+    ResponseFailed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultEvent {
+    pub op: FaultOp,
+    pub path: String,
+    pub target: Option<String>,
+    pub outcome: FaultOutcome,
+}
+
 #[derive(Debug)]
 struct RuleState {
     rule: FaultRule,
     matched: u64,
     fired: u64,
 }
-
 #[derive(Debug, Default)]
 struct FaultState {
-    /// `true` after a simulated power failure: every operation fails.
     powered_off: AtomicBool,
-    /// Count of mutating operations attempted so far.
     mutations: AtomicU64,
-    /// Mutation index at which to simulate a power failure (`u64::MAX` = never).
     crash_at: AtomicU64,
     rules: Mutex<Vec<RuleState>>,
-    /// Mutations that fully reached the wrapped store, in order.
     log: Mutex<Vec<(FaultOp, String)>>,
+    events: Mutex<Vec<FaultEvent>>,
 }
-
 impl FaultState {
-    fn injected(&self, op: FaultOp, path: &Path, reason: &str) -> Error {
+    fn error(&self, op: FaultOp, path: &Path, why: &str) -> Error {
         Error::Generic {
             store: "FaultStore",
-            source: format!("injected fault: {reason} ({op:?} {path})").into(),
+            source: format!("injected fault: {why} ({op:?} {path})").into(),
         }
     }
-
-    /// Checks faults for one operation. Returns `Ok(None)` to proceed,
-    /// `Ok(Some(kind))` for faults the caller must apply (torn writes), or an
-    /// error for injected failures.
-    fn intercept(&self, op: FaultOp, path: &Path) -> Result<Option<FaultKind>> {
-        if self.powered_off.load(Ordering::Acquire) {
-            return Err(self.injected(op, path, "power failure"));
-        }
-
-        // Note: the counter tracks *attempted* mutations, so operations that
-        // a rule below fails (Error/TornWrite) are still counted. When
-        // combining rules with `crash_after_mutations`, size the crash window
-        // accordingly.
+    fn record(&self, op: FaultOp, path: &Path, target: Option<&Path>, outcome: FaultOutcome) {
         if op.is_mutation() {
-            let n = self.mutations.fetch_add(1, Ordering::AcqRel);
-            if n >= self.crash_at.load(Ordering::Acquire) {
-                self.powered_off.store(true, Ordering::Release);
-                return Err(self.injected(op, path, "power failure"));
-            }
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(FaultEvent {
+                    op,
+                    path: path.to_string(),
+                    target: target.map(ToString::to_string),
+                    outcome,
+                });
         }
-
-        let mut rules = self.rules.lock().expect("FaultStore rules lock poisoned");
-        for rs in rules.iter_mut() {
-            if rs.rule.op != op {
-                continue;
-            }
-            if let Some(substr) = &rs.rule.path_contains
-                && !path.as_ref().contains(substr.as_str())
+    }
+    fn intercept(
+        &self,
+        op: FaultOp,
+        path: &Path,
+        target: Option<&Path>,
+    ) -> Result<Option<FaultKind>> {
+        if self.powered_off.load(Ordering::Acquire) {
+            return Err(self.error(op, path, "power failure"));
+        }
+        if op.is_mutation()
+            && self.mutations.fetch_add(1, Ordering::AcqRel)
+                >= self.crash_at.load(Ordering::Acquire)
+        {
+            self.powered_off.store(true, Ordering::Release);
+            return Err(self.error(op, path, "power failure"));
+        }
+        let mut effect = None;
+        for state in self
+            .rules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            if state.rule.op != op
+                && !(state.rule.op == FaultOp::Put && op == FaultOp::MultipartStart)
             {
                 continue;
             }
-            rs.matched += 1;
-            if rs.matched > rs.rule.skip && rs.fired < rs.rule.times {
-                rs.fired += 1;
-                match rs.rule.kind.clone() {
-                    FaultKind::Error => return Err(self.injected(op, path, "error")),
-                    FaultKind::Crash => {
-                        self.powered_off.store(true, Ordering::Release);
-                        return Err(self.injected(op, path, "power failure"));
-                    }
-                    kind @ FaultKind::TornWrite { .. } => {
-                        if op == FaultOp::Put {
-                            return Ok(Some(kind));
-                        }
-                        return Err(self.injected(op, path, "error"));
-                    }
+            if let Some(part) = &state.rule.path_contains
+                && !path.as_ref().contains(part.as_str())
+                && !target.is_some_and(|p| p.as_ref().contains(part.as_str()))
+            {
+                continue;
+            }
+            state.matched = state.matched.saturating_add(1);
+            if state.matched <= state.rule.skip || state.fired >= state.rule.times {
+                continue;
+            }
+            state.fired += 1;
+            match &state.rule.kind {
+                FaultKind::Error => return Err(self.error(op, path, "error")),
+                FaultKind::Crash => {
+                    self.powered_off.store(true, Ordering::Release);
+                    return Err(self.error(op, path, "power failure"));
+                }
+                FaultKind::TornWrite { .. } if op != FaultOp::Put => {
+                    return Err(self.error(op, path, "error"));
+                }
+                kind => {
+                    effect = Some(kind.clone());
+                    break;
                 }
             }
         }
-        drop(rules);
-
         if op.is_mutation() {
             self.log
                 .lock()
-                .expect("FaultStore log lock poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .push((op, path.to_string()));
         }
-        Ok(None)
+        Ok(effect)
+    }
+    fn start(
+        self: &Arc<Self>,
+        op: FaultOp,
+        path: &Path,
+        target: Option<&Path>,
+    ) -> Result<Operation> {
+        self.record(op, path, target, FaultOutcome::Attempted);
+        match self.intercept(op, path, target) {
+            Ok(kind) => Ok(Operation {
+                state: self.clone(),
+                op,
+                path: path.clone(),
+                target: target.cloned(),
+                kind,
+                finished: false,
+            }),
+            Err(err) => {
+                self.record(op, path, target, FaultOutcome::ResponseFailed);
+                Err(err)
+            }
+        }
     }
 }
 
-/// Control handle for a [`FaultStore`]; clonable and shareable across tasks.
+struct Operation {
+    state: Arc<FaultState>,
+    op: FaultOp,
+    path: Path,
+    target: Option<Path>,
+    kind: Option<FaultKind>,
+    finished: bool,
+}
+impl Operation {
+    async fn run<R>(mut self, future: impl Future<Output = Result<R>>) -> Result<R> {
+        if let Some(FaultKind::PauseBefore(gate)) = &self.kind {
+            gate.pause().await;
+        }
+        let result = future.await;
+        self.state.record(
+            self.op,
+            &self.path,
+            self.target.as_ref(),
+            if result.is_ok() {
+                FaultOutcome::BackendSucceeded
+            } else {
+                FaultOutcome::BackendFailed
+            },
+        );
+        if result.is_ok() {
+            if let Some(FaultKind::PauseAfter(gate)) = &self.kind {
+                gate.pause().await;
+            }
+            if matches!(
+                self.kind,
+                Some(FaultKind::ErrorAfter | FaultKind::TornWrite { .. })
+            ) {
+                self.finished = true;
+                self.state.record(
+                    self.op,
+                    &self.path,
+                    self.target.as_ref(),
+                    FaultOutcome::ResponseFailed,
+                );
+                return Err(self.state.error(
+                    self.op,
+                    &self.path,
+                    if matches!(self.kind, Some(FaultKind::TornWrite { .. })) {
+                        "torn write"
+                    } else {
+                        "response lost after backend success"
+                    },
+                ));
+            }
+        }
+        self.finished = true;
+        result
+    }
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state.record(
+                self.op,
+                &self.path,
+                self.target.as_ref(),
+                FaultOutcome::Cancelled,
+            );
+        }
+    }
+}
+
+/// Shared controller. Reset when no requests are running.
 #[derive(Clone, Debug)]
 pub struct FaultHandle {
     state: Arc<FaultState>,
 }
-
 impl FaultHandle {
-    /// Injects a targeted fault rule.
     pub fn push_rule(&self, rule: FaultRule) {
         self.state
             .rules
             .lock()
-            .expect("FaultStore rules lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(RuleState {
                 rule,
                 matched: 0,
                 fired: 0,
             });
     }
-
-    /// Simulates a power failure after `n` more successful mutations,
-    /// counted from the current mutation count.
+    /// Fail after n additional attempted mutation stages, including multipart.
     pub fn crash_after_mutations(&self, n: u64) {
-        let base = self.state.mutations.load(Ordering::Acquire);
         self.state
             .crash_at
-            .store(base.saturating_add(n), Ordering::Release);
+            .store(self.mutation_count().saturating_add(n), Ordering::Release);
     }
-
-    /// Number of mutating operations attempted so far.
     pub fn mutation_count(&self) -> u64 {
         self.state.mutations.load(Ordering::Acquire)
     }
-
-    /// Mutations that fully reached the wrapped store, in order.
+    /// Admitted requests, including those for which the backend later failed.
     pub fn mutation_log(&self) -> Vec<(FaultOp, String)> {
         self.state
             .log
             .lock()
-            .expect("FaultStore log lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-
-    /// Clears all faults and revives the store ("reboot"), keeping the
-    /// wrapped store's data intact. Also clears the mutation log and counter.
+    pub fn event_log(&self) -> Vec<FaultEvent> {
+        self.state
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
     pub fn reset(&self) {
-        self.state.powered_off.store(false, Ordering::Release);
         self.state.crash_at.store(u64::MAX, Ordering::Release);
         self.state.mutations.store(0, Ordering::Release);
         self.state
             .rules
             .lock()
-            .expect("FaultStore rules lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.state
             .log
             .lock()
-            .expect("FaultStore log lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.state
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.state.powered_off.store(false, Ordering::Release);
     }
 }
 
-/// An [`ObjectStore`] wrapper that injects faults controlled by a [`FaultHandle`].
 #[derive(Debug)]
 pub struct FaultStore<T: ObjectStore> {
     inner: Arc<T>,
     state: Arc<FaultState>,
 }
-
 impl<T: ObjectStore> FaultStore<T> {
-    /// Wraps `inner`, returning the store and its control handle.
     pub fn wrap(inner: T) -> (Self, FaultHandle) {
         let state = Arc::new(FaultState {
             crash_at: AtomicU64::new(u64::MAX),
             ..Default::default()
         });
-        let handle = FaultHandle {
-            state: state.clone(),
-        };
         (
             Self {
                 inner: Arc::new(inner),
-                state,
+                state: state.clone(),
             },
-            handle,
+            FaultHandle { state },
         )
     }
-
-    /// Returns the wrapped store, e.g. to corrupt objects directly in tests.
     pub fn inner(&self) -> &T {
         &self.inner
     }
+    fn listing(
+        &self,
+        prefix: Option<&Path>,
+        stream: BoxStream<'static, Result<ObjectMeta>>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let operation = self
+            .state
+            .start(FaultOp::List, &prefix.cloned().unwrap_or_default(), None);
+        futures::stream::once(async move { operation?.run(async { Ok(stream) }).await })
+            .try_flatten()
+            .boxed()
+    }
 }
-
 impl<T: ObjectStore> std::fmt::Display for FaultStore<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FaultStore({})", self.inner)
     }
 }
-
 #[async_trait]
 impl<T: ObjectStore> ObjectStore for FaultStore<T> {
     async fn put_opts(
         &self,
-        location: &Path,
+        path: &Path,
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        match self.state.intercept(FaultOp::Put, location)? {
-            None => self.inner.put_opts(location, payload, opts).await,
-            Some(FaultKind::TornWrite { keep_bytes }) => {
-                let mut buf = Vec::with_capacity(keep_bytes.min(payload.content_length()));
-                'fill: for segment in payload.iter() {
-                    for byte in segment {
-                        if buf.len() >= keep_bytes {
-                            break 'fill;
-                        }
-                        buf.push(*byte);
-                    }
+        let op = self.state.start(FaultOp::Put, path, None)?;
+        let payload = if let Some(FaultKind::TornWrite { keep_bytes }) = op.kind {
+            let mut bytes = Vec::with_capacity(keep_bytes.min(payload.content_length()));
+            for segment in &payload {
+                let remaining = keep_bytes.saturating_sub(bytes.len());
+                if remaining == 0 {
+                    break;
                 }
-                let _ = self
-                    .inner
-                    .put_opts(location, Bytes::from(buf).into(), opts)
-                    .await;
-                Err(self.state.injected(FaultOp::Put, location, "torn write"))
+                bytes.extend_from_slice(&segment[..remaining.min(segment.len())]);
             }
-            Some(_) => unreachable!("intercept only returns TornWrite"),
-        }
+            Bytes::from(bytes).into()
+        } else {
+            payload
+        };
+        op.run(self.inner.put_opts(path, payload, opts)).await
     }
-
     async fn put_multipart_opts(
         &self,
-        location: &Path,
+        path: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.state.intercept(FaultOp::Put, location)?;
-        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        let op = self.state.start(FaultOp::MultipartStart, path, None)?;
+        let inner = op.run(self.inner.put_multipart_opts(path, opts)).await?;
         Ok(Box::new(FaultUploader {
-            location: location.clone(),
+            location: path.clone(),
             state: self.state.clone(),
             inner,
         }))
     }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.state.intercept(FaultOp::Get, location)?;
-        self.inner.get_opts(location, options).await
+    async fn get_opts(&self, path: &Path, opts: GetOptions) -> Result<GetResult> {
+        self.state
+            .start(FaultOp::Get, path, None)?
+            .run(self.inner.get_opts(path, opts))
+            .await
     }
-
-    async fn get_ranges(
-        &self,
-        location: &Path,
-        ranges: &[std::ops::Range<u64>],
-    ) -> Result<Vec<Bytes>> {
-        self.state.intercept(FaultOp::Get, location)?;
-        self.inner.get_ranges(location, ranges).await
+    async fn get_ranges(&self, path: &Path, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        self.state
+            .start(FaultOp::Get, path, None)?
+            .run(self.inner.get_ranges(path, ranges))
+            .await
     }
-
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        let inner = self.inner.clone();
         let state = self.state.clone();
-        let checked = locations
-            .map(move |location| {
-                let location = location?;
-                state.intercept(FaultOp::Delete, &location)?;
-                Ok(location)
+        locations
+            .map(move |path| {
+                let inner = inner.clone();
+                let state = state.clone();
+                async move {
+                    let path = path?;
+                    state
+                        .start(FaultOp::Delete, &path, None)?
+                        .run(inner.delete(&path))
+                        .await?;
+                    Ok(path)
+                }
             })
-            .boxed();
-        self.inner.delete_stream(checked)
+            .buffered(10)
+            .boxed()
     }
-
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        if let Err(err) = self
-            .state
-            .intercept(FaultOp::List, &prefix.cloned().unwrap_or_default())
-        {
-            return futures::stream::once(async move { Err(err) }).boxed();
-        }
-        self.inner.list(prefix)
+        self.listing(prefix, self.inner.list(prefix))
     }
-
     fn list_with_offset(
         &self,
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        if let Err(err) = self
-            .state
-            .intercept(FaultOp::List, &prefix.cloned().unwrap_or_default())
-        {
-            return futures::stream::once(async move { Err(err) }).boxed();
-        }
-        self.inner.list_with_offset(prefix, offset)
+        self.listing(prefix, self.inner.list_with_offset(prefix, offset))
     }
-
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.state
-            .intercept(FaultOp::List, &prefix.cloned().unwrap_or_default())?;
-        self.inner.list_with_delimiter(prefix).await
+            .start(FaultOp::List, &prefix.cloned().unwrap_or_default(), None)?
+            .run(self.inner.list_with_delimiter(prefix))
+            .await
     }
-
-    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.state.intercept(FaultOp::Copy, from)?;
-        self.inner.copy_opts(from, to, options).await
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
+        self.state
+            .start(FaultOp::Copy, from, Some(to))?
+            .run(self.inner.copy_opts(from, to, opts))
+            .await
     }
-
-    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        self.state.intercept(FaultOp::Rename, from)?;
-        self.inner.rename_opts(from, to, options).await
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+        self.state
+            .start(FaultOp::Rename, from, Some(to))?
+            .run(self.inner.rename_opts(from, to, opts))
+            .await
     }
 }
 
-/// Multipart upload wrapper that respects a simulated power failure.
 #[derive(Debug)]
 struct FaultUploader {
     location: Path,
     state: Arc<FaultState>,
     inner: Box<dyn MultipartUpload>,
 }
-
 #[async_trait]
 impl MultipartUpload for FaultUploader {
     fn put_part(&mut self, payload: PutPayload) -> UploadPart {
-        if self.state.powered_off.load(Ordering::Acquire) {
-            let err = self
-                .state
-                .injected(FaultOp::Put, &self.location, "power failure");
-            return Box::pin(async move { Err(err) });
-        }
-        self.inner.put_part(payload)
+        let op = match self
+            .state
+            .start(FaultOp::MultipartPart, &self.location, None)
+        {
+            Ok(op) => op,
+            Err(err) => return Box::pin(async { Err(err) }),
+        };
+        // Reserve the backend part number in invocation order. PauseBefore gates
+        // future polling; an eager backend may already have buffered the part,
+        // but publishing the object still goes through MultipartComplete.
+        let future = self.inner.put_part(payload);
+        Box::pin(op.run(future))
     }
-
     async fn complete(&mut self) -> Result<PutResult> {
-        if self.state.powered_off.load(Ordering::Acquire) {
-            return Err(self
-                .state
-                .injected(FaultOp::Put, &self.location, "power failure"));
-        }
-        self.inner.complete().await
+        self.state
+            .start(FaultOp::MultipartComplete, &self.location, None)?
+            .run(self.inner.complete())
+            .await
     }
-
     async fn abort(&mut self) -> Result<()> {
-        // Consistent with put_part/complete: nothing runs while powered off.
-        if self.state.powered_off.load(Ordering::Acquire) {
-            return Err(self
-                .state
-                .injected(FaultOp::Put, &self.location, "power failure"));
-        }
-        self.inner.abort().await
+        self.state
+            .start(FaultOp::MultipartAbort, &self.location, None)?
+            .run(self.inner.abort())
+            .await
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use object_store::memory::InMemory;
-
-    fn payload(data: &'static [u8]) -> PutPayload {
-        Bytes::from_static(data).into()
-    }
-
-    #[tokio::test]
-    async fn forwards_when_no_faults() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        let path = Path::from("a/b");
-        store.put(&path, payload(b"hello")).await.unwrap();
-        let got = store.get(&path).await.unwrap().bytes().await.unwrap();
-        assert_eq!(got, Bytes::from_static(b"hello"));
-        assert_eq!(handle.mutation_count(), 1);
-        assert_eq!(
-            handle.mutation_log(),
-            vec![(FaultOp::Put, "a/b".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn crash_after_mutations_powers_off_everything() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        handle.crash_after_mutations(2);
-
-        store.put(&Path::from("1"), payload(b"x")).await.unwrap();
-        store.put(&Path::from("2"), payload(b"x")).await.unwrap();
-        // Third mutation hits the power failure.
-        assert!(store.put(&Path::from("3"), payload(b"x")).await.is_err());
-        // Reads are dead too until reset.
-        assert!(store.get(&Path::from("1")).await.is_err());
-        assert!(store.delete(&Path::from("1")).await.is_err());
-
-        handle.reset();
-        let got = store
-            .get(&Path::from("1"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-        assert_eq!(got, Bytes::from_static(b"x"));
-        // Object "3" never made it.
-        assert!(matches!(
-            store.get(&Path::from("3")).await,
-            Err(Error::NotFound { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn crash_after_is_relative_to_current_count() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        store.put(&Path::from("1"), payload(b"x")).await.unwrap();
-        handle.crash_after_mutations(1);
-        store.put(&Path::from("2"), payload(b"x")).await.unwrap();
-        assert!(store.put(&Path::from("3"), payload(b"x")).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn targeted_rule_fails_nth_matching_put() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        handle.push_rule(FaultRule {
-            op: FaultOp::Put,
-            path_contains: Some("meta".to_string()),
-            skip: 1,
-            times: 1,
-            kind: FaultKind::Error,
-        });
-
-        // First matching put passes (skip = 1).
-        store
-            .put(&Path::from("x/meta"), payload(b"a"))
-            .await
-            .unwrap();
-        // Non-matching paths are unaffected.
-        store
-            .put(&Path::from("x/data"), payload(b"b"))
-            .await
-            .unwrap();
-        // Second matching put fails once.
-        assert!(
-            store
-                .put(&Path::from("y/meta"), payload(b"c"))
-                .await
-                .is_err()
-        );
-        // Rule exhausted: passes again.
-        store
-            .put(&Path::from("y/meta"), payload(b"d"))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn torn_write_persists_prefix_and_reports_failure() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        handle.push_rule(FaultRule {
-            op: FaultOp::Put,
-            path_contains: Some("torn".to_string()),
-            skip: 0,
-            times: 1,
-            kind: FaultKind::TornWrite { keep_bytes: 3 },
-        });
-
-        let path = Path::from("torn");
-        assert!(store.put(&path, payload(b"hello world")).await.is_err());
-        let got = store.get(&path).await.unwrap().bytes().await.unwrap();
-        assert_eq!(got, Bytes::from_static(b"hel"));
-    }
-
-    #[tokio::test]
-    async fn delete_stream_and_list_respect_power_failure() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        store.put(&Path::from("a"), payload(b"1")).await.unwrap();
-        handle.crash_after_mutations(0);
-
-        assert!(store.delete(&Path::from("a")).await.is_err());
-        let listed: Vec<_> = store.list(None).collect().await;
-        assert!(listed.iter().any(|r| r.is_err()));
-        assert!(store.list_with_delimiter(None).await.is_err());
-
-        handle.reset();
-        // Data survived the failed delete.
-        assert!(store.get(&Path::from("a")).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn crash_rule_kind_powers_off() {
-        let (store, handle) = FaultStore::wrap(InMemory::new());
-        handle.push_rule(FaultRule {
-            op: FaultOp::Put,
-            path_contains: Some("ids".to_string()),
-            skip: 0,
-            times: 1,
-            kind: FaultKind::Crash,
-        });
-
-        store.put(&Path::from("meta"), payload(b"m")).await.unwrap();
-        assert!(
-            store
-                .put(&Path::from("col/ids"), payload(b"i"))
-                .await
-                .is_err()
-        );
-        // Everything is dead now.
-        assert!(
-            store
-                .put(&Path::from("other"), payload(b"o"))
-                .await
-                .is_err()
-        );
-        assert!(store.get(&Path::from("meta")).await.is_err());
-    }
-}
+mod tests;

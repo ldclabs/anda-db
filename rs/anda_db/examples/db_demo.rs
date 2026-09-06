@@ -47,7 +47,7 @@ async fn main() -> Result<(), DBError> {
 
     // let object_store = InMemory::new();
     let object_store = MetaStoreBuilder::new(
-        LocalFileSystem::new_with_prefix("./debug/metastore")?,
+        LocalFileSystem::new_with_prefix("./debug/metastore")?.with_fsync(true),
         10000,
     )
     .build();

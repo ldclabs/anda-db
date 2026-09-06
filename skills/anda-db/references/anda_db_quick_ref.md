@@ -47,7 +47,7 @@ Use `anda_db_hnsw::DistanceMetric` only when you need to override
 ## Database Lifecycle
 
 ```rust
-let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?);
+let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
 let config = DBConfig {
     name: "agent_memory".into(),
     description: "Embedded AI memory".into(),
@@ -312,7 +312,7 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 
 let memory_store = Arc::new(InMemory::new());
-let local_store = Arc::new(LocalFileSystem::new_with_prefix("./db")?);
+let local_store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
 ```
 
 Other backends such as S3, GCS, Azure Blob, and HTTP are available through
@@ -324,7 +324,7 @@ Other backends such as S3, GCS, Azure Blob, and HTTP are available through
 use anda_object_store::{EncryptedStoreBuilder, MetaStoreBuilder};
 use object_store::local::LocalFileSystem;
 
-let local = LocalFileSystem::new_with_prefix("./encrypted-db")?;
+let local = LocalFileSystem::new_with_prefix("./encrypted-db")?.with_fsync(true);
 
 let metastore = MetaStoreBuilder::new(local, 10000).build();
 

@@ -31,3 +31,7 @@ async-stream = { workspace = true }
 tempfile = "3.1.0"
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true, features = ["fs", "integration", "rand"] }
+
+[[bench]]
+name = "storage"
+harness = false

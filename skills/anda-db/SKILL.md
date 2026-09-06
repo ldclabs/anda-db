@@ -35,7 +35,7 @@ struct Memory {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?);
+    let store = Arc::new(LocalFileSystem::new_with_prefix("./db")?.with_fsync(true));
 
     let db = AndaDB::connect(
         store,
@@ -138,6 +138,7 @@ cbor2 = "1"               # direct CBOR values, readers, writers, size
   `db.open_collection(...)`, which discards the poisoned handle and recovers
   from storage. Storage failures with unknown outcomes poison the handle the
   same way.
+- Local deployments needing durable writes should enable `LocalFileSystem::with_fsync(true)`. In object_store 0.14.1 this does not cover standalone deletes; do not claim complete host-power-loss durability from this setting alone.
 - One live writer process per database: this is a deployment contract. A
   `Precondition` error from flush means a second writer touched the storage.
 

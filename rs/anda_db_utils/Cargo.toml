@@ -17,3 +17,7 @@ rustc-hash = { workspace = true }
 [dev-dependencies]
 cbor2 = { workspace = true }
 serde_json = { workspace = true }
+
+[[bench]]
+name = "unique_vec"
+harness = false

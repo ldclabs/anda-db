@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "peak_rss_bytes": 137691136,
+  "user_seconds": 1.371322,
+  "system_seconds": 0.08241,
+  "stderr": ""
+}
