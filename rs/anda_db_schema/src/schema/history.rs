@@ -114,7 +114,7 @@ fn record_changes(
 
 /// Recovers schema history from a complete, consistent scan of stored data.
 ///
-/// Feed **every** raw document, including unregistered objects and every
+/// Feed **every** raw document, including unregistered objects and every valid
 /// previous/proposed image in pending recovery records, into [`Self::observe`].
 /// Do not prune or normalize fields before observing them. Writers must be
 /// excluded for the duration of the scan and the following upgrade. Calling
@@ -142,7 +142,15 @@ impl SchemaHistoryRecovery {
                     "stored field index {idx} exceeds u16::MAX"
                 )));
             }
-            self.schema.next_idx = self.schema.allocated_idx_end().max(idx + 1);
+            // Only a legacy schema with no allocation watermark may infer one
+            // from raw values. When `next_idx` is already trustworthy, an
+            // undeclared index can be foreign data or a document written by
+            // an interrupted schema-upgrade callback. Moving the watermark
+            // would classify it as retired and silently reassign the intended
+            // field to another index on retry.
+            if !self.schema.has_allocation_watermark() {
+                self.schema.next_idx = self.schema.allocated_idx_end().max(idx + 1);
+            }
         }
         for field in self.schema.fields.values() {
             if let Some(value) = doc.fields.get(&field.idx()) {

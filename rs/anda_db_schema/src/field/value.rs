@@ -1282,7 +1282,11 @@ pub(super) fn cbor_into_json(value: Cbor, depth: usize) -> Result<Json, SchemaEr
             }
             Json::Object(object)
         }
-        Cbor::Tag(_, inner) => cbor_into_json(*inner, depth + 1)?,
+        Cbor::Tag(_, _) => {
+            return Err(SchemaError::FieldValue(
+                "CBOR tags have no JSON representation".into(),
+            ));
+        }
         _ => {
             return Err(SchemaError::FieldValue(
                 "value has no JSON representation".into(),

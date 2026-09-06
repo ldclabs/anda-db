@@ -876,8 +876,14 @@ impl Collection {
         };
         collection.load_indexes().await?;
 
-        if let Some(schema) = schema {
-            collection.try_upgrade_schema(schema).await?;
+        if let Some(schema) = schema
+            && collection.try_upgrade_schema(schema).await?
+        {
+            // The callback may write documents with newly assigned field
+            // indexes. Persist that assignment first, so cancellation or a
+            // callback error cannot leave a new-schema document behind
+            // metadata that still describes the old schema.
+            collection.store_metadata_unclaimed().await?;
         }
 
         // The callback installs custom index hooks and may add indexes. Run it
@@ -1077,17 +1083,17 @@ impl Collection {
         }
     }
 
-    /// Replays intents left by a crash or failed flush. Historical values are
-    /// removed first; the document currently present in storage is then the
-    /// sole source of truth for both the bitmap and every derived index.
+    /// Loads the subset of durable mutation intents that is safe to use for
+    /// both schema-history recovery and mutation replay.
     ///
     /// A single unusable intent must never make the collection unopenable:
-    /// nothing clears it, so every reopen would replay it and fail
-    /// identically, with no operator escape hatch. Unusable records are
-    /// therefore logged and skipped (the same treatment
-    /// [`Self::repair_document`] gives a document that no longer matches the
-    /// schema); the skipped records are retired by the next flush.
-    async fn replay_mutation_intents(&self) -> Result<usize, DBError> {
+    /// nothing clears it, so every reopen would fail identically, with no
+    /// operator escape hatch. Undecodable records, reserved document ids and
+    /// path/sequence mismatches are logged and returned as stale paths for the
+    /// next flush to retire.
+    async fn load_mutation_intents(
+        &self,
+    ) -> Result<(BTreeMap<u64, MutationIntent>, BTreeSet<String>), DBError> {
         let mut stream = self
             .storage
             .list_meta(Some(Self::MUTATION_INTENT_PREFIX), None);
@@ -1097,7 +1103,7 @@ impl Collection {
             let meta = meta?;
             let Some(relative) = meta.location.prefix_match(self.storage.base_path()) else {
                 log::warn!(
-                    action = "Collection::replay_mutation_intents",
+                    action = "Collection::load_mutation_intents",
                     collection = self.name,
                     path = meta.location.as_ref();
                     "Skipping mutation intent outside the collection storage prefix",
@@ -1113,7 +1119,7 @@ impl Collection {
                 // right answer.
                 Err(err @ DBError::Serialization { .. }) => {
                     log::warn!(
-                        action = "Collection::replay_mutation_intents",
+                        action = "Collection::load_mutation_intents",
                         collection = self.name;
                         "Skipping undecodable mutation intent: {err:?}",
                     );
@@ -1124,7 +1130,7 @@ impl Collection {
             };
             if intent.document_id == 0 {
                 log::warn!(
-                    action = "Collection::replay_mutation_intents",
+                    action = "Collection::load_mutation_intents",
                     collection = self.name,
                     sequence = intent.sequence;
                     "Skipping mutation intent with the reserved document id 0",
@@ -1135,7 +1141,7 @@ impl Collection {
             let expected_path = Self::mutation_intent_path(intent.sequence);
             if path != expected_path {
                 log::warn!(
-                    action = "Collection::replay_mutation_intents",
+                    action = "Collection::load_mutation_intents",
                     collection = self.name,
                     sequence = intent.sequence,
                     path;
@@ -1146,6 +1152,16 @@ impl Collection {
             }
             intents.insert(intent.sequence, intent);
         }
+        Ok((intents, stale_paths))
+    }
+
+    /// Replays intents left by a crash or failed flush. Historical values are
+    /// removed first; the document currently present in storage is then the
+    /// sole source of truth for both the bitmap and every derived index.
+    /// Unusable records found by [`Self::load_mutation_intents`] are retired
+    /// by the next flush.
+    async fn replay_mutation_intents(&self) -> Result<usize, DBError> {
+        let (intents, stale_paths) = self.load_mutation_intents().await?;
         *self.stale_mutation_intents.lock() = stale_paths;
         if intents.is_empty() {
             return Ok(0);
@@ -1576,9 +1592,9 @@ impl Collection {
         .await
     }
 
-    async fn try_upgrade_schema(&mut self, mut new_schema: Schema) -> Result<(), DBError> {
+    async fn try_upgrade_schema(&mut self, mut new_schema: Schema) -> Result<bool, DBError> {
         if !new_schema.needs_upgrade(&self.schema) {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut old_schema = self.schema.clone();
@@ -1592,11 +1608,8 @@ impl Collection {
             while let Some(document) = documents.next().await {
                 recovery.observe(&document?.0)?;
             }
-            let mut intents = self
-                .storage
-                .list::<MutationIntent>(Some(Self::MUTATION_INTENT_PREFIX), None);
-            while let Some(intent) = intents.next().await {
-                let intent = intent?.0;
+            let (intents, _) = self.load_mutation_intents().await?;
+            for intent in intents.values() {
                 for image in [intent.previous.as_ref(), intent.proposed.as_ref()]
                     .into_iter()
                     .flatten()
@@ -1620,7 +1633,7 @@ impl Collection {
             "Schema upgraded to version {}",
             self.schema.version()
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Sets the collection to read-only mode.
@@ -4466,6 +4479,20 @@ mod tests {
         Ok(db)
     }
 
+    fn simple_upgrade_schema(version: u64, add_fresh: bool) -> Schema {
+        let mut builder = Schema::builder();
+        builder.with_version(version);
+        builder
+            .add_field(Fe::new("payload".into(), Ft::Text).unwrap())
+            .unwrap();
+        if add_fresh {
+            builder
+                .add_field(Fe::new("fresh".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
+                .unwrap();
+        }
+        builder.build().unwrap()
+    }
+
     #[tokio::test]
     async fn schema_upgrade_recovers_unregistered_documents_and_intent_images()
     -> Result<(), DBError> {
@@ -4572,6 +4599,153 @@ mod tests {
                 .is_err()
         );
         assert_eq!(serde_json::to_value(broken.metadata()).unwrap(), snapshot);
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_ignores_undecodable_mutation_intents() -> Result<(), DBError> {
+        let mut wire = serde_json::to_value(simple_upgrade_schema(1, false)).unwrap();
+        wire.as_object_mut().unwrap().remove("next_idx");
+        wire.as_object_mut().unwrap().remove("history");
+        let legacy: Schema = serde_json::from_value(wire).unwrap();
+        let db = setup_test_db().await?;
+        let mut collection = Collection::create(
+            db.clone(),
+            legacy,
+            CollectionConfig {
+                name: "undecodable_intent_history".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        collection
+            .storage
+            .put_bytes(
+                &Collection::mutation_intent_path(1),
+                Bytes::from_static(b"not a mutation intent"),
+                PutMode::Overwrite,
+            )
+            .await?;
+
+        collection
+            .try_upgrade_schema(simple_upgrade_schema(2, true))
+            .await?;
+        assert_eq!(collection.schema.get_field("fresh").unwrap().idx(), 2);
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_ignores_reserved_and_misplaced_mutation_intents() -> Result<(), DBError>
+    {
+        let mut wire = serde_json::to_value(simple_upgrade_schema(1, false)).unwrap();
+        wire.as_object_mut().unwrap().remove("next_idx");
+        wire.as_object_mut().unwrap().remove("history");
+        let legacy: Schema = serde_json::from_value(wire).unwrap();
+        let db = setup_test_db().await?;
+        let mut collection = Collection::create(
+            db.clone(),
+            legacy,
+            CollectionConfig {
+                name: "invalid_intent_history".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let foreign_image = DocumentOwned {
+            fields: BTreeMap::from([
+                (0, Fv::U64(1)),
+                (60_000, Fv::Text("must not affect schema history".into())),
+            ]),
+        };
+        collection
+            .storage
+            .create(
+                &Collection::mutation_intent_path(2),
+                &MutationIntent {
+                    sequence: 2,
+                    document_id: 0,
+                    previous: Some(foreign_image.clone()),
+                    proposed: None,
+                },
+            )
+            .await?;
+        collection
+            .storage
+            .create(
+                &Collection::mutation_intent_path(3),
+                &MutationIntent {
+                    sequence: 4,
+                    document_id: 1,
+                    previous: Some(foreign_image),
+                    proposed: None,
+                },
+            )
+            .await?;
+
+        collection
+            .try_upgrade_schema(simple_upgrade_schema(2, true))
+            .await?;
+        assert_eq!(collection.schema.get_field("fresh").unwrap().idx(), 2);
+        db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_is_durable_before_the_open_callback_writes() -> Result<(), DBError> {
+        let mut wire = serde_json::to_value(simple_upgrade_schema(1, false)).unwrap();
+        wire.as_object_mut().unwrap().remove("history");
+        let incomplete: Schema = serde_json::from_value(wire).unwrap();
+        assert!(incomplete.has_allocation_watermark());
+        assert!(!incomplete.has_upgrade_history());
+
+        let db = setup_test_db().await?;
+        let name = "upgrade_callback_checkpoint";
+        let created = Collection::create(
+            db.clone(),
+            incomplete,
+            CollectionConfig {
+                name: name.into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        drop(created);
+
+        let upgraded = simple_upgrade_schema(2, true);
+        let first_open = Collection::open(
+            db.clone(),
+            name.into(),
+            Some(upgraded),
+            async |collection| {
+                let mut doc = Document::new(collection.schema());
+                doc.set_id(0);
+                doc.set_field("payload", Fv::Text("old".into()))?;
+                doc.set_field(
+                    "fresh",
+                    Fv::Text("written before the callback failed".into()),
+                )?;
+                collection.add(doc).await?;
+                Err(DBError::Generic {
+                    name: "test".into(),
+                    source: "stop after writing the document".into(),
+                })
+            },
+        )
+        .await;
+        assert!(first_open.is_err());
+
+        // Reopen without supplying a schema: the only way this handle can
+        // understand index 2 is if the first open persisted its upgrade before
+        // invoking the callback.
+        let reopened = Collection::open(db.clone(), name.into(), None, async |_| Ok(())).await?;
+        assert_eq!(reopened.schema.version(), 2);
+        assert_eq!(reopened.schema.get_field("fresh").unwrap().idx(), 2);
+        assert_eq!(
+            reopened.get(1).await?.get_field("fresh"),
+            Some(&Fv::Text("written before the callback failed".into()))
+        );
         db.close().await?;
         Ok(())
     }

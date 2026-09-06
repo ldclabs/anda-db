@@ -220,6 +220,48 @@ fn recovered_history_covers_raw_indexes_and_nested_keys() {
 }
 
 #[test]
+fn history_recovery_does_not_expand_a_trusted_allocation_watermark() {
+    let mut wire = serde_json::to_value(schema(Ft::Text, 1)).unwrap();
+    wire.as_object_mut().unwrap().remove("history");
+    let old: Schema = serde_json::from_value(wire).unwrap();
+    assert!(old.has_allocation_watermark());
+    assert!(!old.has_upgrade_history());
+
+    // Index 2 can be a write from an interrupted upgrade. The durable
+    // watermark says it is the next allocatable index, so recovery of the
+    // independently missing nested-key history must not move that boundary.
+    let raw = DocumentOwned {
+        fields: BTreeMap::from([
+            (0, Fv::U64(1)),
+            (1, Fv::Text("old".into())),
+            (2, Fv::Text("written before metadata checkpoint".into())),
+        ]),
+    };
+    let mut recovery = old.history_recovery();
+    recovery.observe(&raw).unwrap();
+    let recovered = recovery.finish();
+    assert_eq!(recovered.allocated_idx_end(), 2);
+
+    let mut builder = Schema::builder();
+    builder.with_version(2);
+    builder
+        .add_field(Fe::new("payload".into(), Ft::Text).unwrap())
+        .unwrap();
+    builder
+        .add_field(Fe::new("fresh".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
+        .unwrap();
+    let mut upgraded = builder.build().unwrap();
+    upgraded.upgrade_with(&recovered).unwrap();
+    assert_eq!(upgraded.get_field("fresh").unwrap().idx(), 2);
+
+    let loaded = Document::try_from_doc(Arc::new(upgraded), raw).unwrap();
+    assert_eq!(
+        loaded.get_field("fresh"),
+        Some(&Fv::Text("written before metadata checkpoint".into()))
+    );
+}
+
+#[test]
 fn nested_history_is_preserved_through_arrays_and_wildcard_maps() {
     let nested = |with_key: bool| {
         let mut fields = vec![("keep", Ft::Bool)];
@@ -278,4 +320,31 @@ fn field_updates_are_atomic_and_move_canonical_buffers() {
         .is_err()
     );
     assert_eq!(serde_json::to_value(doc).unwrap(), before);
+}
+
+#[test]
+fn vector_fast_path_falls_back_to_established_cbor_coercion() {
+    let entry = Fe::new("vector".into(), Ft::Vector).unwrap();
+    assert_eq!(
+        entry
+            .coerce(Fv::Array(vec![Fv::Json(serde_json::json!(1))]))
+            .unwrap(),
+        Fv::Vector(vec![anda_db_schema::bf16::from_bits(1)])
+    );
+    assert!(
+        entry
+            .coerce(Fv::Array(vec![Fv::Json(serde_json::json!("invalid"))]))
+            .is_err()
+    );
+}
+
+#[test]
+fn json_conversion_rejects_cbor_tags_instead_of_discarding_them() {
+    let tagged = Cbor::Tag(0, Box::new(Cbor::Text("2026-09-06".into())));
+    assert!(Ft::Json.extract(tagged.clone()).is_err());
+    assert!(Fv::json_from(tagged).is_err());
+    assert_eq!(
+        Ft::Json.extract(Cbor::Text("2026-09-06".into())).unwrap(),
+        Fv::Json(Json::String("2026-09-06".into()))
+    );
 }

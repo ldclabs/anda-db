@@ -152,6 +152,20 @@ is left to the release).
 
 ### Fixed — `anda_db_schema`
 
+- **Schema-history recovery preserves an existing allocation watermark.** A
+  scan used to raise a trustworthy `next_idx` to every undeclared index it
+  encountered. After an interrupted open callback, that reassigned the new
+  field on retry and silently treated its stored value as retired. Only legacy
+  schemas with no watermark now infer one from raw values. The core collection
+  also excludes undecodable, reserved-ID and path/sequence-mismatched mutation
+  intents from recovery, and durably stores an upgraded schema before the open
+  callback can write documents with its new indexes.
+- The allocation-saving Vector array path falls back to the established CBOR
+  coercion for noncanonical elements, so wrappers such as `Json(Number(1))`
+  retain their previous behavior while plain integer arrays stay on the fast
+  path.
+- JSON conversion rejects tagged CBOR values instead of silently discarding
+  the tag and accepting the enclosed value with different semantics.
 - **`Vec<u8>` / `[u8; N]` map keys.** The derive inferred
   `BTreeMap<Vec<u8>, T>` as `Map<Bytes, T>`, but serde writes such keys as
   CBOR integer arrays and `FieldKey`'s `TryFrom<cbor2::Value>` accepted only

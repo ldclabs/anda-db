@@ -93,21 +93,20 @@ impl FieldType {
                     for value in values {
                         let bits = match value {
                             FieldValue::U64(bits) if *bits <= u16::MAX as u64 => *bits as u16,
-                            FieldValue::I64(bits)
-                                if mode == ValueMode::Write
-                                    && (0..=i64::from(u16::MAX)).contains(bits) =>
-                            {
+                            FieldValue::I64(bits) if (0..=i64::from(u16::MAX)).contains(bits) => {
                                 *bits as u16
                             }
-                            other => {
-                                return Err(SchemaError::FieldValue(format!(
-                                    "expected a u16 vector bit pattern, got {other:?}"
-                                )));
-                            }
+                            // This path is only an allocation-saving shortcut
+                            // for the canonical integer representation. Other
+                            // inputs must retain the established CBOR coercion
+                            // below (for example `Json(Number(1))`).
+                            _ => break,
                         };
                         vector.push(bf16::from_bits(bits));
                     }
-                    return Ok(FieldValue::Vector(vector));
+                    if vector.len() == values.len() {
+                        return Ok(FieldValue::Vector(vector));
+                    }
                 }
             }
             FieldType::Array(types) if !types.is_empty() => {

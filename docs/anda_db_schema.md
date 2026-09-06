@@ -497,10 +497,17 @@ Schemas persisted without `next_idx` or nested history remain readable.
 However, an unknown allocation watermark cannot authorize new top-level
 indexes, and incomplete nested history cannot authorize new nested keys.
 The core collection scans **all raw stored documents**, including unregistered
-objects and both images in pending mutation intents, before upgrading such a
-schema. Scan failures leave metadata unchanged. The recovered watermark and
-history are saved with the upgraded schema, so subsequent upgrades do not need
-to repeat that scan.
+objects and both images in valid, replayable mutation intents, before upgrading
+such a schema. It applies the same decoding, reserved-ID and path/sequence checks
+as mutation replay, so unusable recovery records cannot block or distort schema
+allocation. A missing allocation watermark is inferred from that scan; an
+existing watermark remains authoritative while independently missing nested-key
+history is recovered. Scan failures leave metadata unchanged.
+
+The upgraded schema is persisted before the open callback can write documents.
+This keeps newly assigned field indexes recoverable if the callback fails or is
+cancelled. The recovered watermark and history are therefore durable before
+such writes, and subsequent upgrades do not need to repeat the scan.
 
 Custom storage integrations use a recovery accumulator while excluding writers:
 

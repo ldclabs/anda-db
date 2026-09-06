@@ -730,7 +730,10 @@ impl AndaDB {
     /// When opening an existing collection, the method compares the provided
     /// schema's version with the stored schema's version. If the provided schema
     /// has a higher version, the collection's schema will be upgraded automatically
-    /// before executing the callback `f`.
+    /// before executing the callback `f`. The upgraded schema is durably stored
+    /// first because the callback can write documents with newly assigned field
+    /// indexes. Consequently, a callback error does not roll back a completed
+    /// schema upgrade.
     ///
     /// # Concurrency
     ///
