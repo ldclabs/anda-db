@@ -28,9 +28,10 @@ rustc-hash = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 structured-logger = { workspace = true }
-# https://github.com/rust-ndarray/ndarray?tab=readme-ov-file#how-to-enable-blas-integration
-# ndarray = { workspace = true, features = ["blas"] }
-# blas-src = { workspace = true, features = ["accelerate"] }
+
+[[bench]]
+name = "hnsw_index"
+harness = false
 
 [[example]]
 name = "hnsw_demo"

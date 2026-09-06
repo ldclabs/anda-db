@@ -16,10 +16,14 @@
 //! - Support for bf16 (brain floating point) vector storage for memory efficiency.
 //!
 
+mod config;
 mod distance;
 mod error;
 mod hnsw;
+mod node;
 
+pub use config::*;
 pub use distance::*;
 pub use error::*;
 pub use hnsw::*;
+pub use node::{HnswNode, serialize_node};

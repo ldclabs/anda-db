@@ -1,132 +1,135 @@
-use anda_db_hnsw::{HnswConfig, HnswIndex};
-use rand::RngExt;
-use std::io::{Read, Write};
-use tokio::time;
+//! Single-writer demo: atomic per-object writes and recovery of partial progress.
+//! Optional first argument: a fresh directory. Default: a new temporary directory.
+use anda_db_hnsw::{BoxError, FlushOptions, FlushOutcome, HnswConfig, HnswIndex};
+use rand::{RngExt, SeedableRng};
+use std::{
+    path::{Path, PathBuf},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::io::AsyncWriteExt;
 
-// extern crate blas_src;
-
-pub fn unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ts = SystemTime::now()
+fn unix_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time before Unix epoch");
-    ts.as_millis() as u64
+        .expect("system clock")
+        .as_millis() as u64
 }
 
-// cargo build --example hnsw_demo --release
-// ./target/release/examples/hnsw_demo
+async fn atomic_write(path: PathBuf, bytes: Vec<u8>) -> Result<(), BoxError> {
+    let temporary = path.with_extension("cbor.tmp");
+    let mut file = tokio::fs::File::create(&temporary).await?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&temporary, &path).await?;
+    tokio::fs::File::open(path.parent().expect("object directory"))
+        .await?
+        .sync_all()
+        .await?;
+    Ok(())
+}
+
+async fn save(index: &HnswIndex, dir: &Path) -> Result<FlushOutcome, BoxError> {
+    Ok(index
+        .flush_with_options(
+            unix_ms(),
+            FlushOptions {
+                node_concurrency: 8,
+                ..Default::default()
+            },
+            |id, bytes| {
+                let path = dir.join(format!("node_{id}.cbor"));
+                async move {
+                    atomic_write(path, bytes).await?;
+                    Ok(true)
+                }
+            },
+            |bytes| atomic_write(dir.join("ids.cbor"), bytes),
+            |bytes| atomic_write(dir.join("metadata.cbor"), bytes),
+        )
+        .await?)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxError> {
     structured_logger::Builder::new().init();
-
+    let dir = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "anda_hnsw_demo_{}_{}",
+                std::process::id(),
+                unix_ms()
+            ))
+        });
+    tokio::fs::create_dir_all(&dir).await?;
+    let metadata_path = dir.join("metadata.cbor");
+    if metadata_path.try_exists()? {
+        return Err("The demo requires a fresh directory; existing data was left untouched".into());
+    }
     const DIM: usize = 384;
-
-    // 创建索引 (384维向量，如BERT嵌入)
-    let config = HnswConfig {
-        dimension: DIM,
-        ..Default::default()
-    };
-    // 39900 inserted 100 vectors in 2.479251625s
-    // 39900 Search returned 10 results in 2.368542ms
-    // 40000 inserted 100 vectors in 2.459010458s
-    // 40000 Search returned 10 results in 2.661541ms
-    // 40000 Removed vector 16909 in 16.174542ms
-    // config.select_neighbors_strategy = SelectNeighborsStrategy::Simple;
-    // 39900 inserted 100 vectors in 631.205083ms
-    // 39900 Search returned 10 results in 2.442875ms
-    // 40000 inserted 100 vectors in 637.636791ms
-    // 40000 Search returned 10 results in 2.136208ms
-    // 40000 Removed vector 13432 in 12.864834ms
-    let index = HnswIndex::new("anda_db_hnsw".to_string(), Some(config));
-
-    // 模拟数据流
-    let mut rng = rand::rng();
-
-    let mut inert_start = time::Instant::now();
-    for i in 0..1_000 {
-        let vector: Vec<f32> = (0..DIM).map(|_| rng.random::<f32>()).collect();
-        index.insert_f32(i, vector, unix_ms())?;
-        // println!("{} inserted vector {}", i, i);
-
-        // 模拟搜索查询
-        if i % 100 == 0 {
-            println!("{} inserted 100 vectors in {:?}", i, inert_start.elapsed());
-            inert_start = time::Instant::now();
-
-            let query: Vec<f32> = (0..DIM).map(|_| rng.random::<f32>()).collect();
-            let query_start = time::Instant::now();
-            let results = index.search_f32(&query, 10)?;
-            println!(
-                "{} Search returned {} results in {:?}",
-                i,
-                results.len(),
-                query_start.elapsed()
-            );
-        }
-
-        // 模拟删除
-        if i % 1000 == 0 && i > 0 {
-            let to_remove = rng.random_range(0..i);
-            let remove_start = time::Instant::now();
-            index.remove(to_remove, unix_ms());
-            println!(
-                "{} Removed vector {} in {:?}",
-                i,
-                to_remove,
-                remove_start.elapsed()
-            );
-        }
+    const N: u64 = 1000;
+    let index = HnswIndex::try_new_seeded(
+        "demo".into(),
+        Some(HnswConfig {
+            dimension: DIM,
+            ..Default::default()
+        }),
+        42,
+    )?;
+    let mut random = rand::rngs::StdRng::seed_from_u64(42);
+    let start = Instant::now();
+    for id in 0..N {
+        index.insert_f32(
+            id,
+            (0..DIM).map(|_| random.random::<f32>()).collect(),
+            unix_ms(),
+        )?;
     }
+    println!("Inserted {N} vectors in {:?}", start.elapsed());
+    assert_eq!(save(&index, &dir).await?, FlushOutcome::Committed);
 
-    // 打印统计信息
-    let stats = index.stats();
-    println!("Index statistics:");
-    println!("- Total vectors: {}", stats.num_elements);
-    println!("- Max layer: {}", stats.max_layer);
-    println!("- Search operations: {}", stats.search_count);
-    println!("- Insert operations: {}", stats.insert_count);
-    println!("- Delete operations: {}", stats.delete_count);
-
-    // 最终保存
-    std::fs::create_dir_all("debug/hnsw_demo")?;
-    {
-        let metadata = std::fs::File::create("debug/hnsw_demo/metadata.cbor")?;
-        let ids = std::fs::File::create("debug/hnsw_demo/ids.cbor")?;
-        let store_start = time::Instant::now();
-        index
-            .flush(metadata, ids, 0, async |id, data| {
-                let mut node = std::fs::File::create(format!("debug/hnsw_demo/node_{id}.cbor"))?;
-                node.write_all(data)?;
-                Ok(true)
-            })
-            .await?;
-
-        // metadata.close().await?;
-        // ids.close().await?;
-        println!("Stored index with nodes in {:?}", store_start.elapsed());
+    // Commit deletions before purging blobs, then save the cleared tombstones.
+    for id in (0..N).step_by(10) {
+        assert!(index.remove(id, unix_ms()));
     }
+    save(&index, &dir).await?;
+    index
+        .purge_removed_nodes(async |id| {
+            match tokio::fs::remove_file(dir.join(format!("node_{id}.cbor"))).await {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await?;
+    save(&index, &dir).await?;
+    assert_eq!(save(&index, &dir).await?, FlushOutcome::NoChanges);
 
-    let metadata = std::fs::File::open("debug/hnsw_demo/metadata.cbor")?;
-    let ids = std::fs::File::open("debug/hnsw_demo/ids.cbor")?;
-    let load_start = time::Instant::now();
-    let loaded_index = HnswIndex::load_all(metadata, ids, async |id| {
-        let mut node = std::fs::File::open(format!("debug/hnsw_demo/node_{id}.cbor"))?;
-        let mut buf = Vec::new();
-        node.read_to_end(&mut buf)?;
-        Ok(Some(buf))
-    })
-    .await?;
-
-    println!("Load index in {:?}", load_start.elapsed());
-    let query: Vec<f32> = (0..DIM).map(|_| rng.random::<f32>()).collect();
-    let query_start = time::Instant::now();
-    let results = loaded_index.search_f32(&query, 10)?;
+    let metadata = tokio::fs::read(&metadata_path).await?;
+    let ids = tokio::fs::read(dir.join("ids.cbor")).await?;
+    let loaded =
+        HnswIndex::load_all(
+            metadata.as_slice(),
+            ids.as_slice(),
+            async |id| match tokio::fs::read(dir.join(format!("node_{id}.cbor"))).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+        )
+        .await?;
+    assert_eq!(loaded.len(), 900);
+    assert!(!loaded.has_removed_nodes());
+    let query: Vec<f32> = (0..DIM).map(|_| random.random::<f32>()).collect();
+    let results = loaded.search_f32(&query, 10)?;
+    assert!(results.iter().all(|(id, _)| id % 10 != 0));
     println!(
-        "Search returned {} results in {:?}",
+        "Reloaded {} vectors; query returned {} hits. Files: {}",
+        loaded.len(),
         results.len(),
-        query_start.elapsed()
+        dir.display()
     );
-
     Ok(())
 }

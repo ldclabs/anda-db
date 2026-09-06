@@ -1,0 +1,11 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "opt_level": "3",
+  "data_seed": 42,
+  "counting_allocator": true,
+  "baseline_source": "pre-edit snapshot of rs/anda_db_hnsw at ac19bc06d4e5fac8a3a569e4764d6a3eb0605186",
+  "comparison": "single-layer graphs; baseline uses its unmodified constructor and borrowed flush adapter; new runtime uses deterministic constructor and owned callback API; 1000-node comparisons use three trials",
+  "scope": "synthetic data; hardware not isolated; maxrss_raw retains platform-native getrusage units; full parameter Cartesian matrix not executed"
+}

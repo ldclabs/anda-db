@@ -28,11 +28,21 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_hnsw = "0.4"
+anda_db_hnsw = "0.11"
 ```
 
 This crate is normally used through `anda_db`, but it can also be embedded
 independently for lower-level vector-search use cases.
+
+Use `HnswIndex::try_new` for validated configuration. Search requests above
+4,096 results return an error; `SearchOptions` can override ef per query.
+Persistence calls must be serialized by the caller. Prefer
+`flush_with_options` for explicit completion status and bounded parallel I/O,
+then purge committed deletions. Fixed-key objects support recovery of partial
+progress, not multi-object transactions. The technical reference explains
+generation markers, numeric limits and legacy-format loading.
+
+For repeatable performance measurements, see [the benchmark guide](benches/README.md).
 
 ## Technical Reference
 

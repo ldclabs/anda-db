@@ -29,10 +29,10 @@ impl DistanceMetric {
     /// result is returned as `f32`.
     ///
     /// # Errors
-    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
+    /// Returns [`HnswError::DimensionMismatch`] for different lengths, or
+    /// [`HnswError::Generic`] for non-finite input or an unrepresentable result.
     pub fn compute(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
-        check_dimensions(a, b)?;
-        Ok(self.dispatch(a, b))
+        self.checked(a, b)
     }
 
     /// Computes the distance between two `f32` vectors.
@@ -41,10 +41,10 @@ impl DistanceMetric {
     /// evaluation time (e.g. during offline evaluation).
     ///
     /// # Errors
-    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
+    /// Returns [`HnswError::DimensionMismatch`] for different lengths, or
+    /// [`HnswError::Generic`] for non-finite input or an unrepresentable result.
     pub fn compute_f32(&self, a: &[f32], b: &[f32]) -> Result<f32, HnswError> {
-        check_dimensions(a, b)?;
-        Ok(self.dispatch(a, b))
+        self.checked(a, b)
     }
 
     /// Computes the distance between an `f32` query and a stored `bf16` vector.
@@ -54,10 +54,85 @@ impl DistanceMetric {
     /// the search hot path.
     ///
     /// # Errors
-    /// Returns [`HnswError::DimensionMismatch`] if `a.len() != b.len()`.
+    /// Returns [`HnswError::DimensionMismatch`] for different lengths, or
+    /// [`HnswError::Generic`] for non-finite input or an unrepresentable result.
     pub fn compute_mixed(&self, a: &[f32], b: &[bf16]) -> Result<f32, HnswError> {
+        self.checked(a, b)
+    }
+
+    fn checked<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> Result<f32, HnswError> {
         check_dimensions(a, b)?;
-        Ok(self.dispatch(a, b))
+        if a.iter().any(|v| !v.as_f32().is_finite()) || b.iter().any(|v| !v.as_f32().is_finite()) {
+            return Err(numeric_error("vectors must contain only finite values"));
+        }
+        self.validated(a, b)
+    }
+
+    fn validated<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> Result<f32, HnswError> {
+        let value = self.dispatch(a, b);
+        if value.is_finite() {
+            return Ok(value);
+        }
+        finite_distance(self.wide(a, b))
+    }
+
+    /// Inputs have already passed the index's dimension/numeric validation.
+    pub(crate) fn stored(&self, a: &[bf16], b: &[bf16]) -> f32 {
+        self.validated(a, b)
+            .expect("validated stored vector bounds guarantee finite distances")
+    }
+
+    fn wide<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> f64 {
+        match self {
+            Self::Euclidean => a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| {
+                    let d = a.as_f32() as f64 - b.as_f32() as f64;
+                    d * d
+                })
+                .sum::<f64>()
+                .sqrt(),
+            Self::Manhattan => a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| (a.as_f32() as f64 - b.as_f32() as f64).abs())
+                .sum(),
+            Self::InnerProduct => -dot_wide(a, b),
+            Self::Cosine => cosine_wide(a, b),
+        }
+    }
+
+    /// Guarantees that every pair of stored vectors has a finite bf16 edge
+    /// distance, before any graph mutation. Cosine accepts all finite inputs.
+    pub(crate) fn validate_stored(&self, vector: &[bf16], name: &str) -> Result<(), HnswError> {
+        if vector.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::Generic {
+                name: name.into(),
+                source: "Vector contains NaN or infinity".into(),
+            });
+        }
+        let limit = bf16::MAX.to_f32() as f64 / 4.0;
+        let valid = match self {
+            Self::Cosine => true,
+            Self::Euclidean => norm(vector) <= limit,
+            Self::Manhattan => {
+                vector
+                    .iter()
+                    .map(|v| (v.to_f32() as f64).abs())
+                    .sum::<f64>()
+                    <= limit
+            }
+            Self::InnerProduct => norm(vector) <= limit.sqrt(),
+        };
+        if !valid {
+            return Err(HnswError::Generic {
+                name: name.into(),
+                source: format!("Vector magnitude exceeds the safe stored range for {self:?}")
+                    .into(),
+            });
+        }
+        Ok(())
     }
 
     #[inline]
@@ -154,7 +229,11 @@ impl LayerGen {
     ///
     /// * `u8` - Generated layer
     pub fn generate(&self, current_max_layer: u8) -> u8 {
-        let mut r = rng();
+        self.generate_with(current_max_layer, &mut rng())
+    }
+
+    /// Uses a caller-owned RNG for reproducible construction and benchmarks.
+    pub fn generate_with<R: Rng + ?Sized>(&self, current_max_layer: u8, r: &mut R) -> u8 {
         let val = r.sample(self.uniform).max(f64::MIN_POSITIVE);
 
         // Sample l = ⌊−ln(u) · scale⌋ from an exponential distribution.
@@ -168,7 +247,7 @@ impl LayerGen {
 }
 
 /// Element types that promote losslessly to `f32` for distance computation.
-trait AsF32: Copy {
+pub(crate) trait AsF32: Copy {
     fn as_f32(self) -> f32;
 }
 
@@ -208,6 +287,19 @@ fn euclidean_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
         let d = x.as_f32() - y.as_f32();
         sum += d * d;
     }
+    if sum < f32::MIN_POSITIVE {
+        // Squared differences may underflow even when the final distance is
+        // representable in f32. The cold path also handles exact duplicates.
+        return a
+            .iter()
+            .zip(b)
+            .map(|(a, b)| {
+                let d = a.as_f32() as f64 - b.as_f32() as f64;
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt() as f32;
+    }
     sum.sqrt()
 }
 
@@ -239,10 +331,97 @@ fn cosine_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     }
     let norm_a = norm_a2_sum.sqrt();
     let norm_b = norm_b2_sum.sqrt();
+    if !dot_sum.is_finite()
+        || !norm_a.is_finite()
+        || !norm_b.is_finite()
+        || !(norm_a * norm_b).is_finite()
+    {
+        return cosine_wide(a, b) as f32;
+    }
     if norm_a < f32::EPSILON || norm_b < f32::EPSILON {
         return 1.0;
     }
     1.0 - (dot_sum / (norm_a * norm_b)).clamp(-1.0, 1.0)
+}
+
+fn numeric_error(message: &str) -> HnswError {
+    HnswError::Generic {
+        name: "distance".into(),
+        source: message.to_owned().into(),
+    }
+}
+
+fn finite_distance(value: f64) -> Result<f32, HnswError> {
+    let result = value as f32;
+    if result.is_finite() {
+        Ok(result)
+    } else {
+        Err(numeric_error("distance is outside the finite f32 range"))
+    }
+}
+
+pub(crate) fn norm<A: AsF32>(values: &[A]) -> f64 {
+    values
+        .iter()
+        .map(|v| {
+            let v = v.as_f32() as f64;
+            v * v
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn dot_wide<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| a.as_f32() as f64 * b.as_f32() as f64)
+        .sum()
+}
+
+fn cosine_wide<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f64 {
+    let na = norm(a);
+    let nb = norm(b);
+    if na < f32::EPSILON as f64 || nb < f32::EPSILON as f64 {
+        1.0
+    } else {
+        1.0 - (dot_wide(a, b) / (na * nb)).clamp(-1.0, 1.0)
+    }
+}
+
+/// Query-side cosine norm is computed once; node norms are immutable.
+pub(crate) struct PreparedQuery<'a> {
+    pub values: &'a [f32],
+    metric: DistanceMetric,
+    norm: f64,
+}
+
+impl<'a> PreparedQuery<'a> {
+    pub fn new(metric: DistanceMetric, values: &'a [f32]) -> Self {
+        Self {
+            metric,
+            values,
+            norm: if metric == DistanceMetric::Cosine {
+                norm(values)
+            } else {
+                0.0
+            },
+        }
+    }
+    pub fn compute(&self, vector: &[bf16], node_norm: f64) -> Result<f32, HnswError> {
+        if self.metric != DistanceMetric::Cosine {
+            return self.metric.validated(self.values, vector);
+        }
+        if self.norm < f32::EPSILON as f64 || node_norm < f32::EPSILON as f64 {
+            return Ok(1.0);
+        }
+        let dot = -inner_product(self.values, vector);
+        let dot = if dot.is_finite() {
+            dot as f64
+        } else {
+            dot_wide(self.values, vector)
+        };
+        finite_distance(1.0 - (dot / (self.norm * node_norm)).clamp(-1.0, 1.0))
+    }
 }
 
 #[inline]
@@ -286,21 +465,24 @@ mod tests {
     #[test]
     fn test_layer_distribution() {
         let lg = LayerGen::new(10, 16);
+        let mut random = rand::rngs::StdRng::seed_from_u64(42);
         let mut counts = [0; 16];
 
         // Sample many layers and check the empirical distribution.
         const SAMPLES: usize = 100_000;
         let mut current_max_layer = 0;
         for _ in 0..SAMPLES {
-            let level = lg.generate(current_max_layer);
+            let level = lg.generate_with(current_max_layer, &mut random);
             current_max_layer = level.max(current_max_layer);
             counts[level as usize] += 1;
         }
         println!("Max layer: {current_max_layer}");
 
-        // The histogram must be monotonically non-increasing.
-        for i in 1..16 {
-            assert!(counts[i] <= counts[i - 1]);
+        // Test the populated buckets with a six-sigma tolerance. Sparse tails
+        // need not be monotone in any finite random sample.
+        for (layer, &count) in counts.iter().enumerate().take(4) {
+            let expected = SAMPLES as f64 * 0.9 * 0.1_f64.powi(layer as i32);
+            assert!((count as f64 - expected).abs() <= 6.0 * expected.sqrt() + 2.0);
         }
 
         // The bottom layer should hold the majority of the samples.
@@ -311,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_distance_impl_vs_scalar() {
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
         fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
             a.iter()
@@ -384,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_compute_mixed_matches_bf16_for_exact_queries() {
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         // Vector lengths that exercise both the unrolled body and the remainder.
         for dims in [3, 8, 17, 128] {
             // Build a query already representable in bf16, so `compute_mixed`

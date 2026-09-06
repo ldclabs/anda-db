@@ -128,7 +128,8 @@ impl Bench {
     fn build_with(config: HnswConfig, n: usize, num_queries: usize, seed: u64) -> Self {
         let dim = config.dimension;
         let metric = config.distance_metric;
-        let index = HnswIndex::new("recall".to_string(), Some(config));
+        let index = HnswIndex::try_new_seeded("recall".to_string(), Some(config), seed)
+            .expect("valid config");
         let mut rng = SplitMix64(seed);
         let mut data = BTreeMap::new();
         for id in 1..=(n as u64) {

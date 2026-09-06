@@ -36,7 +36,7 @@ pub enum HnswError {
         got: usize,
     },
 
-    /// Error when a token is not found.
+    /// Error when a node is not found.
     #[error("HNSW index {name:?}, node not found: {id:?}")]
     NotFound {
         /// Name of the HNSW index that was searched.

@@ -1,391 +1,311 @@
-# anda_db_hnsw — HNSW Vector Index
+# anda_db_hnsw — HNSW vector index
 
-`anda_db_hnsw` is the approximate nearest-neighbor (ANN) index used as the
-vector-search backbone of AndaDB's long-term memory subsystem. It implements
-the Hierarchical Navigable Small World graph described by Malkov & Yashunin
-(2018) with several engineering extensions tailored to an embedded,
-persistable, AI-agent workload:
+`anda_db_hnsw` is the embeddable vector index used by AndaDB. It stores vectors
+as bf16, computes distances in floating point, and supports incremental
+persistence through caller-supplied callbacks.
 
-- **bf16 storage** — vectors are kept in `half::bf16` to roughly halve the
-  in-memory footprint relative to `f32`, with negligible impact on recall.
-- **Lock-free reads** — the node table is a `papaya::HashMap`, so query paths
-  never block on writers.
-- **Incremental persistence** — the index is serialized as three independently
-  flushable artifacts (metadata / id bitmap / dirty node blobs), so a writer
-  can fsync only what changed since the last flush.
-- **Concurrent bulk load** — restoring an index streams node blobs through a
-  bounded `buffer_unordered` (concurrency `LOAD_NODES_CONCURRENCY = 32`).
-
-This document is a deep reference for the crate's design and algorithms.
-For a hands-on introduction, see the [crate README](../rs/anda_db_hnsw/README.md).
-
-## 1. Design Goals
-
-| Goal                                  | How it is achieved                                               |
-| ------------------------------------- | ---------------------------------------------------------------- |
-| Low query latency at $N \gtrsim 10^6$ | Layered graph with $O(\log N)$ expected search                   |
-| Embedded (no service)                 | Everything is a library; persistence is pluggable                |
-| Memory frugal                         | `bf16` vectors, Roaring bitmap of live ids, `SmallVec` adjacency |
-| Concurrent reads + writes             | `papaya` lock-free map, fine-grained `RwLock`s                   |
-| Crash-safe incremental saves          | Version-watermarked, idempotent flush protocol                   |
-| Small dependency tree                 | Pure Rust; no BLAS, no async runtime required                    |
-
-## 2. HNSW Algorithm Primer
-
-HNSW builds a multi-layer proximity graph. Layer 0 contains every live
-element; upper layers contain a random sparse subset. Every search is a
-greedy descent from the top layer to layer 0, followed by a layer-0 beam
-search.
-
-### 2.1 Layer Assignment
-
-New nodes pick their highest layer by sampling from a (truncated)
-geometric-ish distribution whose expected occupancy at layer $\ell$ decays
-exponentially:
-
-$$P(\ell) \;=\; (1-p)\, p^{\ell},\quad p \;=\; e^{-1/\operatorname{scale}}$$
-
-In this crate the sample is drawn as $\ell = \lfloor -\ln(u)\cdot \operatorname{scale}\rfloor$
-with $u \sim \mathrm{Uniform}(0,1]$, then clamped so that no node skips more
-than one existing layer at a time. The `scale` factor is
-`scale_factor.unwrap_or(1.0) / ln(max_connections)`.
-
-See `LayerGen::generate` in [distance.rs](../rs/anda_db_hnsw/src/distance.rs).
-
-### 2.2 Greedy Descent
-
-Given entry point $e$ at the top layer $L$, for each layer $\ell$ from $L$ down
-to 1, the algorithm repeatedly moves to the neighbor of the current node
-that is closer to the query, until no neighbor improves the distance. This
-yields an entry point at layer $\ell-1$ in $O(\log N)$ expected hops.
-
-### 2.3 Beam Search (`search_layer`)
-
-At layer 0 (or any layer during construction) the search is widened into a
-beam of size $\mathrm{ef}$. It maintains:
-
-- a *candidates* min-heap of nodes to visit, and
-- a *results* max-heap (bounded to `ef`) of the best found so far.
-
-A candidate is expanded only if it could still improve the top of the results
-heap; the search terminates when the next candidate is farther than the
-current farthest result.
-
-### 2.4 Neighbor Selection
-
-When a node is inserted or pruned, an over-sized candidate list must be
-reduced to $M$ connections. Two strategies are available (configured via
-`SelectNeighborsStrategy`):
-
-- **`Simple`** — just take the $M$ closest. Fastest; recall degrades on
-  strongly clustered data because many picked neighbors are mutually close.
-- **`Heuristic`** — Algorithm 4 of the original HNSW paper with
-  `keepPrunedConnections`: candidates are scanned from nearest to farthest,
-  and candidate $c$ is kept only if
-
-  $$d(c, q) \;<\; \min_{s \,\in\, \mathrm{selected}} d(c, s),$$
-
-  i.e. it is closer to the query point than to every neighbor already
-  selected, so the edge set spreads across the local manifold instead of
-  collapsing into one cluster. Pruned candidates are then backfilled
-  (closest first) until $M$ edges are reached. Pairwise distances are
-  memoized per insert, and the scan exits early on the first conflict, so
-  selection costs at most $c \cdot M$ distance computations.
-
-The heuristic strategy is the default.
-
-## 3. In-Memory Data Structures
-
-```
-HnswIndex
-├── config:        HnswConfig                (frozen at construction)
-├── layer_gen:     LayerGen
-├── nodes:         papaya::HashMap<u64, HnswNode>   ← lock-free hot path
-├── entry_point:   RwLock<(u64, u8)>         ← (id, layer)
-├── metadata:      RwLock<HnswMetadata>      ← snapshot-able
-├── ids:           RwLock<croaring::Treemap> ← live ids
-├── dirty_nodes:   RwLock<BTreeSet<u64>>     ← pending flush
-├── search_count:  AtomicU64
-└── last_saved_version: AtomicU64            ← flush watermark
-```
-
-Each `HnswNode` stores:
+## Usage
 
 ```rust
+use anda_db_hnsw::{HnswConfig, HnswIndex, SearchOptions};
+
+let index = HnswIndex::try_new(
+    "memory".into(),
+    Some(HnswConfig { dimension: 384, ..Default::default() }),
+)?;
+index.insert_f32(1, vec![0.1; 384], 0)?;
+index.insert_f32(2, vec![0.2; 384], 0)?;
+
+let hits = index.search_f32_with_options(
+    &[0.15; 384],
+    10,
+    SearchOptions { ef_search: Some(100) },
+)?;
+# Ok::<(), anda_db_hnsw::HnswError>(())
+```
+
+Prefer `try_new`: it rejects invalid configuration. The compatibility
+constructor `new` normalizes invalid values into the supported range.
+`try_new_seeded(name, config, seed)` provides reproducible layer assignment
+for tests and benchmarks with the same dependency versions and insertion order.
+The seed is runtime state, not part of the persisted configuration.
+
+## Configuration and queries
+
+| Parameter | Default | Accepted range / meaning |
+| --- | --- | --- |
+| dimension | 512 | 1–16,384 |
+| max_layers | 16 | 1–64; layer indices start at zero |
+| max_connections | 32 | 2–128; layer zero targets 2×M |
+| ef_construction | 200 | 1–4,096 |
+| ef_search | 50 | 1–4,096; actual beam is max(ef, top_k) |
+| scale_factor | None / 1.0 | Finite and positive |
+| distance_metric | Euclidean | Euclidean, Cosine, InnerProduct, Manhattan |
+| select_neighbors_strategy | Heuristic | Simple or Heuristic |
+| reconnect_on_delete | false | Whether deletion attempts local reconnection |
+
+Per-layer out-degree is bounded by `capacity + capacity/5`, where capacity is
+2×M at layer zero and M above it. The allowance amortizes pruning.
+
+Both query APIs treat `top_k == 0` as an unconditional no-op, without input
+validation or a search-counter increment. Positive requests validate dimension
+and finite input values. Requests above 4,096 return an error instead of
+silently returning fewer results because of a hidden beam cap. An approximate
+search can still return fewer than k results on a small or disconnected graph.
+
+`search_f32` keeps the query in f32, avoiding query quantization.
+`search` promotes a bf16 query once. Results are sorted by ascending distance.
+
+`search_f32_with_options` changes ef for one query. The default methods reuse
+thread-local scratch storage with a safe fallback for reentrant calls.
+`search_f32_with_workspace` accepts an exclusively borrowed `SearchWorkspace`
+for applications that want to own those allocations.
+
+## Distance semantics and numeric bounds
+
+| Metric | Distance |
+| --- | --- |
+| Euclidean | sqrt(sum((a − b)²)) |
+| Cosine | 1 − cosine similarity, clamped to [0, 2] |
+| InnerProduct | −dot(a, b) |
+| Manhattan | sum(abs(a − b)) |
+
+Smaller distances are better, including negative inner-product distances.
+Cosine returns 1 when either norm is below f32::EPSILON.
+
+Public `DistanceMetric::compute`, `compute_f32` and `compute_mixed` reject
+dimension mismatches and non-finite inputs. Kernels keep the ordinary f32 fast
+path, with wider arithmetic for overflow and Euclidean square underflow.
+A result outside the finite f32 range is an error.
+
+The index also checks a conservative **stored-vector** magnitude bound before
+mutation so that every pair of accepted nodes has a finite bf16 edge distance.
+Let B = bf16::MAX expressed as f64:
+
+| Metric | Stored-vector bound |
+| --- | --- |
+| Euclidean | L2 norm ≤ B / 4 |
+| Manhattan | L1 norm ≤ B / 4 |
+| InnerProduct | L2 norm ≤ sqrt(B / 4) |
+| Cosine | Any finite bf16 elements |
+
+These ranges are far larger than typical embeddings. A finite f32 input that
+overflows during bf16 conversion is rejected too. Query distance overflow
+returns an error rather than inserting NaN/Inf into ranking heaps.
+Rejected vector input leaves the graph and public operation counters unchanged.
+
+Cosine query norms are prepared once; immutable node norms are cached.
+The API still returns Euclidean distance, not squared L2.
+
+## Graph storage and mutation
+
+The public `HnswNode` type and its existing serde fields remain available:
+
+```rust
+# use anda_db_hnsw::half::bf16;
 pub struct HnswNode {
-    pub id:       u64,
-    pub layer:    u8,                               // highest layer
-    pub vector:   Vec<bf16>,                        // stored vector
-    pub neighbors: Vec<SmallVec<[(u64, bf16); 64]>>, // per-layer adjacency
-    pub version:  u64,                              // write counter
+    pub id: u64,
+    pub layer: u8,
+    pub vector: Vec<bf16>,
+    pub neighbors: Vec<smallvec::SmallVec<[(u64, bf16); 64]>>,
+    pub version: u64,
 }
 ```
 
-`neighbors[l]` is the adjacency list at layer $l$. Edge weights are kept in
-`bf16` because they are only used as cheap tie-breakers during pruning;
-re-computation in `f32` happens whenever we need true precision.
+The hot runtime representation is separate: an immutable node is held by Arc,
+its bf16 vector is shared by Arc, and each adjacency layer uses a Vec.
+Updating edges copies adjacency without copying the vector. Adjacency lists are
+ordered by target ID and contain no duplicates. Exact reverse references are
+maintained per target and layer, including asymmetric edges created by pruning.
 
-Several invariants hold:
+`get_node_with` materializes the public owned representation for compatibility;
+it is intended for inspection/export, not the search hot path. Individual
+`HnswNode::version` counters describe mutations of one node instance, not a
+globally unique incarnation of a reusable ID. Use the index's persistence APIs
+for generation-safe acknowledgement.
 
-- `neighbors.len() == layer + 1`.
-- Layer-0 lists are bounded by `2 * max_connections`; higher layers by
-  `max_connections`. A 20 % slack (`max_conns + max_conns/5`) is permitted
-  before a prune is triggered, to amortise the cost of `select_neighbors`.
-- An edge may exist in one direction only: HNSW allows a lower-layer node
-  to appear in a higher-layer node's neighbor list but forbids the reverse
-  (the lower-layer node does not exist at that higher layer).
+Deletion removes **all** incoming references before the ID can be reused.
+A non-entry deletion retains the maximum layer because the surviving entry
+already proves that layer exists. Only entry deletion scans for a replacement.
 
-## 4. Insert Pipeline
+With `reconnect_on_delete=false`, deletions only remove edges; deletion-heavy
+workloads can lose recall and connectivity. With true, affected incoming
+neighbors also consider the deleted node's peers as reconnection candidates.
+This improves resilience, but it is not a proof of connectivity for every
+dataset/deletion order and costs additional distance work under the writer gate.
 
-`HnswIndex::insert` is organised into four explicit phases:
+## Concurrency
 
-1. **Descend & collect.** Starting from the current entry point, greedily
-   descend to the candidate layer. For each layer $\ell$ from the node's
-   layer down to 0, run `search_layer` with width `ef_construction`, then
-   pick neighbors via `select_neighbors`. Forward edges go into the new
-   node's own adjacency list; required reverse edges are buffered in a
-   `FxHashMap<u64, SmallVec<[(u8,(u64,bf16));8]>>`.
+Insert/remove are synchronous and serialized by a structural mutex. Search
+does not take that mutex; it uses the concurrent node table and briefly reads
+the entry-point RwLock. The whole query is therefore not described as lock-free
+or as a linearizable snapshot. Missing entry points during concurrent deletion
+are retried at most `SEARCH_MAX_ATTEMPTS` times.
 
-2. **Publish the new node.** Insert the `HnswNode` into the `papaya` map.
-   From this point, concurrent searches can reach it. If the new node
-   sits on a higher layer than the current entry point (or the entry point
-   was concurrently deleted), promote it.
+**All persistence and purge calls must be serialized by the caller.**
+Structural mutations may overlap with a flush; later changes stay pending.
+AndaDB's Collection already holds its exclusive operation gate across flush,
+which also excludes collection mutations.
 
-3. **Apply reverse edges + in-place pruning.** For each affected neighbor:
-   - clone once (`papaya` has no in-place update API),
-   - append all pending reverse edges,
-   - if any layer's list exceeds `1.2 * max_conns`, re-run
-     `select_neighbors` over the *current* adjacency list and replace it
-     with the selected subset,
-   - bump `version`, mark the id dirty, and write back via `nodes.insert`.
+No synchronous lock or papaya local pin guard spans a callback await.
+Snapshots capture immutable node handles under the gate; encoding and I/O run
+after it is released. A successful flush clears a node's dirty mark only if its
+current Arc identity still matches the snapshot. Remove/reinsert cannot cause an
+ABA acknowledgement even when the public node counter restarts.
 
-   This merged pass guarantees exactly one clone and one write per affected
-   neighbor per insertion.
+## Persistence APIs
 
-4. **Commit dirty set.** The local `BTreeSet<u64>` of touched ids is
-   merged into the index-wide `dirty_nodes` under a single lock acquisition.
-
-### Errors
-
-- `DimensionMismatch` — vector length ≠ `config.dimension`.
-- `Generic` — vector contains `NaN` / `±∞` (validated via `normalize`).
-- `AlreadyExists` — an entry with `id` is already present.
-
-## 5. Delete Semantics
-
-`HnswIndex::remove`:
-
-1. Reads the target node, then walks its own neighbor list layer-by-layer to
-   locate the set of back-referencing nodes — this avoids an $O(N)$ scan.
-2. For each back-referrer, clones, drops the edge to the deleted id at the
-   relevant layer, bumps `version`, marks dirty, and writes back.
-3. Removes the target from `nodes` and from the `ids` bitmap.
-4. If the target was the entry point, `try_update_entry_point` picks a
-   replacement by iterating `ids`, preferring the highest layer present.
-
-Stale back-references (e.g. from nodes that were not listed as neighbors of
-the removed node because they were pruned away earlier) are intentionally
-tolerated: `search_layer` silently skips ids that are absent from the `nodes`
-map. This trades a tiny amount of read-time work for a much cheaper delete.
-
-## 6. Search Pipeline
-
-`HnswIndex::search(query, top_k)`:
-
-1. Validate dimension; reject `NaN`/`Inf`.
-2. Greedy descent from the entry point down to layer 1.
-3. Layer-0 beam search with width $\max(\mathrm{ef\_search},\,\mathrm{top\_k})$.
-4. Truncate to `top_k` and sort by ascending distance.
-
-The query is kept in `f32` for every distance computation (only the stored
-vectors are `bf16`), so `search_f32` loses no query precision to
-quantization. If a node on the search path is removed concurrently, the
-search transparently retries from the repaired entry point (up to
-`SEARCH_MAX_ATTEMPTS` times) instead of surfacing a transient `NotFound`.
-
-`ef_search` is the primary recall/latency knob at query time; values in the
-range `2 × top_k … 10 × top_k` are typical.
-
-## 7. Persistence Model
-
-Persistence is split into three artifacts:
-
-### 7.1 Metadata (`HnswMetadata` — CBOR)
-
-Carries `name`, the full `HnswConfig`, the live `HnswStats`, and the current
-`entry_point`. Written by `store_metadata`. A monotonically increasing
-`version` makes the call idempotent: if the on-disk version already matches
-the in-memory one, the call is a no-op.
-
-### 7.2 Ids (`croaring::Treemap` — Portable format)
-
-Written by `store_ids` whenever the metadata is actually flushed. The bitmap
-is used at load time to issue concurrent reads for every live node.
-
-### 7.3 Nodes (per-id CBOR blobs)
-
-Written by `store_dirty_nodes`, which consumes (but does not yet remove)
-entries from the `dirty_nodes` set. The caller supplies an async closure
-`F: AsyncFn(u64, &[u8]) -> Result<bool, BoxError>`:
-
-- `Ok(true)` — persisted; continue.
-- `Ok(false)` — stop cleanly; unprocessed ids are returned to `dirty_nodes`.
-- `Err(e)`  — stop with error; the failing id is also requeued, so no data
-  is silently dropped on I/O failure.
-
-Crucially, the `papaya` pin guard is *only* held while serialising a node;
-it is dropped before the `.await` to the user callback. Papaya guards
-contain raw pointers and are therefore `!Send`, so they must not span
-`.await` points — see the `test_async_send_lifetime` test in the crate.
-
-### 7.4 `flush` — The Orchestrator
-
-`flush(metadata_writer, ids_writer, now_ms, node_cb)` runs the three steps
-in order and only writes ids + nodes if the metadata version actually
-advanced *or* dirty nodes are still outstanding. This lets callers flush
-after every write without amplifying writes when nothing has changed.
-
-### 7.5 `load_all` — Bulk Reconstruction
+Prefer `flush_with_options` for owned buffers and explicit status:
 
 ```rust
-pub async fn load_all<R1, R2, F>(
-    metadata_reader: R1,
-    ids_reader: R2,
-    f: F,
-) -> Result<Self, BoxError>
-where
-    F: AsyncFn(u64) -> Result<Option<Vec<u8>>, BoxError>,
-```
+use anda_db_hnsw::{BoxError, FlushOptions, FlushOutcome, HnswIndex};
 
-After parsing metadata and the id bitmap, `load_nodes` uses
-
-```rust
-futures::stream::iter(ids)
-    .map(|id| async move { (id, f(id).await) })
-    .buffer_unordered(LOAD_NODES_CONCURRENCY)   // = 32
-    .try_next()
-    .await?
-```
-
-to issue up to 32 object-store reads in flight concurrently. The resulting
-throughput is typically bound by the underlying store, not by per-node
-deserialisation.
-
-If an id exists in the bitmap but its node blob is missing, the loader removes
-that id from the live bitmap, repairs the entry point if needed, prunes all
-loaded edges pointing to the missing node, and marks the repaired nodes dirty.
-The next flush writes the cleaned graph back to storage.
-
-## 8. Concurrency & `Send` Safety
-
-Hot paths are designed so that no lock is held across an `.await`:
-
-- `papaya::LocalGuard` is `!Send` — it is always re-acquired via `nodes.pin()`
-  per loop iteration and dropped before any suspension point.
-- `parking_lot::RwLock` guards are held only around tiny critical sections
-  (metadata snapshot, entry-point read/update, dirty-set append).
-- All counters that are hit on every operation are `AtomicU64` with
-  `Ordering::Relaxed` — they are *statistics*, not fences.
-
-Structural writers (`insert` and `remove`) are serialized by an internal
-mutex because they clone and rewrite adjacency lists. Search remains lock-free
-on the hot path and may overlap with writers; stale references are skipped if
-their node is no longer present.
-
-## 9. Tuning Guide
-
-| Parameter                   | Default     | Effect when increased                                    |
-| --------------------------- | ----------- | -------------------------------------------------------- |
-| `max_connections` (M)       | 32          | Higher recall; RAM grows linearly; insert cost grows too |
-| `ef_construction`           | 200         | Better graph quality; slower inserts                     |
-| `ef_search`                 | 50          | Higher recall; slower queries (must be ≥ `top_k`)        |
-| `max_layers`                | 16          | Only matters for $N \gg 10^7$; rarely tuned              |
-| `scale_factor`              | `1.0`       | `>1.0` makes upper layers denser; `<1.0` sparser         |
-| `distance_metric`           | `Euclidean` | Pick the one matching your embedding model               |
-| `select_neighbors_strategy` | `Heuristic` | `Simple` is faster to build, lower recall                |
-
-Rough sizing for $N$ = 1 M, $D$ = 768, $M$ = 32:
-
-- Vectors: $N \cdot D \cdot 2\,\mathrm{B} \approx$ 1.5 GiB
-- Adjacency (layer 0, avg. 2 M edges/node): $\approx$ 640 MiB
-- Total with metadata: ≈ 2.2 GiB
-
-## 10. Error Model
-
-```rust
-pub enum HnswError {
-    Generic { name, source },
-    Serialization { name, source },
-    DimensionMismatch { name, expected, got },
-    NotFound { name, id },
-    AlreadyExists { name, id },
-}
-```
-
-All variants carry the index `name` so that multi-index applications can
-attribute failures at the log level without extra wrapping.
-
-## 11. API Quick Reference
-
-| Method                                                 | Purpose                                                   |
-| ------------------------------------------------------ | --------------------------------------------------------- |
-| `HnswIndex::new`                                       | Create an empty in-memory index                           |
-| `HnswIndex::load_all`                                  | Reconstruct from metadata + ids + async node reader       |
-| `HnswIndex::load_metadata` / `load_ids` / `load_nodes` | Lower-level loaders                                       |
-| `insert` / `insert_f32`                                | Add a vector (bf16 or f32 convenience)                    |
-| `remove`                                               | Delete by id, fixing reverse edges and entry point        |
-| `search` / `search_f32`                                | k-NN query, sorted ascending by distance                  |
-| `get_node_with`                                        | Visit a node under its pin guard (for custom projections) |
-| `node_ids`                                             | Snapshot the live-id set                                  |
-| `has_dirty_nodes`                                      | Inspect whether the flush backlog is non-empty            |
-| `store_metadata` / `store_ids` / `store_dirty_nodes`   | Granular persistence                                      |
-| `flush`                                                | End-to-end persist in one call                            |
-| `stats` / `metadata`                                   | Snapshot counters and configuration                       |
-
-## 12. Minimal Example
-
-```rust
-use anda_db_hnsw::{HnswConfig, HnswIndex, DistanceMetric};
-
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let index = HnswIndex::new(
-    "memory".to_string(),
-    Some(HnswConfig {
-        dimension: 384,
-        distance_metric: DistanceMetric::Cosine,
-        ..Default::default()
-    }),
-);
-
-// Insert
-index.insert_f32(1, vec![0.1_f32; 384], 0)?;
-index.insert_f32(2, vec![0.2_f32; 384], 0)?;
-
-// Search
-let hits = index.search_f32(&vec![0.15_f32; 384], 5)?;
-for (id, dist) in hits { println!("{id}: {dist:.4}"); }
-
-// Persist: metadata + ids into in-memory buffers, nodes via callback
-let mut meta = Vec::new();
-let mut ids  = Vec::new();
-let mut blobs = std::collections::HashMap::new();
-index
-    .flush(&mut meta, &mut ids, 0, async |id, data| {
-        blobs.insert(id, data.to_vec());
+# async fn example(index: &HnswIndex) -> Result<(), BoxError> {
+let outcome = index.flush_with_options(
+    1234,
+    FlushOptions {
+        node_concurrency: 8,
+        max_in_flight_bytes: 16 * 1024 * 1024,
+    },
+    |id, bytes| async move {
+        // Atomically persist this node object and confirm durability.
+        # let _ = (id, bytes);
         Ok(true)
-    })
-    .await?;
+    },
+    |bytes| async move {
+        // Atomically persist the IDs object.
+        # let _ = bytes;
+        Ok(())
+    },
+    |bytes| async move {
+        // Persist metadata last; use the backend's conditional-write token.
+        # let _ = bytes;
+        Ok(())
+    },
+).await?;
+
+match outcome {
+    FlushOutcome::Committed => { /* a complete pass was acknowledged */ }
+    FlushOutcome::NoChanges => { /* no callbacks ran */ }
+    FlushOutcome::Stopped => { /* no commit; changes remain pending */ }
+}
 # Ok(()) }
 ```
 
-For a complete demo that also performs a load round-trip, see
-[`rs/anda_db_hnsw/examples/hnsw_demo.rs`](../rs/anda_db_hnsw/examples/hnsw_demo.rs).
+The placeholders above illustrate callback contracts; the complete
+[filesystem demo](../rs/anda_db_hnsw/examples/hnsw_demo.rs) performs actual
+temporary-file writes, file sync, rename and directory sync.
 
-## References
+Upload concurrency is 1–64, and the encoded buffers in flight stay within the
+configured byte budget. A single node larger than the budget is an error.
+Exact encoded sizes use cbor2::serialized_size. IDs are written only after all
+node callbacks succeed; metadata is written last. A node callback returning
+false stops without committing. Error/cancellation can leave individual object
+writes durable, but dirty evidence is retained for recovery/retry.
 
-- Yu. A. Malkov, D. A. Yashunin.
-  *Efficient and robust approximate nearest neighbor search using hierarchical
-  navigable small world graphs.* IEEE TPAMI, 2018.
-- `papaya` crate — lock-free hash map, <https://docs.rs/papaya>.
-- `croaring` crate — compressed bitmap, <https://docs.rs/croaring>.
-- `half::bf16` — truncated 16-bit float, <https://docs.rs/half>.
+Compatibility `flush_with` returns true only for a committed pass and false
+for no changes; an early stop is now an error. `flush_outcome` gives the same
+explicit status for borrowed-buffer node callbacks and synchronous writers.
+`flush` is its bool compatibility adapter.
+
+Writer adapters check both write_all and Write::flush before acknowledging the
+pass. Write::flush is **not** a file fsync or remote durability guarantee.
+For those guarantees use callbacks. Never truncate existing metadata/IDs files
+before calling an API that may return NoChanges.
+
+Granular interfaces remain available:
+
+| API | Contract |
+| --- | --- |
+| metadata_bytes | Pure serialization; advances no watermark |
+| store_metadata | Checks the writer flush, acknowledges metadata only |
+| store_metadata_with | Acknowledges metadata after callback success |
+| store_ids | Writes the IDs image and checks the writer flush |
+| store_dirty_nodes | Acknowledges each unchanged node after callback success |
+
+Granular metadata writes do not acknowledge a complete generation or authorize
+purging. Writing to an in-memory Vec does not confirm an external backend write;
+use metadata_bytes to serialize or store_metadata_with to confirm the backend.
+
+## Tombstones and purge
+
+The normal sequence is:
+
+1. Complete a flush containing the deletion.
+2. Call `purge_removed_nodes` to delete eligible node blobs.
+3. Flush again, or on the next periodic pass, to save the reduced tombstone set.
+
+A tombstone becomes eligible only when its exact removal instance was included
+in a **complete** acknowledged snapshot, or loaded from committed metadata.
+A removal occurring during flush belongs to a later pass. Reinserted IDs and
+newer removal instances are checked around the callback and cannot accidentally
+consume an older acknowledgement.
+
+Purge callbacks return true to acknowledge, false to stop, or an error. Treat
+“blob not found” as success: a crash after physical deletion but before the next
+metadata flush can replay the deletion. Cancellation preserves unacknowledged
+tombstones. `has_pending_flush` includes nodes, metadata/IDs and tombstones.
+
+## Wire compatibility and recovery
+
+The existing metadata fields and public node fields remain readable.
+New node objects add an optional `g` field containing the pass generation.
+The IDs object is a CBOR sequence: the original byte string containing the
+Portable Roaring treemap, followed by a u64 generation. Older AndaDB readers
+decode the first item; new readers also accept legacy one-item IDs objects.
+Custom decoders that require exactly one CBOR item must accept the trailer.
+
+Each backend must atomically replace individual objects. The sequence
+nodes → IDs → metadata plus metadata CAS is **recoverable partial progress**,
+not a multi-object transaction or a promise to reopen the previous snapshot.
+
+Bootstrap proceeds transactionally in memory:
+
+1. Validate metadata/config and stage IDs without changing a live graph.
+2. Fetch/validate node objects with bounded concurrency, up to 32 in flight.
+3. Remove missing references, duplicate edges, self-loops and invalid layer
+   edges; repair the entry point and maximum layer. Reject invalid numeric
+   data, invalid node IDs/layer shapes and excessive degree.
+4. Recompute legacy cached distances once during migration.
+5. If pass markers disagree, or an unversioned legacy graph is disconnected, rebuild from
+   vectors referenced by the loaded IDs. If pruning still isolates nodes,
+   reserve one bounded ring edge per node in that rebuilt graph. A coherent
+   modern image retains its original graph, even if approximate pruning or
+   cheap deletion left it disconnected.
+6. Publish the replacement only after success; mark repairs dirty.
+
+The loaded IDs object defines which vectors recovery retains. A failed pass can
+therefore recover earlier or later progress depending on whether IDs were
+replaced. Operation counters originate from the saved metadata; they are not
+an audit log of writes that occurred after it. AndaDB's Collection additionally
+replays document mutation intents to recover authoritative document state.
+
+`recovery_report` exposes missing-node count, repair count and whether rebuilding
+was required. A loader returning None explicitly permits dropping a missing blob;
+return an error instead if missing data must abort your application's open.
+Failure or cancellation during node loading leaves the previous runtime graph
+intact and the staged IDs available for retry.
+
+Invalid persisted configuration is rejected, rather than silently changing a
+dimension or graph limit. Persisted repair results are saved by the next flush.
+
+## Testing, sizing and benchmarks
+
+```sh
+cargo test -p anda_db_hnsw --all-targets
+cargo clippy -p anda_db_hnsw --all-targets -- -D warnings
+cargo run -p anda_db_hnsw --example hnsw_demo
+```
+
+The regression suite covers numeric overflow, ID reuse, buffered-writer failure,
+stop/cancellation contracts, tombstone generations, mixed-image recovery,
+transactional load retries, query bounds and bounded parallel uploads.
+Recall tests use deterministic data and graph seeds.
+
+Memory estimates must include alignment, capacities, Arc/hash-table overhead,
+reverse references and temporary snapshots. On the measured 64-bit build,
+(u64,bf16) occupies 16 bytes, not 10. A bf16 vector's elements take 2×dimension
+bytes, but this does not describe the whole index footprint.
+
+See the [benchmark guide](../rs/anda_db_hnsw/benches/README.md) for the configurable
+data matrix, allocation/latency/recall measurements and release-profile controls.

@@ -1,4 +1,4 @@
-use anda_db_hnsw::HnswIndex;
+use anda_db_hnsw::{FlushOptions, FlushOutcome, HnswError, HnswIndex};
 use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -225,11 +225,11 @@ impl Hnsw {
 
     /// Persists one coherent graph snapshot, then deletes removed-node blobs.
     ///
-    /// [`HnswIndex::flush_with`] owns the crash contract and generation gate:
-    /// dirty nodes are durable first, then the ids bitmap, and finally the
-    /// metadata is compare-and-swap updated as the commit record. Mutations
-    /// crossing the I/O window remain pending as the next snapshot rather than
-    /// being mixed into the metadata or ids of this one.
+    /// Node uploads are bounded to eight in flight, followed by conditional
+    /// IDs and metadata writes. These are recoverable partial progress, not a
+    /// multi-object transaction: generation markers let bootstrap rebuild a
+    /// mixed graph, and Collection replays authoritative document intents.
+    /// The owning Collection serializes persistence and excludes mutations.
     ///
     /// Returns `true` when any object was written or deleted.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
@@ -244,8 +244,12 @@ impl Hnsw {
         let metadata_version = self.metadata_version.clone();
         let saved = self
             .index
-            .flush_with(
+            .flush_with_options(
                 now_ms,
+                FlushOptions {
+                    node_concurrency: 8,
+                    ..Default::default()
+                },
                 move |id, data| {
                     let name = node_name.clone();
                     let storage = node_storage.clone();
@@ -264,6 +268,18 @@ impl Hnsw {
                 },
             )
             .await?;
+
+        let saved = match saved {
+            FlushOutcome::Committed => true,
+            FlushOutcome::NoChanges => false,
+            FlushOutcome::Stopped => {
+                return Err(HnswError::Generic {
+                    name: self.name.clone(),
+                    source: "HNSW flush stopped before commit".into(),
+                }
+                .into());
+            }
+        };
 
         // Delete the persisted blobs of removed nodes; without this they
         // would leak forever. "Not found" is success (already deleted).
