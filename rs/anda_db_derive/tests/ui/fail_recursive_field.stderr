@@ -1,0 +1,11 @@
+error: recursive fields cannot describe a finite FieldType; use an explicit non-recursive #[field_type = "..."] override
+ --> tests/ui/fail_recursive_field.rs:5:11
+  |
+5 |     next: Option<Box<Node>>,
+  |           ^^^^^^^^^^^^^^^^^
+
+error: recursive fields cannot describe a finite FieldType; use an explicit non-recursive #[field_type = "..."] override
+  --> tests/ui/fail_recursive_field.rs:10:11
+   |
+10 |     next: Vec<Self>,
+   |           ^^^^^^^^^

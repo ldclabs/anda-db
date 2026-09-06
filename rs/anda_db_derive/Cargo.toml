@@ -12,7 +12,7 @@ license.workspace = true
 
 [lib]
 proc-macro = true
-doctest = false
+doctest = true
 
 [dependencies]
 syn = "2.0"
@@ -21,6 +21,7 @@ proc-macro2 = "1.0"
 proc-macro-crate = "3"
 
 [dev-dependencies]
+serde = { workspace = true }
 # Cyclic dev-dependency (allowed by cargo, stripped on publish): used by the
 # trybuild UI tests to compile the generated code for real.
 anda_db_schema = { path = "../anda_db_schema" }

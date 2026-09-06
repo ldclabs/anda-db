@@ -5,8 +5,8 @@ use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
     TypeParams, effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
-    parse_field_cbor_attrs, parse_field_serde_attrs, resolve_field_type, schema_crate_path,
-    validate_schema_field_name,
+    parse_field_cbor_attrs, parse_field_serde_attrs, reject_direct_recursion, resolve_field_type,
+    schema_crate_path, validate_schema_field_name, validate_unique_attrs,
 };
 
 /// Implementation of `#[derive(AndaDBSchema)]`.
@@ -73,7 +73,40 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
         let rust_name = field_ident.unraw().to_string();
+        has_serialized_id |= rust_name == "_id";
         let serde_attrs = parse_field_serde_attrs(&field.attrs);
+        if let Err(err) = validate_unique_attrs(&field.attrs) {
+            field_entries.push(err.to_compile_error());
+            continue;
+        }
+
+        // Validate shape-changing attributes before the special `_id` path
+        // can return. Skipped ordinary fields have no serialized shape.
+        if !serde_attrs.skip_serializing {
+            match parse_field_cbor_attrs(&field.attrs) {
+                Ok(attrs) if attrs.key.is_some() => {
+                    field_entries.push(syn::Error::new_spanned(field_ident,
+                        "#[cbor(key = ...)] is not supported on top-level document fields: AndaDB documents are stored with text field names. Integer CBOR keys are only supported in nested structs deriving FieldTyped").to_compile_error());
+                    if rust_name == "_id" {
+                        has_serialized_id = true;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    field_entries.push(err.to_compile_error());
+                    continue;
+                }
+                _ => {}
+            }
+            if serde_attrs.flatten {
+                field_entries.push(syn::Error::new_spanned(field_ident,
+                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field").to_compile_error());
+                if rust_name == "_id" {
+                    has_serialized_id = true;
+                }
+                continue;
+            }
+        }
 
         // The `_id` column is provided automatically by `SchemaBuilder`; the
         // user-declared field is validated and then skipped.
@@ -139,41 +172,6 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         if serde_attrs.skip_serializing {
             continue;
         }
-        // Top-level document fields are stored under their text names;
-        // an integer CBOR key (honoured by nested `FieldTyped` structs)
-        // would make the serialized document unreadable, so reject it here
-        // instead of failing at runtime.
-        match parse_field_cbor_attrs(&field.attrs) {
-            Ok(cbor_attrs) => {
-                if cbor_attrs.key.is_some() {
-                    field_entries.push(
-                        syn::Error::new_spanned(
-                            field_ident,
-                            "#[cbor(key = ...)] is not supported on top-level document fields: \
-                             AndaDB documents are stored with text field names. Integer CBOR \
-                             keys are only supported in nested structs deriving FieldTyped",
-                        )
-                        .to_compile_error(),
-                    );
-                    continue;
-                }
-            }
-            Err(err) => {
-                field_entries.push(err.to_compile_error());
-                continue;
-            }
-        }
-        if serde_attrs.flatten {
-            field_entries.push(
-                syn::Error::new_spanned(
-                    field_ident,
-                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field",
-                )
-                .to_compile_error(),
-            );
-            continue;
-        }
-
         // Schema field names follow the serialized names: serde renames and
         // container-level rename_all rules are honoured.
         let schema_name = effective_field_name(&rust_name, &serde_attrs, container.rename_all);
@@ -219,6 +217,10 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         }
 
         // `#[field_type = "..."]` wins over auto-inference.
+        if let Err(err) = reject_direct_recursion(field, name) {
+            field_entries.push(err.to_compile_error());
+            continue;
+        }
         let field_type = match resolve_field_type(field, &root, &type_params) {
             Ok(field_type) => field_type,
             Err(err) => {
@@ -349,9 +351,10 @@ mod tests {
         assert!(expanded.contains("with_unique"));
         assert!(expanded.contains(":: anda_db_schema :: FieldType :: Option"));
         // Generic *user* types keep working through their own field_type().
-        assert!(expanded.contains("< Wrapper < T > > :: field_type ()"));
+        assert!(expanded.contains("< Wrapper < T > > :: field_type"));
         // The generated body must not import bare schema names into scope.
-        assert!(!expanded.contains("use ::"));
+        assert!(!expanded.contains("use :: anda_db_schema :: Field"));
+        assert!(expanded.contains("ResolveFieldType as _"));
         assert!(!expanded.contains("use anda_db_schema"));
         assert!(!expanded.contains("\"_id\" . to_string"));
         assert!(!expanded.contains("compile_error"));

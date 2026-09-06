@@ -4,6 +4,7 @@
 //!
 //! - [`FieldTyped`] generates a `field_type()` associated function that
 //!   describes a struct as an `anda_db_schema::FieldType::Map`.
+//!   Its `try_field_type()` counterpart reports recursive/invalid types.
 //! - [`AndaDBSchema`] generates a `schema()` associated function returning an
 //!   `anda_db_schema::Schema` for collection creation.
 //!
@@ -20,6 +21,10 @@ use proc_macro::TokenStream;
 mod common;
 mod field_typed;
 mod schema;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
 
 /// A derive macro that generates a `field_type()` associated function for a
 /// struct.
@@ -56,6 +61,16 @@ mod schema;
 /// - Other serde options are ignored. Note that `#[serde(with = "...")]` /
 ///   `serialize_with` may change the serialized shape -- combine them with
 ///   an explicit `#[field_type = "..."]` override when they do.
+/// - `#[serde(tag = "...")]` and `#[serde(into = "...")]` are rejected:
+///   they change the container's serialized shape.
+/// - Fixed map keys `"*"` and `i64::MIN` are reserved for wildcard maps.
+///   Direct recursive fields must use an explicit non-recursive override.
+///
+/// The generated `try_field_type() -> Result<FieldType, SchemaError>` detects
+/// indirect recursion, including type aliases. `AndaDBSchema::schema()` uses
+/// this fallible path automatically for derived nested types. The legacy
+/// `field_type()` convenience method panics on invalid declarations; use
+/// `try_field_type()` when the type graph may be recursive.
 ///
 /// **Warning:** `#[serde(skip_serializing_if = "...")]` on a **non-`Option`**
 /// field is a trap: the field is described as *required*, but serde may omit
@@ -103,17 +118,17 @@ mod schema;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use anda_db_schema::{FieldType, FieldTyped};
-/// use ic_auth_types::Xid;
+/// ```rust
+/// use anda_db_schema::{ByteArrayB64, FieldTyped};
 ///
 /// #[derive(FieldTyped)]
 /// struct User {
 ///     #[field_type = "Bytes"]
-///     id: Xid,
+///     id: ByteArrayB64<12>,
 ///     name: String,
 ///     age: u32,
 /// }
+/// assert!(User::try_field_type().is_ok());
 /// ```
 #[proc_macro_derive(FieldTyped, attributes(field_type, cbor, serde))]
 pub fn field_typed_derive(input: TokenStream) -> TokenStream {
@@ -176,8 +191,7 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use anda_db_schema::{FieldEntry, FieldType, Schema, SchemaError};
+/// ```rust
 /// use anda_db_derive::AndaDBSchema;
 ///
 /// #[derive(AndaDBSchema)]
@@ -197,11 +211,12 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///     /// User tags for categorization
 ///     tags: Vec<String>,
 /// }
+/// assert!(User::schema().is_ok());
 /// ```
 ///
 /// Expands to:
 ///
-/// ```rust,ignore
+/// ```text
 /// impl User {
 ///     pub fn schema() -> Result<Schema, SchemaError> {
 ///         // ... generated schema construction code

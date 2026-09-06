@@ -185,6 +185,12 @@ pub struct ContainerSerdeAttrs {
 pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<ContainerSerdeAttrs> {
     let mut out = ContainerSerdeAttrs::default();
     for attr in attrs {
+        if attr.path().is_ident("field_type") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[field_type] must be applied to a field, not to the struct itself",
+            ));
+        }
         if !attr.path().is_ident("serde") {
             continue;
         }
@@ -195,6 +201,14 @@ pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<Container
 
         for meta in args {
             match &meta {
+                Meta::NameValue(value)
+                    if value.path.is_ident("tag") || value.path.is_ident("into") =>
+                {
+                    return Err(syn::Error::new_spanned(
+                        &meta,
+                        "this serde container option changes the serialized map shape and is not supported by AndaDB derives",
+                    ));
+                }
                 Meta::Path(path) if path.is_ident("transparent") => out.transparent = true,
                 Meta::NameValue(name_value) if name_value.path.is_ident("rename_all") => {
                     if let Expr::Lit(expr_lit) = &name_value.value
@@ -226,6 +240,26 @@ pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<Container
         }
     }
     Ok(out)
+}
+
+pub fn validate_unique_attrs(attrs: &[Attribute]) -> syn::Result<()> {
+    let mut seen = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("unique")) {
+        if seen {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "duplicate #[unique] attribute",
+            ));
+        }
+        if !matches!(attr.meta, Meta::Path(_)) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "unique must use the marker form #[unique]",
+            ));
+        }
+        seen = true;
+    }
+    Ok(())
 }
 
 /// Field-level serde options that affect schema generation.
@@ -514,6 +548,62 @@ pub fn resolve_field_type(
     }
 }
 
+/// Reject direct recursive fields before generating a constructor that could
+/// never produce a finite FieldType. Aliases and mutual recursion are caught
+/// by the fallible construction guard in anda_db_schema.
+pub fn reject_direct_recursion(field: &Field, owner: &syn::Ident) -> syn::Result<()> {
+    if field.attrs.iter().any(|a| a.path().is_ident("field_type")) {
+        return Ok(());
+    }
+    fn refers_to(ty: &Type, owner: &syn::Ident) -> bool {
+        match peel_type(ty) {
+            Type::Path(p) => {
+                (p.qself.is_none()
+                    && p.path.segments.len() == 1
+                    && p.path
+                        .segments
+                        .first()
+                        .is_some_and(|s| s.ident == *owner || s.ident == "Self"))
+                    || p.path.segments.iter().any(|s| match &s.arguments {
+                        PathArguments::AngleBracketed(args) => args.args.iter().any(|a| {
+                            matches!(
+                                s.ident.to_string().as_str(),
+                                "Option"
+                                    | "Box"
+                                    | "Arc"
+                                    | "Rc"
+                                    | "Cow"
+                                    | "Vec"
+                                    | "VecDeque"
+                                    | "LinkedList"
+                                    | "BinaryHeap"
+                                    | "HashSet"
+                                    | "BTreeSet"
+                                    | "HashMap"
+                                    | "BTreeMap"
+                                    | "Map"
+                            ) && matches!(a, GenericArgument::Type(t) if refers_to(t, owner))
+                        }),
+                        _ => false,
+                    })
+            }
+            Type::Reference(r) => refers_to(&r.elem, owner),
+            Type::Array(a) => refers_to(&a.elem, owner),
+            Type::Slice(s) => refers_to(&s.elem, owner),
+            Type::Tuple(t) => t.elems.iter().any(|t| refers_to(t, owner)),
+            _ => false,
+        }
+    }
+    if refers_to(&field.ty, owner) {
+        Err(syn::Error::new_spanned(
+            &field.ty,
+            "recursive fields cannot describe a finite FieldType; use an explicit non-recursive #[field_type = \"...\"] override",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Locate a `#[field_type = "..."]` attribute and parse its string payload
 /// into a `FieldType` token stream.
 ///
@@ -523,6 +613,17 @@ pub fn find_field_type_attr(
     attrs: &[Attribute],
     root: &TokenStream,
 ) -> syn::Result<Option<TokenStream>> {
+    let mut matching = attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("field_type"));
+    if matching.next().is_some()
+        && let Some(duplicate) = matching.next()
+    {
+        return Err(syn::Error::new_spanned(
+            duplicate,
+            "duplicate #[field_type = ...] attribute",
+        ));
+    }
     for attr in attrs {
         if attr.path().is_ident("field_type") {
             let meta_name_value = attr.meta.require_name_value().map_err(|_| {
@@ -581,7 +682,22 @@ pub fn parse_field_type_str(
     root: &TokenStream,
 ) -> syn::Result<TokenStream> {
     let normalized: String = type_str.chars().filter(|ch| !ch.is_whitespace()).collect();
-    match normalized.as_str() {
+    parse_normalized_field_type(&normalized, span, root, 0)
+}
+
+fn parse_normalized_field_type(
+    type_str: &str,
+    span: Span,
+    root: &TokenStream,
+    nesting: usize,
+) -> syn::Result<TokenStream> {
+    if nesting > 128 {
+        return Err(syn::Error::new(
+            span,
+            "field_type exceeds maximum nesting depth 128",
+        ));
+    }
+    match type_str {
         // Primitive types. The Rust spellings are accepted as synonyms so an
         // override can mirror the field's own type (`u64`, `String`, ...).
         "Bytes" => Ok(quote! { #root::FieldType::Bytes }),
@@ -596,7 +712,8 @@ pub fn parse_field_type_str(
 
         // Compound wrappers: Array<T>, Option<T>.
         s if s.starts_with("Array<") && s.ends_with('>') => {
-            let inner_type = parse_field_type_str(&s[6..s.len() - 1], span, root)?;
+            let inner_type =
+                parse_normalized_field_type(&s[6..s.len() - 1], span, root, nesting + 1)?;
             Ok(quote! { #root::FieldType::Array(::std::vec![#inner_type]) })
         }
         s if s.starts_with("Option<") && s.ends_with('>') => {
@@ -609,7 +726,7 @@ pub fn parse_field_type_str(
                     ),
                 ));
             }
-            let inner_type = parse_field_type_str(inner, span, root)?;
+            let inner_type = parse_normalized_field_type(inner, span, root, nesting)?;
             Ok(quote! { #root::FieldType::Option(::std::boxed::Box::new(#inner_type)) })
         }
 
@@ -658,7 +775,8 @@ pub fn parse_field_type_str(
                     ));
                 }
             };
-            let value_type = parse_field_type_str(&inner[idx + 1..], span, root)?;
+            let value_type =
+                parse_normalized_field_type(&inner[idx + 1..], span, root, nesting + 1)?;
             Ok(quote! {
                 #root::FieldType::Map(::std::collections::BTreeMap::from([(
                     #key_token,
@@ -874,7 +992,10 @@ pub fn determine_field_type(
                     // the `#[derive(...)]` attribute.
                     let span = ty.span();
                     Ok(quote_spanned! {span=>
-                        <#ty>::field_type()
+                        {
+                            use #root::__private::ResolveFieldType as _;
+                            #root::__private::TypeProbe::<#ty>::new().resolve(<#ty>::field_type)?
+                        }
                     })
                 }
             }
@@ -967,7 +1088,7 @@ fn unsupported_scalar_bf16(ty: &Type) -> syn::Result<TokenStream> {
         ty,
         "Standalone `bf16` is not supported as a field type. \
          Use `Vec<bf16>` (mapped to FieldType::Vector), \
-         or annotate with `#[field_type = \"F32\"]`.",
+         or combine `#[field_type = \"F32\"]` with `#[serde(serialize_with = \"bf16::serialize_as_f32\")]`.",
     ))
 }
 
@@ -983,7 +1104,7 @@ pub fn is_u8_type(ty: &Type) -> bool {
 
 /// Returns `true` if `ty` is `String` or `str`.
 pub fn is_string_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = peel_type(ty)
+    if let Type::Path(type_path) = peel_key_type(ty)
         && let Some(segment) = type_path.path.segments.last()
     {
         return segment.ident == "String" || segment.ident == "str";
@@ -994,7 +1115,7 @@ pub fn is_string_type(ty: &Type) -> bool {
 /// Returns `true` if `ty` is one of the signed integer types represented as
 /// `FieldType::I64`.
 pub fn is_signed_integer_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = peel_type(ty)
+    if let Type::Path(type_path) = peel_key_type(ty)
         && let Some(segment) = type_path.path.segments.last()
     {
         return matches!(
@@ -1014,7 +1135,10 @@ pub fn is_signed_integer_type(ty: &Type) -> bool {
 /// byte-string specialization for them); the schema side coerces that shape
 /// into `Bytes` for values and map keys alike.
 pub fn is_bytes_type(ty: &Type) -> bool {
-    let ty = peel_type(ty);
+    let ty = peel_key_type(ty);
+    if let Type::Slice(slice) = ty {
+        return is_u8_type(&slice.elem);
+    }
     if let Type::Array(array) = ty {
         return is_u8_type(&array.elem);
     }
@@ -1037,6 +1161,31 @@ pub fn is_bytes_type(ty: &Type) -> bool {
             || segment.ident == "ByteArrayB64";
     }
     false
+}
+
+/// Map-key serializers are transparent through the same wrappers as values.
+fn peel_key_type(mut ty: &Type) -> &Type {
+    loop {
+        ty = peel_type(ty);
+        match ty {
+            Type::Reference(r) => ty = &r.elem,
+            Type::Path(p) => {
+                let Some(segment) = p.path.segments.last() else {
+                    return ty;
+                };
+                if matches!(
+                    segment.ident.to_string().as_str(),
+                    "Box" | "Arc" | "Rc" | "Cow"
+                ) && let Some(inner) = first_type_argument(segment)
+                {
+                    ty = inner;
+                } else {
+                    return ty;
+                }
+            }
+            _ => return ty,
+        }
+    }
 }
 
 /// Returns `true` if `ty` is `bf16` (the `half::bf16` short name).
@@ -1416,6 +1565,22 @@ mod tests {
     }
 
     #[test]
+    fn dsl_depth_matches_runtime_declarations_through_options() {
+        let mut declaration = anda_db_schema::Ft::Text;
+        for _ in 0..128 {
+            declaration =
+                anda_db_schema::Ft::Array(vec![anda_db_schema::Ft::Option(Box::new(declaration))]);
+        }
+        declaration.validate_declaration().unwrap();
+        let legal = format!("{}Text{}", "Array<Option<".repeat(128), ">>".repeat(128));
+        assert!(
+            parse_ft(&legal).is_ok(),
+            "Option wrapping is not a container level"
+        );
+        assert!(parse_ft(&format!("Array<{legal}>")).is_err());
+    }
+
+    #[test]
     fn determine_field_type_covers_paths_collections_maps_and_errors() {
         let ty: Type = parse_quote!(serde_json::Value);
         assert_eq!(
@@ -1511,13 +1676,12 @@ mod tests {
         );
 
         let ty: Type = parse_quote!(CustomType);
-        assert_eq!(tokens(dft(&ty).unwrap()), "< CustomType > :: field_type ()");
+        assert!(tokens(dft(&ty).unwrap()).contains("resolve (< CustomType > :: field_type) ?"));
 
         // Generic user-defined types stay valid in expression position.
         let ty: Type = parse_quote!(Wrapper<Inner>);
-        assert_eq!(
-            tokens(dft(&ty).unwrap()),
-            "< Wrapper < Inner > > :: field_type ()"
+        assert!(
+            tokens(dft(&ty).unwrap()).contains("resolve (< Wrapper < Inner > > :: field_type) ?")
         );
 
         let ty: Type = parse_quote!(half::bf16);
@@ -1567,17 +1731,17 @@ mod tests {
         // through Wrapper's own generated impl.
         let params = TypeParams::from_generics(&parse_quote!(<T>));
         let ty: Type = parse_quote!(Wrapper<T>);
-        assert_eq!(
-            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
-            "< Wrapper < T > > :: field_type ()"
+        assert!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap())
+                .contains("resolve (< Wrapper < T > > :: field_type) ?")
         );
 
         // A type merely sharing the parameter's name via a path is not a
         // parameter.
         let ty: Type = parse_quote!(module::T);
-        assert_eq!(
-            tokens(determine_field_type(&ty, &root(), &params).unwrap()),
-            "< module :: T > :: field_type ()"
+        assert!(
+            tokens(determine_field_type(&ty, &root(), &params).unwrap())
+                .contains("resolve (< module :: T > :: field_type) ?")
         );
     }
 

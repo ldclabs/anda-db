@@ -1,0 +1,17 @@
+error: duplicate #[field_type = ...] attribute
+ --> tests/ui/fail_duplicate_and_invalid_helpers.rs:6:5
+  |
+6 |     #[field_type = "Bytes"]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unique must use the marker form #[unique]
+  --> tests/ui/fail_duplicate_and_invalid_helpers.rs:13:5
+   |
+13 |     #[unique = false]
+   |     ^^^^^^^^^^^^^^^^^
+
+error: duplicate #[unique] attribute
+  --> tests/ui/fail_duplicate_and_invalid_helpers.rs:21:5
+   |
+21 |     #[unique]
+   |     ^^^^^^^^^

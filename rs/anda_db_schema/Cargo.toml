@@ -21,9 +21,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 cbor2 = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 serde_bytes = { workspace = true }
 
 [lib]
-doctest = false
+doctest = true
+
+[[bench]]
+name = "values"
+harness = false

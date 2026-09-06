@@ -55,6 +55,15 @@ mod resource;
 mod schema;
 mod value_serde;
 
+// Public only because proc-macro expansions run in downstream crates.
+#[doc(hidden)]
+#[path = "type_construction.rs"]
+pub mod __private;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
+
 pub use anda_db_derive::{AndaDBSchema, FieldTyped};
 
 pub use document::*;

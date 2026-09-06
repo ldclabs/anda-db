@@ -1,0 +1,5 @@
+error: #[cbor(key = ...)] is not supported on top-level document fields: AndaDB documents are stored with text field names. Integer CBOR keys are only supported in nested structs deriving FieldTyped
+ --> tests/ui/fail_cbor_key_on_id.rs:6:5
+  |
+6 |     _id: u64,
+  |     ^^^

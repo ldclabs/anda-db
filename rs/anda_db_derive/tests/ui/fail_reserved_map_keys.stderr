@@ -1,0 +1,11 @@
+error: "*" is reserved for wildcard maps and cannot name a fixed struct field
+ --> tests/ui/fail_reserved_map_keys.rs:6:5
+  |
+6 |     value: String,
+  |     ^^^^^
+
+error: i64::MIN is reserved for wildcard maps and cannot name a fixed struct field
+  --> tests/ui/fail_reserved_map_keys.rs:12:5
+   |
+12 |     value: u64,
+   |     ^^^^^

@@ -37,6 +37,40 @@ use std::collections::BTreeMap;
 
 use crate::{FieldKey, FieldValue, Json};
 
+/// Deserialize maps without losing entries to duplicate (possibly decoded)
+/// keys. Shared by values, document indexes and type/history metadata.
+pub(crate) fn unique_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: de::Deserializer<'de>,
+    K: de::Deserialize<'de> + Ord,
+    V: de::Deserialize<'de>,
+{
+    struct UniqueMap<K, V>(std::marker::PhantomData<(K, V)>);
+    impl<'de, K: de::Deserialize<'de> + Ord, V: de::Deserialize<'de>> de::Visitor<'de>
+        for UniqueMap<K, V>
+    {
+        type Value = BTreeMap<K, V>;
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("a map with unique keys")
+        }
+        fn visit_map<A: de::MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some(key) = access.next_key()? {
+                match map.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(access.next_value()?);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(de::Error::custom("duplicate map key"));
+                    }
+                }
+            }
+            Ok(map)
+        }
+    }
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
+}
+
 /// Human-readable encoding of a [`FieldKey::I64`] map key.
 const I64_KEY_PREFIX: &str = "i64:";
 /// Human-readable encoding of [`FieldValue::Bytes`] / [`FieldKey::Bytes`].
@@ -161,11 +195,21 @@ impl Serialize for FieldValue {
                 if x.is_nan() {
                     return Err(serde::ser::Error::custom("cannot serialize NaN F64"));
                 }
+                if serializer.is_human_readable() && x.is_infinite() {
+                    return Err(serde::ser::Error::custom(
+                        "cannot serialize infinite F64 in a human-readable format",
+                    ));
+                }
                 serializer.serialize_f64(*x)
             }
             FieldValue::F32(x) => {
                 if x.is_nan() {
                     return Err(serde::ser::Error::custom("cannot serialize NaN F32"));
+                }
+                if serializer.is_human_readable() && x.is_infinite() {
+                    return Err(serde::ser::Error::custom(
+                        "cannot serialize infinite F32 in a human-readable format",
+                    ));
                 }
                 serializer.serialize_f32(*x)
             }
@@ -336,8 +380,7 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
 
     #[inline]
     fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut seq: Vec<u8> =
-            Vec::with_capacity(acc.size_hint().filter(|&l| l < 1024).unwrap_or(0));
+        let mut seq: Vec<u8> = Vec::with_capacity(acc.size_hint().unwrap_or(0).min(1024));
 
         while let Some(elem) = acc.next_element()? {
             seq.push(elem);
@@ -494,8 +537,7 @@ impl<'de> de::Visitor<'de> for Visitor {
 
     #[inline]
     fn visit_seq<A: de::SeqAccess<'de>>(self, mut acc: A) -> Result<Self::Value, A::Error> {
-        let mut seq: Vec<FieldValue> =
-            Vec::with_capacity(acc.size_hint().filter(|&l| l < 1024).unwrap_or(0));
+        let mut seq: Vec<FieldValue> = Vec::with_capacity(acc.size_hint().unwrap_or(0).min(1024));
 
         while let Some(elem) = acc.next_element()? {
             seq.push(elem);

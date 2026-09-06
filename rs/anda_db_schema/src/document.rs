@@ -43,7 +43,7 @@ pub struct Document {
 pub struct DocumentOwned {
     /// Field values indexed by their stable schema-assigned `idx`.
     /// The `_id` field (`idx == 0`) is required.
-    #[serde(rename = "f")]
+    #[serde(rename = "f", deserialize_with = "crate::value_serde::unique_map")]
     pub fields: IndexedFieldValues,
 }
 
@@ -108,8 +108,7 @@ impl Document {
     /// * `Result<Self, SchemaError>` - The validated Document or an error
     pub fn try_from_doc(schema: Arc<Schema>, mut doc: DocumentOwned) -> Result<Self, SchemaError> {
         Self::drop_retired_fields(&schema, &mut doc.fields)?;
-        Self::normalize_fields(&schema, &mut doc.fields);
-        schema.validate(&doc.fields)?;
+        Self::normalize_fields(&schema, &mut doc.fields)?;
 
         Ok(Self {
             fields: doc.fields,
@@ -155,13 +154,28 @@ impl Document {
     /// [`FieldType::prune_undeclared`](crate::FieldType::prune_undeclared) —
     /// and read-back value shapes are folded into the schema's canonical
     /// variants. See [`Document::try_from_doc`].
-    fn normalize_fields(schema: &Schema, fields: &mut IndexedFieldValues) {
+    fn normalize_fields(
+        schema: &Schema,
+        fields: &mut IndexedFieldValues,
+    ) -> Result<(), SchemaError> {
         for field in schema.iter() {
             if let Some(value) = fields.get_mut(&field.idx()) {
-                field.r#type().prune_undeclared(value);
-                field.r#type().normalize(value);
+                *value = field
+                    .prepare_read(std::mem::replace(value, Fv::Null))
+                    .map_err(|err| {
+                        SchemaError::FieldValue(format!(
+                            "field {:?} is invalid, error: {err}",
+                            field.name()
+                        ))
+                    })?;
+            } else if field.required() {
+                return Err(SchemaError::Validation(format!(
+                    "field {:?} is required",
+                    field.name()
+                )));
             }
         }
+        Ok(())
     }
 
     /// Creates a Document by serializing and validating a value against the schema.
@@ -471,8 +485,7 @@ impl Document {
     /// * `Result<(), SchemaError>` - Success or an error
     pub fn set_doc(&mut self, mut doc: DocumentOwned) -> Result<(), SchemaError> {
         Self::drop_retired_fields(&self.schema, &mut doc.fields)?;
-        Self::normalize_fields(&self.schema, &mut doc.fields);
-        self.schema.validate(&doc.fields)?;
+        Self::normalize_fields(&self.schema, &mut doc.fields)?;
         self.fields = doc.fields;
 
         Ok(())

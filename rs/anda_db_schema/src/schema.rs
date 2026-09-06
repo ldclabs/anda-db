@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{FieldEntry, FieldType, IndexedFieldValues, Resource, SchemaError};
 
+mod history;
+pub use history::SchemaHistoryRecovery;
+use history::UpgradeHistory;
+
 /// Document schema definition for Anda DB.
 ///
 /// A `Schema` describes:
@@ -29,7 +33,7 @@ use crate::{FieldEntry, FieldType, IndexedFieldValues, Resource, SchemaError};
 /// schemas coming from untrusted storage.
 ///
 /// Equality compares the *declaration* — the fields (name, type,
-/// uniqueness, idx) and the version — but not the allocation watermark,
+/// uniqueness, idx) and the version — but not allocation or nested-key history,
 /// which is bookkeeping about the lineage's history rather than part of
 /// what the schema declares.
 #[derive(Debug, Clone)]
@@ -63,6 +67,8 @@ pub struct Schema {
     /// status is sticky: it survives [`Schema::upgrade_with`] and
     /// re-serialization. See [`Schema::has_allocation_watermark`].
     legacy_lineage: bool,
+    /// Nested-key tombstones; old encodings default to incomplete history.
+    history: UpgradeHistory,
 }
 
 impl PartialEq for Schema {
@@ -122,6 +128,8 @@ impl Schema {
     /// - If a field that exists in both schemas changed to an incompatible type.
     /// - If a field that exists only in the new schema is required.
     /// - If assigning indexes to new fields would exceed `u16::MAX`.
+    /// - If history is incomplete when adding fields/keys, or a nested key
+    ///   was previously retired. Use [`Self::history_recovery`] for old data.
     ///
     /// On error `self` is left unchanged.
     pub fn upgrade_with(&mut self, old: &Schema) -> Result<(), SchemaError> {
@@ -138,6 +146,7 @@ impl Schema {
         // only validates, so that `self` stays untouched when any field is
         // rejected.
         let mut next_idx = old.allocated_idx_end();
+        let mut history = old.history.clone();
         for (name, field) in self.fields.iter() {
             if let Some(old_field) = old.fields.get(name) {
                 // Field exists in both: the type may only change in ways that
@@ -163,7 +172,11 @@ impl Schema {
                         field.unique()
                     )));
                 }
+                history.upgrade(old_field.idx(), field.r#type(), old_field.r#type())?;
             } else {
+                if !old.has_allocation_watermark() {
+                    return Err(SchemaError::Schema("field allocation history is unknown; recover schema history from all stored documents before adding fields".into()));
+                }
                 if field.required() {
                     return Err(SchemaError::Schema(format!(
                         "new field {name:?} must be optional when upgrading schema"
@@ -204,6 +217,8 @@ impl Schema {
         self.idx = self.fields.values().map(|f| f.idx()).collect();
         self.next_idx = next_idx;
         self.legacy_lineage = old.legacy_lineage;
+        history.retired.retain(|idx, _| self.idx.contains(idx));
+        self.history = history;
         Ok(())
     }
 
@@ -268,9 +283,23 @@ impl Schema {
     /// legacy: [`Schema::allocated_idx_end`] still advances monotonically
     /// for such a lineage, so a removed field's index is never handed to a
     /// new field. The status is sticky: it survives
-    /// [`Schema::upgrade_with`] and re-serialization.
+    /// [`Schema::upgrade_with`] and re-serialization. A complete explicit
+    /// [`SchemaHistoryRecovery`] scan ends legacy leniency and establishes a
+    /// reliable watermark before any new allocation is allowed.
     pub fn has_allocation_watermark(&self) -> bool {
         !self.legacy_lineage
+    }
+
+    /// Whether allocation and nested-key history are complete. An old schema
+    /// remains readable, but additions need a full scan when this is false.
+    pub fn has_upgrade_history(&self) -> bool {
+        self.has_allocation_watermark() && self.history.complete
+    }
+
+    /// Starts recovery from raw stored documents; see [`SchemaHistoryRecovery`]
+    /// for the full-scan and writer-exclusion requirements.
+    pub fn history_recovery(&self) -> SchemaHistoryRecovery {
+        SchemaHistoryRecovery::new(self)
     }
 
     /// Gets a field by name.
@@ -352,6 +381,7 @@ struct SchemaRef<'a> {
     /// created by this version is byte-identical to before the flag existed.
     #[serde(skip_serializing_if = "core::ops::Not::not")]
     legacy: bool,
+    history: &'a UpgradeHistory,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -370,6 +400,8 @@ struct SchemaOwned {
     /// the `0` briefly written for a legacy lineage) says the same thing.
     #[serde(default)]
     legacy: bool,
+    #[serde(default)]
+    history: UpgradeHistory,
 }
 
 impl Serialize for Schema {
@@ -386,6 +418,7 @@ impl Serialize for Schema {
             // the round trip (see `Schema::has_allocation_watermark`).
             next_idx: self.allocated_idx_end(),
             legacy: self.legacy_lineage,
+            history: &self.history,
         };
         val.serialize(serializer)
     }
@@ -397,6 +430,12 @@ impl<'de> Deserialize<'de> for Schema {
         D: serde::Deserializer<'de>,
     {
         let val = SchemaOwned::deserialize(deserializer)?;
+        if val.next_idx > usize::from(u16::MAX) + 1 {
+            return Err(serde::de::Error::custom(
+                "schema allocation watermark exceeds u16::MAX + 1",
+            ));
+        }
+        val.history.validate().map_err(serde::de::Error::custom)?;
 
         // Validate invariants here because `FieldEntry` derives `Deserialize` and would
         // otherwise allow invalid names / malformed types / duplicate indexes.
@@ -476,6 +515,7 @@ impl<'de> Deserialize<'de> for Schema {
             // the `0` a previous build wrote for such a lineage) is legacy;
             // once flagged, the flag itself carries the status forward.
             legacy_lineage: val.legacy || val.next_idx == 0,
+            history: val.history,
         })
     }
 }
@@ -561,6 +601,8 @@ impl SchemaBuilder {
     /// - A field with the same name already exists
     /// - The maximum number of fields has been reached
     pub fn add_field(&mut self, entry: FieldEntry) -> Result<&mut Self, SchemaError> {
+        crate::validate_field_name(entry.name())?;
+        entry.r#type().validate_declaration()?;
         if self.fields.contains_key(entry.name()) {
             return Err(SchemaError::Schema(format!(
                 "Field {:?} already exists in schema",
@@ -596,6 +638,7 @@ impl SchemaBuilder {
             fields: self.fields,
             version: self.version,
             legacy_lineage: false,
+            history: UpgradeHistory::known(),
         })
     }
 }
@@ -1221,14 +1264,17 @@ mod tests {
         let again: Schema = serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
         assert!(!again.has_allocation_watermark());
 
-        // So does upgrading it; allocation continues from `max(idx) + 1`.
+        // New allocations require a complete history scan. This fixture has
+        // no documents; an empty scan therefore establishes its watermark.
         let mut next = Schema::builder();
         next.add_field(Fe::new("a".into(), opt()).unwrap()).unwrap();
         next.add_field(Fe::new("c".into(), opt()).unwrap()).unwrap();
         next.with_version(1);
         let mut next = next.build().unwrap();
-        next.upgrade_with(&legacy).unwrap();
-        assert!(!next.has_allocation_watermark());
+        assert!(next.upgrade_with(&legacy).is_err());
+        next.upgrade_with(&legacy.history_recovery().finish())
+            .unwrap();
+        assert!(next.has_allocation_watermark());
         assert_eq!(next.get_field("c").unwrap().idx(), 3);
         assert_eq!(next.allocated_idx_end(), 4);
 
@@ -1253,7 +1299,8 @@ mod tests {
         let build = |names: &[&str], version: u64| {
             let mut b = Schema::builder();
             for name in names {
-                b.add_field(Fe::new((*name).into(), opt()).unwrap()).unwrap();
+                b.add_field(Fe::new((*name).into(), opt()).unwrap())
+                    .unwrap();
             }
             b.with_version(version);
             b.build().unwrap()
@@ -1279,9 +1326,10 @@ mod tests {
 
         // v2 adds a field: it gets a fresh index, not `c`'s.
         let mut v2 = build(&["a", "b", "d"], 2);
-        v2.upgrade_with(&v1).unwrap();
+        assert!(v2.upgrade_with(&v1).is_err());
+        v2.upgrade_with(&v1.history_recovery().finish()).unwrap();
         assert_eq!(v2.get_field("d").unwrap().idx(), 4);
-        assert!(!reload(&v2).has_allocation_watermark());
+        assert!(reload(&v2).has_allocation_watermark());
     }
 
     #[test]
@@ -1357,4 +1405,3 @@ mod tests {
         assert!(err.to_string().contains("wildcard"), "{err}");
     }
 }
-

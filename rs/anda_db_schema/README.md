@@ -30,12 +30,50 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_schema = "0.9"
+anda_db_schema = "0.11"
 serde = { version = "1", features = ["derive"] }
 ```
 
 This crate is commonly paired with `anda_db_derive` when you want schemas to be
 generated automatically from Rust structs.
+
+A typed document round trip:
+
+```rust
+use anda_db_schema::{AndaDBSchema, Document, Vector, vector_from_f32};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, AndaDBSchema)]
+struct Note {
+    _id: u64,
+    body: String,
+    embedding: Vector,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Note::schema()?);
+    let note = Note {
+        _id: 1,
+        body: "A persistent memory".into(),
+        embedding: vector_from_f32(vec![0.25, 0.5]),
+    };
+    let doc = Document::try_from(schema, &note)?;
+    let restored: Note = doc.try_into()?;
+    assert_eq!(restored, note);
+    Ok(())
+}
+```
+
+Schema upgrades preserve field indexes and nested-key deletion history.
+An older schema with incomplete history needs a full scan of raw documents
+and pending recovery images before new fields can be allocated. The core
+AndaDB collection performs this scan automatically during upgrade; custom
+storage integrations use `Schema::history_recovery()`.
+
+JSON serialization rejects non-finite `F32`/`F64` values instead of silently
+writing null. Binary CBOR still represents infinities. Text/bytes are
+separated using explicit `txt:`/`b64:` prefixes in human-readable formats.
 
 ## Technical Reference
 

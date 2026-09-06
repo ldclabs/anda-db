@@ -1,0 +1,17 @@
+error: this serde container option changes the serialized map shape and is not supported by AndaDB derives
+ --> tests/ui/fail_container_shape.rs:4:9
+  |
+4 | #[serde(tag = "kind")]
+  |         ^^^^^^^^^^^^
+
+error: this serde container option changes the serialized map shape and is not supported by AndaDB derives
+  --> tests/ui/fail_container_shape.rs:10:9
+   |
+10 | #[serde(into = "String")]
+   |         ^^^^^^^^^^^^^^^
+
+error: #[field_type] must be applied to a field, not to the struct itself
+  --> tests/ui/fail_container_shape.rs:16:1
+   |
+16 | #[field_type = "Json"]
+   | ^^^^^^^^^^^^^^^^^^^^^^

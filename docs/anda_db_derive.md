@@ -1,7 +1,7 @@
 # `anda_db_derive` Technical Documentation
 
-**Crate version**: 0.5
-**Last updated**: 2026-06-11
+**Crate version**: 0.11
+**Last updated**: 2026-09-06
 
 ---
 
@@ -28,7 +28,7 @@ through `anda_db_schema`:
 
 | Macro          | Generated method                                 |
 | -------------- | ------------------------------------------------ |
-| `FieldTyped`   | `pub fn field_type() -> FieldType`               |
+| `FieldTyped`   | `field_type() -> FieldType` and `try_field_type() -> Result<FieldType, SchemaError>`               |
 | `AndaDBSchema` | `pub fn schema() -> Result<Schema, SchemaError>` |
 
 Both macros operate on structs with named fields. Tuple structs, unit
@@ -49,9 +49,10 @@ rs/anda_db_derive/
 
 ### 1.3 Required scope
 
-Generated code references `FieldType`, `FieldKey`, `FieldEntry`, `Schema` and
-`SchemaError` by bare name. The recommended pattern is to import them via the
-`anda_db_schema` prelude (or a glob import) at the call site.
+Generated code resolves schema items through the direct `anda_db_schema`
+dependency (including renamed dependencies), or through `anda_db::schema` when
+using the umbrella crate. Users do not need to import `Schema`, `FieldType`,
+`FieldEntry` or `FieldKey` for the generated code.
 
 ---
 
@@ -60,7 +61,7 @@ Generated code references `FieldType`, `FieldKey`, `FieldEntry`, `Schema` and
 ### 2.1 `FieldTyped`
 
 ```rust
-#[proc_macro_derive(FieldTyped, attributes(field_type, cbor))]
+#[proc_macro_derive(FieldTyped, attributes(field_type, cbor, serde))]
 ```
 
 For each named field, the macro emits one `(key, FieldType)` tuple and packs
@@ -78,31 +79,18 @@ struct User {
     age: u32,
 }
 
-// Expanded:
-impl User {
-    pub fn field_type() -> FieldType {
-        FieldType::Map(
-            vec![
-                ("id".into(),   FieldType::U64),
-                ("name".into(), FieldType::Text),
-                ("age".into(),  FieldType::U64),
-            ]
-            .into_iter()
-            .collect(),
-        )
-    }
-}
+assert!(User::try_field_type().is_ok());
 ```
 
 ### 2.2 `AndaDBSchema`
 
 ```rust
-#[proc_macro_derive(AndaDBSchema, attributes(field_type, unique))]
+#[proc_macro_derive(AndaDBSchema, attributes(field_type, unique, cbor, serde))]
 ```
 
 Builds a complete `Schema` via `Schema::builder()`. Declaring the `_id: u64`
-field is **optional** — the builder injects the primary-key column either
-way. When declared, the macro validates at compile time that it is `u64` and
+field is **required** — the builder injects its metadata, while the struct
+must serialize it. The macro validates at compile time that it is `u64` and
 that serde keeps serializing it as `"_id"` (beware `rename_all` rules), and
 skips it during code generation.
 
@@ -214,8 +202,10 @@ type and produce a `FieldType` token stream.
 | `Json`, `serde_json::Value` | `Json`      |
 
 > Bare `bf16` (or `half::bf16`) is **not** a valid field type. Wrap it in
-> a `Vec` to obtain `Vector`, or annotate the field with `#[field_type =
-> "F32"]` if a scalar is desired.
+> a `Vec` to obtain `Vector`. A scalar override requires both
+> `#[field_type = "F32"]` and
+> `#[serde(serialize_with = "bf16::serialize_as_f32")]`, because the default
+> bf16 serializer writes integer bit patterns rather than a float.
 
 ### 4.4 Collections
 
@@ -248,7 +238,7 @@ values.
 | `Option<Option<T>>`                        | **compile error** — serde serializes `Some(None)` and `None` identically |
 | `u128` / `i128`                            | **compile error** — AndaDB integers are 64-bit       |
 | `Box<T>` / `Arc<T>` / `Rc<T>` / `Cow<'_, T>` | the inner `T` (serde serializes these transparently) |
-| Any other path `Foo` (incl. `Foo<G>`)      | `<Foo>::field_type()` — **must** derive `FieldTyped` |
+| Any other path `Foo` (incl. `Foo<G>`)      | fallible construction for derived types; legacy `field_type()` methods remain supported |
 
 Selected fully qualified paths are recognised explicitly even if the leading
 segment is not the type name:
@@ -266,8 +256,7 @@ structs infer the same way as hand-written ones.
 ## 5. The `field_type` DSL
 
 The string passed to `#[field_type = "..."]` is parsed by
-`parse_field_type_str` and accepts the grammar below (whitespace anywhere
-is ignored):
+`parse_field_type_str` and accepts the grammar below (whitespace is normalized once before recursive parsing; nesting is bounded):
 
 ```text
 type        := primitive | array | option | map
@@ -430,6 +419,20 @@ struct Transaction {
 
 ---
 
+Direct recursive fields through known containers (for example
+`Option<Box<Self>>`) are rejected at compile time unless explicitly overridden.
+Indirect recursion and type aliases are detected by `try_field_type()`, which
+returns a `SchemaError`; `schema()` propagates that error for derived nested
+types. The infallible `field_type()` wrapper panics on an invalid declaration.
+A generic user-defined wrapper may intentionally hide its parameter from the
+serialized shape, so that case is handled by the runtime construction guard.
+
+`"*"` and `i64::MIN` cannot name fixed struct fields. Container serde `tag` and
+`into`, container-level `field_type`, duplicate `field_type`/`unique`, and
+non-marker forms of `unique` are rejected. Integer CBOR keys are rejected on
+all top-level fields, including `_id`. Borrowed and transparently wrapped map
+keys are inferred through their serialized key types.
+
 ## 7. Internal Implementation
 
 ### 7.1 `common.rs`
@@ -491,7 +494,8 @@ Pipeline executed by `anda_db_schema_derive`:
 Same parse / validation prelude as `schema.rs` (minus the AndaDB naming
 restrictions — nested map keys are free-form). For each serialized field the
 macro produces a `(key, <field_type>)` tuple and collects them into a single
-`FieldType::Map`. The key is normally the serde serialized field name; when a
+`FieldType::Map`. The generated fallible constructor uses a per-thread type-construction guard
+and validates the finished declaration. The key is normally the serde serialized field name; when a
 field has `#[cbor(key = N)]`, the generated key is `FieldKey::from(N)` so the
 schema mirrors CBOR integer-keyed maps.
 
@@ -573,4 +577,4 @@ with:
 
 ---
 
-*Document updated: 2026-06-11*
+*Document updated: 2026-09-06*

@@ -6,7 +6,7 @@
 |                 |                                                                                          |
 | :-------------- | :--------------------------------------------------------------------------------------- |
 | Crate           | [`anda_db_schema`](../rs/anda_db_schema/)                                                |
-| Version         | `0.4.x`                                                                                  |
+| Version         | `0.11.x`                                                                                  |
 | Companion crate | [`anda_db_derive`](../rs/anda_db_derive/) (re-exported as `AndaDBSchema` / `FieldTyped`) |
 
 ---
@@ -79,7 +79,16 @@ Schema ────────────────────────�
 rs/anda_db_schema/src/
 ├── lib.rs          # crate-level docs, re-exports, validate_field_name
 ├── error.rs        # SchemaError, BoxError
-├── field.rs        # FieldType, FieldKey, FieldValue, FieldEntry
+├── field.rs        # stable public facade and aliases
+├── field/
+│   ├── field_type.rs # declarations, typed preparation and compatibility
+│   ├── key.rs        # FieldKey and wildcard maps
+│   ├── value.rs      # FieldValue and CBOR/JSON conversions
+│   ├── entry.rs      # FieldEntry
+│   ├── budget.rs     # structural complexity checks
+│   └── tests.rs      # field-level regressions
+├── schema/history.rs # nested-key tombstones and legacy-history recovery
+├── type_construction.rs # fallible derive construction guard
 ├── schema.rs       # Schema, SchemaBuilder
 ├── document.rs     # Document, DocumentOwned
 ├── resource.rs     # Resource (predefined schema)
@@ -140,7 +149,11 @@ shape:
 #### `Map`
 
 `FieldType::Map` is keyed by `FieldKey` (text, signed `i64`, or bytes). It
-supports two shapes:
+supports three shapes:
+
+- **Open map** — an empty declaration accepts arbitrary map entries. It
+  cannot change to or from a fixed-key declaration by a metadata-only upgrade.
+  An empty `FieldTyped` struct uses this open representation as well.
 
 - **Wildcard map** — exactly one entry whose key is the wildcard
   (`"*"` for text, `i64::MIN` for integer keys, `b"*"` for bytes; see
@@ -170,7 +183,8 @@ Ft::Map([
 
 `FieldType::Option(Box<Ft>)` is the only way to declare a nullable field.
 A field whose type is *not* `Option` is treated as required by both
-`Schema::validate` and `FieldEntry::validate`.
+`Schema::validate` and `FieldEntry::validate`. A required `Json` field may
+contain a JSON null payload, but its key must still be present.
 
 ### 2.4 `FieldKey`
 
@@ -215,7 +229,7 @@ crate (assigned `idx = 0` and `unique`).
 | Method                   | Purpose                                              |
 | :----------------------- | :--------------------------------------------------- |
 | `FieldType::allows_null` | Returns `true` for `Option(_)` only.                 |
-| `FieldType::validate_declaration` | Checks that `self` is a well-formed declaration: no `Option<Option<T>>`, no wildcard key mixed with other keys, bounded nesting. Run by `FieldEntry::new` and `Schema` deserialization. |
+| `FieldType::validate_declaration` | Checks that `self` is a well-formed declaration: no `Option<Option<T>>`, no wildcard key mixed with other keys, bounded nesting. Run by `FieldEntry::new`, `SchemaBuilder::add_field` and `Schema` deserialization. |
 | `FieldType::extract`     | CBOR → `FieldValue`, requiring CBOR to match `self`. |
 | `FieldType::validate`    | Checks an existing `FieldValue` against `self`, accepting the read-back shapes listed in §3.3. |
 | `FieldType::normalize`   | Folds read-back shapes into the canonical variant.   |
@@ -386,11 +400,14 @@ optional `validate` step, and `FieldEntry::validate` enforces:
 
 `FieldEntry::coerce(value)` is the entry point for a `FieldValue` that did
 not arrive as CBOR (a JSON API payload, say): it runs the value through the
-same CBOR coercion `Document::try_from` applies — a `Bytes` field accepts an
+same coercion rules `Document::try_from` applies — a `Bytes` field accepts an
 array of `0..=255`, a float field an integer, an `I64` field a non-negative
 `U64`, a `Vector` field an array of bf16 bit patterns — and then enforces the
 complexity budget. `Document::set_field` goes through it, so creating and
-updating a document accept the same shapes.
+updating a document accept the same shapes. Canonical values retain their
+buffers; typed containers are traversed directly, and read materialization
+combines pruning, normalization and type checking before a single complexity
+check per field.
 
 ---
 
@@ -403,6 +420,7 @@ pub struct Schema {
     idx:     BTreeSet<usize>,
     fields:  BTreeMap<String, FieldEntry>,
     version: u64,
+    // Private allocation watermark, legacy flag and nested-key history.
 }
 ```
 
@@ -416,12 +434,12 @@ Invariants enforced both by `SchemaBuilder` and by deserialization:
 ### 5.2 `SchemaBuilder`
 
 ```rust
-let schema = Schema::builder()
-    .with_version(1)                                     // optional
-    .add_field(FieldEntry::new("title".into(), Ft::Text)?)?
-    .add_field(FieldEntry::new("views".into(), Ft::U64)?)?
-    .with_resource("thumbnail", /* required = */ false)? // optional helper
-    .build()?;
+let mut builder = Schema::builder();
+builder.with_version(1);
+builder.add_field(FieldEntry::new("title".into(), Ft::Text)?)?;
+builder.add_field(FieldEntry::new("views".into(), Ft::U64)?)?;
+builder.with_resource("thumbnail", false)?;
+let schema = builder.build()?;
 ```
 
 `add_field` assigns an `idx` automatically (`1`, `2`, … in insertion
@@ -470,18 +488,34 @@ be read after the upgrade. On read, values stored under a removed field's
 index are dropped; an index at or above the watermark marks foreign or
 corrupt data and is rejected.
 
-Schemas persisted before the watermark existed (0.10 and earlier: no
-`next_idx` on disk) form a **legacy lineage**:
-`Schema::has_allocation_watermark()` is `false`, every undeclared index is
-dropped on read instead of being rejected, and the status is kept across
-`upgrade_with` and re-serialization, because the lineage's history of
-removed indexes cannot be reconstructed.
+Nested field deletions are recorded as tombstones in schema metadata, including
+inside arrays, optional values and wildcard map values. A later version cannot
+reuse a deleted path without a data migration. `is_compatible_upgrade_of` is a
+structural check; `Schema::upgrade_with` additionally checks this history.
 
-Only the *leniency* is legacy. `Schema::allocated_idx_end()` still advances
-monotonically for such a lineage and is written back on every save, so rule
-3 above holds there too: removing a lineage's highest field never lets a
-later upgrade hand that index to a new field, which would read the removed
-field's stale bytes as the new field's value.
+Schemas persisted without `next_idx` or nested history remain readable.
+However, an unknown allocation watermark cannot authorize new top-level
+indexes, and incomplete nested history cannot authorize new nested keys.
+The core collection scans **all raw stored documents**, including unregistered
+objects and both images in pending mutation intents, before upgrading such a
+schema. Scan failures leave metadata unchanged. The recovered watermark and
+history are saved with the upgraded schema, so subsequent upgrades do not need
+to repeat that scan.
+
+Custom storage integrations use a recovery accumulator while excluding writers:
+
+```rust
+let mut recovery = old_schema.history_recovery();
+for raw_document in all_raw_documents_and_recovery_images {
+    recovery.observe(&raw_document)?;
+}
+let recovered = recovery.finish(); // certifies that the scan is complete
+new_schema.upgrade_with(&recovered)?;
+```
+
+Never feed already-pruned values or only an index-selected subset into recovery.
+`has_upgrade_history()` reports whether both allocation and nested-key history
+are complete. `has_allocation_watermark()` separately describes index history.
 
 ### 5.5 `IndexedFieldValues`
 
@@ -610,16 +644,19 @@ use anda_db_schema::{AndaDBSchema, FieldTyped};
 ### 8.1 `AndaDBSchema`
 
 Generates `MyStruct::schema() -> Result<Schema, SchemaError>`. Declaring
-`_id: u64` on the struct is optional (the builder injects the primary-key
-column automatically); when declared, it must be `u64` and keep serializing
-as `"_id"`.
+`_id: u64` on the struct is required. The builder injects its metadata,
+while the struct must actually serialize the `"_id"` field. It cannot be
+skipped, assigned an integer CBOR key, or given a `field_type` override.
 
 ### 8.2 `FieldTyped`
 
-Generates `MyStruct::field_type() -> FieldType`. The result is a
+Generates `MyStruct::try_field_type() -> Result<FieldType, SchemaError>`
+and the existing `field_type() -> FieldType` convenience wrapper. The result is a
 `FieldType::Map` whose entries map `field_name` → `FieldType`. This is
 how nested user structs participate in schemas: `AndaDBSchema` calls the
-derived `field_type()` of any sub-struct it encounters.
+fallible constructor of derived nested types, propagating recursive-type
+errors. The infallible wrapper panics on invalid declarations; custom legacy
+`field_type()` methods continue to work.
 
 ### 8.3 Attributes
 
@@ -681,14 +718,20 @@ diagnostics.
 |                             | Human-readable (JSON, …)              | Binary (CBOR, MessagePack, …) |
 | :-------------------------- | :------------------------------------ | :---------------------------- |
 | `FieldKey::I64`             | `i64:<decimal>` string                | native integer                |
-| `Bytes` / `FieldKey::Bytes` | URL-safe Base64 string                | native byte string            |
+| `Bytes` / `FieldKey::Bytes` | `b64:<url-safe Base64>` string                | native byte string            |
 | `Vector`                    | array of `u16` (bf16 bits)            | same                          |
-| `Json`                      | JSON delegated to `serde_json::Value` | same                          |
+| `Json`                      | JSON with reserved text/key prefixes escaped | plain JSON data shape                          |
 | `Null`                      | `null` / unit                         | `null`                        |
 
-When deserializing in human-readable mode, a textual value that
-successfully decodes as URL-safe Base64 is *promoted* to `Bytes`. This
-matches the convention used by `ic_auth_types::ByteBufB64`.
+Only explicit prefixes are decoded: `b64:` for bytes, `i64:` for integer
+map keys, and `txt:` to escape reserved prefixes in text. Ordinary strings
+such as `"test"` remain text. Embedded JSON strings and object keys follow
+the same escaping rule. Malformed prefixed values are errors.
+
+Duplicate document indexes, field-value map keys and type-declaration map keys
+are rejected before they can overwrite earlier entries. JSON serialization of
+non-finite scalar floats returns an error; CBOR preserves infinities. F32
+read-back checks use the actual JSON formatter/parser rather than Rust Display.
 
 ### 9.2 CBOR examples
 
@@ -720,8 +763,8 @@ let fv = Fv::serialized(&vv, Some(&Ft::Array(vec![Ft::Vector])))?;
 ```
 
 Both representations deserialize back into `Vec<[bf16; 2]>` thanks to
-`half`'s serde impl, but only the typed form preserves the original
-shape on disk.
+`half`'s serde impl, but the declared schema is needed to recover the canonical `Vector` variant
+after an untyped storage round trip.
 
 ---
 
@@ -805,12 +848,12 @@ pub fn vector_from_f64(v: Vec<f64>) -> Vector;
 use anda_db_schema::{Fe, Ft, Schema};
 use std::sync::Arc;
 
-let schema = Schema::builder()
-    .add_field(Fe::new("title".into(),   Ft::Text)?
-        .with_description("Document title".into()))?
-    .add_field(Fe::new("content".into(), Ft::Text)?)?
-    .add_field(Fe::new("views".into(),   Ft::U64)?)?
-    .build()?;
+let mut builder = Schema::builder();
+builder.add_field(Fe::new("title".into(), Ft::Text)?
+    .with_description("Document title".into()))?;
+builder.add_field(Fe::new("content".into(), Ft::Text)?)?;
+builder.add_field(Fe::new("views".into(), Ft::U64)?)?;
+let schema = builder.build()?;
 let schema = Arc::new(schema);
 ```
 
@@ -867,24 +910,18 @@ let back: Article = doc.try_into()?;
 ### 12.5 Schema migration
 
 ```rust
-// Persisted v1 schema:
-let old = Schema::builder()
-    .with_version(1)
-    .add_field(Fe::new("name".into(), Ft::Text)?)?
-    .add_field(Fe::new("age".into(),  Ft::Option(Box::new(Ft::U64)))?)?
-    .build()?;
+let mut builder = Schema::builder();
+builder.with_version(1);
+builder.add_field(Fe::new("name".into(), Ft::Text)?)?;
+let old = builder.build()?;
 
-// New code defines v2 with an additional `email` field:
-let mut new = Schema::builder()
-    .with_version(2)
-    .add_field(Fe::new("name".into(),  Ft::Text)?)?
-    .add_field(Fe::new("age".into(),   Ft::Option(Box::new(Ft::U64)))?)?
-    .add_field(Fe::new("email".into(), Ft::Option(Box::new(Ft::Text)))?)?
-    .build()?;
-
+let mut builder = Schema::builder();
+builder.with_version(2);
+builder.add_field(Fe::new("name".into(), Ft::Text)?)?;
+builder.add_field(Fe::new("email".into(), Ft::Option(Box::new(Ft::Text)))?)?;
+let mut new = builder.build()?;
 new.upgrade_with(&old)?;
-
-// `name` keeps idx=1, `age` keeps idx=2, `email` gets idx=3.
+// name keeps idx=1; email gets idx=2.
 ```
 
 ### 12.6 Embedding a `Resource`

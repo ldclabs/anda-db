@@ -1581,7 +1581,32 @@ impl Collection {
             return Ok(());
         }
 
-        new_schema.upgrade_with(&self.schema)?;
+        let mut old_schema = self.schema.clone();
+        if !old_schema.has_upgrade_history() {
+            // Recover before changing the schema, and before replay/pruning
+            // can erase retired indexes or nested keys. Include unregistered
+            // documents as well as both images of every durable intent.
+            // A failed scan leaves the collection metadata untouched.
+            let mut recovery = old_schema.history_recovery();
+            let mut documents = self.storage.list::<DocumentOwned>(Some("data/"), None);
+            while let Some(document) = documents.next().await {
+                recovery.observe(&document?.0)?;
+            }
+            let mut intents = self
+                .storage
+                .list::<MutationIntent>(Some(Self::MUTATION_INTENT_PREFIX), None);
+            while let Some(intent) = intents.next().await {
+                let intent = intent?.0;
+                for image in [intent.previous.as_ref(), intent.proposed.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    recovery.observe(image)?;
+                }
+            }
+            old_schema = Arc::new(recovery.finish());
+        }
+        new_schema.upgrade_with(&old_schema)?;
         self.schema = Arc::new(new_schema.clone());
         self.update_metadata(|m| {
             m.schema = new_schema;
@@ -4439,6 +4464,116 @@ mod tests {
 
         let db = AndaDB::connect(object_store, db_config).await?;
         Ok(db)
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_recovers_unregistered_documents_and_intent_images()
+    -> Result<(), DBError> {
+        let make_schema = |version, resurrect: bool| -> Schema {
+            let mut fields = BTreeMap::from([(FieldKey::from("keep"), Ft::Bool)]);
+            if resurrect {
+                fields.insert("retired".into(), Ft::Option(Box::new(Ft::Text)));
+            }
+            let mut b = Schema::builder();
+            b.with_version(version);
+            b.add_field(Fe::new("payload".into(), Ft::Map(fields)).unwrap())
+                .unwrap();
+            if version > 1 {
+                b.add_field(Fe::new("fresh".into(), Ft::Option(Box::new(Ft::Text))).unwrap())
+                    .unwrap();
+            }
+            b.build().unwrap()
+        };
+        let mut wire = serde_json::to_value(make_schema(1, false)).unwrap();
+        wire.as_object_mut().unwrap().remove("next_idx");
+        wire.as_object_mut().unwrap().remove("history");
+        let legacy: Schema = serde_json::from_value(wire).unwrap();
+        let db = setup_test_db().await?;
+        let mut collection = Collection::create(
+            db.clone(),
+            legacy.clone(),
+            CollectionConfig {
+                name: "history".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let raw = DocumentOwned {
+            fields: BTreeMap::from([
+                (0, Fv::U64(1)),
+                (
+                    1,
+                    Fv::Map(BTreeMap::from([
+                        ("keep".into(), Fv::Bool(true)),
+                        ("retired".into(), Fv::Text("old".into())),
+                    ])),
+                ),
+                (9, Fv::Text("removed top field".into())),
+            ]),
+        };
+        collection
+            .storage
+            .create(&Collection::doc_path(1), &raw)
+            .await?;
+        assert!(
+            collection.ids().is_empty(),
+            "scan must include unregistered objects"
+        );
+        let mut previous = raw.clone();
+        previous
+            .fields
+            .insert(12, Fv::Text("intent-only retired field".into()));
+        collection
+            .storage
+            .create(
+                &Collection::mutation_intent_path(1),
+                &MutationIntent {
+                    sequence: 1,
+                    document_id: 1,
+                    previous: Some(previous),
+                    proposed: Some(raw.clone()),
+                },
+            )
+            .await?;
+        collection.try_upgrade_schema(make_schema(2, false)).await?;
+        assert_eq!(collection.schema.get_field("fresh").unwrap().idx(), 13);
+        let loaded = Document::try_from_doc(collection.schema(), raw)?;
+        assert!(loaded.get_field("fresh").is_none());
+        let snapshot = serde_json::to_value(collection.metadata()).unwrap();
+        assert!(
+            collection
+                .try_upgrade_schema(make_schema(3, true))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(collection.metadata()).unwrap(),
+            snapshot
+        );
+
+        let mut broken = Collection::create(
+            db.clone(),
+            legacy,
+            CollectionConfig {
+                name: "broken_history".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        broken
+            .storage
+            .create(&Collection::doc_path(1), &"not a document")
+            .await?;
+        let snapshot = serde_json::to_value(broken.metadata()).unwrap();
+        assert!(
+            broken
+                .try_upgrade_schema(make_schema(2, false))
+                .await
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(broken.metadata()).unwrap(), snapshot);
+        db.close().await?;
+        Ok(())
     }
 
     // 创建测试集合的辅助函数
