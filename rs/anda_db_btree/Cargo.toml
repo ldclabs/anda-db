@@ -22,8 +22,6 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-# `serde` only backs the test-only `BucketRef` serializer.
-dashmap = { workspace = true, features = ["serde"] }
 futures = { workspace = true, features = ["alloc", "executor"] }
 hex = { workspace = true }
 proptest = { workspace = true }
@@ -32,5 +30,9 @@ tokio = { workspace = true, features = ["full"] }
 [[example]]
 name = "btree_demo"
 
+[[bench]]
+name = "workloads"
+harness = false
+
 [lib]
-doctest = false
+doctest = true

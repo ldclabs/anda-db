@@ -1,842 +1,239 @@
-# anda_db_btree Technical Documentation
-
-**Crate**: `anda_db_btree`
-**Version**: 0.5.9
-**Last Updated**: 2026-04-25
-
----
-
-## Table of Contents
-
-1. [Overview](#1-overview)
-2. [Data Model](#2-data-model)
-3. [Architecture and Internal State](#3-architecture-and-internal-state)
-4. [Concurrency Model](#4-concurrency-model)
-5. [Persistence Model](#5-persistence-model)
-6. [Query System](#6-query-system)
-7. [Configuration](#7-configuration)
-8. [API Reference](#8-api-reference)
-9. [Usage Examples](#9-usage-examples)
-10. [Bucket Management & Compaction](#10-bucket-management--compaction)
-11. [Error Handling](#11-error-handling)
-12. [Performance Considerations](#12-performance-considerations)
-13. [Best Practices](#13-best-practices)
-14. [Invariants and Correctness Notes](#14-invariants-and-correctness-notes)
-
----
-
-## 1. Overview
-
-### 1.1 What is `anda_db_btree`
-
-`anda_db_btree` is a generic, in-memory **inverted B-tree index** with
-incremental on-disk persistence. It is one of the three indexing backends that
-power AndaDB (alongside BM25 full-text search and HNSW vector search) and is
-the workhorse for exact-match, range, and prefix queries over scalar fields.
-
-A single index maps:
-
-```
-field_value (FV)  →  set of primary keys (PK)
-```
-
-and additionally maintains an ordered key set so that range iteration is
-`O(log n + k)` rather than `O(n)`.
-
-### 1.2 Design Goals
-
-| Goal                              | How it is achieved                                                                                          |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **Thread-safe concurrent writes** | Fine-grained sharded locks via `DashMap`; no global lock around the index                                   |
-| **Scalable persistence**          | Postings are grouped into size-bounded **buckets**; only dirty buckets are rewritten on flush               |
-| **Consistent snapshots**          | Per-bucket `dirty_version` counter prevents a concurrent mutation from being silently lost during async I/O |
-| **Flexible query composition**    | `RangeQuery` supports boolean combinators (`And`/`Or`/`Not`) over any primitive range                       |
-| **Generic key types**             | Any `Ord + Eq + Hash + Clone + Serialize + DeserializeOwned` type works as `PK` or `FV`                     |
-| **Efficient format**              | CBOR serialization; bucket payload is self-contained                                                        |
-
-### 1.3 When to Use It
-
-Use `anda_db_btree` when you need:
-
-- Exact-match lookups on a field (`WHERE field = ?`).
-- Range scans (`WHERE field BETWEEN x AND y`, `WHERE field > x`).
-- Prefix scans on string keys.
-- Composite boolean queries over a single field.
-- Incremental persistence — the index can be flushed frequently without
-  rewriting all data.
-
-It is **not** a general full-text engine (use `anda_db_tfs`) nor a nearest-
-neighbour engine for dense vectors (use `anda_db_hnsw`).
-
----
-
-## 2. Data Model
-
-### 2.1 Core Entities
-
-```
-┌─────────────────┐
-│ field_value FV  │  Any Ord + Eq + Hash + Clone (Serde)
-└────────┬────────┘
-         │
-         ▼
-┌──────────────────────────────────────────┐
-│ Posting                                  │
-│ ┌────────────┬───────────────┬─────────┐ │
-│ │ bucket_id  │ update_version│ doc_ids │ │   doc_ids: UniqueVec<PK>
-│ │   u32      │      u64      │ Vec<PK> │ │
-│ └────────────┴───────────────┴─────────┘ │
-└──────────────────────────────────────────┘
-```
-
-- `bucket_id` — the persistence bucket currently owning this posting.
-- `update_version` — monotonic counter, bumped on every doc-id add/remove. It
-  lets external observers detect posting-level changes without holding locks.
-- `doc_ids` — unique, insertion-ordered list of primary keys. Backed by
-  [`anda_db_utils::UniqueVec`] for O(1) membership checks combined with
-  deterministic iteration order.
-
-### 2.2 Bucket
-
-A **bucket** is the unit of persistence. Each bucket owns a subset of the
-field values and is serialized as a single CBOR blob:
-
-```rust
-struct BucketOnDisk<PK, FV> {
-    postings: FxHashMap<FV, (bucket_id, version, Vec<PK>)>,
-}
-```
-
-In memory, each bucket carries packing metadata:
-
-| Field                         | Meaning                                          |
-| ----------------------------- | ------------------------------------------------ |
-| `bucket_size: usize`          | Estimated CBOR size used to decide when to spill |
-| `is_dirty: bool`              | Unpersisted changes pending                      |
-| `field_values: UniqueVec<FV>` | Which postings live in this bucket               |
-| `dirty_version: u64`          | Monotonic counter for safe concurrent flush      |
-
-### 2.3 Identifiers
-
-- `bucket_id: u32` — assigned monotonically between compactions (ids may be
-  sparse after concurrent migrations); `compact_buckets` renumbers densely
-  from 0. Bucket 0 always exists.
-- `max_bucket_id: AtomicU32` — upper bound used during legacy load. May
-  transiently exceed the actual largest populated bucket during concurrent
-  inserts, and is reset by `compact_buckets`; durable objects are addressed
-  by `(bucket_id, generation)`, so a reused id never collides with a retired
-  object.
-
----
-
-## 3. Architecture and Internal State
-
-```text
-┌─────────────────────────── BTreeIndex<PK, FV> ───────────────────────────┐
-│                                                                         │
-│   postings : DashMap<FV, (u32, u64, UniqueVec<PK>)>                     │
-│   btree    : RwLock<BTreeSet<FV>>         ◀── ordered key set           │
-│   buckets  : DashMap<u32, (size, dirty, UniqueVec<FV>, version)>        │
-│   metadata : RwLock<BTreeMetadata>                                      │
-│                                                                         │
-│   max_bucket_id      : AtomicU32                                        │
-│   query_count        : AtomicU64                                        │
-│   last_saved_version : AtomicU64                                        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 3.1 Why Three Collections?
-
-| Collection | Purpose                                        | Access pattern                    |
-| ---------- | ---------------------------------------------- | --------------------------------- |
-| `postings` | Point lookup, holds the actual `doc_ids`       | `O(1)` by key                     |
-| `btree`    | Range/prefix iteration over `FV`               | `O(log n + k)` range              |
-| `buckets`  | Persistence packing, independent of query path | Only touched by writers and flush |
-
-Keeping them separate means range queries only lock the small `btree` while
-point operations only lock a DashMap shard, so read-heavy workloads scale
-almost linearly with cores.
-
-### 3.2 Module Layout
-
-```
-rs/anda_db_btree/
-├── src/
-│   ├── lib.rs           # crate root, re-exports
-│   ├── btree.rs         # BTreeIndex, RangeQuery, BTreeConfig, …
-│   └── error.rs         # BTreeError enum
-├── examples/
-│   └── btree_demo.rs
-├── benches/
-└── Cargo.toml
-```
-
----
-
-## 4. Concurrency Model
-
-The index is designed to be cloned into `Arc` and shared across tasks.
-
-### 4.1 Lock Granularity
-
-| Operation                               | Locks acquired                                                                                                          |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `insert`, `insert_array`                | `mutation_gate` **read** (first, always), then DashMap shard for the posting, then DashMap shard for the bucket; `btree` write lock **only** when a new key is added |
-| `remove`, `remove_array`                | Same as insert; `btree` write lock only when a posting becomes empty                                                    |
-| `query_with`                            | DashMap read shard for the posting                                                                                      |
-| `range_query_with`, `range_query_rev_with`, `prefix_query_with` | `btree` read lock for the duration of iteration; postings are fetched via DashMap read shards per key                   |
-| `flush`, `flush_owned_with`             | DashMap read for bucket scan; CBOR is built inside the bucket guard, then released before `await`-ing the user's writer |
-| `compact_buckets`                       | `mutation_gate` **write** (mutations hold it shared), then `btree` write lock and the DashMap shards for the rebuild    |
-
-### 4.2 Race-free Guarantees
-
-- **Uniqueness re-check.** When `allow_duplicates == false`, `insert` and
-  `insert_array` re-verify the constraint inside the `postings` entry lock
-  after the pre-check, closing a TOCTOU gap against concurrent writers.
-- **Atomic posting removal.** Deleting an empty posting is performed via
-  `Entry::Occupied` + empty re-check, so a concurrent `insert` that re-adds
-  a doc id wins over the removal and keeps the posting alive.
-- **Crash-consistent migration.** Moving a posting from bucket A to bucket B
-  marks **both** buckets dirty; the next flush rewrites both to fresh
-  generation-suffixed objects and commits them atomically through the
-  manifest, so no crash boundary can observe A without the posting while B is
-  unreferenced.
-- **Compaction is gated internally.** `insert`, `insert_array`, `remove` and
-  `remove_array` take the index's `mutation_gate` **shared** — so they still
-  run concurrently with each other — while `compact_buckets` takes it
-  **exclusively**. Compaction rebuilds the bucket map non-atomically, so a
-  posting created after it snapshotted `postings` would otherwise be re-binned
-  into nothing and silently dropped by the next flush. The gate is the first
-  lock a mutation acquires, so it never nests inside a `DashMap` shard guard
-  and the ordering stays deadlock-free. Callers do **not** need to serialize
-  compaction against writes. `batch_update` inherits the guarantee through the
-  `insert_array` / `remove_array` calls it delegates to, each of which takes
-  the gate for its own phase — a compaction may still interleave *between* the
-  two phases, so a `batch_update` is not atomic with respect to compaction.
-- **Flush coordination is the caller's job.** The crate does not defend a
-  flush against concurrent mutations, compaction, or another flush;
-  `anda_db`'s `Collection` holds an exclusive operation gate across every
-  flush, and a single writer per durable index is a deployment contract.
-
-### 4.3 Ordering of Ops
-
-`Ordering::Relaxed` is used for statistics counters; `Ordering::Release` /
-`Ordering::Acquire` is used for `last_saved_version`.
-
----
-
-## 5. Persistence Model
-
-### 5.1 Files on Disk (Caller's Responsibility)
-
-The crate is **storage-agnostic** — it hands raw CBOR bytes to user-supplied
-async callbacks. A typical layout is:
-
-```
-<index-dir>/
-├── metadata.cbor         ← BTreeMetadata blob (carries the bucket manifest)
-├── bucket_0_7.cbor       ← immutable object addressed by (bucket_id, generation)
-├── bucket_1_9.cbor
-└── bucket_2.cbor         ← legacy (pre-manifest) object at generation 0, read-only
-```
-
-Both are written by [`flush`] / [`flush_owned_with`]. Every flush writes the
-dirty buckets to **fresh** `(bucket_id, generation)` objects, then commits
-the metadata — whose *manifest* maps every live bucket id to its current
-generation — as the single atomic point. Objects the new manifest no longer
-references are returned as `FlushOutcome::obsolete` for best-effort deletion.
-
-### 5.2 Lifecycle
-
-```text
-                  ┌──────────────┐
-                  │   new(…)     │
-                  └──────┬───────┘
-                         ▼
-  ┌───────────────────────────────────────────────────────┐
-  │                insert / insert_array /                 │
-  │                remove / remove_array                   │
-  └──────────┬────────────────────────────┬────────────────┘
-             │                            │
-             ▼                            ▼
-   bucket marked dirty           metadata.stats.version += 1
-             │                            │
-             └────────────┬───────────────┘
-                          ▼
-                    ┌──────────┐
-                    │  flush   │
-                    └────┬─────┘
-                         │
-        1. write dirty buckets to new (id, generation) objects
-        2. commit metadata + manifest   ← the atomic point
-        3. caller deletes FlushOutcome::obsolete best-effort
-```
-
-### 5.3 Version Tracking
-
-| Counter                    | Bumped on                     | Consumed by                                                          |
-| -------------------------- | ----------------------------- | -------------------------------------------------------------------- |
-| `BTreeStats::version`      | every mutating operation      | `flush` (skips when `last_saved_version >= version` and no bucket is dirty); doubles as the object **generation** |
-| per-bucket `dirty_version` | every mutation to that bucket | `flush` (a bucket mutated after serialization stays dirty)           |
-
-### 5.4 Loading
-
-```rust
-// Option A: two-phase
-let mut idx = BTreeIndex::load_metadata(meta_reader)?;
-idx.load_buckets(async |object| Ok(store.get(&object).cloned())).await?;
-
-// Option B: one-shot
-let idx = BTreeIndex::load_all(meta_reader, async |object| …).await?;
-```
-
-With a manifest present, `load_buckets` reads exactly the referenced
-`(bucket_id, generation)` objects. Metadata persisted by pre-manifest
-releases has no manifest; the loader falls back to scanning bucket ids
-`0..=max_bucket_id` at generation `0` (the legacy un-suffixed objects), and
-the first flush upgrades the durable layout to the manifest format. Missing
-objects are tolerated (the callback returns `Ok(None)`) for read-only partial
-loads: with a manifest the omission is logged as a warning, and the
-placeholder that `load_metadata` registered for every manifest bucket keeps
-the entry alive so a later flush does not retire the object. A partially
-loaded index still must not be mutated and flushed, and an index whose
-buckets were never loaded refuses to flush. A legacy `max_bucket_id` beyond
-`1 << 20` is rejected as corrupted instead of being probed. When the same field
-value appears in multiple legacy bucket files (a leftover of the old
-multi-phase flush), later bucket ids win: the loader reconciles the older
-bucket's in-memory `field_values` list and marks that bucket dirty, allowing
-a normal flush to remove the stale on-disk entry.
-
----
-
-## 6. Query System
-
-All queries are expressed through `RangeQuery<FV>`:
-
-```rust
-pub enum RangeQuery<FV> {
-    Eq(FV),
-    Gt(FV), Ge(FV), Lt(FV), Le(FV),
-    Between(FV, FV),       // inclusive on both ends
-    Include(Vec<FV>),      // explicit key set
-    And(Vec<Box<RangeQuery<FV>>>),
-    Or(Vec<Box<RangeQuery<FV>>>),
-    Not(Box<RangeQuery<FV>>),
-}
-```
-
-### 6.1 Query Methods
-
-| Method                            | Shape                   | Notes                                              |
-| --------------------------------- | ----------------------- | -------------------------------------------------- |
-| `query_with(&FV, f)`              | exact match             | single DashMap lookup                              |
-| `range_query_with(RangeQuery, f)` | any combinator          | streaming, ascending walk, supports early termination |
-| `range_query_rev_with(RangeQuery, f)` | any combinator      | same, walking down from the largest key; results still ascending |
-| `prefix_query_with(&str, f)`      | `FV = String` only      | implemented via `range(prefix..=prefix+char::MAX)` |
-| `keys(cursor, limit)`             | paginated key iteration | ordered, exclusive cursor                          |
-
-### 6.2 Callback Contract
-
-Every query accepts a callback `f(key, ids)` returning `(continue, Vec<R>)`:
-
-- `continue == false` stops iteration.
-- The returned `Vec<R>` is appended to the result. Return an empty vec to
-  filter a key out, or multiple items per key for fan-out.
-
-### 6.3 Ordering Semantics
-
-Every variant emits its results in **ascending** key order. Which end of a
-range a bounded scan keeps is decided by the method, never by the query
-shape: `range_query_with` walks upwards from the smallest matching key, so
-early termination keeps the smallest matches; `range_query_rev_with` walks
-downwards from the largest and keeps the largest matches (its output is
-still ascending, with each key's own posting order preserved).
-
-This matters when combining with a limit: for `Lt(date)` with a limit of 2,
-`range_query_with` returns the two *smallest* keys below `date` and
-`range_query_rev_with` the two *largest*, both ascending.
-
-### 6.4 Logical Combinators
-
-- `Or(subqueries)` returns the **deduplicated union** in global B-tree order
-  regardless of subquery declaration order. This guarantees deterministic
-  `limit` semantics across subquery permutations.
-- `And(subqueries)` intersects the smallest candidate set first for speed.
-- `Not(q)` iterates the full key set and excludes matches of `q`; it is
-  `O(|index| + |q|)` and should be kept out of hot paths on large indices.
-
-### 6.5 Prefix Query (String keys only)
-
-```rust
-let results = idx.prefix_query_with("app", |k, ids| {
-    (true, Some((k.to_string(), ids.clone())))
-});
-```
-
-Internally translates to a range scan `"app"..="app\u{10ffff}"`. An empty
-prefix iterates every key in order.
-
----
-
-## 7. Configuration
-
-```rust
-pub struct BTreeConfig {
-    pub bucket_overload_size: usize, // default 512 * 1024
-    pub allow_duplicates: bool,      // default true
-}
-```
-
-| Field                  | Meaning                                                                                                                   | Tuning advice                                                                                              |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `bucket_overload_size` | soft target size of a bucket's CBOR payload before spilling into a new one                                                | Larger = fewer files, faster load, but each flush rewrites more bytes. 256 KiB – 2 MiB is a sensible range |
-| `allow_duplicates`     | if `false`, enforces uniqueness of `field_value`: a second `doc_id` on the same value returns `BTreeError::AlreadyExists` | Set for unique indexes (PK, unique columns)                                                                |
-
-Bucket overflow is a *soft* limit: the first posting that would cross the
-threshold triggers spilling to a fresh bucket. An existing posting that grows
-past the limit is moved out of a *shared* bucket into a fresh one, so a hot
-posting ends up isolated instead of forcing its neighbours to be rewritten on
-every flush; once it fills a bucket by itself it grows in place. Postings
-larger than the limit therefore always fit (alone in their bucket).
-
----
-
-## 8. API Reference
-
-### 8.1 Construction & Loading
-
-```rust
-impl<PK, FV> BTreeIndex<PK, FV> {
-    pub fn new(name: String, config: Option<BTreeConfig>) -> Self;
-
-    pub fn load_metadata<R: Read>(r: R) -> Result<Self, BTreeError>;
-    pub async fn load_buckets<F>(&mut self, f: F) -> Result<(), BTreeError>
-        where F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>;
-    pub async fn load_all<R: Read, F>(metadata: R, f: F) -> Result<Self, BTreeError>
-        where F: AsyncFnMut(u32) -> Result<Option<Vec<u8>>, BoxError>;
-}
-```
-
-### 8.2 Introspection
-
-```rust
-pub fn name(&self) -> &str;
-pub fn len(&self) -> usize;
-pub fn is_empty(&self) -> bool;
-pub fn allow_duplicates(&self) -> bool;
-pub fn metadata(&self) -> BTreeMetadata;
-pub fn stats(&self) -> BTreeStats;
-pub fn has_dirty_buckets(&self) -> bool;
-```
-
-### 8.3 Mutation
-
-```rust
-pub fn insert(&self, doc_id: PK, field_value: FV, now_ms: u64)
-    -> Result<bool, BTreeError>;
-pub fn remove(&self, doc_id: PK, field_value: FV, now_ms: u64) -> bool;
-
-pub fn insert_array(&self, doc_id: PK, field_values: Vec<FV>, now_ms: u64)
-    -> Result<usize, BTreeError>;
-pub fn remove_array(&self, doc_id: PK, field_values: Vec<FV>, now_ms: u64)
-    -> usize;
-
-pub fn batch_update(&self, doc_id: PK,
-                    old: Vec<FV>, new: Vec<FV>, now_ms: u64)
-    -> Result<(usize /*removed*/, usize /*inserted*/), BTreeError>;
-```
-
-Return-value conventions:
-
-- `insert` returns `true` iff it created a new `(doc_id, field_value)` pair.
-  Re-inserting the same pair is idempotent and returns `false` (no version
-  bump, no stat change).
-- `insert_array` returns the count of newly created pairs.
-- `remove` returns `true` iff the pair existed.
-- `batch_update` is a diff-based wrapper: it computes
-  `new − old` (to insert) and `old − new` (to remove).
-
-### 8.4 Querying
-
-```rust
-pub fn query_with<F, R>(&self, field_value: &FV, f: F) -> Option<R>
-    where F: FnOnce(&Vec<PK>) -> Option<R>;
-
-pub fn range_query_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
-    where F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>);
-
-// Same, but walks from the largest matching key down, so a scan that stops
-// early keeps the *last* page of the range instead of the first. Results are
-// returned in ascending key order either way — the direction decides which
-// keys a bounded scan collects, not how they are ordered.
-pub fn range_query_rev_with<F, R>(&self, query: RangeQuery<FV>, f: F) -> Vec<R>
-    where F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>);
-
-pub fn keys(&self, cursor: Option<FV>, limit: Option<usize>) -> Vec<FV>;
-
-// Only available for FV = String:
-impl<PK> BTreeIndex<PK, String> {
-    pub fn prefix_query_with<F, R>(&self, prefix: &str, f: F) -> Vec<R>
-        where F: FnMut(&str, &Vec<PK>) -> (bool, Option<R>);
-}
-```
-
-### 8.5 Persistence
-
-```rust
-pub struct BucketObject { pub bucket_id: u32, pub generation: u64 }
-pub struct FlushOutcome { pub saved: bool, pub obsolete: Vec<BucketObject> }
-
-pub async fn flush<W: Write, F, Fut>(&self, metadata: W, now_ms: u64, f: F)
-    -> Result<FlushOutcome, BTreeError>
-    where F: FnMut(BucketObject, Vec<u8>) -> Fut,
-          Fut: Future<Output = Result<(), BoxError>>;
-
-pub async fn flush_owned_with<M, MFut, F, FFut>(
-    &self, now_ms: u64, metadata_writer: M, bucket_writer: F,
-) -> Result<FlushOutcome, BTreeError>
-    where M: FnOnce(Vec<u8>) -> MFut,
-          MFut: Future<Output = Result<(), BoxError>>,
-          F: FnMut(BucketObject, Vec<u8>) -> FFut,
-          FFut: Future<Output = Result<(), BoxError>>;
-
-pub fn compact_buckets(&self) -> (usize /*old*/, usize /*new*/);
-```
-
-`new` may be **larger** than `old`: compaction merges fragmented buckets and
-also splits one that grew past the limit while holding several postings. Any
-difference means the layout was rebuilt and every bucket is dirty, so a caller
-deciding whether to persist must test `new != old`, never `new < old`.
-
-### 8.6 Types
-
-```rust
-pub struct BTreeMetadata {
-    pub name, pub config, pub stats,
-    pub buckets: BTreeMap<u32, u64>,   // bucket manifest: id -> generation
-}
-pub struct BTreeStats {
-    pub last_inserted, pub last_deleted, pub last_saved: u64,
-    pub version, pub num_elements,
-    pub query_count, pub insert_count, pub delete_count: u64,
-    pub max_bucket_id: u32,
-}
-
-pub enum BTreeError {
-    Generic       { name: String, source: BoxError },
-    Serialization { name: String, source: BoxError },
-    NotFound      { name: String, id: Value, value: Value },
-    AlreadyExists { name: String, id: Value, value: Value },
-}
-```
-
----
-
-## 9. Usage Examples
-
-### 9.1 Minimal
-
-```rust
-use anda_db_btree::{BTreeConfig, BTreeIndex, RangeQuery};
-
-let idx = BTreeIndex::<u64, String>::new(
-    "by_title".into(),
-    Some(BTreeConfig { bucket_overload_size: 512 * 1024, allow_duplicates: true }),
-);
-
-idx.insert(1, "apple".into(), now_ms)?;
-idx.insert(2, "banana".into(), now_ms)?;
-idx.insert(3, "apple".into(), now_ms)?; // second doc for "apple"
-
-// exact lookup
-let ids = idx.query_with(&"apple".to_string(), |v| Some(v.clone()));
-assert_eq!(ids.unwrap(), vec![1, 3]);
-
-// range
-let keys = idx.range_query_with(
-    RangeQuery::Ge("apple".into()),
-    |k, _| (true, vec![k.clone()]),
-);
-```
-
-### 9.2 Batch + Update
-
-```rust
-// Replace a document's tags: old = [a, b], new = [b, c, d]
-let (removed, inserted) = idx.batch_update(
-    doc_id, vec!["a".into(), "b".into()],
-             vec!["b".into(), "c".into(), "d".into()], now_ms)?;
-assert_eq!((removed, inserted), (1, 2));
-```
-
-### 9.3 Complex Boolean Queries
-
-```rust
-use anda_db_btree::RangeQuery::*;
-
-// (tag >= "cat" AND tag <= "dog") OR tag == "zebra"
-let q = Or(vec![
-    Box::new(And(vec![
-        Box::new(Ge("cat".into())),
-        Box::new(Le("dog".into())),
-    ])),
-    Box::new(Eq("zebra".into())),
-]);
-
-let hits = idx.range_query_with(q, |k, ids| (true, vec![(k.clone(), ids.clone())]));
-```
-
-### 9.4 Persistence Round-Trip
-
-```rust
-use std::fs::File;
-use std::io::{Read, Write};
-
-// generation 0 denotes a legacy (pre-manifest) `bucket_{id}.cbor` object.
-fn bucket_file(object: BucketObject) -> String {
-    if object.generation == 0 {
-        format!("bucket_{}.cbor", object.bucket_id)
-    } else {
-        format!("bucket_{}_{}.cbor", object.bucket_id, object.generation)
-    }
-}
-
-// ---- Save ----
-let meta = File::create("meta.cbor")?;
-let outcome = idx.flush(meta, now_ms, |object, data| {
-    let write = || {
-        File::create(bucket_file(object))?.write_all(&data)?;
-        Ok(())
-    };
-    std::future::ready(write())
-}).await?;
-for object in &outcome.obsolete {
-    let _ = std::fs::remove_file(bucket_file(*object)); // best-effort GC
-}
-
-// ---- Load ----
-let mut loaded = BTreeIndex::<u64, String>::load_metadata(File::open("meta.cbor")?)?;
-loaded.load_buckets(async |object| {
-    let mut f = File::open(bucket_file(object))?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(Some(buf))
-}).await?;
-```
-
-See the runnable [examples/btree_demo.rs](../rs/anda_db_btree/examples/btree_demo.rs).
-
-### 9.5 Concurrent Writes
-
-```rust
-use std::sync::Arc;
-
-let idx = Arc::new(BTreeIndex::<u64, String>::new("shared".into(), None));
-let mut tasks = Vec::new();
-for t in 0..8 {
-    let idx = idx.clone();
-    tasks.push(tokio::spawn(async move {
-        for i in 0..1_000 {
-            idx.insert((t * 1_000 + i) as u64, format!("k{i}"), now_ms).unwrap();
-        }
-    }));
-}
-futures::future::try_join_all(tasks).await.unwrap();
-```
-
----
-
-## 10. Bucket Management & Compaction
-
-### 10.1 Spill Policy
-
-A posting is placed in the **current max bucket** if that bucket still has
-room (`bucket_size < bucket_overload_size`). Otherwise a new bucket is
-allocated and `max_bucket_id` is incremented. Migration in `insert_array`
-only moves postings that actually overflow the destination bucket — existing
-postings are not re-binned unnecessarily.
-
-### 10.2 Migration Semantics
-
-When a posting moves from bucket `A` to bucket `B`:
-
-1. `posting.bucket_id` is updated to `B`.
-2. Bucket `A`'s `field_values` loses the key; `A.is_dirty = true`.
-3. Bucket `B`'s `field_values` gains the key; `B.is_dirty = true`.
-
-Both dirty flags ensure a crash after step 3 cannot cause the posting to be
-re-read from `A` on the next load. If an older source bucket file is still
-present after restart, the loader performs the same source-bucket cleanup in
-memory and schedules it for repair on the next flush.
-
-### 10.3 Compaction
-
-`compact_buckets()` re-bins every posting using **best-fit-decreasing**
-bin packing. This is intended for **offline** repair (e.g. after replaying a
-legacy index whose buckets were over-split by an older bug), and also splits
-a single bucket that reached the limit while holding several postings — so
-the returned `new` count can exceed `old`. The procedure:
-
-1. Estimates the serialized size of each posting.
-2. Sorts descending by size.
-3. Places each posting into the open bucket with the tightest remaining
-   capacity (buckets are indexed by remaining capacity, so a placement costs
-   O(log buckets) rather than a scan over every bucket).
-4. Clears `buckets`, rewrites bucket ids `0..=max`, marks all dirty.
-
-The next `flush` will rewrite every bucket file. Concurrent writers are safe:
-`compact_buckets` holds the `mutation_gate` exclusively for the whole rebuild
-(see [§4.2](#42-race-free-guarantees)), so `insert` / `remove` block for its
-duration rather than racing it. It must still not overlap a `flush`.
-
----
-
-## 11. Error Handling
-
-```rust
-pub enum BTreeError {
-    Generic       { name, source },
-    Serialization { name, source },
-    NotFound      { name, id, value },
-    AlreadyExists { name, id, value },
-}
-```
-
-| Variant         | When raised                                                                 | Typical caller action         |
-| --------------- | --------------------------------------------------------------------------- | ----------------------------- |
-| `AlreadyExists` | `allow_duplicates = false` and a different `doc_id` already owns that value | Surface as 409 Conflict       |
-| `Serialization` | CBOR encode/decode failure                                                  | Fatal; bucket file is suspect |
-| `Generic`       | wrap-around of any user I/O error returned from the flush/load callbacks    | Propagate with context        |
-| `NotFound`      | reserved for higher-level callers; not emitted by current APIs              | n/a                           |
-
-All errors carry the index `name` for observability.
-
----
-
-## 12. Performance Considerations
-
-### 12.1 Complexity
-
-| Operation                              | Amortized cost                                               |
-| -------------------------------------- | ------------------------------------------------------------ |
-| `insert` / `remove`                    | `O(1)` hash lookup + `O(log n)` for new/removed keys (btree) |
-| `insert_array(k items)`                | `O(k)` amortized, one `btree` write-lock round for new keys  |
-| `query_with`                           | `O(1)`                                                       |
-| `range_query_with Gt/Ge/Lt/Le/Between` | `O(log n + k)`                                               |
-| `prefix_query_with`                    | `O(log n + k)`                                               |
-| `And` of N subqueries                  | `O(min_set_size × N)` with early termination                 |
-| `Not`, full-set scans                  | `O(n)`                                                       |
-| `flush`                                | `O(dirty_buckets × bucket_size)`                             |
-
-### 12.2 Memory
-
-- `postings` stores every `(FV, Vec<PK>)` pair; expect `~overhead(32B) +
-  size_of(FV) + sum(size_of(PK))` per entry.
-- `btree` adds another `size_of(FV)` per key.
-- Bucket metadata is negligible (a few dozen bytes per bucket).
-
-For very large indices (tens of millions of keys) consider sharding into
-multiple `BTreeIndex` instances by key prefix.
-
-### 12.3 Tuning Checklist
-
-1. **Bucket size** — raise `bucket_overload_size` (e.g. to 2 MiB) if flushes
-   dominate; lower it if cold-load latency dominates.
-2. **Batch writes** — prefer `insert_array` / `batch_update` over tight
-   single-row loops: they amortize `btree` write locks and statistic updates.
-3. **Flush cadence** — `flush` is cheap when nothing is dirty (it
-   short-circuits before serializing anything). Call it frequently.
-4. **Concurrent readers** — `query_with` and `range_query_with` are lock-free
-   against other readers; scale readers freely.
-5. **Avoid `Not` in hot paths** — it scans the entire key set.
-
----
-
-## 13. Best Practices
-
-### 13.1 Schema Design
-
-- Use a **unique index** (`allow_duplicates = false`) for every field that
-  represents an identity (e.g. external IDs). It turns silent duplication
-  bugs into loud `AlreadyExists` errors.
-- Keep `FV` compact. For long strings, hash to a fixed key and store the
-  original separately — it shrinks both the CBOR payload and the `btree`
-  footprint.
-
-### 13.2 Writing
-
-- Prefer `batch_update` for "replace the tags of this doc" patterns; it
-  avoids the redundant remove-then-reinsert of shared values.
-- Keep `doc_id` small and `Copy`-like (`u64`, `[u8; 16]`): every posting
-  stores it inline.
-
-### 13.3 Querying
-
-- Use `Include(Vec<FV>)` for sparse key lists instead of building an `Or` of
-  `Eq` subqueries — it avoids the extra combinator overhead.
-- When paginating, use `keys(cursor, limit)` directly over `btree` instead
-  of `range_query_with` — it bypasses the posting map entirely.
-
-### 13.4 Persistence
-
-- Call `flush` whenever your host commits a logical transaction. The
-  fast-path check (dirty-bucket scan and `last_saved_version`) makes
-  idempotent calls essentially free.
-- Make the flush callbacks **fsync** at their own cadence. The crate
-  guarantees the in-memory model is correct after `Ok(_)`; durability
-  depends entirely on the caller's I/O layer.
-
-### 13.5 Recovery
-
-- After a crash, re-run `load_all(metadata, loader)`. The metadata's bucket
-  manifest is a complete, consistent snapshot: bucket objects written by an
-  uncommitted flush are unreferenced and invisible, so the load always sees
-  either the old or the new snapshot in full.
-- Unreferenced bucket objects (from a flush that crashed before its manifest
-  commit, or `FlushOutcome::obsolete` deletions that failed) only leak
-  storage space; they can be garbage-collected by comparing the store's
-  listing against the manifest.
-- If you detect fragmentation or legacy over-split buckets, run
-  `compact_buckets()` once (concurrent writers are fine — it gates them
-  internally; just keep it off a concurrent `flush`), then `flush` once more —
-  the flush retires every pre-compaction object via `FlushOutcome::obsolete`.
-
----
-
-## 14. Invariants and Correctness Notes
-
-The implementation upholds the following invariants; tests in
-[`btree.rs`](../rs/anda_db_btree/src/btree.rs) pin them down.
-
-1. **Posting ↔ btree bijection.** Every key in `btree` has a non-empty
-   posting, and every non-empty posting has a key in `btree`.
-2. **Bucket ownership.** Every posting is tracked by exactly one bucket. A
-   migration is always a three-step update (posting's `bucket_id`, source
-   removal, destination insertion) with both buckets left dirty.
-3. **Uniqueness re-check.** `insert` and `insert_array` re-validate
-   `allow_duplicates = false` inside the `postings` entry lock.
-4. **Empty-posting removal is atomic.** The btree key is removed only if the
-   posting is still empty at the moment of removal.
-5. **Dirty version consistency.** `flush` clears the dirty flag only when
-   the bucket's `dirty_version` matches the value it sampled at
-   serialization time — a bucket mutated afterwards stays dirty.
-6. **Version monotonicity.** `BTreeStats::version` is strictly increasing
-   across every mutating operation; idempotent inserts/removes do **not**
-   bump it.
-7. **Bucket size accounting.** For any posting living in bucket `B`, its
-   size contribution flows through `B.bucket_size`; this is the foundation
-   of the spill policy. `insert_array` accumulates per-bucket aggregate
-   deltas in Phase 1 and applies them atomically in Phase 2 (see the
-   "insert_array three phases" doc comment).
-8. **`max_bucket_id` monotonicity.** Never decreases while the index is
-   live; `compact_buckets` resets it atomically as part of the full rebuild.
-
----
-
-## References
-
-- Source: [rs/anda_db_btree](../rs/anda_db_btree)
-- Module overview: [rs/anda_db_btree/src/btree.rs](../rs/anda_db_btree/src/btree.rs)
-- Example: [rs/anda_db_btree/examples/btree_demo.rs](../rs/anda_db_btree/examples/btree_demo.rs)
-- Utilities: `UniqueVec` in [rs/anda_db_utils](../rs/anda_db_utils);
-  CBOR size accounting uses `cbor2::serialized_size`.
+# anda_db_btree
+
+This reference describes the current 0.11 workspace implementation.
+The index maps an ordered field value (FV) to unique document IDs (PK).
+Exact lookups use a sharded hash map; ranges and string prefixes use a
+separate ordered key set. Storage is supplied by the caller.
+
+## Configuration and mutation
+
+`BTreeConfig` has two fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `bucket_overload_size` | 512 KiB | Soft packing target, clamped to at least 64 bytes |
+| `allow_duplicates` | true | Allow multiple different PKs for one FV |
+
+The same (PK, FV) pair is always idempotent. With `allow_duplicates=false`,
+a different PK for an occupied FV returns `BTreeError::AlreadyExists`.
+`len()` counts distinct FVs, not documents or associations.
+
+- `insert(pk, fv, now_ms) -> Result<bool, BTreeError>` adds one association.
+- `remove(pk, fv, now_ms) -> bool` removes one association.
+- `insert_array(pk, values, now_ms) -> Result<usize, BTreeError>` and
+  `remove_array(...) -> usize` batch associations and coalesce duplicates.
+- `batch_update(pk, old, new, now_ms) -> Result<(removed, inserted), BTreeError>`
+  applies the difference. Supply the document's actual old values.
+
+Batches amortize ordered-key locks, bucket accounting and stats. They are not
+transactions. A concurrent uniqueness conflict after the precheck, or a
+serialization failure mid-insertion, may leave an applied prefix. Its
+bookkeeping is completed before returning the error. Batch update inserts
+before removing; an insertion error leaves old associations in place.
+
+IDs are unique. Appends preserve order, but deletion swaps the last ID into
+the removed position; callers cannot rely on insertion order after a deletion.
+Small postings use a compact vector. Larger ones add an ID-to-position map
+for average constant-time membership and deletion. Only IDs are serialized.
+
+## Queries and pagination
+
+`RangeQuery<FV>` supports `Eq`, `Gt`, `Ge`, `Lt`, `Le`, inclusive
+`Between`, `Include`, `And`, `Or` and `Not`. These predicates operate on
+field values, not on document-ID sets. An And of two different Eq values
+matches no single FV, even if a document contains both values.
+
+An inverted Between range is empty. And([]) and Or([]) are empty; Not
+complements relative to indexed keys. Include and Or deduplicate keys.
+
+| Method | Visit order | Return order |
+|---|---|---|
+| `range_query_with` / `try_range_query_with` | Smallest match first | Ascending keys |
+| `range_query_rev_with` / `try_range_query_rev_with` | Largest match first | Ascending keys |
+| `prefix_query_with` | Ascending | Ascending |
+| `keys(cursor, limit)` | Ascending, cursor exclusive | Ascending |
+
+Range callbacks receive `(&FV, &Vec<PK>)` and return `(continue, Vec<R>)`.
+Results from the current callback are retained when continue=false. Reverse
+scans reverse groups while preserving each callback's internal result order.
+Prefix callbacks receive `(&str, &Vec<PK>)` and return
+`(continue, Option<R>)`.
+
+Boolean predicates compile to sorted disjoint intervals using only the query
+input. And intersects intervals, Or unions them, and Not complements them.
+No full-index candidate-key set is materialized, and nested Include does not
+perform a linear membership scan for every candidate. A page stops scanning
+when its callback stops; compilation still processes the input expression.
+
+String prefixes scan from a borrowed str lower bound and stop at the first
+key failing starts_with. Empty prefixes scan all keys. Keys containing
+char::MAX, including suffixes after it, are supported.
+
+### Resource limits
+
+`RangeQuery::MAX_DEPTH = 64`, `MAX_NODES = 4096` and
+`MAX_INCLUDE_KEYS = 65_536` bound total Include entries across a query.
+Custom Serde decoding enforces these while constructing the tree, preserving
+the externally tagged JSON/CBOR enum representation.
+
+Programmatic queries are checked by `validate()` before conversion/evaluation.
+Rejected owned queries are released iteratively, including on empty indexes;
+`discard()` exposes safe iterative disposal to callers handling their own
+programmatically constructed input.
+
+Fallible query methods return BTreeError on invalid input. Non-fallible
+methods log a warning and return an empty vector. Use fallible methods when
+invalid input must be distinguished from no matches. `try_convert_from`
+checks complexity and key conversion.
+
+## Concurrency
+
+Share the index through Arc. Mutations hold the mutation gate shared, update
+posting/bucket shards and briefly lock metadata for stats. New or removed
+ordered keys require a B-tree write lock. Compaction holds the mutation gate
+exclusively; queries can still run.
+
+Callbacks run under internal locks. Range/prefix callbacks may hold both an
+ordered-key read lock and a posting guard. They must not re-enter the same
+index; slow callbacks also delay writers.
+
+The caller must exclude mutations, compaction and other flushes for the
+entire flush, including async callbacks. AndaDB's Collection operation gate
+and wrapper flush gate supply this coordination. Dirty versions do not make
+an uncoordinated flush safe. Concurrent queries do not provide cross-operation
+snapshot isolation. One live writer per durable index is required.
+
+## Loading and recovery
+
+`load_metadata(reader)` returns `LoadState::MetadataOnly`.
+`load_buckets(loader)` completes initialization; `load_all(reader, loader)`
+combines both. The loader receives `BucketObject { bucket_id, generation }`
+and returns `Result<Option<Vec<u8>>, BoxError>`.
+
+An absent buckets field selects legacy loading. A present empty map denotes
+a modern empty index and never scans old files. Legacy loading probes IDs
+0..=max_bucket_id at generation 0; sparse missing IDs are allowed and the
+watermark is capped at 1 << 20. Higher legacy IDs replace stale postings;
+empty postings are tombstones. Successful legacy loading schedules metadata
+persistence, so the next flush upgrades even without application mutations.
+
+Missing manifest objects are errors, including generation 0 objects explicitly
+referenced by an upgraded manifest. `load_buckets_partial` explicitly permits
+missing objects for diagnostics and returns their identities. An incomplete,
+failed or cancelled attempt remains `LoadState::Partial`.
+
+Only Ready accepts mutations:
+
+| Operation on a read-only handle | Result |
+|---|---|
+| insert / insert_array / batch_update / flush | Error |
+| remove / remove_array | false / zero |
+| compaction | No-op |
+
+Partial queries describe available postings, not complete results. Restore
+the objects and retry load_buckets to discard the incomplete attempt and
+rebuild a complete index. Loading an already Ready index is rejected; reopen
+explicitly to discard live state.
+
+## Persistence
+
+Metadata preserves the `{"metadata": ...}` wrapper. Each bucket contains a
+p map from FV to `(bucket_id, posting_version, [PK...])`. Named runtime types
+do not alter the tuple/array wire representation; CBOR maps may have definite
+or indefinite lengths.
+
+Generation 0 addresses legacy unsuffixed objects. The metadata buckets map
+is the authoritative mapping from bucket IDs to object generations.
+
+`flush_owned_with(now_ms, metadata_writer, bucket_writer)`:
+
+1. Captures dirty bucket identities and prepares the manifest.
+2. Encodes and writes one bucket at a time without cloning postings or their
+   auxiliary membership maps.
+3. Invokes metadata_writer after all required bucket writes succeed.
+4. On confirmed success, publishes the manifest, clears matching dirty marks
+   and returns `FlushOutcome { saved, obsolete }`.
+
+The index holds one encoded bucket buffer plus O(bucket count) metadata and
+identity bookkeeping. An isolated oversized posting still needs a correspondingly
+large buffer. Caller-side upload buffering adds its own memory.
+
+A clean flush returns saved=false and calls neither writer. Before the
+manifest commit, written buckets are unreachable and the previous snapshot
+remains readable. Delete obsolete objects best-effort after a confirmed
+commit. Coordinate garbage collection with the writer: unreferenced objects
+can belong to an in-progress commit.
+
+Generations derive from metadata versions. A failure retried without another
+mutation can reuse the same generation/content; each retry does not necessarily
+advance it. The writer must create/overwrite the addressed object.
+
+Metadata success means a durable atomic replacement completed. A storage
+error can have an unknown outcome after the request was sent; Err is not proof
+that no commit occurred. Production adapters should reopen/recover when the
+outcome is uncertain.
+
+### Filesystem use
+
+Use flush_owned_with. Open/write metadata only inside its callback: write a
+same-directory temporary file, sync, atomically rename, and sync the directory
+where supported. Make buckets durable before committing their manifest.
+
+The runnable [example](../rs/anda_db_btree/examples/btree_demo.rs) uses
+[atomic_file.rs](../rs/anda_db_btree/examples/support/atomic_file.rs). Its tests
+cover no-op flush, bucket failure and failure before metadata replacement.
+
+`flush(writer, ...)` remains useful for already-durable atomic sinks and
+in-memory buffers. Write::flush cannot make an arbitrary Write atomic or
+durable. Do not construct File::create on the live metadata file before calling
+it: even a no-op flush would leave it truncated.
+
+## Compaction
+
+Bucket size is advisory. A growing posting in a shared full bucket migrates
+away; a posting already alone grows in place. The soft limit does not split
+one posting.
+
+`compact_buckets_with_outcome()` returns
+`CompactionOutcome { old_bucket_count, new_bucket_count, changed }`.
+Deterministic best-fit-decreasing packing repairs ownership and marks rebuilt
+buckets dirty. A canonical layout is a true no-op; a rebuild can retain the
+same bucket count.
+
+`compact_buckets() -> (usize, usize)` is a compatibility wrapper whose counts
+cannot identify every change. Use changed or pending-flush state when deciding
+whether to save. AndaDB's compact_index commits changed layouts even when
+counts match.
+
+## Complexity and memory
+
+N = indexed FVs, D = IDs in one posting, B = buckets, K = visited matches.
+
+| Operation | Main cost, excluding callbacks |
+|---|---|
+| Point lookup | Average O(1) |
+| Posting add/remove by ID | Average O(1); bounded scan for tiny vectors |
+| New/last-removed FV | Additional O(log N) ordered-key change; removing FV membership can scan its bucket |
+| Primitive range/prefix page | O(log N + K) |
+| Boolean range | Input-dependent interval algebra, then range scans; no full-index candidate materialization |
+| Include | Input sort/deduplication plus lookups/interval traversal |
+| Compaction | Encoded-size pass, FV sorting, O(log B) bin placement |
+| Flush | Dirty data serialization and O(B) bookkeeping, one bucket buffer |
+| Load | Read/decode referenced objects, rebuild posting and ordered-key structures |
+
+FVs exist in the posting map, ordered set and bucket membership vector/set:
+long keys can have several copies. Larger postings have an auxiliary PK map;
+small postings avoid it. Hash-table capacity and membership structures are
+material memory costs.
+
+Run `cargo bench -p anda_db_btree --bench workloads`. The harness reports
+median/p95/p99, throughput, allocation counts/bytes, peak extra live heap and
+serialized bytes. It covers high/low cardinality, large posting deletion,
+first/last pages, multi-threaded reads/writes and 4 KiB keys. Flush fixtures
+isolate one posting per bucket and assert exactly 10% or 100% dirty buckets,
+with optional injected per-bucket I/O delay. Set
+`ANDA_BTREE_BENCH_NO_IO_DELAY=1` for alternating CPU-only comparisons.
+
+Both versions must use the same instrumented allocator and build configuration.
+See [maintenance results](anda_db_btree-maintenance.md) for measured comparisons,
+the completed checklist and decisions about further optimizations.

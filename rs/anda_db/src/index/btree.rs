@@ -730,8 +730,8 @@ impl BTree {
         }
     }
 
-    /// Compacts bucket layout and persists the new layout if the bucket count
-    /// shrinks.
+    /// Compacts bucket layout and persists any changes, including a rebuild
+    /// that keeps the same number of buckets.
     ///
     /// Under the manifest protocol compaction needs no special write
     /// ordering: the repacked layout becomes visible atomically with the
@@ -911,16 +911,12 @@ where
     /// See [`BTree::compact_index`] for the persistence rationale.
     async fn compact(&self) -> Result<(), DBError> {
         let _flush_guard = self.flush_gate.clone().lock_owned().await;
-        let (old_bucket_count, new_bucket_count) = self.index.compact_buckets();
-        // Compaction repacks in *either* direction: it merges fragmented
-        // buckets, and it splits one that grew past the limit while holding
-        // several postings. Any change to the count means the layout was
-        // rebuilt and every bucket is dirty, so it must be committed —
-        // testing for a decrease alone would leave a split uncommitted while
-        // reporting success.
-        if new_bucket_count == old_bucket_count {
+        let outcome = self.index.compact_buckets_with_outcome();
+        if !outcome.changed && !self.has_pending_flush() {
             return Ok(());
         }
+        let old_bucket_count = outcome.old_bucket_count;
+        let new_bucket_count = outcome.new_bucket_count;
 
         log::info!(
             "Compacted BTree index '{}': {} -> {} buckets",
@@ -948,6 +944,36 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn same_count_compaction_commits_and_then_becomes_a_no_op() {
+        let storage = test_storage().await;
+        let tree = BTree::new(field("same_count_compact", Ft::Text), storage.clone(), 1)
+            .await
+            .unwrap();
+        // Every posting occupies its own bucket. Reverse key order ensures the
+        // first compaction changes ownership while keeping four buckets.
+        for id in (0..4u64).rev() {
+            tree.insert(id, &Fv::Text(format!("{id}-{}", "x".repeat(600_000))), 2)
+                .unwrap();
+        }
+        assert!(tree.flush(3).await.unwrap());
+        let before = tree.metadata();
+        assert_eq!(before.buckets.len(), 4);
+        tree.compact_index().await.unwrap();
+        let after = tree.metadata();
+        assert_eq!(after.buckets.len(), 4);
+        assert_ne!(after.buckets, before.buckets);
+        assert!(!tree.has_pending_flush());
+        let reloaded = BTree::bootstrap("same_count_compact".into(), &Ft::Text, storage)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.metadata().buckets, after.buckets);
+        tree.compact_index().await.unwrap();
+        assert_eq!(tree.metadata().buckets, after.buckets);
+        assert!(!tree.has_pending_flush());
+    }
+
     use super::*;
     use crate::storage::StorageConfig;
     use async_trait::async_trait;

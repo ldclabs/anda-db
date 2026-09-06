@@ -11,7 +11,8 @@ support high-concurrency filtering workloads in AI memory systems.
 - prefix queries for string-like keys
 - incremental persistence through bucketized storage
 - concurrent reads and writes without an external service
-- boolean composition through `RangeQuery`
+- boolean composition through `RangeQuery`, compiled to streaming key ranges
+- strict complete loading and explicitly read-only partial recovery
 
 ## When to Use It
 
@@ -40,6 +41,20 @@ Deep technical documentation for this crate lives in:
 
 - [docs/anda_db_btree.md](../../docs/anda_db_btree.md)
 - [docs/anda_db.md](../../docs/anda_db.md)
+
+## Validation and Performance
+
+```sh
+cargo test -p anda_db_btree --all-targets --all-features
+cargo bench -p anda_db_btree --bench workloads
+```
+
+The [maintenance report](../../docs/anda_db_btree-maintenance.md) records the
+recovery fixes, compatibility checks, benchmark results and memory tradeoffs.
+For complete loading, missing manifest objects are errors. Use
+`load_buckets_partial` only to inspect incomplete data; check `load_state()`
+before attempting mutations. Prefer fallible `try_range_query_with` when an
+invalid query must be distinguished from an empty result.
 
 ## Related Crates
 

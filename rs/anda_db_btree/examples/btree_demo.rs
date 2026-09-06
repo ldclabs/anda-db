@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+use std::{io::Read, path::Path};
+
+#[path = "support/atomic_file.rs"]
+mod atomic_file;
 
 use anda_db_btree::{BTreeConfig, BTreeIndex, BucketObject, RangeQuery};
 
@@ -63,16 +66,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // persist the index to files
     {
         std::fs::create_dir_all("debug/btree_demo")?;
-        let metadata = std::fs::File::create("debug/btree_demo/metadata.cbor")?;
         let outcome = index
-            .flush(metadata, now_ms, |object, data| {
-                let write = || {
-                    let mut bucket = std::fs::File::create(bucket_file(object))?;
-                    bucket.write_all(&data)?;
-                    Ok(())
-                };
-                std::future::ready(write())
-            })
+            .flush_owned_with(
+                now_ms,
+                |data| {
+                    std::future::ready(
+                        atomic_file::write_atomically(
+                            Path::new("debug/btree_demo/metadata.cbor"),
+                            &data,
+                        )
+                        .map_err(Into::into),
+                    )
+                },
+                |object, data| {
+                    std::future::ready(
+                        atomic_file::write_atomically(Path::new(&bucket_file(object)), &data)
+                            .map_err(Into::into),
+                    )
+                },
+            )
             .await?;
         // Best-effort cleanup of objects the new manifest replaced.
         for object in &outcome.obsolete {
@@ -100,13 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(index2.len(), 5);
 
-    let result = index.query_with(&apple, |ids| Some(ids.clone()));
+    let result = index2.query_with(&apple, |ids| Some(ids.clone()));
     assert!(result.is_some());
 
     // Remove data
-    let ok = index.remove(1, apple.clone(), now_ms);
+    let ok = index2.remove(1, apple.clone(), now_ms);
     assert!(ok);
-    let result = index.query_with(&apple, |ids| Some(ids.clone()));
+    let result = index2.query_with(&apple, |ids| Some(ids.clone()));
     assert!(result.is_none());
 
     println!("OK");

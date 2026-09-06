@@ -11,6 +11,144 @@ use anda_db_btree::{BTreeConfig, BTreeError, BTreeIndex, BucketObject, RangeQuer
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Debug, Clone)]
+enum Maintenance {
+    Insert(u64, Vec<u64>),
+    Remove(u64, Vec<u64>),
+    Replace(u64, Vec<u64>),
+    Compact,
+    Checkpoint,
+    FailBucket(usize),
+    FailMetadata,
+}
+fn maintenance_strategy() -> impl Strategy<Value = Maintenance> {
+    let values = prop::collection::vec(0u64..16, 0..12);
+    prop_oneof![
+        4 => (0u64..20,values.clone()).prop_map(|(id,vs)|Maintenance::Insert(id,vs)),
+        2 => (0u64..20,values.clone()).prop_map(|(id,vs)|Maintenance::Remove(id,vs)),
+        2 => (0u64..20,values).prop_map(|(id,vs)|Maintenance::Replace(id,vs)),
+        1 => Just(Maintenance::Compact),
+        2 => Just(Maintenance::Checkpoint),
+        1 => (0usize..4).prop_map(Maintenance::FailBucket),
+        1 => Just(Maintenance::FailMetadata),
+    ]
+}
+#[derive(Default)]
+struct PersistentStore {
+    metadata: Vec<u8>,
+    buckets: BTreeMap<BucketObject, Vec<u8>>,
+}
+impl PersistentStore {
+    fn save(
+        &mut self,
+        index: &BTreeIndex<u64, u64>,
+        failure: Option<usize>,
+    ) -> Result<anda_db_btree::FlushOutcome, BTreeError> {
+        let mut writes = 0;
+        let result = futures::executor::block_on(index.flush_owned_with(
+            1_000,
+            |data| {
+                if failure == Some(usize::MAX) {
+                    return std::future::ready(Err("metadata failure".into()));
+                }
+                self.metadata = data;
+                std::future::ready(Ok(()))
+            },
+            |obj, data| {
+                if failure == Some(writes) {
+                    return std::future::ready(Err("bucket failure".into()));
+                }
+                writes += 1;
+                self.buckets.insert(obj, data);
+                std::future::ready(Ok(()))
+            },
+        ));
+        if let Ok(outcome) = &result {
+            for obj in &outcome.obsolete {
+                self.buckets.remove(obj);
+            }
+        }
+        result
+    }
+    fn load(&self) -> BTreeIndex<u64, u64> {
+        futures::executor::block_on(BTreeIndex::load_all(&self.metadata[..], async |obj| {
+            Ok(self.buckets.get(&obj).cloned())
+        }))
+        .unwrap()
+    }
+}
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    #[test]
+    fn batches_compaction_incremental_recovery_and_failures_match_model(
+        actions in prop::collection::vec(maintenance_strategy(),1..160)
+    ) {
+        let mut index=BTreeIndex::new("maintenance".into(),Some(tiny_bucket_config()));
+        let mut model=Model::new();
+        let mut committed=Model::new();
+        let mut store=PersistentStore::default();
+        store.save(&index,None).unwrap();
+        for (step,action) in actions.into_iter().enumerate() {
+            match action {
+                Maintenance::Insert(pk,vs) => {
+                    let expected=vs.iter().filter(|&&fv|model_insert(&mut model,pk,fv)).count();
+                    prop_assert_eq!(index.insert_array(pk,vs,step as u64).unwrap(),expected);
+                }
+                Maintenance::Remove(pk,vs) => {
+                    let expected=vs.iter().filter(|&&fv|model_remove(&mut model,pk,fv)).count();
+                    prop_assert_eq!(index.remove_array(pk,vs,step as u64),expected);
+                }
+                Maintenance::Replace(pk,vs) => {
+                    let old:BTreeSet<_>=model.iter().filter(|(_,ids)|ids.contains(&pk)).map(|(&fv,_)|fv).collect();
+                    let new:BTreeSet<_>=vs.iter().copied().collect();
+                    let expected=(old.difference(&new).count(),new.difference(&old).count());
+                    for &fv in &old {model_remove(&mut model,pk,fv);}
+                    for &fv in &new {model_insert(&mut model,pk,fv);}
+                    prop_assert_eq!(index.batch_update(pk,old.into_iter().collect(),vs,step as u64).unwrap(),expected);
+                }
+                Maintenance::Compact => {index.compact_buckets();}
+                Maintenance::Checkpoint => {
+                    store.save(&index,None).unwrap();committed=model.clone();index=store.load();
+                }
+                Maintenance::FailBucket(_) | Maintenance::FailMetadata => {
+                    let failure=match action {Maintenance::FailBucket(k)=>k,_=>usize::MAX};
+                    let old_metadata=store.metadata.clone();
+                    if store.save(&index,Some(failure)).is_ok() {committed=model.clone();}
+                    else {prop_assert_eq!(&store.metadata,&old_metadata);}
+                    assert_index_matches_model(&store.load(),&committed,"failed/successful checkpoint");
+                }
+            }
+            assert_index_matches_model(&index,&model,&format!("maintenance step {step}"));
+        }
+        store.save(&index,None).unwrap();
+        assert_index_matches_model(&store.load(),&model,"final checkpoint");
+    }
+
+    #[test]
+    fn bounded_queries_preserve_global_order_and_callback_groups(
+        keys in prop::collection::vec(0u64..30,0..70),
+        spec in spec_strategy(),
+        descending in any::<bool>(),
+        limit in 1usize..12
+    ) {
+        let index=BTreeIndex::<u64,u64>::new("pages".into(),None);
+        let keys:BTreeSet<_>=keys.into_iter().collect();
+        for &key in &keys {index.insert(key,key,1).unwrap();}
+        let mut matches:Vec<_>=keys.into_iter().filter(|&key|spec.matches(key)).collect();
+        if descending {matches.reverse();}
+        matches.truncate(limit);matches.sort_unstable();
+        let expected:Vec<_>=matches.into_iter().flat_map(|k|[(k,0u8),(k,1u8)]).collect();
+        let mut seen=0;
+        let callback=|key:&u64,_:&Vec<u64>| {
+            seen+=1;(seen<limit,vec![(*key,0u8),(*key,1u8)])
+        };
+        let result=if descending {index.range_query_rev_with(spec.to_query(),callback)}
+            else {index.range_query_with(spec.to_query(),callback)};
+        prop_assert_eq!(result,expected);
+    }
+}
+
 /// A mutation in the workload.
 #[derive(Debug, Clone)]
 enum Op {
@@ -91,7 +229,7 @@ fn spec_strategy() -> impl Strategy<Value = Spec> {
         (0u64..18, 0u64..18).prop_map(|(a, b)| Spec::Between(a, b)),
         prop::collection::vec(0u64..18, 0..4).prop_map(Spec::Include),
     ];
-    leaf.prop_recursive(2, 8, 3, |inner| {
+    leaf.prop_recursive(4, 48, 4, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..3).prop_map(Spec::And),
             prop::collection::vec(inner.clone(), 0..3).prop_map(Spec::Or),

@@ -1,0 +1,284 @@
+{
+  "flush_details": [
+    {
+      "dirty_percent": 10,
+      "last_bucket_writes": 20,
+      "last_payload_bytes": 83480,
+      "latency_ms": 0
+    },
+    {
+      "dirty_percent": 10,
+      "last_bucket_writes": 20,
+      "last_payload_bytes": 83480,
+      "latency_ms": 1
+    },
+    {
+      "dirty_percent": 100,
+      "last_bucket_writes": 200,
+      "last_payload_bytes": 835152,
+      "latency_ms": 0
+    },
+    {
+      "dirty_percent": 100,
+      "last_bucket_writes": 200,
+      "last_payload_bytes": 835152,
+      "latency_ms": 1
+    }
+  ],
+  "measurements": [
+    {
+      "allocated_bytes_per_sample": 8.0,
+      "allocations_per_sample": 1.0,
+      "case": "query/ge/first",
+      "median_ns": 458,
+      "operations_per_sample": 1,
+      "operations_per_second": 2197705.595358446,
+      "p95_ns": 459,
+      "p99_ns": 1083,
+      "peak_extra_heap_bytes": 8,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 96.0,
+      "allocations_per_sample": 5.0,
+      "case": "query/and/first",
+      "median_ns": 583,
+      "operations_per_sample": 1,
+      "operations_per_second": 1696151.4323998846,
+      "p95_ns": 625,
+      "p99_ns": 2166,
+      "peak_extra_heap_bytes": 80,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 256.0,
+      "allocations_per_sample": 7.0,
+      "case": "query/or/first",
+      "median_ns": 666,
+      "operations_per_sample": 1,
+      "operations_per_second": 1488782.027423365,
+      "p95_ns": 708,
+      "p99_ns": 2334,
+      "peak_extra_heap_bytes": 200,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 152.0,
+      "allocations_per_sample": 5.0,
+      "case": "query/not/last",
+      "median_ns": 583,
+      "operations_per_sample": 1,
+      "operations_per_second": 1649321.3042832874,
+      "p95_ns": 625,
+      "p99_ns": 2000,
+      "peak_extra_heap_bytes": 128,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 488.0,
+      "allocations_per_sample": 11.0,
+      "case": "query/and/last",
+      "median_ns": 834,
+      "operations_per_sample": 1,
+      "operations_per_second": 937461.9156096784,
+      "p95_ns": 1042,
+      "p99_ns": 16000,
+      "peak_extra_heap_bytes": 312,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/1000/miss",
+      "median_ns": 42,
+      "operations_per_sample": 1,
+      "operations_per_second": 17519271.19831815,
+      "p95_ns": 84,
+      "p99_ns": 125,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/1000/tail",
+      "median_ns": 125,
+      "operations_per_sample": 1,
+      "operations_per_second": 8696408.383337682,
+      "p95_ns": 125,
+      "p99_ns": 208,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/10000/miss",
+      "median_ns": 42,
+      "operations_per_sample": 1,
+      "operations_per_second": 18047283.88377549,
+      "p95_ns": 84,
+      "p99_ns": 84,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/10000/tail",
+      "median_ns": 125,
+      "operations_per_sample": 1,
+      "operations_per_second": 8361903.169161301,
+      "p95_ns": 167,
+      "p99_ns": 167,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/100000/miss",
+      "median_ns": 42,
+      "operations_per_sample": 1,
+      "operations_per_second": 18185124.56810329,
+      "p95_ns": 84,
+      "p99_ns": 84,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/100000/tail",
+      "median_ns": 125,
+      "operations_per_sample": 1,
+      "operations_per_second": 8081461.128171974,
+      "p95_ns": 167,
+      "p99_ns": 167,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 712196.0,
+      "allocations_per_sample": 2659.4,
+      "case": "write/high_cardinality",
+      "median_ns": 644250,
+      "operations_per_sample": 2000,
+      "operations_per_second": 3088573.8903854317,
+      "p95_ns": 685084,
+      "p99_ns": 685084,
+      "peak_extra_heap_bytes": 410480,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 189911.4,
+      "allocations_per_sample": 131.6,
+      "case": "write/low_cardinality",
+      "median_ns": 289542,
+      "operations_per_sample": 2000,
+      "operations_per_second": 6877086.013605971,
+      "p95_ns": 307500,
+      "p99_ns": 307500,
+      "peak_extra_heap_bytes": 110176,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 168.0,
+      "allocations_per_sample": 4.0,
+      "case": "point_read/1_threads",
+      "median_ns": 170917,
+      "operations_per_sample": 5000,
+      "operations_per_second": 28816035.54746145,
+      "p95_ns": 215375,
+      "p99_ns": 215375,
+      "peak_extra_heap_bytes": 168,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 163940.2,
+      "allocations_per_sample": 768.85,
+      "case": "write/1_threads",
+      "median_ns": 189459,
+      "operations_per_sample": 500,
+      "operations_per_second": 2635766.3477477245,
+      "p95_ns": 197959,
+      "p99_ns": 197959,
+      "peak_extra_heap_bytes": 111416,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 552.0,
+      "allocations_per_sample": 13.0,
+      "case": "point_read/4_threads",
+      "median_ns": 814916,
+      "operations_per_sample": 20000,
+      "operations_per_second": 20078094.753448274,
+      "p95_ns": 1488417,
+      "p99_ns": 1488417,
+      "peak_extra_heap_bytes": 552,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 721652.8,
+      "allocations_per_sample": 2672.9,
+      "case": "write/4_threads",
+      "median_ns": 830125,
+      "operations_per_sample": 2000,
+      "operations_per_second": 2452752.7765621324,
+      "p95_ns": 983750,
+      "p99_ns": 983750,
+      "peak_extra_heap_bytes": 417944,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 105759.8,
+      "allocations_per_sample": 315.2,
+      "case": "flush/10_percent/0_ms_per_bucket",
+      "median_ns": 114916,
+      "operations_per_sample": 1,
+      "operations_per_second": 8561.031809797843,
+      "p95_ns": 128125,
+      "p99_ns": 128125,
+      "peak_extra_heap_bytes": 19617,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 105735.8,
+      "allocations_per_sample": 314.2,
+      "case": "flush/10_percent/1_ms_per_bucket",
+      "median_ns": 30951000,
+      "operations_per_sample": 1,
+      "operations_per_second": 31.822131291825656,
+      "p95_ns": 39322417,
+      "p99_ns": 39322417,
+      "peak_extra_heap_bytes": 19617,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 870840.0,
+      "allocations_per_sample": 499.2,
+      "case": "flush/100_percent/0_ms_per_bucket",
+      "median_ns": 1245458,
+      "operations_per_sample": 1,
+      "operations_per_second": 798.4177914310768,
+      "p95_ns": 1829250,
+      "p99_ns": 1829250,
+      "peak_extra_heap_bytes": 29123,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 870120.0,
+      "allocations_per_sample": 496.2,
+      "case": "flush/100_percent/1_ms_per_bucket",
+      "median_ns": 311497083,
+      "operations_per_sample": 1,
+      "operations_per_second": 3.206872522279996,
+      "p95_ns": 322117708,
+      "p99_ns": 322117708,
+      "peak_extra_heap_bytes": 28403,
+      "samples": 20
+    }
+  ],
+  "memory": "instrumented heap; fixture setup excluded for query/delete/flush",
+  "profile": "workspace bench/release"
+}

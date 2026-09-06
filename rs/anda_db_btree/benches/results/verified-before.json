@@ -1,0 +1,284 @@
+{
+  "flush_details": [
+    {
+      "dirty_percent": 10,
+      "last_bucket_writes": 20,
+      "last_payload_bytes": 83460,
+      "latency_ms": 0
+    },
+    {
+      "dirty_percent": 10,
+      "last_bucket_writes": 20,
+      "last_payload_bytes": 83460,
+      "latency_ms": 1
+    },
+    {
+      "dirty_percent": 100,
+      "last_bucket_writes": 200,
+      "last_payload_bytes": 834952,
+      "latency_ms": 0
+    },
+    {
+      "dirty_percent": 100,
+      "last_bucket_writes": 200,
+      "last_payload_bytes": 834952,
+      "latency_ms": 1
+    }
+  ],
+  "measurements": [
+    {
+      "allocated_bytes_per_sample": 56.0,
+      "allocations_per_sample": 3.0,
+      "case": "query/ge/first",
+      "median_ns": 500,
+      "operations_per_sample": 1,
+      "operations_per_second": 1820962.925194843,
+      "p95_ns": 542,
+      "p99_ns": 2375,
+      "peak_extra_heap_bytes": 40,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 524344.0,
+      "allocations_per_sample": 931.0,
+      "case": "query/and/first",
+      "median_ns": 235583,
+      "operations_per_sample": 1,
+      "operations_per_second": 4216.777977657739,
+      "p95_ns": 241625,
+      "p99_ns": 273750,
+      "peak_extra_heap_bytes": 233216,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 538320.0,
+      "allocations_per_sample": 1685.0,
+      "case": "query/or/first",
+      "median_ns": 630875,
+      "operations_per_sample": 1,
+      "operations_per_second": 1584.7097567632163,
+      "p95_ns": 638083,
+      "p99_ns": 643916,
+      "peak_extra_heap_bytes": 327224,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 409664.0,
+      "allocations_per_sample": 18.0,
+      "case": "query/not/last",
+      "median_ns": 285333,
+      "operations_per_sample": 1,
+      "operations_per_second": 3493.399501114604,
+      "p95_ns": 289625,
+      "p99_ns": 300958,
+      "peak_extra_heap_bytes": 278568,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 524544.0,
+      "allocations_per_sample": 934.0,
+      "case": "query/and/last",
+      "median_ns": 338208,
+      "operations_per_sample": 1,
+      "operations_per_second": 2952.610541752659,
+      "p95_ns": 343500,
+      "p99_ns": 347708,
+      "peak_extra_heap_bytes": 233256,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/1000/miss",
+      "median_ns": 375,
+      "operations_per_sample": 1,
+      "operations_per_second": 2654843.76244458,
+      "p95_ns": 375,
+      "p99_ns": 458,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/1000/tail",
+      "median_ns": 417,
+      "operations_per_sample": 1,
+      "operations_per_second": 2307816.57473864,
+      "p95_ns": 459,
+      "p99_ns": 500,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/10000/miss",
+      "median_ns": 3208,
+      "operations_per_sample": 1,
+      "operations_per_second": 313355.8531739814,
+      "p95_ns": 3209,
+      "p99_ns": 3292,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/10000/tail",
+      "median_ns": 3250,
+      "operations_per_sample": 1,
+      "operations_per_second": 306160.5628455787,
+      "p95_ns": 3292,
+      "p99_ns": 3334,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/100000/miss",
+      "median_ns": 31125,
+      "operations_per_sample": 1,
+      "operations_per_second": 32115.60590426145,
+      "p95_ns": 31250,
+      "p99_ns": 33209,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 0.0,
+      "allocations_per_sample": 0.0,
+      "case": "delete/100000/tail",
+      "median_ns": 31250,
+      "operations_per_sample": 1,
+      "operations_per_second": 31943.350384693767,
+      "p95_ns": 31334,
+      "p99_ns": 33334,
+      "peak_extra_heap_bytes": 0,
+      "samples": 100
+    },
+    {
+      "allocated_bytes_per_sample": 809931.2,
+      "allocations_per_sample": 4661.3,
+      "case": "write/high_cardinality",
+      "median_ns": 747541,
+      "operations_per_sample": 2000,
+      "operations_per_second": 2668238.0810138453,
+      "p95_ns": 782875,
+      "p99_ns": 782875,
+      "peak_extra_heap_bytes": 505128,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 126425.0,
+      "allocations_per_sample": 147.75,
+      "case": "write/low_cardinality",
+      "median_ns": 300125,
+      "operations_per_sample": 2000,
+      "operations_per_second": 6639740.306477133,
+      "p95_ns": 320083,
+      "p99_ns": 320083,
+      "peak_extra_heap_bytes": 75360,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 168.0,
+      "allocations_per_sample": 4.0,
+      "case": "point_read/1_threads",
+      "median_ns": 168292,
+      "operations_per_sample": 5000,
+      "operations_per_second": 29125503.834809463,
+      "p95_ns": 210375,
+      "p99_ns": 210375,
+      "peak_extra_heap_bytes": 168,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 186123.2,
+      "allocations_per_sample": 1269.45,
+      "case": "write/1_threads",
+      "median_ns": 213750,
+      "operations_per_sample": 500,
+      "operations_per_second": 2312428.5170534668,
+      "p95_ns": 240083,
+      "p99_ns": 240083,
+      "peak_extra_heap_bytes": 133176,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 552.0,
+      "allocations_per_sample": 13.0,
+      "case": "point_read/4_threads",
+      "median_ns": 871083,
+      "operations_per_sample": 20000,
+      "operations_per_second": 19281835.503479816,
+      "p95_ns": 1379292,
+      "p99_ns": 1379292,
+      "peak_extra_heap_bytes": 552,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 804339.6,
+      "allocations_per_sample": 4670.65,
+      "case": "write/4_threads",
+      "median_ns": 963833,
+      "operations_per_sample": 2000,
+      "operations_per_second": 2080277.2759975633,
+      "p95_ns": 1112417,
+      "p99_ns": 1112417,
+      "peak_extra_heap_bytes": 507104,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 364281.8,
+      "allocations_per_sample": 413.2,
+      "case": "flush/10_percent/0_ms_per_bucket",
+      "median_ns": 127208,
+      "operations_per_sample": 1,
+      "operations_per_second": 7766.115660760535,
+      "p95_ns": 142125,
+      "p99_ns": 142125,
+      "peak_extra_heap_bytes": 179917,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 364377.8,
+      "allocations_per_sample": 417.2,
+      "case": "flush/10_percent/1_ms_per_bucket",
+      "median_ns": 30521000,
+      "operations_per_sample": 1,
+      "operations_per_second": 31.51930736448144,
+      "p95_ns": 39643083,
+      "p99_ns": 39643083,
+      "peak_extra_heap_bytes": 179917,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 3455300.0,
+      "allocations_per_sample": 1495.2,
+      "case": "flush/100_percent/0_ms_per_bucket",
+      "median_ns": 1311583,
+      "operations_per_sample": 1,
+      "operations_per_second": 748.5275340613712,
+      "p95_ns": 1890250,
+      "p99_ns": 1890250,
+      "peak_extra_heap_bytes": 1669133,
+      "samples": 20
+    },
+    {
+      "allocated_bytes_per_sample": 3456428.0,
+      "allocations_per_sample": 1500.2,
+      "case": "flush/100_percent/1_ms_per_bucket",
+      "median_ns": 311320083,
+      "operations_per_sample": 1,
+      "operations_per_second": 3.187989950748579,
+      "p95_ns": 335193042,
+      "p99_ns": 335193042,
+      "peak_extra_heap_bytes": 1670285,
+      "samples": 20
+    }
+  ],
+  "memory": "instrumented heap; fixture setup excluded for query/delete/flush",
+  "profile": "workspace bench/release"
+}
