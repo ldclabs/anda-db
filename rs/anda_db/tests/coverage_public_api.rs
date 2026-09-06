@@ -16,8 +16,8 @@ use croaring::{Portable, Treemap};
 use futures::{StreamExt, io::AsyncWriteExt as FuturesAsyncWriteExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
-    memory::InMemory, path::Path,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult, memory::InMemory, path::Path,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -276,7 +276,7 @@ async fn create_indexed_collection(db: &AndaDB, name: &str) -> Result<Arc<Collec
                 collection
                     .create_hnsw_index("missing", HnswConfig::default())
                     .await,
-                Err(DBError::NotFound { .. })
+                Err(DBError::Schema { .. })
             ));
             assert!(matches!(
                 collection
@@ -1369,6 +1369,9 @@ async fn database_and_collection_failed_put_paths_are_reported() -> Result<(), D
         db_config("coverage_fail_db_close", None),
     )
     .await?;
+    // `flush_metadata` writes `db_meta.cbor` only when the metadata changed,
+    // so give the close something to persist before failing that write.
+    close_db.set_extension("marker".to_string(), Fv::U64(1));
     close_store.fail_next_put();
     assert!(matches!(
         close_db.close().await,
@@ -1721,4 +1724,264 @@ async fn storage_public_edge_paths() -> Result<(), DBError> {
     ));
 
     Ok(())
+}
+
+/// A B-tree field scan walks the key space, whose order is not id order:
+/// stopping it after one page used to return the ids under the smallest (or
+/// largest) *keys*, and within one key the oldest ids even for
+/// `query_last_ids`. Both methods must keep the end they promise for every
+/// filter shape.
+#[tokio::test]
+async fn query_pages_on_btree_field_filters_keep_the_requested_end() -> Result<(), DBError> {
+    let db = test_db("btree_field_pages").await?;
+    let collection = db
+        .open_or_create_collection(PublicDoc::schema()?, collection_config("docs"), async |c| {
+            c.create_btree_index_nx(&["name"]).await?;
+            c.create_btree_index_nx(&["tags"]).await?;
+            Ok(())
+        })
+        .await?;
+    // Key order is the reverse of id order: ids 1..=5 are "zed", 6..=10 "amy".
+    for i in 1..=10u64 {
+        let name = if i <= 5 { "zed" } else { "amy" };
+        let mut item = doc(0, name, 20 + i);
+        // An array field maps one document under several keys, so a bounded
+        // page has to de-duplicate before counting against `limit`.
+        item.tags = vec!["all".to_string(), format!("t{i}")];
+        assert_eq!(collection.add_from(&item).await?, i);
+    }
+    let by_name = |query: RangeQuery<Fv>| Filter::Field(("name".to_string(), query));
+
+    let zed = by_name(RangeQuery::Eq(Fv::Text("zed".to_string())));
+    assert_eq!(
+        collection.query_ids(zed.clone(), Some(2)).await?,
+        vec![1, 2]
+    );
+    assert_eq!(collection.query_last_ids(zed, Some(2)).await?, vec![4, 5]);
+
+    let everyone = by_name(RangeQuery::Gt(Fv::Text(String::new())));
+    assert_eq!(
+        collection.query_ids(everyone.clone(), Some(3)).await?,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        collection.query_last_ids(everyone, Some(3)).await?,
+        vec![8, 9, 10]
+    );
+
+    let tagged = Filter::Field(("tags".to_string(), RangeQuery::Gt(Fv::Text(String::new()))));
+    assert_eq!(
+        collection.query_ids(tagged.clone(), Some(3)).await?,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        collection.query_last_ids(tagged, Some(3)).await?,
+        vec![8, 9, 10]
+    );
+    db.close().await
+}
+
+#[tokio::test]
+async fn update_rejects_the_id_field() -> Result<(), DBError> {
+    let db = test_db("update_rejects_id").await?;
+    let collection = db
+        .open_or_create_collection(
+            PublicDoc::schema()?,
+            collection_config("docs"),
+            async |_| Ok(()),
+        )
+        .await?;
+    assert_eq!(collection.add_from(&doc(0, "alice", 30)).await?, 1);
+
+    let mut fields = BTreeMap::new();
+    fields.insert("_id".to_string(), Fv::U64(999));
+    assert!(matches!(
+        collection.update(1, fields).await,
+        Err(DBError::Schema { .. })
+    ));
+    assert_eq!(collection.get(1).await?.id(), 1);
+    db.close().await
+}
+
+/// A dead id (registered, object gone) must leave no index posting behind:
+/// `remove` used to drop it from the id set only, so `query_ids` and text
+/// search kept returning an id that `contains` denied.
+#[tokio::test]
+async fn remove_of_a_dead_id_purges_its_index_postings() -> Result<(), DBError> {
+    let store = Arc::new(InMemory::new());
+    let db = AndaDB::create(store.clone(), db_config("dead_id_remove", None)).await?;
+    let collection = db
+        .open_or_create_collection(PublicDoc::schema()?, collection_config("docs"), async |c| {
+            c.create_btree_index_nx(&["name"]).await?;
+            c.create_bm25_index_nx(&["body"]).await?;
+            Ok(())
+        })
+        .await?;
+    for i in 1..=3u64 {
+        assert_eq!(collection.add_from(&doc(0, "alice", 20 + i)).await?, i);
+    }
+    // Tear the document out from under the collection, as a crash would.
+    store
+        .delete(&Path::from("dead_id_remove/docs/data/2.cbor"))
+        .await
+        .unwrap();
+
+    assert!(collection.remove(2).await?.is_none());
+    assert!(!collection.contains(2));
+    let alice = Filter::Field((
+        "name".to_string(),
+        RangeQuery::Eq(Fv::Text("alice".to_string())),
+    ));
+    assert_eq!(collection.query_all_ids(alice).await?, vec![1, 3]);
+    let hits = collection
+        .search_ids(Query {
+            search: Some(Search {
+                text: Some("body".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(hits, vec![1, 3]);
+    db.close().await
+}
+
+/// Read-only is "persist nothing", not an error: a periodic flush must not
+/// fail on every interval because an operator toggled the mode.
+#[tokio::test]
+async fn flush_is_a_no_op_in_read_only_mode() -> Result<(), DBError> {
+    let db = test_db("read_only_flush").await?;
+    let collection = db
+        .open_or_create_collection(
+            PublicDoc::schema()?,
+            collection_config("docs"),
+            async |_| Ok(()),
+        )
+        .await?;
+    collection.add_from(&doc(0, "alice", 30)).await?;
+
+    db.set_read_only(true);
+    assert!(!collection.flush(anda_db::unix_ms()).await?);
+    db.flush().await?;
+
+    db.set_read_only(false);
+    assert!(collection.flush(anda_db::unix_ms()).await?);
+    db.close().await
+}
+
+/// `db_meta.cbor` is rewritten only when the in-memory metadata changed.
+///
+/// The store is armed to fail the next write of exactly that object, which
+/// makes the skip observable instead of inferred from a put counter that also
+/// moves with the wall-clock-rate-limited storage metadata object: a flush
+/// with nothing to persist must succeed (it leaves the armed failure
+/// unspent), and the next flush that does carry a change must hit it.
+#[tokio::test]
+async fn database_flush_skips_unchanged_metadata() -> Result<(), DBError> {
+    let store = Arc::new(FailPutStore::new("db_meta.cbor"));
+    let db = AndaDB::create(store.clone(), db_config("db_meta_skip", None)).await?;
+    db.set_extension("marker".to_string(), Fv::U64(1));
+    db.flush().await?;
+
+    store.fail_next_put();
+    db.flush().await?;
+    db.flush().await?;
+
+    db.set_extension("marker".to_string(), Fv::U64(2));
+    assert!(matches!(db.flush().await, Err(DBError::Storage { .. })));
+    // The failed write left the version unclaimed, so the retry writes again.
+    db.flush().await?;
+
+    // An update helper that decides to change nothing must not dirty the
+    // metadata either.
+    assert!(db.remove_extension("absent").await?.is_none());
+    assert!(
+        db.set_extension_with("marker".to_string(), |_| None)
+            .is_none()
+    );
+    store.fail_next_put();
+    db.flush().await?;
+    Ok(())
+}
+
+/// An already-open handle cannot be upgraded in place; asking for a newer
+/// schema must not silently hand back the handle with the old one.
+#[tokio::test]
+async fn open_or_create_rejects_a_newer_schema_for_an_open_handle() -> Result<(), DBError> {
+    let db = test_db("open_handle_schema").await?;
+    let _v1 = db
+        .open_or_create_collection(schema_v1()?, collection_config("docs"), async |_| Ok(()))
+        .await?;
+    assert!(matches!(
+        db.open_or_create_collection(schema_v2()?, collection_config("docs"), async |_| Ok(()))
+            .await,
+        Err(DBError::Schema { .. })
+    ));
+    // The same (or an older) schema keeps returning the open handle.
+    db.open_or_create_collection(schema_v1()?, collection_config("docs"), async |_| Ok(()))
+        .await?;
+    db.close_collection("docs").await?;
+    let v2 = db
+        .open_or_create_collection(schema_v2()?, collection_config("docs"), async |_| Ok(()))
+        .await?;
+    assert_eq!(v2.schema().version(), 2);
+    db.close().await
+}
+
+/// The checkpoint bitmap is carried across flushes and reconciled from the
+/// ids that moved, so every path that mutates the id set has to record its
+/// id or the persisted set silently drifts from memory. Interleaving
+/// mutations with checkpoints (so the later flushes go through the delta
+/// rather than the seed), sweeping a torn-out object through the batch path,
+/// and then reopening proves the two still agree.
+#[tokio::test]
+async fn persisted_ids_track_the_id_set_across_checkpoints() -> Result<(), DBError> {
+    let store = Arc::new(InMemory::new());
+    let db = AndaDB::create(store.clone(), db_config("ids_delta", None)).await?;
+    let collection = db
+        .open_or_create_collection(
+            PublicDoc::schema()?,
+            collection_config("docs"),
+            async |_| Ok(()),
+        )
+        .await?;
+
+    let mut expected: Vec<u64> = Vec::new();
+    for round in 0..3u64 {
+        for i in 0..5u64 {
+            expected.push(
+                collection
+                    .add_from(&doc(0, "alice", round * 10 + i))
+                    .await?,
+            );
+        }
+        let victim = expected[(round * 4) as usize];
+        assert!(collection.remove(victim).await?.is_some());
+        expected.retain(|id| *id != victim);
+        assert!(collection.flush(anda_db::unix_ms()).await?);
+        assert_eq!(collection.ids(), expected);
+    }
+
+    // The batch path: tear an object out and let `reconcile_storage` sweep
+    // the id, which drops it through `heal_missing_docs` rather than through
+    // `remove`.
+    let torn = expected[0];
+    store
+        .delete(&Path::from(format!("ids_delta/docs/data/{torn}.cbor")))
+        .await
+        .unwrap();
+    assert_eq!(collection.reconcile_storage().await?, (0, 1));
+    expected.retain(|id| *id != torn);
+    assert!(collection.flush(anda_db::unix_ms()).await?);
+    db.close().await?;
+
+    // Reopen: `ids.cbor` is now the only source of the id set.
+    let db = AndaDB::open(store, db_config("ids_delta", None)).await?;
+    let reopened = db
+        .open_collection("docs".to_string(), async |_| Ok(()))
+        .await?;
+    assert_eq!(reopened.ids(), expected);
+    assert_eq!(reopened.len(), expected.len());
+    assert!(!reopened.contains(torn));
+    db.close().await
 }

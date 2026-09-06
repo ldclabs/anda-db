@@ -259,7 +259,7 @@ impl BM25 {
             return Ok(());
         }
 
-        log::warn!(
+        log::info!(
             "Compacted BM25 index '{}': {} -> {} buckets",
             self.name,
             old_bucket_count,

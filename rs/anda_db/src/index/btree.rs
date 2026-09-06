@@ -32,6 +32,44 @@ pub enum BTree {
     Bytes(InnerBTree<Vec<u8>>),
 }
 
+/// Runs `$body` with `$btree` bound to the concrete `InnerBTree` behind any
+/// variant, for code that does not depend on the key type.
+macro_rules! with_inner {
+    ($self:expr, |$btree:ident| $body:expr) => {
+        match $self {
+            BTree::I64($btree) => $body,
+            BTree::U64($btree) => $body,
+            BTree::String($btree) => $body,
+            BTree::Bytes($btree) => $body,
+        }
+    };
+}
+
+/// Like [`with_inner!`], and additionally binds `$key` to the variant's
+/// native key type, for code that converts field values into keys.
+macro_rules! with_typed_inner {
+    ($self:expr, |$btree:ident, $key:ident| $body:expr) => {
+        match $self {
+            BTree::I64($btree) => {
+                type $key = i64;
+                $body
+            }
+            BTree::U64($btree) => {
+                type $key = u64;
+                $body
+            }
+            BTree::String($btree) => {
+                type $key = String;
+                $body
+            }
+            BTree::Bytes($btree) => {
+                type $key = Vec<u8>;
+                $body
+            }
+        }
+    };
+}
+
 impl Debug for BTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -58,12 +96,7 @@ impl PartialEq for &BTree {
 impl Eq for &BTree {}
 impl Hash for &BTree {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            BTree::I64(btree) => btree.name.hash(state),
-            BTree::U64(btree) => btree.name.hash(state),
-            BTree::String(btree) => btree.name.hash(state),
-            BTree::Bytes(btree) => btree.name.hash(state),
-        }
+        with_inner!(self, |btree| btree.name.hash(state))
     }
 }
 
@@ -291,52 +324,27 @@ impl BTree {
 
     /// Returns the stable index name.
     pub fn name(&self) -> &str {
-        match self {
-            BTree::I64(btree) => &btree.name,
-            BTree::U64(btree) => &btree.name,
-            BTree::String(btree) => &btree.name,
-            BTree::Bytes(btree) => &btree.name,
-        }
+        with_inner!(self, |btree| &btree.name)
     }
 
     /// Returns the physical fields represented by this index.
     pub fn virtual_field(&self) -> &[String] {
-        match self {
-            BTree::I64(btree) => &btree.fields,
-            BTree::U64(btree) => &btree.fields,
-            BTree::String(btree) => &btree.fields,
-            BTree::Bytes(btree) => &btree.fields,
-        }
+        with_inner!(self, |btree| &btree.fields)
     }
 
     /// Returns whether multiple documents may share the same indexed key.
     pub fn allow_duplicates(&self) -> bool {
-        match self {
-            BTree::I64(btree) => btree.index.allow_duplicates(),
-            BTree::U64(btree) => btree.index.allow_duplicates(),
-            BTree::String(btree) => btree.index.allow_duplicates(),
-            BTree::Bytes(btree) => btree.index.allow_duplicates(),
-        }
+        with_inner!(self, |btree| btree.index.allow_duplicates())
     }
 
     /// Returns a snapshot of B-tree runtime statistics.
     pub fn stats(&self) -> BTreeStats {
-        match self {
-            BTree::I64(btree) => btree.index.stats(),
-            BTree::U64(btree) => btree.index.stats(),
-            BTree::String(btree) => btree.index.stats(),
-            BTree::Bytes(btree) => btree.index.stats(),
-        }
+        with_inner!(self, |btree| btree.index.stats())
     }
 
     /// Returns a snapshot of B-tree metadata.
     pub fn metadata(&self) -> BTreeMetadata {
-        match self {
-            BTree::I64(btree) => btree.index.metadata(),
-            BTree::U64(btree) => btree.index.metadata(),
-            BTree::String(btree) => btree.index.metadata(),
-            BTree::Bytes(btree) => btree.index.metadata(),
-        }
+        with_inner!(self, |btree| btree.index.metadata())
     }
 
     fn convert_array_values<FV, I>(&self, field_values: I) -> Result<Vec<FV>, DBError>
@@ -423,36 +431,13 @@ impl BTree {
         field_values: Vec<Fv>,
         now_ms: u64,
     ) -> Result<usize, DBError> {
-        match &self {
-            BTree::I64(btree) => {
-                let values = self.convert_array_values::<i64, _>(field_values)?;
-                btree
-                    .index
-                    .insert_array(doc_id, values, now_ms)
-                    .map_err(DBError::from)
-            }
-            BTree::U64(btree) => {
-                let values = self.convert_array_values::<u64, _>(field_values)?;
-                btree
-                    .index
-                    .insert_array(doc_id, values, now_ms)
-                    .map_err(DBError::from)
-            }
-            BTree::String(btree) => {
-                let values = self.convert_array_values::<String, _>(field_values)?;
-                btree
-                    .index
-                    .insert_array(doc_id, values, now_ms)
-                    .map_err(DBError::from)
-            }
-            BTree::Bytes(btree) => {
-                let values = self.convert_array_values::<Vec<u8>, _>(field_values)?;
-                btree
-                    .index
-                    .insert_array(doc_id, values, now_ms)
-                    .map_err(DBError::from)
-            }
-        }
+        with_typed_inner!(self, |btree, Key| {
+            let values = self.convert_array_values::<Key, _>(field_values)?;
+            btree
+                .index
+                .insert_array(doc_id, values, now_ms)
+                .map_err(DBError::from)
+        })
     }
 
     /// Removes an indexed value for `doc_id`.
@@ -571,24 +556,10 @@ impl BTree {
         field_values: Vec<Fv>,
         now_ms: u64,
     ) -> Result<usize, DBError> {
-        match &self {
-            BTree::I64(btree) => {
-                let values = self.convert_array_values::<i64, _>(field_values)?;
-                Ok(btree.index.remove_array(doc_id, values, now_ms))
-            }
-            BTree::U64(btree) => {
-                let values = self.convert_array_values::<u64, _>(field_values)?;
-                Ok(btree.index.remove_array(doc_id, values, now_ms))
-            }
-            BTree::String(btree) => {
-                let values = self.convert_array_values::<String, _>(field_values)?;
-                Ok(btree.index.remove_array(doc_id, values, now_ms))
-            }
-            BTree::Bytes(btree) => {
-                let values = self.convert_array_values::<Vec<u8>, _>(field_values)?;
-                Ok(btree.index.remove_array(doc_id, values, now_ms))
-            }
-        }
+        with_typed_inner!(self, |btree, Key| {
+            let values = self.convert_array_values::<Key, _>(field_values)?;
+            Ok(btree.index.remove_array(doc_id, values, now_ms))
+        })
     }
 
     /// Applies an array-style batch update and returns `(removed, inserted)`.
@@ -599,44 +570,15 @@ impl BTree {
         new_field_values: &[Fv],
         now_ms: u64,
     ) -> Result<(usize, usize), DBError> {
-        match &self {
-            BTree::I64(btree) => {
-                let old_field_values =
-                    self.convert_array_values::<i64, _>(old_field_values.iter().cloned())?;
-                let new_field_values =
-                    self.convert_array_values::<i64, _>(new_field_values.iter().cloned())?;
-                Ok(btree
-                    .index
-                    .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
-            }
-            BTree::U64(btree) => {
-                let old_field_values =
-                    self.convert_array_values::<u64, _>(old_field_values.iter().cloned())?;
-                let new_field_values =
-                    self.convert_array_values::<u64, _>(new_field_values.iter().cloned())?;
-                Ok(btree
-                    .index
-                    .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
-            }
-            BTree::String(btree) => {
-                let old_field_values =
-                    self.convert_array_values::<String, _>(old_field_values.iter().cloned())?;
-                let new_field_values =
-                    self.convert_array_values::<String, _>(new_field_values.iter().cloned())?;
-                Ok(btree
-                    .index
-                    .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
-            }
-            BTree::Bytes(btree) => {
-                let old_field_values =
-                    self.convert_array_values::<Vec<u8>, _>(old_field_values.iter().cloned())?;
-                let new_field_values =
-                    self.convert_array_values::<Vec<u8>, _>(new_field_values.iter().cloned())?;
-                Ok(btree
-                    .index
-                    .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
-            }
-        }
+        with_typed_inner!(self, |btree, Key| {
+            let old_field_values =
+                self.convert_array_values::<Key, _>(old_field_values.iter().cloned())?;
+            let new_field_values =
+                self.convert_array_values::<Key, _>(new_field_values.iter().cloned())?;
+            Ok(btree
+                .index
+                .batch_update(doc_id, old_field_values, new_field_values, now_ms)?)
+        })
     }
 
     /// Executes `f` with the document ids matching an exact key.
@@ -689,34 +631,15 @@ impl BTree {
             name: self.name().to_string(),
             source,
         };
-        macro_rules! scan {
-            ($index:expr, $q:expr) => {{
-                let cb = |_: &_, pks: &Vec<DocumentId>| (f(pks), Vec::<()>::new());
-                if descending {
-                    $index.range_query_rev_with($q, cb);
-                } else {
-                    $index.range_query_with($q, cb);
-                }
-            }};
-        }
-        match self {
-            BTree::I64(btree) => {
-                let q = RangeQuery::<i64>::try_convert_from(query).map_err(type_error)?;
-                scan!(btree.index, q);
+        with_typed_inner!(self, |btree, Key| {
+            let q = RangeQuery::<Key>::try_convert_from(query).map_err(type_error)?;
+            let cb = |_: &Key, pks: &Vec<DocumentId>| (f(pks), Vec::<()>::new());
+            if descending {
+                btree.index.range_query_rev_with(q, cb);
+            } else {
+                btree.index.range_query_with(q, cb);
             }
-            BTree::U64(btree) => {
-                let q = RangeQuery::<u64>::try_convert_from(query).map_err(type_error)?;
-                scan!(btree.index, q);
-            }
-            BTree::String(btree) => {
-                let q = RangeQuery::<String>::try_convert_from(query).map_err(type_error)?;
-                scan!(btree.index, q);
-            }
-            BTree::Bytes(btree) => {
-                let q = RangeQuery::<Vec<u8>>::try_convert_from(query).map_err(type_error)?;
-                scan!(btree.index, q);
-            }
-        }
+        });
         Ok(())
     }
 
@@ -815,43 +738,23 @@ impl BTree {
     /// manifest commit of the following flush, which also retires every
     /// pre-compaction bucket object best-effort.
     pub async fn compact_index(&self) -> Result<(), DBError> {
-        match self {
-            BTree::I64(btree) => btree.compact().await,
-            BTree::U64(btree) => btree.compact().await,
-            BTree::String(btree) => btree.compact().await,
-            BTree::Bytes(btree) => btree.compact().await,
-        }
+        with_inner!(self, |btree| btree.compact().await)
     }
 
     /// Persists dirty metadata and buckets.
     ///
     /// Returns `true` when any object was written.
     pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        match self {
-            BTree::I64(btree) => btree.flush(now_ms).await,
-            BTree::U64(btree) => btree.flush(now_ms).await,
-            BTree::String(btree) => btree.flush(now_ms).await,
-            BTree::Bytes(btree) => btree.flush(now_ms).await,
-        }
+        with_inner!(self, |btree| btree.flush(now_ms).await)
     }
 
     /// Returns whether metadata or buckets have in-memory changes to flush.
     pub fn has_pending_flush(&self) -> bool {
-        match self {
-            BTree::I64(btree) => btree.has_pending_flush(),
-            BTree::U64(btree) => btree.has_pending_flush(),
-            BTree::String(btree) => btree.has_pending_flush(),
-            BTree::Bytes(btree) => btree.has_pending_flush(),
-        }
+        with_inner!(self, |btree| btree.has_pending_flush())
     }
 
     pub(crate) async fn drop_data(&self) {
-        let rt = match self {
-            BTree::I64(btree) => btree.drop_data().await,
-            BTree::U64(btree) => btree.drop_data().await,
-            BTree::String(btree) => btree.drop_data().await,
-            BTree::Bytes(btree) => btree.drop_data().await,
-        };
+        let rt = with_inner!(self, |btree| btree.drop_data().await);
 
         if let Err(err) = rt {
             log::warn!(
@@ -1019,7 +922,7 @@ where
             return Ok(());
         }
 
-        log::warn!(
+        log::info!(
             "Compacted BTree index '{}': {} -> {} buckets",
             self.name,
             old_bucket_count,

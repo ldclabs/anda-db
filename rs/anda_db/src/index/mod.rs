@@ -177,42 +177,6 @@ fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
     }
 }
 
-/// Recursively appends text values found inside JSON data.
-///
-/// Arrays whose first element is not a string or object are treated as scalar
-/// arrays and skipped to avoid indexing arbitrary numeric/vector payloads.
-pub fn extract_json_text<'a>(texts: &mut Vec<&'a str>, val: &'a Json) {
-    let mut nodes = 0usize;
-    let mut stack = vec![(val, 0usize)];
-
-    while let Some((val, depth)) = stack.pop() {
-        if texts.len() >= MAX_SEARCHABLE_TEXT_FRAGMENTS {
-            return;
-        }
-        nodes = nodes.saturating_add(1);
-        if nodes > MAX_SEARCHABLE_TEXT_NODES {
-            return;
-        }
-
-        match val {
-            Json::String(s) => texts.push(s),
-            Json::Object(obj) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
-                let values: Vec<_> = obj.values().collect();
-                for val in values.into_iter().rev() {
-                    stack.push((val, depth + 1));
-                }
-            }
-            Json::Array(arr)
-                if depth < MAX_SEARCHABLE_TEXT_DEPTH
-                    && (arr.is_empty() || matches!(arr[0], Json::String(_) | Json::Object(_))) =>
-            {
-                stack.extend(arr.iter().rev().map(|val| (val, depth + 1)));
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Default physical-field indexing behavior.
 pub struct DefaultIndexHooks;
 
@@ -398,33 +362,13 @@ mod tests {
 
     #[test]
     fn test_extract_json_text_edge_cases() {
-        // 测试 extract_json_text 的边界情况
-        let mut texts = Vec::new();
-
-        // 测试空对象
-        let empty_obj = json!({});
-        extract_json_text(&mut texts, &empty_obj);
-        assert!(texts.is_empty());
-
-        // 测试空数组
-        let empty_arr = json!([]);
-        extract_json_text(&mut texts, &empty_arr);
-        assert!(texts.is_empty());
-
-        // 测试 null 值
-        let null_val = json!(null);
-        extract_json_text(&mut texts, &null_val);
-        assert!(texts.is_empty());
-
-        // 测试数字
-        let number_val = json!(42);
-        extract_json_text(&mut texts, &number_val);
-        assert!(texts.is_empty());
-
-        // 测试布尔值
-        let bool_val = json!(true);
-        extract_json_text(&mut texts, &bool_val);
-        assert!(texts.is_empty());
+        // JSON 值里没有文本时（空对象、空数组、null、数字、布尔）不产出任何片段
+        for value in [json!({}), json!([]), json!(null), json!(42), json!(true)] {
+            let field = Fv::Json(value);
+            let mut texts = Vec::new();
+            extract_text(&mut texts, &field);
+            assert!(texts.is_empty(), "{field:?}");
+        }
     }
 
     #[tokio::test]

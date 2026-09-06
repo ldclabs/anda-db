@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::{
     fmt::Debug,
@@ -41,6 +41,13 @@ struct InnerDB {
     storage: Storage,
     /// Database metadata protected by a read-write lock
     metadata: RwLock<DBMetadata>,
+    /// Bumped under the `metadata` write lock on every in-memory change
+    /// (see [`AndaDB::update_metadata`]). `flush_metadata` writes the
+    /// metadata object only while `saved_metadata_version` lags behind, so
+    /// a periodic flush with nothing changed does not rewrite it.
+    metadata_version: AtomicU64,
+    /// The `metadata_version` the last successful metadata PUT captured.
+    saved_metadata_version: AtomicU64,
     /// Serializes the complete database-metadata persistence transaction.
     ///
     /// Collection lifecycle locks are intentionally per name, so operations
@@ -205,6 +212,8 @@ impl AndaDB {
                 object_store,
                 storage,
                 metadata: RwLock::new(metadata),
+                metadata_version: AtomicU64::new(0),
+                saved_metadata_version: AtomicU64::new(0),
                 metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
                 collections: RwLock::new(BTreeMap::new()),
                 read_only: Arc::new(AtomicBool::new(false)),
@@ -273,6 +282,8 @@ impl AndaDB {
                         object_store,
                         storage,
                         metadata: RwLock::new(metadata),
+                        metadata_version: AtomicU64::new(0),
+                        saved_metadata_version: AtomicU64::new(0),
                         metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
                         collections: RwLock::new(BTreeMap::new()),
                         read_only: Arc::new(AtomicBool::new(false)),
@@ -301,6 +312,64 @@ impl AndaDB {
         self.inner.metadata.read().clone()
     }
 
+    /// Applies `f` to the in-memory metadata and marks it as changed, so the
+    /// next [`AndaDB::flush_metadata`] persists it. The version is bumped
+    /// while the write lock is held: a flush that reads the version and
+    /// clones the snapshot under the read lock therefore sees both or
+    /// neither.
+    fn update_metadata<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut DBMetadata) -> R,
+    {
+        self.update_metadata_if(|metadata| (f(metadata), true))
+    }
+
+    /// Like [`AndaDB::update_metadata`], but `f` reports whether it actually
+    /// changed anything as the second element of its return.
+    ///
+    /// A helper that inspects the metadata and decides to make no change
+    /// (an update closure returning `None`, a removal of an absent key) must
+    /// not mark it dirty: bumping the version there would make the next
+    /// `flush_metadata` rewrite `db_meta.cbor` for nothing, which is exactly
+    /// the write the version gate exists to skip.
+    fn update_metadata_if<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut DBMetadata) -> (R, bool),
+    {
+        let mut metadata = self.inner.metadata.write();
+        let (rt, changed) = f(&mut metadata);
+        if changed {
+            self.inner.metadata_version.fetch_add(1, Ordering::AcqRel);
+        }
+        rt
+    }
+
+    /// An already-open handle cannot be upgraded in place — its schema is
+    /// shared with every in-flight operation — so a caller asking for a
+    /// newer schema than the open handle carries gets an error, not a handle
+    /// that silently rejects the fields its schema does not know. Close the
+    /// collection first, then reopen it with the new schema.
+    fn ensure_open_handle_schema(
+        collection: &Collection,
+        schema: Option<&Schema>,
+    ) -> Result<(), DBError> {
+        if let Some(schema) = schema
+            && schema.needs_upgrade(&collection.schema())
+        {
+            return Err(DBError::Schema {
+                name: collection.name().to_string(),
+                source: format!(
+                    "collection is open with schema version {}, but version {} was requested; \
+                     close it before upgrading the schema",
+                    collection.schema().version(),
+                    schema.version()
+                )
+                .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns whether the database currently rejects mutations.
     ///
     /// This is a point-in-time observation intended for API boundaries that
@@ -324,7 +393,7 @@ impl AndaDB {
     /// * `read_only` - Whether to enable read-only mode
     pub fn set_read_only(&self, read_only: bool) {
         self.inner.read_only.store(read_only, Ordering::Release);
-        log::warn!(
+        log::info!(
             action = "AndaDB::set_read_only",
             database = self.inner.name;
             "Database is set to read-only: {read_only}"
@@ -377,7 +446,7 @@ impl AndaDB {
         match self.flush_metadata(unix_ms()).await {
             Ok(_) => {
                 let elapsed = start.elapsed();
-                log::warn!(
+                log::info!(
                     action = "AndaDB::close",
                     database = self.inner.name,
                     elapsed = elapsed.as_millis();
@@ -473,7 +542,7 @@ impl AndaDB {
             match self.flush().await {
                 Ok(_) => {
                     let elapsed = start.elapsed();
-                    log::warn!(
+                    log::info!(
                         action = "AndaDB::auto_flush",
                         database = self.inner.name,
                         elapsed = elapsed.as_millis();
@@ -633,18 +702,16 @@ impl AndaDB {
         {
             let mut collections = self.inner.collections.write();
             collections.insert(collection.name().to_string(), collection.clone());
-            self.inner
-                .metadata
-                .write()
-                .collections
-                .insert(collection.name().to_string());
+            self.update_metadata(|metadata| {
+                metadata.collections.insert(collection.name().to_string());
+            });
         }
 
         let now = unix_ms();
         collection.flush(now).await?;
         self.flush_metadata(now).await?;
         let elapsed = start.elapsed();
-        log::warn!(
+        log::info!(
             action = "AndaDB::create_collection",
             database = self.inner.name,
             collection = collection.name(),
@@ -720,6 +787,7 @@ impl AndaDB {
             if let Some(collection) = self.inner.collections.read().get(&config.name)
                 && collection.is_active_handle()
             {
+                Self::ensure_open_handle_schema(collection, Some(&schema))?;
                 return Ok(collection.clone());
             }
         }
@@ -843,6 +911,7 @@ impl AndaDB {
             if let Some(collection) = self.inner.collections.read().get(&name)
                 && collection.is_active_handle()
             {
+                Self::ensure_open_handle_schema(collection, schema.as_ref())?;
                 return Ok(collection.clone());
             }
         }
@@ -884,6 +953,7 @@ impl AndaDB {
         let retiring = { self.inner.collections.read().get(&name).cloned() };
         if let Some(collection) = retiring {
             if collection.is_active_handle() {
+                Self::ensure_open_handle_schema(&collection, schema.as_ref())?;
                 return Ok(collection);
             }
             if collection.is_poisoned() {
@@ -1043,8 +1113,12 @@ impl AndaDB {
 
         // Always persist the current no-name snapshot, including on a retry
         // where an earlier cancelled call already removed it from memory but
-        // may not have completed the object-store PUT.
-        self.inner.metadata.write().collections.remove(name);
+        // may not have completed the object-store PUT: the version bump
+        // below is claimed only by a PUT that succeeded, so the retry's
+        // flush writes again.
+        self.update_metadata(|metadata| {
+            metadata.collections.remove(name);
+        });
         self.flush_metadata(unix_ms()).await?;
 
         // Keep a registered handle reachable until its drain and prefix drop
@@ -1088,9 +1162,7 @@ impl AndaDB {
     }
 
     async fn set_lock(&self, lock: ByteBufB64) -> Result<(), DBError> {
-        {
-            self.inner.metadata.write().config.lock = Some(lock);
-        }
+        self.update_metadata(|metadata| metadata.config.lock = Some(lock));
         self.flush_metadata(unix_ms()).await
     }
 
@@ -1110,12 +1182,29 @@ impl AndaDB {
         // older waiter must observe changes made while it was queued instead
         // of writing its stale clone after the newer operation.
         let _flush_guard = self.inner.metadata_flush_lock.clone().lock_owned().await;
-        let metadata = self.metadata();
+        // Version and snapshot are taken under the same lock the mutators
+        // bump under (`update_metadata`), so the version describes exactly
+        // this snapshot.
+        let (version, metadata) = {
+            let metadata = self.inner.metadata.read();
+            (
+                self.inner.metadata_version.load(Ordering::Acquire),
+                metadata.clone(),
+            )
+        };
 
-        self.inner
-            .storage
-            .put(Self::METADATA_PATH, &metadata, None)
-            .await?;
+        if self.inner.saved_metadata_version.load(Ordering::Acquire) < version {
+            self.inner
+                .storage
+                .put(Self::METADATA_PATH, &metadata, None)
+                .await?;
+            // Claimed only after the PUT succeeded: a failed or cancelled
+            // write leaves the version unclaimed, so the next flush (or a
+            // `delete_collection` retry) writes the snapshot again.
+            self.inner
+                .saved_metadata_version
+                .fetch_max(version, Ordering::AcqRel);
+        }
         self.inner.storage.store_metadata(0, now_ms).await?;
         Ok(())
     }
@@ -1147,7 +1236,9 @@ impl AndaDB {
             );
             return;
         }
-        self.inner.metadata.write().extensions.insert(key, value);
+        self.update_metadata(|metadata| {
+            metadata.extensions.insert(key, value);
+        });
     }
 
     /// Sets a user-defined extension key-value pair by serializing the value from a generic type.
@@ -1190,10 +1281,10 @@ impl AndaDB {
     where
         F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
     {
-        let mut meta = self.inner.metadata.write();
-        let old_value = meta.extensions.get(&key);
-        let new_value = f(old_value);
-        if let Some(value) = new_value {
+        self.update_metadata_if(|meta| {
+            let Some(value) = f(meta.extensions.get(&key)) else {
+                return (None, false);
+            };
             if let Err(err) = value.validate_complexity() {
                 log::warn!(
                     action = "AndaDB::set_extension_with",
@@ -1201,12 +1292,10 @@ impl AndaDB {
                     key = key;
                     "Dropping extension value that exceeds complexity limits: {err:?}",
                 );
-                return None;
+                return (None, false);
             }
-            meta.extensions.insert(key, value)
-        } else {
-            None
-        }
+            (meta.extensions.insert(key, value), true)
+        })
     }
 
     /// Updates a user-defined extension by deserializing the current value, applying a function, and serializing the new value.
@@ -1215,12 +1304,23 @@ impl AndaDB {
         F: FnOnce(Option<T>) -> Option<T>,
         T: Serialize + DeserializeOwned,
     {
-        let mut meta = self.inner.metadata.write();
-        let old_value = meta.extensions.get(&key);
-        let new_value = f(old_value.and_then(|v| v.clone().deserialized().ok()));
-        if let Some(value) = new_value
-            && let Ok(value) = FieldValue::serialized(&value, None)
-        {
+        self.update_metadata_if(|meta| {
+            let old_value = meta.extensions.get(&key);
+            let Some(value) = f(old_value.and_then(|v| v.clone().deserialized().ok())) else {
+                return (None, false);
+            };
+            let value = match FieldValue::serialized(&value, None) {
+                Ok(value) => value,
+                Err(err) => {
+                    log::warn!(
+                        action = "AndaDB::set_extension_from_with",
+                        database = self.inner.name,
+                        key = key;
+                        "Dropping extension value that failed to serialize: {err:?}",
+                    );
+                    return (None, false);
+                }
+            };
             if let Err(err) = value.validate_complexity() {
                 log::warn!(
                     action = "AndaDB::set_extension_from_with",
@@ -1228,12 +1328,15 @@ impl AndaDB {
                     key = key;
                     "Dropping extension value that exceeds complexity limits: {err:?}",
                 );
-                return None;
+                return (None, false);
             }
-            let old = meta.extensions.insert(key, value);
-            return old.and_then(|v| v.deserialized().ok());
-        }
-        None
+            (
+                meta.extensions
+                    .insert(key, value)
+                    .and_then(|v| v.deserialized().ok()),
+                true,
+            )
+        })
     }
 
     /// Sets a user-defined extension key-value pair and immediately persists the change.
@@ -1247,9 +1350,9 @@ impl AndaDB {
         }
         value.validate_complexity()?;
 
-        {
-            self.inner.metadata.write().extensions.insert(key, value);
-        }
+        self.update_metadata(|metadata| {
+            metadata.extensions.insert(key, value);
+        });
         self.flush_metadata(unix_ms()).await
     }
 
@@ -1272,7 +1375,11 @@ impl AndaDB {
             });
         }
 
-        let old = { self.inner.metadata.write().extensions.remove(key) };
+        let old = self.update_metadata_if(|metadata| {
+            let old = metadata.extensions.remove(key);
+            let changed = old.is_some();
+            (old, changed)
+        });
         if old.is_some() {
             self.flush_metadata(unix_ms()).await?;
         }
@@ -1774,7 +1881,9 @@ mod tests {
             .set_field("name", FieldValue::Text("blocked".to_string()))
             .unwrap();
         assert!(reopened.add(document).await.is_err());
-        assert!(reopened.flush(unix_ms()).await.is_err());
+        // Read-only is "persist nothing", not an error: the periodic flush
+        // reports "nothing flushed" instead of failing on every interval.
+        assert!(!reopened.flush(unix_ms()).await.unwrap());
 
         let err = db
             .save_extension("blocked".to_string(), FieldValue::Text("value".to_string()))

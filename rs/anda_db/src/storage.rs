@@ -314,7 +314,9 @@ impl Storage {
             stats,
         };
 
-        let storage = Storage::new(object_store.clone(), metadata)?;
+        // The probe instance reads one small object and is then discarded:
+        // it gets no cache.
+        let storage = Storage::new(object_store.clone(), metadata, false)?;
         match storage
             .fetch::<StorageMetadata>(Storage::METADATA_PATH)
             .await
@@ -349,9 +351,9 @@ impl Storage {
                     metadata.path = storage.inner.metadata.path.clone();
                 }
 
-                Storage::new(object_store, metadata)
+                Storage::new(object_store, metadata, true)
             }
-            Err(DBError::NotFound { .. }) => Ok(storage),
+            Err(DBError::NotFound { .. }) => Storage::new(object_store, storage.metadata(), true),
             Err(err) => Err(err),
         }
     }
@@ -428,6 +430,7 @@ impl Storage {
     fn new(
         object_store: Arc<dyn ObjectStore>,
         metadata: StorageMetadata,
+        with_cache: bool,
     ) -> Result<Storage, DBError> {
         // The cache capacity semantics follow the configuration (see
         // `StorageConfig`): `cache_max_bytes`, when set, bounds the total
@@ -436,22 +439,26 @@ impl Storage {
         // is persisted at first initialization, so re-interpreting the same
         // number under a different unit would silently shrink or grow the
         // cache of existing deployments.
-        let cache = match metadata.config.cache_max_bytes {
-            Some(max_bytes) if max_bytes > 0 => Some(
-                Cache::builder()
-                    .max_capacity(max_bytes)
-                    .weigher(|_key: &Path, value: &Arc<CachedObject>| {
-                        value.bytes.len().clamp(1, u32::MAX as usize) as u32
-                    })
-                    .build(),
-            ),
-            Some(_) => None,
-            None if metadata.config.cache_max_capacity > 0 => Some(
-                Cache::builder()
-                    .max_capacity(metadata.config.cache_max_capacity)
-                    .build(),
-            ),
-            None => None,
+        let cache = if !with_cache {
+            None
+        } else {
+            match metadata.config.cache_max_bytes {
+                Some(max_bytes) if max_bytes > 0 => Some(
+                    Cache::builder()
+                        .max_capacity(max_bytes)
+                        .weigher(|_key: &Path, value: &Arc<CachedObject>| {
+                            value.bytes.len().clamp(1, u32::MAX as usize) as u32
+                        })
+                        .build(),
+                ),
+                Some(_) => None,
+                None if metadata.config.cache_max_capacity > 0 => Some(
+                    Cache::builder()
+                        .max_capacity(metadata.config.cache_max_capacity)
+                        .build(),
+                ),
+                None => None,
+            }
         };
 
         Ok(Storage {

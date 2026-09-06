@@ -9,7 +9,80 @@ All notable changes to this workspace are documented in this file.
 unpublished, so this accumulates into the same version),
 `anda_cognitive_nexus_py` 0.6.0.
 
-Seven changes accumulate here. The latest one first.
+Eight changes accumulate here. The latest one first.
+
+## The 2026-09-06 review of `anda_db`
+
+`anda_db` (still 0.11.1; the version bump is left to the release — the
+removed `index::extract_json_text` and the changed `create_hnsw_index` error
+make it a minor one).
+
+### Fixed — `anda_db`
+
+- **`query_ids` / `query_last_ids` on a bare B-tree field filter kept the
+  wrong page.** The scan walked the key space and stopped after `limit`
+  ids, so a bounded page held the ids under the smallest (or largest)
+  *keys*, not the smallest or largest *ids*; a posting list is in insertion
+  order, so even a single `Eq` key returned the oldest ids from
+  `query_last_ids`. A B-tree field filter now visits every match and keeps
+  the requested end in a bounded set, so the page is right for every filter
+  shape while a bounded query still allocates `O(limit)` however many
+  documents match. Only `_id` filters and complements stop the scan itself
+  after one page.
+- `update` rejects `_id` in the field map with `DBError::Schema`. It used to
+  rewrite the id inside the stored object, leaving `get(id)` returning a
+  document that claimed another id.
+- `remove` of a dead id (still registered, object gone) sweeps the id out of
+  every index instead of only dropping it from the id set, so `query_ids`
+  stops returning it and a unique key stops rejecting new documents — the
+  repair `reconcile_storage` already applied to the same state. That sweep
+  costs `O(index size)` for the one call, which `remove`'s documentation now
+  states, pointing bulk cleanups at `reconcile_storage` instead.
+- `Collection::create` deletes both `meta.cbor` and `ids.cbor` when its final
+  storage-metadata write fails, so the name is not blocked by
+  `AlreadyExists` on every later create.
+- `set_extension_from_with` (collection and database) logs a warning when
+  the value fails to serialize instead of dropping it silently, matching
+  `set_extension_from`.
+
+### Changed — `anda_db`
+
+- `Collection::flush` returns `Ok(false)` while the collection or its
+  database is read-only instead of failing with "Collection is read-only";
+  `AndaDB::flush` and the auto-flush loop therefore stop logging an error on
+  every interval after `set_read_only(true)`. `close` still flushes.
+- `create_hnsw_index` on a missing field returns `DBError::Schema`, like the
+  B-tree and BM25 constructors, instead of `NotFound`.
+- `open_or_create_collection` / `open_collection` return `DBError::Schema`
+  when the requested schema is newer than the one an already-open handle
+  carries, instead of silently returning that handle. Close the collection
+  first to upgrade it.
+- `AndaDB::flush_metadata` writes `db_meta.cbor` only when the in-memory
+  metadata changed since the last successful write. An update helper that
+  inspects the metadata and decides to change nothing (a closure returning
+  `None`, a removal of an absent key) does not count as a change.
+- The reopen repair scan removes a document's postings before re-inserting
+  them, as intent replay already did, so a crash between the ids flush and
+  the storage checkpoint no longer logs one `AlreadyExists` warning per
+  document per index.
+- Routine successes (`close`, `auto_flush`, `create_collection`,
+  `drop_data`, index compaction) log at `info` instead of `warn`.
+- Removed the unused `index::extract_json_text`; the default
+  `IndexHooks::bm25_index_value` already walks JSON values through the same
+  guarded traversal.
+- Every read and every query path answers from one sorted document-id set
+  (`_id` filters and complement walks need ordered range and reverse scans),
+  and the roaring form `ids.cbor` stores is maintained next to it rather
+  than rebuilt at each checkpoint — rebuilding costs ~17ns per document,
+  which on a 10M-document collection would be ~170ms per flush, under the
+  exclusive operation gate, even for a one-document change. One pair of
+  helpers updates both structures together, so a reader can no longer catch
+  them disagreeing (`add` used to update them under separate locks), and a
+  cardinality probe repairs the bitmap loudly if anything ever bypasses that
+  pair.
+- Internal: the id-set and complement walks share one helper, the
+  cancel-guard boilerplate is a single `guarded` call, and the `BTree`
+  wrapper dispatches through a macro instead of four-way matches.
 
 ## The 2026-09-06 review of `anda_db_btree`
 

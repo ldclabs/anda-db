@@ -116,8 +116,10 @@ Important methods:
 
 - `add` and `add_from`
 - `get` and `get_as`
-- `update`
-- `remove`
+- `update` (rejects `_id`: the id is the document's storage path and its key
+  in every index)
+- `remove` (a dead id — still registered, but its object is gone — is
+  removed like any other, with its index postings swept by id)
 - `search` and `search_as`
 - `search_ids` and `query_ids` (smallest matching IDs, clamped to
   `MAX_SEARCH_LIMIT`)
@@ -127,7 +129,10 @@ Important methods:
 
 Which end of the match set a bounded query keeps is decided by the method you
 call, never by the filter's shape: `_id < cursor` alone and
-`AND(user == u, _id < cursor)` page identically.
+`AND(user == u, _id < cursor)` page identically. Only `_id` filters and
+complements scan the id set in the requested direction and stop after one
+page; a B-tree field filter walks the key space, whose order is not id
+order, so it is evaluated in full and trimmed to the requested end.
 - `create_btree_index`, `create_bm25_index`, `create_hnsw_index`
 - `compact_btree_index`, `compact_bm25_index`
 - `flush` and `close`
@@ -446,6 +451,13 @@ This is useful for:
 - controlled shutdown
 - maintenance windows
 - serving queries from a stable snapshot in-process
+
+Read-only stops document and index state from being persisted:
+`Collection::flush` returns `Ok(false)` without writing while the collection
+or its database is read-only, rather than failing on every interval of
+`AndaDB::flush` and the auto-flush loop. `close` still flushes pending state,
+and `AndaDB::flush` still persists database metadata that changed, so a
+`set_extension` on a read-only database is written on the next flush.
 
 Database-level configuration also supports an optional opaque lock value. This lets applications enforce that only processes with the expected lock material may open a database for mutation.
 
