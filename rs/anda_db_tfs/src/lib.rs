@@ -16,14 +16,15 @@
 //! - **Concurrent reads and writes** powered by [`dashmap`] + atomic counters,
 //!   so inserts, removes, and searches can run from multiple threads.
 //! - **Incremental persistence**: the inverted index is sharded into *buckets*
-//!   of bounded CBOR size; only dirty buckets are re-written on
+//!   with a soft CBOR size target; only dirty buckets are re-written on
 //!   [`BM25Index::flush`].
 //! - **Bucket compaction** via [`BM25Index::compact_buckets`] to repack a
-//!   fragmented index into the minimum number of buckets.
+//!   fragmented index using best-fit-decreasing packing.
 //!
 //! ## Quick start
 //!
 //! ```no_run
+//! # #[cfg(feature = "tantivy")] {
 //! use anda_db_tfs::{BM25Index, default_tokenizer};
 //!
 //! let index = BM25Index::new("notes".to_string(), default_tokenizer(), None);
@@ -34,6 +35,7 @@
 //! for (doc_id, score) in hits {
 //!     println!("doc {doc_id}: {score}");
 //! }
+//! # }
 //! ```
 //!
 //! See the [README](https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_tfs)

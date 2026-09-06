@@ -8,6 +8,8 @@
 //! All checks are repeated after a flush/load round-trip with tiny buckets so
 //! bucket splitting is exercised.
 
+#![cfg(feature = "tantivy")]
+
 use anda_db_tfs::{
     BM25Config, BM25Error, BM25Index, BucketObject, TokenizerChain, default_tokenizer,
 };
@@ -93,6 +95,22 @@ fn assert_search_matches_model(index: &BM25Index<TokenizerChain>, model: &Model,
         let expected = model.docs_containing(word);
         let got = search_ids(index, word, false);
         assert_eq!(got, expected, "{context}: term query {word:?} diverged");
+        // Independent scoring oracle from the document model, without using
+        // index counters or posting lists. In particular DF must remain global.
+        let total: usize = model.docs.values().map(Vec::len).sum();
+        for (id, score) in index.search(word, 10_000, None) {
+            let words = &model.docs[&id];
+            let tf = words.iter().filter(|term| *term == word).count() as f64;
+            let n = model.docs.len() as f64;
+            let df = expected.len() as f64;
+            let avg = total as f64 / n;
+            let reference = ((n - df + 0.5) / (df + 0.5)).ln_1p() * tf * 2.2
+                / (tf + 1.2 * (0.25 + 0.75 * words.len() as f64 / avg));
+            assert!(
+                (score as f64 - reference).abs() < 1e-5 * (1.0 + reference),
+                "{context}: score for {word}/{id}"
+            );
+        }
     }
 
     // Boolean queries over a few word pairs: intersection, union, difference.

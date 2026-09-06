@@ -20,6 +20,11 @@ jobs:
       - name: Run full test suite
         run: |
           make test-all
+      - name: Test full-text feature combinations
+        run: |
+          cargo test -p anda_db_tfs --no-default-features
+          cargo test -p anda_db_tfs
+          cargo test -p anda_db_tfs --features full --example tfs_demo
   typescript:
     # `ts/kip-do` is the second KIP 2.0 engine, and the whole point of a second
     # engine is that the two agree. Its conformance suite and its differential

@@ -85,13 +85,17 @@ impl QueryType {
             return QueryType::Or(vec![]);
         }
 
-        Self::parse_or_expression(query, 0)
+        Self::parse_or_expression(query, 0, &mut false)
     }
 
     /// Parses a query string after applying resource-exhaustion guards.
     pub fn try_parse(query: &str) -> Result<Self, String> {
         validate_query_input(query)?;
-        let query = Self::parse(query);
+        let mut budget_exhausted = false;
+        let query = Self::parse_or_expression(query.trim(), 0, &mut budget_exhausted);
+        if budget_exhausted {
+            return Err("logical query combined nesting exceeds parser depth budget".into());
+        }
         query.validate_complexity()?;
         Ok(query)
     }
@@ -110,16 +114,16 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed OR expression
-    fn parse_or_expression(query: &str, depth: usize) -> Self {
+    fn parse_or_expression(query: &str, depth: usize, budget_exhausted: &mut bool) -> Self {
         let parts: Vec<&str> = Self::split_top_level(query, " OR ");
 
         if parts.len() == 1 {
-            return Self::parse_and_expression(parts[0], depth);
+            return Self::parse_and_expression(parts[0], depth, budget_exhausted);
         }
 
         let subqueries: Vec<QueryType> = parts
             .into_iter()
-            .map(|p| Self::parse_and_expression(p, depth))
+            .map(|p| Self::parse_and_expression(p, depth, budget_exhausted))
             .collect();
 
         QueryType::Or(subqueries)
@@ -134,16 +138,16 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed AND expression
-    fn parse_and_expression(query: &str, depth: usize) -> Self {
+    fn parse_and_expression(query: &str, depth: usize, budget_exhausted: &mut bool) -> Self {
         let parts: Vec<&str> = Self::split_top_level(query, " AND ");
 
         if parts.len() == 1 {
-            return Self::parse_not_expression(parts[0], depth);
+            return Self::parse_not_expression(parts[0], depth, budget_exhausted);
         }
 
         let subqueries: Vec<QueryType> = parts
             .into_iter()
-            .map(|p| Self::parse_not_expression(p, depth))
+            .map(|p| Self::parse_not_expression(p, depth, budget_exhausted))
             .collect();
 
         QueryType::And(subqueries)
@@ -158,7 +162,7 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed NOT expression
-    fn parse_not_expression(query: &str, depth: usize) -> Self {
+    fn parse_not_expression(query: &str, depth: usize, budget_exhausted: &mut bool) -> Self {
         let mut rest = query.trim();
 
         // Every `NOT` nests one more level. Counting them iteratively and
@@ -174,7 +178,10 @@ impl QueryType {
             rest = stripped.trim_start();
         }
 
-        let mut expr = Self::parse_term(rest, depth + negations);
+        if rest.starts_with("NOT ") {
+            *budget_exhausted = true;
+        }
+        let mut expr = Self::parse_term(rest, depth + negations, budget_exhausted);
         for _ in 0..negations {
             expr = QueryType::Not(Box::new(expr));
         }
@@ -190,9 +197,12 @@ impl QueryType {
     /// # Returns
     ///
     /// A QueryType representing the parsed term or parenthesized expression
-    fn parse_term(query: &str, depth: usize) -> Self {
+    fn parse_term(query: &str, depth: usize, budget_exhausted: &mut bool) -> Self {
         let query = query.trim();
 
+        if depth >= MAX_LOGICAL_QUERY_DEPTH && (query.starts_with('(') || query.ends_with(')')) {
+            *budget_exhausted = true;
+        }
         // Handle parenthesized expressions.
         //
         // The parenthesis handling below recurses back into
@@ -207,18 +217,26 @@ impl QueryType {
                 // 处理可能存在的非平衡括号
                 if stripped.ends_with(')') && Self::is_balanced_parentheses(query) {
                     // 完全平衡的括号表达式
-                    return Self::parse_or_expression(&stripped[..stripped.len() - 1], depth + 1);
+                    return Self::parse_or_expression(
+                        &stripped[..stripped.len() - 1],
+                        depth + 1,
+                        budget_exhausted,
+                    );
                 } else {
                     // 处理不平衡的括号
                     // 1. 如果缺少右括号，尝试解析括号内的内容
-                    return Self::parse_or_expression(stripped, depth + 1);
+                    return Self::parse_or_expression(stripped, depth + 1, budget_exhausted);
                 }
             } else if query.ends_with(')') {
                 // 处理只有右括号的情况。Strip ALL contiguous trailing ')' at
                 // once: stripping one per recursion needs O(n) stack (and
                 // O(n²) rescans) for a `")"` flood, which overflowed the
                 // stack before this guard existed.
-                return Self::parse_or_expression(query.trim_end_matches(')'), depth + 1);
+                return Self::parse_or_expression(
+                    query.trim_end_matches(')'),
+                    depth + 1,
+                    budget_exhausted,
+                );
             }
         }
 
@@ -227,14 +245,14 @@ impl QueryType {
         if terms.len() > 1 {
             let subqueries: Vec<QueryType> = terms
                 .into_iter()
-                .map(|t| QueryType::Term(t.to_lowercase()))
+                .map(|t| QueryType::Term(t.to_owned()))
                 .collect();
             return QueryType::Or(subqueries);
         }
 
         // Handle single term
         if !query.is_empty() {
-            return QueryType::Term(query.to_lowercase());
+            return QueryType::Term(query.to_owned());
         }
 
         // Handle empty query

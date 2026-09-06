@@ -1,6 +1,9 @@
 use anda_db_tfs::{BM25Index, jieba_tokenizer};
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::{io::Read, path::Path};
+
+#[path = "support/atomic_file.rs"]
+mod atomic_file;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Document {
@@ -67,16 +70,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all("debug/tfs_demo")?;
     let outcome = {
-        let metadata = std::fs::File::create("debug/tfs_demo/metadata.cbor")?;
         index
-            .flush(metadata, 0, |object, data| {
-                let write = || {
-                    let mut node = std::fs::File::create(bucket_file(object))?;
-                    node.write_all(&data)?;
-                    Ok(())
-                };
-                std::future::ready(write())
-            })
+            .flush_with(
+                0,
+                |data| {
+                    std::future::ready(
+                        atomic_file::write_atomic(Path::new("debug/tfs_demo/metadata.cbor"), &data)
+                            .map_err(Into::into),
+                    )
+                },
+                |object, data| {
+                    let write = || -> Result<(), anda_db_tfs::BoxError> {
+                        atomic_file::write_atomic(Path::new(&bucket_file(object)), &data)?;
+                        Ok(())
+                    };
+                    std::future::ready(write())
+                },
+            )
             .await?
     };
     // 清理被新 manifest 取代的旧桶对象（尽力而为）。
@@ -85,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let metadata = std::fs::File::open("debug/tfs_demo/metadata.cbor")?;
-    let loaded_index = BM25Index::load_all(jieba_tokenizer(), metadata, async |object| {
+    let loaded_index = BM25Index::load_all_strict(jieba_tokenizer(), metadata, async |object| {
         let mut node = std::fs::File::open(bucket_file(object))?;
         let mut buf = Vec::new();
         node.read_to_end(&mut buf)?;

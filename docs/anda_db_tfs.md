@@ -12,7 +12,7 @@
 | Friendly to mixed Chinese and English text | Pluggable `Tokenizer` pipeline; built-in Porter stemmer and jieba tokenization                     |
 | High-concurrency reads and writes          | `DashMap` plus atomic counters; `insert` / `remove` / `search` can run concurrently across threads |
 | Incremental persistence                    | The inverted index is sharded into **buckets**; only dirty buckets are flushed                     |
-| Small memory footprint                     | `UniqueVec`, `FxHashMap`, and compact CBOR encoding                                                |
+| Small memory footprint                     | `Vec`, `FxHashMap`, and compact CBOR encoding                                                |
 | Boolean queries                            | `AND / OR / NOT` syntax with parentheses for agent retrieval                                       |
 
 ---
@@ -30,7 +30,7 @@ $$
 - $\text{idf}(t) = \ln\!\left(1 + \dfrac{N - df_t + 0.5}{df_t + 0.5}\right)$, the classic Okapi IDF smoothing formula.
 - The hyperparameters $k_1$ and $b$ are configured through `BM25Params`, with defaults `k1=1.2` and `b=0.75`.
 
-Before scoring, the library defensively clamps user-provided parameters: `k1` has a lower bound of `0.0`, and `b` is clamped to `[0, 1]` to avoid generating `NaN` or `inf`.
+Before scoring, the library defensively clamps user-provided parameters: `k1` is clamped to `[0, 1000]`, and `b` to `[0, 1]`; non-finite inputs fall back to the defaults to avoid generating `NaN` or `inf`.
 
 ---
 
@@ -39,7 +39,7 @@ Before scoring, the library defensively clamps user-provided parameters: `k1` ha
 ```text
 BM25Index
 ├── doc_tokens       DashMap<doc_id, token_count>           // document length table
-├── postings         DashMap<token, (bucket_id, UniqueVec<(doc_id, tf)>)>  // inverted index
+├── postings         DashMap<token, (bucket_id, Vec<(doc_id, tf)>)>  // inverted index
 ├── buckets          DashMap<bucket_id, Bucket>             // shard metadata
 ├── metadata         RwLock<BM25Metadata>                   // name / config / stats
 └── atomic counters  max_bucket_id, max_document_id, total_tokens, ...
@@ -65,8 +65,8 @@ BM25Index
 `BM25Config.bucket_overload_size` is the **soft upper limit** for the serialized size of a single bucket object, defaulting to `512 KiB`. On `insert`:
 
 1. A token that already has a posting stays in the bucket that owns it; that bucket is only charged for the appended entry (and, the first time the document lands in it, for the document's token-count entry).
-2. Brand-new tokens are created in the tail bucket (`max_bucket_id`). Each one is listed there if the bucket is empty or stays `< limit` after adding it.
-3. The tokens that do not fit open a fresh tail bucket (`max_bucket_id + 1`) and are listed there; a fresh bucket always accepts at least one token, so placement always terminates.
+2. A brand-new token is placed in the current tail if the bucket is empty or its estimated payload stays `< limit`, including the new document-length entry.
+3. Otherwise insertion advances the tail and retries that token. Its posting and final bucket registration are published together under the bucket lock; existing postings never have a temporary owner. Each token is placed once instead of repeatedly moving a pending token list.
 
 Between flushes `size` is an estimate accumulated from those charges. Every flush and every reload replaces it with the exact length of the serialized bucket object — which includes the per-document token counts the object carries — so the estimate cannot drift for long. The same flush makes the bucket's `doc_ids` hint exact.
 
@@ -86,14 +86,13 @@ The return value `(old_count, new_count)` is useful for monitoring. Concurrent `
 
 ## 5. Concurrency Model
 
-- All shared state is stored in `DashMap`, `RwLock`, and atomic counters, so **concurrent `insert` / `remove` / `search` can freely overlap across threads** without an outer lock.
-- In `insert` and `remove`, the critical regions involving bucket sizing and splitting use fine-grained entry locks via `DashMap::entry().or_default()`, avoiding holding a lock across `.await`.
-- Average document length is **derived, never cached**. There is no `avg_doc_tokens` field: the value is computed as `total_tokens / doc_tokens.len()` at its two read sites — `score_term` (once per query, not per document) and `refresh_live_stats` (once per `stats()` call). A cached quotient had to be resynchronized on every `insert` / `remove`, disagreed with its own inputs in between, and was wrong outright after a `load_metadata` that had not yet loaded any documents. Deriving it makes the reported value exactly consistent with the counters it comes from — there is no convergence window.
-- **`compact_buckets` is exclusive with mutations, and the crate enforces that.** `insert` / `remove` / `purge_ids` take an internal `mutation_gate` **shared** (so they still run concurrently with each other) and `compact_buckets` takes it **exclusively**, because it rebuilds the bucket map non-atomically: a posting created after compaction snapshotted `postings` would otherwise be re-binned into nothing and silently dropped by the next flush. The gate is the first lock a mutation acquires, so it never nests inside a `DashMap` shard guard. Callers do **not** need to serialize compaction against writes.
-- **A metadata-only shell (`load_metadata` without `load_buckets`) is read-only in practice.** Its bucket map is placeholders that carry the committed manifest forward, so a clean metadata commit is safe; but `compact_buckets` is a no-op on it and `flush_with` refuses a flush with a dirty bucket, because both rebuild the manifest from a bucket map that does not mirror the committed layout.
-- **Coordinating `flush` / `flush_with` against mutations, against compaction, and against another flush is the caller's responsibility** (`anda_db`'s `Collection` holds an exclusive operation gate across every flush). A single writer per durable index is a deployment contract; the crate does not defend against a second writer.
-- `flush` serializes every dirty bucket and the metadata into owned buffers before the first `.await`. It never holds a `DashMap` `Ref` across `.await`, which avoids deadlocks.
-- `top_k_results` uses `select_nth_unstable_by` for partial sorting (`O(n + k log k)`), then performs a final `sort` on the top-k tail, making queries significantly faster on large result sets.
+- Insert, remove, purge and search support concurrent calls. Mutations of the same document id are serialized with internal striped locks, spanning document membership, postings and bucket accounting. Batch purge acquires stripes in ascending order.
+- The lock order is mutation gate → document stripes → maps. Posting creation and bucket registration share a bucket lock. Removal rechecks posting ownership while holding that same bucket lock before unlisting a token.
+- Compaction holds the mutation gate exclusively. The caller must exclude flush from mutations, compaction and other flushes for the entire async call; Collection's exclusive operation lease provides this. One writer per durable index remains the deployment contract.
+- Searches are best-effort concurrent reads, not transactional snapshots. A query samples corpus statistics once; counters converge after completed mutations. No average-length cache is maintained.
+- Metadata-only shells expose persisted statistics through `metadata()` and `stats()`, while `len()` counts loaded documents. Partially loaded or failed-load indexes refuse inserts and flushes; remove/purge and compaction do nothing. `is_fully_loaded()` indicates writability.
+- Flush captures dirty versions and metadata, then serializes and uploads one bucket at a time. Extra payload memory is bounded by the largest dirty bucket. No internal map guard spans an await, and no bucket is marked clean before the manifest commit succeeds.
+- Top-k selection uses `select_nth_unstable_by`, followed by sorting the selected results: `O(matches + k log k)`.
 
 ---
 
@@ -153,7 +152,7 @@ for object in &outcome.obsolete {
 }
 ```
 
-- `flush` first serializes every dirty bucket (only postings whose current owner is that bucket are written; the serialized `doc_tokens` table is derived from those postings, so stale bucket-side document IDs are not re-persisted).
+- `flush` captures dirty versions and the next manifest, then serializes/uploads dirty buckets one at a time. Only postings owned by that bucket are written; document lengths are derived from those postings.
 - Each dirty bucket is written to a **new** object keyed by `(bucket_id, generation)`; the generation is this flush's metadata version, so committed objects are never mutated in place.
 - The metadata — whose manifest maps every live bucket id to its current generation — is written **last**. That single write is the atomic commit point: a crash or error before it leaves the previous snapshot fully intact (the new objects are unreferenced garbage); after it, the replaced objects are garbage and are returned in `FlushOutcome::obsolete` for best-effort deletion.
 - `compact_buckets` needs no special ordering: the repacked layout becomes visible atomically with the next manifest commit, and every pre-compaction object is reported obsolete.
@@ -168,7 +167,8 @@ let idx = BM25Index::load_all(tokenizer, metadata_reader, async |object| {
 
 - `load_metadata` restores metadata only, which is useful for lightweight scenarios that need just statistics.
 - With a manifest present, `load_buckets` reads exactly the referenced `(bucket_id, generation)` objects. Metadata persisted by pre-manifest releases has no manifest; the loader falls back to scanning bucket ids `0..=max_bucket_id` at generation `0` (the legacy un-suffixed objects), and the first flush upgrades the durable layout to the manifest format.
-- `load_buckets` can skip buckets (read-only partial loads) when the closure returns `Ok(None)`. During search, `score_term` automatically ignores documents that were not loaded. A partially loaded index must not be flushed: a flush persists exactly the loaded content.
+- `load_all` / `load_buckets` permit explicit read-only partial loads through `Ok(None)`. The missing bucket set is retained across incremental loads; completing it enables mutation. Failed or cancelled loads remain read-only and retain already loaded document lengths for retry.
+- Production startup uses `load_all_strict`; `load_buckets_strict` is also available. Missing manifest-referenced objects fail the load. Legacy layouts still tolerate holes in their bucket-id scan.
 - If the same token appears in more than one loaded bucket (possible only in legacy data written by the old multi-phase flush), the later bucket id wins. The loader removes that token from the older bucket, rebuilds bucket document-id sets from the winning postings, and marks repaired buckets dirty so the next flush removes stale on-disk ownership.
 
 ---
@@ -190,8 +190,9 @@ Precedence is `OR < AND < NOT`. The operators are case-sensitive and must stand 
 - **Multi-term queries default to OR**: `"quick fox"` and `"quick OR fox"` return the same results in `search` and `search_advanced`.
 - **Score merging**: `AND` sums the BM25 scores of its subqueries; `OR` does the same; `NOT` produces a zero-scored placeholder set used only for filtering, and in an `AND` context it **removes** matching items from the result set.
 - **Robust parsing**: unbalanced parentheses do not panic. They are treated as ordinary characters, which makes direct forwarding of user input safe. An empty group is an empty `OR` that matches nothing, so `a AND ()` returns nothing.
-- **Bare words score in one pass**: an `OR` made only of words (the implicit `OR` of `"quick fox"`) is scored exactly like `search("quick fox")`, in a single pass with one tokenizer clone; a word repeated in the query is scored once.
-- **`NOT` complement guard**: `try_search_advanced` fails when a `NOT` has to complement its operand against more than 10 000 documents — a top-level `NOT`, a `NOT` inside an `OR`, or an `AND` made only of `NOT`s. `a AND NOT b` never builds a complement. The check runs where the executor would build the complement, so it cannot drift from the evaluation. `search_advanced` turns that error (and a parse-budget error) into an empty result.
+- **Tokenization belongs to the tokenizer**: the parser preserves operand case. Every boolean operand is tokenized independently with one tokenizer clone per query. An OR of terms merges and deduplicates the resulting tokens, never the raw text. Custom context-sensitive tokenizers may therefore distinguish plain text search from boolean word expressions.
+- **Candidate execution**: AND evaluates selective operands first, retains global DF/IDF for scoring, and restricts later work to the surviving candidates. NOT filters use set membership without computing discarded BM25 scores. IDFs are cached within the query and computed using `ln_1p` for numerical stability.
+- **`NOT` complement guard**: every materialized complement is limited to 10 000 documents, including candidate-relative complements. Simple `AND NOT term` and `AND NOT (a OR b)` filters remove ids directly from the relevant posting lists without copying the candidate set. Leading NOT pairs are cancelled, so `hello AND NOT (NOT world)` is evaluated as a positive filter and remains accepted for larger result sets. Mixed-polarity expressions that really need a candidate universe return an error above the limit. `try_search_advanced` exposes resource errors; `search_advanced` returns an empty result on error. Strict parsing rejects combined parentheses/NOT budget exhaustion instead of silently changing query meaning.
 - **Multi-byte safe**: the delimiters `" AND "` and `" OR "` are ASCII, so byte-wise scanning remains safe under UTF-8. Mixed CJK text does not require extra handling.
 
 Example:
@@ -221,11 +222,13 @@ All tokenizers implement `tantivy_tokenizer_api::Tokenizer` and are composed thr
 
 ### 8.1 `JiebaMergeFilter`
 
-In mixed-script scenarios such as Chinese, English, Russian, and Arabic text together, a plain `SimpleTokenizer` will treat consecutive Chinese characters as a single token. `JiebaMergeFilter` re-segments tokens where `detect_script == Cjk` with jieba, merges offsets and `position`, and finally sorts by `(offset_from, offset_to, position, text)`, guaranteeing that:
+In mixed-script text, `SimpleTokenizer` treats consecutive Chinese characters as one token. The public generic `JiebaMergeFilter` re-segments CJK spans and globally orders `(offset_from, offset_to, position, text)`. The built-in `jieba_tokenizer()` uses the same segmentation and filters but buffers and sorts only one SimpleTokenizer span at a time. Regression tests compare the complete token stream, including offsets and positions, against the generic chain. Both preserve:
 
 - Chinese text is segmented correctly (`"北京市东城区长安街"` -> `北京`, `东城区`, `长安街`);
 - English, Russian, Arabic, and other scripts retain the stemmed and lowercased output of the primary pipeline;
 - The resulting `TokenStream` is still monotonic, so downstream BM25 consumption remains correct.
+
+`RemoveLongFilter::limit(32)` retains tokens with UTF-8 byte length **less than 32**, not 32 Unicode characters. `collect_tokens` copies a term only on its first occurrence in the frequency map.
 
 > **Note**: `collect_tokens` filters out single-byte tokens where `token.text.len() <= 1` (length measured in bytes), which removes punctuation and isolated ASCII letters. Single Chinese characters are unaffected because their UTF-8 length is at least 3 bytes.
 
@@ -272,10 +275,13 @@ Tuning guidance:
 
 Test coverage includes:
 
-- `cargo test -p anda_db_tfs --features full --lib` (31 unit tests)
+- `cargo test -p anda_db_tfs --all-features`
+- `cargo test -p anda_db_tfs --no-default-features`
+- `cargo test -p anda_db_tfs`
+- `cargo test -p anda_db_tfs --features full --example tfs_demo`
 - Correctness of insert / remove / search, bucket serialization and partial loading, result invariance after compaction, the regression test `test_no_excessive_small_buckets`, UTF-8 query parsing, and more.
 
-Benchmark command: `cargo bench -p anda_db_tfs --features full --bench tfs_tokenizer`.
+Benchmarks: `cargo bench -p anda_db_tfs --features full --bench tfs_tokenizer` and `cargo bench -p anda_db_tfs --features full --bench tfs_index`. The latter covers scoring, mutations, load/flush, compaction and mixed Chinese text. See [measurements and the review checklist](anda_db_tfs_review.md) for reproducible comparisons and remaining storage tradeoffs.
 
 ---
 
@@ -298,55 +304,53 @@ for (id, score) in idx.search_advanced("(brown AND fox) AND NOT sleeps", 10, Non
 }
 ```
 
-Persisting to the local filesystem:
+Persisting to the local filesystem uses the tested [`write_atomic` helper](../rs/anda_db_tfs/examples/support/atomic_file.rs). It creates a temporary file beside the target, writes and syncs it, renames it atomically, and syncs the directory on Unix. If a crashed process left the first temporary name behind, the helper advances its sequence until it creates a fresh file; it never deletes an existing temporary file that could belong to another writer. The complete runnable adapter is in [`tfs_demo`](../rs/anda_db_tfs/examples/tfs_demo.rs).
 
 ```rust
-use std::{fs, io::Write};
+use std::{fs, path::{Path, PathBuf}};
+use anda_db_tfs::{BoxError, BucketObject};
+// Import write_atomic from the linked helper into your application.
 
-let metadata = fs::File::create("./idx/metadata.cbor")?;
-let outcome = idx.flush(metadata, now_ms, |object, bytes| {
-    let write = || {
-        let mut f = fs::File::create(format!(
-            "./idx/b_{}_{}.cbor", object.bucket_id, object.generation
-        ))?;
-        f.write_all(&bytes)?;
-        Ok(())
-    };
-    std::future::ready(write())
-}).await?;
-for object in &outcome.obsolete {
-    let _ = fs::remove_file(format!(
-        "./idx/b_{}_{}.cbor", object.bucket_id, object.generation
-    ));
-}
-```
-
-Loading:
-
-```rust
-use std::{fs, io::Read};
-
-let metadata = fs::File::open("./idx/metadata.cbor")?;
-let idx = BM25Index::load_all(default_tokenizer(), metadata, async |object| {
-    // generation 0 denotes a legacy (pre-manifest) `b_{id}.cbor` object.
-    let path = if object.generation == 0 {
-        format!("./idx/b_{}.cbor", object.bucket_id)
+fn bucket_path(object: BucketObject) -> PathBuf {
+    if object.generation == 0 {
+        format!("./idx/b_{}.cbor", object.bucket_id).into()
     } else {
-        format!("./idx/b_{}_{}.cbor", object.bucket_id, object.generation)
-    };
-    match fs::File::open(path) {
-        Ok(mut f) => { let mut buf = Vec::new(); f.read_to_end(&mut buf)?; Ok(Some(buf)) }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        format!("./idx/b_{}_{}.cbor", object.bucket_id, object.generation).into()
     }
-}).await?;
+}
+
+fs::create_dir_all("./idx")?;
+let outcome = idx.flush_with(
+    now_ms,
+    |bytes| std::future::ready(
+        write_atomic(Path::new("./idx/metadata.cbor"), &bytes)
+            .map_err(BoxError::from)
+    ),
+    |object, bytes| std::future::ready(
+        write_atomic(&bucket_path(object), &bytes).map_err(BoxError::from)
+    ),
+).await?;
+for object in outcome.obsolete {
+    let _ = fs::remove_file(bucket_path(object));
+}
+
+let idx = BM25Index::load_all_strict(
+    default_tokenizer(), fs::File::open("./idx/metadata.cbor")?,
+    async |object| match fs::read(bucket_path(object)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    },
+).await?;
 ```
+
+Never open the committed metadata with `File::create` before flush: a clean flush invokes no callback, so that would leave an empty file. `flush<W: Write>` writes and flushes its writer but cannot supply atomic replacement or filesystem durability on its own. A metadata callback with an uncertain outcome requires reopening from durable state.
 
 ---
 
 ## 13. Usage Notes
 
-1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. Historical misuse does not affect search correctness — scoring only counts documents present in `doc_tokens` — but it leaves stale posting entries behind; they are pruned the next time the index is loaded (`load_buckets`), not by `compact_buckets()`, which repacks buckets without inspecting their entries. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
+1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. A wrong-text removal hides an absent document but leaves stale posting entries; reusing that id can expose old terms. Always use the original text or purge before reuse. Stale entries of absent documents are pruned the next time the index is loaded (`load_buckets`), not by `compact_buckets()`, which repacks buckets without inspecting their entries. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
 3. **Flush coordination**: the crate does not serialize flushes internally. The caller must ensure a flush never overlaps mutations, compaction, or another flush (`anda_db`'s `Collection` already guarantees this); a single writer per durable index is a deployment contract.
 4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.
@@ -358,4 +362,4 @@ let idx = BM25Index::load_all(default_tokenizer(), metadata, async |object| {
 
 - Robertson & Zaragoza. *The Probabilistic Relevance Framework: BM25 and Beyond*, 2009.
 - [`tantivy_tokenizer_api`](https://docs.rs/tantivy-tokenizer-api) - tokenizer trait.
-- For regression cases and design discussion, see the integration tests at the end of `rs/anda_db_tfs/src/bm25.rs`, and [anda_db_btree.md](anda_db_btree.md) for the related bucket strategy.
+- For regression cases and design discussion, see `rs/anda_db_tfs/src/bm25/tests.rs`, `src/bm25/regression_tests.rs` and `tests/regressions.rs`, and [anda_db_btree.md](anda_db_btree.md) for the related bucket strategy.

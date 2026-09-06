@@ -98,7 +98,7 @@ impl<T: Tokenizer> BoxableTokenizer for T {
 
 /// Creates a default English-friendly tokenizer chain.
 ///
-/// The pipeline is: `SimpleTokenizer` → `RemoveLongFilter` (max 32 chars)
+/// The pipeline is: `SimpleTokenizer` → `RemoveLongFilter` (UTF-8 byte length < 32)
 /// → `LowerCaser` → `Stemmer` (Porter English).
 /// Suitable for most Latin-script text; for Chinese content use
 /// [`crate::jieba_tokenizer`] (enabled by the `tantivy-jieba` feature).
@@ -153,7 +153,11 @@ pub fn collect_tokens<T: Tokenizer>(
             continue;
         }
 
-        *tokens.entry(token.text.to_owned()).or_default() += 1;
+        if let Some(count) = tokens.get_mut(token.text.as_str()) {
+            *count += 1;
+        } else {
+            tokens.insert(token.text.to_owned(), 1);
+        }
     }
     tokens
 }

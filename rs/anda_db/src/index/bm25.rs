@@ -33,10 +33,9 @@ pub struct BM25 {
     index: BM25Index<TokenizerChain>,
     storage: Storage, // 与 Collection 共享同一个 Storage 实例
     metadata_version: RwLock<ObjectVersion>,
-    /// Serializes complete object-store flushes for this wrapper. Mutation
-    /// consistency is handled by `BM25Index::flush_with`; this gate prevents
-    /// two frozen generations from being uploaded in reverse order (compact
-    /// runs under a shared collection lease, so two compacts can overlap).
+    /// Serializes complete object-store flushes for this wrapper. Collection
+    /// excludes mutations and compaction with its exclusive operation lease;
+    /// this gate also orders direct wrapper flush/compact calls.
     flush_gate: Arc<Mutex<()>>,
 }
 
@@ -147,7 +146,7 @@ impl BM25 {
         let (metadata, ver) = storage.fetch_bytes(&BM25::metadata_path(&name)).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
-        let index = BM25Index::load_all(tokenizer, &metadata[..], async move |object| {
+        let index = BM25Index::load_all_strict(tokenizer, &metadata[..], async move |object| {
             let path = BM25::bucket_path(n.clone().as_str(), object);
             match s.clone().fetch_bytes(&path).await {
                 Ok((data, _)) => Ok(Some(data.into())),
@@ -362,6 +361,40 @@ mod tests {
     use super::*;
     use crate::storage::StorageConfig;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn bootstrap_rejects_a_missing_manifest_bucket() -> Result<(), DBError> {
+        let storage = Storage::connect(
+            "bm25_missing_bucket".into(),
+            Arc::new(InMemory::new()),
+            StorageConfig {
+                compress_level: 0,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let index = BM25::new(vec!["body".into()], default_tokenizer(), storage.clone(), 0).await?;
+        index.insert(1, "alpha", 1)?;
+        index.flush(2).await?;
+        let (bucket_id, generation) = index.metadata().buckets.into_iter().next().unwrap();
+        storage
+            .delete(&BM25::bucket_path(
+                "body",
+                BucketObject {
+                    bucket_id,
+                    generation,
+                },
+            ))
+            .await?;
+        let err = BM25::bootstrap("body".into(), default_tokenizer(), storage)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing referenced bucket"),
+            "{err}"
+        );
+        Ok(())
+    }
 
     /// The wrapper's metadata CAS token is the last defense against a second
     /// writer: after a foreign overwrite the next flush must fail instead of

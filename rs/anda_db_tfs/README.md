@@ -28,7 +28,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_tfs = { version = "0.5", features = ["full"] }
+anda_db_tfs = { version = "0.11", features = ["full"] }
 ```
 
 This crate is normally used through `anda_db`, but it can also be used as a
@@ -40,6 +40,7 @@ Deep technical documentation for this crate lives in:
 
 - [docs/anda_db_tfs.md](../../docs/anda_db_tfs.md)
 - [docs/anda_db.md](../../docs/anda_db.md)
+- [Performance measurements and review checklist](../../docs/anda_db_tfs_review.md)
 
 ## Related Crates
 

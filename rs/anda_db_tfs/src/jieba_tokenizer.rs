@@ -6,12 +6,14 @@ use super::TokenizerChain;
 
 /// Creates a new `TokenizerChain` with `JiebaTokenizer` as the default tokenizer.
 pub fn jieba_tokenizer() -> TokenizerChain {
-    TokenizerChain::builder(SimpleTokenizer::default())
-        .filter(JiebaMergeFilter::new())
-        .filter(RemoveLongFilter::limit(32))
-        .filter(LowerCaser)
-        .filter(Stemmer::default())
-        .build()
+    TokenizerChain::builder(StreamingJiebaTokenizer {
+        inner: SimpleTokenizer::default(),
+        jieba: JiebaTokenizer::new(),
+    })
+    .filter(RemoveLongFilter::limit(32))
+    .filter(LowerCaser)
+    .filter(Stemmer::default())
+    .build()
 }
 
 /// Coarse script family detected from token text.
@@ -45,7 +47,6 @@ pub fn detect_script(text: &str) -> Script {
     let mut latin = 0;
     let mut cyrillic = 0;
     let mut arabic = 0;
-    let mut cjk = 0;
 
     for c in text.chars() {
         match c {
@@ -63,13 +64,9 @@ pub fn detect_script(text: &str) -> Script {
             | '\u{31f0}'..='\u{31ff}'
             // Hangul syllables and jamo.
             | '\u{ac00}'..='\u{d7af}'
-            | '\u{1100}'..='\u{11ff}' => cjk += 1,
+            | '\u{1100}'..='\u{11ff}' => return Script::Cjk,
             _ => {}
         }
-    }
-
-    if cjk > 0 {
-        return Script::Cjk;
     }
 
     let max = latin.max(cyrillic).max(arabic);
@@ -84,6 +81,97 @@ pub fn detect_script(text: &str) -> Script {
     } else {
         Script::Arabic
     }
+}
+
+/// The built-in chain has ordered, disjoint SimpleTokenizer spans. Sorting
+/// each CJK span gives the same output as the generic merge filter while only
+/// buffering one span. The public generic filter retains its global ordering
+/// guarantee for arbitrary tokenizers and its existing return type.
+#[derive(Clone)]
+struct StreamingJiebaTokenizer {
+    inner: SimpleTokenizer,
+    jieba: JiebaTokenizer,
+}
+
+impl Tokenizer for StreamingJiebaTokenizer {
+    type TokenStream<'a> =
+        StreamingMergedTokens<'a, <SimpleTokenizer as Tokenizer>::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        StreamingMergedTokens {
+            inner: self.inner.token_stream(text),
+            jieba: &mut self.jieba,
+            pending: Vec::new(),
+            next: 0,
+            token: Token::default(),
+        }
+    }
+}
+
+struct StreamingMergedTokens<'a, S> {
+    inner: S,
+    jieba: &'a mut JiebaTokenizer,
+    pending: Vec<Token>,
+    next: usize,
+    token: Token,
+}
+
+impl<S: TokenStream> TokenStream for StreamingMergedTokens<'_, S> {
+    fn advance(&mut self) -> bool {
+        loop {
+            if self.next < self.pending.len() {
+                self.token = std::mem::take(&mut self.pending[self.next]);
+                self.next += 1;
+                return true;
+            }
+            if !self.inner.advance() {
+                return false;
+            }
+            let token = self.inner.token_mut();
+            self.pending.clear();
+            self.next = 0;
+            if detect_script(&token.text) == Script::Cjk {
+                let mut stream = self.jieba.token_stream(&token.text);
+                while stream.advance() {
+                    let part = stream.token_mut();
+                    self.pending.push(Token {
+                        offset_from: token.offset_from + part.offset_from,
+                        offset_to: token.offset_from + part.offset_to,
+                        position: token.position,
+                        position_length: token.position_length,
+                        text: std::mem::take(&mut part.text),
+                    });
+                }
+                self.pending.sort_unstable_by(compare_tokens);
+                if !self.pending.is_empty() {
+                    continue;
+                }
+            }
+            self.token = Token {
+                offset_from: token.offset_from,
+                offset_to: token.offset_to,
+                position: token.position,
+                position_length: token.position_length,
+                text: std::mem::take(&mut token.text),
+            };
+            return true;
+        }
+    }
+
+    fn token(&self) -> &Token {
+        &self.token
+    }
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.token
+    }
+}
+
+fn compare_tokens(a: &Token, b: &Token) -> std::cmp::Ordering {
+    a.offset_from
+        .cmp(&b.offset_from)
+        .then(a.offset_to.cmp(&b.offset_to))
+        .then(a.position.cmp(&b.position))
+        .then(a.text.cmp(&b.text))
 }
 
 /// Jieba 中文分词合并过滤器
@@ -177,13 +265,7 @@ impl<T: Tokenizer> Tokenizer for JiebaMergeTokenizer<T> {
         }
 
         if needs_sort {
-            tokens.sort_unstable_by(|a, b| {
-                a.offset_from
-                    .cmp(&b.offset_from)
-                    .then(a.offset_to.cmp(&b.offset_to))
-                    .then(a.position.cmp(&b.position))
-                    .then(a.text.cmp(&b.text))
-            });
+            tokens.sort_unstable_by(compare_tokens);
         }
 
         MergedTokenStream { tokens, index: 0 }
@@ -221,6 +303,35 @@ impl TokenStream for MergedTokenStream {
 mod tests {
     use super::*;
     use crate::tokenizer::collect_tokens;
+
+    #[test]
+    fn streaming_chain_matches_generic_merge_output() {
+        let mut streaming = jieba_tokenizer();
+        let mut reference = TokenizerChain::builder(SimpleTokenizer::default())
+            .filter(JiebaMergeFilter::new())
+            .filter(RemoveLongFilter::limit(32))
+            .filter(LowerCaser)
+            .filter(Stemmer::default())
+            .build();
+        for text in [
+            "",
+            "Hello Rust Rust",
+            "中华人民共和国。北京大学人工智能实验室。",
+            "Hello北京大学 world 上海长安街！Москва東京한국",
+            "水 木 火 123 ABC",
+            "中华人民共和国".repeat(100).as_str(),
+        ] {
+            let snapshot = |tokenizer: &mut TokenizerChain| {
+                let mut stream = tokenizer.token_stream(text);
+                let mut tokens = Vec::new();
+                while stream.advance() {
+                    tokens.push(stream.token().clone());
+                }
+                tokens
+            };
+            assert_eq!(snapshot(&mut streaming), snapshot(&mut reference), "{text}");
+        }
+    }
 
     #[test]
     fn test_jieba_collect_tokens() {
