@@ -157,11 +157,15 @@ impl Session {
         let task = store.get_element(request.task_ref.parse()?).await?;
         let task_view = crate::view::render(&task);
         let lease = facet(&task, "LeaseState")?;
+        let lease_expiry = crate::time::normalize(
+            lease["expires_at"].as_str().unwrap_or(""),
+            "lease expires_at",
+        )?;
         if task.space() != space
             || task_view["attributes"]["status"] != "running"
             || lease["owner"] != self.auth.principal_id
             || lease["fencing_token"] != request.fencing_token
-            || lease["expires_at"].as_str().unwrap_or("") <= crate::time::now().as_str()
+            || lease_expiry <= crate::time::now()
         {
             return Err(KipError::version_conflict(
                 "dispatch requires the current unexpired lease fence",
@@ -536,7 +540,8 @@ impl Session {
             let Element::Concept(row)=tx.load(id).await? else {return Err(KipError::constraint_violation("task must be a SleepTask"));};
             if row.schema_ref!=format!("{PROFILE}SleepTask") {return Err(KipError::constraint_violation("task must be a SleepTask"));}
             let previous=row.facets.get(&format!("{PROFILE}LeaseState")).cloned();
-            let takeover=row.attributes.get("status")!=Some(&json!("running")) || previous.as_ref().is_some_and(|p|p["expires_at"].as_str().unwrap_or("")<=now.as_str());
+            let previous_expiry=previous.as_ref().and_then(|p|p["expires_at"].as_str()).map(|value|crate::time::normalize(value,"lease expires_at")).transpose()?;
+            let takeover=row.attributes.get("status")!=Some(&json!("running")) || previous_expiry.as_ref().is_some_and(|expiry|expiry<=&now);
             let fence=previous.as_ref().and_then(|p|p["fencing_token"].as_u64()).unwrap_or(0)+u64::from(takeover||previous.is_none());
             let attempts=previous.as_ref().and_then(|p|p["attempt_count"].as_u64()).unwrap_or(0)+u64::from(takeover||previous.is_none());
             let lease=json!({"owner":self.auth.principal_id,"fencing_token":fence,"expires_at":expires_at,"attempt_count":attempts});

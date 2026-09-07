@@ -79,6 +79,12 @@ pub fn validate_lease_transition(
     now: &str,
 ) -> Result<(), KipError> {
     let fail = |message: &str| Err(KipError::constraint_violation(message));
+    let instant = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+            KipError::constraint_violation("lease expiry must be an RFC 3339 timestamp")
+        })
+    };
+    let now = instant(now)?;
     let Some(after) = after else {
         if before.is_some() || matches!(after_status, "running" | "completed" | "failed") {
             return fail("running tasks require a retained fenced lease");
@@ -90,11 +96,12 @@ pub fn validate_lease_transition(
     }
     let fence = after["fencing_token"].as_u64().unwrap_or(0);
     let attempts = after["attempt_count"].as_u64().unwrap_or(0);
-    let expiry = after["expires_at"].as_str().unwrap_or("");
+    let expiry = instant(after["expires_at"].as_str().unwrap_or(""))?;
     if let Some(before) = before {
         let old_fence = before["fencing_token"].as_u64().unwrap_or(0);
         let old_attempts = before["attempt_count"].as_u64().unwrap_or(0);
-        let expired = before["expires_at"].as_str().unwrap_or("") <= now;
+        let old_expiry = instant(before["expires_at"].as_str().unwrap_or(""))?;
+        let expired = old_expiry <= now;
         if after_status == "running" && (expired || before_status != "running") {
             if fence != old_fence + 1
                 || attempts != old_attempts + 1
@@ -111,7 +118,7 @@ pub fn validate_lease_transition(
                 || after["owner"] != actor
                 || fence != old_fence
                 || attempts != old_attempts
-                || expiry < before["expires_at"].as_str().unwrap_or("")
+                || expiry < old_expiry
             {
                 return fail("stale or expired lease cannot renew, complete or dispatch");
             }

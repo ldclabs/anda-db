@@ -180,7 +180,7 @@ fn build(concepts: &[LegacyRow], propositions: &[LegacyRow]) -> MigrationPlan {
 
 /// Reads the ambiguous legacy fields out of a 1.x `metadata` map.
 fn collect_legacy(doc: &Json, plan: &mut MigrationPlan, by_name: Option<&BTreeMap<&str, usize>>) {
-    let Some(metadata) = doc.get("metadata").and_then(Json::as_object) else {
+    let Some(metadata) = super::values::metadata(doc).as_object() else {
         return;
     };
     if let Some(value) = metadata.get("confidence").and_then(Json::as_f64) {

@@ -213,7 +213,58 @@ impl<'a> Context<'a> {
                 self.views.insert(id, Arc::new(view));
             }
         }
+        self.filter_reference_audit(id).await?;
         Ok(element)
+    }
+
+    /// Runtime reference audit is useful only for inputs this caller may read.
+    /// Filtering both spellings prevents a visible canonical target from
+    /// disclosing a hidden alias that another write originally supplied.
+    async fn filter_reference_audit(&mut self, id: ElementId) -> Result<(), KipError> {
+        let Some(bindings) = self
+            .views
+            .get(&id)
+            .and_then(|view| view["_system"]["input_references"].as_array())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut visible = Vec::new();
+        for binding in bindings {
+            let mut readable = true;
+            for key in ["supplied", "resolved"] {
+                let Some(reference) = binding[key]
+                    .as_str()
+                    .and_then(|value| value.parse::<ElementId>().ok())
+                else {
+                    readable = false;
+                    break;
+                };
+                let source = self
+                    .store
+                    .element_at(&self.space, reference, self.pinned_seq)
+                    .await?;
+                if !source.as_ref().is_some_and(|row| {
+                    self.authority
+                        .may_read(row, self.auth)
+                        .is_some_and(|visibility| visibility.content)
+                }) {
+                    readable = false;
+                    break;
+                }
+            }
+            if readable {
+                visible.push(binding);
+            }
+        }
+        if let Some(view) = self.views.get_mut(&id) {
+            let mut json = (**view).clone();
+            if let Some(system) = json.get_mut("_system").and_then(Json::as_object_mut) {
+                system.insert("input_references".into(), Json::Array(visible));
+            }
+            *view = Arc::new(json);
+        }
+        Ok(())
     }
 
     /// Loads and admits one element without attaching the canonical

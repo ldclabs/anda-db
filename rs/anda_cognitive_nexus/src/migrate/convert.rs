@@ -36,7 +36,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 use super::MIGRATION_KEY_PREFIX;
-use super::package::{Vocabulary, legacy_package_ref};
+use super::package::Vocabulary;
 use super::stage::{self, LegacyKind, LegacyRow};
 use crate::CognitiveNexus;
 use crate::nexus::DEFAULT_SPACE;
@@ -53,6 +53,12 @@ const MIGRATION_ACTOR_KEY: &str = "kip:migrate:v1:actor";
 /// whole migration. Batching keeps a failure's blast radius readable in the log
 /// while a resumed run still skips what landed.
 const BATCH: usize = 64;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FrozenPlan {
+    vocabulary: Vocabulary,
+    package: Json,
+}
 
 fn internal(message: impl std::fmt::Display) -> KipError {
     KipError::new(KipErrorCode::InternalError, format!("migration: {message}"))
@@ -125,21 +131,50 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         propositions.len(),
     );
 
-    let mut vocabulary = Vocabulary::scan(&concepts, &propositions);
-    // Hand every name the Space can already resolve to whoever declares it, so
-    // a 1.x `Person` becomes the host's `Person` rather than a second symbol
-    // spelled the same way. What is left has no owner and is declared below.
-    vocabulary.resolve(&nexus.store.schema_environment(DEFAULT_SPACE).await?);
-    // The actor every migrated Assertion is attributed to needs a type, and no
-    // type in the cognitive-memory profile means "the engine that imported
-    // this". Generating one keeps the attribution honest without bending
-    // `Person`, which the profile is explicit is never a Principal (§88.1).
-    vocabulary
-        .concept_types
-        .insert(MIGRATION_ACTOR_TYPE.to_string());
-    activate_legacy_package(nexus, &vocabulary).await?;
+    // Freeze before installing anything. Resolving against a partially migrated
+    // environment on retry must not change an immutable Package's contents.
+    let frozen = if let Some(frozen) = staging.get_extension_as::<FrozenPlan>("migration_plan_v1") {
+        frozen
+    } else {
+        let mut vocabulary = if let Some(vocabulary) =
+            staging.get_extension_as::<Vocabulary>("migration_vocabulary_v2")
+        {
+            vocabulary
+        } else {
+            let mut vocabulary = Vocabulary::scan(&concepts, &propositions);
+            // Hand every name the Space can already resolve to whoever declares it, so
+            // a 1.x `Person` becomes the host's `Person` rather than a second symbol
+            // spelled the same way. What is left has no owner and is declared below.
+            vocabulary.resolve(&nexus.store.schema_environment(DEFAULT_SPACE).await?);
+            vocabulary.resolve_legacy_endpoints(
+                &nexus.store.schema_environment(DEFAULT_SPACE).await?,
+                &concepts,
+                &propositions,
+            );
+            // The actor every migrated Assertion is attributed to needs a type, and no
+            // type in the cognitive-memory profile means "the engine that imported
+            // this". Generating one keeps the attribution honest without bending
+            // `Person`, which the profile is explicit is never a Principal (§88.1).
+            vocabulary
+                .concept_types
+                .insert(MIGRATION_ACTOR_TYPE.to_string());
+            vocabulary
+        };
+        vocabulary.freeze_refs();
+        let frozen = FrozenPlan {
+            package: vocabulary.artifact()?,
+            vocabulary,
+        };
+        staging
+            .save_extension_from("migration_plan_v1".to_string(), &frozen)
+            .await
+            .map_err(internal)?;
+        frozen
+    };
+    let vocabulary = frozen.vocabulary;
+    activate_legacy_package(nexus, &vocabulary, &frozen.package).await?;
 
-    let actor = ensure_actor(nexus).await?;
+    let actor = ensure_actor(nexus, &vocabulary).await?;
     let concept_ids = load_concepts(nexus, &concepts, &vocabulary).await?;
     let speakers = unambiguous_speakers(&concepts, &concept_ids);
     let claims = load_propositions(
@@ -151,6 +186,16 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         &speakers,
     )
     .await?;
+    for row in &concepts {
+        if super::values::archive(&row.doc["metadata"], &crate::time::now()) {
+            run(
+                nexus,
+                "TRANSITION :id TO \"archived\"",
+                Map::from_iter([("id".into(), json!(concept_ids[&row.legacy_id]))]),
+            )
+            .await?;
+        }
+    }
 
     stage::mark_complete(
         &staging,
@@ -158,7 +203,7 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
             "concepts": concept_ids.len(),
             "proposition_rows": propositions.len(),
             "assertions": claims,
-            "package": legacy_package_ref(),
+            "package": vocabulary.package_ref(),
             "actor": actor,
         }),
     )
@@ -184,11 +229,11 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
 async fn activate_legacy_package(
     nexus: &CognitiveNexus,
     vocabulary: &Vocabulary,
+    artifact: &Json,
 ) -> Result<(), KipError> {
     if vocabulary.is_empty() {
         return Ok(());
     }
-    let artifact = vocabulary.artifact()?;
     let package = crate::schema::SchemaPackage::parse(&artifact.to_string())?;
     let package_ref = nexus.install_package(&package, "kip-1.x-migration").await?;
 
@@ -209,7 +254,7 @@ async fn activate_legacy_package(
 }
 
 /// Finds or creates the Concept migrated Assertions are attributed to.
-async fn ensure_actor(nexus: &CognitiveNexus) -> Result<String, KipError> {
+async fn ensure_actor(nexus: &CognitiveNexus, vocabulary: &Vocabulary) -> Result<String, KipError> {
     if let Some(id) = find_by_client_key(nexus, MIGRATION_ACTOR_KEY).await? {
         return Ok(id);
     }
@@ -219,13 +264,13 @@ async fn ensure_actor(nexus: &CognitiveNexus) -> Result<String, KipError> {
         nexus,
         &format!(
             r#"CREATE CONCEPT ?actor {{
-                 TYPE "{MIGRATION_ACTOR_TYPE}"
+                 TYPE "{}/{MIGRATION_ACTOR_TYPE}"
                  NAME "KIP 1.x migration"
                  CLIENT KEY :k
                  SET ATTRIBUTES {{
                    "description": "The engine, standing as the recorded source of every claim carried in from the KIP 1.x database. Not a person, and not a Principal: it names where these Assertions came from, which is the one thing the old rows actually established."
                  }}
-               }}"#
+               }}"#, vocabulary.package_ref()
         ),
         parameters,
     )
@@ -306,6 +351,15 @@ async fn load_concepts(
     rows: &[LegacyRow],
     vocabulary: &Vocabulary,
 ) -> Result<BTreeMap<u64, String>, KipError> {
+    let environment = nexus.store.schema_environment(DEFAULT_SPACE).await?;
+    let mnemonic = environment
+        .resolve_symbol(
+            crate::schema::SymbolKind::Facet,
+            "MnemonicState",
+            crate::schema::Intent::Write,
+        )
+        .ok()
+        .map(|s| s.to_string());
     let mut ids = BTreeMap::new();
     let mut pending: Vec<&LegacyRow> = Vec::new();
     for row in rows {
@@ -344,7 +398,7 @@ async fn load_concepts(
             parameters.insert(format!("n{index}"), json!(name));
             parameters.insert(format!("k{index}"), json!(concept_key(row.legacy_id)));
             let attributes = render_assignments(
-                &legacy_attributes(row),
+                &super::values::attributes(row, &symbol, &environment)?,
                 &format!("a{index}"),
                 &mut parameters,
             );
@@ -356,16 +410,33 @@ async fn load_concepts(
             // `name` stays too, because in 2.0 it is a display label and a 1.x
             // name was both — dropping it would lose what the old system
             // actually showed people.
+            parameters.insert(
+                format!("r{index}"),
+                super::values::retention(&row.doc["metadata"]),
+            );
+            parameters.insert(format!("raw{index}"), row.doc.clone());
             let identity = if name.is_empty() {
-                String::new()
+                format!(" SET FIELDS {{ retention: :r{index} }}")
             } else {
                 parameters.insert(format!("i{index}"), json!(name));
-                format!(" SET FIELDS {{ key: :i{index} }}")
+                format!(" SET FIELDS {{ key: :i{index}, retention: :r{index} }}")
             };
-
+            let mut facets = format!(
+                " SET FACET \"{}/LegacyRecord\" {{ record: :raw{index} }}",
+                vocabulary.package_ref()
+            );
+            if let Some(symbol) = &mnemonic
+                && let Some(state) = super::values::mnemonic(&row.doc["metadata"])
+            {
+                let assignments = render_assignments(&state, &format!("m{index}"), &mut parameters);
+                facets.push_str(&format!(
+                    " SET FACET {} {assignments}",
+                    anda_kip::quote_str(symbol)
+                ));
+            }
             clauses.push(format!(
                 "CREATE CONCEPT ?{handle} {{ TYPE :t{index} NAME :n{index} \
-                 CLIENT KEY :k{index}{identity} SET ATTRIBUTES {attributes} }}"
+                 CLIENT KEY :k{index}{identity} SET ATTRIBUTES {attributes}{facets} }}"
             ));
         }
         let handles = mutate_handles(
@@ -394,22 +465,6 @@ async fn load_concepts(
 /// — `access_level` annotated where 2.0's classification enforces, and
 /// `confidence` may have been truth, staleness or importance (§13, §21).
 /// Preserved and labelled is recoverable; guessed is not.
-fn legacy_attributes(row: &LegacyRow) -> Json {
-    let mut attributes = row
-        .doc
-        .get("attributes")
-        .and_then(Json::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut legacy = Map::new();
-    legacy.insert("id".to_string(), json!(row.legacy_id));
-    if let Some(metadata) = row.doc.get("metadata").and_then(Json::as_object) {
-        legacy.insert("metadata".to_string(), Json::Object(metadata.clone()));
-    }
-    attributes.insert("legacy".to_string(), Json::Object(legacy));
-    Json::Object(attributes)
-}
-
 /// Renders an assignment object, with every value bound as a parameter.
 ///
 /// `SET ATTRIBUTES` takes a literal object (`assignment_object` in the
@@ -467,6 +522,7 @@ async fn load_propositions(
     speakers: &BTreeMap<String, String>,
 ) -> Result<usize, KipError> {
     let mut created: BTreeMap<String, String> = BTreeMap::new();
+    let mut claims = BTreeMap::new();
     let mut assertions = 0usize;
     let mut outstanding: Vec<(u64, String, Json)> = Vec::new();
 
@@ -526,11 +582,20 @@ async fn load_propositions(
         }
 
         for chunk in ready.chunks(BATCH) {
-            assertions +=
-                write_batch(nexus, chunk, vocabulary, actor, speakers, &mut created).await?;
+            assertions += write_batch(
+                nexus,
+                chunk,
+                vocabulary,
+                actor,
+                speakers,
+                &mut created,
+                &mut claims,
+            )
+            .await?;
         }
         outstanding = deferred;
     }
+    finalize_claims(nexus, rows, &claims, &created, speakers).await?;
     Ok(assertions)
 }
 
@@ -543,6 +608,7 @@ async fn write_batch(
     actor: &str,
     speakers: &BTreeMap<String, String>,
     created: &mut BTreeMap<String, String>,
+    claims: &mut BTreeMap<String, String>,
 ) -> Result<usize, KipError> {
     let mut clauses = Vec::new();
     let mut parameters = Map::new();
@@ -551,11 +617,13 @@ async fn write_batch(
     parameters.insert("actor".to_string(), json!({"id": actor}));
 
     for (index, (legacy_id, predicate, properties, subject, object)) in chunk.iter().enumerate() {
-        let symbol = vocabulary.predicate_ref(predicate).ok_or_else(|| {
-            internal(format!(
-                "1.x predicate {predicate:?} is missing from the generated package"
-            ))
-        })?;
+        let symbol = vocabulary
+            .predicate_for(*legacy_id, predicate)
+            .ok_or_else(|| {
+                internal(format!(
+                    "1.x predicate {predicate:?} is missing from the generated package"
+                ))
+            })?;
         parameters.insert(format!("s{index}"), json!({"id": subject}));
         parameters.insert(format!("o{index}"), json!({"id": object}));
         parameters.insert(format!("p{index}"), json!(symbol));
@@ -567,21 +635,26 @@ async fn write_batch(
         // *plus* a positive Assertion (§11): without one, nothing would be
         // believed after migration, because silence in 2.0 is `insufficient`
         // rather than assent.
-        let confidence = properties
-            .get("metadata")
-            .and_then(|m| m.get("confidence"))
+        let metadata = super::values::metadata(properties);
+        let confidence = metadata
+            .get("confidence")
             .and_then(Json::as_f64)
             .filter(|value| (0.0..=1.0).contains(value));
         parameters.insert(
             format!("ak{index}"),
             json!(proposition_key(*legacy_id, predicate)),
         );
+        parameters.insert(
+            format!("raw{index}"),
+            json!({"legacy_id":legacy_id,"predicate":predicate,"properties":properties}),
+        );
+        parameters.insert(format!("time{index}"), super::values::valid_time(metadata));
+        parameters.insert(format!("ret{index}"), super::values::retention(metadata));
         // A legacy `author` that names exactly one migrated Concept is a
         // speaker the old system really did record; anything else stays the
         // migration actor, and the string stays an attribute (§12).
-        let speaker = properties
-            .get("metadata")
-            .and_then(|m| m.get("author"))
+        let speaker = metadata
+            .get("author")
             .and_then(Json::as_str)
             .and_then(|author| speakers.get(author))
             .cloned();
@@ -602,7 +675,8 @@ async fn write_batch(
         clauses.push(format!(
             "CREATE ASSERTION ?a{index} {{ CLIENT KEY :ak{index} SET FIELDS {{ \
              proposition: ?p{index}, asserted_by: {by}, stance: \"support\", \
-             mode: \"imported\"{confidence_clause} }} }}"
+             mode: \"imported\"{confidence_clause}, valid_time: :time{index}, retention: :ret{index} }} \
+             SET FACET \"{}/LegacyRecord\" {{ record: :raw{index} }} }}", vocabulary.package_ref()
         ));
         assertions += 1;
     }
@@ -617,6 +691,126 @@ async fn write_batch(
         if let Some(id) = handles.get(&format!("p{index}")) {
             created.insert(proposition_key(*legacy_id, predicate), id.clone());
         }
+        if let Some(id) = handles.get(&format!("a{index}")) {
+            claims.insert(proposition_key(*legacy_id, predicate), id.clone());
+        }
     }
     Ok(assertions)
+}
+
+/// Apply source lifecycle only after every referenced claim exists. This phase
+/// is idempotent and must finish before the durable completion marker is set.
+async fn finalize_claims(
+    nexus: &CognitiveNexus,
+    rows: &[LegacyRow],
+    claims: &BTreeMap<String, String>,
+    propositions: &BTreeMap<String, String>,
+    speakers: &BTreeMap<String, String>,
+) -> Result<(), KipError> {
+    let mut metadata = BTreeMap::new();
+    for row in rows {
+        for predicate in row.doc["predicates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Json::as_str)
+        {
+            metadata.insert(
+                proposition_key(row.legacy_id, predicate),
+                super::values::metadata(&row.doc["properties"][predicate]),
+            );
+        }
+    }
+    let now = crate::time::now();
+    for key in revision_order(&metadata) {
+        let meta = metadata[&key];
+        let Some(id) = claims.get(&key) else {
+            continue;
+        };
+        let mut parameters = Map::from_iter([("id".into(), json!(id))]);
+        let by = meta["author"].as_str().and_then(|a| speakers.get(a));
+        if meta["status"] == "retracted" && by.is_some() {
+            run(nexus, "TRANSITION :id TO \"retracted\"", parameters).await?;
+            continue;
+        }
+        let successor = meta["superseded_by"]
+            .as_str()
+            .map(|s| format!("{MIGRATION_KEY_PREFIX}{s}"));
+        if let Some(next) = successor.as_ref()
+            && let Some(next_id) = claims.get(next)
+            && let Some(other) = metadata.get(next)
+            && by.is_some()
+            && by == other["author"].as_str().and_then(|a| speakers.get(a))
+            && id != next_id
+            // Native supersession is an actor revising the same Proposition.
+            // v1 state changes across different tuples remain legacy history.
+            && propositions.get(&key) == propositions.get(next)
+            && (meta["superseded"] == true || meta["status"] == "superseded")
+            && acyclic_revision(&key, &metadata)
+        {
+            parameters.insert("by".into(), json!(next_id));
+            run(nexus, "TRANSITION :id TO \"superseded\" BY :by", parameters).await?;
+        } else if super::values::archive(meta, &now) {
+            // An ambiguous legacy actor or revision pointer does not authorize
+            // us to fabricate a source-specific withdrawal/supersession.
+            run(nexus, "TRANSITION :id TO \"archived\"", parameters).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Cyclic legacy annotations cannot justify native supersession. Keep them
+/// as provenance and archive the excluded source claims instead.
+fn acyclic_revision(start: &str, metadata: &BTreeMap<String, &Json>) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut current = start.to_string();
+    for _ in 0..1024 {
+        if !seen.insert(current.clone()) {
+            return false;
+        }
+        let Some(next) = metadata
+            .get(&current)
+            .and_then(|m| m["superseded_by"].as_str())
+        else {
+            return true;
+        };
+        current = format!("{MIGRATION_KEY_PREFIX}{next}");
+    }
+    false
+}
+
+/// Retire predecessors before their replacements. v1 row ids are not a
+/// reliable revision order, and a replacement may itself have been withdrawn.
+fn revision_order(metadata: &BTreeMap<String, &Json>) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut incoming: BTreeMap<String, usize> = metadata.keys().map(|k| (k.clone(), 0)).collect();
+    let mut links = BTreeMap::new();
+    for (key, meta) in metadata {
+        if let Some(next) = meta["superseded_by"].as_str() {
+            let next = format!("{MIGRATION_KEY_PREFIX}{next}");
+            if let Some(count) = incoming.get_mut(&next) {
+                *count += 1;
+                links.insert(key.clone(), next);
+            }
+        }
+    }
+    let mut ready: BTreeSet<_> = incoming
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut ordered = Vec::with_capacity(metadata.len());
+    while let Some(key) = ready.pop_first() {
+        if let Some(next) = links.get(&key) {
+            let count = incoming.get_mut(next).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                ready.insert(next.clone());
+            }
+        }
+        ordered.push(key);
+    }
+    let emitted: BTreeSet<_> = ordered.iter().cloned().collect();
+    ordered.extend(metadata.keys().filter(|k| !emitted.contains(*k)).cloned());
+    ordered
 }

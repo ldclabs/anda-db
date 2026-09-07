@@ -139,7 +139,32 @@ export class Context {
       const view = this.views.get(key)
       if (view && isJsonMap(view._system)) view._system.dependency_validity = dependencyValidity(this, element, this.projectionPolicy, this.validAt)
     }
+    this.filterReferenceAudit(key)
     return element
+  }
+
+  /** Hide both spellings of an audited reference unless both are readable. */
+  private filterReferenceAudit(key: string): void {
+    const view = this.views.get(key),
+      system = view && isJsonMap(view._system) ? view._system : null,
+      bindings = system?.input_references
+    if (!system || !Array.isArray(bindings)) return
+    system.input_references = bindings.filter((value) => {
+      if (!isJsonMap(value)) return false
+      return ['supplied', 'resolved'].every((name) => {
+        const reference = tryParseElementId(String(value[name] ?? ''))
+        if (!reference) return false
+        const row =
+          this.asOf === null
+            ? this.store.load(reference)
+            : this.store.elementAt(this.space, reference, this.asOf)
+        return (
+          !!row &&
+          row.row.space === this.space &&
+          this.authority.mayRead(row, this.auth)?.content === true
+        )
+      })
+    })
   }
 
   /** The rendered Core view of an element, computed once per query. */

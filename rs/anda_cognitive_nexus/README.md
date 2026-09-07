@@ -87,3 +87,9 @@ authorization through the same path, not a bypass.
 - [docs/anda_db.md](../../docs/anda_db.md) — the storage core
 
 `anda_cognitive_nexus_server` serves this crate over HTTP/JSON-RPC. MIT licensed.
+
+## Upgrading a v1 store
+
+Migration is automatic on first open after host Schema activation. Stop the old
+writer, back up and rehearse on a copy first; collection replacement is one-way.
+See [migration mapping, checkpoints and limitations](../../docs/kip-v1-migration.md).

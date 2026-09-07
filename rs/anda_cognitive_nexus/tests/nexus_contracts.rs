@@ -1,5 +1,10 @@
 use anda_cognitive_nexus::{
     CognitiveNexus,
+    governance::{
+        AuthContext,
+        rows::{AuthorityConstraints, AuthorityScope},
+        store::{GrantDraft, PrincipalDraft},
+    },
     nexus::DEFAULT_SPACE,
     profiles::{COGNITIVE_MEMORY, COGNITIVE_MEMORY_ID, COGNITIVE_MEMORY_VERSION},
     schema::{PackageState, SchemaLock, SchemaPackage, contracts},
@@ -333,6 +338,25 @@ async fn task_leases_and_watch_generations_are_persistent_cas() {
         .arm_watch(DEFAULT_SPACE, "C-4", 1)
         .await
         .unwrap();
+    assert_eq!(
+        run(
+            &n,
+            r#"UPDATE "C-4" SET ATTRIBUTES {status:"fired"} EXPECT VERSION 2"#,
+            Json::Null
+        )
+        .await
+        .status,
+        TopLevelStatus::Failed,
+        "ordinary KML cannot fire a Watch"
+    );
+    n.system_session()
+        .put_artifact(
+            DEFAULT_SPACE,
+            json!({"retained":"watch-independent"}),
+            vec!["E-1".into()],
+        )
+        .await
+        .unwrap();
     ok(
         &n,
         r#"UPDATE "C-1" SET FIELDS {name:"Ada Byron"}"#,
@@ -374,6 +398,96 @@ async fn task_leases_and_watch_generations_are_persistent_cas() {
         Json::Null,
     )
     .await;
+}
+
+#[tokio::test]
+async fn lease_expiry_compares_instants_and_persists_utc() {
+    let (n, _) = fresh("offset_lease_expiry").await;
+    ok(&n, r#"CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}"#, Json::Null).await;
+    let expires = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        .replace('Z', "+02:00");
+    assert!(chrono::DateTime::parse_from_rfc3339(&expires).unwrap() < chrono::Utc::now());
+    assert_eq!(
+        run(
+            &n,
+            &format!(r#"UPDATE "C-1" SET ATTRIBUTES {{status:"running"}} SET FACET "LeaseState" {{owner:"kip:principal:system",fencing_token:1,attempt_count:1,expires_at:"{expires}"}} EXPECT VERSION 1"#),
+            Json::Null,
+        )
+        .await
+        .status,
+        TopLevelStatus::Failed
+    );
+    let future = n
+        .system_session()
+        .lease_task(DEFAULT_SPACE, "C-1", 1, "2099-01-01T02:00:00+02:00")
+        .await
+        .unwrap();
+    assert_eq!(future["lease"]["expires_at"], "2099-01-01T00:00:00.000Z");
+}
+
+#[tokio::test]
+async fn reference_audit_is_scoped_to_each_write_and_current_visibility() {
+    let (n, _) = fresh("reference_audit_visibility").await;
+    ok(&n, SETUP, Json::Null).await;
+    ok(
+        &n,
+        r#"MUTATE {
+          CREATE CONCEPT ?public {TYPE "Person" NAME "Public"}
+          ASSERT (:private,"prefers",:value) {by: :private,mode:"stated"}
+          CREATE ACTIVITY ?audit {SET FIELDS {activity_class:"audit",status:"completed"} SET STRUCTURAL {("inputs",:private)}}
+        }"#,
+        json!({"private":"C-1","value":"C-2"}),
+    )
+    .await;
+    let public_audit = ok(
+        &n,
+        r#"FIND(?c._system.input_references) WHERE {?c CONCEPT {id:"C-3"}}"#,
+        Json::Null,
+    )
+    .await;
+    assert!(!public_audit.to_string().contains("C-1"));
+
+    n.governance()
+        .ensure_principal(PrincipalDraft {
+            principal_id: "kip:principal:limited".into(),
+            principal_class: "agent".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    n.governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: "kip:principal:limited".into(),
+                actions: vec!["read".into()],
+                scope: AuthorityScope {
+                    elements: vec!["X-1".into()],
+                    ..Default::default()
+                },
+                constraints: AuthorityConstraints {
+                    fields: vec!["_system".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "kip:principal:system",
+        )
+        .await
+        .unwrap();
+    let reader = n.session(AuthContext::principal("kip:principal:limited"));
+    let command = r#"FIND(?x._system.input_references) WHERE {?x ACTIVITY {id:"X-1"}}"#;
+    let request = Request::single(command);
+    let response = reader
+        .execute(
+            anda_kip::parse_kip(command).unwrap(),
+            &request,
+            &request.operations[0],
+        )
+        .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    assert!(!response.first_result().unwrap().to_string().contains("C-1"));
 }
 
 #[tokio::test]

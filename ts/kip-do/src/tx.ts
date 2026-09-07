@@ -6,6 +6,7 @@ import type { ActivityRow } from './store/rows.js'
 import { isDerived } from './projection/dependency.js'
 import { validateRecord, pinnedPlane } from './schema/contracts.js'
 import { render } from './view.js'
+import { referencedIds } from './store/references.js'
 /**
  * # Transactions
  *
@@ -702,15 +703,19 @@ export class Transaction {
 
   commit(idempotencyKey: string, requestDigest = ''): Outcome {
     for (const staged of this.staged.values()) {
-      if (
-        staged.changed &&
-        staged.verb !== 'purge' &&
-        this.referenceBindings.length
-      ) {
+      if (staged.changed && staged.verb !== 'purge') {
+        const referenced = new Set(referencedIds(staged.element))
+        const bindings = this.referenceBindings.filter(
+          (binding) =>
+            isJsonMap(binding) &&
+            typeof binding.resolved === 'string' &&
+            referenced.has(binding.resolved),
+        )
+        if (!bindings.length) continue
         const origin = staged.element.row.origin
         origin._kip_runtime = {
           ...((origin._kip_runtime ?? {}) as JsonMap),
-          input_references: this.referenceBindings,
+          input_references: bindings,
         }
       }
     }

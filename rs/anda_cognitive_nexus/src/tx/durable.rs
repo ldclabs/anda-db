@@ -229,7 +229,22 @@ impl Transaction {
         Ok(())
     }
 
-    pub(crate) fn validate_durable(&self) -> Result<(), KipError> {
+    pub(crate) fn validate_durable(&mut self) -> Result<(), KipError> {
+        for staged in self.staged.values_mut() {
+            let Element::Concept(row) = &mut staged.row else {
+                continue;
+            };
+            if row.schema_ref == "kip://profiles/cognitive-memory@2.1.0/SleepTask"
+                && let Some(lease) = row
+                    .facets
+                    .get_mut("kip://profiles/cognitive-memory@2.1.0/LeaseState")
+            {
+                lease["expires_at"] = Json::String(crate::time::normalize(
+                    lease["expires_at"].as_str().unwrap_or(""),
+                    "lease expires_at",
+                )?);
+            }
+        }
         for (id, s) in &self.staged {
             if !s.changed || s.op == ChangeOp::Purge {
                 continue;
@@ -246,12 +261,6 @@ impl Transaction {
                     .unwrap_or_default();
                 let before_lease = s.before.as_ref().and_then(|r| facet(r, "LeaseState"));
                 let after_lease = facet(&s.row, "LeaseState");
-                if let Some(lease) = after_lease {
-                    crate::time::normalize(
-                        lease["expires_at"].as_str().unwrap_or(""),
-                        "lease expires_at",
-                    )?;
-                }
                 anda_kip::cognitive::validate_lease_transition(
                     before["attributes"]["status"].as_str().unwrap_or("pending"),
                     row.attributes
@@ -268,6 +277,30 @@ impl Transaction {
                 self.require_changed_guards(*id, s)?;
                 let old = s.before.as_ref().and_then(|r| facet(r, "WatchState"));
                 let new = facet(&s.row, "WatchState");
+                let before_status = s
+                    .before
+                    .as_ref()
+                    .map(crate::view::render)
+                    .and_then(|view| view["attributes"]["status"].as_str().map(str::to_string));
+                let after_status = row
+                    .attributes
+                    .get("status")
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                if s.before.is_none() && (after_status != "disarmed" || new.is_some()) {
+                    return Err(KipError::constraint_violation(
+                        "a new Watch must be disarmed without WatchState",
+                    ));
+                }
+                if before_status
+                    .as_deref()
+                    .is_some_and(|old| old != after_status)
+                    && !self.authorized_watch_updates.contains(id)
+                {
+                    return Err(KipError::not_authorized(
+                        "Watch status is updated by the protected arm/advance binding",
+                    ));
+                }
                 if new.is_none()
                     && (old.is_some()
                         || row.attributes.get("status") == Some(&Json::String("armed".into())))

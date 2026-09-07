@@ -374,6 +374,17 @@ impl Transaction {
         }
     }
 
+    /// ENSURE must see tuples created by this same transaction, including
+    /// the implicit ENSURE inside each ASSERT clause.
+    pub(crate) fn staged_proposition(&self, key: &str) -> Option<ElementId> {
+        self.staged
+            .iter()
+            .find_map(|(id, staged)| match &staged.row {
+                Element::Proposition(row) if row.tuple_key == key => Some(*id),
+                _ => None,
+            })
+    }
+
     /// Stages a newly created element's final row.
     pub fn stage_new(&mut self, id: ElementId, row: Element, op: ChangeOp) {
         self.staged.insert(
@@ -1093,7 +1104,23 @@ impl Transaction {
             .values_mut()
             .filter(|s| s.changed && s.op != ChangeOp::Purge)
         {
-            if !self.reference_bindings.is_empty() {
+            let referenced: BTreeSet<String> = staged
+                .row
+                .references()
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            let bindings: Vec<Json> = self
+                .reference_bindings
+                .iter()
+                .filter(|binding| {
+                    binding["resolved"]
+                        .as_str()
+                        .is_some_and(|id| referenced.contains(id))
+                })
+                .cloned()
+                .collect();
+            if !bindings.is_empty() {
                 let origin = staged.row.envelope_mut().origin;
                 if !origin.is_object() {
                     *origin = serde_json::json!({});
@@ -1101,8 +1128,7 @@ impl Transaction {
                 if !origin["_kip_runtime"].is_object() {
                     origin["_kip_runtime"] = serde_json::json!({});
                 }
-                origin["_kip_runtime"]["input_references"] =
-                    Json::Array(self.reference_bindings.clone());
+                origin["_kip_runtime"]["input_references"] = Json::Array(bindings);
             }
         }
         let pending: Vec<_> = self

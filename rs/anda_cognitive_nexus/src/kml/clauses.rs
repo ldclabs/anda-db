@@ -1203,8 +1203,14 @@ async fn ensure_proposition(
     // semantic tuple (§12.4), so an existing tuple is bound rather than
     // duplicated — and binding it changes nothing, because the tuple is
     // immutable (§12.5).
-    if let Some(existing) = store.find_proposition(&key).await? {
-        let id = ElementId::new(ElementKind::Proposition, existing._id);
+    let existing = match tx.staged_proposition(&key) {
+        Some(id) => Some(id),
+        None => store
+            .find_proposition(&key)
+            .await?
+            .map(|row| ElementId::new(ElementKind::Proposition, row._id)),
+    };
+    if let Some(id) = existing {
         tx.expect_versions(id, &guards).await?;
         if let Some(handle) = &clause.handle {
             tx.bind_existing(handle, id)?;

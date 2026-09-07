@@ -1,6 +1,7 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, it, expect } from 'vitest'
-import { CognitiveNexus } from '../src/nexus.js'
+import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
+import { principalAuth } from '../src/governance/index.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { digest } from '../src/schema/contracts.js'
 import { parseElementId } from '../src/id.js'
@@ -352,6 +353,12 @@ describe('Nexus host contracts', () => {
         ).toBe(1)
         expect(() => s.leaseTask('C-3', 1, '2099-02-01T00:00:00Z')).toThrow()
         s.armWatch('C-4', 1)
+        expect(() =>
+          n.execute(
+            'UPDATE "C-4" SET ATTRIBUTES {status:"fired"} EXPECT VERSION 2',
+          ),
+        ).toThrow()
+        s.putArtifact({ retained: 'watch-independent' }, ['E-1'])
         n.execute('UPDATE "C-1" SET FIELDS {name:"Ada Byron"}')
         const re = CognitiveNexus.connect(state.storage).systemSession()
         expect(re.advanceWatch('C-4', 2, 1).status).toBe('fired')
@@ -363,6 +370,79 @@ describe('Nexus host contracts', () => {
         n.execute(
           'UPDATE "C-3" SET ATTRIBUTES {status:"completed"} EXPECT VERSION 2',
         )
+      },
+    )
+  })
+  it('compares lease expiry as an instant and persists UTC', async () => {
+    await runInDurableObject(
+      env.KIP_DB.getByName('host-offset-lease'),
+      (_, state) => {
+        const n = CognitiveNexus.connect(state.storage)
+        n.activatePackages([COGNITIVE_MEMORY])
+        n.execute(
+          'CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}',
+        )
+        const expires = new Date(Date.now() + 60 * 60 * 1000)
+          .toISOString()
+          .replace('Z', '+02:00')
+        expect(Date.parse(expires)).toBeLessThan(Date.now())
+        expect(() =>
+          n.execute(
+            `UPDATE "C-1" SET ATTRIBUTES {status:"running"} SET FACET "LeaseState" {owner:"${SYSTEM_PRINCIPAL}",fencing_token:1,attempt_count:1,expires_at:"${expires}"} EXPECT VERSION 1`,
+          ),
+        ).toThrow()
+        expect(
+          (n
+            .systemSession()
+            .leaseTask('C-1', 1, '2099-01-01T02:00:00+02:00')
+            .lease as JsonMap).expires_at,
+        ).toBe('2099-01-01T00:00:00.000Z')
+      },
+    )
+  })
+  it('scopes reference audit to each write and current visibility', async () => {
+    await runInDurableObject(
+      env.KIP_DB.getByName('host-reference-audit'),
+      (_, state) => {
+        const n = CognitiveNexus.connect(state.storage)
+        n.activatePackages([COGNITIVE_MEMORY])
+        n.execute(SETUP)
+        n.execute(
+          `MUTATE {
+            CREATE CONCEPT ?public {TYPE "Person" NAME "Public"}
+            ASSERT (:private,"prefers",:value) {by: :private,mode:"stated"}
+            CREATE ACTIVITY ?audit {SET FIELDS {activity_class:"audit",status:"completed"} SET STRUCTURAL {("inputs",:private)}}
+          }`,
+          { private: 'C-1', value: 'C-2' },
+        )
+        expect(
+          JSON.stringify(
+            n.query(
+              'FIND(?c._system.input_references) WHERE {?c CONCEPT {id:"C-3"}}',
+            ),
+          ),
+        ).not.toContain('C-1')
+
+        const gov = n.store.governance
+        gov.ensurePrincipal({ principal_id: 'kip:principal:limited' })
+        gov.createGrant(
+          {
+            space_id: n.space,
+            grantee_principal: 'kip:principal:limited',
+            actions: ['read'],
+            scope: { elements: ['X-1'] },
+            constraints: { fields: ['_system'] },
+          },
+          SYSTEM_PRINCIPAL,
+        )
+        const reader = n.session(principalAuth('kip:principal:limited'))
+        expect(
+          JSON.stringify(
+            reader.query(
+              'FIND(?x._system.input_references) WHERE {?x ACTIVITY {id:"X-1"}}',
+            ),
+          ),
+        ).not.toContain('C-1')
       },
     )
   })

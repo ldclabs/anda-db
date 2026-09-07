@@ -238,7 +238,7 @@ async fn a_1_x_database_migrates_on_the_first_2_0_start() {
     .await;
     assert_eq!(
         serenity,
-        json!(["kip://legacy/nexus@1.0.0/Spaceship"]),
+        json!(["kip://legacy/nexus@1.1.0/Spaceship"]),
         "the legacy type must resolve to a real package symbol"
     );
 
@@ -265,7 +265,7 @@ async fn a_1_x_database_migrates_on_the_first_2_0_start() {
     // not to the row it came from.
     let higher_order = query(
         &nexus,
-        r#"FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, "kip://legacy/nexus@1.0.0/noted_by", ?o) }"#,
+        r#"FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, "kip://legacy/nexus@1.1.0/noted_by", ?o) }"#,
     )
     .await;
     assert_eq!(higher_order, json!([1]));
@@ -333,7 +333,7 @@ async fn a_second_start_migrates_nothing_further() {
 async fn the_1_x_rows_are_kept_after_migrating() {
     let store = write_v1("migrate_keeps").await;
     let nexus = open_v2(store, "migrate_keeps").await;
-    // Three concepts, two proposition rows, plus the completion marker: the
+    // Three concepts, two proposition rows, plus extraction and completion markers: the
     // original is still there to be read in the shape it was stored in.
     let staged = nexus
         .store
@@ -341,7 +341,7 @@ async fn the_1_x_rows_are_kept_after_migrating() {
         .open_collection(LEGACY_STAGING.to_string(), async |_| Ok(()))
         .await
         .unwrap();
-    assert_eq!(staged.len(), 6);
+    assert_eq!(staged.len(), 7);
 }
 
 #[tokio::test]

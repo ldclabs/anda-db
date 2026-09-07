@@ -10,7 +10,7 @@ Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
 |                       |                                                                                                                                                      |
 | :-------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Crate                 | [`anda_cognitive_nexus`](../rs/anda_cognitive_nexus/)                                                                                                |
-| Version               | `0.11.x`                                                                                                                                             |
+| Version               | `0.13.x`                                                                                                                                             |
 | Implements            | KIP **2.0** [`Executor`](../rs/anda_kip/src/executor.rs) ([SPECIFICATION.md](../rs/anda_kip/SPECIFICATION.md))                                        |
 | Storage backend       | [Anda DB](../rs/anda_db/) — embedded document store with B-Tree + BM25 + HNSW indexes                                                                 |
 | Other implementations | [`anda_cognitive_nexus_server`](../rs/anda_cognitive_nexus_server/) (HTTP/JSON-RPC), [`anda_cognitive_nexus_py`](../py/anda_cognitive_nexus_py/) (Py) |
@@ -22,6 +22,8 @@ Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
 > those, you are looking at the wrong major version.
 
 ---
+
+For existing deployments, read the [published v1 migration guide](kip-v1-migration.md) before opening a backup copy with this build.
 
 ## Contents
 

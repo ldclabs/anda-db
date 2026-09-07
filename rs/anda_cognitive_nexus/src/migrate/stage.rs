@@ -24,6 +24,8 @@ pub mod kind {
     pub const PROPOSITION: &str = "proposition";
     /// The sentinel that records phase 3 finished.
     pub const MARKER: &str = "marker";
+    /// Extraction finished durably; the source collections may now be dropped.
+    pub const EXTRACTED: &str = "extracted";
 }
 
 /// A staged 1.x row, kept verbatim.
@@ -91,8 +93,28 @@ fn is_v1_concepts(schema: &Schema) -> bool {
 /// Extracts a 1.x layout into staging and drops the colliding collections.
 pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
     let collections = db.metadata().collections;
+    let staging = open(db).await?;
+    if let Some(staging) = &staging
+        && (has_marker(staging, kind::EXTRACTED).await?
+            // Compatibility with a pre-checkpoint migration interrupted after
+            // its first delete. That implementation flushed all rows first.
+            || !collections.contains(CONCEPTS) && !staging.is_empty())
+    {
+        return drop_legacy_collections(db, staging).await;
+    }
     if !collections.contains(CONCEPTS) {
         // A fresh database, or one already migrated: nothing occupies the name.
+        if collections.contains(PROPOSITIONS) {
+            let c = db
+                .open_collection(PROPOSITIONS.to_string(), async |_| Ok(()))
+                .await
+                .map_err(db_error)?;
+            if is_v1_propositions(&c.schema()) {
+                return Err(KipError::internal_error(
+                    "migration: legacy propositions remain without concepts or a durable staging copy",
+                ));
+            }
+        }
         return Ok(());
     }
 
@@ -151,6 +173,16 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
         copy_out(&propositions, &staging, kind::PROPOSITION).await?;
     }
     staging.flush(unix_ms()).await.map_err(db_error)?;
+    staging
+        .add_from(&LegacyRow {
+            _id: 0,
+            kind: kind::EXTRACTED.into(),
+            legacy_id: 0,
+            doc: serde_json::json!({"rows": staging.len()}),
+        })
+        .await
+        .map_err(db_error)?;
+    staging.flush(unix_ms()).await.map_err(db_error)?;
 
     let staged = staging.len();
     log::warn!(
@@ -160,9 +192,58 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
     );
 
     // Only now, with a durable copy on the other side of a flush.
-    db.delete_collection(CONCEPTS).await.map_err(db_error)?;
-    if collections.contains(PROPOSITIONS) {
-        db.delete_collection(PROPOSITIONS).await.map_err(db_error)?;
+    drop_legacy_collections(db, &staging).await
+}
+
+fn is_v1_propositions(schema: &Schema) -> bool {
+    schema.get_field("predicates").is_some()
+        && schema.get_field("properties").is_some()
+        && schema.get_field("space").is_none()
+}
+
+/// A restart may find either old collection, or already-created v2 ones.
+/// Only remove a confirmed old layout, after durable extraction.
+async fn drop_legacy_collections(
+    db: &Arc<AndaDB>,
+    staging: &Arc<anda_db::collection::Collection>,
+) -> Result<(), KipError> {
+    for name in [CONCEPTS, PROPOSITIONS] {
+        if !db.metadata().collections.contains(name) {
+            continue;
+        }
+        let collection = db
+            .open_collection(name.to_string(), async |_| Ok(()))
+            .await
+            .map_err(db_error)?;
+        let legacy = if name == CONCEPTS {
+            is_v1_concepts(&collection.schema())
+        } else {
+            is_v1_propositions(&collection.schema())
+        };
+        if legacy {
+            // A compatibility checkpoint or storage failure must not cause us
+            // to discard the last surviving copy. Verify each remaining source
+            // row before its collection is irreversibly removed.
+            let kind = if name == CONCEPTS {
+                LegacyKind::Concept
+            } else {
+                LegacyKind::Proposition
+            };
+            let copies: std::collections::BTreeMap<_, _> = rows(staging, kind)
+                .await?
+                .into_iter()
+                .map(|row| (row.legacy_id, row.doc))
+                .collect();
+            for id in collection.ids() {
+                let source: Json = collection.get_as(id).await.map_err(db_error)?;
+                if copies.get(&id) != Some(&source) {
+                    return Err(KipError::internal_error(format!(
+                        "migration: refusing to drop {name}; staging has no identical copy of row {id}"
+                    )));
+                }
+            }
+            db.delete_collection(name).await.map_err(db_error)?;
+        }
     }
     Ok(())
 }
@@ -280,11 +361,18 @@ pub(crate) async fn rows(
 pub(crate) async fn is_complete(
     staging: &Arc<anda_db::collection::Collection>,
 ) -> Result<bool, KipError> {
+    has_marker(staging, kind::MARKER).await
+}
+
+async fn has_marker(
+    staging: &Arc<anda_db::collection::Collection>,
+    marker: &str,
+) -> Result<bool, KipError> {
     let markers: Vec<LegacyRow> = staging
         .search_as(Query {
             filter: Some(Filter::Field((
                 "kind".to_string(),
-                RangeQuery::Eq(Fv::Text(kind::MARKER.to_string())),
+                RangeQuery::Eq(Fv::Text(marker.to_string())),
             ))),
             limit: Some(1),
             ..Default::default()

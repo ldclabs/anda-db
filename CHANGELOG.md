@@ -11,6 +11,24 @@ unpublished, so this accumulates into the same version),
 
 Eight changes accumulate here. The latest one first.
 
+## 2026-09-07 — Brain release migration and transaction identity
+
+- Read the published v1 `a` / `m` property aliases and preserve source data in
+  LegacyRecord. Normalize compatible Brain fields, validity, retention and
+  mnemonic state; retain unproven runtime/learning content under Legacy types.
+- Preserve known lifecycle exclusions. Same-actor/same-Proposition revisions
+  replay in dependency order; ambiguous and cross-Proposition old corrections
+  remain archived source history rather than current beliefs.
+- Persist extraction checkpoints and the complete immutable migration Package
+  plus mappings. Verify staged copies before removing remaining v1 collections;
+  resume without reinterpreting partially installed vocabulary.
+- Rust and TypeScript ingest reject a reused key with different observation
+  content/provenance and deduplicate identical keys inside one transaction.
+- ENSURE/ASSERT reuse a tuple already staged in their transaction, so recording
+  several actors' claims about one Proposition does not cause a duplicate tuple
+  conflict at commit.
+- See [migration operations and limitations](docs/kip-v1-migration.md).
+
 ## The 2026-09-06 review of `anda_db`
 
 `anda_db` (still 0.11.1; the version bump is left to the release — the

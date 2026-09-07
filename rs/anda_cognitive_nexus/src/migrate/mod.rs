@@ -48,7 +48,7 @@
 //!   string that resolves to nothing stays an attribute rather than becoming a
 //!   speaker (§12);
 //! - legacy `confidence` is carried onto the Assertion *and* preserved
-//!   verbatim under `attributes.legacy`, because 1.x deployments used that
+//!   verbatim in `LegacyRecord`, because 1.x deployments used that
 //!   field for several different things and only the operator knows which
 //!   (§13, §14);
 //! - `access_level` is preserved as a legacy attribute and does **not** become
@@ -60,6 +60,7 @@ mod convert;
 mod package;
 mod plan;
 mod stage;
+mod values;
 
 pub use package::{LEGACY_PACKAGE_ID, legacy_package_ref};
 pub use plan::{ConfidenceRange, MigrationPlan, plan};

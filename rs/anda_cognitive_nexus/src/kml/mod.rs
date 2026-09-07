@@ -226,6 +226,7 @@ async fn mint_ingested_evidence(
     ingest.validate()?;
 
     let mut bound = Map::new();
+    let mut ingested_by_key = std::collections::BTreeMap::new();
     for entry in &ingest.evidence {
         // A request parameter of the same name would make it ambiguous which
         // value the command cited, and the two cannot be reconciled: one is a
@@ -274,20 +275,7 @@ async fn mint_ingested_evidence(
             )
         };
 
-        // A retry of the same logical ingestion resolves to the Evidence the
-        // first attempt minted, exactly as `CLIENT KEY` does on a `CREATE`
-        // (§52.1) — which is what makes re-sending a lost request safe.
         let client_key = entry.client_key.clone().unwrap_or_default();
-        if let Some(existing) = store
-            .find_by_client_key(&tx.cx.space, ElementKind::Evidence, &client_key)
-            .await?
-        {
-            bound.insert(
-                entry.key.clone(),
-                serde_json::json!({"id": existing.to_string()}),
-            );
-            continue;
-        }
 
         let mut source_refs = match &entry.source_actor {
             Some(actor) => vec![resolve_source_actor(store, tx, actor).await?],
@@ -310,6 +298,50 @@ async fn mint_ingested_evidence(
         // an OutcomeRecord to an ingested outcome without re-typing anything,
         // and how a member the Facet does not declare fails the whole request.
         let facets = ingested_facets(tx, &entry.facets)?;
+        let media_type = entry.media_type.clone().unwrap_or_else(|| {
+            if entry.payload_artifact.is_some() {
+                "application/json".into()
+            } else {
+                String::new()
+            }
+        });
+        let existing = match ingested_by_key.get(&client_key).copied() {
+            Some(id) => Some(id),
+            None => {
+                store
+                    .find_by_client_key(&tx.cx.space, ElementKind::Evidence, &client_key)
+                    .await?
+            }
+        };
+        if let Some(existing) = existing {
+            let old = tx.load(existing).await?;
+            let crate::store::Element::Evidence(old) = old else {
+                return Err(KipError::internal_error(
+                    "ingest key resolved to a non-Evidence element",
+                ));
+            };
+            if old.evidence_class != entry.evidence_class
+                || old.payload_mode != "inline"
+                || anda_kip::canonical_json(&old.payload_inline)
+                    != anda_kip::canonical_json(&payload)
+                || old.source_refs != source_refs
+                || old.media_type != media_type
+                || entry.observed_at.is_some() && old.observed_at != observed_at
+                || !facets
+                    .iter()
+                    .all(|(name, value)| old.facets.get(name) == Some(value))
+            {
+                return Err(KipError::new(
+                    anda_kip::KipErrorCode::ClientKeyConflict,
+                    "ingest client_key already names a different observation; use a distinct message/ingestion identity",
+                ));
+            }
+            bound.insert(
+                entry.key.clone(),
+                serde_json::json!({"id": existing.to_string()}),
+            );
+            continue;
+        }
 
         let id = tx.mint(ElementKind::Evidence).await?;
         let row = crate::store::rows::EvidenceRow {
@@ -318,18 +350,12 @@ async fn mint_ingested_evidence(
             payload_mode: "inline".to_string(),
             payload_inline: payload,
             content_digest,
-            media_type: entry.media_type.clone().unwrap_or_else(|| {
-                if entry.payload_artifact.is_some() {
-                    "application/json".into()
-                } else {
-                    String::new()
-                }
-            }),
+            media_type,
             observed_at,
             source_keys: source_refs.iter().map(clauses::endpoint_key).collect(),
             source_refs,
             status: "active".to_string(),
-            client_key,
+            client_key: client_key.clone(),
             facets,
             ..Default::default()
         };
@@ -340,6 +366,9 @@ async fn mint_ingested_evidence(
         // around the gate.
         clauses::require_outcome_authority(tx, &element)?;
         tx.stage_new(id, element, anda_kip::ChangeOp::Create);
+        if !client_key.is_empty() {
+            ingested_by_key.insert(client_key, id);
+        }
         bound.insert(entry.key.clone(), serde_json::json!({"id": id.to_string()}));
     }
     Ok(bound)

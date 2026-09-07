@@ -1048,7 +1048,15 @@ function ensureProposition(
   // stays exact.
   const key = tupleKey(tx.cx.space, subject, predicateLineage, object)
 
-  const found = tx.store.propositionByTuple(key)
+  let found = tx.store.propositionByTuple(key)
+  // Read our own writes: repeated ASSERT sugar must not mint the same tuple
+  // twice and discover the collision only when SQLite commits it.
+  for (const staged of tx.staged.values()) {
+    if (staged.element.kind === 'Proposition' && staged.element.row.tuple_key === key) {
+      found = staged.element.row
+      break
+    }
+  }
   const id =
     found === null
       ? tx.mint('Proposition')

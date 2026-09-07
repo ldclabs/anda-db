@@ -29,7 +29,7 @@ import { digest } from '../schema/contracts.js'
 
 import { errors } from '../errors.js'
 import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
-import { isJsonMap, type Json, type JsonMap } from '../json.js'
+import { isJsonMap, canonicalJson, type Json, type JsonMap } from '../json.js'
 import {
   facetDef,
   formatSymbolRef,
@@ -233,6 +233,7 @@ export function mintIngestedEvidence(
   const entries = checkIngest(ingest)
 
   const bound: JsonMap = {}
+  const ingestedByKey = new Map<string, ElementId>()
   for (const entry of entries) {
     // A request parameter of the same name would make it ambiguous which value
     // the command cited, and the two cannot be reconciled: one is a
@@ -250,13 +251,26 @@ export function mintIngestedEvidence(
       payload=artifact.payload;artifactSources=artifact.sources
     }
 
-    // A retry of the same logical ingestion resolves to the Evidence the first
-    // attempt minted, exactly as `CLIENT KEY` does on a `CREATE` (§52.1) —
-    // which is what makes re-sending a lost request safe.
     const clientKey = entry.client_key ?? ''
+    const sourceRefs = [...(entry.source_actor === undefined ? [] : [{id:formatElementId(sourceActor(tx,entry.source_actor))}]),...artifactSources.map((id)=>({id}))]
+    const observedAt = entry.observed_at === undefined ? tx.cx.at : normalizeTime(entry.observed_at, 'ingest.observed_at')
+    const mediaType = entry.media_type ?? (entry.payload_artifact ? 'application/json' : '')
+    const facets = ingestedFacets(tx, entry.facets)
     if (clientKey !== '') {
-      const existing = tx.store.byClientKey('Evidence', tx.cx.space, clientKey)
+      const stored = tx.store.byClientKey('Evidence', tx.cx.space, clientKey)
+      const existingId = ingestedByKey.get(clientKey) ?? (stored ? {kind: 'Evidence' as const, seq: (stored.row as EvidenceRow).id} : undefined)
+      const existing = existingId ? tx.load(existingId) : null
       if (existing !== null) {
+        if (existing.kind !== 'Evidence') throw errors.internalError('ingest key resolved to a non-Evidence element')
+        const old = existing.row
+        if (old.evidence_class !== entry.evidence_class || old.payload_mode !== 'inline'
+          || canonicalJson(old.payload_inline) !== canonicalJson(payload)
+          || canonicalJson(old.source_refs) !== canonicalJson(sourceRefs)
+          || old.media_type !== mediaType
+          || entry.observed_at !== undefined && old.observed_at !== observedAt
+          || !Object.entries(facets).every(([name,value]) => old.facets[name] !== undefined && canonicalJson(old.facets[name]) === canonicalJson(value))) {
+          throw errors.clientKeyConflict('ingest client_key already names a different observation; use a distinct message/ingestion identity')
+        }
         bound[entry.key] = {
           id: formatElementId({
             kind: existing.kind,
@@ -270,19 +284,16 @@ export function mintIngestedEvidence(
     const id = tx.mint('Evidence')
     const row: EvidenceRow = {
       ...blankEnvelope(id.seq),
-      facets: ingestedFacets(tx, entry.facets),
+      facets,
       client_key: clientKey,
       evidence_class: entry.evidence_class,
       payload_mode: 'inline',
       payload_inline: payload,
       content_ref: '',
       content_digest: entry.payload_artifact ? digest(payload) : '',
-      media_type: entry.media_type ?? (entry.payload_artifact ? 'application/json' : ''),
-      observed_at:
-        entry.observed_at === undefined
-          ? tx.cx.at
-          : normalizeTime(entry.observed_at, 'ingest.observed_at'),
-      source_refs: [...(entry.source_actor === undefined ? [] : [{id:formatElementId(sourceActor(tx,entry.source_actor))}]),...artifactSources.map((id)=>({id}))],
+      media_type: mediaType,
+      observed_at: observedAt,
+      source_refs: sourceRefs,
       generated_by: '',
       status: 'active',
       corrects: [],
@@ -295,6 +306,7 @@ export function mintIngestedEvidence(
     // the consequence channel's gate.
     if (recordsOutcome(element)) tx.authorizeCreated(element, 'record_outcome')
     tx.stageNew(id, element)
+    if (clientKey !== '') ingestedByKey.set(clientKey, id)
     bound[entry.key] = { id: formatElementId(id) }
   }
   return bound

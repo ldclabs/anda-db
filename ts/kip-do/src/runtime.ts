@@ -203,14 +203,15 @@ export function validateDurable(tx: Transaction): void {
           fail('running and terminal tasks require retained fenced lease')
         continue
       }
-      normalizeTime(String(lease.expires_at), 'lease expiry')
+      const expiry = normalizeTime(String(lease.expires_at), 'lease expiry')
+      lease.expires_at = expiry
       if (status === 'completed' && beforeStatus !== 'running')
         fail('only a leased running task can complete')
       const fence = Number(lease.fencing_token),
-        attempts = Number(lease.attempt_count),
-        expiry = String(lease.expires_at)
+        attempts = Number(lease.attempt_count)
       if (old) {
-        const expired = String(old.expires_at) <= tx.cx.at
+        const oldExpiry = normalizeTime(String(old.expires_at), 'lease expiry'),
+          expired = oldExpiry <= tx.cx.at
         if (status === 'running' && (expired || beforeStatus !== 'running')) {
           if (
             fence !== Number(old.fencing_token) + 1 ||
@@ -228,7 +229,7 @@ export function validateDurable(tx: Transaction): void {
             lease.owner !== tx.auth.principal_id ||
             fence !== old.fencing_token ||
             attempts !== old.attempt_count ||
-            expiry < String(old.expires_at)
+            expiry < oldExpiry
           )
             fail('stale or expired lease cannot renew, complete or dispatch')
         } else if (canonicalJson(old) !== canonicalJson(lease))
@@ -244,7 +245,21 @@ export function validateDurable(tx: Transaction): void {
         fail('initial lease requires authenticated acquisition with fence 1')
     } else {
       const old = before ? facet(before, 'WatchState') : undefined,
-        watch = facet(e, 'WatchState')
+        watch = facet(e, 'WatchState'),
+        beforeStatus = before
+          ? String(obj(render(before).attributes).status)
+          : null,
+        afterStatus = String(e.row.attributes.status)
+      if (!before && (afterStatus !== 'disarmed' || watch))
+        fail('a new Watch must be disarmed without WatchState')
+      if (
+        beforeStatus !== null &&
+        beforeStatus !== afterStatus &&
+        !tx.authorizedWatchUpdates.has(id)
+      )
+        throw errors.notAuthorized(
+          'Watch status is updated by protected arm/advance binding',
+        )
       if (!watch && (old || e.row.attributes.status === 'armed'))
         fail('armed Watch requires persisted WatchState')
       if (watch) {
@@ -486,7 +501,8 @@ export function leaseTask(
       old = facet(e, 'LeaseState')
     const takeover =
       row.attributes.status !== 'running' ||
-      (!!old && String(old.expires_at) <= tx.cx.at)
+      (!!old &&
+        normalizeTime(String(old.expires_at), 'lease expiry') <= tx.cx.at)
     const lease = {
       owner: session.auth.principal_id,
       fencing_token: Number(old?.fencing_token ?? 0) + Number(takeover || !old),
@@ -674,7 +690,7 @@ function checkDispatch(
     !lease ||
     lease.owner !== session.auth.principal_id ||
     lease.fencing_token !== request.fencing_token ||
-    String(lease.expires_at) <= nowTime()
+    normalizeTime(String(lease.expires_at), 'lease expiry') <= nowTime()
   )
     throw errors.versionConflict(
       'dispatch requires current unexpired lease fence',

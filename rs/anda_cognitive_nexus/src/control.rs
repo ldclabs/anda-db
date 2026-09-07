@@ -319,7 +319,7 @@ impl Session {
             if let Some(old)=self.nexus.store.control_at(space,&key,u64::MAX).await? {
                 if old.value!=value { return Err(KipError::constraint_violation("artifact identity already has a different material binding or erasure tombstone")); }
             } else {
-                self.nexus.store.publish_control(space,&key,"policy",0,value,json!({"principal_id":self.auth.principal_id})).await?;
+                self.nexus.store.publish_control(space,&key,"artifact",0,value,json!({"principal_id":self.auth.principal_id})).await?;
             }
             Ok(pin)
         }).await
