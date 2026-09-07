@@ -24,6 +24,7 @@ import type { Json } from '../../src/json.js'
 const VOLATILE = new Set([
   'created_at',
   'updated_at',
+  'authorization_view',
   'created_tx',
   'updated_tx',
   'tx_id',

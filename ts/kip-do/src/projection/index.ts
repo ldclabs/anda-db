@@ -127,8 +127,7 @@ export interface Belief {
  * believe the engine weighed who said it and how good the evidence was.
  */
 const MISSING_STAGE_WARNINGS = [
-  'no trust model is applied: every eligible corroboration group counts equally, ' +
-    'whoever asserted it',
+  'protected actor trust weights are applied; evidence quality is not automatically graded',
   'no evidence-quality evaluation is applied: a cited Evidence record is counted ' +
     'for its independence, never for how good it is',
 ]
@@ -205,7 +204,7 @@ export function project(
 
   let unverified = false
   for (const row of assertionsAbout(cx, proposition)) {
-    if (row.mode !== 'inferred' || !ledger.supporting.includes(formatElementId({ kind: 'Assertion', seq: row.id }))) continue
+    if ((row.mode !== 'inferred' && !cx.store.controlAt(cx.space, `identity_review/A-${row.id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) || !ledger.supporting.includes(formatElementId({ kind: 'Assertion', seq: row.id }))) continue
     const checked = dependencyValidity(cx, { kind: 'Assertion', row }, policy, validAt)
     if (checked.action_eligible !== true) unverified = true
     const next = (checked.basis as JsonMap).next_invalid_at
@@ -332,7 +331,7 @@ function admit(
     actorRef: (row.asserted_by ?? null) as Json,
     evidence: row.evidence_refs.map((ref) => ref.id),
     stance: row.stance,
-    confidence: row.confidence < 0 ? policy.unstated_confidence : row.confidence,
+    confidence: (row.confidence < 0 ? policy.unstated_confidence : row.confidence) * (policy.trust_weights[(row.asserted_by as JsonMap)?.id as string] ?? policy.default_trust_weight),
     opposesTarget,
   }
 }
@@ -838,14 +837,14 @@ export function projectionBasis(cx: Context, policy: Policy, at: string, next: s
   return {
     space_id: cx.space, snapshot_seq: cx.asOf ?? cx.store.currentSeq(cx.space),
     schema_environment_version: cx.env.version, identity_version: Math.max(0, ...identityVersions.filter((v) => v <= (cx.asOf ?? cx.store.currentSeq(cx.space)))),
-    policy: { id: policy.id, version: sha256Text(canonicalJson([policy.version, policy.accept, policy.material, policy.modes, policy.expand_conflicts, policy.unstated_confidence])) },
-    trust_version: 'structural-no-trust-v1',
+    policy: { id: policy.id, version: `sha256:${sha256Text(canonicalJson([policy.version, policy.accept, policy.material, policy.modes, policy.expand_conflicts, policy.unstated_confidence]))}` },
+    trust_version: policy.trust_version,
     authorization_view: sha256Text(canonicalJson(authorization)),
     context_refs: contextRefs, purpose: policy.purpose || cx.auth.purpose || 'unspecified', risk: policy.risk || cx.auth.risk || 'unspecified',
     valid_at: at, next_invalid_at: next,
   }
 }
 
-export function checkProjectionHistory(cx: Context, policy: Policy): void {
-  if (cx.asOf !== null && !policy.explicit_selection) throw errors.historicalSnapshotUnavailable('historical projection control state is unavailable; explicitly select an epistemic policy to reinterpret the retained cognition')
+export function checkProjectionHistory(_cx: Context, policy: Policy): void {
+  if (!policy.trust_version || policy.trust_version === 'unavailable') throw errors.historicalSnapshotUnavailable('projection control history unavailable')
 }

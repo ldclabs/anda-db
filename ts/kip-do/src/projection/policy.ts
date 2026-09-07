@@ -25,6 +25,9 @@ export const BASELINE_ID = 'kip:policy:baseline'
 export const BASELINE_VERSION = 2
 
 export interface Policy {
+  trust_weights: Record<string, number>
+  default_trust_weight: number
+  trust_version: string
   context_refs: string[]
   purpose: string
   risk: string
@@ -84,6 +87,7 @@ const EPISTEMIC_SETTINGS = [
 export function baseline(): Policy {
   return {
     id: BASELINE_ID,
+    trust_weights: {}, default_trust_weight: 1, trust_version: '',
     explicit_selection: false,
     context_refs: [],
     purpose: '',

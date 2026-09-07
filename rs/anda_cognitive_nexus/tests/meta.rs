@@ -138,8 +138,6 @@ async fn capabilities_report_the_gaps_as_data_not_as_errors() {
         "atomic_batch",
         "historical_search",
         "semantic_search",
-        "trust_model",
-        "trust_governance",
         "capsule_restore_mode",
         "capsule_signatures",
         "retention_policy",
@@ -700,11 +698,8 @@ async fn trust_refuses_rather_than_reporting_an_empty_judgement() {
     // `DESCRIBE ACCESS` used to refuse for the parallel reason and no longer
     // does, because there is now a Governance plane with something true to say.
     let nexus = fresh("governance").await;
-    let response = run(&nexus, "DESCRIBE TRUST").await;
-    assert_eq!(
-        response.error.as_ref().unwrap().code.as_str(),
-        "UnsupportedCapability"
-    );
+    let response = ok(&nexus, "DESCRIBE TRUST").await;
+    assert_eq!(response["model"], "protected-actor-weights-v1");
 
     let access = ok(&nexus, "DESCRIBE ACCESS").await;
     assert_eq!(access["principal"]["id"], "kip:principal:system");
@@ -749,7 +744,7 @@ async fn the_epistemic_policy_is_introspectable_before_it_is_used() {
     // source trust, which is `weighted_projection: false` — a stated absence,
     // not a silence a caller has to interpret.
     let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
-    assert_eq!(registry["weighted_projection"], json!(false));
+    assert_eq!(registry["weighted_projection"], json!(true));
     assert_eq!(registry["materialized_projection"], json!(false));
     assert_eq!(registry["belief_slot"], json!(true));
 }
@@ -859,12 +854,10 @@ async fn derived(name: &str) -> CognitiveNexus {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?skill {
-                TYPE "Skill"
+                TYPE "Insight"
                 NAME "Plan a migration"
                 SET ATTRIBUTES {
-                    skill_class: "workflow",
-                    summary: "Write the rollback first",
-                    status: "proposed"
+                    summary: "Write the rollback first"
                 }
             }
             CREATE ACTIVITY ?compile {

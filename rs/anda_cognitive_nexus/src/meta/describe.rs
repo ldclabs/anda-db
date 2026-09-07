@@ -70,7 +70,7 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
                 Some(scalar) => scalar_str(cx, scalar, "DESCRIBE EPISTEMIC POLICY")?,
                 None => cx.policy.id.clone(),
             };
-            Answer::whole(policy(&name)?)
+            Answer::whole(policy(cx, &name).await?)
         }
         DescribeTarget::Transaction(scalar) => {
             let tx_id = scalar_str(cx, scalar, "DESCRIBE TRANSACTION")?;
@@ -87,14 +87,34 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
             let source = scalar_str(cx, scalar, "DESCRIBE CAPSULE")?;
             Answer::whole(crate::capsule::describe(&source)?)
         }
-        // Reporting an empty trust answer would read as "nothing is trusted",
-        // which is a judgement. This engine evaluates no source trust, so it
-        // says that instead of implying it.
-        DescribeTarget::Trust { .. } => {
-            return Err(KipError::unsupported_capability(
-                "this engine evaluates no source trust; an empty trust report would read as a \
-                 judgement that nothing is trusted",
-            ));
+        DescribeTarget::Trust { value } => {
+            cx.authority
+                .authorize(
+                    Permission::ReadGovernanceHistory,
+                    &ResourceContext::default(),
+                    cx.auth,
+                )
+                .into_result()?;
+            let control = cx
+                .store
+                .control_at(&cx.space, "trust", cx.pinned_seq)
+                .await?
+                .ok_or_else(|| {
+                    KipError::new(
+                        KipErrorCode::HistoricalSnapshotUnavailable,
+                        "trust state unavailable",
+                    )
+                })?;
+            let value = match value {
+                Some(v) => {
+                    let subject = scalar_str(cx, v, "DESCRIBE TRUST")?;
+                    serde_json::json!({"subject":subject,"weight":control.value["weights"].get(&subject).unwrap_or(&control.value["default_weight"])})
+                }
+                None => control.value.clone(),
+            };
+            Answer::whole(
+                serde_json::json!({"model":"protected-actor-weights-v1","version":crate::schema::contracts::digest(&control.value)?,"state":value}),
+            )
         }
         DescribeTarget::Access { with } => Answer::whole(access(cx, with.as_ref())?),
     })
@@ -244,8 +264,8 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
         ListTarget::Facets => symbols(cx, SymbolKind::Facet),
         ListTarget::StructuralFields => symbols(cx, SymbolKind::StructuralField),
         ListTarget::EpistemicPolicies => vec![
-            policy(&Policy::baseline().id)?,
-            policy(&Policy::forecast().id)?,
+            policy(cx, &Policy::baseline().id).await?,
+            policy(cx, &Policy::forecast().id).await?,
         ],
         ListTarget::Dependents => {
             let (rows, cut) = dependents(cx, command).await?;
@@ -447,7 +467,30 @@ async fn activities_consuming(
 ) -> Result<Vec<crate::id::ElementId>, KipError> {
     let key = crate::term::Endpoint::Local(id).key();
     let mut ids = cx.store.activities_with_input(&cx.space, &key).await?;
+    // Required contracts remain traversable even on legacy rows whose optional
+    // Activity.inputs index was incomplete. The ordinary query budget bounds it.
+    let candidates = cx.candidates(anda_kip::ElementKind::Activity, None).await?;
+    cx.charge(candidates.len())?;
+    for candidate in candidates {
+        if let Some(crate::store::Element::Activity(row)) = cx.load_unattached(candidate).await?
+            && row
+                .facets
+                .iter()
+                .filter(|(name, _)| name.ends_with("/DependencyBasis"))
+                .any(|(_, basis)| {
+                    basis["groups"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|g| g["pins"].as_array().into_iter().flatten())
+                        .any(|pin| pin["id"] == id.to_string())
+                })
+        {
+            ids.push(candidate);
+        }
+    }
     ids.sort_unstable();
+    ids.dedup();
     cx.charge(ids.len())?;
     Ok(ids)
 }
@@ -905,17 +948,12 @@ fn error(code: &str) -> Result<Json, KipError> {
     }))
 }
 
-fn policy(name: &str) -> Result<Json, KipError> {
-    let policy = match name {
-        "baseline" | crate::projection::policy::BASELINE_ID => Policy::baseline(),
-        "forecast" | "kip:policy:forecast" => Policy::forecast(),
-        other => {
-            return Err(KipError::new(
-                KipErrorCode::ProjectionPolicyUnavailable,
-                format!("this Nexus has no epistemic policy {other:?}"),
-            ));
-        }
-    };
+async fn policy(cx: &Context<'_>, name: &str) -> Result<Json, KipError> {
+    let settings = anda_kip::Map::from_iter([("policy".into(), Json::String(name.into()))]);
+    let policy = cx
+        .store
+        .projection_policy_at(&cx.space, cx.pinned_seq, &settings)
+        .await?;
     Ok(serde_json::json!({
         "id": policy.id,
         "version": policy.version,

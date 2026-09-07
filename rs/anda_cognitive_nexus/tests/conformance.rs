@@ -226,6 +226,7 @@ impl Normalizer {
                             | "committed_at"
                             | "valid_at"
                             | "content_digest"
+                            | "authorization_view"
                             | "score"
                     ) {
                         continue;

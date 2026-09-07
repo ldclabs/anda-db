@@ -1,3 +1,9 @@
+import { validateDurable } from './runtime.js'
+import type { ControlRecord } from './control.js'
+import { validateLearning } from './learning.js'
+import { isJsonMap } from './json.js'
+import type { ActivityRow } from './store/rows.js'
+import { isDerived } from './projection/dependency.js'
 import { validateRecord, pinnedPlane } from './schema/contracts.js'
 import { render } from './view.js'
 /**
@@ -27,11 +33,11 @@ import { render } from './view.js'
  * would burn a version and emit a change record for a transition that did not
  * happen.
  *
- * ## What this engine gives you that the Rust one does not
+ * ## Transaction boundaries
  *
  * `ctx.storage.transactionSync` is a real transaction: a clause that throws
- * rolls the whole statement back, shells included. The Rust engine has no
- * write-ahead log and recovers by sweeping `pending` elements on open. Shells
+ * rolls the whole statement back, shells included. The Rust engine uses a
+ * durable redo plan for the equivalent multi-collection commit. Shells
  * still exist here, because a row id is only assigned by inserting and a
  * forward reference needs the id first — but they are no longer the recovery
  * mechanism, and `sweepPending` is kept as a cheap invariant check rather than
@@ -134,7 +140,7 @@ function materialInputs(element: Element): string[] {
 }
 
 /** One element this transaction will write. */
-interface Staged {
+export interface Staged {
   element: Element
   isNew: boolean
   /** Whether the final state differs from what was there before. */
@@ -244,8 +250,13 @@ export class Transaction {
   /** The Space sequence the transaction started from. */
   readonly snapshotSeq: number
 
+  readonly declaredTypes = new Map<string, string>()
   private readonly handleMap = new Map<string, ElementId>()
-  private readonly staged = new Map<string, Staged>()
+  readonly staged = new Map<string, Staged>()
+  readonly controlEffects: Omit<ControlRecord, 'id'>[] = []
+  identityChanged = false
+  readonly authorizedWatchUpdates = new Set<string>()
+  readonly guarded = new Map<string, Set<string>>()
   private readonly referenceBindings: Json[] = []
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
@@ -305,7 +316,11 @@ export class Transaction {
    */
   authorizeElement(id: ElementId, permission: Permission): void {
     requirePermitted(
-      this.authority.authorize(permission, resourceOfElement(this.load(id)), this.auth),
+      this.authority.authorize(
+        permission,
+        resourceOfElement(this.load(id)),
+        this.auth,
+      ),
     )
   }
 
@@ -334,7 +349,11 @@ export class Transaction {
    * the Space default — which is what the element will carry. A Grant narrowed
    * to Concepts must not be a way to create Evidence.
    */
-  authorizeNew(kind: ElementKind, schemaRef: string, permission: Permission): void {
+  authorizeNew(
+    kind: ElementKind,
+    schemaRef: string,
+    permission: Permission,
+  ): void {
     requirePermitted(
       this.authority.authorize(
         permission,
@@ -351,7 +370,9 @@ export class Transaction {
 
   /** Authorizes a permission that is about the Space rather than an element. */
   require(permission: Permission): void {
-    requirePermitted(this.authority.authorize(permission, spaceResource(), this.auth))
+    requirePermitted(
+      this.authority.authorize(permission, spaceResource(), this.auth),
+    )
   }
 
   /**
@@ -580,9 +601,12 @@ export class Transaction {
    */
   stagedConceptType(id: ElementId): string | null {
     const staged = this.staged.get(formatElementId(id))
-    if (staged?.element.kind !== 'Concept') return null
+    if (staged?.element.kind !== 'Concept')
+      return this.declaredTypes.get(formatElementId(id)) ?? null
     const ref = staged.element.row.schema_ref
-    return ref === '' ? null : ref
+    return ref === ''
+      ? (this.declaredTypes.get(formatElementId(id)) ?? null)
+      : ref
   }
 
   /**
@@ -626,6 +650,9 @@ export class Transaction {
     const isNew = staged?.isNew === true
     const named = formatElementId(id)
     for (const guard of guards) {
+      const set = this.guarded.get(named) ?? new Set<string>()
+      set.add(guard.plane ?? 'version')
+      this.guarded.set(named, set)
       if (guard.plane === null) {
         const actual = isNew ? 0 : (staged?.baseVersion ?? 0)
         if (actual !== guard.version) {
@@ -636,7 +663,9 @@ export class Transaction {
         }
         continue
       }
-      const actual = isNew ? 0 : planeCounter(staged?.basePlanes ?? emptyPlanes(), guard.plane)
+      const actual = isNew
+        ? 0
+        : planeCounter(staged?.basePlanes ?? emptyPlanes(), guard.plane)
       if (actual !== guard.version) {
         throw detailed.versionConflictOnPlane(
           guard.plane,
@@ -660,24 +689,50 @@ export class Transaction {
    * being told its key was never seen.
    */
   recordReference(supplied: string, resolved: string): void {
-    const identity = (this.authority.space.policies._kip_identity_changes ?? []) as number[]
-    this.referenceBindings.push({ supplied, resolved, identity_version: Math.max(0, ...identity), path: `references[${this.referenceBindings.length}]`, op_id: this.cx.tx_id })
+    const identity = (this.authority.space.policies._kip_identity_changes ??
+      []) as number[]
+    this.referenceBindings.push({
+      supplied,
+      resolved,
+      identity_version: Math.max(0, ...identity),
+      path: `references[${this.referenceBindings.length}]`,
+      op_id: this.cx.tx_id,
+    })
   }
 
   commit(idempotencyKey: string, requestDigest = ''): Outcome {
     for (const staged of this.staged.values()) {
-      if (staged.changed && staged.verb !== 'purge' && this.referenceBindings.length) {
+      if (
+        staged.changed &&
+        staged.verb !== 'purge' &&
+        this.referenceBindings.length
+      ) {
         const origin = staged.element.row.origin
-        origin._kip_runtime = { ...((origin._kip_runtime ?? {}) as JsonMap), input_references: this.referenceBindings }
+        origin._kip_runtime = {
+          ...((origin._kip_runtime ?? {}) as JsonMap),
+          input_references: this.referenceBindings,
+        }
       }
     }
     for (const staged of this.staged.values()) {
       if (staged.changed && staged.verb !== 'purge') {
-        const old = staged.baseRow ? this.store.load({ kind: staged.element.kind, seq: staged.element.row.id }) : null
-        validateRecord(this.env, render(staged.element), old ? render(old) : null)
+        const old = staged.baseRow
+          ? this.store.load({
+              kind: staged.element.kind,
+              seq: staged.element.row.id,
+            })
+          : null
+        validateRecord(
+          this.env,
+          render(staged.element),
+          old ? render(old) : null,
+        )
+        this.validateRevalidation(staged.element)
       }
     }
     this.captureActivityVersions()
+    validateLearning(this)
+    validateDurable(this)
     this.requestDigest = requestDigest
     const pending = [...this.staged.entries()].filter(
       ([, staged]) => staged.changed,
@@ -705,12 +760,40 @@ export class Transaction {
     this.propagateGovernance(pending)
 
     const seq = this.store.nextSeq(this.cx.space)
-    if (pending.some(([, s]) => s.verb === 'merge')) {
+    if (this.identityChanged || pending.some(([, s]) => s.verb === 'merge')) {
       const space = this.store.space(this.cx.space)!
       const history = (space.policies._kip_identity_changes ?? []) as Json[]
-      space.policies = { ...space.policies, _kip_identity_changes: [...history, seq] }
+      space.policies = {
+        ...space.policies,
+        _kip_identity_changes: [...history, seq],
+      }
       this.store.putSpace(space)
     }
+    for (const [id, s] of pending) {
+      if (s.verb === 'merge' && s.element.kind === 'Concept') {
+        const key = `identity:${this.cx.tx_id}:${id}`
+        this.controlEffects.push({
+          record_id: key,
+          space: this.cx.space,
+          key,
+          seq,
+          version: 1,
+          kind: 'identity',
+          value: {
+            decision_id: key,
+            source: id,
+            target: s.element.row.merged_into,
+            actor: this.auth.principal_id,
+            basis_seq: this.snapshotSeq,
+            resolution_version: seq,
+            status: 'active',
+          },
+          origin: this.cx.origin,
+        })
+      }
+    }
+    for (const row of this.controlEffects)
+      this.store.putControl({ ...row, seq })
     const committedAt = nowTime()
     const changes: ChangeEntry[] = []
     const written = new Set<string>()
@@ -732,7 +815,10 @@ export class Transaction {
       // would otherwise answer that has just been destroyed.
       if (staged.verb !== 'purge') {
         const runtime = row.origin._kip_runtime
-        row.origin = { ...this.cx.origin, ...(runtime ? { _kip_runtime: runtime } : {}) }
+        row.origin = {
+          ...this.cx.origin,
+          ...(runtime ? { _kip_runtime: runtime } : {}),
+        }
       }
       if (staged.isNew) {
         row.created_at = committedAt
@@ -764,33 +850,186 @@ export class Transaction {
    * computes the same entry without keeping the advance: the row is discarded
    * with the transaction.
    */
+  private validateRevalidation(element: Element): void {
+    const contract = Object.entries(element.row.facets).find(([name]) =>
+      name.endsWith('/DependencyBasis'),
+    )?.[1] as JsonMap | undefined
+    if (isDerived(element) || contract)
+      requirePermitted(
+        this.authority.authorize(
+          'derive',
+          resourceOfElement(element),
+          this.auth,
+        ),
+      )
+    if (element.kind !== 'Activity') return
+    const row = element.row
+    if (!contract) {
+      if (row.activity_class === 'dependency_validation')
+        throw errors.constraintViolation(
+          'revalidation requires DependencyBasis',
+        )
+      return
+    }
+    for (const group of contract.groups as JsonMap[])
+      for (const pin of group.pins as JsonMap[]) {
+        if (!row.inputs.some((r) => referenceText(r) === pin.id))
+          throw errors.constraintViolation(
+            'dependency pin is absent from Activity inputs',
+          )
+      }
+    if (row.activity_class !== 'dependency_validation') return
+    if (row.status !== 'completed' || !row.outputs.length)
+      throw errors.constraintViolation(
+        'revalidation must complete and name its exact outputs',
+      )
+    const premises = (basis: JsonMap): string =>
+      canonicalJson(
+        (basis.groups as JsonMap[])
+          .map((g) => ({
+            role: g.role,
+            pins: (g.pins as JsonMap[])
+              .map((p) => ({
+                id: p.id,
+                planes: isJsonMap(p.planes)
+                  ? Object.keys(p.planes).sort()
+                  : null,
+              }))
+              .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))),
+          }))
+          .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b))),
+      )
+    for (const output of row.outputs) {
+      const id = tryParseElementId(referenceText(output))
+      const target = id && this.store.load(id)
+      if (!target || target.row.space !== this.cx.space)
+        throw errors.notFoundOrNotVisible('revalidation target unavailable')
+      if (this.staged.get(referenceText(output))?.changed)
+        throw errors.constraintViolation(
+          'refreshing an output requires a producing Activity, not revalidation',
+        )
+      requirePermitted(
+        this.authority.authorize(
+          'derive',
+          resourceOfElement(target),
+          this.auth,
+        ),
+      )
+      if (target.kind !== 'Assertion') continue
+      let original: string | null = null
+      for (const producer of this.store.all<ActivityRow>(
+        'activities',
+        'SELECT * FROM activities WHERE space = ?',
+        this.cx.space,
+      )) {
+        if (
+          producer.activity_class === 'dependency_validation' ||
+          producer.status !== 'completed' ||
+          producer.state !== State.ACTIVE ||
+          (producer.created_tx !== target.row.created_tx &&
+            producer.updated_tx !== target.row.updated_tx)
+        )
+          continue
+        if (
+          (
+            (producer.origin._kip_runtime as JsonMap)
+              ?.output_versions as JsonMap
+          )?.[referenceText(output)] !== target.row.version
+        )
+          continue
+        requirePermitted(
+          this.authority.authorize(
+            'read',
+            resourceOfElement({ kind: 'Activity', row: producer }),
+            this.auth,
+          ),
+        )
+        const basis = Object.entries(producer.facets).find(([name]) =>
+          name.endsWith('/DependencyBasis'),
+        )?.[1]
+        if (isJsonMap(basis)) original = premises(basis)
+      }
+      if (original !== premises(contract))
+        throw errors.constraintViolation(
+          'revalidation cannot replace an Assertion original premises; create a new Assertion',
+        )
+    }
+  }
+
   private captureActivityVersions(): void {
     for (const staged of this.staged.values()) {
       const element = staged.element
-      if (!staged.changed || element.kind !== 'Activity' || !['completed', 'failed', 'cancelled'].includes(element.row.status)) continue
-      if (staged.baseRow && ['completed', 'failed', 'cancelled'].includes(String(staged.baseRow.status))) continue
+      if (
+        !staged.changed ||
+        element.kind !== 'Activity' ||
+        !['completed', 'failed', 'cancelled'].includes(element.row.status)
+      )
+        continue
+      if (
+        staged.baseRow &&
+        ['completed', 'failed', 'cancelled'].includes(
+          String(staged.baseRow.status),
+        )
+      )
+        continue
       const activity = element.row
-      const contract = Object.entries(activity.facets).find(([name]) => name.endsWith('/DependencyBasis'))?.[1] as JsonMap | undefined
+      const contract = Object.entries(activity.facets).find(([name]) =>
+        name.endsWith('/DependencyBasis'),
+      )?.[1] as JsonMap | undefined
       const inputs: JsonMap = {}
       if (contract) {
         const seq = Number(contract.basis_seq)
-        if (!Number.isSafeInteger(seq) || seq < 0 || seq > this.store.currentSeq(this.cx.space)) throw errors.constraintViolation('DependencyBasis cannot name a future snapshot')
+        if (
+          !Number.isSafeInteger(seq) ||
+          seq < 0 ||
+          seq > this.store.currentSeq(this.cx.space)
+        )
+          throw errors.constraintViolation(
+            'DependencyBasis cannot name a future snapshot',
+          )
         for (const group of contract.groups as JsonMap[]) {
           for (const pin of group.pins as JsonMap[]) {
             const id = tryParseElementId(String(pin.id))
-            if (!id) throw errors.constraintViolation('invalid DependencyBasis source')
+            if (!id)
+              throw errors.constraintViolation('invalid DependencyBasis source')
             const pending = this.staged.get(formatElementId(id))
-            const retained = pending?.isNew ? pending.element : this.store.elementAt(this.cx.space, id, seq)
-            if (!retained) throw errors.constraintViolation('DependencyBasis source version is unavailable')
-            if (!pending?.isNew) requirePermitted(this.authority.authorize('read', resourceOfElement(retained), this.auth))
+            const retained = pending?.isNew
+              ? pending.element
+              : this.store.elementAt(this.cx.space, id, seq)
+            if (!retained)
+              throw errors.constraintViolation(
+                'DependencyBasis source version is unavailable',
+              )
+            if (!pending?.isNew)
+              requirePermitted(
+                this.authority.authorize(
+                  'read',
+                  resourceOfElement(retained),
+                  this.auth,
+                ),
+              )
             const version = pending?.isNew ? 1 : retained.row.version
-            if (version !== pin.version) throw errors.versionConflict('DependencyBasis must pin the version actually read')
+            if (version !== pin.version)
+              throw errors.versionConflict(
+                'DependencyBasis must pin the version actually read',
+              )
             const planes = render(retained)._system as JsonMap
-            for (const [plane, expected] of Object.entries((pin.planes ?? {}) as JsonMap)) {
-              if (pinnedPlane(planes.plane_versions as JsonMap, plane) !== expected) throw errors.versionConflict('DependencyBasis plane pin does not match retained input')
+            for (const [plane, expected] of Object.entries(
+              (pin.planes ?? {}) as JsonMap,
+            )) {
+              if (
+                pinnedPlane(planes.plane_versions as JsonMap, plane) !==
+                expected
+              )
+                throw errors.versionConflict(
+                  'DependencyBasis plane pin does not match retained input',
+                )
             }
             const key = formatElementId(id)
-            if (inputs[key] !== undefined && inputs[key] !== version) throw errors.constraintViolation('conflicting DependencyBasis pins')
+            if (inputs[key] !== undefined && inputs[key] !== version)
+              throw errors.constraintViolation(
+                'conflicting DependencyBasis pins',
+              )
             inputs[key] = version
           }
         }
@@ -799,10 +1038,18 @@ export class Transaction {
         const key = referenceText(reference)
         const id = tryParseElementId(key)
         if (!id || inputs[key] !== undefined) continue
-        if (contract) throw errors.constraintViolation('derived Activity input is missing its read pin')
+        if (contract)
+          throw errors.constraintViolation(
+            'derived Activity input is missing its read pin',
+          )
         const pending = this.staged.get(key)
-        const version = pending ? (pending.isNew ? 1 : pending.baseVersion) : this.store.load(id)?.row.version
-        if (version === undefined) throw errors.notFoundOrNotVisible('Activity input is unavailable')
+        const version = pending
+          ? pending.isNew
+            ? 1
+            : pending.baseVersion
+          : this.store.load(id)?.row.version
+        if (version === undefined)
+          throw errors.notFoundOrNotVisible('Activity input is unavailable')
         inputs[key] = version
       }
       const outputs: JsonMap = {}
@@ -811,11 +1058,32 @@ export class Transaction {
         const id = tryParseElementId(key)
         if (!id) continue
         const pending = this.staged.get(key)
-        const version = pending?.changed ? (pending.isNew ? 1 : pending.baseVersion + 1) : this.store.load(id)?.row.version
-        if (version === undefined) throw errors.notFoundOrNotVisible('Activity output is unavailable')
+        const output = pending?.element ?? this.store.load(id)
+        if (activity.inputs.length && output)
+          requirePermitted(
+            this.authority.authorize(
+              'derive',
+              resourceOfElement(output),
+              this.auth,
+            ),
+          )
+        const version = pending?.changed
+          ? pending.isNew
+            ? 1
+            : pending.baseVersion + 1
+          : this.store.load(id)?.row.version
+        if (version === undefined)
+          throw errors.notFoundOrNotVisible('Activity output is unavailable')
         outputs[key] = version
       }
-      activity.origin = { ...activity.origin, _kip_runtime: { ...((activity.origin._kip_runtime ?? {}) as JsonMap), input_versions: inputs, output_versions: outputs } }
+      activity.origin = {
+        ...activity.origin,
+        _kip_runtime: {
+          ...((activity.origin._kip_runtime ?? {}) as JsonMap),
+          input_versions: inputs,
+          output_versions: outputs,
+        },
+      }
     }
   }
 
@@ -850,7 +1118,9 @@ export class Transaction {
       // Through `planesToJson`, so `facets` is absent when the element carries
       // no Facet counter — the same bytes the Rust engine writes, and the same
       // spelling `_system.plane_versions` already uses.
-      ...(!staged.isNew && diff.planes.size > 0 ? { planes: planesToJson(planes) } : {}),
+      ...(!staged.isNew && diff.planes.size > 0
+        ? { planes: planesToJson(planes) }
+        : {}),
     })
   }
 
@@ -879,6 +1149,9 @@ export class Transaction {
       result: {
         handles: this.handles(),
         actor_binding_id: this.actorBinding,
+        control_changes: this.controlEffects
+          .filter((c) => c.kind !== 'erasure')
+          .map((c) => ({ kind: c.kind, version: String(seq) })),
       } as Json,
       changes,
     })
@@ -950,7 +1223,9 @@ export class Transaction {
     }
     for (const staged of this.staged.values()) {
       if (staged.element.kind !== 'Activity') continue
-      const inputs = staged.element.row.inputs.map(referenceText).filter((v) => v !== '')
+      const inputs = staged.element.row.inputs
+        .map(referenceText)
+        .filter((v) => v !== '')
       for (const output of staged.element.row.outputs.map(referenceText)) {
         if (output !== '') add(output, inputs)
       }
@@ -1035,7 +1310,9 @@ export class Transaction {
  * Lifecycle columns live in {@link LIFECYCLE_COLUMNS} instead: they are named
  * in `touched` like everything else, and they advance no plane.
  */
-const FIELD_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+const FIELD_COLUMNS: Readonly<
+  Record<ElementKind, readonly [column: string, path: string][]>
+> = {
   Concept: [
     ['key', 'fields.key'],
     ['name', 'fields.name'],
@@ -1079,7 +1356,9 @@ const FIELD_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path
  * They are still named so a Watch can see what moved without reading payload
  * (§36.1).
  */
-const LIFECYCLE_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+const LIFECYCLE_COLUMNS: Readonly<
+  Record<ElementKind, readonly [column: string, path: string][]>
+> = {
   Concept: [['merged_into', 'fields.merged_into']],
   Proposition: [],
   Assertion: [
@@ -1097,7 +1376,9 @@ const LIFECYCLE_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, 
 }
 
 /** The Core structural columns, by kind (§8.2), for the `structural` plane. */
-const CORE_STRUCTURAL_COLUMNS: Readonly<Record<ElementKind, readonly [column: string, path: string][]>> = {
+const CORE_STRUCTURAL_COLUMNS: Readonly<
+  Record<ElementKind, readonly [column: string, path: string][]>
+> = {
   Concept: [],
   Proposition: [],
   Assertion: [
@@ -1130,14 +1411,20 @@ export interface PlaneDiff {
  * stale guard rather than a true statement. `touched` is empty for a create —
  * the entry says `create`, and listing every path would only repeat the row.
  */
-export function diffPlanes(element: Element, before: JsonMap | null): PlaneDiff {
+export function diffPlanes(
+  element: Element,
+  before: JsonMap | null,
+): PlaneDiff {
   const after = element.row as unknown as Record<string, Json>
   const touched: string[] = []
   const planes = new Set<PlaneKey>()
   const differs = (column: string): boolean =>
     before === null
       ? populated(after[column])
-      : !jsonEquals((before[column] ?? null) as Json, (after[column] ?? null) as Json)
+      : !jsonEquals(
+          (before[column] ?? null) as Json,
+          (after[column] ?? null) as Json,
+        )
 
   const seen = new Set<string>()
   /** Names a path, and — where one is given — the plane it advances. */
@@ -1158,7 +1445,8 @@ export function diffPlanes(element: Element, before: JsonMap | null): PlaneDiff 
   if (element.kind === 'Concept') {
     const was = before === null ? {} : asMap(before.attributes)
     const now = asMap(after.attributes)
-    for (const name of memberDiff(was, now)) touch(`attributes.${name}`, 'attributes')
+    for (const name of memberDiff(was, now))
+      touch(`attributes.${name}`, 'attributes')
   }
   for (const [column, path] of CORE_STRUCTURAL_COLUMNS[element.kind]) {
     if (differs(column)) touch(path, 'structural')
@@ -1170,7 +1458,8 @@ export function diffPlanes(element: Element, before: JsonMap | null): PlaneDiff 
       touch(`structural.${symbolLocalName(symbol)}`, 'structural')
     }
   }
-  if (differs('retention') || differs('expires_at')) touch('retention', 'retention')
+  if (differs('retention') || differs('expires_at'))
+    touch('retention', 'retention')
   {
     const was = before === null ? {} : asMap(before.facets)
     const now = asMap(after.facets)
@@ -1213,7 +1502,8 @@ export function lifecycleMove(
   if (stateBefore !== row.state) return { from: stateBefore, to: row.state }
   if ('status' in row) {
     const statusBefore = typeof before.status === 'string' ? before.status : ''
-    if (statusBefore !== row.status) return { from: statusBefore, to: row.status }
+    if (statusBefore !== row.status)
+      return { from: statusBefore, to: row.status }
   }
   return null
 }
@@ -1228,7 +1518,10 @@ function asMap(value: unknown): JsonMap {
 function memberDiff(before: JsonMap, after: JsonMap): string[] {
   const out: string[] = []
   for (const name of Object.keys(after)) {
-    if (!Object.hasOwn(before, name) || !jsonEquals(before[name] as Json, after[name] as Json)) {
+    if (
+      !Object.hasOwn(before, name) ||
+      !jsonEquals(before[name] as Json, after[name] as Json)
+    ) {
       out.push(name)
     }
   }

@@ -546,12 +546,9 @@ pub async fn import(
                 .to_string(),
         );
     }
-    // §39.5: none of the source's trust travels with its records. This engine
-    // has no trust model to apply either, and says so rather than letting the
-    // absence read as acceptance.
+    // §39.5: destination control state governs imported records.
     report.warnings.push(
-        "imported records carry no trust from their source, and this engine has no trust model \
-         to apply in its place: what arrived is a record of what somebody else claimed"
+        "imported records carry no source trust or local standing; destination policies govern their use"
             .to_string(),
     );
 

@@ -321,3 +321,11 @@ that is the moment a divergence is meant to surface.
 ## License
 
 MIT. See [LICENSE](../../LICENSE).
+
+## Brain host contracts
+
+The protected Session APIs cover versioned policies, dependency revalidation,
+identity repair, immutable replay material, validated learning records, fenced
+tasks, persistent Watches and dispatch recovery. See the [integration guide](../../docs/anda-brain-nexus-contracts.zh.md)
+for Rust/TypeScript signatures and record ordering. Deterministic host evaluators
+are registered by exact rule-artifact digest; uploaded data never executes code.

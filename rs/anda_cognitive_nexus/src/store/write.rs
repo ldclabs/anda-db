@@ -210,7 +210,7 @@ envelope_columns!(impl_row, ActivityRow => Activity,);
 /// One context per transaction, not per element: elements written by the same
 /// commit share a `tx_id` and a `space_seq`, which is what makes "what changed
 /// in transaction T" and "what changed at sequence N" the same question.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WriteContext {
     /// The Space being written to.
     pub space: String,
@@ -251,13 +251,17 @@ impl WriteContext {
     /// `created_at` and `created_tx` are deliberately untouched: they record
     /// when this element entered the Nexus, and an update that refreshed them
     /// would erase the only engine-side record of that.
-    fn stamp_update<R: Row>(&self, row: &mut R) {
+    pub(crate) fn stamp_update<R: Row>(&self, row: &mut R) {
         let envelope = row.envelope_mut();
         *envelope.version = envelope.version.saturating_add(1);
         *envelope.seq = self.seq;
         *envelope.updated_at = self.at.clone();
         *envelope.updated_tx = self.tx_id.clone();
+        let runtime = envelope.origin.get("_kip_runtime").cloned();
         *envelope.origin = self.origin.clone();
+        if let Some(runtime) = runtime {
+            envelope.origin["_kip_runtime"] = runtime;
+        }
     }
 }
 

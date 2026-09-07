@@ -277,3 +277,6 @@ mod tests {
         assert!(COGNITIVE_MEMORY_PROFILE.contains("Cognitive Memory Profile"));
     }
 }
+
+/// Protected cognitive runtime host contracts.
+pub mod cognitive;

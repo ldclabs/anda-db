@@ -434,9 +434,11 @@ describe('governance additions', () => {
   })
 
   it('registers record_outcome and manage_legal_hold, and nothing no gate asks for', () => {
+    expect(parsePermission('derive')).toBe('derive')
+    expect(parsePermission('manage_trust')).toBe('manage_trust')
     expect(parsePermission('record_outcome')).toBe('record_outcome')
     expect(parsePermission('manage_legal_hold')).toBe('manage_legal_hold')
-    for (const name of ['legal_hold', 'derive', 'approve', 'share', 'manage_trust']) {
+    for (const name of ['legal_hold', 'approve', 'share']) {
       expect(() => parsePermission(name), name).toThrowError(/not a permission/)
     }
   })

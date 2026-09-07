@@ -118,7 +118,9 @@ impl<'a> Context<'a> {
             operation,
             loaded: BTreeMap::new(),
             views: BTreeMap::new(),
-            policy: crate::projection::Policy::baseline(),
+            policy: store
+                .projection_policy_at(space, u64::MAX, &Map::new())
+                .await?,
             at: crate::time::now(),
             projected: false,
             as_of: None,
@@ -169,7 +171,16 @@ impl<'a> Context<'a> {
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
         let element = self.load_unattached(id).await?;
         if let Some(row) = &element
-            && crate::schema::contracts::is_derived(row)
+            && (crate::schema::contracts::is_derived(row)
+                || self
+                    .store
+                    .control_at(
+                        &self.space,
+                        &format!("identity_review/{id}"),
+                        self.pinned_seq,
+                    )
+                    .await?
+                    .is_some())
         {
             let policy = self.policy.clone();
             let at = self.at.clone();
@@ -595,6 +606,17 @@ impl<'a> Context<'a> {
         if let Some(seq) = self.as_of {
             self.pinned_seq = seq;
         }
+        if let Some(seq) = self.as_of {
+            self.policy = self
+                .store
+                .projection_policy_at(&self.space, seq, &Map::new())
+                .await
+                .unwrap_or_else(|_| {
+                    let mut p = crate::projection::Policy::baseline();
+                    p.trust_version = "unavailable".into();
+                    p
+                });
+        }
         // The Schema that was in force then is what a historical read resolves
         // symbols through: reconstructing the past under today's schema would
         // answer a question nobody asked (§20.9).
@@ -881,10 +903,22 @@ async fn run(
         .await?;
     let environment_version = cx.env.version;
 
-    if let Some(block) = &query.epistemic {
-        let settings = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
-        cx.policy = crate::projection::Policy::from_settings(&settings)?;
-    }
+    let settings = match &query.epistemic {
+        Some(block) => crate::projection::settings_of(block, |name| cx.param_ref(name))?,
+        None => Map::new(),
+    };
+    cx.policy = match store
+        .projection_policy_at(space, cx.pinned_seq, &settings)
+        .await
+    {
+        Ok(policy) => policy,
+        Err(e) if e.code == anda_kip::KipErrorCode::HistoricalSnapshotUnavailable => {
+            let mut p = crate::projection::Policy::from_settings(&settings)?;
+            p.trust_version = "unavailable".into();
+            p
+        }
+        Err(e) => return Err(e),
+    };
     let mut policy = cx.policy.clone();
     cx.resolve_projection_context(&mut policy).await?;
     cx.policy = policy;

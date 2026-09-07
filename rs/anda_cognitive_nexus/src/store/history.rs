@@ -41,6 +41,17 @@ impl Store {
         op: &str,
         row: &R,
     ) -> Result<(), KipError> {
+        // A retained redo intent may replay after the version was flushed.
+        for row_id in self.version_ids(&cx.space, id).await? {
+            let old: ElementVersionRow = self
+                .element_versions()
+                .get_as(row_id)
+                .await
+                .map_err(db_error)?;
+            if old.tx_id == cx.tx_id && old.version == version {
+                return Ok(());
+            }
+        }
         let encoded = serde_json::to_value(row).map_err(|err| {
             KipError::internal_error(format!("an element row failed to encode: {err}"))
         })?;

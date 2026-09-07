@@ -56,24 +56,24 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   hybrid_search: false, // §66.3
   search_index_freshness: { mode: 'synchronous' }, // §66.5: written by the committing transaction
   belief_slot: true, // §47
-  weighted_projection: false, // §21.10: the structural baseline only
+  weighted_projection: true, // §21.10: the structural baseline only
   materialized_projection: false, // §21.9: every projection is computed on read
   signed_receipts: false, // §33.3: no signing keys
   ingestion_context: true, // §71.1
   streaming: false, // §84
-  artifacts: false, // §85: no artifact store
+  artifacts: true, // §85: governed canonical-JSON artifacts
   change_stream: true, // §36, §68
-  filtered_delivery: false, // §36.3: CHANGES is unfiltered
-  watch_evaluation: false, // Cognitive Memory Profile §5.11
+  filtered_delivery: true, // §36.3: CHANGES is unfiltered
+  watch_evaluation: true, // Cognitive Memory Profile §5.11
   list_dependents: true, // §63.5
   payload_purge: true, // §60.6
-  identity_repair: false,
-  dependency_validity: false,
+  identity_repair: true,
+  dependency_validity: true,
   durable_brain_runtime: false,
   capsule_export: true, // §63.4
   capsule_import: false, // §39
   capsule_signatures: false, // §37.8
-  derive_permission: false, // §29.6: this engine does not distinguish derived writes
+  derive_permission: true, // §29.6: derived outputs and dependency contracts are gated
   record_outcome_permission: true, // §29.8
   kip1_migration: false, // §103: no DESCRIBE COMPATIBILITY, no 1.x conversions
   memory_interface: false,
@@ -103,6 +103,7 @@ export const CAPABILITY_LIMITS: Readonly<Record<string, Json>> = {
  * a name is added, never renamed.
  */
 const SUPPORTED_NAMES: readonly string[] = [
+  'trust_model', 'trust_governance', 'artifact_store',
   'kql',
   'kml',
   'meta',
@@ -160,12 +161,10 @@ const UNSUPPORTED_NAMES: readonly string[] = [
   'search_over_assertions_and_activities',
   'hop_quantifiers',
   'nested_proposition_endpoint',
-  'trust_model',
-  'trust_governance',
+
   'retention_policy',
   'capsule_restore_mode',
   'deadlines',
-  'artifact_store',
 ]
 
 /**
@@ -222,12 +221,8 @@ export function capabilities(): Json {
       score_semantics: 'normalized_support_not_probability',
       explanation: true,
       // §21.10: the structural baseline, and nothing weighted on top of it.
-      weighted_projection: false,
+      weighted_projection: true,
       missing_stages: [
-        {
-          stage: 'trust_evaluation',
-          reason: 'no trust model; every eligible corroboration group counts equally',
-        },
         {
           stage: 'evidence_quality',
           reason:
@@ -988,16 +983,7 @@ export function capabilities(): Json {
           'source is a claim a destination cannot check. VERIFY reports ' +
           '`signed` separately from `valid` rather than conflating them',
       },
-      {
-        capability: 'trust_governance',
-        detail: 'DESCRIBE TRUST',
-        reason:
-          'the trust policy binding is Governance state, but this engine ' +
-          'evaluates no source trust, so there is no trust judgement to ' +
-          'report — see `trust_model`. Named here as well as there so a ' +
-          '`requires` block written against either engine gets an answer ' +
-          'rather than an unrecognized name',
-      },
+
       {
         capability: 'retention_policy',
         detail:
@@ -1019,13 +1005,7 @@ export function capabilities(): Json {
           'this one, so a `requires` block asking about restore gets the same ' +
           'answer from both',
       },
-      {
-        capability: 'trust_model',
-        detail: 'source trust and evidence-quality evaluation in the projection',
-        reason:
-          'not implemented; every eligible corroboration group counts equally, ' +
-          'and every projection says so in its warnings',
-      },
+
       {
         capability: 'atomic_batch',
         detail: 'execution.mode "atomic" over several operations (§75.3)',
@@ -1036,15 +1016,7 @@ export function capabilities(): Json {
           'refused rather than run as a sequence that looks like one (§75.4); ' +
           'one MUTATE block is already one Transaction (§53)',
       },
-      {
-        capability: 'artifact_store',
-        detail: 'ArtifactRef handles (§85), including `ingest.payload_artifact`',
-        reason:
-          'there is no artifact store, so a handle would name bytes this ' +
-          'engine cannot read. Minting an Evidence record with an empty ' +
-          'payload under one would be exactly the fabrication the mechanism ' +
-          'exists to prevent',
-      },
+
       {
         capability: 'deadlines',
         detail: 'options.deadline_ms (§80.1)',

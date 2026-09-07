@@ -76,7 +76,7 @@ describe('META', () => {
       // A partial capability names what is left rather than shrinking to one
       // word: Governance is enforced at command scope, so the gaps that remain
       // are the element-scope ones, and they are listed as themselves.
-      expect(gaps).toContain('trust_model')
+      expect(gaps).not.toContain('trust_model')
       expect(gaps).toContain('capsule_import')
       expect(gaps).toContain('hop_quantifiers')
       // Keyword SEARCH is built, so the gaps that remain are the specific ones
@@ -454,9 +454,7 @@ describe('META', () => {
     await withNexus('refusals', (nexus) => {
       // "Nothing is trusted" is a judgement. An absent subsystem is not one, so
       // the trust report refuses instead of answering emptily.
-      expect(() => nexus.describe('DESCRIBE TRUST')).toThrowError(
-        /would read as a judgement that nothing is trusted/,
-      )
+      expect((nexus.describe('DESCRIBE TRUST') as {model:string}).model).toBe('protected-actor-weights-v1')
       // A token that promises a coordinate can be read back is only issued
       // once the engine can honour it — and now it can, so it is issued and
       // binds a later read to that coordinate (§68).
@@ -626,12 +624,10 @@ describe('Capsules', () => {
     }`,
     `MUTATE {
       CREATE CONCEPT ?skill {
-        TYPE "Skill"
+        TYPE "Insight"
         NAME "Plan a migration"
         SET ATTRIBUTES {
-          skill_class: "workflow",
-          summary: "Write the rollback first",
-          status: "proposed"
+          summary: "Write the rollback first"
         }
       }
       CREATE ACTIVITY ?compile {

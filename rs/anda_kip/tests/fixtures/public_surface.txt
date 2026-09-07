@@ -90,6 +90,15 @@ capsule.rs: struct CapsuleSource
 capsule.rs: struct ExternalRef
 capsule.rs: struct SchemaDependency
 capsule.rs: type CapsuleRefMap
+cognitive.rs: fn evaluate_binary_rule
+cognitive.rs: fn validate_lease_transition
+cognitive.rs: struct ArtifactPin
+cognitive.rs: struct DispatchRequest
+cognitive.rs: struct EvaluationInput
+cognitive.rs: struct EvaluationPolicy
+cognitive.rs: struct EvaluationSamples
+cognitive.rs: struct ObserverControl
+cognitive.rs: trait EvaluationRule
 conformance.rs: const PROTOCOL_SURFACE
 conformance.rs: fn capability_engine_names
 conformance.rs: fn capability_registry_names

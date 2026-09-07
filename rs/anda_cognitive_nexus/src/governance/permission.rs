@@ -19,22 +19,11 @@
 //! confers nothing is a Grant that looks like authority and is not, and the
 //! holder discovers it during an incident.
 //!
-//! ## A name is here only when a gate asks for it
+//! ## Every registered name has an enforcing gate
 //!
-//! The maintenance contract, and the reason `derive`, `share`, `manage_trust`
-//! and `approve` are absent (`record_outcome` is here because §29.8's gate on
-//! outcome-class Evidence asks for it, and `manage_legal_hold` because §29.9's
-//! gate on `retention.legal_hold` does): this engine distinguishes no derived write, exposes no controlled
-//! cross-Space view, and versions no trust policy, so nothing would ever ask for
-//! them. Registering them anyway would fail in exactly the way an unrecognized
-//! name is rejected to prevent — a Grant that looks like authority and is not —
-//! except worse, because it would be *accepted*, and §29.6 makes refusing it a
-//! MUST for that reason.
-//!
-//! So a name is added here in the same change that adds the gate asking for it,
-//! never in advance. The absence is reported as a gap by
-//! `DESCRIBE CAPABILITIES`, which is where a caller looks to find out that this
-//! Space cannot express a distinction it wanted.
+//! Derived outputs and dependency validation use `derive`. Protected trust
+//! configuration uses `manage_trust`. Sharing across Spaces has no implicit
+//! permission, and independent approval is named `approve_high_risk`.
 
 use anda_kip::KipError;
 
@@ -140,6 +129,10 @@ macro_rules! permissions {
 }
 
 permissions! {
+    Derive => "derive", CognitiveMutation,
+        "produce or revalidate a derived cognitive artifact";
+    ManageTrust => "manage_trust", Governance,
+        "version the protected trust configuration";
     // Discovery / Read (§53–§58)
     Discover => "discover", Discovery,
         "learn that an element or match exists";

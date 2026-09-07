@@ -467,6 +467,31 @@ pub struct SpaceRow {
     pub policies: Json,
 }
 
+/// An immutable version of a protected control value. Erasure replaces content
+/// with a tombstone; it never restores an earlier retained version.
+#[derive(Clone, Debug, Serialize, Deserialize, AndaDBSchema)]
+pub struct ControlRecordRow {
+    pub _id: u64,
+    #[unique]
+    pub record_id: String,
+    pub space: String,
+    pub key: String,
+    pub seq: u64,
+    pub version: u64,
+    pub kind: String,
+    pub value: Json,
+    pub origin: Json,
+}
+
+/// Durable redo intent, removed only after all of its effects are flushed.
+#[derive(Clone, Debug, Serialize, Deserialize, AndaDBSchema)]
+pub struct CommitLogRow {
+    pub _id: u64,
+    #[unique]
+    pub tx_id: String,
+    pub plan: Json,
+}
+
 /// One installed Schema Package artifact (Spec §4, §28).
 ///
 /// Immutable: `package_id + version` identifies one canonical content forever,

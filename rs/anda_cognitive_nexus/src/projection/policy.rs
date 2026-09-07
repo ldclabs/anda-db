@@ -26,11 +26,17 @@ pub const BASELINE_ID: &str = "kip:policy:baseline";
 pub const BASELINE_VERSION: u64 = 2;
 
 /// The knobs a projection runs under.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Policy {
     /// The policy's name, reported with every answer.
     pub id: String,
     pub explicit_selection: bool,
+    #[serde(default)]
+    pub trust_weights: std::collections::BTreeMap<String, f64>,
+    #[serde(default = "default_trust_weight")]
+    pub default_trust_weight: f64,
+    #[serde(default)]
+    pub trust_version: String,
     pub context_refs: Vec<String>,
     pub purpose: String,
     pub risk: String,
@@ -60,7 +66,8 @@ pub struct Policy {
 /// A caller that asked for `none` and got the full ledger has been handed the
 /// Assertion ids, the actors and the exclusion reasons it declined — which
 /// §49.2 treats as a disclosure decision rather than a formatting one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Explanation {
     /// The status and scores only.
     None,
@@ -100,6 +107,9 @@ impl Policy {
         Self {
             id: BASELINE_ID.to_string(),
             explicit_selection: false,
+            trust_weights: Default::default(),
+            default_trust_weight: 1.0,
+            trust_version: String::new(),
             context_refs: Vec::new(),
             purpose: String::new(),
             risk: String::new(),
@@ -349,6 +359,10 @@ fn parse_modes(value: &Json) -> Result<Vec<AssertionMode>, KipError> {
                 .map_err(|_| KipError::type_mismatch(format!("{item} is not an Assertion mode")))
         })
         .collect()
+}
+
+fn default_trust_weight() -> f64 {
+    1.0
 }
 
 #[cfg(test)]

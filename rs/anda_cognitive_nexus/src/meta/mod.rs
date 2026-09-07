@@ -487,7 +487,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "leading": ["support", "opposition", "none"],
                 "score_semantics": "normalized_support_not_probability",
                 "baseline": "structural: every eligible corroboration group counts equally",
-                "weighted": false,
+                "weighted": true,
                 "explanation": true,
                 "conflict_set_expansion": true,
                 "corroboration_grouping": true,
@@ -501,7 +501,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                     "temporal_eligibility", "mode_eligibility", "corroboration_grouping",
                     "aggregation", "classification", "explanation"
                 ],
-                "missing_stages": ["trust_evaluation", "evidence_quality"]
+                "missing_stages": ["evidence_quality"]
             },
             "governance": {
                 // What is enforced, stated as what it is rather than as a
@@ -690,24 +690,24 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ),
     ("belief_slot", true, None),
     // §21.10: the structural baseline; no trust-weighted policy.
-    ("weighted_projection", false, None),
+    ("weighted_projection", true, None),
     ("materialized_projection", false, None),
     ("signed_receipts", false, None),
     ("ingestion_context", true, None),
     ("streaming", false, None),
-    ("artifacts", false, None),
+    ("artifacts", true, None),
     ("change_stream", true, None),
-    ("filtered_delivery", false, None),
-    ("watch_evaluation", false, None),
+    ("filtered_delivery", true, None),
+    ("watch_evaluation", true, None),
     ("list_dependents", true, None),
     ("payload_purge", true, None),
-    ("identity_repair", false, None),
-    ("dependency_validity", false, None),
+    ("identity_repair", true, None),
+    ("dependency_validity", true, None),
     ("durable_brain_runtime", false, None),
     ("capsule_export", true, None),
     ("capsule_import", true, None),
     ("capsule_signatures", false, None),
-    ("derive_permission", false, None),
+    ("derive_permission", true, None),
     ("record_outcome_permission", true, None),
     ("kip1_migration", true, None),
     ("memory_interface", false, None),
@@ -737,6 +737,9 @@ fn registry_json() -> Json {
 /// is organized for a reader and this list is a contract: a name here is one a
 /// caller may build a fail-fast check on.
 const SUPPORTED_NAMES: &[&str] = &[
+    "trust_model",
+    "trust_governance",
+    "artifact_store",
     "kql",
     "kml",
     "meta",
@@ -793,13 +796,10 @@ const UNSUPPORTED_NAMES: &[&str] = &[
     "historical_search",
     "semantic_search",
     "search_over_assertions_and_activities",
-    "trust_model",
-    "trust_governance",
     "capsule_restore_mode",
     "capsule_signatures",
     "retention_policy",
     "deadlines",
-    "artifact_store",
     "nested_proposition_endpoint",
 ];
 
@@ -872,7 +872,7 @@ mod tests {
         }
         assert_eq!(
             declared["supported"]["registry"]["weighted_projection"],
-            false
+            true
         );
         assert_eq!(declared["supported"]["registry"]["belief_slot"], true);
         assert!(declared["supported"]["projection"]["missing_stages"].is_array());

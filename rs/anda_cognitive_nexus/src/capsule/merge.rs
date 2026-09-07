@@ -361,7 +361,12 @@ fn build(
 ) -> Result<Element, KipError> {
     let view = &record.view;
     let client_key = import_key(digest, &record.source_id);
-    let facets = map_of(view, "facets");
+    let mut facets = map_of(view, "facets");
+    let mut attributes = map_of(view, "attributes");
+    if view["schema_ref"].as_str() == Some("kip://profiles/cognitive-memory@2.1.0/Skill") {
+        attributes.insert("status".into(), Json::String("proposed".into()));
+        facets.retain(|name, _| !name.ends_with("/TrialState") && !name.ends_with("/GradingState"));
+    }
     let structural = rewrite_structural(map_of(view, "structural"), mapping)?;
     let retention = view
         .get("retention")
@@ -383,7 +388,7 @@ fn build(
             name: text(view, "name"),
             canonical_id: text(view, "canonical_id"),
             aliases: strings(view, "aliases"),
-            attributes: map_of(view, "attributes"),
+            attributes,
             facets,
             structural,
             client_key,

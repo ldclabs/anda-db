@@ -84,9 +84,9 @@ export { SCHEMA_DOCUMENTS, SCHEMA_DIGESTS }
 /** Validate the final transaction state, including mutations through UPDATE/UNSET. */
 export function validateRecord(env: SchemaEnvironment, view: JsonMap, before: JsonMap | null): void {
   canonicalJson(view)
-  if (view.activity_class === 'dependency_validation') throw errors.unsupportedCapability('dependency revalidation is not implemented; create a new derived artifact with a new producing Activity')
   const terminal = (v: JsonMap) => ['completed', 'failed', 'cancelled'].includes(String(v.status))
   for (const [name, value] of Object.entries((view.facets ?? {}) as JsonMap)) {
+    if (name === 'kip://profiles/cognitive-memory@2.1.0/OutcomeRecord' && isJsonMap(before?.facets) && before.facets[name] !== undefined && canonicalJson(before.facets[name]) !== canonicalJson(value)) throw errors.immutableField('attached OutcomeRecord is immutable, including previously absent optional members')
     const symbol = env.resolveSymbol('Facet', name, 'write')
     const pkg = env.definitionPackage(symbol)
     const def = pkg && facetDef(pkg, symbol.name)
@@ -98,7 +98,6 @@ export function validateRecord(env: SchemaEnvironment, view: JsonMap, before: Js
       if (Array.isArray(attachment.activity_classes) && !attachment.activity_classes.includes(view.activity_class ?? null)) throw errors.constraintViolation(`${name} is attached to the wrong Activity class`)
       if (attachment.terminal_only === true && !terminal(view)) throw errors.constraintViolation(`${name} requires a terminal Activity`)
     }
-    if (name.startsWith('kip://profiles/cognitive-memory@2.1.0/') && ['TrialRecord', 'EvaluationRecord', 'TrialState', 'GradingState', 'AttemptRecord'].includes(symbol.name)) throw errors.unsupportedCapability('validated learning and dispatch require a connected Brain contract (memory_learning / memory_durable)')
   }
   if (before && terminal(before)) {
     for (const [name, value] of Object.entries((before.facets ?? {}) as JsonMap)) {
@@ -111,7 +110,6 @@ export function validateRecord(env: SchemaEnvironment, view: JsonMap, before: Js
   const name = String(view.schema_ref ?? '')
   const attributes = view.attributes as JsonMap | undefined
   if (name.startsWith('kip://profiles/cognitive-memory@2.1.0/')) {
-    if (name.endsWith('/Skill') && attributes?.status !== 'proposed') throw errors.unsupportedCapability('local Skill standing requires validated memory_learning evaluations')
     if (name.endsWith('/SkillRevision')) {
       const { behavior_digest, ...behavior } = attributes ?? {}
       if (behavior_digest !== 'sha256:' + sha256Text(canonicalJson(behavior))) throw errors.digestMismatch('SkillRevision behavior_digest must cover the immutable behavior fields')
@@ -153,4 +151,26 @@ export function pinnedPlane(planes: JsonMap, name: string): Json | undefined {
   if (['attributes', 'structural', 'retention'].includes(name)) return planes[name]
   if (name.startsWith('facets.') && name.length > 7) return (planes.facets as JsonMap | undefined)?.[name.slice(7)] ?? 0
   return undefined
+}
+
+export const digest = (value: Json): string => `sha256:${sha256Text(canonicalJson(value))}`
+
+export function normalizeRecordRefs(name: string, members: JsonMap): void {
+  if (!name.startsWith('kip://profiles/cognitive-memory@2.1.0/')) return
+  const paths: Record<string,string[]> = {
+    DependencyBasis:['groups.*.pins.*.id','policy_basis.context_refs.*'],
+    DecisionRecord:['retrieved_refs.*','used_refs.*','applied_revisions.*','basis.context_refs.*'],
+    AttemptRecord:['decision_ref','applied_revisions.*','trial_ref'], OutcomeRecord:['attempt_ref'],
+    TrialRecord:['revision_refs.*','baseline_attempt_refs.*','baseline_outcome_refs.*','basis.context_refs.*'],
+    EvaluationRecord:['trial_ref','revision_refs.*','attempt_refs.*','outcome_refs.*','missing_attempt_refs.*','excluded_samples.*.ref'],
+    TrialState:['trial_ref','revision_ref'],GradingState:['revision_ref','evaluation_ref'],ErasurePlan:['source_event_refs.*','targets.*.ref'],
+  }
+  function visit(value: Json, path: string[]): Json {
+    if (!path.length) return isJsonMap(value) && Object.keys(value).length === 1 && typeof value.id === 'string' && /^[CPAEX]-[1-9][0-9]*$/.test(value.id) ? value.id : value
+    const [first,...rest]=path
+    if (first === '*' && Array.isArray(value)) return value.map((v)=>visit(v,rest))
+    if (isJsonMap(value) && first! in value) value[first!]=visit(value[first!]!,rest)
+    return value
+  }
+  for (const path of paths[name.split('/').at(-1)!] ?? []) visit(members,path.split('.'))
 }

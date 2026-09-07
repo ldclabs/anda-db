@@ -1,3 +1,20 @@
+import * as runtime from './runtime.js'
+import { Transaction } from './tx.js'
+import { artifactValue } from './control.js'
+import { digest } from './schema/contracts.js'
+import type {
+  ArtifactPin,
+  EvaluationPolicy,
+  DispatchRequest,
+  EvaluationRule,
+} from './cognitive.js'
+import { isJsonMap } from './json.js'
+import { lineageText as lineageOf } from './schema/symbol.js'
+import { parseElementId } from './id.js'
+import { resourceOfElement } from './governance/index.js'
+import type { ConceptRow, ElementVersionRow } from './store/rows.js'
+import { publishControl, type ControlRecord } from './control.js'
+import { policyFromSettings } from './projection/policy.js'
 import { verifyArtifact } from './schema/contracts.js'
 /**
  * The Cognitive Nexus: one KIP 2.0 engine over one Durable Object's SQLite.
@@ -9,8 +26,8 @@ import { verifyArtifact } from './schema/contracts.js'
  * The transaction boundary is the one thing it cannot delegate.
  * `ctx.storage.transactionSync` gives real all-or-nothing commit, so a KML
  * statement either lands whole or leaves nothing behind, shells included. The
- * Rust engine has no equivalent and recovers by sweeping `pending` rows on
- * open; this one gets the property from the platform.
+ * Rust engine supplies this property with durable redo plans; this engine
+ * uses the platform transaction.
  */
 
 import { scopedIdempotencyKey } from './idempotency.js'
@@ -64,18 +81,18 @@ import {
   type PrincipalGroupRow,
   type PrincipalRow,
 } from './governance/index.js'
-import { kmlPermissions, kqlPermissions, metaPermissions } from './governance/gate.js'
+import {
+  kmlPermissions,
+  kqlPermissions,
+  metaPermissions,
+} from './governance/gate.js'
 import { isAlwaysAudited } from './governance/index.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
 import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
 import { executeKml, type IngestContext, type KmlContext } from './kml/index.js'
-import {
-  executeKqlPage,
-  type KqlAnswer,
-  type KqlContext,
-} from './kql/index.js'
+import { executeKqlPage, type KqlAnswer, type KqlContext } from './kql/index.js'
 import { executeMeta, type MetaContext } from './meta/index.js'
 import {
   BUNDLED_PACKAGES,
@@ -133,6 +150,11 @@ export interface NexusOptions {
 }
 
 export class CognitiveNexus {
+  /** Restore trusted bindings on startup. A digest cannot be rebound live. */
+  registerEvaluationRule(artifact: Json, evaluator: EvaluationRule): string {
+    return this.store.evaluationRules.register(artifact, evaluator)
+  }
+
   readonly store: Store
   readonly space: string
   private readonly storage: DurableObjectStorage
@@ -630,7 +652,11 @@ export class Session {
     })
     // §63.5: `truncated` says a LIST DEPENDENTS walk was cut short by an
     // element this caller may not discover, without saying where.
-    return { result, nextCursor: page.next_cursor ?? null, truncated: page.truncated === true }
+    return {
+      result,
+      nextCursor: page.next_cursor ?? null,
+      truncated: page.truncated === true,
+    }
   }
 
   /** Runs one parsed KQL query, reporting its coordinates and page cursor. */
@@ -639,7 +665,12 @@ export class Session {
     params: JsonMap = {},
     options: Partial<KqlContext> & ReadOptions = {},
   ): KqlAnswer {
-    canonicalJson({ query, params, request: options.request, operation: options.operation })
+    canonicalJson({
+      query,
+      params,
+      request: options.request,
+      operation: options.operation,
+    })
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     // Both spellings, because both reach `executeKql`: the envelope's
@@ -683,7 +714,12 @@ export class Session {
     params: JsonMap = {},
     options: MutationOptions = {},
   ): Outcome {
-    canonicalJson({ statement, params, operation: options.operation, ingest: options.ingest })
+    canonicalJson({
+      statement,
+      params,
+      operation: options.operation,
+      ingest: options.ingest,
+    })
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     const needed = kmlPermissions(statement)
@@ -700,7 +736,11 @@ export class Session {
     const replayed =
       options.idempotencyKey === undefined || options.dryRun === true
         ? null
-        : this.nexus.store.transactionForKey(space, this.auth.principal_id, options.idempotencyKey)
+        : this.nexus.store.transactionForKey(
+            space,
+            this.auth.principal_id,
+            options.idempotencyKey,
+          )
     if (replayed !== null) {
       for (const permission of needed) {
         requirePermittedForReplay(
@@ -714,7 +754,10 @@ export class Session {
       // looks ordinary. An empty stored digest is a transaction journaled
       // before this check existed; those replay as they did.
       const digest = requestDigest(statement, params, options.operation)
-      if (replayed.request_digest !== '' && replayed.request_digest !== digest) {
+      if (
+        replayed.request_digest !== '' &&
+        replayed.request_digest !== digest
+      ) {
         throw errors.idempotencyConflict(
           `idempotency key ${JSON.stringify(options.idempotencyKey)} already ` +
             `committed transaction ${replayed.tx_id} for a different request; ` +
@@ -741,7 +784,10 @@ export class Session {
       idempotencyKey:
         options.idempotencyKey === undefined
           ? undefined
-          : scopedIdempotencyKey(this.auth.principal_id, options.idempotencyKey),
+          : scopedIdempotencyKey(
+              this.auth.principal_id,
+              options.idempotencyKey,
+            ),
       requestDigest:
         options.idempotencyKey === undefined
           ? undefined
@@ -757,7 +803,9 @@ export class Session {
       this.consume(decisions)
       return committed
     })
-    return provenance === null ? outcome : { ...outcome, governance: provenance }
+    return provenance === null
+      ? outcome
+      : { ...outcome, governance: provenance }
   }
 
   /**
@@ -823,7 +871,9 @@ export class Session {
    */
   readAudit(limit = 50, space = this.nexus.space) {
     const authority = this.effectiveAuthority(space)
-    requirePermitted(authority.authorize('read_audit', spaceResource(), this.auth))
+    requirePermitted(
+      authority.authorize('read_audit', spaceResource(), this.auth),
+    )
     return this.nexus.store.governance.readAudit(space, limit)
   }
 
@@ -837,7 +887,11 @@ export class Session {
    *
    * Returns the label the element carried before.
    */
-  classify(element: ElementId, label: string, space = this.nexus.space): string {
+  classify(
+    element: ElementId,
+    label: string,
+    space = this.nexus.space,
+  ): string {
     return this.nexus.transact(() =>
       classify(this.governanceContext(space), element, label),
     )
@@ -853,7 +907,11 @@ export class Session {
    *
    * Returns the ceiling the element carried before.
    */
-  elevateAuthority(element: ElementId, cls: string, space = this.nexus.space): string {
+  elevateAuthority(
+    element: ElementId,
+    cls: string,
+    space = this.nexus.space,
+  ): string {
     return this.nexus.transact(() =>
       elevateAuthority(this.governanceContext(space), element, cls),
     )
@@ -866,7 +924,11 @@ export class Session {
    * of the element, which is a statement about this Brain and not about whoever
    * wrote it (§39.2).
    */
-  quarantine(element: ElementId, reason: string, space = this.nexus.space): void {
+  quarantine(
+    element: ElementId,
+    reason: string,
+    space = this.nexus.space,
+  ): void {
     this.nexus.transact(() =>
       quarantine(this.governanceContext(space), element, reason),
     )
@@ -1049,7 +1111,9 @@ export class Session {
    */
   createGrant(draft: GrantDraft, space = this.nexus.space): GrantRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_grants'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_grants',
+      ])
       for (const action of draft.actions) parsePermission(action)
       const row = this.nexus.store.governance.createGrant(
         { ...draft, space_id: space },
@@ -1063,7 +1127,9 @@ export class Session {
   /** Revokes a Grant (§29, `manage_grants`). Revoked, never deleted. */
   revokeGrant(id: number, space = this.nexus.space): void {
     this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_grants'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_grants',
+      ])
       this.nexus.store.governance.revokeGrant(id, this.auth.principal_id)
       this.consume(approvals)
     })
@@ -1079,7 +1145,10 @@ export class Session {
    * them would let anyone who may delegate their own authority hand out
    * somebody else's.
    */
-  createDelegation(draft: DelegationDraft, space = this.nexus.space): DelegationRow {
+  createDelegation(
+    draft: DelegationDraft,
+    space = this.nexus.space,
+  ): DelegationRow {
     return this.nexus.transact(() => {
       const own = draft.delegator_principal === this.auth.principal_id
       const approvals = this.gate(this.effectiveAuthority(space), [
@@ -1104,17 +1173,438 @@ export class Session {
    */
   revokeDelegation(id: number, space = this.nexus.space): void {
     this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_delegation'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_delegation',
+      ])
       this.nexus.store.governance.revokeDelegation(id, this.auth.principal_id)
       this.consume(approvals)
     })
   }
 
+  enqueueDispatch(request: DispatchRequest, space = this.nexus.space): JsonMap {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['maintain'])
+      const value = runtime.enqueueDispatch(this, space, request)
+      this.consume(approvals)
+      return value
+    })
+  }
+  beginDispatch(
+    attemptId: string,
+    expected: number,
+    fencingToken: number,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['maintain'])
+      const value = runtime.beginDispatch(
+        this,
+        space,
+        attemptId,
+        expected,
+        fencingToken,
+      )
+      this.consume(approvals)
+      return value
+    })
+  }
+  reconcileDispatch(
+    attemptId: string,
+    expected: number,
+    outcomeRef: string,
+    space = this.nexus.space,
+  ): Json {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'record_outcome',
+      ])
+      const value = runtime.reconcileDispatch(
+        this,
+        space,
+        attemptId,
+        expected,
+        outcomeRef,
+      )
+      this.consume(approvals)
+      return value
+    })
+  }
+  /** Validate actual storage coverage before publishing a Brain erasure report. */
+  validateErasurePlan(plan: JsonMap, space = this.nexus.space): void {
+    runtime.validateErasurePlan(this, space, plan)
+  }
+
+  changePage(after: number, limit = 100, space = this.nexus.space): JsonMap {
+    return runtime.changePage(this, after, limit, space)
+  }
+  leaseTask(
+    ref: string,
+    expected: number,
+    expiresAt: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return runtime.leaseTask(this, space, ref, expected, expiresAt)
+  }
+  armWatch(ref: string, expected: number, space = this.nexus.space): JsonMap {
+    return runtime.armWatch(this, space, ref, expected)
+  }
+  advanceWatch(
+    ref: string,
+    expected: number,
+    generation: number,
+    limit = 100,
+    space = this.nexus.space,
+    evaluate?: (condition: Json, change: Json) => boolean,
+  ): JsonMap {
+    return runtime.advanceWatch(
+      this,
+      space,
+      ref,
+      expected,
+      generation,
+      limit,
+      evaluate,
+    )
+  }
+
+  putArtifact(
+    content: Json,
+    sourceRefs: string[],
+    space = this.nexus.space,
+  ): ArtifactPin {
+    return this.nexus.transact(() => {
+      const authority = this.effectiveAuthority(space),
+        approvals = this.gate(authority, [
+          sourceRefs.length ? 'derive' : 'manage_policy',
+        ])
+      const sources = [...new Set(sourceRefs)].sort()
+      for (const source of sources) {
+        const row = this.nexus.store.load(parseElementId(source)),
+          visibility = row && authority.mayRead(row, this.auth)
+        if (
+          !row ||
+          row.row.space !== space ||
+          row.row.state !== 'active' ||
+          !visibility?.content ||
+          visibility.constraints.fields.length
+        )
+          throw errors.notFoundOrNotVisible(
+            'artifact material input unavailable',
+          )
+      }
+      const content_digest = digest(content),
+        artifact_ref = `kip:artifact:${content_digest}`,
+        key = `artifact/${artifact_ref}`
+      const value = {
+          state: 'available',
+          content,
+          content_digest,
+          source_refs: sources,
+        },
+        old = this.nexus.store.controlAt(space, key)
+      if (old && digest(old.value) !== digest(value))
+        throw errors.constraintViolation(
+          'artifact identity has different material binding or erasure tombstone',
+        )
+      if (!old)
+        publishControl(this.nexus.store, space, key, 'artifact', 0, value, {
+          principal_id: this.auth.principal_id,
+        })
+      this.consume(approvals)
+      return { artifact_ref, content_digest }
+    })
+  }
+
+  readArtifact(pin: ArtifactPin, space = this.nexus.space): Json {
+    const authority = this.effectiveAuthority(space),
+      row = this.nexus.store.controlAt(space, `artifact/${pin.artifact_ref}`)
+    if (!row || !isJsonMap(row.value) || !Array.isArray(row.value.source_refs))
+      throw errors.notFoundOrNotVisible('artifact unavailable')
+    if (!row.value.source_refs.length)
+      requirePermitted(
+        authority.authorize(
+          'read_governance_history',
+          spaceResource(),
+          this.auth,
+        ),
+      )
+    for (const source of row.value.source_refs) {
+      const element = this.nexus.store.load(parseElementId(String(source))),
+        visibility = element && authority.mayRead(element, this.auth)
+      if (!visibility?.content || visibility.constraints.fields.length)
+        throw errors.notFoundOrNotVisible('artifact unavailable')
+    }
+    return artifactValue(this.nexus.store, space, { ...pin })
+  }
+
+  setEvaluationPolicy(
+    expected: number,
+    policy: EvaluationPolicy,
+    space = this.nexus.space,
+  ): ControlRecord {
+    if (
+      !policy.id ||
+      !policy.version ||
+      policy.minimum_independent_attempts < 2 ||
+      !Number.isSafeInteger(policy.minimum_independent_attempts) ||
+      policy.observers.some(
+        (o) => !o.control_domain || !o.configuration_digest || !o.principal_id,
+      )
+    )
+      throw errors.constraintViolation('incomplete evaluation policy')
+    if (
+      policy.observer_control_digest !==
+      digest(policy.observers as unknown as Json)
+    )
+      throw errors.digestMismatch('observer control digest mismatch')
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_policy',
+      ])
+      const row = publishControl(
+        this.nexus.store,
+        space,
+        `evaluation_policy/${policy.id}`,
+        'policy',
+        expected,
+        policy as unknown as Json,
+        { principal_id: this.auth.principal_id },
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  withdrawIdentity(
+    decisionId: string,
+    expectedIdentityVersion: number,
+    reasonEvidence: string[],
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.nexus.transact(() => {
+      const store = this.nexus.store,
+        authority = this.effectiveAuthority(space),
+        approvals = this.gate(authority, ['merge_identity'])
+      const decision = store.controlAt(space, decisionId)
+      const value =
+        decision && isJsonMap(decision.value) ? decision.value : null
+      if (
+        !decision ||
+        decision.kind !== 'identity' ||
+        !value ||
+        value.status !== 'active'
+      )
+        throw errors.constraintViolation('identity decision is not active')
+      const current = Math.max(
+        0,
+        ...((authority.space.policies._kip_identity_changes ?? []) as number[]),
+      )
+      if (current !== expectedIdentityVersion)
+        throw errors.versionConflict('identity version changed')
+      if (!reasonEvidence.length)
+        throw errors.constraintViolation(
+          'identity withdrawal needs reason Evidence',
+        )
+      for (const ref of reasonEvidence) {
+        const row = store.load(parseElementId(ref))
+        if (!row || row.kind !== 'Evidence' || row.row.space !== space)
+          throw errors.notFoundOrNotVisible('reason Evidence unavailable')
+        requirePermitted(
+          authority.authorize('read', resourceOfElement(row), this.auth),
+        )
+      }
+      const source = parseElementId(String(value.source)),
+        old = store.load(source)
+      if (
+        !old ||
+        old.kind !== 'Concept' ||
+        old.row.merged_into !== value.target
+      )
+        throw errors.versionConflict('resolution no longer current')
+      for (const row of store.all<ConceptRow>(
+        'concepts',
+        'SELECT * FROM concepts WHERE space = ? AND state = ?',
+        space,
+        'active',
+      )) {
+        if (row.id === source.seq) continue
+        if (
+          (old.row.canonical_id && old.row.canonical_id === row.canonical_id) ||
+          (old.row.key &&
+            old.row.key === row.key &&
+            lineageOf(old.row.schema_ref) === lineageOf(row.schema_ref))
+        )
+          throw errors.identityConflict(
+            'withdrawal conflicts with active key or canonical identity',
+          )
+      }
+      const tx = new Transaction(
+        store,
+        space,
+        this.nexus.environment(space),
+        { principal_id: this.auth.principal_id },
+        false,
+        authority,
+        this.auth,
+      )
+      const row = tx.load(source)
+      if (row.kind !== 'Concept')
+        throw errors.constraintViolation('identity source is not Concept')
+      row.row.merged_into = ''
+      row.row.state = 'active'
+      tx.markChanged(source, 'update')
+      tx.identityChanged = true
+      const affected = new Map<string, JsonMap>()
+      for (const version of store.all<ElementVersionRow>(
+        'element_versions',
+        'SELECT * FROM element_versions WHERE space = ? AND seq >= ?',
+        space,
+        decision.seq,
+      )) {
+        const record = version.row as JsonMap,
+          origin = record.origin as JsonMap | undefined,
+          runtime = origin?._kip_runtime as JsonMap | undefined
+        for (const r of (runtime?.input_references ?? []) as JsonMap[])
+          if (r.resolved === value.target || r.supplied === value.source)
+            affected.set(version.element, {
+              ref: version.element,
+              status: 'needs_review',
+              ambiguous: r.supplied === r.resolved,
+              supplied: r.supplied!,
+              resolved: r.resolved!,
+            })
+      }
+      for (const [id, review] of affected) {
+        const key = `identity_review/${id}`
+        tx.controlEffects.push({
+          record_id: `${tx.cx.tx_id}:${key}`,
+          space,
+          key,
+          seq: 0,
+          version: (store.controlAt(space, key)?.version ?? 0) + 1,
+          kind: 'identity',
+          value: review,
+          origin: tx.cx.origin,
+        })
+      }
+      tx.controlEffects.push({
+        ...decision,
+        record_id: `${tx.cx.tx_id}:${decisionId}`,
+        version: decision.version + 1,
+        value: {
+          ...value,
+          status: 'withdrawn',
+          reason_evidence: reasonEvidence,
+          withdrawn_at_version: current + 1,
+        },
+      })
+      const outcome = tx.commit(''),
+        visible: Json[] = []
+      let complete = true
+      for (const [id, review] of affected) {
+        const row = store.load(parseElementId(id))
+        if (row && authority.mayRead(row, this.auth)?.content)
+          visible.push(review)
+        else complete = false
+      }
+      this.consume(approvals)
+      return {
+        decision_id: decisionId,
+        identity_version: outcome.space_seq,
+        review_set: visible,
+        complete,
+      }
+    })
+  }
+
+  setProjectionPolicy(
+    name: 'baseline' | 'forecast',
+    expected: number,
+    settings: JsonMap,
+    space = this.nexus.space,
+  ): ControlRecord {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_policy',
+      ])
+      const policy = policyFromSettings({ ...settings, policy: name })
+      policy.explicit_selection = false
+      const config = this.nexus.store.controlAt(space, 'projection')!
+        .value as JsonMap
+      config[name] = policy as unknown as Json
+      const row = publishControl(
+        this.nexus.store,
+        space,
+        'projection',
+        'policy',
+        expected,
+        config,
+        { principal_id: this.auth.principal_id },
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  setTrust(
+    expected: number,
+    weights: Record<string, number>,
+    defaultWeight = 1,
+    space = this.nexus.space,
+  ): ControlRecord {
+    if (
+      [defaultWeight, ...Object.values(weights)].some(
+        (n) => !Number.isFinite(n) || n < 0 || n > 1,
+      )
+    )
+      throw errors.constraintViolation('trust weights must be in [0,1]')
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_trust',
+      ])
+      const row = publishControl(
+        this.nexus.store,
+        space,
+        'trust',
+        'trust',
+        expected,
+        { weights, default_weight: defaultWeight },
+        { principal_id: this.auth.principal_id },
+      )
+      this.consume(approvals)
+      return row
+    })
+  }
+
+  readControl(
+    key: string,
+    seq = Number.MAX_SAFE_INTEGER,
+    space = this.nexus.space,
+  ): ControlRecord | null {
+    if (key.startsWith('artifact/'))
+      throw errors.notAuthorized(
+        'artifact content is read through readArtifact with material-source authorization',
+      )
+    requirePermitted(
+      this.effectiveAuthority(space).authorize(
+        'read_governance_history',
+        spaceResource(),
+        this.auth,
+      ),
+    )
+    return this.nexus.store.controlAt(space, key, seq)
+  }
+
   /** Creates or replaces a Principal group (§29, `manage_membership`). */
   putGroup(draft: GroupDraft, space = this.nexus.space): PrincipalGroupRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_membership'])
-      const row = this.nexus.store.governance.putGroup(draft, this.auth.principal_id)
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_membership',
+      ])
+      const row = this.nexus.store.governance.putGroup(
+        draft,
+        this.auth.principal_id,
+      )
       this.consume(approvals)
       return row
     })
@@ -1127,7 +1617,9 @@ export class Session {
     space = this.nexus.space,
   ): PrincipalRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_membership'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_membership',
+      ])
       const row = this.nexus.store.governance.setPrincipalStatus(
         principalId,
         status,
@@ -1146,9 +1638,14 @@ export class Session {
    * either — a writer who could bind itself could authorize its own
    * impersonation.
    */
-  createBinding(draft: ActorBindingDraft, space = this.nexus.space): ActorBindingRow {
+  createBinding(
+    draft: ActorBindingDraft,
+    space = this.nexus.space,
+  ): ActorBindingRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_actor_binding'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_actor_binding',
+      ])
       const row = this.nexus.store.governance.createBinding(
         draft,
         this.auth.principal_id,
@@ -1161,16 +1658,23 @@ export class Session {
   /** Revokes an ActorBinding (§17, `manage_actor_binding`). */
   revokeBinding(id: number, space = this.nexus.space): void {
     this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_actor_binding'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_actor_binding',
+      ])
       this.nexus.store.governance.revokeBinding(id, this.auth.principal_id)
       this.consume(approvals)
     })
   }
 
   /** Publishes a Governance Policy version (§29, `manage_policy`). */
-  publishPolicy(draft: PolicyDraft, space = this.nexus.space): GovernancePolicyRow {
+  publishPolicy(
+    draft: PolicyDraft,
+    space = this.nexus.space,
+  ): GovernancePolicyRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_policy'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_policy',
+      ])
       const row = this.nexus.store.governance.publishPolicy(
         { ...draft, space_id: draft.space_id ?? space },
         this.auth.principal_id,
@@ -1190,8 +1694,14 @@ export class Session {
    */
   approve(id: number, note = '', space = this.nexus.space): ApprovalRow {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['approve_high_risk'])
-      const row = this.nexus.store.governance.approve(id, this.auth.principal_id, note)
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'approve_high_risk',
+      ])
+      const row = this.nexus.store.governance.approve(
+        id,
+        this.auth.principal_id,
+        note,
+      )
       this.consume(approvals)
       return row
     })
@@ -1204,9 +1714,15 @@ export class Session {
    * by the Schema Lock, and this only makes an artifact available to be locked
    * onto.
    */
-  installPackage(artifact: SchemaPackage, source: string, space = this.nexus.space): void {
+  installPackage(
+    artifact: SchemaPackage,
+    source: string,
+    space = this.nexus.space,
+  ): void {
     this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_schema',
+      ])
       this.nexus.installPackage(artifact, source)
       this.consume(approvals)
     })
@@ -1224,7 +1740,9 @@ export class Session {
     space = this.nexus.space,
   ): SchemaEnvironment {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
+      const approvals = this.gate(this.effectiveAuthority(space), [
+        'manage_schema',
+      ])
       const env = this.nexus.activatePackages(artifacts, space)
       this.consume(approvals)
       return env

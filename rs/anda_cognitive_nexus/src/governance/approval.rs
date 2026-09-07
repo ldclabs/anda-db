@@ -136,6 +136,9 @@ pub struct Approved {
 }
 
 impl Approved {
+    pub(crate) fn into_ids(self) -> Vec<u64> {
+        self.approvals
+    }
     /// Requires an already-resolved decision to permit, and takes custody of
     /// the approvals it spent.
     pub fn require(decision: Authorization) -> Result<Self, KipError> {

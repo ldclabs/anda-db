@@ -20,15 +20,11 @@
 //! §21). Manufactured corroboration is exactly what an attacker builds, so
 //! shared Evidence merges two groups even when the actors differ.
 //!
-//! ## What this implementation does not do
+//! ## Projection stages
 //!
-//! The full pipeline has fourteen stages (§55). This one implements
-//! grounding, conflict-set expansion, lifecycle, temporal and mode
-//! eligibility, corroboration grouping, aggregation, classification and the
-//! explanation ledger. Governance visibility, trust evaluation and
-//! evidence-quality evaluation are **not** implemented: there is no trust model
-//! in this engine yet, so every eligible group counts equally, and the answer
-//! says so in its warnings rather than implying a judgement it did not make.
+//! Grounding, conflict expansion, lifecycle/time/mode eligibility, Governance
+//! visibility, protected actor weighting, corroboration and aggregation run at
+//! one basis. Evidence quality is not automatically evaluated.
 
 mod dependency;
 pub mod policy;
@@ -325,10 +321,10 @@ impl Belief {
 
 impl Context<'_> {
     fn require_projection_history(&self, policy: &Policy) -> Result<(), KipError> {
-        if self.as_of.is_some() && !policy.explicit_selection {
+        if policy.trust_version == "unavailable" {
             return Err(KipError::new(
                 anda_kip::KipErrorCode::HistoricalSnapshotUnavailable,
-                "historical projection control state is unavailable; explicitly select an epistemic policy to reinterpret the retained cognition",
+                "historical projection control state unavailable",
             ));
         }
         Ok(())
@@ -342,7 +338,8 @@ impl Context<'_> {
         at: &str,
         next: Option<String>,
     ) -> anda_kip::ProjectionBasis {
-        let digest = |v: &Json| crate::store::schema::content_digest(v);
+        let digest =
+            |v: &Json| crate::schema::contracts::digest(v).expect("validated projection basis");
         let mut authority = self.authority.clone();
         authority.space.seq = 0;
         authority.space.schema_environment_version = 0;
@@ -372,7 +369,7 @@ impl Context<'_> {
                     policy.unstated_confidence
                 ])),
             },
-            trust_version: "structural-no-trust-v1".into(),
+            trust_version: policy.trust_version.clone(),
             authorization_view: digest(&Json::String(format!("{:?}:{:?}", authority, self.auth))),
             context_refs: policy.context_refs.clone(),
             purpose: if policy.purpose.is_empty() {
@@ -431,8 +428,7 @@ impl Context<'_> {
                 // Not a caveat about this answer in particular: it is what the
                 // engine structurally cannot do yet, and an answer that read
                 // as trust-weighted when it is not would be worse than none.
-                "this engine evaluates no source trust and no evidence quality; every eligible \
-                 corroboration group counts equally"
+                "protected actor trust weights are applied; evidence quality is not automatically graded"
                     .to_string(),
             ],
             ..Default::default()
@@ -529,8 +525,7 @@ impl Context<'_> {
             valid_at: at.to_string(),
             as_of: self.as_of,
             warnings: vec![
-                "this engine evaluates no source trust and no evidence quality; every eligible \
-                 corroboration group counts equally"
+                "protected actor trust weights are applied; evidence quality is not automatically graded"
                     .to_string(),
             ],
         })
@@ -550,7 +545,17 @@ impl Context<'_> {
             record_boundary(ledger, &row, at);
             match self.eligible(&row, policy, at).await? {
                 Ok(candidate) => {
-                    if row.mode == "inferred" {
+                    if row.mode == "inferred"
+                        || self
+                            .store
+                            .control_at(
+                                &self.space,
+                                &format!("identity_review/A-{}", row._id),
+                                self.pinned_seq,
+                            )
+                            .await?
+                            .is_some()
+                    {
                         let checked = self
                             .dependency_validity(
                                 &Element::Assertion(Box::new(row.clone())),
@@ -730,11 +735,20 @@ impl Context<'_> {
             // enforced on the way in may hold another, and taking one of those
             // as a real commitment would clamp it to zero and silently weigh
             // the claim as worthless.
-            confidence: if row.confidence < 0.0 {
+            confidence: (if row.confidence < 0.0 {
                 policy.unstated_confidence
             } else {
                 row.confidence
-            },
+            }) * policy
+                .trust_weights
+                .get(
+                    row.asserted_by
+                        .as_str()
+                        .or_else(|| row.asserted_by["id"].as_str())
+                        .unwrap_or(""),
+                )
+                .copied()
+                .unwrap_or(policy.default_trust_weight),
             opposes_target: false,
         }))
     }

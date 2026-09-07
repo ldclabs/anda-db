@@ -1,7 +1,8 @@
 # `anda_cognitive_nexus` — Technical Reference
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) and the
+[Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI
 > agents, built on Anda DB.
@@ -183,8 +184,9 @@ cycle.
 **`anda_db` cannot reserve an element id** — `add_impl` calls `fetch_add`
 itself — so a handle's element is inserted as a `state: "pending"` shell and
 filled in at commit. Nothing reads a pending element, which makes
-`sweep_pending()` on open recovery *by construction* rather than by replay. It
-is also why a selection block cannot see its own transaction's writes: clause
+unused shells safe to sweep. A durable redo plan restores committed after-images
+before the sweep and before reads resume. A selection block cannot see its own
+transaction's writes: clause
 order carries no mutation semantics, so a sweep that could see them would mean
 different things depending on where its author put it.
 
@@ -387,9 +389,9 @@ The policy is named and versioned and travels with the answer. Changing a
 threshold changes the reported policy id — otherwise the audit trail would be
 fiction.
 
-What is *missing* is stated in every projection's warnings: no trust model, no
-evidence-quality evaluation, so every eligible corroboration group counts
-equally. Do not remove that warning without implementing the stages.
+Protected actor trust weights participate in projection and are retained by Space
+sequence. Evidence quality is not automatically graded; the returned warning
+states that boundary. `DESCRIBE TRUST` reports the protected configuration.
 
 ---
 
@@ -669,15 +671,12 @@ refused rather than answered wrongly:
 | atomic batches               | one transaction across several operations is an engine property a loop lacks |
 | Capsule signatures           | nothing is signed, and `VERIFY` says so separately from `valid`             |
 | the `restore` import mode    | its point is mapping a source `$self` onto the destination's, which is the one thing an import must never do by resemblance |
-| `DESCRIBE TRUST`             | no trust evaluation; an empty trust report reads as "nothing is trusted"    |
-| trust / evidence quality     | stages 9 and 10 of the projection; every projection says so in its warnings |
+| automatic evidence quality | no built-in evidence-quality model |
+| controlled cross-Space sharing | no implicit shared view |
 | Space-level retention policy | retention is set per element and swept on request, not defaulted by kind or class |
-| grouped aggregation          | `FIND(?c.name, COUNT(?x))` and `ORDER BY COUNT(?x)` need grouping; answering either without it returns one global row where a caller asked for one per group |
 | `SEARCH ASSERTION` / `ACTIVITY` | neither carries free text to index; refused rather than answered empty, which would read as "no such claim exists" |
-| `derive`, `share`, `manage_trust` | no gate asks for them, so §29.6 makes refusing them where a Grant names one a MUST: a permission accepted and gating nothing is authority that looks conferred and is not |
 | Capsule digest profiles      | both engines use kip-jcs-safe-v1 and SHA-256 over the native frame excluding integrity; an artifact from elsewhere under another profile is refused as unreadable, never reported as tampered with |
 | `options.deadline_ms`        | §80.2 makes a client timeout not an abort, and a commit here is not cancellable; accepting one would promise a cancellation that never happens |
-| artifact handles             | there is nowhere to fetch bytes from, so `payload_artifact` names content this engine cannot read |
 
 ---
 

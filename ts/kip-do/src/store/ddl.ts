@@ -68,7 +68,7 @@ import { rebuildSearch } from './search.js'
  * never shipped a KIP 1.x, so there is no data to migrate; the additive steps
  * exist so a development database written a day earlier still opens.
  */
-export const SCHEMA_VERSION = 7
+export const SCHEMA_VERSION = 8
 
 /**
  * The `_system` envelope every element table repeats.
@@ -780,6 +780,8 @@ function dropRedefinedIndexes(sql: SqlStorage): void {
 /** Applies the current schema. Safe to retry after an interrupted migration. */
 export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
+  sql.exec(`CREATE TABLE IF NOT EXISTS kip_control_records (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT UNIQUE NOT NULL, space TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, origin TEXT NOT NULL)`)
+  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_control ON kip_control_records(space, key, seq)`)
   // Before the `CREATE`s, which would otherwise skip the stale definition.
   dropRedefinedIndexes(sql)
   // The tables first, then any column a later revision added, then the

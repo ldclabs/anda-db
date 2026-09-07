@@ -36,13 +36,9 @@ impl Context<'_> {
         policy: &Policy,
         at: &str,
     ) -> Result<Json, KipError> {
-        if self.as_of.is_some() && !policy.explicit_selection {
-            let mut basis = self.projection_basis(policy, at, None);
-            basis.policy.version = "unavailable".into();
-            basis.trust_version = "unavailable".into();
+        if policy.trust_version == "unavailable" {
             return Ok(
-                serde_json::json!({"status":"unverifiable", "action_eligible":false,
-                "reasons":["historical projection control state unavailable"], "basis":basis}),
+                serde_json::json!({"status":"unverifiable","action_eligible":false,"reasons":["historical projection control state unavailable"],"basis":self.projection_basis(policy,at,None)}),
             );
         }
         let mut result = self
@@ -104,6 +100,21 @@ impl Context<'_> {
             }
             _ => {}
         }
+        if self
+            .store
+            .control_at(
+                &self.space,
+                &format!("identity_review/{id}"),
+                self.pinned_seq,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(Validity::issue(
+                1,
+                "identity interpretation requires review",
+            ));
+        }
         if !crate::schema::contracts::is_derived(element) {
             return Ok(result);
         }
@@ -121,14 +132,13 @@ impl Context<'_> {
             {
                 continue;
             }
-            if row.created_tx != *element.envelope().created_tx
+            if row.activity_class != "dependency_validation"
+                && row.created_tx != *element.envelope().created_tx
                 && row.updated_tx != *element.envelope().updated_tx
             {
                 continue; // A retrospective audit is not the producing computation.
             }
-            if !matches!(row.status.as_str(), "completed" | "failed" | "cancelled")
-                || row.state != state::ACTIVE
-            {
+            if row.status != "completed" || row.state != state::ACTIVE {
                 continue;
             }
             if row.origin["_kip_runtime"]["output_versions"][id.to_string()].as_u64()

@@ -22,9 +22,9 @@
  *
  * ## A name is here only when a gate asks for it
  *
- * The maintenance contract, and the reason `derive`, `share`, `manage_trust`
- * and `approve` are absent: this engine distinguishes no derived write,
- * exposes no controlled cross-Space view, versions no trust policy, and
+ * The maintenance contract, and the reason `share`
+ * and `approve` have different contracts: derived writes and trust configuration
+ * now have enforcing gates; controlled cross-Space sharing remains unavailable, and
  * records approvals under `approve_high_risk`, so nothing would ever ask for
  * them. `record_outcome` (§29.8) and `manage_legal_hold` (§29.9) are present
  * because a gate asks for each: the consequence channel's writes, and the
@@ -96,6 +96,8 @@ interface PermissionSpec {
  * same reason.
  */
 export const PERMISSIONS = {
+  derive: { family: "cognitive_mutation", description: "produce or revalidate a derived cognitive artifact" },
+  manage_trust: { family: "governance", description: "version protected trust configuration" },
   // Discovery / Read (§53–§58)
   discover: {
     family: 'discovery',

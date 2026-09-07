@@ -642,9 +642,10 @@ async fn a_projection_never_claims_a_trust_judgement_it_did_not_make() {
     let projected = belief(&nexus, "").await;
     let warnings = projected["explanation"]["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("no source trust")),
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("evidence quality is not automatically graded")),
         "{warnings:?}"
     );
 }

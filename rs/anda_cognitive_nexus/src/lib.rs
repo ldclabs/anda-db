@@ -112,7 +112,9 @@
 #![recursion_limit = "256"]
 
 pub mod capsule;
+pub mod control;
 pub mod error;
+pub mod evaluation;
 pub mod governance;
 pub mod id;
 pub mod kml;
@@ -122,6 +124,7 @@ pub mod migrate;
 pub mod nexus;
 pub mod profiles;
 pub mod projection;
+pub mod runtime;
 pub mod schema;
 pub mod store;
 pub mod term;
@@ -138,3 +141,6 @@ pub use store::{
     write::{Row, WriteContext},
 };
 pub use term::*;
+
+/// SHA-256 over portable KIP canonical JSON, for behavior and artifact pins.
+pub use schema::contracts::digest as content_digest;

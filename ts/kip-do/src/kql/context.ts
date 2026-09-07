@@ -1,3 +1,4 @@
+import { projectionPolicyAt } from '../control.js'
 import { dependencyValidity, isDerived } from '../projection/dependency.js'
 import { baseline } from '../projection/policy.js'
 import { projectionBasis } from '../projection/index.js'
@@ -110,6 +111,7 @@ export class Context {
     this.authority = authority
     this.auth = auth
     this.asOf = asOf
+    try { this.projectionPolicy = projectionPolicyAt(store, space, asOf ?? store.currentSeq(space), {}) } catch { /* Raw history remains readable; derived status is unavailable. */ }
     this.governedResultLimit = authority.authorize(
       'read',
       spaceResource(),
@@ -133,7 +135,7 @@ export class Context {
       element = this.admit(key, found)
       this.elements.set(key, element)
     }
-    if (validate && element && isDerived(element)) {
+    if (validate && element && (isDerived(element) || this.store.controlAt(this.space, `identity_review/${key}`, this.asOf ?? this.store.currentSeq(this.space)))) {
       const view = this.views.get(key)
       if (view && isJsonMap(view._system)) view._system.dependency_validity = dependencyValidity(this, element, this.projectionPolicy, this.validAt)
     }

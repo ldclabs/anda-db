@@ -508,7 +508,7 @@ describe('a host that authenticates its callers', () => {
     expect(body.results[0]?.error?.code).toBe('InvalidRequestEnvelope')
   })
 
-  it('refuses an artifact handle rather than minting an empty record under it', async () => {
+  it('refuses an unavailable artifact instead of minting empty Evidence', async () => {
     // §85.2: a handle would name bytes this engine cannot read, and an Evidence
     // record with an empty payload under one is exactly the fabrication the
     // mechanism exists to prevent.
@@ -526,7 +526,7 @@ describe('a host that authenticates its callers', () => {
       operations: [{ command: 'CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }' }],
     })
     const body = (await response.json()) as KipResponse
-    expect(body.results[0]?.error?.code).toBe('UnsupportedCapability')
+    expect(body.results[0]?.error?.code).toBe('NotFoundOrNotVisible')
   })
 
   it('checks an ingest block before any operation of the batch runs', async () => {

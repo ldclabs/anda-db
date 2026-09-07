@@ -68,6 +68,7 @@ impl Store {
     /// repeatedly, and a second open must not fail or reset the sequence.
     pub async fn open_or_create_space(&self, draft: SpaceDraft) -> Result<SpaceRow, KipError> {
         if let Some(existing) = self.find_space(&draft.space_id).await? {
+            self.ensure_control_history(&existing).await?;
             return Ok(existing);
         }
         let mut owners = draft.owners;
@@ -101,6 +102,7 @@ impl Store {
         };
         let id = self.spaces().add_from(&row).await.map_err(db_error)?;
         let row = SpaceRow { _id: id, ..row };
+        self.ensure_control_history(&row).await?;
         self.governance
             .record_mutation(MutationEntry {
                 operation: "create_space",
@@ -189,20 +191,38 @@ impl Store {
     /// sequence advances through [`Store::begin_transaction`] instead, so a
     /// Governance edit can never move a Space's history coordinate.
     pub async fn put_space(&self, row: &SpaceRow) -> Result<(), KipError> {
+        let old = self.get_space(&row.space_id).await?;
+        let mut row = row.clone();
+        let changed = authorization_config(&old) != authorization_config(&row);
+        if let Some(internal) = old.policies.as_object() {
+            if !row.policies.is_object() {
+                row.policies = serde_json::json!({});
+            }
+            for (key, value) in internal {
+                if key.starts_with("_kip_") {
+                    row.policies[key] = value.clone();
+                }
+            }
+        }
         let spaces = self.spaces();
-        let fields = super::full_row_fields(spaces.schema(), row)?;
-        spaces.update(row._id, fields).await.map_err(db_error)?;
-        self.governance
+        spaces
+            .update(row._id, super::full_row_fields(spaces.schema(), &row)?)
+            .await
+            .map_err(db_error)?;
+        let audit = self
+            .governance
             .record_mutation(MutationEntry {
                 operation: "put_space",
                 space_id: row.space_id.clone(),
                 resource: row.space_id.clone(),
-                record: serde_json::to_value(row).map_err(|err| {
-                    KipError::internal_error(format!("a MemorySpace failed to encode: {err}"))
-                })?,
+                record: serde_json::to_value(&row)
+                    .map_err(|e| KipError::internal_error(e.to_string()))?,
                 ..Default::default()
             })
             .await?;
+        if changed {
+            self.governance.notify_audit(audit).await?;
+        }
         Ok(())
     }
 
@@ -268,8 +288,50 @@ impl Store {
     pub async fn journal(
         &self,
         cx: &WriteContext,
-        entry: JournalEntry,
+        mut entry: JournalEntry,
     ) -> Result<TransactionRow, KipError> {
+        if let Some(row) = self.find_transaction(&cx.tx_id).await? {
+            return Ok(row);
+        }
+        if entry.changes.iter().any(|c| {
+            c["touched"].as_array().is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|p| p.as_str().is_some_and(|p| p.starts_with("governance.")))
+            })
+        }) {
+            let mut space = self.get_space(&cx.space).await?;
+            if !space.policies.is_object() {
+                space.policies = serde_json::json!({});
+            }
+            space.policies["_kip_authorization_version"] = Json::from(
+                cx.seq.max(
+                    space.policies["_kip_authorization_version"]
+                        .as_u64()
+                        .unwrap_or(0),
+                ),
+            );
+            self.spaces()
+                .update(
+                    space._id,
+                    super::full_row_fields(self.spaces().schema(), &space)?,
+                )
+                .await
+                .map_err(db_error)?;
+            if !entry.result.is_object() {
+                entry.result = serde_json::json!({});
+            }
+            let controls = entry
+                .result
+                .as_object_mut()
+                .unwrap()
+                .entry("control_changes")
+                .or_insert_with(|| serde_json::json!([]));
+            controls
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"kind":"authorization","version":cx.seq.to_string()}));
+        }
         let row = TransactionRow {
             _id: 0,
             tx_id: cx.tx_id.clone(),
@@ -335,7 +397,7 @@ impl Store {
 }
 
 /// What one journal entry records beyond the write context.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
     /// `committed`, `aborted` or `no_effect`.
     pub status: String,
@@ -361,6 +423,21 @@ pub struct JournalEntry {
 
 fn changed_id(change: &Json) -> Option<String> {
     change.get("id")?.as_str().map(str::to_string)
+}
+
+pub(crate) fn authorization_config(row: &SpaceRow) -> Json {
+    let mut policies = row.policies.as_object().cloned().unwrap_or_default();
+    policies.retain(|k, _| !k.starts_with("_kip_"));
+    serde_json::json!([
+        row.owner_principal,
+        row.owners,
+        row.status,
+        row.default_policy_id,
+        row.trust_policy_id,
+        row.default_classification,
+        row.audit_mode,
+        policies
+    ])
 }
 
 #[cfg(test)]

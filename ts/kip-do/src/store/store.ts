@@ -1,3 +1,5 @@
+import { EvaluationRules } from '../evaluation.js'
+import { initialProjection, type ControlRecord } from '../control.js'
 /**
  * The persistent home of one Cognitive Nexus.
  *
@@ -22,7 +24,7 @@ import {
   type ElementId,
   type ElementKind,
 } from '../id.js'
-import type { Json, JsonMap } from '../json.js'
+import { canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
 import { idSet } from '../sql.js'
 import { nowTime } from '../time.js'
 import { decodeRow, rowToJson, type SqlRow } from './codec.js'
@@ -128,12 +130,48 @@ export class Store extends RowStore {
    * `store.governance.createGrant(...)` reads as the host API it is, where a
    * `store.createGrant(...)` would read as one more table.
    */
+  readonly evaluationRules = new EvaluationRules()
   readonly governance: GovernanceStore
 
   constructor(sql: SqlStorage) {
     super(sql)
     applySchema(sql)
     this.governance = new GovernanceStore(sql)
+    this.governance.onMutation = (entry) => {
+      for (const space of this.spaces()) {
+        if (
+          entry.space_id &&
+          entry.space_id !== '*' &&
+          entry.space_id !== space.space_id
+        )
+          continue
+        const seq = this.nextSeq(space.space_id)
+        space.seq = seq
+        space.policies._kip_authorization_version = seq
+        this.updateRow('spaces', space)
+        this.putGovernanceTransaction({
+          tx_id: `${space.space_id}#${seq}`,
+          space: space.space_id,
+          seq,
+          snapshot_seq: seq - 1,
+          committed_at: entry.at ?? nowTime(),
+          schema_environment_version: space.schema_environment_version,
+          result: {
+            control_changes: [
+              {
+                kind:
+                  entry.operation === 'publish_policy'
+                    ? 'policy'
+                    : 'authorization',
+                version: String(seq),
+              },
+            ],
+          },
+          changes: [],
+        })
+      }
+    }
+    for (const space of this.spaces()) this.ensureControlHistory(space)
   }
 
   // --- Spaces ------------------------------------------------------------
@@ -145,6 +183,43 @@ export class Store extends RowStore {
       'SELECT * FROM spaces WHERE space_id = ?',
       spaceId,
     )
+  }
+
+  controlAt(
+    space: string,
+    key: string,
+    seq = Number.MAX_SAFE_INTEGER,
+  ): ControlRecord | null {
+    return this.one(
+      'kip_control_records',
+      'SELECT * FROM kip_control_records WHERE space = ? AND key = ? AND seq <= ? ORDER BY seq DESC, version DESC LIMIT 1',
+      space,
+      key,
+      seq,
+    )
+  }
+
+  putControl(row: Omit<ControlRecord, 'id'>): void {
+    this.writeRow('kip_control_records', row)
+  }
+
+  ensureControlHistory(space: SpaceRow): void {
+    for (const [key, kind, value] of [
+      ['projection', 'policy', initialProjection()],
+      ['trust', 'trust', { weights: {}, default_weight: 1 }],
+    ] as const) {
+      if (!this.controlAt(space.space_id, key))
+        this.putControl({
+          record_id: `${space.space_id}#${key}:genesis`,
+          space: space.space_id,
+          key,
+          seq: space.seq,
+          version: 1,
+          kind,
+          value,
+          origin: { principal_id: 'kip:principal:system' },
+        })
+    }
   }
 
   /** Every Space, in creation order. */
@@ -162,6 +237,7 @@ export class Store extends RowStore {
       resource: stored.space_id,
       record: stored as unknown as Json,
     })
+    this.ensureControlHistory(stored)
     return stored
   }
 
@@ -173,12 +249,14 @@ export class Store extends RowStore {
    * it as one ordered stream.
    */
   nextSeq(spaceId: string): number {
-    if (this.currentSeq(spaceId) >= Number.MAX_SAFE_INTEGER) throw errors.resourceExhausted('Space sequence exceeds the portable numeric range')
-    const row = this.sql
-      .exec<{ seq: number }>(
-        'UPDATE spaces SET seq = seq + 1 WHERE space_id = ? RETURNING seq',
-        spaceId,
+    if (this.currentSeq(spaceId) >= Number.MAX_SAFE_INTEGER)
+      throw errors.resourceExhausted(
+        'Space sequence exceeds the portable numeric range',
       )
+    const row = this.sql
+      .exec<{
+        seq: number
+      }>('UPDATE spaces SET seq = seq + 1 WHERE space_id = ? RETURNING seq', spaceId)
       .toArray()[0]
     if (!row) {
       throw errors.notFoundOrNotVisible(`no MemorySpace ${spaceId}`)
@@ -242,14 +320,42 @@ export class Store extends RowStore {
 
   /** Overwrites a Space registry row. */
   putSpace(row: SpaceRow): void {
+    const old = this.space(row.space_id)
+    const config = (s: SpaceRow): string =>
+      canonicalJson([
+        s.owner_principal,
+        s.owners,
+        s.status,
+        s.default_policy_id,
+        s.trust_policy_id,
+        s.default_classification,
+        s.audit_mode,
+        Object.fromEntries(
+          Object.entries(s.policies).filter(([k]) => !k.startsWith('_kip_')),
+        ),
+      ])
+    const changed = old && config(old) !== config(row)
+    row = {
+      ...row,
+      policies: {
+        ...row.policies,
+        ...Object.fromEntries(
+          Object.entries(old?.policies ?? {}).filter(([k]) =>
+            k.startsWith('_kip_'),
+          ),
+        ),
+      },
+    }
     this.updateRow('spaces', row)
-    this.governance.recordMutation({
+    const entry = {
       operation: 'put_space',
       at: nowTime(),
       space_id: row.space_id,
       resource: row.space_id,
       record: row as unknown as Json,
-    })
+    }
+    this.governance.recordMutation(entry)
+    if (changed) this.governance.onMutation?.(entry)
   }
 
   // --- elements ----------------------------------------------------------
@@ -494,7 +600,10 @@ export class Store extends RowStore {
    * destructive operation leave a dangling reference, which is the failure the
    * reverse index exists to prevent.
    */
-  referrers(space: string, id: ElementId): { from: ElementId; field: string }[] {
+  referrers(
+    space: string,
+    id: ElementId,
+  ): { from: ElementId; field: string }[] {
     return this.sql
       .exec<{ from_id: string; field: string }>(
         `SELECT DISTINCT from_id, field FROM element_refs
@@ -520,7 +629,11 @@ export class Store extends RowStore {
    * the element did not exist yet, which is a different answer from an element
    * that existed and was empty.
    */
-  versionAt(space: string, id: ElementId, seq: number): ElementVersionRow | null {
+  versionAt(
+    space: string,
+    id: ElementId,
+    seq: number,
+  ): ElementVersionRow | null {
     return this.one<ElementVersionRow>(
       'element_versions',
       `SELECT * FROM element_versions
@@ -619,7 +732,28 @@ export class Store extends RowStore {
    * scrubbed only in its current row stays fully readable through `AS OF`, and
    * the other order leaves a readable stub with nothing saying to look (§19.3).
    */
+  scrubOwnedArtifacts(space: string, ref: string): void {
+    for (const row of this.all<ControlRecord>(
+      'kip_control_records',
+      'SELECT * FROM kip_control_records WHERE space = ?',
+      space,
+    )) {
+      const value = row.value as JsonMap
+      if (
+        row.key.startsWith('artifact/') &&
+        value.state === 'available' &&
+        Array.isArray(value.source_refs) &&
+        value.source_refs.includes(ref)
+      ) {
+        delete value.content
+        value.state = 'erased'
+        this.updateRow('kip_control_records', row)
+      }
+    }
+  }
+
   purgeVersions(space: string, id: ElementId): number {
+    this.scrubOwnedArtifacts(space, formatElementId(id))
     return this.sql.exec(
       'DELETE FROM element_versions WHERE space = ? AND element = ?',
       space,
@@ -639,13 +773,13 @@ export class Store extends RowStore {
    * being erased and destroying it would take more than the caller asked for.
    */
   scrubPayloadVersions(space: string, id: ElementId): number {
+    this.scrubOwnedArtifacts(space, formatElementId(id))
     const named = formatElementId(id)
     const rows = this.sql
-      .exec<{ id: number; row: string }>(
-        'SELECT id, row FROM element_versions WHERE space = ? AND element = ?',
-        space,
-        named,
-      )
+      .exec<{
+        id: number
+        row: string
+      }>('SELECT id, row FROM element_versions WHERE space = ? AND element = ?', space, named)
       .toArray()
     for (const version of rows) {
       const stored = JSON.parse(version.row) as Record<string, unknown>
@@ -668,23 +802,62 @@ export class Store extends RowStore {
    * must agree on which Activity first reached a shared dependent.
    */
   activitiesWithInput(space: string, id: ElementId): ElementId[] {
-    return this.sql
-      .exec<{ from_id: string }>(
-        `SELECT DISTINCT from_id FROM element_refs
-           WHERE space = ? AND to_id = ? AND field = 'inputs'
-           ORDER BY from_id`,
+    const named = formatElementId(id)
+    const found = new Set(
+      this.sql
+        .exec<{ from_id: string }>(
+          `SELECT DISTINCT from_id FROM element_refs WHERE space = ? AND to_id = ? AND field = 'inputs'`,
+          space,
+          named,
+        )
+        .toArray()
+        .map((r) => r.from_id),
+    )
+    // JSON paths cover required pins even when legacy optional lineage is absent.
+    const pinned = this.sql
+      .exec<{ id: number }>(
+        `SELECT DISTINCT a.id FROM activities a, json_each(a.facets) f,
+      json_each(CASE WHEN f.type='object' AND f.key LIKE '%/DependencyBasis' THEN json_extract(f.value,'$.groups') ELSE '[]' END) g,
+      json_each(CASE WHEN g.type='object' THEN json_extract(g.value,'$.pins') ELSE '[]' END) p
+      WHERE a.space = ? AND p.type='object' AND json_extract(p.value,'$.id') = ?`,
         space,
-        formatElementId(id),
+        named,
       )
       .toArray()
-      .map((row) => parseElementId(row.from_id))
-      .filter((from) => from.kind === 'Activity')
+    for (const row of pinned)
+      found.add(formatElementId({ kind: 'Activity', seq: row.id }))
+    return [...found]
+      .map(parseElementId)
+      .filter((r) => r.kind === 'Activity')
       .sort(compareElementId)
   }
 
   // --- the transaction journal -------------------------------------------
 
   putTransaction(row: Omit<TransactionRow, 'id'>): void {
+    if (
+      row.changes.some((c) =>
+        (c.touched ?? []).some((p) => p.startsWith('governance.')),
+      )
+    ) {
+      const space = this.space(row.space)!
+      space.policies._kip_authorization_version = Math.max(
+        Number(space.policies._kip_authorization_version ?? 0),
+        row.seq,
+      )
+      this.updateRow('spaces', space)
+      const result = isJsonMap(row.result) ? row.result : {}
+      row = {
+        ...row,
+        result: {
+          ...result,
+          control_changes: [
+            ...((result.control_changes ?? []) as Json[]),
+            { kind: 'authorization', version: String(row.seq) },
+          ],
+        },
+      }
+    }
     this.writeRow('transactions', row)
   }
 
@@ -732,7 +905,11 @@ export class Store extends RowStore {
    * caller replays the key, not the mutation (§80.4).
    */
   /** The retained transaction a client's key names for one Principal (§34.2). */
-  transactionForKey(space: string, principalId: string, key: string): TransactionRow | null {
+  transactionForKey(
+    space: string,
+    principalId: string,
+    key: string,
+  ): TransactionRow | null {
     return this.transactionByKey(space, scopedIdempotencyKey(principalId, key))
   }
 
@@ -814,4 +991,3 @@ export class Store extends RowStore {
         )
   }
 }
-

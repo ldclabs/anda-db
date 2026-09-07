@@ -1299,8 +1299,7 @@ function beliefSlot(
       validAt,
       asOf: cx.asOf ?? null,
       warnings: [
-        'no trust model is applied: every eligible corroboration group counts ' +
-          'equally, whoever asserted it',
+        'protected actor trust weights are applied; evidence quality is not automatically graded',
         'no evidence-quality evaluation is applied: a cited Evidence record is ' +
           'counted for its independence, never for how good it is',
       ],

@@ -70,6 +70,27 @@ pub async fn declare_handles(
     Ok(())
 }
 
+/// Seed all declared Concept types before validating cyclic structural edges.
+pub(crate) fn declare_concept_type(
+    tx: &mut Transaction,
+    clause: &MutationClause,
+    request: Option<&Map<String, Json>>,
+    operation: Option<&Map<String, Json>>,
+) -> Result<(), KipError> {
+    if let MutationClause::CreateConcept(c) = clause
+        && let Some(symbol) = &c.r#type
+    {
+        let b = bindings(tx, request, operation);
+        let id = b.handle(&c.handle)?;
+        let name = symbol_name(&b, symbol)?;
+        let symbol =
+            tx.env
+                .resolve_symbol(crate::schema::SymbolKind::ConceptType, &name, Intent::Write)?;
+        tx.declared_types.insert(id, symbol.to_string());
+    }
+    Ok(())
+}
+
 /// Which planning pass a clause belongs to.
 ///
 /// Clause order carries no mutation semantics (§24), so the engine is free to
@@ -312,7 +333,8 @@ pub fn resolve_facets(
         let symbol =
             tx.env
                 .resolve_symbol(crate::schema::SymbolKind::Facet, &name, Intent::Write)?;
-        let members = assignments_to_json(b, &assignment.values, view)?;
+        let mut members = assignments_to_json(b, &assignment.values, view)?;
+        crate::schema::contracts::normalize_record_refs(&symbol.to_string(), &mut members);
         facets.insert(symbol.to_string(), Json::Object(members));
     }
     Ok(facets)

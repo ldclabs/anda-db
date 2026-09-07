@@ -1687,7 +1687,7 @@ describe('the write path', () => {
     // that confers only the first must not buy the second.
     await withWriter(
       'moderation',
-      ['create', 'read', 'assert', 'record_attributed_assertion', 'archive', 'tombstone'],
+      ['create', 'read', 'assert', 'derive', 'record_attributed_assertion', 'archive', 'tombstone'],
       (nexus, session) => {
         nexus.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
@@ -2288,7 +2288,7 @@ describe('erasure', () => {
     // no controlled cross-Space view and versions no trust policy, so nothing
     // would ever ask for either.
     await withNexus('unregistered-permission', (nexus) => {
-      for (const name of ['derive', 'share', 'manage_trust']) {
+      for (const name of ['share']) {
         expect(() => parsePermission(name), name).toThrowError(
           /is not a permission this engine implements/,
         )
@@ -2302,7 +2302,7 @@ describe('erasure', () => {
         nexus.systemSession().createGrant({
           space_id: nexus.space,
           grantee_principal: 'kip:principal:subject',
-          actions: ['read', 'derive'],
+          actions: ['read', 'share'],
         }),
       ).toThrowError(/is not a permission this engine implements/)
 

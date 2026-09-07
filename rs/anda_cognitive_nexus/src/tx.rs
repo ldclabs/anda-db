@@ -22,14 +22,12 @@
 //! would burn a version and emit a change record for a transition that did not
 //! happen.
 //!
-//! ## What this engine does and does not give you
+//! ## Atomic visibility and recovery
 //!
-//! Within one process, the Nexus serializes mutations behind a write lock that
-//! readers also take, so no reader observes a half-applied transaction. What it
-//! does not have is a write-ahead log: a crash *during* commit can leave
-//! elements written. Those are minted in the `pending` state and belong to no
-//! journalled transaction, so [`Store::sweep_pending`] removes them on open —
-//! recovery by construction rather than by replay.
+//! The Nexus write lock keeps a commit atomically visible. A durable redo plan
+//! contains its final rows, control effects, erasure work, audit and approvals.
+//! Recovery reapplies the plan idempotently before reads resume. Pending shells
+//! without a committed plan are removed on open.
 
 use anda_kip::{
     ChangeEntry, ChangeOp, ChangeRefs, ChangeState, ElementKind, Json, KipError, KipErrorCode, Map,
@@ -48,6 +46,9 @@ use crate::store::rows::*;
 use crate::store::space::JournalEntry;
 use crate::store::write::{Row, WriteContext};
 use crate::store::{Element, Store};
+mod cognitive;
+mod durable;
+mod learning;
 
 /// The engine state one KML statement runs against.
 pub struct Transaction {
@@ -72,7 +73,12 @@ pub struct Transaction {
     /// Who the caller is.
     pub auth: AuthContext,
     reference_bindings: Vec<Json>,
+    pub(crate) control_effects: Vec<ControlRecordRow>,
+    pub(crate) identity_changed: bool,
+    pub(crate) authorized_watch_updates: BTreeSet<ElementId>,
+    guarded: BTreeMap<ElementId, BTreeSet<String>>,
     handles: BTreeMap<String, ElementId>,
+    pub(crate) declared_types: BTreeMap<ElementId, String>,
     staged: BTreeMap<ElementId, Staged>,
     shells: Vec<ElementId>,
     warnings: Vec<String>,
@@ -146,7 +152,18 @@ impl Transaction {
     ) -> Result<Self, KipError> {
         let env = store.schema_environment(space_id).await?;
         let cx = store.begin_transaction(space_id, origin).await?;
-        Ok(Self {
+        Ok(Self::at_context(store, cx, env, dry_run, authority, auth))
+    }
+
+    fn at_context(
+        store: &Store,
+        cx: WriteContext,
+        env: SchemaEnvironment,
+        dry_run: bool,
+        authority: EffectiveAuthority,
+        auth: AuthContext,
+    ) -> Self {
+        Self {
             store: store.clone(),
             cx,
             env,
@@ -154,7 +171,12 @@ impl Transaction {
             authority,
             auth,
             handles: BTreeMap::new(),
+            declared_types: BTreeMap::new(),
             reference_bindings: Vec::new(),
+            control_effects: Vec::new(),
+            identity_changed: false,
+            authorized_watch_updates: BTreeSet::new(),
+            guarded: BTreeMap::new(),
             staged: BTreeMap::new(),
             shells: Vec::new(),
             warnings: Vec::new(),
@@ -165,7 +187,25 @@ impl Transaction {
             structural_positions: BTreeMap::new(),
             assignments: BTreeMap::new(),
             exercised_binding: None,
-        })
+        }
+    }
+
+    pub(crate) async fn inspection(
+        store: &Store,
+        space: &str,
+        authority: EffectiveAuthority,
+        auth: AuthContext,
+    ) -> Result<Self, KipError> {
+        let env = store.schema_environment(space).await?;
+        let seq = store.get_space(space).await?.seq;
+        let cx = WriteContext {
+            space: space.into(),
+            tx_id: String::new(),
+            seq: seq.saturating_add(1),
+            at: crate::time::now(),
+            origin: Json::Null,
+        };
+        Ok(Self::at_context(store, cx, env, true, authority, auth))
     }
 
     /// The handles bound so far.
@@ -330,7 +370,7 @@ impl Transaction {
             Some(Element::Concept(row)) if !row.schema_ref.is_empty() => {
                 Some(row.schema_ref.clone())
             }
-            _ => None,
+            _ => self.declared_types.get(&id).cloned(),
         }
     }
 
@@ -804,6 +844,10 @@ impl Transaction {
             None => (0, PlaneVersions::default()),
         };
         for guard in guards {
+            self.guarded
+                .entry(id)
+                .or_default()
+                .insert(guard.plane.name());
             let actual = guard.plane.counter(version, &planes);
             if actual == guard.version {
                 continue;
@@ -831,7 +875,15 @@ impl Transaction {
     /// A dry run never establishes a durable cognitive commit (§69.3), so it
     /// removes its own shells and journals nothing.
     pub async fn commit(mut self, entry: JournalEntry) -> Result<Outcome, KipError> {
-        if let Err(error) = self.capture_cognitive_contracts().await {
+        if let Err(error) = async {
+            self.capture_cognitive_contracts().await?;
+            self.validate_learning().await?;
+            self.validate_durable()?;
+            self.capture_erasure_edges().await?;
+            self.validate_erasure().await
+        }
+        .await
+        {
             self.discard_shells().await;
             return Err(error);
         }
@@ -879,7 +931,9 @@ impl Transaction {
         let identity_changed = self
             .staged
             .values()
-            .any(|s| s.changed && s.op == ChangeOp::Merge);
+            .any(|s| s.changed && s.op == ChangeOp::Merge)
+            || self.identity_changed;
+        let mut space_effect = None;
         if identity_changed {
             let mut space = self.store.get_space(&self.cx.space).await?;
             let mut versions = space.policies["_kip_identity_changes"]
@@ -891,30 +945,34 @@ impl Transaction {
                 space.policies = serde_json::json!({});
             }
             space.policies["_kip_identity_changes"] = Json::Array(versions);
-            self.store.put_space(&space).await?;
+            space_effect = Some(space);
+        }
+        for (id, staged) in &self.staged {
+            if staged.changed
+                && staged.op == ChangeOp::Merge
+                && let Element::Concept(row) = &staged.row
+            {
+                let key = format!("identity:{}:{id}", self.cx.tx_id);
+                self.control_effects.push(ControlRecordRow { _id:0,record_id:key.clone(),space:self.cx.space.clone(),key:key.clone(),seq:self.cx.seq,version:1,kind:"identity".into(),
+                        value:serde_json::json!({"decision_id":key,"source":id.to_string(),"target":row.merged_into,"actor":self.auth.principal_id,"basis_seq":self.cx.seq-1,"resolution_version":self.cx.seq,"status":"active"}),origin:self.cx.origin.clone() });
+            }
         }
         let prepared = self.prepared_changes();
         let mut changes = Vec::with_capacity(prepared.len());
         let mut written = 0usize;
+        let mut writes = Vec::new();
         for (id, prepared) in prepared {
             let staged = self.staged.remove(&id).expect("prepared from staged");
             let mut row = staged.row;
             row.set_plane_versions(&prepared.planes);
-            if let Some(versions) = self.purges.get(&id) {
-                self.store.remove_versions(versions).await?;
-            }
-            if let Some(versions) = self.payload_purges.get(&id) {
-                self.store.scrub_payload_versions(versions).await?;
-            }
-            self.write(
+            let row = self.prepare_write(
                 id,
                 row,
                 prepared.entry.new_version,
-                prepared.entry.op,
                 staged.is_new,
                 staged.keep_origin,
-            )
-            .await?;
+            );
+            writes.push((row, op_name(prepared.entry.op).to_string()));
             changes.push(entry_json(&prepared.entry));
             written += 1;
         }
@@ -934,32 +992,56 @@ impl Transaction {
         // a resend under the same idempotency key replays, and a journal that
         // recorded the key but not the answer would let a caller find its
         // transaction and still not learn what it bound (§34, §33).
-        let result = result_body(&self.handles, &changes);
+        let mut result = result_body(&self.handles, &changes);
+        if !self.control_effects.is_empty() {
+            result["control_changes"] = Json::Array(
+                self.control_effects
+                    .iter()
+                    .filter(|c| c.kind != "erasure")
+                    .map(|c| serde_json::json!({"kind":c.kind,"version":self.cx.seq.to_string()}))
+                    .collect(),
+            );
+        }
+        let audits = std::mem::take(&mut self.governance_audit)
+            .into_iter()
+            .map(|entry| crate::governance::rows::GovernanceAuditRow {
+                entry_class: "mutation".into(),
+                at: self.cx.at.clone(),
+                space_id: entry.space_id,
+                principal_id: entry.principal_id,
+                operation: entry.operation.into(),
+                resource: entry.resource,
+                decision: entry.operation.into(),
+                record: entry.record,
+                ..Default::default()
+            })
+            .collect();
         let journalled = self
             .store
-            .journal(
-                &self.cx,
-                JournalEntry {
+            .commit_plan(crate::store::control::CommitPlan {
+                cx: self.cx.clone(),
+                journal: JournalEntry {
                     status: receipt_status_name(status).to_string(),
-                    transaction_class: "cognitive".to_string(),
+                    transaction_class: "cognitive".into(),
                     schema_environment_version: self.env.version,
                     changes: changes.clone(),
                     result,
-                    // §33.2, §80.4: journalled so a resend replays the Receipt
-                    // the first attempt produced rather than one rebuilt from
-                    // whoever resent it.
                     origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
                     ..entry
                 },
-            )
+                control_replacements: self.artifact_erasure_replacements().await?,
+                writes,
+                controls: std::mem::take(&mut self.control_effects),
+                space: space_effect,
+                purge_versions: self.purges.values().flatten().copied().collect(),
+                scrub_versions: self.payload_purges.values().flatten().copied().collect(),
+                audits,
+                approvals: std::mem::take(&mut self.approval_decisions)
+                    .into_iter()
+                    .flat_map(Approved::into_ids)
+                    .collect(),
+            })
             .await?;
-        for entry in std::mem::take(&mut self.governance_audit) {
-            self.store.governance.record_mutation(entry).await?;
-        }
-        for approved in std::mem::take(&mut self.approval_decisions) {
-            approved.spend(&self.store).await?;
-        }
-        self.store.flush(now_ms()).await?;
 
         // §32.8: a transaction that changed nothing reports no cognitive
         // sequence, however the journal records that it ran.
@@ -1036,6 +1118,7 @@ impl Transaction {
             let view = crate::view::render(&element);
             let old_view = before.as_ref().map(crate::view::render);
             crate::schema::contracts::validate_record(&self.env, &view, old_view.as_ref())?;
+            self.validate_revalidation(&element).await?;
             let Element::Activity(activity) = element else {
                 continue;
             };
@@ -1146,6 +1229,16 @@ impl Transaction {
                 let Some(target) = reference_id(reference) else {
                     continue;
                 };
+                if !activity.inputs.is_empty() {
+                    let output = self.final_element(target).await?;
+                    self.authority
+                        .authorize(
+                            Permission::Derive,
+                            &ResourceContext::of_element(&output),
+                            &self.auth,
+                        )
+                        .into_result()?;
+                }
                 let version = if let Some(staged) = self.staged.get(&target).filter(|s| s.changed) {
                     prepare(target, staged).entry.new_version
                 } else {
@@ -1192,18 +1285,16 @@ impl Transaction {
     /// was loaded and already has its creation coordinates, which must not be
     /// refreshed (they are the only engine-side record of when the element
     /// entered the Nexus).
-    async fn write(
+    fn prepare_write(
         &self,
         id: ElementId,
         row: Element,
         version: u64,
-        op: ChangeOp,
         is_new: bool,
         keep_origin: bool,
-    ) -> Result<(), KipError> {
-        let op = op_name(op);
+    ) -> Element {
         macro_rules! put {
-            ($row:expr) => {{
+            ($row:expr, $variant:ident) => {{
                 let mut row = *$row;
                 row._id = id.seq;
                 row.space = self.cx.space.clone();
@@ -1230,24 +1321,16 @@ impl Transaction {
                 if row.state.is_empty() || row.state == state::PENDING {
                     row.state = state::ACTIVE.to_string();
                 }
-                self.store.put(&row).await?;
-                // The version log is appended in the same commit as the row it
-                // records. A history written afterwards can be missing the
-                // last write a crash interrupted, and a history with a hole in
-                // it answers `AS OF` wrongly rather than refusing.
-                self.store
-                    .record_version(&self.cx, id, version, op, &row)
-                    .await?;
+                Element::$variant(Box::new(row))
             }};
         }
         match row {
-            Element::Concept(row) => put!(row),
-            Element::Proposition(row) => put!(row),
-            Element::Assertion(row) => put!(row),
-            Element::Evidence(row) => put!(row),
-            Element::Activity(row) => put!(row),
+            Element::Concept(row) => put!(row, Concept),
+            Element::Proposition(row) => put!(row, Proposition),
+            Element::Assertion(row) => put!(row, Assertion),
+            Element::Evidence(row) => put!(row, Evidence),
+            Element::Activity(row) => put!(row, Activity),
         }
-        Ok(())
     }
 
     async fn discard_shells(&mut self) {
@@ -1504,7 +1587,7 @@ pub(crate) fn none_if_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     anda_db::unix_ms()
 }
 

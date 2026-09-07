@@ -866,8 +866,10 @@ export class GovernanceStore extends RowStore {
   // --- Audit -------------------------------------------------------------
 
   /** Appends one control-plane mutation to the audit log. */
+  onMutation?: (entry: MutationEntry) => void
+
   recordMutation(entry: MutationEntry): number {
-    return this.appendAudit({
+    const id = this.appendAudit({
       entry_class: 'mutation',
       at: entry.at ?? nowTime(),
       space_id: entry.space_id === undefined || entry.space_id === '' ? ANY_SPACE : entry.space_id,
@@ -880,6 +882,8 @@ export class GovernanceStore extends RowStore {
       decision: entry.operation,
       record: entry.record,
     })
+    if (!["create_space","put_space"].includes(entry.operation)) this.onMutation?.(entry)
+    return id
   }
 
   /** Appends one authorization decision to the audit log. */

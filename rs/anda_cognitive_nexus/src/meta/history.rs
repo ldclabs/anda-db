@@ -192,6 +192,13 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     )
     .await?;
     rows.sort_by_key(|row| row.seq);
+    let floor = cx
+        .store
+        .control_at(&cx.space, "internal/governance", u64::MAX)
+        .await?
+        .and_then(|r| r.value["coverage_floor"].as_u64())
+        .unwrap_or(0);
+    let complete = rows.len() <= limit && after >= floor;
     rows.truncate(limit);
 
     // The coordinate this page *consumed*, read before the visibility filter
@@ -202,7 +209,15 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     let consumed = rows.last().map(|row| row.seq);
     visible_changes(cx, &mut rows).await;
 
-    let page: Vec<Json> = rows.iter().map(|row| entry(row, None)).collect();
+    let coverage = serde_json::json!({"through_seq":if complete {cx.pinned_seq} else {consumed.unwrap_or(after)},"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
+    let page: Vec<Json> = rows
+        .iter()
+        .map(|row| {
+            let mut v = entry(row, None);
+            v["coverage"] = coverage.clone();
+            v
+        })
+        .collect();
 
     Ok(Answer {
         result: Json::Array(page),
@@ -328,15 +343,98 @@ async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
             let Ok(parsed) = id.parse::<crate::id::ElementId>() else {
                 continue;
             };
-            if matches!(cx.load(parsed).await, Ok(Some(_))) {
-                kept.push(change.clone());
+            if let Ok(Some(element)) = cx.load_unattached(parsed).await
+                && let Some(visibility) = cx
+                    .authority
+                    .may_read(&element, cx.auth)
+                    .filter(|v| v.content)
+            {
+                let mut visible = change.clone();
+                if !visibility.constraints.fields.is_empty() {
+                    let fields = &visibility.constraints.fields;
+                    if let Some(paths) = visible["touched"].as_array_mut() {
+                        paths.retain(|p| {
+                            p.as_str().is_some_and(|p| {
+                                fields.iter().any(|f| {
+                                    f == p
+                                        .strip_prefix("fields.")
+                                        .unwrap_or(p)
+                                        .split('.')
+                                        .next()
+                                        .unwrap_or("")
+                                })
+                            })
+                        });
+                    }
+                    if let Some(map) = visible.as_object_mut() {
+                        map.remove("refs");
+                        map.remove("planes");
+                        map.remove("state");
+                    }
+                }
+                kept.push(visible);
             }
         }
         row.changes = kept;
     }
     // A transaction whose every change is hidden is one this caller has no
     // business knowing happened.
-    rows.retain(|row| !row.changes.is_empty());
+    rows.retain(|row| {
+        !row.changes.is_empty()
+            || row.result["control_changes"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty())
+            || row.result.get("schema_environment_version").is_some()
+    });
+}
+
+/// Host page shape also carries coverage when no visible commits were returned.
+pub(crate) async fn change_page(
+    cx: &mut Context<'_>,
+    after: u64,
+    limit: usize,
+) -> Result<Json, KipError> {
+    if limit == 0 || limit > 10000 || after > cx.pinned_seq {
+        return Err(KipError::constraint_violation("invalid change page bounds"));
+    }
+    let mut rows = journal(
+        cx,
+        Filter::And(vec![
+            Box::new(crate::store::eq_field("space", Fv::Text(cx.space.clone()))),
+            Box::new(Filter::Field((
+                "seq".into(),
+                RangeQuery::Gt(Fv::U64(after)),
+            ))),
+        ]),
+    )
+    .await?;
+    rows.sort_by_key(|r| r.seq);
+    let floor = cx
+        .store
+        .control_at(&cx.space, "internal/governance", u64::MAX)
+        .await?
+        .and_then(|r| r.value["coverage_floor"].as_u64())
+        .unwrap_or(0);
+    let complete = rows.len() <= limit && after >= floor;
+    rows.truncate(limit);
+    let through = if complete {
+        cx.pinned_seq
+    } else {
+        rows.last().map_or(after, |r| r.seq)
+    };
+    visible_changes(cx, &mut rows).await;
+    let coverage = serde_json::json!({"through_seq":through,"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
+    let changes: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let mut value = entry(r, None);
+            value["coverage"] = coverage.clone();
+            value
+        })
+        .collect();
+    Ok(
+        serde_json::json!({"changes":changes,"coverage":coverage,"through_time":cx.at,"next_cursor":through.to_string(),"resync_required":after<floor}),
+    )
 }
 
 /// One journal row as the Change Envelope §36.1 fixes.
@@ -371,7 +469,13 @@ fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
             &row.status,
         )),
     );
-    let mut controls = Vec::new();
+    let mut controls: Vec<anda_kip::ControlChange> = serde_json::from_value(
+        row.result
+            .get("control_changes")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
+    .unwrap_or_default();
     if row.transaction_class == "governance"
         && row.result.get("schema_environment_version").is_some()
     {

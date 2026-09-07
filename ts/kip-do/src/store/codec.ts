@@ -60,6 +60,7 @@ function spec(
 }
 
 export const TABLE_SPECS: Readonly<Record<string, TableSpec>> = {
+  kip_control_records: { columns: ["record_id", "space", "key", "seq", "version", "kind", "value", "origin"], json: new Set(["value", "origin"]) },
   concepts: spec(
     [
       'client_key',

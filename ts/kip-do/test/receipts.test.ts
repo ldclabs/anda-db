@@ -246,11 +246,11 @@ describe('receipts', () => {
         ingestion_context: true,
         record_outcome_permission: true,
         search_index_freshness: true,
-        weighted_projection: false,
+        weighted_projection: true,
         semantic_search: false,
         hybrid_search: false,
         capsule_import: false,
-        derive_permission: false,
+        derive_permission: true,
         signed_receipts: false,
         streaming: false,
       },
@@ -264,7 +264,7 @@ describe('receipts', () => {
     }
     // §67.4 fixes the names; both engines report them from `supported.registry`
     // so one client can ask either the same question.
-    expect(report.supported.registry.weighted_projection).toBe(false)
+    expect(report.supported.registry.weighted_projection).toBe(true)
     expect(report.supported.registry.change_stream).toBe(true)
     expect(report.supported.registry.semantic_search).toBe(false)
     // An entry that carries a value reports it on the entry, not in `limits`.
@@ -279,7 +279,7 @@ describe('receipts', () => {
     // A registry name this engine answers `false` for, required `true`.
     const unmet = await post('requires', {
       kip: '2.0',
-      requires: { weighted_projection: true },
+      requires: { semantic_search: true },
       operations: [{ command: 'DESCRIBE PROTOCOL' }],
     })
     expect(unmet.error?.code).toBe('UnsupportedCapability')

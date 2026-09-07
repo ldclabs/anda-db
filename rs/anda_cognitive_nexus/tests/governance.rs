@@ -2785,8 +2785,11 @@ async fn a_change_cursor_walks_past_a_window_the_reader_may_not_see() {
             .unwrap()
             .as_array()
             .unwrap()
-            .is_empty(),
-        "the reader may see none of it"
+            .iter()
+            .all(|envelope| envelope["changes"]
+                .as_array()
+                .is_none_or(|changes| changes.is_empty())),
+        "hidden cognition stays hidden while authorization notifications remain visible"
     );
 
     let seq = nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq;
@@ -3142,6 +3145,7 @@ async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
             "read",
             "create",
             "assert",
+            "derive",
             "record_attributed_assertion",
             "archive",
             "tombstone",
@@ -3364,7 +3368,8 @@ async fn a_permission_no_gate_asks_for_is_refused_rather_than_accepted() {
     // The same reasoning covers `share` and `manage_trust`: this engine
     // exposes no controlled cross-Space view and versions no trust policy, so
     // nothing would ever ask for either.
-    for name in ["derive", "share", "manage_trust"] {
+    {
+        let name = "share";
         let error =
             Permission::parse(name).expect_err("a name no gate asks for is not in the registry");
         assert_eq!(error.code, anda_kip::KipErrorCode::NotAuthorized, "{name}");
@@ -3380,7 +3385,7 @@ async fn a_permission_no_gate_asks_for_is_refused_rather_than_accepted() {
             GrantDraft {
                 space_id: DEFAULT_SPACE.into(),
                 grantee_principal: subject,
-                actions: vec!["read".into(), "derive".into()],
+                actions: vec!["read".into(), "share".into()],
                 ..Default::default()
             },
         )
@@ -3774,8 +3779,8 @@ async fn a_source_cannot_vouch_for_itself_into_the_trust_resolver() {
     );
     // And the engine still refuses to report a trust judgement it does not make.
     assert_eq!(
-        error_code(&run_as(&owner, "DESCRIBE TRUST").await),
-        "UnsupportedCapability"
+        run_as(&owner, "DESCRIBE TRUST").await.status,
+        TopLevelStatus::Succeeded
     );
 }
 

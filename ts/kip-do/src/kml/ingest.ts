@@ -1,3 +1,5 @@
+import { authorizedArtifact } from '../control.js'
+import { digest } from '../schema/contracts.js'
 /**
  * The request envelope's ingestion context (§71.1).
  *
@@ -241,15 +243,11 @@ export function mintIngestedEvidence(
           `parameter; a command citing :${entry.key} could mean either`,
       )
     }
-    // An artifact handle promises bytes this engine has nowhere to fetch from.
-    // Minting an Evidence record with an empty payload under a handle that
-    // resolves to nothing would be the fabrication the whole mechanism exists
-    // to prevent (§85.2).
+    let payload=entry.payload ?? null, artifactSources:string[]=[]
     if (entry.payload_artifact !== undefined) {
-      throw errors.unsupportedCapability(
-        'this engine has no artifact store, so `payload_artifact` names bytes ' +
-          'it cannot read; send the observation as an inline `payload`',
-      )
+      if(entry.media_type && entry.media_type !== 'application/json')throw errors.unsupportedCapability('governed artifacts carry canonical application/json bytes')
+      const artifact=authorizedArtifact(tx.store,tx.cx.space,entry.payload_artifact,tx.authority,tx.auth)
+      payload=artifact.payload;artifactSources=artifact.sources
     }
 
     // A retry of the same logical ingestion resolves to the Evidence the first
@@ -276,18 +274,15 @@ export function mintIngestedEvidence(
       client_key: clientKey,
       evidence_class: entry.evidence_class,
       payload_mode: 'inline',
-      payload_inline: entry.payload ?? null,
+      payload_inline: payload,
       content_ref: '',
-      content_digest: '',
-      media_type: entry.media_type ?? '',
+      content_digest: entry.payload_artifact ? digest(payload) : '',
+      media_type: entry.media_type ?? (entry.payload_artifact ? 'application/json' : ''),
       observed_at:
         entry.observed_at === undefined
           ? tx.cx.at
           : normalizeTime(entry.observed_at, 'ingest.observed_at'),
-      source_refs:
-        entry.source_actor === undefined
-          ? []
-          : [{ id: formatElementId(sourceActor(tx, entry.source_actor)) }],
+      source_refs: [...(entry.source_actor === undefined ? [] : [{id:formatElementId(sourceActor(tx,entry.source_actor))}]),...artifactSources.map((id)=>({id}))],
       generated_by: '',
       status: 'active',
       corrects: [],

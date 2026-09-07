@@ -1,3 +1,4 @@
+import { projectionPolicyAt } from '../control.js'
 import { parseElementId } from '../id.js'
 /**
  * # Executing KQL
@@ -137,6 +138,7 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   const env =
     asOf === null ? cx.env : cx.environmentAt(cx.store.schemaVersionAt(cx.space, asOf))
   const context = new Context(cx.store, env, cx.space, cx.authority, cx.auth, asOf)
+  try { b.policy = projectionPolicyAt(cx.store,cx.space,pinnedSeq,epistemicSettings(query.epistemic,cx)) } catch (e) { if ((e as {code?:string}).code !== 'HistoricalSnapshotUnavailable') throw e; b.policy.trust_version='unavailable' }
 
   // `FOR TIME` names the world time a claim has to apply at, so a projection in
   // the same query answers about that instant rather than about now. A different

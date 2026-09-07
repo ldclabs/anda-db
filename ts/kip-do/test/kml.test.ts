@@ -898,32 +898,19 @@ describe('KML', () => {
   it('lets UPDATE reach a record\'s Facets while its payload stays immutable', async () => {
     // §18.1: a Facet is representation-local state and none of it is truth, so
     // a Facet on Evidence moves while what the Evidence observed does not.
-    // The Profile relies on this: `OutcomeRecord` — the consequence channel's
-    // graded index — lives on Evidence, and an optional member has to be
-    // establishable after the instrument first wrote the record.
+    // Mutable retrieval metadata remains independent of immutable observation records.
     await withNexus('record-facets', (nexus) => {
       nexus.execute(CITED_EVIDENCE)
-      nexus.execute(
-        'UPDATE "E-1" SET FACET "OutcomeRecord" ' +
-          '{task_family: "prefs/stated", outcome_status: "unknown", attempt_ref: null, metric: "completion", window: "run", terminal: true, observation_key: "prefs-1", observer_config_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}',
-      )
-      nexus.execute('UPDATE "E-1" SET FACET "OutcomeRecord" {magnitude: 0.5}')
-      expect(
-        nexus.query(
-          'FIND(?e.facets["OutcomeRecord"].magnitude) WHERE { ?e EVIDENCE {} }',
-        ),
-      ).toEqual([0.5])
-
-      // Established once, and not revised afterwards (§39).
-      expect(() =>
-        nexus.execute('UPDATE "E-1" SET FACET "OutcomeRecord" {magnitude: 0.9}'),
-      ).toThrowError(/immutable/)
+      nexus.execute('UPDATE "E-1" SET FACET "Annotation" {salience:0.5}')
+      expect(nexus.query('FIND(?e.facets["Annotation"].salience) WHERE {?e EVIDENCE {}}')).toEqual([0.5])
+      nexus.execute('UPDATE "E-1" SET FACET "Annotation" {salience:0.9}')
+      expect(nexus.query('FIND(?e.facets["Annotation"].salience) WHERE {?e EVIDENCE {}}')).toEqual([0.9])
 
       // What the record itself says is still corrected, never edited.
       expect(() =>
         nexus.execute('UPDATE "E-1" SET FIELDS {payload: "something else"}'),
       ).toThrowError(/corrected/)
-    })
+    }, [{format:'KIP-Schema-Package',manifest:{package_id:'kip://test/annotation',version:'1.0.0'},definitions:{facets:{Annotation:{kind:'FacetDefinition',applicable_to:{kinds:['Evidence']},fields:{salience:{type:'number',mutable:true}}}}}} as unknown as SchemaPackage])
   })
 
   it('lets a legal hold block a payload purge, as it blocks an element purge', async () => {

@@ -15,8 +15,8 @@
 //! per database — so the guarantee is not weaker than the storage underneath
 //! it.
 //!
-//! What neither provides is crash atomicity mid-commit. That is handled by
-//! construction instead: elements are minted `pending` and swept on open.
+//! Multi-collection commits use a durable redo plan. Recovery completes each
+//! prepared plan before reads resume, then sweeps unused pending shells.
 
 use anda_kip::{
     Command, CommandType, Executor, Json, KipError, Operation, Request, Response, SpaceSelector,
@@ -52,7 +52,7 @@ pub struct CognitiveNexus {
     pub store: Store,
     /// The Space a request runs against when its envelope names none.
     default_space: String,
-    lock: Arc<RwLock<()>>,
+    pub(crate) lock: Arc<RwLock<()>>,
     approval_lock: Arc<Mutex<()>>,
 }
 
@@ -65,11 +65,27 @@ impl std::fmt::Debug for CognitiveNexus {
 }
 
 impl CognitiveNexus {
+    /// Recover a prepared commit before a read can observe any after-images.
+    pub(crate) async fn read_guard(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, KipError> {
+        loop {
+            let guard = self.lock.read().await;
+            if !self.store.has_poisoned_handle()
+                && self.store.commit_log().ids().is_empty()
+                && !self.store.governance.control_recovery_needed()
+            {
+                return Ok(guard);
+            }
+            drop(guard);
+            let _write = self.lock.write().await;
+            self.store.reopen_if_poisoned().await?;
+        }
+    }
     /// Opens a Nexus on an existing database.
     ///
-    /// Sweeps any element left `pending` by a run that crashed mid-commit
-    /// before returning: such an element belongs to no committed transaction
-    /// and was never visible, so removing it is the whole of the recovery.
+    /// Recovers durable commit plans before sweeping uncommitted pending shells.
+    /// Control checkpoints distinguish a retained stream from interrupted delivery.
     pub async fn connect(db: Arc<anda_db::database::AndaDB>) -> Result<Self, KipError> {
         // A KIP 1.x database occupies the two collection names this engine is
         // about to open, with schemas that mean something else. Extract and
@@ -77,6 +93,7 @@ impl CognitiveNexus {
         // the old schema never had — safe, but unreadable as a diagnosis.
         crate::migrate::prepare(&db).await?;
         let store = Store::open(db).await?;
+        store.recover_commits().await?;
         store.sweep_pending().await?;
         store.install_core_package().await?;
         store
@@ -112,6 +129,15 @@ impl CognitiveNexus {
             })
             .await?;
         store.adopt_unowned_spaces(SYSTEM_PRINCIPAL).await?;
+        for id in store.spaces().ids() {
+            let space: crate::store::rows::SpaceRow = store
+                .spaces()
+                .get_as(id)
+                .await
+                .map_err(crate::error::db_error)?;
+            store.ensure_control_history(&space).await?;
+        }
+        store.governance.recover_control_delivery().await?;
         let nexus = Self {
             store,
             default_space: DEFAULT_SPACE.to_string(),
@@ -375,8 +401,8 @@ impl CognitiveNexus {
 /// January does not still hold what January's Grants said (§28.6).
 #[derive(Clone)]
 pub struct Session {
-    nexus: CognitiveNexus,
-    auth: Arc<AuthContext>,
+    pub(crate) nexus: CognitiveNexus,
+    pub(crate) auth: Arc<AuthContext>,
 }
 
 impl std::fmt::Debug for Session {
@@ -416,7 +442,7 @@ impl Session {
         space_id: &str,
         limit: usize,
     ) -> Result<Vec<crate::governance::rows::GovernanceAuditRow>, KipError> {
-        let _guard = self.nexus.lock.read().await;
+        let _guard = self.nexus.read_guard().await?;
         let authority = self.authority(space_id, &self.auth).await?;
         authority
             .authorize(
@@ -444,7 +470,7 @@ impl Session {
         space_id: &str,
         at: &str,
     ) -> Result<EffectiveAuthority, KipError> {
-        let _guard = self.nexus.lock.read().await;
+        let _guard = self.nexus.read_guard().await?;
         let now = self.authority(space_id, &self.auth).await?;
         now.authorize(
             Permission::ReadGovernanceHistory,
@@ -758,7 +784,7 @@ impl Session {
     /// silently when it is forgotten: a missing guard corrupts under
     /// concurrency, a missing recovery bricks the Nexus after a poisoned
     /// flush, and an unspent approval stays available for a second use.
-    async fn governed<T>(
+    pub(crate) async fn governed<T>(
         &self,
         space_id: &str,
         permission: Permission,
@@ -807,7 +833,7 @@ impl Session {
     /// No Space-scope gate: these authorize *per element*, inside
     /// [`governance::element`](crate::governance::element), because reaching
     /// one element is not reaching the Space.
-    async fn with_authority<T>(
+    pub(crate) async fn with_authority<T>(
         &self,
         space_id: &str,
         operation: impl AsyncFnOnce(EffectiveAuthority) -> Result<T, KipError>,
@@ -1182,7 +1208,10 @@ impl Session {
     /// The read lane, which KQL and META share: a shared lock, the gate, and
     /// an approval a read may satisfy but never spends (§63.2).
     async fn run_read(&self, call: &Call<'_>, read: Read<'_>) -> Response {
-        let _guard = self.nexus.lock.read().await;
+        let _guard = match self.nexus.read_guard().await {
+            Ok(g) => g,
+            Err(e) => return Response::from(e),
+        };
         let authority = match self.authority(call.space, call.auth).await {
             Ok(authority) => authority,
             Err(err) => return Response::from(err),

@@ -178,6 +178,9 @@ async fn plan(
     for clause in &statement.clauses {
         clauses::declare_handles(tx, clause).await?;
     }
+    for clause in &statement.clauses {
+        clauses::declare_concept_type(tx, clause, parameters, operation.parameters.as_ref())?;
+    }
     // Clause order carries no mutation semantics (§24), so this is a planning
     // order rather than an execution order. See `clauses::plan_pass`.
     for pass in 0..clauses::PLAN_PASSES {
@@ -242,21 +245,34 @@ async fn mint_ingested_evidence(
                 entry.key, entry.key
             )));
         }
-        // An artifact handle promises bytes this engine has nowhere to fetch
-        // from. Minting an Evidence record with an empty payload under a
-        // handle that resolves to nothing would be the fabrication the whole
-        // mechanism exists to prevent (§85.2).
-        if entry.payload_artifact.is_some() {
-            return Err(KipError::unsupported_capability(
-                "this engine has no artifact store, so `payload_artifact` names bytes it cannot \
-                 read; send the observation as an inline `payload`",
-            ));
-        }
-        let payload = entry.payload.clone().ok_or_else(|| {
-            KipError::invalid_request_envelope(
-                "an ingest entry declares exactly one of `payload` or `payload_artifact`",
+        let (payload, artifact_sources) = if let Some(reference) = &entry.payload_artifact {
+            if entry.payload.is_some() {
+                return Err(KipError::invalid_request_envelope(
+                    "ingestion must declare exactly one payload source",
+                ));
+            }
+            if entry
+                .media_type
+                .as_deref()
+                .is_some_and(|v| v != "application/json")
+            {
+                return Err(KipError::unsupported_capability(
+                    "governed artifacts currently carry canonical application/json bytes",
+                ));
+            }
+            store
+                .authorized_artifact(&tx.cx.space, reference, &tx.authority, &tx.auth)
+                .await?
+        } else {
+            (
+                entry.payload.clone().ok_or_else(|| {
+                    KipError::invalid_request_envelope(
+                        "ingestion needs payload or payload_artifact",
+                    )
+                })?,
+                Vec::new(),
             )
-        })?;
+        };
 
         // A retry of the same logical ingestion resolves to the Evidence the
         // first attempt minted, exactly as `CLIENT KEY` does on a `CREATE`
@@ -273,9 +289,17 @@ async fn mint_ingested_evidence(
             continue;
         }
 
-        let source_refs = match &entry.source_actor {
+        let mut source_refs = match &entry.source_actor {
             Some(actor) => vec![resolve_source_actor(store, tx, actor).await?],
             None => Vec::new(),
+        };
+        for source in artifact_sources {
+            source_refs.push(serde_json::json!({"id":source}));
+        }
+        let content_digest = if entry.payload_artifact.is_some() {
+            crate::schema::contracts::digest(&payload)?
+        } else {
+            String::new()
         };
         let observed_at = match &entry.observed_at {
             Some(at) => crate::time::normalize(at, "ingest.observed_at")?,
@@ -293,7 +317,14 @@ async fn mint_ingested_evidence(
             evidence_class: entry.evidence_class.clone(),
             payload_mode: "inline".to_string(),
             payload_inline: payload,
-            media_type: entry.media_type.clone().unwrap_or_default(),
+            content_digest,
+            media_type: entry.media_type.clone().unwrap_or_else(|| {
+                if entry.payload_artifact.is_some() {
+                    "application/json".into()
+                } else {
+                    String::new()
+                }
+            }),
             observed_at,
             source_keys: source_refs.iter().map(clauses::endpoint_key).collect(),
             source_refs,

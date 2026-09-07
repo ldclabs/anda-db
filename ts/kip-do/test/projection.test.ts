@@ -305,7 +305,7 @@ describe('the Epistemic Projection', () => {
         `FIND(?b.explanation.warnings) ${BELIEF('Quiet')}`,
       ) as string[][]
       expect(warnings).toHaveLength(2)
-      expect(warnings?.join(' ')).toMatch(/no trust model/)
+      expect(warnings?.join(' ')).toMatch(/protected actor trust weights/)
       expect(warnings?.join(' ')).toMatch(/no evidence-quality evaluation/)
     })
   })

@@ -46,7 +46,6 @@ use anda_kip::{Json, KipError};
 use super::approval::Approved;
 use super::auth::AuthContext;
 use super::decision::{EffectiveAuthority, ResourceContext};
-use super::store::MutationEntry;
 use super::{Permission, authority, classification};
 use crate::id::ElementId;
 use crate::store::rows::state;
@@ -390,24 +389,39 @@ where
     F: Fn(&Json) -> Json,
     R: FnOnce(u64) -> Json,
 {
-    let Governed {
-        store,
-        space_id,
-        auth,
-    } = *gov;
+    let Governed { space_id, auth, .. } = *gov;
     let id = element.id();
+    let version = element
+        .version()
+        .checked_add(1)
+        .filter(|v| *v <= anda_kip::MAX_SAFE_INTEGER)
+        .ok_or_else(|| KipError::constraint_violation("element version exhausted"))?;
+    let mut record = record(version);
+    if let Some(object) = record.as_object_mut() {
+        object.insert("element".into(), Json::String(id.to_string()));
+    }
+    let audit = super::rows::GovernanceAuditRow {
+        entry_class: "mutation".into(),
+        space_id: space_id.into(),
+        resource: id.to_string(),
+        principal_id: auth.principal_id.clone(),
+        operation: change.audit_op.into(),
+        decision: change.audit_op.into(),
+        record,
+        ..Default::default()
+    };
     let version = commit(
-        store,
-        space_id,
+        gov,
         element,
         change.op,
         change.new_state,
         patch,
-        auth,
+        CommitAudit {
+            row: audit,
+            approvals: approved.into_ids(),
+        },
     )
     .await?;
-    audit(store, space_id, id, change.audit_op, record(version), auth).await?;
-    approved.spend(store).await?;
     Ok(version)
 }
 
@@ -465,24 +479,33 @@ async fn inherited_ceiling(store: &Store, element: &Element) -> Result<String, K
 }
 
 /// Writes a Governance patch onto an element as its own transaction.
+struct CommitAudit {
+    row: super::rows::GovernanceAuditRow,
+    approvals: Vec<u64>,
+}
+
 async fn commit<F>(
-    store: &Store,
-    space_id: &str,
+    gov: &Governed<'_>,
     element: Element,
     op: &'static str,
     new_state: Option<&str>,
     patch: F,
-    auth: &AuthContext,
+    audit: CommitAudit,
 ) -> Result<u64, KipError>
 where
     F: Fn(&Json) -> Json,
 {
+    let Governed {
+        store,
+        space_id,
+        auth,
+    } = *gov;
     let cx = store
         .begin_transaction(space_id, engine_origin(auth))
         .await?;
     macro_rules! write {
         ($row:expr) => {
-            put(store, &cx, *$row, op, new_state, patch).await
+            put(store, &cx, *$row, op, new_state, patch, audit).await
         };
     }
     match element {
@@ -507,11 +530,16 @@ async fn put<R, F>(
     op: &'static str,
     new_state: Option<&str>,
     patch: F,
+    audit: CommitAudit,
 ) -> Result<u64, KipError>
 where
     R: crate::store::write::Row,
     F: Fn(&Json) -> Json,
 {
+    let CommitAudit {
+        row: mut audit,
+        approvals,
+    } = audit;
     // Read before the patch, not after it: an entry whose `before` was taken
     // from the already-patched row can only ever report that nothing moved,
     // and §36.1's `touched` and `state {from, to}` are the two things a
@@ -527,9 +555,9 @@ where
             *envelope.state = state.to_string();
         }
     }
-    let version = store.update(cx, &mut row).await?;
+    cx.stamp_update(&mut row);
+    let version = *row.envelope_mut().version;
     let id = ElementId::new(R::KIND, row.id());
-    store.record_version(cx, id, version, op, &row).await?;
     let schema_environment_version = store.get_space(&cx.space).await?.schema_environment_version;
     // The same entry shape a cognitive commit journals (§36.1): a Governance
     // decision that moved the state is a `lifecycle` entry, one that relabelled
@@ -568,18 +596,46 @@ where
         planes: None,
         extensions: None,
     };
+    let encoded =
+        serde_json::to_value(&row).map_err(|e| KipError::internal_error(e.to_string()))?;
+    let element = match R::KIND {
+        anda_kip::ElementKind::Concept => Element::Concept(
+            serde_json::from_value(encoded).map_err(|e| KipError::internal_error(e.to_string()))?,
+        ),
+        anda_kip::ElementKind::Proposition => Element::Proposition(
+            serde_json::from_value(encoded).map_err(|e| KipError::internal_error(e.to_string()))?,
+        ),
+        anda_kip::ElementKind::Assertion => Element::Assertion(
+            serde_json::from_value(encoded).map_err(|e| KipError::internal_error(e.to_string()))?,
+        ),
+        anda_kip::ElementKind::Evidence => Element::Evidence(
+            serde_json::from_value(encoded).map_err(|e| KipError::internal_error(e.to_string()))?,
+        ),
+        anda_kip::ElementKind::Activity => Element::Activity(
+            serde_json::from_value(encoded).map_err(|e| KipError::internal_error(e.to_string()))?,
+        ),
+    };
+    audit.at = cx.at.clone();
     store
-        .journal(
-            cx,
-            crate::store::space::JournalEntry {
-                status: "committed".to_string(),
-                transaction_class: "governance".to_string(),
+        .commit_plan(crate::store::control::CommitPlan {
+            cx: cx.clone(),
+            journal: crate::store::space::JournalEntry {
+                status: "committed".into(),
+                transaction_class: "governance".into(),
                 schema_environment_version,
-                result: serde_json::json!({"element": id.to_string(), "op": op}),
+                result: serde_json::json!({"element":id.to_string(),"op":op}),
                 changes: vec![crate::tx::entry_json(&entry)],
                 ..Default::default()
             },
-        )
+            writes: vec![(element, op.into())],
+            controls: vec![],
+            control_replacements: vec![],
+            space: None,
+            purge_versions: vec![],
+            scrub_versions: vec![],
+            audits: vec![audit],
+            approvals,
+        })
         .await?;
     Ok(version)
 }
@@ -616,31 +672,6 @@ fn set_member(governance: &Json, key: &str, value: Json) -> Json {
         object.insert(key.to_string(), value);
     }
     Json::Object(object)
-}
-
-async fn audit(
-    store: &Store,
-    space_id: &str,
-    id: ElementId,
-    operation: &'static str,
-    mut record: Json,
-    auth: &AuthContext,
-) -> Result<(), KipError> {
-    if let Some(object) = record.as_object_mut() {
-        object.insert("element".to_string(), Json::from(id.to_string()));
-    }
-    store
-        .governance
-        .record_mutation(MutationEntry {
-            operation,
-            at: crate::time::now(),
-            space_id: space_id.to_string(),
-            resource: id.to_string(),
-            principal_id: auth.principal_id.clone(),
-            record,
-        })
-        .await
-        .map(|_| ())
 }
 
 /// The engine origin a Governance write stamps.

@@ -24,7 +24,7 @@ import type { KmlStatement } from '../kip/ast.js'
 import type { SchemaEnvironment } from '../schema/index.js'
 import type { Store } from '../store/index.js'
 import { Transaction, type Outcome } from '../tx.js'
-import { apply, declareHandles, PLAN_PASSES, planPass } from './clauses.js'
+import { apply, declareHandles, declareConceptType, PLAN_PASSES, planPass } from './clauses.js'
 import { mintIngestedEvidence, type IngestContext } from './ingest.js'
 
 /** What one KML execution needs from its caller. */
@@ -96,6 +96,7 @@ export function executeKml(
   for (const clause of statement.clauses) {
     declareHandles(tx, clause)
   }
+  for (const clause of statement.clauses) declareConceptType(tx,clause,request,cx.operation)
   // Clause order carries no mutation semantics (§24), so this is a planning
   // order rather than an execution order. See `clauses.planPass`.
   for (let pass = 0; pass < PLAN_PASSES; pass++) {
@@ -131,6 +132,7 @@ export {
   PLAN_PASSES,
   apply,
   declareHandles,
+  declareConceptType,
   planPass,
 } from './clauses.js'
 

@@ -1,3 +1,4 @@
+import { normalizeRecordRefs } from '../schema/contracts.js'
 import { validateValue } from '../schema/contracts.js'
 import { canonicalJson } from '../json.js'
 /**
@@ -29,7 +30,10 @@ import {
   TRANSITION_STATES,
   TRANSITION_WITH_BY,
 } from '../kip/semantics.js'
-import { permissionForTargetState, permissionsForState } from '../governance/gate.js'
+import {
+  permissionForTargetState,
+  permissionsForState,
+} from '../governance/gate.js'
 import { bindingId, type Permission } from '../governance/index.js'
 import {
   referencePolicy,
@@ -174,11 +178,36 @@ export function planPass(clause: MutationClause): number {
  * so minting a shell for them would allocate an id that is thrown away on every
  * resolve-to-existing.
  */
+export function declareConceptType(
+  tx: Transaction,
+  clause: MutationClause,
+  request: JsonMap | undefined,
+  operation: JsonMap | undefined,
+): void {
+  if ('CreateConcept' in clause && clause.CreateConcept.type !== null) {
+    const c = clause.CreateConcept,
+      b = bindings(tx, request, operation),
+      symbol = tx.env.resolveSymbol(
+        'ConceptType',
+        symbolName(b, c.type!),
+        'write',
+      )
+    tx.declaredTypes.set(
+      formatElementId(requireHandle(tx, c.handle)),
+      formatSymbolRef(symbol),
+    )
+  }
+}
+
 export function declareHandles(tx: Transaction, clause: MutationClause): void {
-  if ('CreateConcept' in clause) tx.declare(clause.CreateConcept.handle, 'Concept')
-  else if ('CreateEvidence' in clause) tx.declare(clause.CreateEvidence.handle, 'Evidence')
-  else if ('CreateAssertion' in clause) tx.declare(clause.CreateAssertion.handle, 'Assertion')
-  else if ('CreateActivity' in clause) tx.declare(clause.CreateActivity.handle, 'Activity')
+  if ('CreateConcept' in clause)
+    tx.declare(clause.CreateConcept.handle, 'Concept')
+  else if ('CreateEvidence' in clause)
+    tx.declare(clause.CreateEvidence.handle, 'Evidence')
+  else if ('CreateAssertion' in clause)
+    tx.declare(clause.CreateAssertion.handle, 'Assertion')
+  else if ('CreateActivity' in clause)
+    tx.declare(clause.CreateActivity.handle, 'Activity')
 }
 
 /** Interprets one clause against a plan with every handle already bound. */
@@ -196,22 +225,45 @@ export function apply(
     what: string,
     permission: Permission,
   ) =>
-    resolveTargets(tx, b, target, where, limit, request, operation, what, permission)
+    resolveTargets(
+      tx,
+      b,
+      target,
+      where,
+      limit,
+      request,
+      operation,
+      what,
+      permission,
+    )
 
-  if ('CreateConcept' in clause) return createConcept(tx, b, clause.CreateConcept)
-  if ('UpsertConcept' in clause) return upsertConcept(tx, b, clause.UpsertConcept)
+  if ('CreateConcept' in clause)
+    return createConcept(tx, b, clause.CreateConcept)
+  if ('UpsertConcept' in clause)
+    return upsertConcept(tx, b, clause.UpsertConcept)
   if ('EnsureProposition' in clause) {
     ensureProposition(tx, b, clause.EnsureProposition)
     return
   }
-  if ('CreateEvidence' in clause) return createRecord(tx, b, clause.CreateEvidence, 'Evidence')
-  if ('CreateAssertion' in clause) return createRecord(tx, b, clause.CreateAssertion, 'Assertion')
-  if ('CreateActivity' in clause) return createRecord(tx, b, clause.CreateActivity, 'Activity')
-  if ('Transition' in clause) return transition(tx, b, clause.Transition, select)
+  if ('CreateEvidence' in clause)
+    return createRecord(tx, b, clause.CreateEvidence, 'Evidence')
+  if ('CreateAssertion' in clause)
+    return createRecord(tx, b, clause.CreateAssertion, 'Assertion')
+  if ('CreateActivity' in clause)
+    return createRecord(tx, b, clause.CreateActivity, 'Activity')
+  if ('Transition' in clause)
+    return transition(tx, b, clause.Transition, select)
   if ('Update' in clause) {
-    const { target, where_clauses, limit, expect_versions, actions } = clause.Update
+    const { target, where_clauses, limit, expect_versions, actions } =
+      clause.Update
     const guards = versionGuards(tx, b, expect_versions)
-    for (const id of select(target, where_clauses, limit, 'UPDATE', 'update').authorized(tx)) {
+    for (const id of select(
+      target,
+      where_clauses,
+      limit,
+      'UPDATE',
+      'update',
+    ).authorized(tx)) {
       tx.expectVersions(id, guards)
       const element = tx.load(id)
       const before = JSON.stringify(element.row)
@@ -230,12 +282,21 @@ export function apply(
     return
   }
   if ('Purge' in clause) {
-    const { target, where_clauses, limit, reference_policy, expect_versions } = clause.Purge
+    const { target, where_clauses, limit, reference_policy, expect_versions } =
+      clause.Purge
     const policy = referencePolicy(
-      reference_policy === null ? null : scalarText(b, reference_policy, 'REFERENCE POLICY'),
+      reference_policy === null
+        ? null
+        : scalarText(b, reference_policy, 'REFERENCE POLICY'),
     )
     const guards = versionGuards(tx, b, expect_versions)
-    for (const id of select(target, where_clauses, limit, 'PURGE', 'purge').authorized(tx)) {
+    for (const id of select(
+      target,
+      where_clauses,
+      limit,
+      'PURGE',
+      'purge',
+    ).authorized(tx)) {
       tx.expectVersions(id, guards)
       stagePurge(tx, id, policy)
     }
@@ -246,8 +307,15 @@ export function apply(
     // bytes after digesting them without destroying the evidence event, its
     // citations, or its provenance role. No `REFERENCE POLICY` and no referrer
     // check: the element survives, so nothing can be left pointing at nothing.
-    const { target, where_clauses, limit, expect_versions } = clause.PurgePayload
-    const selected = select(target, where_clauses, limit, 'PURGE PAYLOAD', 'purge')
+    const { target, where_clauses, limit, expect_versions } =
+      clause.PurgePayload
+    const selected = select(
+      target,
+      where_clauses,
+      limit,
+      'PURGE PAYLOAD',
+      'purge',
+    )
     const guards = versionGuards(tx, b, expect_versions)
     for (const id of selected.authorized(tx)) {
       tx.expectVersions(id, guards)
@@ -267,7 +335,8 @@ export function apply(
     return
   }
   if ('SetRetention' in clause) {
-    const { target, values, where_clauses, limit, expect_versions } = clause.SetRetention
+    const { target, values, where_clauses, limit, expect_versions } =
+      clause.SetRetention
     const selected = select(
       target,
       where_clauses,
@@ -298,8 +367,20 @@ export function apply(
   }
   if ('MergeConcept' in clause) {
     const { source, into, where_clauses, expect_versions } = clause.MergeConcept
-    const sources = select(source, where_clauses, null, 'MERGE CONCEPT', 'merge_identity').authorized(tx)
-    const targets = select(into, where_clauses, null, 'MERGE CONCEPT ... INTO', 'merge_identity').authorized(tx)
+    const sources = select(
+      source,
+      where_clauses,
+      null,
+      'MERGE CONCEPT',
+      'merge_identity',
+    ).authorized(tx)
+    const targets = select(
+      into,
+      where_clauses,
+      null,
+      'MERGE CONCEPT ... INTO',
+      'merge_identity',
+    ).authorized(tx)
     return merge(tx, sources, targets, versionGuards(tx, b, expect_versions))
   }
 
@@ -315,11 +396,15 @@ export function apply(
 
 // --- creation ---------------------------------------------------------------
 
-function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): void {
+function createConcept(
+  tx: Transaction,
+  b: Bindings,
+  clause: ConceptCreate,
+): void {
   const id = requireHandle(tx, clause.handle)
   if (clause.type === null) {
     throw errors.schemaSymbolNotFound(
-      'CREATE CONCEPT needs a TYPE: a Concept\'s type is schema-defined, and ' +
+      "CREATE CONCEPT needs a TYPE: a Concept's type is schema-defined, and " +
         'this engine will not invent one',
     )
   }
@@ -352,11 +437,14 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
   fields.rest('Concept')
 
   const clientKey =
-    clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
+    clause.client_key === null
+      ? ''
+      : scalarText(b, clause.client_key, 'CLIENT KEY')
   const existing = findClientKey(tx, 'Concept', clientKey)
 
   const definition = tx.env.definitionPackage(symbol)
-  const valueSchema = definition?.definitions?.concept_types?.[symbol.name]?.value_schema
+  const valueSchema =
+    definition?.definitions?.concept_types?.[symbol.name]?.value_schema
   if (valueSchema !== undefined) validateValue(valueSchema as Json, attributes)
   validateAttributes(
     formatSymbolRef(symbol),
@@ -395,7 +483,9 @@ function createRecord(
 ): void {
   const id = requireHandle(tx, clause.handle)
   const clientKey =
-    clause.client_key === null ? '' : scalarText(b, clause.client_key, 'CLIENT KEY')
+    clause.client_key === null
+      ? ''
+      : scalarText(b, clause.client_key, 'CLIENT KEY')
   const existing = findClientKey(tx, kind, clientKey)
   const fields = new Fields(
     clause.set_fields === null ? {} : assignments(b, clause.set_fields),
@@ -405,10 +495,18 @@ function createRecord(
     kind: 'element',
     elementKind: kind,
   })
-  const structural = collectStructural(tx, b, clause.set_structural, CORE_STRUCTURAL[kind])
+  const structural = collectStructural(
+    tx,
+    b,
+    clause.set_structural,
+    CORE_STRUCTURAL[kind],
+  )
   const retention = fields.json('retention')
   authorizeRetention(tx, retention)
-  const draft: Draft = { envelope: envelopeOf(id, facets, structural, retention), clientKey }
+  const draft: Draft = {
+    envelope: envelopeOf(id, facets, structural, retention),
+    clientKey,
+  }
 
   const element =
     kind === 'Evidence'
@@ -509,14 +607,17 @@ function assertionRow(
   const actor = fields.value('asserted_by')
   if (actor === null || (isJsonMap(actor) && Object.keys(actor).length === 0)) {
     throw errors.constraintViolation(
-      'CREATE ASSERTION needs `asserted_by`: an Assertion is one actor\'s ' +
+      "CREATE ASSERTION needs `asserted_by`: an Assertion is one actor's " +
         'commitment (§13.3), and a claim whose actor cannot be resolved is ' +
         'recorded as Evidence, not asserted',
     )
   }
   // §11.3: a claim recorded now is attributed to the identity that
   // survived the merge, or the two would never meet again.
-  const assertedBy = canonicalizeReference(tx, referenceValue(actor, 'asserted_by'))
+  const assertedBy = canonicalizeReference(
+    tx,
+    referenceValue(actor, 'asserted_by'),
+  )
   // Each citation keeps the role it was cited in: Core records that this
   // Assertion cites E *as supporting*, and never that E proves anything —
   // that judgement belongs to the Projection (§8.4).
@@ -541,19 +642,27 @@ function assertionRow(
     return citation as unknown as { id: string; role?: string }
   })
   const givenContext = fields.value('context_refs')
-  if (givenContext !== null && !Array.isArray(givenContext)) throw errors.typeMismatch('context_refs must be an array of Concept references')
-  const contexts = [...structural.values('context'), ...(Array.isArray(givenContext) ? givenContext : [])]
+  if (givenContext !== null && !Array.isArray(givenContext))
+    throw errors.typeMismatch(
+      'context_refs must be an array of Concept references',
+    )
+  const contexts = [
+    ...structural.values('context'),
+    ...(Array.isArray(givenContext) ? givenContext : []),
+  ]
   const contextRefs = contexts.map((value) => {
     const ref = referenceValue(value, 'context_refs')
     const id = tryParseElementId(String(ref.id))
-    if (!id || id.kind !== 'Concept') throw errors.typeMismatch('context_refs must name Concepts')
+    if (!id || id.kind !== 'Concept')
+      throw errors.typeMismatch('context_refs must name Concepts')
     tx.load(id)
     return canonicalizeReference(tx, ref)
   })
   const validTime = fields.json('valid_time')
   const from = validTimePart(validTime, 'from')
   const until = validTimePart(validTime, 'until')
-  if (from && until && from >= until) throw errors.constraintViolation('valid_time requires from < until')
+  if (from && until && from >= until)
+    throw errors.constraintViolation('valid_time requires from < until')
   const confidence = fields.confidence()
   const row: AssertionRow = {
     ...draft.envelope,
@@ -575,7 +684,11 @@ function assertionRow(
     valid_from: validTimePart(validTime, 'from'),
     valid_until: validTimePart(validTime, 'until'),
     evidence_refs: evidence,
-    context_refs: [...new Map(contextRefs.map((r) => [canonicalJson(r), r])).entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,r]) => r),
+    context_refs: [
+      ...new Map(contextRefs.map((r) => [canonicalJson(r), r])).entries(),
+    ]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, r]) => r),
     status: 'active',
     supersedes: [],
     superseded_by: [],
@@ -614,7 +727,8 @@ function activityRow(
 
 /** Whether a new record is part of the consequence channel (§15.7, §29.8). */
 export function recordsOutcome(element: Element): boolean {
-  if (element.kind === 'Evidence') return element.row.evidence_class === 'outcome'
+  if (element.kind === 'Evidence')
+    return element.row.evidence_class === 'outcome'
   if (element.kind === 'Activity') {
     return element.row.activity_class === 'outcome_observation'
   }
@@ -641,7 +755,9 @@ function attributionPermission(tx: Transaction, actorKey: string): Permission {
   if (actorKey === '') return 'assert'
   const bound = tx.authority.bindingClassOf(actorKey)
   if (bound === null) return 'record_attributed_assertion'
-  return bound === 'self' || bound === 'service_identity' ? 'assert' : 'assert_as_actor'
+  return bound === 'self' || bound === 'service_identity'
+    ? 'assert'
+    : 'assert_as_actor'
 }
 
 /**
@@ -651,7 +767,11 @@ function attributionPermission(tx: Transaction, actorKey: string): Permission {
  * is mutable grounding state that several Concepts may share, so upserting on
  * one would silently pick a winner (§5.2, §5.3).
  */
-function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): void {
+function upsertConcept(
+  tx: Transaction,
+  b: Bindings,
+  clause: ConceptUpsert,
+): void {
   const matcher = clause.match
   if (matcher === null) {
     throw errors.identitySelectorRequired(
@@ -765,10 +885,15 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
     Object.assign(element.row.attributes, assignments(b, clause.set_attributes))
   }
   if (clause.unset_attributes !== null) {
-    for (const name of clause.unset_attributes) delete element.row.attributes[name]
+    for (const name of clause.unset_attributes)
+      delete element.row.attributes[name]
   }
   if (clause.set_fields !== null) {
-    applyConceptFields(tx, element.row, new Fields(assignments(b, clause.set_fields)))
+    applyConceptFields(
+      tx,
+      element.row,
+      new Fields(assignments(b, clause.set_fields)),
+    )
   }
   // An upsert's Facet clauses are the same clauses `UPDATE` runs, so they go
   // through the same applier: merged-result validation and §39 immutability
@@ -793,7 +918,11 @@ function upsertConcept(tx: Transaction, b: Bindings, clause: ConceptUpsert): voi
   if (clause.unset_structural !== null) {
     for (const removal of clause.unset_structural) {
       const field = formatSymbolRef(
-        tx.env.resolveSymbol('StructuralField', symbolName(b, removal.field), 'write'),
+        tx.env.resolveSymbol(
+          'StructuralField',
+          symbolName(b, removal.field),
+          'write',
+        ),
       )
       const target = referenceValue(mutationValue(b, removal.value), field)
       const current = element.row.structural[field]
@@ -900,7 +1029,10 @@ function ensureProposition(
   const predicateRef = formatSymbolRef(predicate)
   const predicateLineage = lineageOfSymbol(predicate)
   const definition = tx.env.definitionPackage(predicate)
-  const def = definition === undefined ? undefined : predicateDef(definition, predicate.name)
+  const def =
+    definition === undefined
+      ? undefined
+      : predicateDef(definition, predicate.name)
   if (def !== undefined) {
     validatePredicateEndpoints(
       predicateRef,
@@ -1003,7 +1135,10 @@ function transition(
       `TRANSITION TO ${JSON.stringify(state)} names the replacing element with BY (§52.5)`,
     )
   }
-  if ((clause.set_fields !== null || clause.set_structural !== null) && !activity) {
+  if (
+    (clause.set_fields !== null || clause.set_structural !== null) &&
+    !activity
+  ) {
     throw errors.invalidSyntax(
       `TRANSITION TO ${JSON.stringify(state)} cannot finalize fields or topology; ` +
         `only an Activity state does (§52.5)`,
@@ -1031,7 +1166,8 @@ function transition(
   // exactly what a literal one does, which the command gate could not know.
   for (const permission of spaceScoped) tx.require(permission)
   const guards = versionGuards(tx, b, clause.expect_versions)
-  const by = clause.by === null ? null : refTarget(b, clause.by, 'TRANSITION ... BY')
+  const by =
+    clause.by === null ? null : refTarget(b, clause.by, 'TRANSITION ... BY')
   for (const id of selected.authorized(tx)) {
     tx.expectVersions(id, guards)
     switch (state) {
@@ -1051,7 +1187,14 @@ function transition(
         changeState(tx, id, State.TOMBSTONED, 'tombstone')
         break
       default:
-        transitionActivity(tx, b, id, state, clause.set_fields, clause.set_structural)
+        transitionActivity(
+          tx,
+          b,
+          id,
+          state,
+          clause.set_fields,
+          clause.set_structural,
+        )
     }
   }
 }
@@ -1079,7 +1222,12 @@ function lifecycleStateOf(element: Element): string {
 }
 
 /** The refusal for a move that does not fit the target's kind (§52.5). */
-function wrongKind(element: Element, id: ElementId, to: string, fits: string): never {
+function wrongKind(
+  element: Element,
+  id: ElementId,
+  to: string,
+  fits: string,
+): never {
   throw detailed.invalidLifecycleTransitionFrom(
     lifecycleStateOf(element),
     to,
@@ -1089,7 +1237,12 @@ function wrongKind(element: Element, id: ElementId, to: string, fits: string): n
 }
 
 /** The refusal for a move that is not legal from the current state (§52.5). */
-function notFrom(id: ElementId, from: string, to: string, legalFrom: string): never {
+function notFrom(
+  id: ElementId,
+  from: string,
+  to: string,
+  legalFrom: string,
+): never {
   throw detailed.invalidLifecycleTransitionFrom(
     from,
     to,
@@ -1108,7 +1261,8 @@ function notFrom(id: ElementId, from: string, to: string, legalFrom: string): ne
  */
 function retract(tx: Transaction, id: ElementId): void {
   const element = tx.load(id)
-  if (element.kind !== 'Assertion') wrongKind(element, id, 'retracted', 'only an Assertion')
+  if (element.kind !== 'Assertion')
+    wrongKind(element, id, 'retracted', 'only an Assertion')
   // The move is judged before the caller is: a second retraction is `no_effect`
   // whoever asks (§52.5), and a move from `superseded` is illegal whoever asks.
   // Asking about standing first would answer a governance question the engine
@@ -1157,7 +1311,8 @@ function requireStanding(
 /** `TO "superseded" BY newer` — a later Assertion replaces an earlier one (§57.4). */
 function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
   const older = tx.load(id)
-  if (older.kind !== 'Assertion') wrongKind(older, id, 'superseded', 'only an Assertion')
+  if (older.kind !== 'Assertion')
+    wrongKind(older, id, 'superseded', 'only an Assertion')
   const olderId = formatElementId(id)
   const newerId = formatElementId(by)
   // Already superseded by this very Assertion: the move happened, and saying
@@ -1199,7 +1354,8 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
 /** `TO "corrected" BY new` — a later observation corrects an earlier one (§57.2). */
 function correct(tx: Transaction, id: ElementId, by: ElementId): void {
   const older = tx.load(id)
-  if (older.kind !== 'Evidence') wrongKind(older, id, 'corrected', 'only Evidence')
+  if (older.kind !== 'Evidence')
+    wrongKind(older, id, 'corrected', 'only Evidence')
   const olderId = formatElementId(id)
   const newerId = formatElementId(by)
   // The same rule supersession follows: already corrected by this very record
@@ -1254,7 +1410,8 @@ function transitionActivity(
   setStructural: StructuralEdge[] | null,
 ): void {
   const element = tx.load(id)
-  if (element.kind !== 'Activity') wrongKind(element, id, to, 'only an Activity')
+  if (element.kind !== 'Activity')
+    wrongKind(element, id, to, 'only an Activity')
   const row = element.row
   if (row.status === to) return
   // An Activity that has left ordinary recall — archived, tombstoned,
@@ -1273,7 +1430,11 @@ function transitionActivity(
   if (to === 'running' && row.status !== 'pending') {
     notFrom(id, row.status, to, 'pending')
   }
-  if (TERMINAL.has(to) && row.status !== 'pending' && row.status !== 'running') {
+  if (
+    TERMINAL.has(to) &&
+    row.status !== 'pending' &&
+    row.status !== 'running'
+  ) {
     notFrom(id, row.status, to, 'pending or running')
   }
 
@@ -1285,10 +1446,16 @@ function transitionActivity(
     finalizeActivityFields(row, fields)
   }
   if (setStructural !== null) {
-    const edges = collectStructural(tx, b, setStructural, CORE_STRUCTURAL.Activity)
+    const edges = collectStructural(
+      tx,
+      b,
+      setStructural,
+      CORE_STRUCTURAL.Activity,
+    )
     for (const core of ['inputs', 'outputs', 'associated_actors'] as const) {
       for (const value of edges.values(core)) {
-        if (!row[core].some((held) => sameReference(held, value))) row[core].push(value)
+        if (!row[core].some((held) => sameReference(held, value)))
+          row[core].push(value)
       }
     }
     for (const [field, values] of Object.entries(edges.profile)) {
@@ -1383,7 +1550,9 @@ export function versionGuards(
   for (const guard of guards) {
     const version = numberOf(b, guard.version, 'EXPECT VERSION')
     if (version < 0) {
-      throw errors.typeMismatch(`EXPECT VERSION takes a non-negative integer, got ${version}`)
+      throw errors.typeMismatch(
+        `EXPECT VERSION takes a non-negative integer, got ${version}`,
+      )
     }
     let plane: PlaneKey | null
     if (guard.plane === null) plane = null
@@ -1391,7 +1560,11 @@ export function versionGuards(
     else if (guard.plane === 'Structural') plane = 'structural'
     else if (guard.plane === 'Retention') plane = 'retention'
     else {
-      const symbol = tx.env.resolveSymbol('Facet', symbolName(b, guard.plane.Facet), 'read')
+      const symbol = tx.env.resolveSymbol(
+        'Facet',
+        symbolName(b, guard.plane.Facet),
+        'read',
+      )
       plane = `facets.${symbol.name}`
     }
     const key = plane ?? 'version'
@@ -1498,7 +1671,10 @@ function creationDiffers(
   }
   if (next.kind === 'Evidence' && old.kind === 'Evidence') {
     return (
-      differs('evidence_class', next.row.evidence_class === old.row.evidence_class) ??
+      differs(
+        'evidence_class',
+        next.row.evidence_class === old.row.evidence_class,
+      ) ??
       differs(
         'payload',
         jsonEquals(next.row.payload_inline, old.row.payload_inline),
@@ -1511,14 +1687,23 @@ function creationDiffers(
   }
   if (next.kind === 'Assertion' && old.kind === 'Assertion') {
     return (
-      differs('proposition', next.row.proposition_id === old.row.proposition_id) ??
-      differs('asserted_by', next.row.asserted_by_key === old.row.asserted_by_key) ??
+      differs(
+        'proposition',
+        next.row.proposition_id === old.row.proposition_id,
+      ) ??
+      differs(
+        'asserted_by',
+        next.row.asserted_by_key === old.row.asserted_by_key,
+      ) ??
       differs('stance', next.row.stance === old.row.stance) ??
       differs('mode', next.row.mode === old.row.mode)
     )
   }
   if (next.kind === 'Activity' && old.kind === 'Activity') {
-    return differs('activity_class', next.row.activity_class === old.row.activity_class)
+    return differs(
+      'activity_class',
+      next.row.activity_class === old.row.activity_class,
+    )
   }
   return 'kind'
 }
@@ -1668,7 +1853,10 @@ function canonicalizeEndpoint(tx: Transaction, endpoint: Endpoint): Endpoint {
  * a rewrite toward an identity the Space already declared; it is not a place to
  * invent one.
  */
-export function canonicalizeReference(tx: Transaction, value: JsonMap): JsonMap {
+export function canonicalizeReference(
+  tx: Transaction,
+  value: JsonMap,
+): JsonMap {
   if (!isJsonMap(value) || typeof value.id !== 'string') return value
   const id = tryParseElementId(value.id)
   if (id === null || id.kind !== 'Concept') return value
@@ -1682,11 +1870,7 @@ export function canonicalizeReference(tx: Transaction, value: JsonMap): JsonMap 
 // --- targets ----------------------------------------------------------------
 
 /** Resolves an `ElementRef` — a handle, a parameter or a literal id. */
-function refTarget(
-  b: Bindings,
-  target: ElementRef,
-  what: string,
-): ElementId {
+function refTarget(b: Bindings, target: ElementRef, what: string): ElementId {
   if ('Handle' in target) return parseElementId(handleId(b, target.Handle))
   if ('Id' in target) return parseElementId(target.Id)
   const value = parameter(b, target.Param)
@@ -1974,7 +2158,11 @@ export const GOVERNANCE_FIELDS = [
 ]
 
 /** The subset of Concept fields an `UPSERT` may rewrite. */
-function applyConceptFields(tx: Transaction, row: ConceptRow, fields: Fields): void {
+function applyConceptFields(
+  tx: Transaction,
+  row: ConceptRow,
+  fields: Fields,
+): void {
   const name = fields.text('name')
   if (name !== '') row.name = name
   const canonical = fields.text('canonical_id')
@@ -2024,11 +2212,17 @@ function resolveFacets(
 ): JsonMap {
   const out: JsonMap = {}
   for (const entry of list) {
-    const symbol = tx.env.resolveSymbol('Facet', symbolName(b, entry.facet), 'write')
+    const symbol = tx.env.resolveSymbol(
+      'Facet',
+      symbolName(b, entry.facet),
+      'write',
+    )
     const text = formatSymbolRef(symbol)
     const values = assignments(b, entry.values)
+    normalizeRecordRefs(text, values)
     const definition = tx.env.definitionPackage(symbol)
-    const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+    const def =
+      definition === undefined ? undefined : facetDef(definition, symbol.name)
     if (def !== undefined) {
       validateFacetCarrier(text, def, carrier)
         .extend(validateFacet(text, def, values))
@@ -2199,7 +2393,9 @@ export function checkStructural(tx: Transaction, element: Element): void {
     const symbol = tx.env.resolveSymbol('StructuralField', field, 'write')
     const definition = tx.env.definitionPackage(symbol)
     const def =
-      definition === undefined ? undefined : structuralFieldDef(definition, symbol.name)
+      definition === undefined
+        ? undefined
+        : structuralFieldDef(definition, symbol.name)
     // A field this environment cannot resolve declares nothing to hold the
     // write to, the same stance a Proposition takes on an unresolvable
     // predicate.
@@ -2236,11 +2432,13 @@ function factsFor(tx: Transaction, endpoint: Endpoint): EndpointFacts {
   if (elementKind !== 'Concept') return { kind: 'element', elementKind }
   const staged = tx.stagedConceptType(endpoint.id)
   const schemaRef =
-    staged ?? (tx.store.load(endpoint.id)?.row as ConceptRow | undefined)?.schema_ref
+    staged ??
+    (tx.store.load(endpoint.id)?.row as ConceptRow | undefined)?.schema_ref
   return {
     kind: 'element',
     elementKind,
-    schemaRef: schemaRef === undefined || schemaRef === '' ? undefined : schemaRef,
+    schemaRef:
+      schemaRef === undefined || schemaRef === '' ? undefined : schemaRef,
   }
 }
 
@@ -2359,7 +2557,10 @@ function matcherIdentity(
   )
 }
 
-function predicateName(b: Bindings, atom: { Literal: string } | { Param: string } | { Variable: string }): string {
+function predicateName(
+  b: Bindings,
+  atom: { Literal: string } | { Param: string } | { Variable: string },
+): string {
   if ('Literal' in atom) return atom.Literal
   if ('Param' in atom) {
     const value = parameter(b, atom.Param)
@@ -2373,7 +2574,11 @@ function predicateName(b: Bindings, atom: { Literal: string } | { Param: string 
   )
 }
 
-function numberOf(b: Bindings, value: { Literal: unknown } | { Param: string }, what: string): number {
+function numberOf(
+  b: Bindings,
+  value: { Literal: unknown } | { Param: string },
+  what: string,
+): number {
   const resolved = scalar(b, value as never)
   if (typeof resolved !== 'number' || !Number.isInteger(resolved)) {
     throw errors.typeMismatch(

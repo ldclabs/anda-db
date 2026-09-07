@@ -1,3 +1,7 @@
+import { projectionBasis } from '../projection/index.js'
+import { requirePermitted } from '../governance/index.js'
+import { projectionPolicyAt } from '../control.js'
+import { digest } from '../schema/contracts.js'
 import { parseCanonicalJson } from '@ldclabs/kip-lang'
 /**
  * # Executing META
@@ -72,7 +76,7 @@ import {
   scalarValue,
   type ReadBindings,
 } from '../kql/matching.js'
-import { baseline, forecast, type Policy } from '../projection/policy.js'
+import { baseline, type Policy } from '../projection/policy.js'
 import { endpointFromJson, endpointLocal } from '../term.js'
 import {
   conceptTypeDef,
@@ -312,23 +316,21 @@ function describe(
       target.EpistemicPolicy.value === null
         ? baseline().id
         : readText(target.EpistemicPolicy.value, b, 'DESCRIBE EPISTEMIC POLICY')
-    for (const policy of [baseline(), forecast()]) {
-      if (policy.id === named) return policyJson(policy)
-    }
-    throw errors.projectionPolicyUnavailable(
-      `no Epistemic Policy named ${JSON.stringify(named)} is available here`,
-    )
+    return policyJson(projectionPolicyAt(cx.store,cx.space,cx.store.currentSeq(cx.space),{policy:named}))
+
   }
 
   // Reporting an empty answer here would read as a judgement — "nothing is
   // trusted", "you may do nothing" — which is not what an absent subsystem
   // means.
   if ('Trust' in target) {
-    throw errors.unsupportedCapability(
-      'this engine evaluates no source trust; an empty trust report would ' +
-        'read as a judgement that nothing is trusted',
-    )
+    requirePermitted(cx.authority.authorize('read_governance_history',spaceResource(),cx.auth))
+    const row=cx.store.controlAt(cx.space,'trust')
+    if(!row)throw errors.historicalSnapshotUnavailable('trust state unavailable')
+    const value=row.value as JsonMap, subject=target.Trust.value===null ? null : readText(target.Trust.value,b,'DESCRIBE TRUST')
+    return {model:'protected-actor-weights-v1',version:digest(value),state:subject===null ? value : {subject,weight:(value.weights as JsonMap)[subject] ?? value.default_weight!}}
   }
+
   // §67.2: an Agent must be able to learn what it may do without first being
   // permitted to do it, so this asks for no permission of its own.
   //
@@ -800,7 +802,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     case 'StructuralFields':
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
-      return page([policyJson(baseline()), policyJson(forecast())])
+      return page(['baseline','forecast'].map((policy)=>policyJson(projectionPolicyAt(cx.store,cx.space,cx.store.currentSeq(cx.space),{policy}))))
     case 'Dependents': {
       // §63.5: the result carries `truncated: true` when traversal was cut
       // short by an element the caller may not discover — without saying
@@ -1203,7 +1205,7 @@ function describedTransaction(row: TransactionRow): Json {
 }
 
 function changeEnvelope(row: TransactionRow, element: string | null): Json {
-  const controls: Json[] = []
+  const controls: Json[] = isJsonMap(row.result) && Array.isArray(row.result.control_changes) ? [...row.result.control_changes] : []
   if (row.transaction_class === 'governance' && isJsonMap(row.result) && row.result.schema_environment_version !== undefined) controls.push({ kind: 'schema', version: String(row.schema_environment_version) })
   if (row.changes.some((c) => c.op === 'merge')) controls.push({ kind: 'identity', version: String(row.seq) })
   return {
@@ -1273,7 +1275,7 @@ function readContext(cx: MetaContext): KqlContext {
  * the unrestricted case rather than applied uniformly and losing history for
  * everyone.
  */
-function visibleChanges<T extends { changes: readonly ChangeEntry[] }>(
+function visibleChanges<T extends { changes: readonly ChangeEntry[]; result?: Json }>(
   cx: MetaContext,
   rows: readonly T[],
 ): T[] {
@@ -1284,12 +1286,13 @@ function visibleChanges<T extends { changes: readonly ChangeEntry[] }>(
       ...row,
       changes: row.changes.filter((change) => {
         const id = tryParseElementId(change.id)
-        return id !== null && context.load(id) !== null
+        const element=id===null ? null : context.load(id,false)
+        return element!==null && cx.authority.mayRead(element,cx.auth)?.content===true
       }),
     }))
     // A transaction whose every change is hidden is one this caller has no
     // business knowing happened.
-    .filter((row) => row.changes.length > 0)
+    .filter((row) => row.changes.length > 0 || isJsonMap(row.result) && (Array.isArray(row.result.control_changes) && row.result.control_changes.length>0 || row.result.schema_environment_version!==undefined))
 }
 
 function changes(
@@ -1317,12 +1320,14 @@ function changes(
     cx.space,
     after + 1,
     Number.MAX_SAFE_INTEGER,
-    limit,
+    limit + 1,
   )
   // One envelope per committed transition, never a flattened list of changes:
   // §36.2 makes the envelope the unit of atomicity, so a consumer handed the
   // changes loose cannot tell which of them happened together — and §36.3's
   // deduplication key needs the `tx_id` and `space_id` that flattening drops.
+  const complete=journal.length<=limit
+  journal.length=Math.min(journal.length,limit)
   const rows = visibleChanges(cx, journal)
   // The cursor advances to the last coordinate this page *consumed*, not to the
   // last one it could show. They differ for a restricted caller whose authority
@@ -1338,7 +1343,9 @@ function changes(
   if (cx.page !== undefined && consumed !== undefined) {
     cx.page.next_cursor = String(consumed)
   }
-  return rows.map((row) => changeEnvelope(row, null)) as unknown as Json
+  const context=reader(cx)
+  const coverage={through_seq:complete ? cx.store.currentSeq(cx.space) : consumed ?? after,complete,authorization_view:projectionBasis(context,context.projectionPolicy,context.validAt).authorization_view!}
+  return rows.map((row) => ({...(changeEnvelope(row,null) as JsonMap),coverage}))
 }
 
 // --- SEARCH -----------------------------------------------------------------

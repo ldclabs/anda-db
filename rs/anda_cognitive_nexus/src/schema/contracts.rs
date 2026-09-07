@@ -229,11 +229,6 @@ pub fn validate_record(
     before: Option<&Json>,
 ) -> Result<(), KipError> {
     anda_kip::validate_json(view)?;
-    if view["activity_class"] == "dependency_validation" {
-        return Err(KipError::unsupported_capability(
-            "dependency revalidation is not implemented; create a new derived artifact with a new producing Activity",
-        ));
-    }
     let terminal = |v: &Json| {
         matches!(
             v["status"].as_str(),
@@ -242,6 +237,18 @@ pub fn validate_record(
     };
     if let Some(facets) = view["facets"].as_object() {
         for (name, value) in facets {
+            if name == "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord"
+                && before.is_some_and(|b| {
+                    b["facets"].get(name).is_some_and(|old| {
+                        anda_kip::canonical_json(old) != anda_kip::canonical_json(value)
+                    })
+                })
+            {
+                return Err(KipError::new(
+                    KipErrorCode::ImmutableField,
+                    "an attached OutcomeRecord is immutable, including previously absent optional members",
+                ));
+            }
             let symbol =
                 env.resolve_symbol(super::SymbolKind::Facet, name, super::Intent::Write)?;
             let def = env.facet_def(&symbol)?;
@@ -270,20 +277,6 @@ pub fn validate_record(
                     )));
                 }
             }
-            if name.starts_with("kip://profiles/cognitive-memory@2.1.0/")
-                && matches!(
-                    symbol.name.as_str(),
-                    "TrialRecord"
-                        | "EvaluationRecord"
-                        | "TrialState"
-                        | "GradingState"
-                        | "AttemptRecord"
-                )
-            {
-                return Err(KipError::unsupported_capability(
-                    "validated learning and dispatch require a connected Brain contract (memory_learning / memory_durable)",
-                ));
-            }
         }
     }
     if let Some(old) = before.filter(|old| terminal(old))
@@ -305,23 +298,17 @@ pub fn validate_record(
     if let Some(name) = view["schema_ref"]
         .as_str()
         .filter(|r| r.starts_with("kip://profiles/cognitive-memory@2.1.0/"))
+        && name.ends_with("/SkillRevision")
     {
-        if name.ends_with("/Skill") && view["attributes"]["status"] != "proposed" {
-            return Err(KipError::unsupported_capability(
-                "local Skill standing requires validated memory_learning evaluations",
+        let mut behavior = view["attributes"].clone();
+        let supplied = behavior
+            .as_object_mut()
+            .and_then(|o| o.remove("behavior_digest"));
+        if supplied.as_ref().and_then(Json::as_str) != Some(digest(&behavior)?.as_str()) {
+            return Err(KipError::new(
+                KipErrorCode::DigestMismatch,
+                "SkillRevision behavior_digest must cover the immutable behavior fields",
             ));
-        }
-        if name.ends_with("/SkillRevision") {
-            let mut behavior = view["attributes"].clone();
-            let supplied = behavior
-                .as_object_mut()
-                .and_then(|o| o.remove("behavior_digest"));
-            if supplied.as_ref().and_then(Json::as_str) != Some(digest(&behavior)?.as_str()) {
-                return Err(KipError::new(
-                    KipErrorCode::DigestMismatch,
-                    "SkillRevision behavior_digest must cover the immutable behavior fields",
-                ));
-            }
         }
     }
     Ok(())
@@ -357,4 +344,69 @@ pub(crate) fn pinned_plane(planes: &Json, name: &str) -> Option<u64> {
             .filter(|s| !s.is_empty())
             .map(|s| planes["facets"][s].as_u64().unwrap_or(0)),
     }
+}
+
+/// KML handles evaluate to `{id}` endpoints. Standard record identity slots
+/// serialize as strings, including forward handles in an atomic MUTATE.
+/// Only declared reference slots are normalized; arbitrary JSON stays intact.
+pub(crate) fn normalize_record_refs(name: &str, members: &mut anda_kip::Map<String, Json>) {
+    if !name.starts_with("kip://profiles/cognitive-memory@2.1.0/") {
+        return;
+    }
+    let local = name.rsplit('/').next().unwrap_or("");
+    let paths: &[&str] = match local {
+        "DependencyBasis" => &["groups.*.pins.*.id", "policy_basis.context_refs.*"],
+        "DecisionRecord" => &[
+            "retrieved_refs.*",
+            "used_refs.*",
+            "applied_revisions.*",
+            "basis.context_refs.*",
+        ],
+        "AttemptRecord" => &["decision_ref", "applied_revisions.*", "trial_ref"],
+        "OutcomeRecord" => &["attempt_ref"],
+        "TrialRecord" => &[
+            "revision_refs.*",
+            "baseline_attempt_refs.*",
+            "baseline_outcome_refs.*",
+            "basis.context_refs.*",
+        ],
+        "EvaluationRecord" => &[
+            "trial_ref",
+            "revision_refs.*",
+            "attempt_refs.*",
+            "outcome_refs.*",
+            "missing_attempt_refs.*",
+            "excluded_samples.*.ref",
+        ],
+        "TrialState" => &["trial_ref", "revision_ref"],
+        "GradingState" => &["revision_ref", "evaluation_ref"],
+        "ErasurePlan" => &["source_event_refs.*", "targets.*.ref"],
+        _ => &[],
+    };
+    fn visit(value: &mut Json, path: &[&str]) {
+        if let Some((first, rest)) = path.split_first() {
+            if *first == "*" {
+                if let Some(items) = value.as_array_mut() {
+                    for item in items {
+                        visit(item, rest);
+                    }
+                }
+            } else if let Some(child) = value.get_mut(*first) {
+                visit(child, rest);
+            }
+        } else if let Some(map) = value.as_object()
+            && map.len() == 1
+            && map
+                .get("id")
+                .and_then(Json::as_str)
+                .is_some_and(|id| id.parse::<crate::ElementId>().is_ok())
+        {
+            *value = map["id"].clone();
+        }
+    }
+    let mut value = Json::Object(std::mem::take(members));
+    for path in paths {
+        visit(&mut value, &path.split('.').collect::<Vec<_>>());
+    }
+    *members = value.as_object().cloned().unwrap_or_default();
 }

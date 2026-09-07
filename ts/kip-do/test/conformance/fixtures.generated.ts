@@ -344,7 +344,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "consequence",
     "description": "The consequence channel: what the world did after the Brain acted, and what a Skill's standing is spent from. Outcome Evidence (Spec §15.7) carries an OutcomeRecord Facet — the graded index over an untouched payload — and cognition subscribes to a stream by task family rather than by reference. What an engine owes here is the Profile's schema discipline: the scoring handle a Skill cannot be compiled without, the four lifecycle states, a graded index its subject cannot rewrite, and the one guarded statement (Appendix F.6) a lifecycle verdict executes as. The verdict rule itself is Brain policy; that it lands as one recomputable transition is not.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Dry-run the migration before the deploy\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n  }\n}",
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Dry-run the migration before the deploy\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n    SET STRUCTURAL {(\"current_revision\",?revision)}\n  }\n  CREATE CONCEPT ?revision {TYPE \"SkillRevision\" SET ATTRIBUTES {task_family:\"deploy/pre-flight\",procedure:\"dry-run migration before deploy\",behavior_digest:\"sha256:045d856aa6d929d266e7b68583ab860353254097da85f7f4969499ab535bb7b3\"} SET STRUCTURAL {(\"revision_of\",?skill)}}\n}",
       "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"win\", task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"loss\", task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
     ],
     "cases": [
@@ -420,15 +420,17 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "an optional grade member may still be established after the fact, once",
+        "name": "an immutable OutcomeRecord cannot gain a retrospective measurement",
         "command": "MUTATE {\n  UPDATE \"E-2\"\n  SET FACET \"OutcomeRecord\" {magnitude: 0.25}\n}",
-        "expect": {}
+        "expect": {
+          "error": "ImmutableField"
+        }
       },
       {
-        "name": "establishing it is not a licence to revise it",
+        "name": "a second retrospective measurement is also refused",
         "command": "UPDATE \"E-2\" SET FACET \"OutcomeRecord\" {magnitude: 0.9}",
         "expect": {
-          "error": "ConstraintViolation"
+          "error": "ImmutableField"
         }
       },
       {
@@ -455,7 +457,7 @@ export const FIXTURES: readonly Fixture[] = [
         "name": "an unvalidated adoption cannot bypass the learning contract",
         "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n  EXPECT VERSION 1\n}",
         "expect": {
-          "error": "UnsupportedCapability"
+          "error": "ConstraintViolation"
         }
       },
       {
@@ -501,10 +503,10 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {}
       },
       {
-        "name": "adoption requires an available validated learning runtime",
+        "name": "adoption cannot omit the lifecycle and cache version guards",
         "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n}",
         "expect": {
-          "error": "UnsupportedCapability"
+          "error": "VersionConflict"
         }
       },
       {
@@ -796,7 +798,7 @@ export const FIXTURES: readonly Fixture[] = [
     "description": "What a Space can find out about cognition it built on something else, and what byte destruction may and may not take with it. LIST DEPENDENTS walks provenance in the derived direction so a revised root's downstream artifacts can be reviewed instead of guessed at (Spec §57.5, §63.5); reachability is topology, not a verdict. PURGE PAYLOAD destroys Evidence bytes while the record, its digest, its citations and its provenance role survive (§60.6) — the data-minimization instrument, which is a different promise from element purge.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?event {\n    TYPE \"Event\"\n    NAME \"Migration meeting\"\n    SET ATTRIBUTES {summary: \"The team agreed to migrate on Friday\"}\n  }\n  CREATE CONCEPT ?insight {\n    TYPE \"Insight\"\n    NAME \"Migrations need a rollback plan\"\n    SET ATTRIBUTES {summary: \"Every migration ships with a rollback\"}\n  }\n  CREATE ACTIVITY ?consolidate {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?event)\n      (\"outputs\", ?insight)\n    }\n  }\n}",
-      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Write the rollback first\",\n      status: \"proposed\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Insight\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      summary: \"Write the rollback first\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
     ],
     "cases": [
@@ -1563,6 +1565,10 @@ export const FIXTURES: readonly Fixture[] = [
                   "snapshot_seq": 1,
                   "status": "committed"
                 }
+              },
+              "coverage": {
+                "through_seq": 2,
+                "complete": true
               }
             }
           ]

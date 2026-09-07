@@ -40,6 +40,7 @@
 //! [`Store::reopen`] can replace, and every mutating entry point checks
 //! [`Store::has_poisoned_handle`] first.
 
+pub mod control;
 pub mod history;
 pub mod planes;
 pub mod rows;
@@ -85,6 +86,8 @@ pub const SCHEMA_PACKAGES: &str = "schema_packages";
 pub const SCHEMA_ENVS: &str = "schema_envs";
 /// The collection holding one row per element version.
 pub const ELEMENT_VERSIONS: &str = "element_versions";
+pub const CONTROL_RECORDS: &str = "kip_control_records";
+pub const COMMIT_LOG: &str = "kip_commit_log";
 
 /// A collection handle that survives poisoning.
 #[derive(Clone, Debug)]
@@ -123,6 +126,7 @@ macro_rules! collections {
             /// flush and one poison recovery — and from nowhere in [`kml`](crate::kml),
             /// which is what keeps an ordinary cognitive write off the control plane.
             pub governance: crate::governance::store::GovernanceStore,
+            pub evaluation_rules: crate::evaluation::EvaluationRules,
             $($field: Slot,)*
             /// Resolved Schema Environments, keyed by Space and version.
             ///
@@ -150,12 +154,15 @@ macro_rules! collections {
                     );
                 )*
                 let governance = crate::governance::store::GovernanceStore::open(db.clone()).await?;
-                Ok(Self {
+                let opened = Self {
                     db,
                     governance,
+                    evaluation_rules: crate::evaluation::EvaluationRules::default(),
                     $($field,)*
                     environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
-                })
+                };
+                opened.attach_control_notifications();
+                Ok(opened)
             }
 
             /// Reloads every collection handle from storage.
@@ -218,6 +225,22 @@ collections! {
     /// The element version log handle.
     element_versions: ElementVersionRow =
         (ELEMENT_VERSIONS, init_element_versions, "One row per element version"),
+    control_records: ControlRecordRow =
+        (CONTROL_RECORDS, init_control, "Protected, versioned Nexus control records"),
+    commit_log: CommitLogRow = (COMMIT_LOG, init_commit_log, "Recoverable multi-collection commits"),
+}
+
+async fn init_control(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["space"]).await?;
+    c.create_btree_index_nx(&["key"]).await?;
+    c.create_btree_index_nx(&["seq"]).await?;
+    c.create_btree_index_nx(&["record_id"]).await?;
+    Ok(())
+}
+
+async fn init_commit_log(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["tx_id"]).await?;
+    Ok(())
 }
 
 /// The columns every element kind is indexed on.
@@ -367,6 +390,14 @@ async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 impl Store {
+    fn attach_control_notifications(&self) {
+        self.governance.attach_notifications(
+            self.spaces.clone(),
+            self.transactions.clone(),
+            self.control_records.clone(),
+        );
+    }
+
     /// The collection holding one Core element kind.
     pub fn elements(&self, kind: ElementKind) -> Arc<Collection> {
         match kind {
@@ -397,6 +428,10 @@ impl Store {
     pub async fn reopen_if_poisoned(&self) -> Result<(), KipError> {
         if self.has_poisoned_handle() {
             self.reopen().await?;
+        }
+        self.recover_commits().await?;
+        if self.governance.control_recovery_needed() {
+            self.governance.recover_control_delivery().await?;
         }
         Ok(())
     }
@@ -576,7 +611,7 @@ pub fn eq_fields(pairs: &[(&str, Fv)]) -> Filter {
 ///
 /// Boxed variants: the rows differ in size by several hundred bytes, and an
 /// unboxed enum would make every `Element` as large as the widest one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Element {
     /// A Concept.
     Concept(Box<ConceptRow>),

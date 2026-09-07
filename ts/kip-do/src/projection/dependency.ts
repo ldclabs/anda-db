@@ -23,11 +23,7 @@ const absorb = (into: Validity, other: Validity): void => {
 }
 
 export function dependencyValidity(cx: Context, element: Element, policy: Policy, at: string): JsonMap {
-  if (cx.asOf !== null && !policy.explicit_selection) {
-    const basis = projectionBasis(cx, policy, at)
-    basis.policy = { id: policy.id, version: 'unavailable' }; basis.trust_version = 'unavailable'
-    return { status: 'unverifiable', action_eligible: false, reasons: ['historical projection control state unavailable'], basis }
-  }
+  if (!policy.trust_version || policy.trust_version === 'unavailable') return {status:'unverifiable',action_eligible:false,reasons:['historical projection control state unavailable'],basis:projectionBasis(cx,policy,at)}
   function check(element: Element, path: string[]): Validity {
     const id = formatElementId({ kind: element.kind, seq: element.row.id })
     if (path.includes(id) || path.length >= 64) return issue(2, 'dependency cycle or traversal limit')
@@ -41,6 +37,7 @@ export function dependencyValidity(cx: Context, element: Element, policy: Policy
       if (row.status !== 'active' || (row.valid_from && row.valid_from > at) || (row.valid_until && row.valid_until <= at)) return issue(1, 'dependency no longer eligible')
       result.next = [row.valid_from, row.valid_until].filter((t) => t > at).sort()[0] ?? null
     }
+    if (cx.store.controlAt(cx.space, `identity_review/${id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) return issue(1, 'identity interpretation requires review')
     if (!isDerived(element)) return result
     const activities = cx.asOf !== null
       ? cx.reconstruct('Activity').map((e) => e.row as ActivityRow)
@@ -50,8 +47,8 @@ export function dependencyValidity(cx: Context, element: Element, policy: Policy
     for (const activity of activities) {
       const readable = cx.load({ kind: 'Activity', seq: activity.id }, false)
       if (!readable || !cx.authority.mayRead(readable, cx.auth)?.content) continue
-      if (activity.created_tx !== element.row.created_tx && activity.updated_tx !== element.row.updated_tx) continue
-      if (!['completed', 'failed', 'cancelled'].includes(activity.status) || activity.state !== State.ACTIVE) continue
+      if (activity.activity_class !== 'dependency_validation' && activity.created_tx !== element.row.created_tx && activity.updated_tx !== element.row.updated_tx) continue
+      if (activity.status !== 'completed' || activity.state !== State.ACTIVE) continue
       const runtime = activity.origin._kip_runtime as JsonMap | undefined
       if (!runtime || (runtime.output_versions as JsonMap)?.[id] !== element.row.version) continue
       if (!activity.outputs.some((ref) => (typeof ref === 'string' ? ref : (ref as JsonMap).id) === id)) continue

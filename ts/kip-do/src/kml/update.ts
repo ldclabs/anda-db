@@ -1,3 +1,4 @@
+import { normalizeRecordRefs } from '../schema/contracts.js'
 /**
  * `UPDATE` — the mutable surface of an element, and nothing else.
  *
@@ -31,7 +32,11 @@ import {
 import { errors } from '../errors.js'
 import { formatElementId } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
-import type { FacetAssignment, StructuralEdge, UpdateAction } from '../kip/ast.js'
+import type {
+  FacetAssignment,
+  StructuralEdge,
+  UpdateAction,
+} from '../kip/ast.js'
 import {
   facetDef,
   formatSymbolRef,
@@ -227,6 +232,7 @@ export function applyAction(
     // state the first one is about to move.
     const facet = resolveFacetText(tx, b, action.SetFacet.facet)
     const values = assignments(b, action.SetFacet.values, read)
+    normalizeRecordRefs(facet, values)
     claim(tx, element, `facets.${facet}`, values)
     mergeFacet(
       tx,
@@ -255,7 +261,8 @@ export function applyAction(
       const after = { ...before }
       for (const field of action.UnsetFacet.fields) delete after[field]
       const definition = tx.env.definitionPackage(symbol)
-      const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+      const def =
+        definition === undefined ? undefined : facetDef(definition, symbol.name)
       if (def !== undefined) {
         validateFacetMutability(symbolText, def, before, after).throwIfInvalid()
       }
@@ -427,7 +434,12 @@ export function checkAttributes(
   const after = element.row.attributes
   validateAttributes(schemaRef, conceptType.attributes, after)
     .extend(
-      validateAttributeMutability(schemaRef, conceptType.attributes, before, after),
+      validateAttributeMutability(
+        schemaRef,
+        conceptType.attributes,
+        before,
+        after,
+      ),
     )
     .throwIfInvalid()
 }
@@ -449,7 +461,8 @@ function mergeFacet(
   )
   const text = formatSymbolRef(symbol)
   const definition = tx.env.definitionPackage(symbol)
-  const def = definition === undefined ? undefined : facetDef(definition, symbol.name)
+  const def =
+    definition === undefined ? undefined : facetDef(definition, symbol.name)
   if (def !== undefined) {
     // Validated against the *merged* result, not the assignment: a member that
     // is only legal beside another one is legal exactly when both are there.
@@ -481,7 +494,8 @@ function sameReference(left: Json, right: Json): boolean {
   if (jsonEquals(left, right)) return true
   try {
     return (
-      endpointKey(endpointFromJson(left)) === endpointKey(endpointFromJson(right))
+      endpointKey(endpointFromJson(left)) ===
+      endpointKey(endpointFromJson(right))
     )
   } catch {
     return false
