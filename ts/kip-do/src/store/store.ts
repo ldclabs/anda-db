@@ -173,6 +173,7 @@ export class Store extends RowStore {
    * it as one ordered stream.
    */
   nextSeq(spaceId: string): number {
+    if (this.currentSeq(spaceId) >= Number.MAX_SAFE_INTEGER) throw errors.resourceExhausted('Space sequence exceeds the portable numeric range')
     const row = this.sql
       .exec<{ seq: number }>(
         'UPDATE spaces SET seq = seq + 1 WHERE space_id = ? RETURNING seq',

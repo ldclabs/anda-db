@@ -12,24 +12,50 @@
 import type { SchemaPackage } from './package.js'
 
 /**
- * KIP Cognitive Memory Profile, version 2.0.0.
+ * KIP Cognitive Memory Profile, version 2.1.0.
  *
- * Vendored verbatim from `rs/anda_cognitive_nexus/profiles/cognitive-memory-2.0.0.json`.
+ * Vendored verbatim from `rs/anda_cognitive_nexus/profiles/cognitive-memory-2.1.0.json`.
  */
 export const COGNITIVE_MEMORY: SchemaPackage = {
   "format": "KIP-Schema-Package",
   "format_version": "2.0-draft",
   "manifest": {
     "package_id": "kip://profiles/cognitive-memory",
-    "version": "2.0.0",
-    "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+    "version": "2.1.0",
+    "package_ref": "kip://profiles/cognitive-memory@2.1.0",
     "name": "KIP Cognitive Memory Profile",
     "description": "Standard portable memory ontology for KIP 2.0 Brains.",
     "publisher": "urn:kip:publisher:ldclabs",
     "purpose": "standard_profile",
-    "stability": "profile_candidate",
+    "stability": "normative_draft",
     "executable": false,
-    "source_document": "profiles/CognitiveMemoryProfile-2.0.md"
+    "source_document": "profiles/CognitiveMemoryProfile-2.0.md",
+    "validation_schemas": [
+      {
+        "id": "urn:kip:2.0:schema:projection",
+        "content_digest": "sha256:e61db27ce18a582077968c81464093e9f9f072b42b8c501578a32c858016f8ae"
+      },
+      {
+        "id": "urn:kip:2.0:schema:cognitive-records",
+        "content_digest": "sha256:bed69bb4d0de88a38a541ad58e5b532777d2f2d31a6d014145194c9288eb5b28"
+      },
+      {
+        "id": "urn:kip:2.0:schema:element",
+        "content_digest": "sha256:8600776090c6a67966508432aed94db98391b9c4812da2ecadf0931bd9133fb1"
+      },
+      {
+        "id": "urn:kip:2.0:schema:capsule",
+        "content_digest": "sha256:0e2f7c60034c7a2d59ddd4fa1bd72d5ee712c4fbc404b46f553f4d4251cfac5e"
+      },
+      {
+        "id": "urn:kip:2.0:schema:schema-package",
+        "content_digest": "sha256:b8d5807b272381694a93c7912a1ba1316984779db59462c9ff6a53d6d0cb38cc"
+      },
+      {
+        "id": "https://kip.ldclabs.org/schemas/2.0/kip-change-envelope.schema.json",
+        "content_digest": "sha256:6ae8f52c1b9f6b19984e8dc45230c00548152eafafbb4b78226877bd0c8e7cb9"
+      }
+    ]
   },
   "dependencies": [
     {
@@ -42,7 +68,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
   "definitions": {
     "concept_types": {
       "Person": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Person",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Person",
         "kind": "ConceptType",
         "description": "Semantic person/actor used in cognitive content; never an authenticated Principal or ActorBinding.",
         "attributes": {
@@ -70,7 +96,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Event": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Event",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Event",
         "kind": "ConceptType",
         "description": "Compact episodic anchor describing what happened in a bounded situation.",
         "attributes": {
@@ -132,7 +158,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Experience": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Experience",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Experience",
         "kind": "ConceptType",
         "description": "Bounded goal-directed trajectory through state, action, observation, feedback, and outcome.",
         "attributes": {
@@ -237,7 +263,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "ExperienceStep": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/ExperienceStep",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/ExperienceStep",
         "kind": "ConceptType",
         "description": "One ordered externally representable step of an Experience trajectory.",
         "attributes": {
@@ -325,7 +351,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Preference": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Preference",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Preference",
         "kind": "ConceptType",
         "description": "Mutable summary artifact for a relatively stable preference pattern; truth-sensitive preference claims remain Proposition + Assertion + Evidence.",
         "attributes": {
@@ -379,9 +405,9 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Insight": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Insight",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Insight",
         "kind": "ConceptType",
-        "description": "Declarative lesson derived from Evidence or Experience. May carry a task_family to subscribe to a consequence stream, in which case it may carry GradingState and TrialState like a Skill.",
+        "description": "Declarative lesson derived from Evidence or Experience. An optional task_family associates relevant stream material, but an Insight has no Skill trial or lifecycle standing.",
         "attributes": {
           "open": true,
           "fields": {
@@ -418,7 +444,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Commitment": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Commitment",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Commitment",
         "kind": "ConceptType",
         "description": "Prospective memory artifact for an obligation, promise, reminder, follow-up, or intended future action.",
         "attributes": {
@@ -481,11 +507,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Skill": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Skill",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Skill",
         "kind": "ConceptType",
-        "description": "Reusable procedural cognition compiled from Experience, Evidence, or validated instruction. Carries a required task_family (its scoring handle: where its baseline comes from) and an outcome-graded lifecycle: proposed | trialed | adopted | revoked. Its graded record is GradingState, its open trial TrialState, its admission bet MnemonicState.utility.",
+        "description": "Stable Skill identity, display state and current lifecycle cache. Behavior lives only on current_revision; selecting a new revision resets current standing to proposed atomically.",
         "attributes": {
-          "open": true,
+          "open": false,
           "fields": {
             "skill_class": {
               "type": "string",
@@ -504,50 +530,9 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
                 "subagent_pattern"
               ]
             },
-            "task_family": {
-              "type": "string",
-              "required": true,
-              "mutable": true
-            },
             "summary": {
               "type": "string",
               "required": true,
-              "mutable": true
-            },
-            "applicability": {
-              "type": [
-                "string",
-                "array",
-                "object"
-              ],
-              "required": false,
-              "mutable": true
-            },
-            "preconditions": {
-              "type": [
-                "string",
-                "array",
-                "object"
-              ],
-              "required": false,
-              "mutable": true
-            },
-            "procedure": {
-              "type": [
-                "string",
-                "array",
-                "object"
-              ],
-              "required": true,
-              "mutable": true
-            },
-            "success_criteria": {
-              "type": [
-                "string",
-                "array",
-                "object"
-              ],
-              "required": false,
               "mutable": true
             },
             "failure_modes": {
@@ -560,15 +545,6 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             },
             "counterexamples": {
               "type": [
-                "array",
-                "object"
-              ],
-              "required": false,
-              "mutable": true
-            },
-            "recovery": {
-              "type": [
-                "string",
                 "array",
                 "object"
               ],
@@ -598,12 +574,12 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "authority_invariant": "Adopted Skill != executable authority.",
-          "lifecycle_invariant": "Transitions execute only as deterministic lifecycle_verdict Activities over graded Outcome Evidence; the acting model never promotes, and revocation is never harder than adoption.",
+          "lifecycle_invariant": "Lifecycle changes and grading refreshes require validated immutable EvaluationRecord. Only trialed -> adopted promotes through a comparative TrialRecord; same-state monitoring follows authorized policy and retains prior adoption evidence; policy withdrawal may have zero outcomes. The acting model never promotes, and revocation is never harder than adoption.",
           "attribution_invariant": "An outcome counts toward this Skill only through an outcome_observation Activity that names an action_gate decision which applied it; sharing the task_family attributes nothing."
         }
       },
       "SleepTask": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/SleepTask",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/SleepTask",
         "kind": "ConceptType",
         "description": "Durable maintenance work item for a Brain maintenance process.",
         "attributes": {
@@ -681,7 +657,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "Watch": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/Watch",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/Watch",
         "kind": "ConceptType",
         "description": "Durable attention state: a declared condition under which a committed change (delta) or the absence of one before due_at (silence) deserves the Brain's attention. Firing grants nothing.",
         "attributes": {
@@ -757,12 +733,12 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "authority_invariant": "A fired Watch creates attention (SleepTask/wake signal), never an external action or permission.",
-          "firing_invariant": "Firing is one atomic transition: watch_fire Activity (client_key watch_fire:<id>:<envelope seq> or watch_fire:<id>:silence:<due_at>) plus a guarded UPDATE of status; concurrent evaluators replay, never double-fire. The outward decision goes through the action_gate and its DecisionRecord (act | ask | defer | silence).",
+          "firing_invariant": "Atomic generation-guarded firing: watch_fire:<id>:<arm_generation>:<seq> or watch_fire:<id>:<arm_generation>:silence:<due_at>. Requires complete authorized coverage; no automatic action authority.",
           "condition_form": "Baseline object members: element, slot {subject, predicate}, type (at least one); ops (create|update|lifecycle|retention|merge|purge|payload_purge); touched (paths); text (fallback)."
         }
       },
       "SelfModel": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/SelfModel",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/SelfModel",
         "kind": "ConceptType",
         "description": "Derived cognition describing the Brain/agent's model of its own identity, capabilities, limitations, values, preferences, habits, relationships, and goals.",
         "attributes": {
@@ -842,7 +818,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "WorkingState": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/WorkingState",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/WorkingState",
         "kind": "ConceptType",
         "description": "Derived, versioned digest of what matters now — the consolidated state a waking Agent resumes from. A derived recall surface served with its basis_seq; never Evidence.",
         "attributes": {
@@ -881,16 +857,89 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "evidence_invariant": "WorkingState is never cited as Evidence and never corroborates its own inputs.",
           "identity_hint": "WorkingState answers 'what is my situation'; SelfModel answers 'who am I'. Keep at most one active per actor scope under a stable key."
         }
+      },
+      "SkillRevision": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/SkillRevision",
+        "kind": "ConceptType",
+        "description": "Immutable behavior of a stable Skill. All grades, trials, decisions and execution authority bind this revision and its behavior_digest.",
+        "attributes": {
+          "open": false,
+          "fields": {
+            "task_family": {
+              "type": "string",
+              "required": true,
+              "mutable": false
+            },
+            "applicability": {
+              "type": [
+                "string",
+                "array",
+                "object"
+              ],
+              "required": false,
+              "mutable": false
+            },
+            "preconditions": {
+              "type": [
+                "string",
+                "array",
+                "object"
+              ],
+              "required": false,
+              "mutable": false
+            },
+            "procedure": {
+              "type": [
+                "string",
+                "array",
+                "object"
+              ],
+              "required": true,
+              "mutable": false
+            },
+            "success_criteria": {
+              "type": [
+                "string",
+                "array",
+                "object"
+              ],
+              "required": false,
+              "mutable": false
+            },
+            "recovery": {
+              "type": [
+                "string",
+                "array",
+                "object"
+              ],
+              "required": false,
+              "mutable": false
+            },
+            "behavior_digest": {
+              "type": "string",
+              "required": true,
+              "mutable": false,
+              "value_schema": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "value_schema": {
+            "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/SkillRevision"
+          }
+        }
       }
     },
     "predicates": {
       "prefers": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/prefers",
         "kind": "PredicateType",
         "description": "Subject holds a relatively stable preference for the object. Truth-sensitive: use Proposition + Assertion + Evidence, not a bare attribute.",
         "subject": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
           ]
         },
         "object": {
@@ -903,17 +952,17 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "complete": false
       },
       "caused_by": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
         "kind": "PredicateType",
         "description": "Effect-to-cause claim between ExperienceSteps: the subject step's outcome/observation was causally produced by the object step. Direction is effect -> cause. This is a truth-sensitive semantic claim (Proposition + Assertion, typically mode observed/inferred with Evidence), never structural topology; step order alone must not be promoted into caused_by.",
         "subject": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/ExperienceStep"
+            "kip://profiles/cognitive-memory@2.1.0/ExperienceStep"
           ]
         },
         "object": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/ExperienceStep"
+            "kip://profiles/cognitive-memory@2.1.0/ExperienceStep"
           ]
         },
         "functional": false,
@@ -921,7 +970,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "complete": false
       },
       "same_as": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/same_as",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/same_as",
         "kind": "PredicateType",
         "description": "Unverified identity claim: subject and object are believed to denote the same real-world entity. Feeds identity review; it never auto-merges Concepts and never establishes canonical_id by itself.",
         "subject": {
@@ -941,7 +990,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
     },
     "facets": {
       "MnemonicState": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/MnemonicState",
         "kind": "FacetDefinition",
         "description": "Mutable mnemonic accessibility/importance state, separate from epistemic confidence and trust.",
         "closed": true,
@@ -992,14 +1041,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "GradingState": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/GradingState",
         "kind": "FacetDefinition",
-        "description": "Graded record of an artifact that carries a task_family (Skill; an Insight that subscribes to a stream): tallies of Outcome Evidence linked, through an outcome_observation Activity, to a decision that applied the artifact. Maintained by verdict/grading Activities, never by the acting model's own report, and never by an outcome that merely shares the task_family. Not epistemic probability, not utility, not authority.",
+        "description": "Cache of one immutable EvaluationRecord for a specific revision: counts independent attempts, never raw observations. Empty until the first evaluation; reference and counts update atomically.",
         "closed": true,
         "applicable_to": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Skill",
-            "kip://profiles/cognitive-memory@2.0.0/Insight"
+            "kip://profiles/cognitive-memory@2.1.0/Skill"
           ]
         },
         "fields": {
@@ -1028,15 +1076,24 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             ],
             "required": false,
             "mutable": true
+          },
+          "revision_ref": {
+            "type": "string",
+            "required": true,
+            "mutable": true
+          },
+          "evaluation_ref": {
+            "type": "string",
+            "required": true,
+            "mutable": true
           }
         },
         "model_hints": {
-          "attribution_invariant": "A tally changes only through an outcome linked to the decision that applied the artifact; task_family finds the baseline and never attributes.",
-          "authority_invariant": "A perfect record != executable authority."
+          "authority_invariant": "Current cache only; immutable revision/trial/evaluation records are authoritative. A cache grants no permission."
         }
       },
       "DerivationState": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/DerivationState",
         "kind": "FacetDefinition",
         "description": "Review state of a derived artifact relative to its provenance roots. stale means a root was revised after basis_seq and the derivation awaits review; it is a flag, not an epistemic verdict.",
         "closed": true,
@@ -1076,9 +1133,9 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         }
       },
       "OutcomeRecord": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord",
         "kind": "FacetDefinition",
-        "description": "Graded index over Outcome Evidence (evidence_class outcome): the consequence channel entry. task_family is the stream key that finds comparable consequences (the baseline); attribution to a decision is the outcome_observation Activity that names the action_gate among its inputs, never the family. The raw instrument output stays untouched in the Evidence payload.",
+        "description": "OutcomeRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
         "closed": true,
         "applicable_to": {
           "kinds": [
@@ -1089,19 +1146,69 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "task_family": {
             "type": "string",
             "required": true,
-            "mutable": false
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/task_family"
+            }
+          },
+          "attempt_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/attempt_ref"
+            }
+          },
+          "metric": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/metric"
+            }
+          },
+          "window": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/window"
+            }
+          },
+          "terminal": {
+            "type": "boolean",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/terminal"
+            }
+          },
+          "observation_key": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/observation_key"
+            }
+          },
+          "observer_config_digest": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/observer_config_digest"
+            }
           },
           "outcome_status": {
             "type": "string",
             "required": true,
             "mutable": false,
-            "enum": [
-              "success",
-              "partial",
-              "failure",
-              "aborted",
-              "unknown"
-            ]
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/outcome_status"
+            }
           },
           "magnitude": {
             "type": [
@@ -1110,80 +1217,45 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             ],
             "required": false,
             "mutable": false,
-            "minimum": 0,
-            "maximum": 1
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord/properties/magnitude"
+            }
           }
         },
-        "model_hints": {
-          "origin_invariant": "Written by instrumentation, never by the actor whose action it grades; the actor's account is agent_statement, citable as context only.",
-          "attribution_invariant": "task_family != attribution; an outcome without a decision link belongs to the stream's baseline and grades nothing."
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/OutcomeRecord"
         }
       },
       "TrialState": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/TrialState",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/TrialState",
         "kind": "FacetDefinition",
-        "description": "Recorded comparison basis of an open Skill trial: written by the lifecycle_verdict that opens the trial and rewritten only by a later verdict. basis_seq is the space_seq at opening; baseline_* are the family's outcomes not linked to this artifact that the rule counted up to that basis; quota is how many linked graded outcomes the rule needs before deciding; rule_id names the deterministic rule and matches the verdict's parameters_digest.",
+        "description": "Current pointer to an immutable trial_open Activity carrying TrialRecord. Re-trial selects a new Activity; prior comparisons never read this cache.",
         "closed": true,
         "applicable_to": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Skill",
-            "kip://profiles/cognitive-memory@2.0.0/Insight"
+            "kip://profiles/cognitive-memory@2.1.0/Skill"
           ]
         },
         "fields": {
-          "opened_at": {
-            "type": [
-              "timestamp",
-              "null"
-            ],
-            "required": false,
+          "trial_ref": {
+            "type": "string",
+            "required": true,
             "mutable": true
           },
-          "basis_seq": {
-            "type": "integer",
-            "required": true,
-            "mutable": true,
-            "minimum": 0
-          },
-          "baseline_graded_count": {
-            "type": "integer",
-            "required": false,
-            "mutable": true,
-            "minimum": 0
-          },
-          "baseline_success_count": {
-            "type": "integer",
-            "required": false,
-            "mutable": true,
-            "minimum": 0
-          },
-          "baseline_failure_count": {
-            "type": "integer",
-            "required": false,
-            "mutable": true,
-            "minimum": 0
-          },
-          "quota": {
-            "type": "integer",
-            "required": false,
-            "mutable": true,
-            "minimum": 1
-          },
-          "rule_id": {
+          "revision_ref": {
             "type": "string",
             "required": true,
             "mutable": true
           }
         },
         "model_hints": {
-          "audit_invariant": "With the basis on the artifact and the treatment set as the verdict's inputs, an auditor recomputes the verdict from state alone.",
-          "standing_invariant": "An open trial is not adoption."
+          "authority_invariant": "Current cache only; immutable revision/trial/evaluation records are authoritative. A cache grants no permission."
         }
       },
       "DecisionRecord": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/DecisionRecord",
         "kind": "FacetDefinition",
-        "description": "What an action_gate Activity decided before anything outward happened. The Activity's inputs name the cognition applied (the trigger, the Skills, the memories the briefing drew on) and its associated_actors name who decided; this is the decision half of the consequence channel that an outcome_observation Activity links an outcome to.",
+        "description": "DecisionRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
         "closed": true,
         "applicable_to": {
           "kinds": [
@@ -1195,12 +1267,9 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "type": "string",
             "required": true,
             "mutable": false,
-            "enum": [
-              "act",
-              "ask",
-              "defer",
-              "silence"
-            ]
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/decision"
+            }
           },
           "rationale": {
             "type": [
@@ -1208,28 +1277,690 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
               "null"
             ],
             "required": false,
-            "mutable": false
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/rationale"
+            }
+          },
+          "retrieved_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/retrieved_refs"
+            }
+          },
+          "used_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/used_refs"
+            }
+          },
+          "applied_revisions": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/applied_revisions"
+            }
+          },
+          "basis": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord/properties/basis"
+            }
           }
         },
-        "model_hints": {
-          "authority_invariant": "Recording that the gate said act is not permission to act.",
-          "privacy_invariant": "rationale is a concise reusable account, never hidden chain-of-thought."
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DecisionRecord"
+        },
+        "attachment": {
+          "activity_classes": [
+            "action_gate"
+          ],
+          "terminal_only": true
+        }
+      },
+      "DependencyBasis": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/DependencyBasis",
+        "kind": "FacetDefinition",
+        "description": "DependencyBasis: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "basis_seq": {
+            "type": "integer",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis/properties/basis_seq"
+            }
+          },
+          "groups": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis/properties/groups"
+            }
+          },
+          "policy_basis": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis/properties/policy_basis"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis"
+        }
+      },
+      "AttemptRecord": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/AttemptRecord",
+        "kind": "FacetDefinition",
+        "description": "AttemptRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "attempt_id": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/attempt_id"
+            }
+          },
+          "decision_ref": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/decision_ref"
+            }
+          },
+          "applied_revisions": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/applied_revisions"
+            }
+          },
+          "trial_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/trial_ref"
+            }
+          },
+          "context": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/context"
+            }
+          },
+          "environment_digest": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/environment_digest"
+            }
+          },
+          "tool_versions": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/tool_versions"
+            }
+          },
+          "selection_policy": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/selection_policy"
+            }
+          },
+          "preconditions_satisfied": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/preconditions_satisfied"
+            }
+          },
+          "started_at": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/started_at"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord"
+        },
+        "attachment": {
+          "activity_classes": [
+            "action_attempt"
+          ],
+          "terminal_only": true
+        }
+      },
+      "TrialRecord": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/TrialRecord",
+        "kind": "FacetDefinition",
+        "description": "TrialRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "revision_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/revision_refs"
+            }
+          },
+          "basis": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/basis"
+            }
+          },
+          "rule": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/rule"
+            }
+          },
+          "parameters": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/parameters"
+            }
+          },
+          "baseline_attempt_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/baseline_attempt_refs"
+            }
+          },
+          "baseline_outcome_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/baseline_outcome_refs"
+            }
+          },
+          "comparability": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/comparability"
+            }
+          },
+          "quota": {
+            "type": "integer",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/quota"
+            }
+          },
+          "observation_window": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/observation_window"
+            }
+          },
+          "replay_artifact": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/replay_artifact"
+            }
+          },
+          "evaluation_policy": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord/properties/evaluation_policy"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/TrialRecord"
+        },
+        "attachment": {
+          "activity_classes": [
+            "trial_open"
+          ],
+          "terminal_only": true
+        }
+      },
+      "EvaluationRecord": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/EvaluationRecord",
+        "kind": "FacetDefinition",
+        "description": "EvaluationRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "trial_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/trial_ref"
+            }
+          },
+          "revision_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/revision_refs"
+            }
+          },
+          "from_status": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/from_status"
+            }
+          },
+          "to_status": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/to_status"
+            }
+          },
+          "rule_digest": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/rule_digest"
+            }
+          },
+          "parameters_digest": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/parameters_digest"
+            }
+          },
+          "cutoff": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/cutoff"
+            }
+          },
+          "attempt_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/attempt_refs"
+            }
+          },
+          "outcome_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/outcome_refs"
+            }
+          },
+          "excluded_samples": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/excluded_samples"
+            }
+          },
+          "missing_attempt_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/missing_attempt_refs"
+            }
+          },
+          "comparison": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/comparison"
+            }
+          },
+          "replay_artifact": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord/properties/replay_artifact"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/EvaluationRecord"
+        },
+        "attachment": {
+          "activity_classes": [
+            "lifecycle_verdict"
+          ],
+          "terminal_only": true
+        }
+      },
+      "WatchState": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/WatchState",
+        "kind": "FacetDefinition",
+        "description": "WatchState: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/Watch"
+          ]
+        },
+        "fields": {
+          "arm_generation": {
+            "type": "integer",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/arm_generation"
+            }
+          },
+          "armed_seq": {
+            "type": "integer",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/armed_seq"
+            }
+          },
+          "condition_digest": {
+            "type": "string",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/condition_digest"
+            }
+          },
+          "authorization_view": {
+            "type": "string",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/authorization_view"
+            }
+          },
+          "consumed_seq": {
+            "type": "integer",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/consumed_seq"
+            }
+          },
+          "matched": {
+            "type": "boolean",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState/properties/matched"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/WatchState"
+        }
+      },
+      "LeaseState": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/LeaseState",
+        "kind": "FacetDefinition",
+        "description": "LeaseState: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/SleepTask"
+          ]
+        },
+        "fields": {
+          "owner": {
+            "type": "string",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/LeaseState/properties/owner"
+            }
+          },
+          "fencing_token": {
+            "type": "integer",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/LeaseState/properties/fencing_token"
+            }
+          },
+          "expires_at": {
+            "type": "string",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/LeaseState/properties/expires_at"
+            }
+          },
+          "attempt_count": {
+            "type": "integer",
+            "required": true,
+            "mutable": true,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/LeaseState/properties/attempt_count"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/LeaseState"
+        }
+      },
+      "CompressionRecord": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/CompressionRecord",
+        "kind": "FacetDefinition",
+        "description": "CompressionRecord: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "source_refs": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/source_refs"
+            }
+          },
+          "extractor_version": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/extractor_version"
+            }
+          },
+          "schema_version": {
+            "type": "string",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/schema_version"
+            }
+          },
+          "preserved_fields": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/preserved_fields"
+            }
+          },
+          "known_omissions": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/known_omissions"
+            }
+          },
+          "reencoding_eligible": {
+            "type": "boolean",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord/properties/reencoding_eligible"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/CompressionRecord"
+        },
+        "attachment": {
+          "activity_classes": [
+            "extraction",
+            "experience_formation",
+            "encoding_review"
+          ],
+          "terminal_only": true
+        }
+      },
+      "RecallCoverage": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/RecallCoverage",
+        "kind": "FacetDefinition",
+        "description": "RecallCoverage: normative contract in KIP-2.0-Cognitive-Consistency.md; value_schema is binding.",
+        "closed": true,
+        "applicable_to": {
+          "kinds": [
+            "Activity"
+          ]
+        },
+        "fields": {
+          "basis": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/RecallCoverage/properties/basis"
+            }
+          },
+          "channels": {
+            "type": "object",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/RecallCoverage/properties/channels"
+            }
+          },
+          "unverified_preconditions": {
+            "type": "array",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/RecallCoverage/properties/unverified_preconditions"
+            }
+          },
+          "action_eligible": {
+            "type": "boolean",
+            "required": true,
+            "mutable": false,
+            "value_schema": {
+              "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/RecallCoverage/properties/action_eligible"
+            }
+          }
+        },
+        "value_schema": {
+          "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/RecallCoverage"
+        },
+        "attachment": {
+          "activity_classes": [
+            "recall_coverage"
+          ],
+          "terminal_only": true
         }
       }
     },
     "structural_fields": {
       "experienced_by": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/experienced_by",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/experienced_by",
         "kind": "StructuralFieldDefinition",
         "description": "Primary semantic actor who experienced the trajectory.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Experience"
+            "kip://profiles/cognitive-memory@2.1.0/Experience"
           ]
         },
         "target": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
           ]
         },
         "cardinality": {
@@ -1240,17 +1971,17 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "has_step": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/has_step",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/has_step",
         "kind": "StructuralFieldDefinition",
         "description": "Ordered Experience trajectory membership.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Experience"
+            "kip://profiles/cognitive-memory@2.1.0/Experience"
           ]
         },
         "target": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/ExperienceStep"
+            "kip://profiles/cognitive-memory@2.1.0/ExperienceStep"
           ]
         },
         "cardinality": {
@@ -1261,13 +1992,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "involves": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/involves",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/involves",
         "kind": "StructuralFieldDefinition",
         "description": "Contextual participation without claiming stronger domain semantics.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Event",
-            "kip://profiles/cognitive-memory@2.0.0/Experience"
+            "kip://profiles/cognitive-memory@2.1.0/Event",
+            "kip://profiles/cognitive-memory@2.1.0/Experience"
           ]
         },
         "target": {
@@ -1283,14 +2014,14 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "mentions": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/mentions",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/mentions",
         "kind": "StructuralFieldDefinition",
         "description": "Retrieval/context mention without a stronger semantic claim.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Event",
-            "kip://profiles/cognitive-memory@2.0.0/Experience",
-            "kip://profiles/cognitive-memory@2.0.0/Insight"
+            "kip://profiles/cognitive-memory@2.1.0/Event",
+            "kip://profiles/cognitive-memory@2.1.0/Experience",
+            "kip://profiles/cognitive-memory@2.1.0/Insight"
           ]
         },
         "target": {
@@ -1306,22 +2037,23 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "derived_from": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/derived_from",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/derived_from",
         "kind": "StructuralFieldDefinition",
         "description": "Profile derivation lineage when no more specific structural field exists.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Event",
-            "kip://profiles/cognitive-memory@2.0.0/Experience",
-            "kip://profiles/cognitive-memory@2.0.0/ExperienceStep",
-            "kip://profiles/cognitive-memory@2.0.0/Preference",
-            "kip://profiles/cognitive-memory@2.0.0/Insight",
-            "kip://profiles/cognitive-memory@2.0.0/Commitment",
-            "kip://profiles/cognitive-memory@2.0.0/Watch",
-            "kip://profiles/cognitive-memory@2.0.0/Skill",
-            "kip://profiles/cognitive-memory@2.0.0/SleepTask",
-            "kip://profiles/cognitive-memory@2.0.0/SelfModel",
-            "kip://profiles/cognitive-memory@2.0.0/WorkingState"
+            "kip://profiles/cognitive-memory@2.1.0/Event",
+            "kip://profiles/cognitive-memory@2.1.0/Experience",
+            "kip://profiles/cognitive-memory@2.1.0/ExperienceStep",
+            "kip://profiles/cognitive-memory@2.1.0/Preference",
+            "kip://profiles/cognitive-memory@2.1.0/Insight",
+            "kip://profiles/cognitive-memory@2.1.0/Commitment",
+            "kip://profiles/cognitive-memory@2.1.0/Watch",
+            "kip://profiles/cognitive-memory@2.1.0/Skill",
+            "kip://profiles/cognitive-memory@2.1.0/SleepTask",
+            "kip://profiles/cognitive-memory@2.1.0/SelfModel",
+            "kip://profiles/cognitive-memory@2.1.0/WorkingState",
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
           ]
         },
         "target": {
@@ -1341,17 +2073,18 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "compiled_from": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/compiled_from",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/compiled_from",
         "kind": "StructuralFieldDefinition",
         "description": "Experience source(s) used in Skill compilation.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Skill"
+            "kip://profiles/cognitive-memory@2.1.0/Skill",
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
           ]
         },
         "target": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Experience"
+            "kip://profiles/cognitive-memory@2.1.0/Experience"
           ]
         },
         "cardinality": {
@@ -1362,12 +2095,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "compiled_by": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/compiled_by",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/compiled_by",
         "kind": "StructuralFieldDefinition",
         "description": "Activity that compiled or procedurally consolidated the Skill.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Skill"
+            "kip://profiles/cognitive-memory@2.1.0/Skill",
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
           ]
         },
         "target": {
@@ -1383,13 +2117,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "consolidated_to": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/consolidated_to",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/consolidated_to",
         "kind": "StructuralFieldDefinition",
         "description": "Lineage from Event/Experience into derived Profile cognition.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Event",
-            "kip://profiles/cognitive-memory@2.0.0/Experience"
+            "kip://profiles/cognitive-memory@2.1.0/Event",
+            "kip://profiles/cognitive-memory@2.1.0/Experience"
           ]
         },
         "target": {
@@ -1405,17 +2139,17 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "committed_to": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/committed_to",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/committed_to",
         "kind": "StructuralFieldDefinition",
         "description": "Semantic maker/owner of a Commitment.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Commitment"
+            "kip://profiles/cognitive-memory@2.1.0/Commitment"
           ]
         },
         "target": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
           ]
         },
         "cardinality": {
@@ -1426,17 +2160,17 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "owed_to": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/owed_to",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/owed_to",
         "kind": "StructuralFieldDefinition",
         "description": "Beneficiary/counterparty of a Commitment.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Commitment"
+            "kip://profiles/cognitive-memory@2.1.0/Commitment"
           ]
         },
         "target": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
           ]
         },
         "cardinality": {
@@ -1447,13 +2181,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "assigned_to": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/assigned_to",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/assigned_to",
         "kind": "StructuralFieldDefinition",
         "description": "Semantic SleepTask/Watch assignment; never Governance permission.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/SleepTask",
-            "kip://profiles/cognitive-memory@2.0.0/Watch"
+            "kip://profiles/cognitive-memory@2.1.0/SleepTask",
+            "kip://profiles/cognitive-memory@2.1.0/Watch"
           ]
         },
         "target": {
@@ -1469,12 +2203,12 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "watches": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/watches",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/watches",
         "kind": "StructuralFieldDefinition",
         "description": "The cognition a Watch observes. Topology only: watching an element claims nothing about it.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Watch"
+            "kip://profiles/cognitive-memory@2.1.0/Watch"
           ]
         },
         "target": {
@@ -1494,22 +2228,23 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         "unique": true
       },
       "about": {
-        "ref": "kip://profiles/cognitive-memory@2.0.0/about",
+        "ref": "kip://profiles/cognitive-memory@2.1.0/about",
         "kind": "StructuralFieldDefinition",
         "description": "Generic topical Profile relation; prefer domain predicates when semantic relation matters epistemically.",
         "source": {
           "concept_types": [
-            "kip://profiles/cognitive-memory@2.0.0/Event",
-            "kip://profiles/cognitive-memory@2.0.0/Experience",
-            "kip://profiles/cognitive-memory@2.0.0/ExperienceStep",
-            "kip://profiles/cognitive-memory@2.0.0/Preference",
-            "kip://profiles/cognitive-memory@2.0.0/Insight",
-            "kip://profiles/cognitive-memory@2.0.0/Commitment",
-            "kip://profiles/cognitive-memory@2.0.0/Watch",
-            "kip://profiles/cognitive-memory@2.0.0/Skill",
-            "kip://profiles/cognitive-memory@2.0.0/SleepTask",
-            "kip://profiles/cognitive-memory@2.0.0/SelfModel",
-            "kip://profiles/cognitive-memory@2.0.0/WorkingState"
+            "kip://profiles/cognitive-memory@2.1.0/Event",
+            "kip://profiles/cognitive-memory@2.1.0/Experience",
+            "kip://profiles/cognitive-memory@2.1.0/ExperienceStep",
+            "kip://profiles/cognitive-memory@2.1.0/Preference",
+            "kip://profiles/cognitive-memory@2.1.0/Insight",
+            "kip://profiles/cognitive-memory@2.1.0/Commitment",
+            "kip://profiles/cognitive-memory@2.1.0/Watch",
+            "kip://profiles/cognitive-memory@2.1.0/Skill",
+            "kip://profiles/cognitive-memory@2.1.0/SleepTask",
+            "kip://profiles/cognitive-memory@2.1.0/SelfModel",
+            "kip://profiles/cognitive-memory@2.1.0/WorkingState",
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
           ]
         },
         "target": {
@@ -1523,6 +2258,46 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "ordered": false,
         "unique": true
+      },
+      "current_revision": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/current_revision",
+        "kind": "StructuralFieldDefinition",
+        "description": "Required stable identity / behavior revision link; current selection is guarded and does not transfer standing.",
+        "source": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/Skill"
+          ]
+        },
+        "target": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
+          ]
+        },
+        "cardinality": {
+          "min": 1,
+          "max": 1
+        },
+        "ordered": false
+      },
+      "revision_of": {
+        "ref": "kip://profiles/cognitive-memory@2.1.0/revision_of",
+        "kind": "StructuralFieldDefinition",
+        "description": "Required stable identity / behavior revision link; current selection is guarded and does not transfer standing.",
+        "source": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/SkillRevision"
+          ]
+        },
+        "target": {
+          "concept_types": [
+            "kip://profiles/cognitive-memory@2.1.0/Skill"
+          ]
+        },
+        "cardinality": {
+          "min": 1,
+          "max": 1
+        },
+        "ordered": false
       }
     },
     "enums": {},
@@ -1543,34 +2318,41 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           "derivation_review",
           "working_state_refresh",
           "outcome_observation",
-          "lifecycle_verdict"
+          "lifecycle_verdict",
+          "action_attempt",
+          "trial_open",
+          "dependency_validation",
+          "encoding_review",
+          "recall_coverage",
+          "identity_repair",
+          "erasure_review"
         ],
-        "description": "Recommended Profile activity_class values; Activity remains a KIP Core kind. action_gate is the decision record: DecisionRecord facet (act | ask | defer | silence), inputs = the cognition applied. outcome_observation is the instrument's record of writing Outcome Evidence, with the graded action_gate among its inputs (required when the outcome is to count); lifecycle_verdict is the deterministic, recomputable evaluation that moves a Skill between lifecycle states, its inputs the linked outcomes and its basis the Skill's TrialState."
+        "description": "Process records follow Cognitive Consistency §3 and §5–§8. Terminal input/output versions are engine-captured; immutable TrialRecord/EvaluationRecord retain replay inputs."
       }
     }
   },
   "constraints": [
     {
       "id": "cognitive-memory.person-is-not-principal",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Person",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Person",
       "kind": "governance_boundary",
       "description": "Person is semantic cognition and cannot authenticate a Principal or create ActorBinding."
     },
     {
       "id": "cognitive-memory.skill-is-not-authority",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Skill",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Skill",
       "kind": "governance_boundary",
       "description": "Skill class/status/utility/provenance cannot grant executable or tool authority."
     },
     {
       "id": "cognitive-memory.self-model-is-not-governance",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/SelfModel",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/SelfModel",
       "kind": "governance_boundary",
       "description": "SelfModel cannot mutate Principal identity, ActorBinding, Governance, trust, or Schema authority."
     },
     {
       "id": "cognitive-memory.mnemonic-is-not-epistemic",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/MnemonicState",
       "kind": "epistemic_boundary",
       "description": "memory_strength/salience cannot rewrite Assertion confidence or source trust."
     },
@@ -1582,19 +2364,19 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
     },
     {
       "id": "cognitive-memory.failure-first-class",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Experience",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Experience",
       "kind": "profile_invariant",
       "description": "A failed Experience is valid memory and does not imply low learning value or automatic archival."
     },
     {
       "id": "cognitive-memory.no-hidden-cot",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/ExperienceStep",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/ExperienceStep",
       "kind": "privacy_boundary",
       "description": "Store observable steps and concise reusable rationale; hidden chain-of-thought is not required."
     },
     {
       "id": "cognitive-memory.commitment-time-separation",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Commitment",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Commitment",
       "kind": "temporal_boundary",
       "description": "Commitment.due_at is distinct from retention expiry and Assertion valid time."
     },
@@ -1606,51 +2388,93 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
     },
     {
       "id": "cognitive-memory.import-authority-conservation",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Skill",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Skill",
       "kind": "capsule_boundary",
       "description": "Imported Skill content is non-authoritative by default and cannot raise destination Governance authority."
     },
     {
       "id": "cognitive-memory.watch-is-not-authority",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Watch",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Watch",
       "kind": "governance_boundary",
       "description": "A fired Watch creates attention, never an external action, a schedule, or a permission."
     },
     {
       "id": "cognitive-memory.derivation-state-is-not-belief",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/DerivationState",
       "kind": "epistemic_boundary",
       "description": "DerivationState.status is review state; stale does not retract, reject, or hide the artifact."
     },
     {
       "id": "cognitive-memory.working-state-is-not-evidence",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/WorkingState",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/WorkingState",
       "kind": "epistemic_boundary",
       "description": "WorkingState is a derived view served with its basis_seq; it is never cited as Evidence and never corroborates its inputs."
     },
     {
       "id": "cognitive-memory.outcome-origin-separation",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord",
       "kind": "provenance_invariant",
       "description": "Outcome Evidence is written by instrumentation; an actor's self-report about its own action's result is never Outcome Evidence, and re-typed instrument output is derived_result, not outcome."
     },
     {
       "id": "cognitive-memory.skill-lifecycle-verdict",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/Skill",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Skill",
       "kind": "profile_invariant",
-      "description": "Skill lifecycle transitions (proposed | trialed | adopted | revoked) execute only as deterministic lifecycle_verdict Activities over Outcome Evidence linked to decisions that applied the Skill, measured against the TrialState basis written when the trial opened; trial entry requires a task_family; revocation is never harder than adoption; adoption is provisional; lifecycle standing, GradingState and TrialState do not survive import."
+      "description": "Skill lifecycle changes and GradingState refreshes commit with validated immutable EvaluationRecord. Only trialed -> adopted promotes, using at least two independent treatment attempts and an improved comparison against the immutable TrialRecord basis; TrialState is only the current pointer/cache. Same-state monitoring follows authorized policy, retains prior adoption evidence and need not claim new improvement. Trial entry requires task_family; revoked -> trialed opens a new trial before adoption can recur. Policy withdrawal may have zero outcomes; revocation is never harder than adoption. Lifecycle standing, GradingState and TrialState do not survive import."
     },
     {
       "id": "cognitive-memory.outcome-attribution",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/GradingState",
       "kind": "provenance_invariant",
-      "description": "task_family finds comparable consequences and never attributes one. A GradingState tally, a lifecycle verdict, or a MnemonicState.utility calibration changes only through an outcome whose outcome_observation Activity names the action_gate decision that applied the artifact; an outcome that merely shares the task_family is baseline."
+      "description": "task_family finds candidate consequences; sharing it establishes neither attribution nor baseline membership. Treatment outcomes link through outcome_observation to the action_attempt and action_gate decision that applied the exact revision; grading counts independent attempts assigned before execution to that trial/revision. TrialRecord explicitly freezes comparable baseline attempts/outcomes; unlinked stream material never becomes control automatically. MnemonicState.utility calibration additionally records attribution method, evidence and uncertainty using DecisionRecord.used_refs/applied_revisions; retrieved-only content receives no automatic credit."
     },
     {
       "id": "cognitive-memory.decision-record-is-not-authorization",
-      "scope": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/DecisionRecord",
       "kind": "authority_boundary",
-      "description": "A DecisionRecord records what the gate decided; it never authorizes the action, and its inputs name what was applied so that a linked outcome can grade it."
+      "description": "A DecisionRecord records what the gate decided and distinguishes retrieved_refs, used_refs and applied_revisions. Every applied revision also occurs in the action_gate inputs; retrieval alone proves neither use nor causal credit. The record never authorizes an action."
+    },
+    {
+      "id": "cognitive-memory.revision-standing",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "Skill behavior is immutable SkillRevision; selection resets caches; all grades and permissions bind exact revision."
+    },
+    {
+      "id": "cognitive-memory.attempt-sampling",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "Grade distinct attempt + metric + window aggregates, not observation count; late outcomes retain original trial."
+    },
+    {
+      "id": "cognitive-memory.evaluation-replay",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "Immutable TrialRecord and EvaluationRecord retain complete replay inputs under governance and erasure."
+    },
+    {
+      "id": "cognitive-memory.dependency-validity",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "Producing/validation Activities pin DependencyBasis; virtual validity is checked before ordinary Recall."
+    },
+    {
+      "id": "cognitive-memory.durable-workers",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "When advertised, WatchState generation and LeaseState fencing are enforced at commit and dispatch."
+    },
+    {
+      "id": "cognitive-memory.behavior-fields-only-on-revision",
+      "scope": "kip://profiles/cognitive-memory@2.1.0/Skill",
+      "kind": "profile_invariant",
+      "description": "Behavior fields are forbidden on Skill writes, including UPSERT and open extensions; current_revision is required. Creation binds revision_of/current_revision in the same transaction."
+    },
+    {
+      "id": "cognitive-memory.revision-ownership",
+      "scope": "Profile",
+      "kind": "profile_invariant",
+      "description": "current_revision target must have revision_of pointing back to that stable Skill. Required one-to-one selection and creation closure are validated atomically."
     }
   ],
   "aliases": {
@@ -1664,28 +2488,32 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
       "kip://core@2.0.0"
     ],
     "supersedes": [],
-    "breaking_changes": []
+    "breaking_changes": [
+      "Skill behavior moved to immutable SkillRevision; old status/tallies are legacy until migrated.",
+      "New typed process records and dependency/coverage contracts are required.",
+      "Canonical artifacts use kip-jcs-safe-v1 and portable numeric values."
+    ]
   },
   "migrations": [],
   "model_hints": {
-    "summary": "Portable cognitive memory structures above KIP Core. Truth-sensitive claims use Proposition + Assertion + Evidence; transformations preserve Activity provenance.",
+    "summary": "Stable Skills select immutable SkillRevisions; decisions enroll independent attempts into immutable trials; outcomes are observations, and replayable evaluations produce current standing. See the consistency companion.",
     "minimal_primer": [
       "Event = compact record of what happened",
       "Experience = goal-directed state/action/observation trajectory",
       "ExperienceStep = ordered observable step; no hidden chain-of-thought",
       "caused_by = explicit effect->cause claim between steps; edge order alone is not causality",
-      "Skill = reusable procedure with a task_family; proposed|trialed|adopted|revoked; not execution authority",
+      "Skill = stable identity + current_revision; SkillRevision = immutable behavior + task_family + digest; standing and authority bind the revision",
       "Commitment = prospective memory; not automatic scheduling",
       "Watch = armed attention (delta or silence); firing grants nothing",
       "SelfModel = cognition about self; not Governance",
       "WorkingState = what matters now, with its basis_seq; never Evidence",
       "MnemonicState = accessibility/importance/expected usefulness; not confidence; Skills carry it too",
-      "GradingState = tallies of outcomes linked to decisions that applied the artifact; not authority",
-      "TrialState = the recorded basis an open trial is measured against; not standing",
+      "GradingState = revision_ref/evaluation_ref plus independent attempt counts; absent grades leave proposed/trialed recall candidates unproven, and mismatched grades confer no adopted standing",
+      "TrialState = current trial_ref/revision_ref pointer; immutable TrialRecord/EvaluationRecord carry retained replay inputs",
       "DerivationState = review state relative to provenance roots; not belief",
       "DecisionRecord = act|ask|defer|silence on an action_gate Activity whose inputs name what was applied; not authorization",
       "OutcomeRecord = task_family + outcome_status on Outcome Evidence; instruments write it, never the graded actor",
-      "task_family finds the baseline; only the outcome_observation link attributes an outcome to a decision",
+      "task_family finds candidate comparison material; baseline membership and comparability are explicit",
       "lifecycle_verdict = deterministic recorded evaluation; the only path between Skill lifecycle states"
     ],
     "common_confusions": [
@@ -1713,13 +2541,13 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
     ]
   },
   "canonicalization": {
-    "profile": "kip-draft-canonical-json-v1",
-    "status": "draft",
-    "description": "UTF-8 JSON, recursively sorted object keys, compact separators (\",\" and \":\"), finite JSON numbers written as RFC 8785 (JCS) writes them, so 1.0 is 1; integrity is excluded from its own digest. Draft deterministic encoding for freezing this Profile artifact; not yet the final KIP-wide canonicalization standard."
+    "profile": "kip-jcs-safe-v1",
+    "status": "normative-draft",
+    "description": "RFC 8785 JCS, narrowed to KIP portable safe integral values; no nonzero underflow; strict decoded-key/Unicode validation; integrity excluded from its own digest."
   },
   "integrity": {
-    "digest_profile": "kip-draft-canonical-json-v1",
-    "content_digest": "sha256:7f32a27a78d9bf95e34410326f85e16d38ae3d1933ef5064c17bc3292dc1a7d1",
+    "digest_profile": "kip-jcs-safe-v1",
+    "content_digest": "sha256:ff398b411ed4b324072ca299b33797fcc6df87c4ec52271dc25321dcc673483a",
     "covers": "all top-level fields except integrity",
     "signatures": []
   }
@@ -1729,7 +2557,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
 export const COGNITIVE_MEMORY_ID = "kip://profiles/cognitive-memory"
 
 /** The version COGNITIVE_MEMORY declares. */
-export const COGNITIVE_MEMORY_VERSION = "2.0.0"
+export const COGNITIVE_MEMORY_VERSION = "2.1.0"
 
 /** Every bundled artifact, in package-id order. */
 export const BUNDLED_PACKAGES: readonly SchemaPackage[] = [

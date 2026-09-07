@@ -234,7 +234,13 @@ impl Store {
         origin: Json,
     ) -> Result<WriteContext, KipError> {
         let space = self.get_space(space_id).await?;
-        let seq = space.seq.saturating_add(1);
+        let seq = space
+            .seq
+            .checked_add(1)
+            .filter(|n| *n <= anda_kip::MAX_SAFE_INTEGER)
+            .ok_or_else(|| {
+                KipError::resource_exhausted("Space sequence exceeds the portable numeric range")
+            })?;
         let mut fields = BTreeMap::new();
         fields.insert("seq".to_string(), Fv::U64(seq));
         self.spaces()

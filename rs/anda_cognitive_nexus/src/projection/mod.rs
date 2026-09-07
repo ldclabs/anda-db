@@ -30,6 +30,7 @@
 //! in this engine yet, so every eligible group counts equally, and the answer
 //! says so in its warnings rather than implying a judgement it did not make.
 
+mod dependency;
 pub mod policy;
 
 use anda_kip::{
@@ -80,6 +81,7 @@ pub struct Belief {
     pub proposition: Option<ElementId>,
     /// The classification.
     pub status: BeliefStatus,
+    pub basis: anda_kip::ProjectionBasis,
     /// Normalized support strength.
     pub support: f64,
     /// Normalized opposition strength.
@@ -96,6 +98,11 @@ pub struct Belief {
 
 #[derive(Default)]
 struct Ledger {
+    unverified_dependency: bool,
+    candidate_status: BeliefStatus,
+    conflict_refs: Vec<String>,
+    conflict_reasons: Vec<String>,
+    next_invalid_at: Option<String>,
     supporting: Vec<String>,
     opposing: Vec<String>,
     uncertain: Vec<String>,
@@ -187,6 +194,11 @@ impl Belief {
 
     fn projection_json(&self) -> Json {
         let projection = Projection {
+            basis: Some(self.basis.clone()),
+            candidate_status: Some(self.ledger.candidate_status),
+            slot_status: Some(self.status),
+            conflict_refs: self.ledger.conflict_refs.clone(),
+            conflict_reasons: self.ledger.conflict_reasons.clone(),
             proposition_id: self.proposition.map(|id| id.to_string()),
             status: self.status,
             support: Some(self.side(
@@ -312,6 +324,100 @@ impl Belief {
 }
 
 impl Context<'_> {
+    fn require_projection_history(&self, policy: &Policy) -> Result<(), KipError> {
+        if self.as_of.is_some() && !policy.explicit_selection {
+            return Err(KipError::new(
+                anda_kip::KipErrorCode::HistoricalSnapshotUnavailable,
+                "historical projection control state is unavailable; explicitly select an epistemic policy to reinterpret the retained cognition",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Conservative version identities invalidate on every relevant Space or
+    /// authorization change. There is no mutable trust model in this engine.
+    pub fn projection_basis(
+        &self,
+        policy: &Policy,
+        at: &str,
+        next: Option<String>,
+    ) -> anda_kip::ProjectionBasis {
+        let digest = |v: &Json| crate::store::schema::content_digest(v);
+        let mut authority = self.authority.clone();
+        authority.space.seq = 0;
+        authority.space.schema_environment_version = 0;
+        if let Some(object) = authority.space.policies.as_object_mut() {
+            object.remove("_kip_identity_changes");
+        }
+        anda_kip::ProjectionBasis {
+            space_id: self.space.clone(),
+            snapshot_seq: self.pinned_seq,
+            schema_environment_version: self.env.version,
+            identity_version: self.authority.space.policies["_kip_identity_changes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Json::as_u64)
+                .filter(|v| *v <= self.pinned_seq)
+                .max()
+                .unwrap_or(0),
+            policy: anda_kip::ProjectionPolicyVersion {
+                id: policy.id.clone(),
+                version: digest(&serde_json::json!([
+                    policy.version,
+                    policy.accept,
+                    policy.material,
+                    policy.modes,
+                    policy.expand_conflicts,
+                    policy.unstated_confidence
+                ])),
+            },
+            trust_version: "structural-no-trust-v1".into(),
+            authorization_view: digest(&Json::String(format!("{:?}:{:?}", authority, self.auth))),
+            context_refs: policy.context_refs.clone(),
+            purpose: if policy.purpose.is_empty() {
+                if self.auth.purpose.is_empty() {
+                    "unspecified".into()
+                } else {
+                    self.auth.purpose.clone()
+                }
+            } else {
+                policy.purpose.clone()
+            },
+            risk: if policy.risk.is_empty() {
+                if self.auth.risk.is_empty() {
+                    "unspecified".into()
+                } else {
+                    self.auth.risk.clone()
+                }
+            } else {
+                policy.risk.clone()
+            },
+            valid_at: at.into(),
+            next_invalid_at: next,
+        }
+    }
+
+    pub async fn resolve_projection_context(
+        &mut self,
+        policy: &mut Policy,
+    ) -> Result<(), KipError> {
+        let mut refs = Vec::new();
+        for reference in &policy.context_refs {
+            let id = reference.parse::<ElementId>()?;
+            if id.kind != anda_kip::ElementKind::Concept || self.load(id).await?.is_none() {
+                return Err(KipError::not_found_or_not_visible(
+                    "projection context is unavailable",
+                ));
+            }
+            refs.push(self.canonical_of(id).await?.to_string());
+        }
+        refs.sort();
+        refs.dedup();
+        policy.context_refs = refs;
+        Ok(())
+    }
+
     /// Projects belief about one Proposition.
     pub async fn project_belief(
         &mut self,
@@ -319,6 +425,7 @@ impl Context<'_> {
         policy: &Policy,
         at: &str,
     ) -> Result<Belief, KipError> {
+        self.require_projection_history(policy)?;
         let mut ledger = Ledger {
             warnings: vec![
                 // Not a caveat about this answer in particular: it is what the
@@ -340,10 +447,22 @@ impl Context<'_> {
         ledger.support_groups = support_groups;
         ledger.opposition_groups = opposition_groups;
 
-        let status = classify(support, opposition, &ledger, policy);
+        let mut status = if !ledger.conflict_refs.is_empty() {
+            BeliefStatus::Contested
+        } else {
+            classify(support, opposition, &ledger, policy)
+        };
+        if ledger.unverified_dependency && status == BeliefStatus::Accepted {
+            status = BeliefStatus::Uncertain;
+            ledger
+                .warnings
+                .push("inferred support has no verified recursive dependency basis".into());
+        }
+        let basis = self.projection_basis(policy, at, ledger.next_invalid_at.clone());
         Ok(Belief {
             proposition: Some(proposition),
             status,
+            basis,
             support,
             opposition,
             ledger,
@@ -363,9 +482,11 @@ impl Context<'_> {
     /// indistinguishable from a query that was simply written wrong.
     ///
     /// A read must not create the Proposition to have something to point at.
-    pub fn ungrounded_belief(&self, policy: &Policy, at: &str) -> Belief {
-        Belief {
+    pub fn ungrounded_belief(&self, policy: &Policy, at: &str) -> Result<Belief, KipError> {
+        self.require_projection_history(policy)?;
+        Ok(Belief {
             proposition: None,
+            basis: self.projection_basis(policy, at, None),
             status: BeliefStatus::Insufficient,
             support: 0.0,
             opposition: 0.0,
@@ -380,7 +501,7 @@ impl Context<'_> {
             policy: policy.clone(),
             valid_at: at.to_string(),
             as_of: self.as_of,
-        }
+        })
     }
 
     /// The conflict set of one slot: every Proposition with this subject and
@@ -392,11 +513,17 @@ impl Context<'_> {
         policy: &Policy,
         at: &str,
     ) -> Result<Slot, KipError> {
+        self.require_projection_history(policy)?;
         let mut candidates = Vec::new();
         for id in self.slot_propositions(subject, predicate_ref).await? {
             candidates.push(self.project_belief(id, policy, at).await?);
         }
+        let next = candidates
+            .iter()
+            .filter_map(|b| b.basis.next_invalid_at.clone())
+            .min();
         Ok(Slot {
+            basis: self.projection_basis(policy, at, next),
             candidates,
             policy: policy.clone(),
             valid_at: at.to_string(),
@@ -420,8 +547,29 @@ impl Context<'_> {
         let mut candidates = Vec::new();
 
         for row in self.assertions_about(target).await? {
-            match self.eligible(&row, policy, at) {
+            record_boundary(ledger, &row, at);
+            match self.eligible(&row, policy, at).await? {
                 Ok(candidate) => {
+                    if row.mode == "inferred" {
+                        let checked = self
+                            .dependency_validity(
+                                &Element::Assertion(Box::new(row.clone())),
+                                policy,
+                                at,
+                            )
+                            .await?;
+                        if checked["action_eligible"] != true {
+                            ledger.unverified_dependency = true;
+                        }
+                        if let Some(next) = checked["basis"]["next_invalid_at"].as_str()
+                            && ledger
+                                .next_invalid_at
+                                .as_ref()
+                                .is_none_or(|old| next < old.as_str())
+                        {
+                            ledger.next_invalid_at = Some(next.to_string());
+                        }
+                    }
                     let id = candidate.id.to_string();
                     match candidate.stance.as_str() {
                         "support" => ledger.supporting.push(id),
@@ -440,34 +588,67 @@ impl Context<'_> {
             }
         }
 
+        let (local_support, local_groups) = aggregate(&candidates, false);
+        let (local_opposition, opposing_groups) = aggregate(&candidates, true);
+        ledger.support_groups = local_groups;
+        ledger.opposition_groups = opposing_groups;
+        ledger.candidate_status = classify(local_support, local_opposition, ledger, policy);
         // Stage 3 — conflict-set expansion (§58). Support for a rival value of
         // a functional predicate opposes this one, because the schema says only
         // one of them can apply.
         if policy.expand_conflicts {
             for rival in self.functional_rivals(target).await? {
+                let mut rival_candidates = Vec::new();
                 for row in self.assertions_about(rival).await? {
-                    if let Ok(mut candidate) = self.eligible(&row, policy, at)
+                    record_boundary(ledger, &row, at);
+                    if let Ok(candidate) = self.eligible(&row, policy, at).await?
                         && candidate.stance == "support"
                     {
-                        candidate.opposes_target = true;
-                        ledger.opposing.push(candidate.id.to_string());
-                        candidates.push(candidate);
+                        rival_candidates.push(candidate);
                     }
                 }
+                let (rival_support, _) = aggregate(&rival_candidates, false);
+                if local_support >= policy.material && rival_support >= policy.material {
+                    ledger.conflict_refs.push(rival.to_string());
+                }
+                for mut candidate in rival_candidates {
+                    candidate.opposes_target = true;
+                    ledger.opposing.push(candidate.id.to_string());
+                    candidates.push(candidate);
+                }
             }
+        }
+        if !ledger.conflict_refs.is_empty() {
+            let reason = match self.load(target).await? {
+                Some(Element::Proposition(row)) => row
+                    .predicate_ref
+                    .parse::<crate::schema::SymbolRef>()
+                    .ok()
+                    .and_then(|symbol| self.env.predicate_def(&symbol).ok())
+                    .map(|d| {
+                        if d.functional {
+                            "functional_value"
+                        } else {
+                            "exclusive_value"
+                        }
+                    })
+                    .unwrap_or("slot_constraint"),
+                _ => "slot_constraint",
+            };
+            ledger.conflict_reasons.push(reason.into());
         }
         Ok(candidates)
     }
 
     /// Stages 4–6: lifecycle, temporal and mode eligibility.
-    fn eligible(
-        &self,
+    async fn eligible(
+        &mut self,
         row: &AssertionRow,
         policy: &Policy,
         at: &str,
-    ) -> Result<Candidate, Excluded> {
+    ) -> Result<Result<Candidate, Excluded>, KipError> {
         let id = ElementId::new(anda_kip::ElementKind::Assertion, row._id);
-        let reject = |reason| Err(Excluded { id, reason });
+        let reject = |reason| Ok(Err(Excluded { id, reason }));
 
         // Stage 4 — lifecycle (§59). A retracted claim was withdrawn and a
         // superseded one was replaced; both stay on record for explanation.
@@ -498,6 +679,28 @@ impl Context<'_> {
             return reject("outside_valid_time");
         }
 
+        for reference in &row.context_refs {
+            let canonical = self.canonical_endpoint(reference).await?;
+            let name = canonical
+                .get("id")
+                .and_then(Json::as_str)
+                .or_else(|| canonical.as_str());
+            if !name.is_some_and(|r| policy.context_refs.iter().any(|v| v == r)) {
+                return reject("context_mismatch");
+            }
+        }
+        for evidence in &row.evidence_ids {
+            let Ok(eid) = evidence.parse::<ElementId>() else {
+                return reject("evidence_unavailable");
+            };
+            match self.load(eid).await? {
+                Some(Element::Evidence(root)) if root.status == "corrected" => {
+                    return reject("corrected_evidence");
+                }
+                Some(Element::Evidence(_)) => {}
+                _ => return reject("evidence_unavailable"),
+            }
+        }
         // Stage 6 — mode (§61).
         let mode: Option<AssertionMode> =
             serde_json::from_value(Json::String(row.mode.clone())).ok();
@@ -505,7 +708,7 @@ impl Context<'_> {
             return reject(policy.mode_exclusion(mode));
         }
 
-        Ok(Candidate {
+        Ok(Ok(Candidate {
             id,
             actor: if row.asserted_by_key.is_empty() {
                 // An Assertion with no recorded actor cannot be grouped with
@@ -533,7 +736,7 @@ impl Context<'_> {
                 row.confidence
             },
             opposes_target: false,
-        })
+        }))
     }
 
     async fn assertions_about(
@@ -900,10 +1103,9 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
                 .partial_cmp(&b.support)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-    let contested = accepted.len() > 1
-        || beliefs
-            .iter()
-            .any(|belief| belief.status == BeliefStatus::Contested);
+    let contested = beliefs
+        .iter()
+        .any(|belief| belief.status == BeliefStatus::Contested);
 
     // §47.3's four statuses, decided over the slot rather than over any one
     // candidate. Two accepted values in one slot is a contradiction, so it is
@@ -923,6 +1125,7 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
 
     serde_json::json!({
         "status": status,
+        "basis": slot.basis,
         // The reference shape §8 fixes, never the engine's internal endpoint
         // key: a caller cannot feed `id\u001fC-1` back into anything, and a
         // storage key on the wire is a detail that becomes a contract the
@@ -962,6 +1165,7 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
 /// Carries the coordinates the projection ran under, so the slot can report
 /// them whether or not any candidate exists.
 pub struct Slot {
+    pub basis: anda_kip::ProjectionBasis,
     /// Every Proposition competing for the slot, each projected.
     pub candidates: Vec<Belief>,
     /// The policy it ran under.
@@ -1018,6 +1222,19 @@ impl Belief {
     /// The policy identity, for the result context.
     pub fn policy_identity(&self) -> anda_kip::PolicyIdentity {
         self.policy.identity()
+    }
+}
+
+fn record_boundary(ledger: &mut Ledger, row: &AssertionRow, at: &str) {
+    for boundary in [&row.valid_from, &row.valid_until] {
+        if boundary.as_str() > at
+            && ledger
+                .next_invalid_at
+                .as_ref()
+                .is_none_or(|old| boundary < old)
+        {
+            ledger.next_invalid_at = Some(boundary.clone());
+        }
     }
 }
 

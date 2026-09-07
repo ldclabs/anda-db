@@ -64,7 +64,8 @@ jobs:
         run: pnpm run test
       - name: Check generated files are in sync with their sources
         # The error registry, the bundled profile, the conformance fixtures and
-        # the oracle corpus are all generated. A stale one silently narrows what
+        # the static contract validators and oracle corpus are all generated.
+        # A stale one silently narrows what
         # is tested instead of failing, which is how the corpus lost ten
         # commands before anyone noticed.
         run: |

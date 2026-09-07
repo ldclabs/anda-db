@@ -29,7 +29,6 @@ mod kml;
 mod kql;
 mod meta;
 
-
 /// Maximum accepted length (in bytes) of a single KIP command string.
 ///
 /// Inputs longer than this are rejected by every `parse_*` entry point before
@@ -123,6 +122,9 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 /// assert!(operation.parse().is_err());
 /// ```
 pub(crate) fn validate_command(command: &Command) -> Result<(), KipError> {
+    crate::validate_json(
+        &serde_json::to_value(command).map_err(|e| KipError::invalid_syntax(e.to_string()))?,
+    )?;
     match command {
         Command::Kql(query) => validate_query(query),
         Command::Kml(statement) => validate_statement(statement),

@@ -62,7 +62,7 @@ async fn fresh(name: &str) -> CognitiveNexus {
             .unwrap();
     }
     let mut lock = SchemaLock::default();
-    for (id, version) in [(PROFILE_ID, "2.0.0"), ("kip://test/status", "1.0.0")] {
+    for (id, version) in [(PROFILE_ID, "2.1.0"), ("kip://test/status", "1.0.0")] {
         lock.packages.insert(id.to_string(), version.to_string());
         lock.states.insert(id.to_string(), PackageState::Active);
     }
@@ -387,7 +387,7 @@ async fn the_policy_travels_with_the_answer() {
 
     let default = belief(&nexus, "").await;
     assert_eq!(default["policy"]["id"], "kip:policy:baseline");
-    assert_eq!(default["policy"]["version"], 1);
+    assert_eq!(default["policy"]["version"], 2);
     assert_eq!(default["status"], "accepted");
 
     // Raising the bar changes the answer — and changes the reported identity,

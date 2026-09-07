@@ -245,6 +245,7 @@ impl SchemaEnvironment {
                     )
                 })?
             };
+            super::contracts::validate_package(&artifact)?;
             artifacts.insert(package_ref, artifact);
         }
         Ok(Self {
@@ -462,7 +463,7 @@ mod tests {
             1,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.0.0",
+                "2.1.0",
                 PackageState::Active,
             )]),
             &available(),
@@ -480,7 +481,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             symbol.to_string(),
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
         );
         // The same name resolves the same way through its canonical spelling.
         assert_eq!(
@@ -499,7 +500,7 @@ mod tests {
             lock(&[
                 (
                     "kip://profiles/cognitive-memory",
-                    "2.0.0",
+                    "2.1.0",
                     PackageState::Active,
                 ),
                 ("kip://acme/hr", "1.0.0", PackageState::Active),
@@ -517,7 +518,7 @@ mod tests {
         assert!(err.effective_hint().contains("kip://acme/hr@1.0.0/Person"));
         assert!(
             err.effective_hint()
-                .contains("kip://profiles/cognitive-memory@2.0.0/Person")
+                .contains("kip://profiles/cognitive-memory@2.1.0/Person")
         );
 
         // An unambiguous name in the same environment still resolves, and the
@@ -557,7 +558,7 @@ mod tests {
             3,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.0.0",
+                "2.1.0",
                 PackageState::Deprecated,
             )]),
             &available(),
@@ -574,13 +575,13 @@ mod tests {
             4,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.0.0",
+                "2.1.0",
                 PackageState::Blocked,
             )]),
             &available(),
         )
         .unwrap();
-        let qualified = "kip://profiles/cognitive-memory@2.0.0/Person";
+        let qualified = "kip://profiles/cognitive-memory@2.1.0/Person";
         assert!(
             blocked
                 .resolve_symbol(SymbolKind::ConceptType, qualified, Intent::Read)
@@ -602,7 +603,7 @@ mod tests {
             lock(&[
                 (
                     "kip://profiles/cognitive-memory",
-                    "2.0.0",
+                    "2.1.0",
                     PackageState::Active,
                 ),
                 ("kip://acme/hr", "1.0.0", PackageState::Quarantined),
@@ -616,7 +617,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             symbol.to_string(),
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
         );
         let err = env
             .resolve_symbol(
@@ -635,7 +636,7 @@ mod tests {
         let mut lock = lock(&[
             (
                 "kip://profiles/cognitive-memory",
-                "2.0.0",
+                "2.1.0",
                 PackageState::Active,
             ),
             ("kip://acme/hr", "1.0.0", PackageState::Active),
@@ -719,7 +720,7 @@ mod tests {
         // another during a dual-version period (§20.9).
         let mut lock = lock(&[(
             "kip://profiles/cognitive-memory",
-            "2.0.0",
+            "2.1.0",
             PackageState::Active,
         )]);
         lock.write_defaults.insert(
@@ -729,7 +730,7 @@ mod tests {
         let env = SchemaEnvironment::resolve(8, lock, &available()).unwrap();
         assert_eq!(
             env.package_ref("kip://profiles/cognitive-memory", Intent::Read),
-            Some("kip://profiles/cognitive-memory@2.0.0".to_string())
+            Some("kip://profiles/cognitive-memory@2.1.0".to_string())
         );
         assert_eq!(
             env.package_ref("kip://profiles/cognitive-memory", Intent::Write),

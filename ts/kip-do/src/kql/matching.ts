@@ -54,6 +54,8 @@ import {
   project,
   slotPropositions,
   slotToJson,
+  projectionBasis,
+  checkProjectionHistory,
   ungroundedBelief,
   type Policy,
   type Slot,
@@ -1283,8 +1285,10 @@ function beliefSlot(
     }
     const predicateLineage = resolveSymbol(cx, 'predicate', name)
     const keys = canonicalKeys(cx, endpointFromJson(subject))
-    const validAt = nowTime()
+    const validAt = cx.validAt
+    checkProjectionHistory(cx, b.policy)
     const slot: Slot = {
+      basis: projectionBasis(cx, b.policy, validAt),
       // §12.3: the slot sees every Assertion in it, whichever version its
       // Proposition was created under and whichever merged spelling of the
       // subject it was recorded on.

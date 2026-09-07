@@ -1,3 +1,7 @@
+import { errors } from '../errors.js'
+import { dependencyValidity } from './dependency.js'
+import { sha256Text } from '../digest.js'
+import { canonicalJson } from '../json.js'
 /**
  * # The Epistemic Projection
  *
@@ -31,7 +35,7 @@
  * refuses — the caller cannot tell the difference from a calibrated answer.
  */
 
-import { formatElementId, type ElementId } from '../id.js'
+import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
 import {
   lineageText,
@@ -47,7 +51,6 @@ import {
   type PropositionRow,
 } from '../store/index.js'
 import type { Context } from '../kql/context.js'
-import { nowTime } from '../time.js'
 import { admits, modeExclusion, type Policy } from './policy.js'
 
 /** One Assertion, reduced to what the projection scores. */
@@ -94,6 +97,10 @@ interface Ledger {
 
 /** A projected belief, as a query binds and projects it. */
 export interface Belief {
+  basis: JsonMap
+  candidateStatus: string
+  conflictRefs: string[]
+  conflictReasons: string[]
   /**
    * The Proposition projected, when one durably exists.
    *
@@ -131,8 +138,9 @@ export function project(
   cx: Context,
   proposition: ElementId,
   policy: Policy,
-  validAt: string = nowTime(),
+  validAt: string = cx.validAt,
 ): Belief {
+  checkProjectionHistory(cx, policy)
   const ledger: Ledger = {
     supporting: [],
     opposing: [],
@@ -145,10 +153,19 @@ export function project(
 
   const candidates: Candidate[] = []
   for (const row of assertionsAbout(cx, proposition)) {
-    const candidate = admit(row, policy, ledger, false)
+    const candidate = admit(cx, row, policy, ledger, false, validAt)
     if (candidate !== null) candidates.push(candidate)
   }
 
+  const localLedger = { ...ledger }
+  const [localSupport, localGroups] = aggregate(candidates, false)
+  const [localOpposition, localOpposingGroups] = aggregate(candidates, true)
+  localLedger.supportGroups = localGroups
+  localLedger.oppositionGroups = localOpposingGroups
+  const candidateStatus = classify(localSupport, localOpposition, localLedger, policy)
+  const conflictRefs: string[] = []
+  const boundaries: string[] = []
+  for (const row of assertionsAbout(cx, proposition)) boundaries.push(row.valid_from, row.valid_until)
   // Conflict-set expansion (§25, §20.15): support for a rival value of a
   // functional slot is opposition to this one. The schema says the slot holds
   // one value, so somebody claiming another value *is* disagreeing — even
@@ -160,10 +177,16 @@ export function project(
   const rules = predicateRulesOf(cx, proposition)
   if (policy.expand_conflicts && rules.temporal_conflict !== 'none') {
     for (const rival of exclusiveRivals(cx, proposition, rules)) {
+      const rivalCandidates: Candidate[] = []
       for (const row of assertionsAbout(cx, rival)) {
-        const candidate = admit(row, policy, ledger, true)
-        if (candidate !== null) candidates.push(candidate)
+        boundaries.push(row.valid_from, row.valid_until)
+        if (row.stance !== 'support') continue
+        const candidate = admit(cx, row, policy, ledger, true, validAt)
+        if (candidate !== null) rivalCandidates.push(candidate)
       }
+      const [rivalSupport] = aggregate(rivalCandidates.map((c) => ({ ...c, opposesTarget: false })), false)
+      if (localSupport >= policy.material && rivalSupport >= policy.material) conflictRefs.push(formatElementId(rival))
+      candidates.push(...rivalCandidates)
     }
   }
 
@@ -180,9 +203,25 @@ export function project(
     )
   }
 
+  let unverified = false
+  for (const row of assertionsAbout(cx, proposition)) {
+    if (row.mode !== 'inferred' || !ledger.supporting.includes(formatElementId({ kind: 'Assertion', seq: row.id }))) continue
+    const checked = dependencyValidity(cx, { kind: 'Assertion', row }, policy, validAt)
+    if (checked.action_eligible !== true) unverified = true
+    const next = (checked.basis as JsonMap).next_invalid_at
+    if (typeof next === 'string') boundaries.push(next)
+  }
+  let status = conflictRefs.length ? 'contested' : classify(support, opposition, ledger, policy)
+  if (unverified && status === 'accepted') {
+    status = 'uncertain'
+    ledger.warnings.push('inferred support has no verified recursive dependency basis')
+  }
   return {
     proposition,
-    status: classify(support, opposition, ledger, policy),
+    status,
+    basis: projectionBasis(cx, policy, validAt, boundaries.filter((t) => t > validAt).sort()[0] ?? null),
+    candidateStatus, conflictRefs,
+    conflictReasons: conflictRefs.length ? [rules.functional ? 'functional_value' : 'exclusive_value'] : [],
     support,
     opposition,
     ledger,
@@ -208,9 +247,12 @@ export function ungroundedBelief(
   cx: Context,
   policy: Policy,
   validAt: string,
-): Belief {
+ ): Belief {
+  checkProjectionHistory(cx, policy)
   return {
     proposition: null,
+    basis: projectionBasis(cx, policy, validAt),
+    candidateStatus: 'insufficient', conflictRefs: [], conflictReasons: [],
     status: 'insufficient',
     support: 0,
     opposition: 0,
@@ -234,10 +276,12 @@ export function ungroundedBelief(
 
 /** Whether one Assertion is eligible, recording why when it is not. */
 function admit(
+  cx: Context,
   row: AssertionRow,
   policy: Policy,
   ledger: Ledger,
   opposesTarget: boolean,
+  validAt: string,
 ): Candidate | null {
   const id = formatElementId({ kind: 'Assertion', seq: row.id })
 
@@ -250,6 +294,18 @@ function admit(
   if (row.state !== State.ACTIVE) {
     ledger.excluded.push({ assertion_id: id, reason: `record_${row.state}` })
     return null
+  }
+  const exclude = (reason: string): null => { ledger.excluded.push({ assertion_id: id, reason }); return null }
+  if ((row.valid_from && row.valid_from > validAt) || (row.valid_until && row.valid_until <= validAt)) return exclude('outside_valid_time')
+  for (const reference of row.context_refs) {
+    const canonical = cx.canonicalEndpoint(reference as Json) as JsonMap
+    if (!policy.context_refs.includes(String(canonical.id))) return exclude('context_mismatch')
+  }
+  for (const reference of row.evidence_refs) {
+    const eid = tryParseElementId(reference.id)
+    const root = eid === null ? null : cx.load(eid)
+    if (!root || root.kind !== 'Evidence') return exclude('evidence_unavailable')
+    if (root.row.status === 'corrected') return exclude('corrected_evidence')
   }
   if (!admits(policy, row.mode)) {
     ledger.excluded.push({ assertion_id: id, reason: modeExclusion(row.mode) })
@@ -418,6 +474,11 @@ export function beliefToJson(belief: Belief): JsonMap {
     proposition_id:
       belief.proposition === null ? null : formatElementId(belief.proposition),
     status: belief.status,
+    basis: belief.basis,
+    candidate_status: belief.candidateStatus,
+    slot_status: belief.status,
+    conflict_refs: belief.conflictRefs,
+    conflict_reasons: belief.conflictReasons,
     leading: leadingSide(belief),
     // The Assertion ids and the corroboration groups *are* the ledger: they
     // name who said it and which observations stood behind them. A caller that
@@ -542,7 +603,7 @@ export function slotToJson(
   // Two accepted values in one slot is a contradiction the caller has to see,
   // even though each candidate was accepted on its own.
   const contested =
-    accepted.length > 1 || beliefs.some((belief) => belief.status === 'contested')
+    beliefs.some((belief) => belief.status === 'contested')
 
   // §47.3's four statuses, decided over the slot rather than over any one
   // candidate.
@@ -556,6 +617,7 @@ export function slotToJson(
 
   return {
     status,
+    basis: { ...slot.basis, next_invalid_at: beliefs.map((b) => b.basis.next_invalid_at).filter((t): t is string => typeof t === 'string').sort()[0] ?? null },
     subject,
     predicate_ref: predicateRef,
     accepted_values: accepted.flatMap((belief) =>
@@ -596,6 +658,7 @@ export function slotToJson(
  * them whether or not any candidate exists.
  */
 export interface Slot {
+  basis: JsonMap
   candidates: Belief[]
   policy: Policy
   validAt: string
@@ -764,3 +827,25 @@ export {
   policyFromSettings,
   type Policy,
 } from './policy.js'
+
+/** Full computation basis. Opaque digests never expose grants or hidden counts. */
+export function projectionBasis(cx: Context, policy: Policy, at: string, next: string | null = null): JsonMap {
+  const contextRefs = policy.context_refs
+  const identityVersions = (cx.authority.space.policies._kip_identity_changes ?? []) as number[]
+  const { _kip_identity_changes: _identity, ...policies } = cx.authority.space.policies
+  const authorization = { ...cx.authority, space: { ...cx.authority.space, seq: 0, schema_environment_version: 0, policies }, auth: cx.auth }
+
+  return {
+    space_id: cx.space, snapshot_seq: cx.asOf ?? cx.store.currentSeq(cx.space),
+    schema_environment_version: cx.env.version, identity_version: Math.max(0, ...identityVersions.filter((v) => v <= (cx.asOf ?? cx.store.currentSeq(cx.space)))),
+    policy: { id: policy.id, version: sha256Text(canonicalJson([policy.version, policy.accept, policy.material, policy.modes, policy.expand_conflicts, policy.unstated_confidence])) },
+    trust_version: 'structural-no-trust-v1',
+    authorization_view: sha256Text(canonicalJson(authorization)),
+    context_refs: contextRefs, purpose: policy.purpose || cx.auth.purpose || 'unspecified', risk: policy.risk || cx.auth.risk || 'unspecified',
+    valid_at: at, next_invalid_at: next,
+  }
+}
+
+export function checkProjectionHistory(cx: Context, policy: Policy): void {
+  if (cx.asOf !== null && !policy.explicit_selection) throw errors.historicalSnapshotUnavailable('historical projection control state is unavailable; explicitly select an epistemic policy to reinterpret the retained cognition')
+}

@@ -25,6 +25,7 @@
 //! report it either.
 
 pub mod apply;
+pub mod contracts;
 pub mod env;
 pub mod package;
 pub mod symbol;

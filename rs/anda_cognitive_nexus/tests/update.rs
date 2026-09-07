@@ -40,7 +40,7 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();

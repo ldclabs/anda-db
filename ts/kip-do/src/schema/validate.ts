@@ -1,3 +1,4 @@
+import { validateValue } from './contracts.js'
 /**
  * # Package validation
  *
@@ -171,6 +172,11 @@ function validateField(
   value: Json,
   into: Validation,
 ): void {
+  if (spec.value_schema !== undefined) {
+    try { validateValue(spec.value_schema, value) } catch (err) {
+      into.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, path, String(err)))
+    }
+  }
   if (!matchesType(spec.type, value)) {
     into.push(
       error(
@@ -272,6 +278,11 @@ export function validateAttributes(
     attributes,
     result,
   )
+  if (spec?.value_schema !== undefined) {
+    try { validateValue(spec.value_schema, attributes) } catch (err) {
+      result.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'attributes', String(err)))
+    }
+  }
   return result
 }
 
@@ -603,6 +614,11 @@ export function validateFacet(
     values,
     result,
   )
+  if (def.value_schema !== undefined) {
+    try { validateValue(def.value_schema as Json, values) } catch (err) {
+      result.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'facets', String(err)))
+    }
+  }
   return result
 }
 

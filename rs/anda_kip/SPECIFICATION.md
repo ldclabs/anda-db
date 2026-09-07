@@ -1,5 +1,7 @@
 # KIP 2.0 Specification
 
+**[English](./KIP-2.0-SPECIFICATION.md) | [中文](./KIP-2.0-SPECIFICATION_CN.md)**
+
 ## Status
 
 **Normative Draft / Protocol Consolidation Candidate**
@@ -10,27 +12,33 @@ This document is the normative consolidation of the KIP 2.0 design.
 
 The following KIP 2.0 design documents are informative references and design rationale. The ten `design/` notes are **frozen** as of 2026-09-02: they are the pre-consolidation drafts, are no longer maintained, and their Chinese twins are no longer synchronized; where they differ from this Specification they are out of date.
 
-- `Architecture.md`
-- `design/Core-Data-Model.md`
-- `design/Epistemic-Model.md`
-- `design/Governance.md`
-- `design/Schema-Packages.md`
-- `design/Transactions.md`
-- `design/Capsule.md`
-- `design/KQL.md`
-- `design/KML.md`
-- `design/META.md`
-- `design/Protocol-Runtime.md`
+- `KIP-2.0-Architecture.md`
+- `design/KIP-2.0-Core-Data-Model.md`
+- `design/KIP-2.0-Epistemic-Model.md`
+- `design/KIP-2.0-Governance.md`
+- `design/KIP-2.0-Schema-Packages.md`
+- `design/KIP-2.0-Transactions.md`
+- `design/KIP-2.0-Capsule.md`
+- `design/KIP-2.0-KQL.md`
+- `design/KIP-2.0-KML.md`
+- `design/KIP-2.0-META.md`
+- `design/KIP-2.0-Protocol-Runtime.md`
 
 The following artifacts are normative companions to this Specification:
 
-- `grammar/KQL.ebnf`, `grammar/KML.ebnf`, `grammar/META.ebnf` — normative syntax
+- `KIP-2.0-Memory-Interface.md`, `schemas/kip-memory.schema.json` and `profiles/memory-bundles.json` — optional Agent-to-Brain intents, processing barriers and composable memory capability bundles
+- `conformance/KIP-2.0-Memory-Interface-Tests.md` — acceptance scenarios for the optional binding
+- `KIP-2.0-Cognitive-Consistency.md` — conflict-complete belief, computation bases, dependency validity, identity repair and reliable learning/worker contracts
+- `schemas/kip-projection.schema.json`, `schemas/kip-cognitive-records.schema.json`, `schemas/kip-element.schema.json`, `schemas/kip-capsule.schema.json`, `schemas/kip-schema-package.schema.json` — normative result and artifact shapes
+- `conformance/KIP-2.0-Cognitive-Tests.md` — cross-cutting Core/Profile acceptance vectors
+
+- `grammar/KIP-2.0-KQL.ebnf`, `grammar/KIP-2.0-KML.ebnf`, `grammar/KIP-2.0-META.ebnf` — normative syntax
 - `schemas/kip-request.schema.json`, `schemas/kip-response.schema.json`, `schemas/kip-change-envelope.schema.json` — normative wire shapes
-- `profiles/cognitive-memory-2.0.0.schema.json` and `profiles/CognitiveMemoryProfile-2.0.md` — the standard Profile package
-- `conformance/Conformance-Tests.md`, `conformance/conformance-test-vector.schema.json`, `conformance/conformance-report.schema.json`, `conformance/conformance-state-fixture.schema.json`, `conformance/conformance-governance-policy.schema.json` and `conformance/fixtures/` — the conformance suite
-- `Capsule-Specification.md` — §37–§41 and §95 of this Specification, the Cognitive Capsule, carried in a companion under the same numbering
-- `Optional-Profiles-and-Migration.md` — §100, §101, §103 and Appendix I of this Specification: historical reads, high-assurance hardening, and KIP 1.x migration — each a capability (§67.4), not a profile
-- `Invariants.md` — the invariant registry: §102's 38 Core invariants (Part A) and the Cognitive Memory Profile's 35 (Part B), one list
+- `profiles/cognitive-memory-2.1.0.schema.json` and `profiles/CognitiveMemoryProfile-2.0.md` — the standard Profile package
+- `conformance/KIP-2.0-Conformance-Tests.md`, `conformance/conformance-test-vector.schema.json`, `conformance/conformance-report.schema.json`, `conformance/conformance-state-fixture.schema.json`, `conformance/conformance-governance-policy.schema.json` and `conformance/fixtures/` — the conformance suite
+- `KIP-2.0-Capsule-Specification.md` — §37–§41 and §95 of this Specification, the Cognitive Capsule, carried in a companion under the same numbering
+- `KIP-2.0-Optional-Profiles-and-Migration.md` — §100, §101, §103 and Appendix I of this Specification: historical reads, high-assurance hardening, and KIP 1.x migration — each a capability (§67.4), not a profile
+- `KIP-2.0-Invariants.md` — the invariant registry: §102's 43 Core invariants (Part A) and the Cognitive Memory Profile's 46 (Part B), one list
 
 `KIPSyntax.md` is an informative LLM-facing syntax card, not a normative artifact.
 
@@ -73,6 +81,14 @@ portable cognitive artifacts
 ```
 
 The protocol is **Model-First**: the language and runtime are designed to be reliably generated and consumed by LLM-based Agents while remaining deterministic enough for interoperable implementations.
+
+KQL/KML/META define the Brain-to-Nexus Interface. A business Agent may instead use
+the optional [Memory Interface](./KIP-2.0-Memory-Interface.md): observe, recall,
+revise, feedback and forget. The Brain Module interprets those intents and manages
+their KIP operations; it may be embedded in the Agent or use a separate model.
+Both paths preserve the same cognitive state contract. A transaction receipt proves
+durable state, while the binding's processing receipt additionally identifies when
+an input has been processed and can participate in recall.
 
 KIP 2.0 separates three fundamental questions:
 
@@ -257,6 +273,12 @@ Learning/reinforcement requires an explicit cognitive mutation.
 KIP SHOULD remain compact, declarative, and structurally regular enough for reliable model generation.
 
 Ergonomic sugar MAY exist, but MUST desugar to the same normative semantics.
+
+Adapters SHOULD capture mechanical read pins, digests, retry identities and paging
+without asking models to invent them. The model still identifies semantic intent,
+actual evidence used and uncertainty. Role-specific instruction cards MAY expose
+only the needed language surface; a short model-facing view MUST retain material
+uncertainty and provide governed access to its full computation basis.
 
 ---
 
@@ -737,15 +759,18 @@ Structured values SHOULD use Concepts or schema/profile-defined value objects.
 
 ## 9.3 Numeric rules
 
-Only finite numeric values are valid.
+Portable JSON numbers use finite IEEE 754 binary64. Integral values MUST be
+within `[-9007199254740991, 9007199254740991]`, in command text, bound parameters,
+wire counters and artifacts alike. The restriction applies equally to integer,
+fraction and exponent spellings; changing notation cannot bypass it. Nonzero
+underflow to zero, non-finite values and out-of-range integers MUST be rejected
+before their source digits are lost. Fractional values use binary64 rounding.
+Use a Schema-defined string/value object for larger exact integers or decimals.
 
-```text
-NaN
-Infinity
--Infinity
-```
-
-MUST be rejected.
+A decoder MUST validate source numeric tokens before binding or lowering. Silent
+rounding of distinct exact integers to one value is non-conforming. The canonical
+artifact profile is `kip-jcs-safe-v1` (§37.7); unsupported previous draft numeric
+contracts require explicit migration, not implicit reinterpretation.
 
 ---
 
@@ -769,8 +794,8 @@ Literal identity (§12.3) compares canonical forms, and a runtime MUST canonical
 
 ```text
 string      Unicode scalar values after NFC normalization; no trimming, no case folding
-number      mathematical value: 1, 1.0 and 1e0 are one Literal; -0 is 0;
-            an integer and a float of equal value are equal
+number      validated binary64 value (§9.3): 1, 1.0 and 1e0 are one Literal;
+            -0 is 0; an integer and a float of equal valid value are equal
 boolean     by value
 null        by value, where the Predicate permits it (§9.5)
 ```
@@ -892,7 +917,11 @@ A historical Proposition that referenced `A` MAY continue to refer to `A` in raw
 
 ## 11.3 New writes
 
-Ordinary new writes SHOULD canonicalize merged references to `B`.
+Ordinary new writes resolve identity through `B`, while engine audit MUST retain
+the as-supplied endpoint and the resolution decision/version used. An ASSERT or
+creation that resolves an existing canonical Proposition still retains its own
+input-reference binding; the canonical tuple alone cannot recover that intent.
+See the Cognitive Consistency companion §4 for identity repair.
 
 ---
 
@@ -906,6 +935,12 @@ Assertion references
 raw provenance
 historical queryability
 ```
+
+---
+
+## 11.5 Identity repair
+
+A runtime advertising `identity_repair` MUST implement the protected resolution-withdrawal and affected-write review contract in [Cognitive Consistency §4](./KIP-2.0-Cognitive-Consistency.md#4-repairable-identity-and-portable-keys). It never rewrites old tuples, invents lost attribution, or gains authority through `same_as`.
 
 ---
 
@@ -1063,7 +1098,7 @@ _system.origin.principal_id
 
 which identifies the authenticated execution origin.
 
-`context_refs` is OPTIONAL: references to Concepts that scope the Assertion — the situation, purpose, or domain under which the stance holds (§25.3). It is set at creation through `SET FIELDS` and is part of the immutable payload (§13.7); a Projection Policy MAY exclude an Assertion whose context does not match the request's (`context_mismatch`).
+`context_refs` is OPTIONAL: references to Concepts that scope the Assertion — the situation, purpose, or domain under which the stance holds (§25.3). It is set at creation through `SET FIELDS` and is part of the immutable payload (§13.7); context matching MUST follow the set-inclusion baseline in Cognitive Consistency §2; an explicitly versioned policy may add declared inheritance. A scoped Assertion is ineligible for a context-free request (`context_mismatch`).
 
 ---
 
@@ -1176,9 +1211,9 @@ Supersession is not generic disagreement, and it is not how the world changing o
 
 ## 14.3 Expired
 
-`expired` is a **computed** status, never a stored one: an Assertion whose `valid_time.until` lies before a projection's `valid_at` (`FOR TIME`) is `expired` for that projection. No KML statement produces it, a Change Envelope never carries it, and the stored lifecycle status remains `active`, `retracted`, or `superseded`. `HISTORY` shows no transition to `expired`, because none is committed.
+`expired` is a **computed** status, never a stored one: an Assertion whose `valid_time.until` is at or before a projection's `valid_at` (`FOR TIME`) is `expired` for that projection. No KML statement produces it, a Change Envelope never carries it, and the stored lifecycle status remains `active`, `retracted`, or `superseded`. `HISTORY` shows no transition to `expired`, because none is committed.
 
-It is distinct from storage retention and from world valid time.
+This status is computed from world valid time, and is distinct from storage retention. Intervals are half-open `[from, until)`; equal finite bounds are invalid (Cognitive Consistency §2).
 
 ---
 
@@ -1286,7 +1321,15 @@ In an open protocol this separation is auditable rather than cryptographically a
 
 Each Outcome Evidence SHOULD carry a **task family**: the namespaced stream of comparable consequences it belongs to (for example `"deploy/rollback"`, `"outreach/reply"`). Graded cognition subscribes to a stream by carrying the same task family value, so an instrument never needs to know which patterns will read what it writes. The Cognitive Memory Profile defines the standard `OutcomeRecord` Facet (task family, outcome status, magnitude) and the Skill lifecycle machinery that consumes the channel.
 
-A task family finds comparable consequences; it never attributes one. An outcome that is to grade a specific decision — a Skill applied, a gate decision taken — MUST be provenance-linked to that decision: the Activity that records the observation (the Profile's `outcome_observation`) names the decision Activity among its `inputs` and the Outcome Evidence among its `outputs`. A grading consumer counts an outcome toward a Skill only through that link. An outcome with no decision link belongs to the stream, and therefore to the stream's baseline, and to nothing else. This is what makes a comparative verdict recomputable: the treatment set is the linked outcomes, the baseline is the rest of the family.
+A task family locates candidate comparison material; it never attributes an
+outcome and never automatically defines the baseline. Outcomes grade a decision
+through an instrument-written `outcome_observation` Activity linking the actual
+attempt, the decision and the Outcome Evidence. The standard Profile binds the
+attempt to exact Skill revisions and a trial before execution. Multiple observations
+of one attempt remain one sampling unit per metric/window. Unlinked outcomes stay
+stream material until an explicit comparable baseline selection admits them.
+Cognitive Consistency §5–§6 defines independent attempts, comparability and retained
+replay inputs; a shared family or a rule digest alone proves none of these.
 
 Writing `outcome`-class Evidence, and the observation Activity that links it, requires `record_outcome` (§29.8).
 
@@ -1377,7 +1420,7 @@ cancelled
 
 the Activity's core provenance topology SHOULD be immutable.
 
-A correction should be represented by another Activity/audit record.
+A correction should be represented by another Activity/audit record. Terminal Activities capture engine-maintained `_system.input_versions` and `_system.output_versions` at commit, including final output versions. For derived writes, input versions are validated against explicit DependencyBasis read pins, not guessed from whatever is current at commit. Output versions identify the actual committed output. Unpinned audit Activities may report transaction-snapshot versions but MUST NOT claim those prove the actor consumed them. The maps are not author-writable and do not replace retained replay artifacts.
 
 ---
 
@@ -1482,7 +1525,7 @@ Example:
 ```json
 {
   "facets": {
-    "kip://profiles/cognitive-memory@2.0.0/MnemonicState": {
+    "kip://profiles/cognitive-memory@2.1.0/MnemonicState": {
       "memory_strength": 0.8,
       "salience": 0.9
     }
@@ -1628,7 +1671,7 @@ Examples:
 ```text
 kip://core@2.0.0
 kip://core@2.0.0/Assertion
-kip://profiles/cognitive-memory@2.0.0/Experience
+kip://profiles/cognitive-memory@2.1.0/Experience
 kip://ldclabs/organization@1.3.0/works_for
 ```
 
@@ -1675,6 +1718,15 @@ model hints
 ```
 
 ---
+
+A package field or Facet definition MAY carry `value_schema`, a JSON Schema 2020-12 constraint. A conforming loader MUST resolve its pinned schema dependencies and validate it in addition to field mutability and reference constraints; unsupported contracts fail activation rather than being ignored. The standard Profile pins the companion schemas by digest in its `validation_schemas` manifest. Facet `attachment` constraints (activity_classes/terminal_only) are binding alongside applicable_to; terminal record fields cannot be bypassed by changing Activity class, UPDATE or UNSET.
+
+The validation-schema lock MUST include the transitive schema-resource closure of
+`$ref` and `$dynamicRef`, keyed by actual schema `$id`, including dependencies whose
+IDs use HTTPS rather than URNs. All locked schemas must compile using only those
+verified resources and the validator's JSON Schema meta-schema. An unresolved or
+unpinned resource fails activation; a previously cached or network-fetched schema
+cannot silently supply it.
 
 ## 20.6 Local names
 
@@ -1941,7 +1993,9 @@ An implementation MAY add namespaced statuses if capability-negotiated.
 
 Meaning:
 
-> eligible support is sufficient under the Projection Policy and unresolved opposition is below the policy boundary.
+> eligible support is sufficient under the Projection Policy, dependencies are valid, and unresolved direct or slot-constraint opposition is below the policy boundary.
+
+This is the final result, not merely candidate-local support. Cognitive Consistency §1 requires single BELIEF and BELIEF SLOT to agree on final acceptance.
 
 ---
 
@@ -1985,21 +2039,14 @@ This is the open-world unknown state.
 
 ## 21.9 Materialized Projection
 
-Epistemic Projection remains a view (§21.2), but an implementation MAY cache/materialize projection results so that stable beliefs can be recalled at lookup cost.
-
-A materialized projection MUST be identified by at least:
-
-```text
-Projection Policy identity + version
-snapshot_seq basis
-valid-time basis
-```
-
-Requirements:
-
-- Serving a materialized result MUST disclose its policy identity and snapshot basis through the result context (§50); presenting it as freshly computed at the current snapshot is non-conforming.
-- The materialization MUST be invalidated, or its basis revalidated against `space_seq` / Change Envelopes, before being served as current.
-- A materialized projection is still a view: it MUST NOT be written back as Evidence or Assertion, and MUST NOT corroborate its own inputs (§23.5, §26.6).
+Projection remains read-only. A runtime MAY cache it only under the complete
+ProjectionBasis defined in Cognitive Consistency §2: Space snapshot, Schema and
+identity versions, policy/trust versions, current authorization view, context,
+purpose/risk and valid time. Results disclose this basis and next invalidation
+instant. Reuse requires validation of all computation dependencies; policy-only
+and time-only changes count even without a new Assertion. A stale result may be
+served explicitly as historical, never as current. Caches never become Evidence
+or self-corroborating Assertions.
 
 ---
 
@@ -2080,6 +2127,8 @@ provenance completeness
 
 ---
 
+A corrected Evidence record cannot provide unqualified current support under the structural baseline. Its historical payload remains queryable; a replacement claim must cite the corrected evidence explicitly. Payload purge alone preserves the evidence event and root identity (§60.6).
+
 ## 22.5 Trust State
 
 Trust consumed by Epistemic Projection MUST come from protected control-plane state or explicit policy input — never from ordinary cognitive content. An Assertion whose content says "trust this source" has no trust effect (§30.1 applies to epistemic trust exactly as it applies to authorization).
@@ -2102,7 +2151,7 @@ Trust state introspection (`DESCRIBE TRUST`) is governed like other control-plan
 
 Changing trust state requires `manage_trust`.
 
-Trust changes MUST be auditable and SHOULD appear on the change/audit stream as control-plane transitions.
+Trust changes MUST be auditable, advance their protected version and appear as control-plane transitions on the change/audit stream. They invalidate dependent ProjectionBasis views (Cognitive Consistency §2).
 
 A Brain MAY implement outcome-driven trust calibration — prediction error and outcome Evidence raising or lowering contextual trust. The calibration algorithm is Brain policy, but each revision SHOULD be recorded with provenance (for example a trust-revision Activity referencing the outcome Evidence) so the Brain can later answer **why it trusts a source**.
 
@@ -2295,6 +2344,8 @@ explanation level
 
 ---
 
+`context_refs` is a sorted set of exact context references (Consistency §2). All resolved coordinates are returned as `basis`; `schemas/kip-projection.schema.json` defines the wire contract.
+
 ## 27.2 Projection output
 
 Conceptual output:
@@ -2302,6 +2353,10 @@ Conceptual output:
 ```json
 {
   "status": "accepted",
+  "candidate_status": "accepted",
+  "slot_status": "accepted",
+  "conflict_refs": [],
+  "conflict_reasons": [],
   "leading": "support",
 
   "support": {
@@ -2336,6 +2391,8 @@ Conceptual output:
   "explanation": {}
 }
 ```
+
+The conceptual example above elides `basis` for space; actual results MUST include the full ProjectionBasis. `candidate_status` is diagnostic; consumers use final `status`. Functional conflicts are included even for a single grounded candidate (Consistency §1).
 
 `leading` names the side the policy would favor if it were forced to choose: `support` under `accepted`, `opposition` under `rejected`, and under `contested` the side with more eligible independent trusted roots, using the tie-break the policy declares (§27.1); an exact tie, `uncertain` and `insufficient` report `none`. `leading` is disclosure for a consumer that must act anyway (Brain Recall surfaces both sides and names the heavier one); it never changes `status`.
 
@@ -2729,15 +2786,22 @@ Derived content SHOULD NOT automatically declassify restricted source content.
 Governance records how far a memory element may influence behavior in `governance.authority_class`:
 
 ```text
-descriptive     may be reported
-advisory        may inform a recommendation
-behavioral      may shape the Agent's own conduct
+descriptive     may be reported or used as factual data within the permitted purpose/scope
+advisory        may supply procedural guidance for deliberation
+behavioral      may be adopted as a procedure shaping the Agent's own conduct
 executable      may drive an external action (§62)
 ```
 
-The field is Governance-protected: ordinary KML cannot write it; it is read in the element's `governance` view (`?x.governance.authority_class`, subject to the caller's visibility under §30) and `DESCRIBE ACCESS` reports which classes the caller may elevate to; it is never inferred from cognitive content (§28.1). An element without the field has `descriptive` authority. A Profile MAY tie lifecycle standing to a class — a `proposed` Skill is at most `advisory`, and adoption under the Cognitive Memory Profile's §14 is what a Governance policy may accept as grounds for `behavioral` — but the class is assigned and enforced by Governance, not by the Profile's own fields.
+The field is Governance-protected: ordinary KML cannot write it; it is read in the element's `governance` view (`?x.governance.authority_class`, subject to the caller's visibility under §30) and `DESCRIBE ACCESS` reports which classes the caller may elevate to; it is never inferred from cognitive content (§28.1). An element without the field has `descriptive` authority. A Profile MAY tie lifecycle standing to a class — a `proposed` Skill is at most `advisory`, and adoption under the Cognitive Memory Profile's §14 is what a Governance policy may accept as grounds for `behavioral` — but the class is assigned and enforced by Governance, not by the Profile's own fields. For procedural influence, grants/elevations bind the exact SkillRevision and behavior_digest; selecting another revision does not transfer them.
 
 ---
+
+These classes govern permitted uses and enforceable operations: disclosure,
+procedural adoption, authority elevation and dispatch. A Nexus MUST NOT claim that
+a label proves exposed content had no internal influence on a model. Using an
+authorized fact as decision data does not require Skill adoption; treating content
+as a governing instruction or executing a stored procedure still requires the
+appropriate independent checks. Factual data cannot grant additional permission.
 
 ## 31.4 Imported Skills
 
@@ -3101,7 +3165,7 @@ Normative shape (`schemas/kip-change-envelope.schema.json`):
       "op": "update",
       "kind": "concept",
       "id": "C-7",
-      "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Commitment",
+      "schema_ref": "kip://profiles/cognitive-memory@2.1.0/Commitment",
       "old_version": 4,
       "new_version": 5,
       "touched": ["attributes.status", "facets.MnemonicState"],
@@ -3116,6 +3180,8 @@ Each entry MUST carry `op` (`create | update | lifecycle | retention | merge | p
 Existence protection (§30.4) applies per entry: an element the consumer may not discover is omitted from the envelope it receives. Payload beyond the entry — old and new values — is not part of the envelope; a consumer reads it under its own authority.
 
 ---
+
+Control-plane commits carry governed `control_changes` entries (`trust`, `policy`, `schema`, `identity`, `authorization`) with opaque version identities; they allocate a Space sequence and invalidate relevant bases. They never masquerade as Cognitive Elements or Evidence. Complete/filtered stream consumers receive a governed coverage watermark and authorization-view binding; missing entries or sequence gaps alone do not prove silence (Consistency §7).
 
 ## 36.2 Atomicity
 
@@ -3145,7 +3211,7 @@ Change replay MUST NOT become new Evidence, reinforcement, or duplicated Experie
 
 # 37. Cognitive Capsule
 
-Sections 37–41 are specified in the normative companion [Capsule-Specification.md](./Capsule-Specification.md), which keeps this numbering so that every reference to §37–§41 from the Core, the Profile and the conformance suite resolves there unchanged:
+Sections 37–41 are specified in the normative companion [KIP-2.0-Capsule-Specification.md](./KIP-2.0-Capsule-Specification.md), which keeps this numbering so that every reference to §37–§41 from the Core, the Profile and the conformance suite resolves there unchanged:
 
 ```text
 §37  Cognitive Capsule
@@ -3553,7 +3619,7 @@ It is not persisted Core state.
 
 Subject and Predicate MUST be groundable/bound before projection.
 
-An unbounded whole-Brain projection SHOULD be rejected.
+An unbounded whole-Brain projection SHOULD be rejected. A bounded candidate still evaluates relevant slot competitors before final acceptance; LIMIT caps returned rows, never the evidence considered. Resource exhaustion yields an explicit incomplete/uncertain result or error, never acceptance from silently truncated opposition.
 
 ---
 
@@ -3695,6 +3761,7 @@ WITH EPISTEMIC {
   purpose: "answer_user",
   risk: "low",
   policy: "optional-policy-id",
+  context_refs: [],
   include_historical: false,
   include_hypothetical: false,
   explanation: "summary"
@@ -3725,7 +3792,7 @@ The result SHOULD disclose when explanation/evidence is redacted.
 
 # 50. KQL Result Context
 
-A KQL response SHOULD identify:
+A KQL response MUST identify its Space and snapshot; projected results additionally MUST expose the complete ProjectionBasis (Consistency §2), including:
 
 ```text
 space_id
@@ -4220,7 +4287,13 @@ Superseding or retracting an Assertion, or correcting Evidence, changes what Pro
 
 A runtime MUST NOT auto-retract, auto-archive, or auto-rewrite derived cognition because one of its provenance roots was revised. Whether a derived element survives its root is a review decision, not a protocol rule.
 
-A runtime SHOULD make that review possible. Where `LIST DEPENDENTS` (§63.5) is supported, the cognition downstream of a revised root is discoverable in one operation, and a Brain SHOULD review those dependents after a material revision. The Cognitive Memory Profile provides `DerivationState` and the `review_derived` maintenance task class for recording the outcome.
+A runtime MUST make required derivation dependencies reviewable. `LIST DEPENDENTS`
+provides paged traversal; the standard Profile also requires virtual dependency
+validation before Recall (Cognitive Consistency §3). A root change leaves stored
+artifacts intact while their computed validity may immediately become needs_review.
+This is not an author-written stale flag or an automatic retraction. Inferred
+Assertions are checked too. Maintenance records DerivationState and completes the
+bounded review with an explicit coverage watermark.
 
 ---
 
@@ -4267,6 +4340,7 @@ Generic UPDATE MUST NOT mutate:
 
 ```text
 Proposition tuple
+Concept merged_into / protected identity-resolution state
 Assertion historical epistemic payload
 Evidence payload
 completed Activity provenance topology
@@ -4456,11 +4530,14 @@ Recommended pattern:
 ```text
 Transaction 1
     the decision record: an Activity (the Profile's action_gate) whose
-    inputs name the cognition applied — the Skills, the memories the
+    inputs name the cognition applied — the exact Skill revisions, the memories the
     briefing drew on, the trigger — and whose Facet records the decision
 
+    + action_attempt Activity / AttemptRecord and durable dispatch intent
+
 external runtime
-    performs action
+    revalidates authority, revision, dependency basis and lease fence
+    performs/reconciles action using the same attempt_id
 
 Transaction 2
     Outcome Evidence
@@ -4471,6 +4548,8 @@ Transaction 2
 The returning half of this pattern is the consequence channel: the external result comes back as Outcome Evidence (§15.7), written by instrumentation rather than by the actor whose action it grades, and linked to the decision it observed so that the consequence can be attributed to the cognition that produced it. Without the first transaction there is nothing for the outcome to grade.
 
 ---
+
+A runtime claiming `durable_brain_runtime` MUST follow Cognitive Consistency §7 for outbox persistence, attempt identity, fenced takeover and outcome_unknown recovery. External systems without idempotency/lookup never acquire an exactly-once guarantee from KIP.
 
 # 63. META — Introspection and Grounding
 
@@ -4820,15 +4899,30 @@ filtered_delivery           §36.3
 watch_evaluation            runtime-evaluated Watch conditions (Cognitive Memory Profile §5.11)
 list_dependents             §63.5
 payload_purge               §60.6
+identity_repair             Cognitive Consistency §4
+dependency_validity         Cognitive Consistency §3 (required by the standard memory Profile)
+durable_brain_runtime       Cognitive Consistency §7
 capsule_export              §63.4
 capsule_import              §39
 capsule_signatures          §37.8
 derive_permission           §29.6
 record_outcome_permission   §29.8
 kip1_migration              §103    KIP 1.x compatibility and `DESCRIBE COMPATIBILITY`
+memory_interface            Memory Interface companion; requires memory_basic
+memory_basic                five intents, scoped recall, processing barriers and governed erasure
+memory_experience           memory_basic + experience/procedural candidates
+memory_learning             memory_experience + validated learning contracts
+memory_durable              memory_basic + durable_brain_runtime
+memory_exchange             memory_basic + capsule_export + capsule_import
 ```
 
 A `requires` entry that names a capability the runtime does not recognize — neither this registry nor one of its own — fails `UnsupportedCapability`, exactly as one the runtime does not support.
+
+The memory entries are additive capability bundles, defined by the Memory Interface
+companion and profiles/memory-bundles.json. They preserve existing Schema lineages
+and do not imply a claim of the full KIP-CognitiveMemory profile. A declaration must
+include its dependencies and must be backed by an available Brain binding, not only
+by installed type definitions.
 
 ---
 
@@ -4964,7 +5058,7 @@ JSON is the baseline logical request/response format.
 
 JSON text MUST be UTF-8.
 
-Duplicate JSON object keys SHOULD be rejected.
+Duplicate decoded JSON object keys and unpaired Unicode surrogates MUST be rejected. Numeric source tokens MUST be validated under §9.3 before binding. `parseCanonicalJson` in the language toolkit is a reference strict decoder; UTF-8 decoding must also reject invalid bytes.
 
 ---
 
@@ -5834,6 +5928,7 @@ KIP-KQL
 KIP-KML
 KIP-META
 KIP-Runtime
+KIP-CognitiveMemory   (standard package plus Cognitive Consistency contracts)
 ```
 
 A profile is a bundle of requirements over the language and the runtime. What an engine may leave out one at a time is a capability, not a profile: Capsule support (§95), historical reads (§100), high-assurance hardening (§101) and KIP 1.x migration (§103) are each advertised through the §67.4 registry — `capsule_export` / `capsule_import`, `historical_reads`, `signed_receipts` / `capsule_signatures`, `kip1_migration` — and measured against the section that defines them only where advertised.
@@ -5991,6 +6086,8 @@ projection ledger
 Requires:
 
 ```text
+MUTATE (atomic coherent formation)
+ASSERT sugar (normative desugaring)
 Concept create/upsert
 ENSURE Proposition
 Evidence create
@@ -6008,8 +6105,6 @@ Governance/Schema validation
 Full profile adds:
 
 ```text
-MUTATE
-ASSERT sugar (normative desugaring)
 forward local refs
 Facets
 Structural mutation
@@ -6081,7 +6176,7 @@ transaction lookup
 
 # 100. Historical Reads
 
-See [Optional-Profiles-and-Migration.md](./Optional-Profiles-and-Migration.md), §100. Historical reads are the `historical_reads` capability (§67.4): an implementation that advertises retention beyond the current head is measured against it, and one that does not is not.
+See [KIP-2.0-Optional-Profiles-and-Migration.md](./KIP-2.0-Optional-Profiles-and-Migration.md), §100. Historical reads are the `historical_reads` capability (§67.4): an implementation that advertises retention beyond the current head is measured against it, and one that does not is not.
 
 ---
 
@@ -6093,17 +6188,23 @@ See the same companion, §101. Its requirements are additive hardening over a co
 
 # 102. Required Conformance Invariants
 
-A conforming native KIP 2.0 implementation MUST preserve the 38 cross-cutting invariants registered as Part A of [Invariants.md](./Invariants.md), the single registry this Specification and the Cognitive Memory Profile share. The registry keeps this section's numbering — `§102 invariant 17` is registry row 17 — and names, for each invariant, the section that establishes it and the conformance vectors that pin it (conformance §27). The Profile's own invariants are Part B of the same registry (Profile §23).
+A conforming native KIP 2.0 implementation MUST preserve the 43 cross-cutting invariants registered as Part A of [KIP-2.0-Invariants.md](./KIP-2.0-Invariants.md), the single registry this Specification and the Cognitive Memory Profile share. The registry keeps this section's numbering — `§102 invariant 17` is registry row 17 — and names, for each invariant, the section that establishes it and the conformance vectors that pin it (conformance §27). The Profile's own invariants are Part B of the same registry (Profile §23).
 
 ---
 
 # 103. KIP 1.x Migration
 
-See [Optional-Profiles-and-Migration.md](./Optional-Profiles-and-Migration.md), §103, together with the operational guide `migration/KIP-2.0-Migration-from-1.x.md`, upstream. KIP 1.x is a compatibility and migration source, not a definition of KIP 2.0 semantics. Migration support is the `kip1_migration` capability (§67.4); `DESCRIBE COMPATIBILITY` (§63.3) is answerable only where it is advertised.
+See [KIP-2.0-Optional-Profiles-and-Migration.md](./KIP-2.0-Optional-Profiles-and-Migration.md), §103, together with the operational guide [migration/KIP-2.0-Migration-from-1.x.md](./migration/KIP-2.0-Migration-from-1.x.md). KIP 1.x is a compatibility and migration source, not a definition of KIP 2.0 semantics. Migration support is the `kip1_migration` capability (§67.4); `DESCRIBE COMPATIBILITY` (§63.3) is answerable only where it is advertised.
 
 ---
 
 # 104. Model-First Primer
+
+Business Agents using the optional Memory Interface need only the compact
+[Agent card](./brain/MemoryInterface.md). Direct KIP callers may load the
+[Recall](./brain/KIPRecall.md), [Formation](./brain/KIPFormation.md) or
+[Maintenance](./brain/KIPMaintenance.md) card as needed. The complete syntax
+reference remains available for uncommon operations and engine authors.
 
 A minimal Agent-facing KIP 2.0 primer SHOULD be derivable from META and may resemble:
 
@@ -6257,7 +6358,7 @@ path_quantifier :=
     "{" integer ("," integer?)? "}"
 ```
 
-The normative parser grammars ship with this Specification as [`grammar/KQL.ebnf`](./grammar/KQL.ebnf), [`grammar/KML.ebnf`](./grammar/KML.ebnf) and [`grammar/META.ebnf`](./grammar/META.ebnf). Where a sketch in these appendices is less complete than its EBNF, the EBNF governs syntax. Productions referenced but not spelled out here (`structural_field`, `order_clause`, `limit_clause`, `cursor_clause`, `scalar`, `value`, …) are defined in [`grammar/KQL.ebnf`](./grammar/KQL.ebnf).
+The normative parser grammars ship with this Specification as [`grammar/KIP-2.0-KQL.ebnf`](./grammar/KIP-2.0-KQL.ebnf), [`grammar/KIP-2.0-KML.ebnf`](./grammar/KIP-2.0-KML.ebnf) and [`grammar/KIP-2.0-META.ebnf`](./grammar/KIP-2.0-META.ebnf). Where a sketch in these appendices is less complete than its EBNF, the EBNF governs syntax. Productions referenced but not spelled out here (`structural_field`, `order_clause`, `limit_clause`, `cursor_clause`, `scalar`, `value`, …) are defined in [`grammar/KIP-2.0-KQL.ebnf`](./grammar/KIP-2.0-KQL.ebnf).
 
 ---
 
@@ -6763,16 +6864,18 @@ The resulting Skill does not receive executable authority automatically, and it 
 ## F.6 Outcome grading and a lifecycle verdict
 
 ```text
-decision (action_gate Activity: inputs name the Skill applied)
+decision (action_gate Activity: DecisionRecord and inputs name applied revisions)
+    ↓
+action_attempt Activity (AttemptRecord fixes attempt, revision and trial before dispatch)
     ↓
 external action / trial run
     ↓
 instrumentation (never the acting model)
     ↓
-Outcome Evidence {task_family, outcome_status}
-    + outcome_observation Activity {inputs: the decision, outputs: the outcome}
+Outcome Evidence {OutcomeRecord: attempt_ref, task_family, outcome_status, metric, window, ...}
+    + outcome_observation Activity {inputs: the attempt and decision, outputs: the outcome}
     ↓
-deterministic verdict code reads the linked outcomes against the TrialState basis
+deterministic verdict code aggregates independent attempts against the immutable TrialRecord basis
     ↓
 lifecycle_verdict Activity + one guarded UPDATE
 ```
@@ -6786,6 +6889,7 @@ CREATE ACTIVITY ?obs {
     status: "completed"
   }
   SET STRUCTURAL {
+    ("inputs", :attempt)
     ("inputs", :decision)
     ("outputs", :outcome)
     ("associated_actors", :verifier)
@@ -6793,7 +6897,7 @@ CREATE ACTIVITY ?obs {
 }
 ```
 
-The verdict, once the trial's quota of linked outcomes is reached:
+The verdict, once the trial's quota of independent eligible attempts is reached and its comparison succeeds. `:evaluation_record` pins the immutable trial, revision, selected attempts/outcomes and retained replay inputs:
 
 ```prolog
 MUTATE {
@@ -6801,9 +6905,19 @@ MUTATE {
     SET FIELDS {
       activity_class: "lifecycle_verdict",
       status: "completed",
-      parameters_digest: :rule_digest
+      parameters_digest: :parameters_digest
+    }
+    SET FACET "EvaluationRecord" {
+      trial_ref: :trial, revision_refs: [:revision],
+      from_status: "trialed", to_status: "adopted",
+      rule_digest: :rule_digest, parameters_digest: :parameters_digest,
+      cutoff: :now, attempt_refs: [:attempt_a, :attempt_b],
+      outcome_refs: [:outcome_a, :outcome_b], excluded_samples: [],
+      missing_attempt_refs: [], comparison: :comparison, replay_artifact: :replay_artifact
     }
     SET STRUCTURAL {
+      ("inputs", :trial)
+      ("inputs", :revision)
       ("inputs", :outcome_a)
       ("inputs", :outcome_b)
       ("outputs", :skill)
@@ -6813,17 +6927,25 @@ MUTATE {
   UPDATE :skill
   SET ATTRIBUTES {status: "adopted"}
   SET FACET "GradingState" {
-    success_count: 9,
-    failure_count: 2,
-    graded_count: 12,
+    revision_ref: :revision, evaluation_ref: ?verdict,
+    success_count: 2,
+    failure_count: 0,
+    graded_count: 2,
     last_verdict_at: :now
   }
   SET FACET "MnemonicState" {utility: 0.78}
   EXPECT VERSION :version OF ATTRIBUTES
+  EXPECT VERSION :grade_version OF FACET "GradingState"
+  EXPECT VERSION :mnemonic_version OF FACET "MnemonicState"
 }
 ```
 
-The promotion executes in one guarded statement: `EXPECT VERSION ... OF ATTRIBUTES` makes it safe under concurrency without being spoiled by a concurrent `MnemonicState` sweep (§35.1), the verdict Activity pins the rule (`parameters_digest`) and the graded outcomes (`inputs`), and the Skill's `TrialState` carries the basis the comparison was made against, so the transition is recomputable by an auditor. Only outcomes linked to a decision that applied the Skill are in `inputs`; the rest of the family is the baseline the trial was opened against.
+The transaction validates the immutable TrialRecord/EvaluationRecord and exact
+revision, independently aggregated attempts, comparison requirements and replay
+artifact before updating current state. Every written mutable plane is guarded;
+concurrent mnemonic writes cause a refresh rather than being overwritten.
+GradingState is a cache of this evaluation. No unlinked result is automatically
+a baseline, and a rule name alone is not a replayable verdict (Consistency §5–§6).
 
 ---
 
@@ -6959,7 +7081,7 @@ unknown?
 
 # Appendix I. Compatibility Summary
 
-Carried in [Optional-Profiles-and-Migration.md](./Optional-Profiles-and-Migration.md), Appendix I, next to §103.
+Carried in [KIP-2.0-Optional-Profiles-and-Migration.md](./KIP-2.0-Optional-Profiles-and-Migration.md), Appendix I, next to §103.
 
 ---
 

@@ -71,6 +71,7 @@ pub struct Transaction {
     pub authority: EffectiveAuthority,
     /// Who the caller is.
     pub auth: AuthContext,
+    reference_bindings: Vec<Json>,
     handles: BTreeMap<String, ElementId>,
     staged: BTreeMap<ElementId, Staged>,
     shells: Vec<ElementId>,
@@ -153,6 +154,7 @@ impl Transaction {
             authority,
             auth,
             handles: BTreeMap::new(),
+            reference_bindings: Vec::new(),
             staged: BTreeMap::new(),
             shells: Vec::new(),
             warnings: Vec::new(),
@@ -829,6 +831,10 @@ impl Transaction {
     /// A dry run never establishes a durable cognitive commit (§69.3), so it
     /// removes its own shells and journals nothing.
     pub async fn commit(mut self, entry: JournalEntry) -> Result<Outcome, KipError> {
+        if let Err(error) = self.capture_cognitive_contracts().await {
+            self.discard_shells().await;
+            return Err(error);
+        }
         if self.dry_run {
             let changes: Vec<Json> = self
                 .prepared_changes()
@@ -870,6 +876,23 @@ impl Transaction {
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element
         // five times still produces one increment.
+        let identity_changed = self
+            .staged
+            .values()
+            .any(|s| s.changed && s.op == ChangeOp::Merge);
+        if identity_changed {
+            let mut space = self.store.get_space(&self.cx.space).await?;
+            let mut versions = space.policies["_kip_identity_changes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            versions.push(Json::from(self.cx.seq));
+            if !space.policies.is_object() {
+                space.policies = serde_json::json!({});
+            }
+            space.policies["_kip_identity_changes"] = Json::Array(versions);
+            self.store.put_space(&space).await?;
+        }
         let prepared = self.prepared_changes();
         let mut changes = Vec::with_capacity(prepared.len());
         let mut written = 0usize;
@@ -968,6 +991,182 @@ impl Transaction {
         })
     }
 
+    pub(crate) fn record_reference(&mut self, supplied: &str, resolved: &str) {
+        let identity_version = self.authority.space.policies["_kip_identity_changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Json::as_u64)
+            .max()
+            .unwrap_or(0);
+        self.reference_bindings.push(serde_json::json!({
+            "supplied": supplied, "resolved": resolved, "identity_version": identity_version,
+            "path": format!("references[{}]", self.reference_bindings.len()), "op_id": self.cx.tx_id,
+        }));
+    }
+
+    async fn capture_cognitive_contracts(&mut self) -> Result<(), KipError> {
+        for staged in self
+            .staged
+            .values_mut()
+            .filter(|s| s.changed && s.op != ChangeOp::Purge)
+        {
+            if !self.reference_bindings.is_empty() {
+                let origin = staged.row.envelope_mut().origin;
+                if !origin.is_object() {
+                    *origin = serde_json::json!({});
+                }
+                if !origin["_kip_runtime"].is_object() {
+                    origin["_kip_runtime"] = serde_json::json!({});
+                }
+                origin["_kip_runtime"]["input_references"] =
+                    Json::Array(self.reference_bindings.clone());
+            }
+        }
+        let pending: Vec<_> = self
+            .staged
+            .iter()
+            .filter(|(_, s)| s.changed)
+            .map(|(id, s)| (*id, s.row.clone(), s.before.clone()))
+            .collect();
+        for (id, element, before) in pending {
+            if element.state() == state::PURGED {
+                continue;
+            }
+            let view = crate::view::render(&element);
+            let old_view = before.as_ref().map(crate::view::render);
+            crate::schema::contracts::validate_record(&self.env, &view, old_view.as_ref())?;
+            let Element::Activity(activity) = element else {
+                continue;
+            };
+            if !matches!(
+                activity.status.as_str(),
+                "completed" | "failed" | "cancelled"
+            ) {
+                continue;
+            }
+            if matches!(before, Some(Element::Activity(ref row)) if matches!(row.status.as_str(), "completed" | "failed" | "cancelled"))
+            {
+                continue;
+            }
+            let contract = activity
+                .facets
+                .iter()
+                .find(|(name, _)| name.ends_with("/DependencyBasis"))
+                .map(|(_, value)| value);
+            let mut inputs = Map::new();
+            if let Some(contract) = contract {
+                let seq = contract["basis_seq"].as_u64().ok_or_else(|| {
+                    KipError::constraint_violation("DependencyBasis needs basis_seq")
+                })?;
+                if seq > self.cx.seq.saturating_sub(1) {
+                    return Err(KipError::constraint_violation(
+                        "DependencyBasis cannot name a future snapshot",
+                    ));
+                }
+                for group in contract["groups"].as_array().into_iter().flatten() {
+                    for pin in group["pins"].as_array().into_iter().flatten() {
+                        let source = pin["id"].as_str().unwrap_or("").parse::<ElementId>()?;
+                        let expected = pin["version"].as_u64().unwrap_or(0);
+                        let retained =
+                            if let Some(staged) = self.staged.get(&source).filter(|s| s.is_new) {
+                                let mut value = crate::view::render(&staged.row);
+                                value["_system"]["version"] = Json::from(1);
+                                value["_system"]["plane_versions"] =
+                                    serde_json::to_value(planes::initial(&staged.row)).unwrap();
+                                value
+                            } else {
+                                let row = self
+                                    .store
+                                    .element_at(&self.cx.space, source, seq)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        KipError::constraint_violation(
+                                            "DependencyBasis source version is unavailable",
+                                        )
+                                    })?;
+                                self.authority
+                                    .authorize(
+                                        Permission::Read,
+                                        &crate::governance::ResourceContext::of_element(&row),
+                                        &self.auth,
+                                    )
+                                    .into_result()?;
+                                crate::view::render(&row)
+                            };
+                        if retained["_system"]["version"].as_u64() != Some(expected) {
+                            return Err(KipError::version_conflict(
+                                "DependencyBasis must pin the version actually read",
+                            ));
+                        }
+                        if let Some(pins) = pin["planes"].as_object() {
+                            for (plane, version) in pins {
+                                if crate::schema::contracts::pinned_plane(
+                                    &retained["_system"]["plane_versions"],
+                                    plane,
+                                ) != version.as_u64()
+                                {
+                                    return Err(KipError::version_conflict(
+                                        "DependencyBasis plane pin does not match retained input",
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(old) = inputs.insert(source.to_string(), Json::from(expected))
+                            && old != expected
+                        {
+                            return Err(KipError::constraint_violation(
+                                "conflicting DependencyBasis pins",
+                            ));
+                        }
+                    }
+                }
+            }
+            for reference in &activity.inputs {
+                let Some(source) = reference_id(reference) else {
+                    continue;
+                };
+                if inputs.contains_key(&source.to_string()) {
+                    continue;
+                }
+                if contract.is_some() {
+                    return Err(KipError::constraint_violation(
+                        "derived Activity input is missing its read pin",
+                    ));
+                }
+                let version = if let Some(staged) = self.staged.get(&source) {
+                    staged.before.as_ref().map_or(1, Element::version)
+                } else {
+                    self.store.get_element(source).await?.version()
+                };
+                inputs.insert(source.to_string(), Json::from(version));
+            }
+            let mut outputs = Map::new();
+            for reference in &activity.outputs {
+                let Some(target) = reference_id(reference) else {
+                    continue;
+                };
+                let version = if let Some(staged) = self.staged.get(&target).filter(|s| s.changed) {
+                    prepare(target, staged).entry.new_version
+                } else {
+                    self.store.get_element(target).await?.version()
+                };
+                outputs.insert(target.to_string(), Json::from(version));
+            }
+            if let Element::Activity(row) = &mut self.staged.get_mut(&id).unwrap().row {
+                if !row.origin.is_object() {
+                    row.origin = serde_json::json!({});
+                }
+                if !row.origin["_kip_runtime"].is_object() {
+                    row.origin["_kip_runtime"] = serde_json::json!({});
+                }
+                row.origin["_kip_runtime"]["input_versions"] = Json::Object(inputs);
+                row.origin["_kip_runtime"]["output_versions"] = Json::Object(outputs);
+            }
+        }
+        Ok(())
+    }
+
     /// Who this commit is attributed to (§33.2).
     fn receipt_origin(&self) -> ReceiptOrigin {
         ReceiptOrigin {
@@ -1018,7 +1217,11 @@ impl Transaction {
                 // here and who wrote it — and the version log that would
                 // otherwise answer that has just been destroyed.
                 if !keep_origin {
+                    let runtime = row.origin.get("_kip_runtime").cloned();
                     row.origin = self.cx.origin.clone();
+                    if let Some(runtime) = runtime {
+                        row.origin["_kip_runtime"] = runtime;
+                    }
                 }
                 if is_new {
                     row.created_at = self.cx.at.clone();
@@ -1233,7 +1436,7 @@ pub(crate) fn digest_of(value: &Json) -> String {
     let canonical = anda_kip::canonical_json(value);
     format!(
         "{}:{}",
-        crate::capsule::DIGEST_PROFILE,
+        "sha3-256",
         hex::encode(Sha3_256::digest(canonical.as_bytes()))
     )
 }
@@ -1343,6 +1546,13 @@ impl Store {
         }
         Ok(removed)
     }
+}
+
+fn reference_id(value: &Json) -> Option<ElementId> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(Json::as_str))
+        .and_then(|id| id.parse().ok())
 }
 
 #[cfg(test)]

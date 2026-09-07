@@ -1,3 +1,4 @@
+import { parseCanonicalJson } from '@ldclabs/kip-lang'
 /**
  * The Durable Object a host deploys.
  *
@@ -13,7 +14,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { DIGEST_PROFILE } from './capsule/index.js'
+import { RECEIPT_DIGEST_ALGORITHM } from './receipt.js'
 import { sha3_256Text } from './digest.js'
 import { KipError, errors, type KipErrorJSON } from './errors.js'
 import { canonicalJson, type Json, type JsonMap } from './json.js'
@@ -370,7 +371,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     const readonly = new URL(request.url).pathname.endsWith('/readonly')
     let body: unknown
     try {
-      body = await request.json()
+      body = parseCanonicalJson(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await request.arrayBuffer()))
     } catch {
       return this.envelope(
         { error: new KipError('InvalidRequestEnvelope', 'the body is not JSON').toJSON() },
@@ -561,7 +562,7 @@ export function receiptOf(outcome: Outcome, auth: AuthContext): KipReceipt {
       delegation_digest:
         auth.delegation_chain.length === 0
           ? null
-          : `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(auth.delegation_chain))}`,
+          : `${RECEIPT_DIGEST_ALGORITHM}:${sha3_256Text(canonicalJson(auth.delegation_chain))}`,
     },
   }
   return {

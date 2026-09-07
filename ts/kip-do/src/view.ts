@@ -61,6 +61,8 @@ function present(map: Record<string, Json | undefined>): JsonMap {
 
 /** The `id`, `kind` and `_system` block every element carries. */
 function envelope(id: ElementId, row: Envelope): JsonMap {
+  const { _kip_runtime, ...origin } = row.origin
+  const runtime = (_kip_runtime ?? {}) as JsonMap
   return present({
     id: formatElementId(id),
     // Lowercase, as the wire tag: `?c.kind` answers "concept", not "Concept".
@@ -80,7 +82,10 @@ function envelope(id: ElementId, row: Envelope): JsonMap {
       updated_tx: row.updated_tx,
       state: row.state,
       space_seq: row.seq,
-      origin: row.origin,
+      origin,
+      input_references: runtime.input_references,
+      input_versions: runtime.input_versions,
+      output_versions: runtime.output_versions,
     }),
     structural: row.structural,
   })

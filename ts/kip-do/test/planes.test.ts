@@ -171,7 +171,7 @@ describe('version planes', () => {
       const twice = refused(() =>
         nexus.execute(
           'UPDATE "C-1" SET FIELDS {name: "B"} EXPECT VERSION 1 OF FACET :a EXPECT VERSION 1 OF FACET :b',
-          { a: 'MnemonicState', b: 'kip://profiles/cognitive-memory@2.0.0/MnemonicState' },
+          { a: 'MnemonicState', b: 'kip://profiles/cognitive-memory@2.1.0/MnemonicState' },
         ),
       )
       expect(twice.code).toBe('InvalidSyntax')
@@ -195,14 +195,14 @@ describe('version planes', () => {
           op: 'create',
           kind: 'concept',
           id: 'C-1',
-          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Person',
+          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Person',
           new_version: 1,
         },
         {
           op: 'create',
           kind: 'concept',
           id: 'C-2',
-          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Preference',
+          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Preference',
           new_version: 1,
         },
         {
@@ -212,7 +212,7 @@ describe('version planes', () => {
           new_version: 1,
           refs: {
             subject: 'C-1',
-            predicate_ref: 'kip://profiles/cognitive-memory@2.0.0/prefers',
+            predicate_ref: 'kip://profiles/cognitive-memory@2.1.0/prefers',
           },
         },
       ])
@@ -226,7 +226,7 @@ describe('version planes', () => {
           op: 'update',
           kind: 'concept',
           id: 'C-2',
-          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Preference',
+          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Preference',
           old_version: 1,
           new_version: 2,
           // Names only, never values (§36.1), and sorted: the same commit

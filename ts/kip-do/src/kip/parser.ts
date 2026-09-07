@@ -1,3 +1,4 @@
+import { canonicalJson } from '../json.js'
 /**
  * Bridge to the KIP grammar.
  *
@@ -99,6 +100,7 @@ function parseProgram(source: string): Program {
 export function parseKip(source: string): Command {
   try {
     const command = lower(parseProgram(source))
+    checkPortableAst(command)
     checkSemantics(command)
     return command
   } catch (err) {
@@ -142,7 +144,7 @@ export function parseKipBatch(
 export function parseKipAll(source: string): Command[] {
   try {
     const commands = lowerAll(parseProgram(source))
-    for (const command of commands) checkSemantics(command)
+    for (const command of commands) { checkPortableAst(command); checkSemantics(command) }
     return commands
   } catch (err) {
     throw toKipError(err)
@@ -168,4 +170,9 @@ export function parserVersion(): string {
  */
 export function specRevision(): string {
   return KIP_SPEC_REVISION
+}
+
+/** The toolkit lowering validates numbers; the engine also checks scalar strings. */
+function checkPortableAst(command: Command): void {
+  try { canonicalJson(command) } catch (error) { throw errors.invalidSyntax(`invalid portable KIP value: ${String(error)}`) }
 }

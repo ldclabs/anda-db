@@ -1,3 +1,6 @@
+import { canonicalize, parseCanonicalJson } from '@ldclabs/kip-lang'
+export { parseCanonicalJson } from '@ldclabs/kip-lang'
+
 /**
  * The JSON value model, and the one canonical way to write it down.
  *
@@ -43,41 +46,28 @@ export function isJsonArray(value: unknown): value is Json[] {
  * `JSON.stringify`, and a top-level one is written as `null` rather than
  * returning the string `"undefined"`.
  *
- * This is deliberately *not* presented as the KIP canonicalization profile:
- * the spec's profile is still a draft, and the Rust engine's
- * `store::schema::content_digest` makes the same reservation.
+ * Uses kip-jcs-safe-v1: UTF-16 key order, ECMAScript number formatting,
+ * safe integral values, scalar strings and no Unicode normalization.
  */
 export function canonicalJson(value: unknown): string {
-  if (value === undefined || value === null) return 'null'
-  if (typeof value === 'number') {
-    // NaN and ±Infinity have no JSON spelling; `JSON.stringify` writes them as
-    // `null`, which would make two different values digest identically.
-    if (!Number.isFinite(value)) {
-      throw new TypeError(`${value} has no canonical JSON form`)
+  // Internal rows have optional undefined members. Remove only those object
+  // members before the strict canonicalizer checks the portable JSON domain.
+  function present(item: unknown): unknown {
+    if (Array.isArray(item)) return item.map(present)
+    if (item && typeof item === 'object' &&
+        (Object.getPrototypeOf(item) === Object.prototype || Object.getPrototypeOf(item) === null)) {
+      return Object.fromEntries(Object.entries(item).filter(([, v]) => v !== undefined)
+        .map(([k, v]) => [k, present(v)]))
     }
-    return JSON.stringify(value)
+    return item
   }
-  if (typeof value === 'boolean' || typeof value === 'string') {
-    return JSON.stringify(value)
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(',')}]`
-  }
-  if (typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    return `{${entries
-      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`)
-      .join(',')}}`
-  }
-  throw new TypeError(`${typeof value} has no canonical JSON form`)
+  return canonicalize(value === undefined ? null : present(value))
 }
 
 /** Parses stored JSON text, returning `fallback` for an empty or absent column. */
 export function parseJson<T extends Json>(text: string | null, fallback: T): T {
   if (text === null || text.length === 0) return fallback
-  return JSON.parse(text) as T
+  return parseCanonicalJson(text) as T
 }
 
 /**

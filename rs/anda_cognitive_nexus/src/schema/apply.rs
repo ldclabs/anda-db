@@ -256,6 +256,9 @@ impl SchemaEnvironment {
         let def = self.concept_type_def(&symbol)?;
         let mut result =
             validate::validate_attributes(&symbol.to_string(), &def.attributes, attributes);
+        if let Some(schema) = def.extra.get("value_schema") {
+            super::contracts::validate_value(schema, &Json::Object(attributes.clone()))?;
+        }
         // The carrier's own type is part of the facts: a Facet declaring
         // `concept_types` is state about *those* Concepts, and a carrier whose
         // type was never supplied would make that half of the declaration
@@ -381,7 +384,7 @@ mod tests {
             Arc::new(package),
         )]);
         let mut lock = SchemaLock::default();
-        lock.packages.insert(PROFILE.into(), "2.0.0".into());
+        lock.packages.insert(PROFILE.into(), "2.1.0".into());
         lock.states.insert(PROFILE.into(), PackageState::Active);
         SchemaEnvironment::resolve(1, lock, &available).unwrap()
     }
@@ -400,7 +403,7 @@ mod tests {
     fn person() -> EndpointFacts {
         EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.0.0/Person")),
+            schema_ref: Some(format!("{PROFILE}@2.1.0/Person")),
         }
     }
 
@@ -416,7 +419,7 @@ mod tests {
                 Intent::Write,
             )
             .unwrap();
-        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.0.0/Person"));
+        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.1.0/Person"));
         assert!(result.is_valid());
     }
 
@@ -428,7 +431,7 @@ mod tests {
         let env = env();
         let dark = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.0.0/Preference")),
+            schema_ref: Some(format!("{PROFILE}@2.1.0/Preference")),
         };
         for _ in 0..2 {
             let (_, result) = env
@@ -455,7 +458,7 @@ mod tests {
 
         let wrong_subject = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.0.0/Event")),
+            schema_ref: Some(format!("{PROFILE}@2.1.0/Event")),
         };
         let (_, result) = env
             .prepare_proposition(
@@ -638,20 +641,20 @@ mod tests {
         // carrier's *kind* would leave half the declaration unenforceable, and
         // a Person carrying it would read as a grade nobody awarded.
         let env = env();
-        let skill = format!("{PROFILE}@2.0.0/Skill");
+        let skill = format!("{PROFILE}@2.1.0/Skill");
         let ok = env
             .validate_facets(
-                &map(json!({"GradingState": {"graded_count": 3}})),
+                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
                 &concept_carrier(Some(&skill)),
                 Intent::Write,
             )
             .unwrap();
         assert!(ok.is_valid());
 
-        let person = format!("{PROFILE}@2.0.0/Person");
+        let person = format!("{PROFILE}@2.1.0/Person");
         let wrong = env
             .validate_facets(
-                &map(json!({"GradingState": {"graded_count": 3}})),
+                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
                 &concept_carrier(Some(&person)),
                 Intent::Write,
             )
@@ -662,7 +665,7 @@ mod tests {
         // type, so it is not refused on that ground.
         let unknown = env
             .validate_facets(
-                &map(json!({"GradingState": {"graded_count": 3}})),
+                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
                 &concept_carrier(None),
                 Intent::Write,
             )
@@ -675,14 +678,14 @@ mod tests {
         let env = env();
         let experience = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.0.0/Experience")),
+            schema_ref: Some(format!("{PROFILE}@2.1.0/Experience")),
         };
         let step = |id: &str| {
             (
                 id.to_string(),
                 EndpointFacts::Element {
                     kind: ElementKind::Concept,
-                    schema_ref: Some(format!("{PROFILE}@2.0.0/ExperienceStep")),
+                    schema_ref: Some(format!("{PROFILE}@2.1.0/ExperienceStep")),
                 },
             )
         };
@@ -695,7 +698,7 @@ mod tests {
                 Intent::Write,
             )
             .unwrap();
-        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.0.0/has_step"));
+        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.1.0/has_step"));
         assert!(ok.is_valid());
 
         let (_, duplicated) = env
@@ -716,7 +719,7 @@ mod tests {
                     "C-9".to_string(),
                     EndpointFacts::Element {
                         kind: ElementKind::Concept,
-                        schema_ref: Some(format!("{PROFILE}@2.0.0/Person")),
+                        schema_ref: Some(format!("{PROFILE}@2.1.0/Person")),
                     },
                 )],
                 Intent::Write,

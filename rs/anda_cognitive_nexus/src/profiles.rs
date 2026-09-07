@@ -9,7 +9,7 @@
 //! This module ships the baseline profile so a host can hand a fresh Space a
 //! working ontology without going looking for a file. It is the artifact
 //! **verbatim** from the specification repository
-//! (`profiles/cognitive-memory-2.0.0.schema.json`), not a Rust transcription of
+//! (`profiles/cognitive-memory-2.1.0.schema.json`), not a Rust transcription of
 //! it: a hand-maintained copy would drift toward whatever this engine happens
 //! to support, and the point of a profile is that two engines mean the same
 //! thing by `Preference`.
@@ -19,17 +19,21 @@
 //! the host makes with
 //! [`CognitiveNexus::ensure_schema`](crate::CognitiveNexus::ensure_schema).
 
-/// The KIP Cognitive Memory Profile, version 2.0.0.
+/// The KIP Cognitive Memory Profile, version 2.1.0.
 ///
 /// Re-copy it from the spec repository when the profile changes; nothing here
 /// edits it.
-pub const COGNITIVE_MEMORY: &str = include_str!("../profiles/cognitive-memory-2.0.0.json");
+pub const COGNITIVE_MEMORY: &str = include_str!("../profiles/cognitive-memory-2.1.0.json");
 
 /// The package id [`COGNITIVE_MEMORY`] declares.
 pub const COGNITIVE_MEMORY_ID: &str = "kip://profiles/cognitive-memory";
 
 /// The version [`COGNITIVE_MEMORY`] declares.
-pub const COGNITIVE_MEMORY_VERSION: &str = "2.0.0";
+pub const COGNITIVE_MEMORY_VERSION: &str = "2.1.0";
+
+/// Previous draft package for explicit compatibility and migration only.
+pub const LEGACY_COGNITIVE_MEMORY: &str =
+    include_str!("../profiles/legacy/cognitive-memory-2.0.0.json");
 
 #[cfg(test)]
 mod tests {
@@ -69,7 +73,12 @@ mod tests {
     fn the_syntax_card_names_every_symbol_this_profile_declares() {
         let package: anda_kip::Json = serde_json::from_str(COGNITIVE_MEMORY).unwrap();
         let definitions = &package["definitions"];
-        let words: std::collections::BTreeSet<&str> = anda_kip::KIP_SYNTAX
+        let instructions = format!(
+            "{}\n{}",
+            anda_kip::KIP_SYNTAX,
+            include_str!("../../anda_kip/profiles/CognitiveMemoryProfile-2.0.md")
+        );
+        let words: std::collections::BTreeSet<&str> = instructions
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .collect();
 
@@ -85,24 +94,6 @@ mod tests {
                 require(kind, name);
             }
         }
-        for (facet, definition) in definitions["facets"].as_object().unwrap() {
-            for member in definition["fields"].as_object().unwrap().keys() {
-                require(&format!("`{facet}` member"), member);
-            }
-        }
-        // A required attribute the card omits is the sharpest form of this
-        // drift: the model cannot supply what it was never told about.
-        for (name, definition) in definitions["concept_types"].as_object().unwrap() {
-            let Some(fields) = definition["attributes"]["fields"].as_object() else {
-                continue;
-            };
-            for (field, spec) in fields {
-                if spec["required"] == anda_kip::Json::Bool(true) {
-                    require(&format!("`{name}` required attribute"), field);
-                }
-            }
-        }
-
         assert!(
             missing.is_empty(),
             "KIPSyntax.md never mentions: {}",

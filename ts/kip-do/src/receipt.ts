@@ -4,11 +4,11 @@
  * what the digest covers — the Receipt without `receipt_digest`, `proofs` and
  * `extensions`, in canonical JSON.
  */
-import { DIGEST_PROFILE } from './capsule/index.js'
+export const RECEIPT_DIGEST_ALGORITHM = 'sha3-256'
 import { sha3_256Text } from './digest.js'
 import { canonicalJson, type JsonMap } from './json.js'
 
 export function receiptDigest(receipt: JsonMap): string {
   const { receipt_digest: _digest, proofs: _proofs, extensions: _extensions, ...bare } = receipt
-  return `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(bare))}`
+  return `${RECEIPT_DIGEST_ALGORITHM}:${sha3_256Text(canonicalJson(bare))}`
 }

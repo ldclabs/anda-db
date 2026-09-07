@@ -218,7 +218,7 @@ describe('KQL', () => {
 
   it('resolves a local type name to its exact symbol on the read side too', async () => {
     await withNexus('symbols', (nexus) => {
-      const CM = 'kip://profiles/cognitive-memory@2.0.0'
+      const CM = 'kip://profiles/cognitive-memory@2.1.0'
       expect(
         nexus.query(`FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: "Alice"} }`),
       ).toEqual([`${CM}/Person`])

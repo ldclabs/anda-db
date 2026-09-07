@@ -36,7 +36,7 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -107,7 +107,7 @@ async fn a_concept_pattern_finds_by_type_and_projects_dot_paths() {
     // index, so writing the canonical form finds the same Concepts.
     let qualified = ok(
         &nexus,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "kip://profiles/cognitive-memory@2.0.0/Person"} }
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "kip://profiles/cognitive-memory@2.1.0/Person"} }
            ORDER BY ?c.name"#,
     )
     .await;
@@ -133,7 +133,7 @@ async fn a_bare_variable_projects_the_whole_element() {
     assert_eq!(concept["_system"]["version"], 1);
     assert_eq!(
         concept["schema_ref"],
-        "kip://profiles/cognitive-memory@2.0.0/Person"
+        "kip://profiles/cognitive-memory@2.1.0/Person"
     );
 }
 

@@ -262,7 +262,7 @@
               "kind": "concept",
               "id": "C:<1>",
               "new_version": 1,
-              "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person"
+              "schema_ref": "kip://profiles/cognitive-memory@2.1.0/Person"
             }
           ]
         }

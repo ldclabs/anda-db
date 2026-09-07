@@ -9,7 +9,7 @@
 //! Governance.
 //!
 //! The structs below mirror the shipped artifact format — the same JSON as
-//! `KIP/v2/profiles/cognitive-memory-2.0.0.schema.json`, which the tests parse
+//! `KIP/v2/profiles/cognitive-memory-2.1.0.schema.json`, which the tests parse
 //! rather than a hand-written imitation of it.
 //!
 //! Everything is `#[serde(default)]` and unknown fields are kept: a package
@@ -26,6 +26,9 @@ use super::symbol::{PackageRef, SymbolKind, SymbolRef};
 /// A published Schema Package.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SchemaPackage {
+    /// Original artifact bytes as JSON; preserves omitted defaults for digest verification.
+    #[serde(skip)]
+    pub source: Option<Json>,
     /// The artifact format tag, e.g. `KIP-Schema-Package`.
     #[serde(default)]
     pub format: String,
@@ -182,6 +185,8 @@ pub struct ConceptTypeDef {
 /// The attribute contract of a Concept type (§34–§40).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AttributeSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_schema: Option<Json>,
     /// Whether attributes not named here are permitted (§37).
     #[serde(default)]
     pub open: bool,
@@ -435,14 +440,33 @@ pub struct Cardinality {
 impl SchemaPackage {
     /// Parses an artifact and checks the identity it declares is coherent.
     pub fn parse(source: &str) -> Result<Self, KipError> {
-        let package: SchemaPackage = serde_json::from_str(source).map_err(|err| {
+        let value = anda_kip::parse_canonical_json(source)
+            .map_err(|e| KipError::new(anda_kip::KipErrorCode::ArtifactParseError, e.message))?;
+        let mut package: SchemaPackage = serde_json::from_value(value.clone()).map_err(|err| {
             KipError::new(
                 anda_kip::KipErrorCode::ArtifactParseError,
                 format!("this is not a readable Schema Package artifact: {err}"),
             )
         })?;
         package.package_ref()?;
+        package.source = Some(value);
         Ok(package)
+    }
+
+    /// Preserve the original JSON shape unless the caller changed the model.
+    pub fn artifact(&self) -> Result<Json, KipError> {
+        let current = serde_json::to_value(self).map_err(|e| {
+            KipError::new(anda_kip::KipErrorCode::ArtifactParseError, e.to_string())
+        })?;
+        if let Some(source) = &self.source {
+            let original: Self = serde_json::from_value(source.clone()).map_err(|e| {
+                KipError::new(anda_kip::KipErrorCode::ArtifactParseError, e.to_string())
+            })?;
+            if serde_json::to_value(original).ok().as_ref() == Some(&current) {
+                return Ok(source.clone());
+            }
+        }
+        Ok(current)
     }
 
     /// The package's exact identity.
@@ -548,7 +572,7 @@ mod tests {
         assert_eq!(package.format, "KIP-Schema-Package");
         assert_eq!(
             package.package_ref().unwrap().to_string(),
-            "kip://profiles/cognitive-memory@2.0.0"
+            "kip://profiles/cognitive-memory@2.1.0"
         );
         // It depends on Core, exactly.
         let core = &package.dependencies[0];
@@ -573,7 +597,7 @@ mod tests {
         assert!(!prefers.complete);
         assert_eq!(
             prefers.subject.concept_types,
-            vec!["kip://profiles/cognitive-memory@2.0.0/Person"]
+            vec!["kip://profiles/cognitive-memory@2.1.0/Person"]
         );
         assert_eq!(prefers.object.kinds, vec!["Concept"]);
     }

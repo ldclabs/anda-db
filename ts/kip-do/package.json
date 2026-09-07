@@ -49,9 +49,10 @@
     "codegen:oracle-corpus": "node scripts/codegen-oracle-corpus.mjs",
     "codegen:profiles": "node scripts/codegen-profiles.mjs",
     "codegen:fixtures": "node scripts/codegen-fixtures.mjs",
-    "codegen": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run codegen:fixtures && pnpm run codegen:oracle-corpus",
-    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run build",
-    "ncu": "npx npm-check-updates -u"
+    "codegen": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run codegen:contracts && pnpm run codegen:fixtures && pnpm run codegen:oracle-corpus",
+    "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run codegen:contracts && pnpm run build",
+    "ncu": "npx npm-check-updates -u",
+    "codegen:contracts": "node scripts/codegen-contracts.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
@@ -64,6 +65,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@ldclabs/kip-lang": "^2.2.0"
+    "@ldclabs/kip-lang": "^2.3.1",
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1"
   }
 }

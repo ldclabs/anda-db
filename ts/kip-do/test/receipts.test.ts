@@ -351,7 +351,7 @@ describe('receipts', () => {
             evidence_class: 'outcome',
             payload: 'deploy 41 went fine',
             facets: {
-              OutcomeRecord: { task_family: 'deploy/pre-flight', outcome_status: 'success' },
+              OutcomeRecord: { task_family: 'deploy/pre-flight', outcome_status: 'success', attempt_ref: null, metric: 'completion', window: 'run', terminal: true, observation_key: 'deploy-41', observer_config_digest: 'sha256:' + '0'.repeat(64) },
             },
           },
         ],

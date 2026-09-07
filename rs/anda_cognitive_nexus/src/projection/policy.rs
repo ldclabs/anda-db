@@ -23,13 +23,17 @@ use anda_kip::{AssertionMode, Json, KipError, Map};
 pub const BASELINE_ID: &str = "kip:policy:baseline";
 /// The baseline policy's version. Any change to the constants below is a new
 /// version, because it changes what a past "accepted" would have meant.
-pub const BASELINE_VERSION: u64 = 1;
+pub const BASELINE_VERSION: u64 = 2;
 
 /// The knobs a projection runs under.
 #[derive(Clone, Debug)]
 pub struct Policy {
     /// The policy's name, reported with every answer.
     pub id: String,
+    pub explicit_selection: bool,
+    pub context_refs: Vec<String>,
+    pub purpose: String,
+    pub risk: String,
     /// The policy's version.
     pub version: u64,
     /// The modes eligible for this projection.
@@ -95,6 +99,10 @@ impl Policy {
     pub fn baseline() -> Self {
         Self {
             id: BASELINE_ID.to_string(),
+            explicit_selection: false,
+            context_refs: Vec::new(),
+            purpose: String::new(),
+            risk: String::new(),
             version: BASELINE_VERSION,
             modes: vec![
                 AssertionMode::Observed,
@@ -152,6 +160,7 @@ impl Policy {
             }
         };
 
+        policy.explicit_selection = settings.get("policy").is_some_and(Json::is_string);
         let mut overridden = false;
         if let Some(value) = threshold(settings, "accept")? {
             policy.accept = value;
@@ -192,6 +201,30 @@ impl Policy {
         if let Some(level) = settings.get("explanation") {
             policy.explanation = Explanation::parse(level)?;
             overridden = true;
+        }
+        if let Some(value) = settings.get("context_refs") {
+            policy.context_refs =
+                serde_json::from_value::<Vec<String>>(value.clone()).map_err(|_| {
+                    KipError::type_mismatch("context_refs must be exact reference strings")
+                })?;
+            if policy.context_refs.iter().any(|s| s.is_empty()) {
+                return Err(KipError::type_mismatch(
+                    "context_refs must not contain empty references",
+                ));
+            }
+            policy.context_refs.sort();
+            policy.context_refs.dedup();
+        }
+        for (name, target) in [("purpose", &mut policy.purpose), ("risk", &mut policy.risk)] {
+            if let Some(value) = settings.get(name) {
+                *target = value
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        KipError::type_mismatch(format!("{name} must be a nonempty string"))
+                    })?
+                    .to_string();
+            }
         }
         // `purpose` and `risk` are the caller's own non-authoritative context
         // (§71): they reach Governance through the request envelope, where a
@@ -265,6 +298,7 @@ const EPISTEMIC_SETTINGS: &[&str] = &[
     "explanation",
     "purpose",
     "risk",
+    "context_refs",
 ];
 
 fn flag(settings: &Map<String, Json>, key: &str) -> Result<Option<bool>, KipError> {

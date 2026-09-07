@@ -1,5 +1,8 @@
 # @ldclabs/kip-do
 
+Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+[synchronization and compatibility notes](../../docs/kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+
 A [KIP](https://github.com/ldclabs/KIP) Cognitive Nexus running inside a
 SQLite-backed **Cloudflare Durable Object**. One Nexus per Durable Object.
 

@@ -701,12 +701,21 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ("watch_evaluation", false, None),
     ("list_dependents", true, None),
     ("payload_purge", true, None),
+    ("identity_repair", false, None),
+    ("dependency_validity", false, None),
+    ("durable_brain_runtime", false, None),
     ("capsule_export", true, None),
     ("capsule_import", true, None),
     ("capsule_signatures", false, None),
     ("derive_permission", false, None),
     ("record_outcome_permission", true, None),
     ("kip1_migration", true, None),
+    ("memory_interface", false, None),
+    ("memory_basic", false, None),
+    ("memory_experience", false, None),
+    ("memory_learning", false, None),
+    ("memory_durable", false, None),
+    ("memory_exchange", false, None),
 ];
 
 /// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4).

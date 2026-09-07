@@ -163,6 +163,16 @@ fn validate_field(
     value: &Json,
     into: &mut Validation,
 ) {
+    if let Some(schema) = spec.extra.get("value_schema")
+        && let Err(err) = super::contracts::validate_value(schema, value)
+    {
+        into.push(error(
+            "SCHEMA_VALUE_NOT_ALLOWED",
+            schema_ref,
+            path,
+            err.message,
+        ));
+    }
     if !matches_type(&spec.r#type, value) {
         into.push(error(
             "SCHEMA_TYPE_MISMATCH",
@@ -273,6 +283,17 @@ pub fn validate_attributes(
         attributes,
         &mut result,
     );
+    if let Some(schema) = &spec.value_schema
+        && let Err(err) =
+            super::contracts::validate_value(schema, &Json::Object(attributes.clone()))
+    {
+        result.push(error(
+            "SCHEMA_VALUE_NOT_ALLOWED",
+            schema_ref,
+            "attributes",
+            err.message,
+        ));
+    }
     result
 }
 
@@ -364,6 +385,16 @@ pub fn validate_facet(schema_ref: &str, def: &FacetDef, values: &Map<String, Jso
         values,
         &mut result,
     );
+    if let Some(schema) = def.extra.get("value_schema")
+        && let Err(err) = super::contracts::validate_value(schema, &Json::Object(values.clone()))
+    {
+        result.push(error(
+            "SCHEMA_VALUE_NOT_ALLOWED",
+            schema_ref,
+            "facets",
+            err.message,
+        ));
+    }
     result
 }
 

@@ -102,6 +102,9 @@ pub async fn export(
 
     let mut records = CapsuleRecords::default();
     let mut schema_refs: BTreeSet<String> = BTreeSet::new();
+    let mut omitted = Vec::new();
+    let mut included = BTreeSet::new();
+    let mut source_control = Map::new();
     for id in &ids {
         let Some(_) = cx.load(*id).await? else {
             continue;
@@ -118,7 +121,58 @@ pub async fn export(
             continue;
         };
         collect_schema_refs(&rendered, &mut schema_refs);
-        let rendered = rendered.as_ref().clone();
+        let mut rendered = rendered.as_ref().clone();
+        if let Some(object) = rendered.as_object_mut() {
+            object.remove("canonical_subject");
+            object.remove("canonical_object");
+        }
+        if let Some(governance) = rendered["governance"].as_object_mut() {
+            let extra: Map<String, Json> = governance
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "classification" | "authority_class" | "policy_ref"
+                    )
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            governance.retain(|k, _| {
+                matches!(
+                    k.as_str(),
+                    "classification" | "authority_class" | "policy_ref"
+                )
+            });
+            if !extra.is_empty() {
+                source_control.insert(id.to_string(), Json::Object(extra));
+            }
+        }
+        if crate::schema::contracts::validate_value(
+            &serde_json::json!({"$ref":"urn:kip:2.0:schema:element"}),
+            &rendered,
+        )
+        .is_err()
+        {
+            if closure == Closure::Closed {
+                return Err(KipError::constraint_violation(
+                    "closed Capsule requires complete, visible canonical element fields",
+                ));
+            }
+            omitted.push(ExternalRef {
+                reference: id.to_string(),
+                kind: if rendered["_system"]["origin"]["redacted"] == true
+                    || rendered.get("_system").is_none()
+                {
+                    ExternalRefKind::Redacted
+                } else {
+                    ExternalRefKind::Unavailable
+                },
+                identity: Some(serde_json::json!({"id": id.to_string()})),
+                reason: None,
+            });
+            continue;
+        }
+        included.insert(*id);
         match id.kind {
             ElementKind::Concept => records.concepts.push(rendered),
             ElementKind::Proposition => records.propositions.push(rendered),
@@ -133,13 +187,13 @@ pub async fn export(
     // the destination believes is whole — an Assertion whose Evidence is
     // silently gone reads as an unsupported claim rather than a partial
     // import.
-    let mut external_refs = Vec::new();
+    let mut external_refs = omitted;
     for id in &ids {
         let Some(element) = cx.load(*id).await? else {
             continue;
         };
         for referenced in element.references() {
-            if ids.contains(&referenced) {
+            if included.contains(&referenced) {
                 continue;
             }
             external_refs.push(ExternalRef {
@@ -173,12 +227,15 @@ pub async fn export(
     let payload = CapsulePayload {
         manifest: CapsuleManifest {
             kind: CapsuleKind::Snapshot,
-            created_at: Some(crate::time::now()),
+            created_at: None,
+            roots: ids.iter().map(ToString::to_string).collect(),
+            base_seq: None,
+            target_seq: None,
             // `partial` unless the closure ran and nothing was dropped: a
             // Capsule that claimed completeness it does not have would import
             // as a graph the destination believes is whole.
-            completeness: Some(closure.completeness().to_string()),
-            closure: Some(serde_json::json!({"mode": closure.as_str(), "provenance_depth": depth})),
+            completeness: None,
+            closure: closure.as_str().into(),
         },
         source: CapsuleSource {
             nexus_id: Some(cx.store.db.name().to_string()),
@@ -198,8 +255,15 @@ pub async fn export(
         },
         records,
         external_refs,
-        blobs: vec![],
-        handling: None,
+        blobs: BTreeMap::new(),
+        handling: anda_kip::CapsuleHandling {
+            extra: if source_control.is_empty() {
+                Map::new()
+            } else {
+                Map::from_iter([("anda/source_control".into(), Json::Object(source_control))])
+            },
+            ..Default::default()
+        },
         extensions: Map::new(),
     };
 
@@ -207,6 +271,7 @@ pub async fn export(
     Ok(Capsule::new(
         payload,
         CapsuleIntegrity {
+            digest_profile: "kip-jcs-safe-v1".into(),
             content_digest: digest,
             // No proofs: this engine signs nothing, and an empty proof list is
             // an honest "unsigned" rather than a claim of provenance.
@@ -234,14 +299,6 @@ impl Closure {
             Closure::Closed => "closed",
             Closure::Referential => "referential",
             Closure::Selective => "selective",
-        }
-    }
-
-    fn completeness(self) -> &'static str {
-        match self {
-            Closure::Closed => "closed",
-            Closure::Referential => "referential_closure",
-            Closure::Selective => "roots_only",
         }
     }
 }
@@ -306,8 +363,7 @@ fn schema_dependencies(cx: &Context<'_>, refs: &BTreeSet<String>) -> Vec<SchemaD
                 digest: cx
                     .env
                     .artifact(&package_ref)
-                    .and_then(|a| a.integrity.as_ref())
-                    .map(|integrity| integrity.content_digest.clone()),
+                    .and_then(|a| package_digest(a).ok()),
             });
     }
     packages.into_values().collect()
@@ -326,11 +382,13 @@ fn schema_dependencies(cx: &Context<'_>, refs: &BTreeSet<String>) -> Vec<SchemaD
 pub fn payload_digest(payload: &CapsulePayload) -> Result<String, KipError> {
     let value = serde_json::to_value(payload)
         .map_err(|err| KipError::internal_error(format!("a Capsule failed to encode: {err}")))?;
-    let canonical = anda_kip::canonical_json(&value);
-    use sha3::{Digest, Sha3_256};
+    let canonical = anda_kip::try_canonical_json(
+        &serde_json::json!({"format": anda_kip::CAPSULE_FORMAT, "format_version": anda_kip::CAPSULE_VERSION, "payload": value}),
+    )?;
+    use sha2::{Digest, Sha256};
     Ok(format!(
         "{DIGEST_PROFILE}:{}",
-        hex::encode(Sha3_256::digest(canonical.as_bytes()))
+        hex::encode(Sha256::digest(canonical.as_bytes()))
     ))
 }
 
@@ -358,7 +416,7 @@ impl ImportReport {
 }
 
 /// The digest algorithm this engine computes over a Capsule payload.
-pub const DIGEST_PROFILE: &str = "sha3-256";
+pub const DIGEST_PROFILE: &str = "sha256";
 
 /// Refuses a Capsule digested under an algorithm this engine cannot compute.
 ///
@@ -409,7 +467,7 @@ pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
     Ok(serde_json::json!({
         "valid": true,
         "content_digest": recomputed,
-        "digest_profile": "sha3-256 over RFC 8785 canonical JSON (§37.7)",
+        "digest_profile": "kip-jcs-safe-v1",
         // An unsigned Capsule proves nothing about who wrote it. Saying so is
         // the difference between "intact" and "trustworthy".
         "signed": !capsule.integrity.proofs.is_empty(),
@@ -467,19 +525,15 @@ pub async fn import(
                 ),
             ));
         };
-        if let (Some(declared), Some(installed)) = (
-            dependency.digest.as_ref(),
-            artifact
-                .integrity
-                .as_ref()
-                .map(|integrity| &integrity.content_digest),
-        ) && declared != installed
+        let installed_digest = package_digest(artifact)?;
+        if let Some(declared) = &dependency.digest
+            && declared != &installed_digest
         {
             return Err(KipError::new(
                 KipErrorCode::DigestMismatch,
                 format!(
                     "this Capsule was written against a {package_ref} whose digest was \
-                     {declared}, and this Space has {installed}; the same version means the same \
+                     {declared}, and this Space has {installed_digest}; the same version means the same \
                      content, so one of them is not what it claims"
                 ),
             ));
@@ -518,13 +572,20 @@ pub async fn import(
 
 /// Parses a Capsule artifact.
 pub fn parse(source: &str) -> Result<Capsule, KipError> {
-    let capsule: Capsule = serde_json::from_str(source).map_err(|err| {
+    let value = anda_kip::parse_canonical_json(source)
+        .map_err(|e| KipError::new(KipErrorCode::ArtifactParseError, e.message))?;
+    let capsule: Capsule = serde_json::from_value(value.clone()).map_err(|err| {
         KipError::new(
             KipErrorCode::ArtifactParseError,
             format!("this is not a readable Cognitive Capsule: {err}"),
         )
     })?;
     capsule.validate_frame()?;
+    crate::schema::contracts::validate_value(
+        &serde_json::json!({"$ref":"urn:kip:2.0:schema:capsule"}),
+        &value,
+    )
+    .map_err(|e| KipError::capsule_validation_failed(e.message))?;
     Ok(capsule)
 }
 
@@ -568,6 +629,14 @@ pub fn describe(source: &str) -> Result<Json, KipError> {
     }))
 }
 
+fn package_digest(package: &crate::schema::SchemaPackage) -> Result<String, KipError> {
+    let mut value = package.artifact()?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("integrity");
+    }
+    crate::schema::contracts::digest(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +648,8 @@ mod tests {
                 kind: CapsuleKind::Snapshot,
                 created_at: Some("2026-08-16T00:00:00.000Z".into()),
                 completeness: Some("roots_only".into()),
-                closure: None,
+                closure: "selective".into(),
+                ..Default::default()
             },
             records: CapsuleRecords {
                 concepts: vec![serde_json::json!({"id": "C-1", "name": "Alice"})],
@@ -591,6 +661,7 @@ mod tests {
         let capsule = Capsule::new(
             payload.clone(),
             CapsuleIntegrity {
+                digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: digest,
                 proofs: vec![],
             },
@@ -635,10 +706,10 @@ mod tests {
             canonical,
             r#"{"manifest":{"completeness":"referential_closure","kind":"snapshot"},"records":{"concepts":[{"id":"C-1","kind":"concept","name":"Alice"}]},"source":{"snapshot_seq":3,"space_ref":"kip:space:default"}}"#
         );
-        use sha3::{Digest, Sha3_256};
+        use sha2::{Digest, Sha256};
         assert_eq!(
-            hex::encode(Sha3_256::digest(canonical.as_bytes())),
-            "fa8db2155f56bf075fe25e59dda1ba01c9a87500baa77d7f3d5c79af6558e567"
+            hex::encode(Sha256::digest(canonical.as_bytes())),
+            "7dc21a89f1745504bba876135b251f50788665c2e1926be12ca6f0186904d4e8"
         );
     }
 
@@ -651,6 +722,7 @@ mod tests {
         let mut capsule = Capsule::new(
             payload,
             CapsuleIntegrity {
+                digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: digest.clone(),
                 proofs: vec![],
             },

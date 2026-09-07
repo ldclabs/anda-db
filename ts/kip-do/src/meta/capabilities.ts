@@ -67,12 +67,21 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   watch_evaluation: false, // Cognitive Memory Profile §5.11
   list_dependents: true, // §63.5
   payload_purge: true, // §60.6
+  identity_repair: false,
+  dependency_validity: false,
+  durable_brain_runtime: false,
   capsule_export: true, // §63.4
   capsule_import: false, // §39
   capsule_signatures: false, // §37.8
   derive_permission: false, // §29.6: this engine does not distinguish derived writes
   record_outcome_permission: true, // §29.8
   kip1_migration: false, // §103: no DESCRIBE COMPATIBILITY, no 1.x conversions
+  memory_interface: false,
+  memory_basic: false,
+  memory_experience: false,
+  memory_learning: false,
+  memory_durable: false,
+  memory_exchange: false,
 }
 
 /**
@@ -576,7 +585,7 @@ export function capabilities(): Json {
         // Capsule is the one artifact that crosses between engines, so the
         // algorithm is part of the contract rather than an engine choice. The
         // two are pinned to one digest by a literal in each engine's tests.
-        digest_profile: 'sha3-256 over RFC 8785 canonical JSON',
+        digest_profile: 'kip-jcs-safe-v1 / SHA-256 over the native frame excluding integrity',
         closure: ['closed', 'referential', 'selective'],
       },
       space: {
@@ -882,9 +891,9 @@ export function capabilities(): Json {
       {
         capability: 'capsule_digest_profiles',
         detail:
-          'verifying a Capsule digested under an algorithm other than sha3-256',
+          'verifying a Capsule digested under an algorithm other than sha256',
         reason:
-          'this engine digests a Capsule as sha3-256 over RFC 8785 canonical ' +
+          'this engine digests a Capsule as sha256 over kip-jcs-safe-v1 canonical ' +
           'JSON, and so does rs/anda_cognitive_nexus — the two interoperate. ' +
           'An artifact from somewhere else under another profile is refused ' +
           'as an unsupported profile rather than reported as a digest ' +

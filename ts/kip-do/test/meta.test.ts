@@ -16,7 +16,7 @@ import {
   CAPABILITY_REGISTRY_NAMES,
 } from '../src/meta/capability-names.generated.js'
 
-/** The nine profile names §89 lists, in the order it lists them. */
+/** Profiles this raw Nexus advertises; KIP-CognitiveMemory is a separate full contract. */
 const KIP_CONFORMANCE_PROFILES = [
   'KIP-Core',
   'KIP-Schema',
@@ -55,11 +55,11 @@ const SETUP = `MUTATE {
   CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE ASSERTION ?a {
-    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
+    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00Z" }
   }
 }`
 
-const CM = 'kip://profiles/cognitive-memory@2.0.0'
+const CM = 'kip://profiles/cognitive-memory@2.1.0'
 
 describe('META', () => {
   it('reports what it cannot do, as data rather than as an error', async () => {
@@ -160,7 +160,7 @@ describe('META', () => {
         p: artifact as never,
       }) as Record<string, unknown>
       expect(report.valid).toBe(true)
-      expect(report.package_ref).toBe('kip://profiles/cognitive-memory@2.0.0')
+      expect(report.package_ref).toBe('kip://profiles/cognitive-memory@2.1.0')
       expect(report.declared).toMatchObject({ checked: true })
       expect(report.installed).toEqual({ known: true, matches: true })
       // A byte changed after sealing fails the declared digest (§20.11).
@@ -491,13 +491,13 @@ describe('Capsules', () => {
         'EXPORT CAPSULE :out WHERE { ?a ASSERTION {} }',
       ) as {
         format: string
-        version: string
+        format_version: string
         payload: {
-          manifest: { completeness: string }
-          records: Record<string, unknown[]>
-          schema: { package: string; version: string; digest: string }[]
+          manifest: { closure: string }
+          records: { kind: string; name?: string }[]
+          schema_dependencies: { package_ref: string; content_digest: string }[]
         }
-        integrity: { content_digest: string; proofs: unknown[] }
+        integrity: { content_digest: string; signatures: unknown[] }
       }
 
       // The frame discriminator is the artifact's contract, not this engine's
@@ -506,35 +506,35 @@ describe('Capsules', () => {
       // this engine writes unreadable by the reference engine — which is the
       // only thing a Capsule is for.
       expect(capsule.format).toBe('KIP-Cognitive-Capsule')
-      expect(capsule.version).toBe('2.0')
+      expect(capsule.format_version).toBe('2.0-draft')
 
       // The closure follows references *outward* from the roots, which is why
       // rooting on the Assertion reaches the Proposition it is about, and the
       // Proposition reaches both its endpoints. Rooting on Alice would reach
       // Alice alone: a Concept points at nothing, and the Propositions point
       // at *it*.
-      expect(capsule.payload.records.assertions).toHaveLength(1)
-      expect(capsule.payload.records.propositions).toHaveLength(1)
-      expect(capsule.payload.records.concepts).toHaveLength(2)
-      expect(capsule.payload.manifest.completeness).toBe('referential_closure')
+      expect(capsule.payload.records.filter((r) => r.kind === 'assertion')).toHaveLength(1)
+      expect(capsule.payload.records.filter((r) => r.kind === 'proposition')).toHaveLength(1)
+      expect(capsule.payload.records.filter((r) => r.kind === 'concept')).toHaveLength(2)
+      expect(capsule.payload.manifest.closure).toBe('referential')
       // §20.4: the exact refs travel with the records, or the Capsule
       // arrives meaning whatever the destination happens to call them. The
       // split into `package` + `version` is the frame `anda_kip` decodes —
       // both are required there, so a single `package_ref` would make the
       // whole Capsule unreadable by the reference engine.
       expect(
-        capsule.payload.schema.map((s) => `${s.package}@${s.version}`),
+        capsule.payload.schema_dependencies.map((s) => s.package_ref),
       ).toContain(CM)
-      expect(capsule.payload.schema[0]?.digest).toMatch(/^[0-9a-f]{64}$/)
+      expect(capsule.payload.schema_dependencies[0]?.content_digest).toMatch(/^sha256:[0-9a-f]{64}$/)
       // Unsigned, and it says so by carrying no proofs rather than by
       // implying provenance it cannot support.
-      expect(capsule.integrity.proofs).toEqual([])
+      expect(capsule.integrity.signatures).toEqual([])
       // SHA3-256, the same profile `rs/anda_cognitive_nexus` writes: a
       // Capsule is the one artifact that leaves this engine and is checked by
       // another, so the algorithm is part of the contract rather than an
       // engine choice.
       expect(capsule.integrity.content_digest).toMatch(
-        /^sha3-256:[0-9a-f]{64}$/,
+        /^sha256:[0-9a-f]{64}$/,
       )
     })
   })
@@ -543,12 +543,12 @@ describe('Capsules', () => {
     await withNexus('roots-only', (nexus) => {
       const capsule = nexus.describe(
         'EXPORT CAPSULE :out WHERE { ?a ASSERTION {} } WITH {closure: "selective"}',
-      ) as { payload: { manifest: { completeness: string }; records: Record<string, unknown[]> } }
-      expect(capsule.payload.records.assertions).toHaveLength(1)
-      expect(capsule.payload.records.propositions).toHaveLength(0)
+      ) as { payload: { manifest: { closure: string }; records: { kind: string; name?: string }[] } }
+      expect(capsule.payload.records.filter((r) => r.kind === 'assertion')).toHaveLength(1)
+      expect(capsule.payload.records.filter((r) => r.kind === 'proposition')).toHaveLength(0)
       // Claiming a completeness it does not have would import as a graph the
       // destination believes is whole.
-      expect(capsule.payload.manifest.completeness).toBe('roots_only')
+      expect(capsule.payload.manifest.closure).toBe('selective')
     })
   })
 
@@ -571,9 +571,9 @@ describe('Capsules', () => {
     await withNexus('tamper', (nexus) => {
       const capsule = nexus.describe(
         'EXPORT CAPSULE :out WHERE { ?c CONCEPT {name: "Alice"} }',
-      ) as { payload: { records: { concepts: { name: string }[] } } }
+      ) as { payload: { records: { kind: string; name: string }[] } }
       const tampered = structuredClone(capsule) as typeof capsule
-      const concept = tampered.payload.records.concepts[0]
+      const concept = tampered.payload.records.find((r) => r.kind === 'concept')
       if (concept !== undefined) concept.name = 'Mallory'
 
       expect(() =>
@@ -630,9 +630,7 @@ describe('Capsules', () => {
         NAME "Plan a migration"
         SET ATTRIBUTES {
           skill_class: "workflow",
-          task_family: "migration/rollback",
           summary: "Write the rollback first",
-          procedure: "1. write the rollback 2. migrate",
           status: "proposed"
         }
       }

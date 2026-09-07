@@ -1,3 +1,5 @@
+import { validateValue } from '../schema/contracts.js'
+import { canonicalJson } from '../json.js'
 /**
  * The KML mutation clauses.
  *
@@ -354,6 +356,8 @@ function createConcept(tx: Transaction, b: Bindings, clause: ConceptCreate): voi
   const existing = findClientKey(tx, 'Concept', clientKey)
 
   const definition = tx.env.definitionPackage(symbol)
+  const valueSchema = definition?.definitions?.concept_types?.[symbol.name]?.value_schema
+  if (valueSchema !== undefined) validateValue(valueSchema as Json, attributes)
   validateAttributes(
     formatSymbolRef(symbol),
     definition?.definitions?.concept_types?.[symbol.name]?.attributes,
@@ -536,7 +540,20 @@ function assertionRow(
     }
     return citation as unknown as { id: string; role?: string }
   })
+  const givenContext = fields.value('context_refs')
+  if (givenContext !== null && !Array.isArray(givenContext)) throw errors.typeMismatch('context_refs must be an array of Concept references')
+  const contexts = [...structural.values('context'), ...(Array.isArray(givenContext) ? givenContext : [])]
+  const contextRefs = contexts.map((value) => {
+    const ref = referenceValue(value, 'context_refs')
+    const id = tryParseElementId(String(ref.id))
+    if (!id || id.kind !== 'Concept') throw errors.typeMismatch('context_refs must name Concepts')
+    tx.load(id)
+    return canonicalizeReference(tx, ref)
+  })
   const validTime = fields.json('valid_time')
+  const from = validTimePart(validTime, 'from')
+  const until = validTimePart(validTime, 'until')
+  if (from && until && from >= until) throw errors.constraintViolation('valid_time requires from < until')
   const confidence = fields.confidence()
   const row: AssertionRow = {
     ...draft.envelope,
@@ -558,7 +575,7 @@ function assertionRow(
     valid_from: validTimePart(validTime, 'from'),
     valid_until: validTimePart(validTime, 'until'),
     evidence_refs: evidence,
-    context_refs: structural.values('context'),
+    context_refs: [...new Map(contextRefs.map((r) => [canonicalJson(r), r])).entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,r]) => r),
     status: 'active',
     supersedes: [],
     superseded_by: [],
@@ -1633,6 +1650,7 @@ function canonicalizeEndpoint(tx: Transaction, endpoint: Endpoint): Endpoint {
   }
   const chain = canonicalChain(tx, endpoint.id)
   const canonical = chain[chain.length - 1] as ElementId
+  tx.recordReference(formatElementId(endpoint.id), formatElementId(canonical))
   return elementIdEquals(canonical, endpoint.id)
     ? endpoint
     : { kind: 'local', id: canonical }
@@ -1656,6 +1674,7 @@ export function canonicalizeReference(tx: Transaction, value: JsonMap): JsonMap 
   if (id === null || id.kind !== 'Concept') return value
   const chain = canonicalChain(tx, id)
   const canonical = chain[chain.length - 1] as ElementId
+  tx.recordReference(value.id, formatElementId(canonical))
   if (elementIdEquals(canonical, id)) return value
   return { ...value, id: formatElementId(canonical) }
 }

@@ -46,6 +46,7 @@ wire_enum! {
         Meta = "KIP-META",
         /// The request/response envelope and execution modes (§99).
         Runtime = "KIP-Runtime",
+        CognitiveMemory = "KIP-CognitiveMemory",
     }
 }
 
@@ -175,7 +176,7 @@ mod tests {
     fn the_registry_matches_the_specifications_listing() {
         // §89 lists nine; a profile added upstream must be added here
         // rather than silently missing from every declaration.
-        assert_eq!(ConformanceProfile::ALL.len(), 9);
+        assert_eq!(ConformanceProfile::ALL.len(), 10);
         let names: Vec<&str> = ConformanceProfile::ALL.iter().map(|p| p.name()).collect();
         assert_eq!(
             names,
@@ -189,6 +190,7 @@ mod tests {
                 "KIP-KML",
                 "KIP-META",
                 "KIP-Runtime",
+                "KIP-CognitiveMemory",
             ]
         );
     }

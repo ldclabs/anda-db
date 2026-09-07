@@ -1449,10 +1449,7 @@ describe('the read path', () => {
       { actions: ['read', 'export'], scope: { elements: ['C-1'] } },
       (nexus, session) => {
         const exported = (capsule: Json): number =>
-          Object.values(
-            (capsule as { payload: { records: Record<string, unknown[]> } }).payload
-              .records,
-          ).reduce((total, bucket) => total + bucket.length, 0)
+          (capsule as { payload: { records: unknown[] } }).payload.records.length
 
         const all = nexus.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', {
           out: 'x',
@@ -1464,7 +1461,8 @@ describe('the read path', () => {
         const mine = session.describe('EXPORT CAPSULE :out WHERE { ?c CONCEPT {} }', {
           out: 'x',
         })
-        expect(exported(mine)).toBe(1)
+        expect(exported(mine)).toBe(0)
+        expect((mine as { payload: { external_refs: unknown[] } }).payload.external_refs).toHaveLength(1)
       },
     )
   })

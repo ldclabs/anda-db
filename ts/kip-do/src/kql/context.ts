@@ -1,3 +1,7 @@
+import { dependencyValidity, isDerived } from '../projection/dependency.js'
+import { baseline } from '../projection/policy.js'
+import { projectionBasis } from '../projection/index.js'
+import { nowTime } from '../time.js'
 /**
  * The one place a read reaches an element.
  *
@@ -59,6 +63,8 @@ export const LIMITS = {
 } as const
 
 export class Context {
+  validAt = nowTime()
+  projectionPolicy = baseline()
   readonly store: Store
   readonly env: SchemaEnvironment
   readonly space: string
@@ -118,19 +124,20 @@ export class Context {
   }
 
   /** Loads an element, or `null` when it is not in this caller's universe. */
-  load(id: ElementId): Element | null {
+  load(id: ElementId, validate = true): Element | null {
     const key = formatElementId(id)
-    const cached = this.elements.get(key)
-    if (cached !== undefined) return cached
-
-    this.spend('loads', 1)
-    const found =
-      this.asOf === null
-        ? this.store.load(id)
-        : this.store.elementAt(this.space, id, this.asOf)
-    const visible = this.admit(key, found)
-    this.elements.set(key, visible)
-    return visible
+    let element = this.elements.get(key)
+    if (element === undefined) {
+      this.spend('loads', 1)
+      const found = this.asOf === null ? this.store.load(id) : this.store.elementAt(this.space, id, this.asOf)
+      element = this.admit(key, found)
+      this.elements.set(key, element)
+    }
+    if (validate && element && isDerived(element)) {
+      const view = this.views.get(key)
+      if (view && isJsonMap(view._system)) view._system.dependency_validity = dependencyValidity(this, element, this.projectionPolicy, this.validAt)
+    }
+    return element
   }
 
   /** The rendered Core view of an element, computed once per query. */
@@ -223,6 +230,14 @@ export class Context {
           : Math.min(this.governedResultLimit, constraints.max_results)
     }
     const view = render(element)
+    if ((element.kind === 'Assertion' && element.row.mode === 'inferred') ||
+        (element.kind === 'Concept' && (['SkillRevision', 'Insight', 'WorkingState'].some((name) => element.row.schema_ref.endsWith('/' + name)) || Object.keys(element.row.structural).some((name) => name.endsWith('/derived_from'))))) {
+      (view._system as JsonMap).dependency_validity = {
+        status: 'unverifiable', action_eligible: false,
+        reasons: ['recursive dependency validation is unavailable'],
+        basis: projectionBasis(this, this.projectionPolicy, this.validAt),
+      }
+    }
     if (element.kind === 'Proposition') {
       // §43.2: the binding keeps both views. `subject` / `object` are the
       // stored endpoints; `canonical_subject` / `canonical_object` follow
@@ -312,7 +327,7 @@ export class Context {
     return rows.map((row) => ({ kind: 'Concept', seq: row.id }) as ElementId)
   }
 
-  private canonicalEndpoint(endpoint: Json): Json {
+  canonicalEndpoint(endpoint: Json): Json {
     if (!isJsonMap(endpoint) || typeof endpoint.id !== 'string') return endpoint
     const id = tryParseElementId(endpoint.id)
     if (id === null || id.kind !== 'Concept') return endpoint

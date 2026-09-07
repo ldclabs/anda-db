@@ -1,5 +1,8 @@
 # `anda_kip` — Technical Reference
 
+Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+
 `anda_kip` is the protocol layer of the AndaDB workspace: it turns KIP 2.0
 command text into a closed, executable AST, models the runtime envelope, and
 defines the seam an engine implements. It holds no state and makes no storage

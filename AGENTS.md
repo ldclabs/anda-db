@@ -197,7 +197,7 @@ make test-ts
 ```
 
 `make test-full` runs both halves. The generated files under `ts/kip-do`
-(`errors.generated.ts`, `profiles.generated.ts`, `fixtures.generated.ts`,
+(`errors.generated.ts`, `profiles.generated.ts`, `contracts.generated.ts`, `fixtures.generated.ts`,
 `corpus.generated.ts`) are committed; regenerate them with `pnpm run codegen`
 after changing their sources, or CI will fail on the drift.
 

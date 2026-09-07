@@ -6,8 +6,8 @@
   },
   {
     "capability": "capsule_digest_profiles",
-    "detail": "verifying a Capsule digested under an algorithm other than sha3-256",
-    "reason": "this engine digests a Capsule as sha3-256 over RFC 8785 canonical JSON, and so does ts/kip-do — the two interoperate, and each pins the algorithm with a literal in its own tests. An artifact from somewhere else under another profile is refused as an unsupported profile rather than reported as a digest mismatch, because the second is an accusation of tampering and the first is the truth"
+    "detail": "verifying a Capsule digested under an algorithm other than kip-jcs-safe-v1 / sha256",
+    "reason": "this engine digests a Capsule as SHA-256 over kip-jcs-safe-v1 canonical JSON excluding integrity, and so does ts/kip-do — the two interoperate, and each pins the algorithm with a literal in its own tests. An artifact from somewhere else under another profile is refused as an unsupported profile rather than reported as a digest mismatch, because the second is an accusation of tampering and the first is the truth"
   },
   {
     "capability": "unregistered_permissions",

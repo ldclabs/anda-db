@@ -1,3 +1,4 @@
+import { verifyArtifact } from './schema/contracts.js'
 /**
  * The Cognitive Nexus: one KIP 2.0 engine over one Durable Object's SQLite.
  *
@@ -202,6 +203,7 @@ export class CognitiveNexus {
    * a re-install of identical bytes is a no-op and a changed one is refused.
    */
   installPackage(artifact: SchemaPackage, source: string): void {
+    verifyArtifact(artifact)
     const ref = formatPackageRef(packageRefOf(artifact))
     rejectCoreShadowing(artifact)
     const digest = sha256Text(canonicalJson(artifact))
@@ -554,6 +556,7 @@ export class Session {
 
   /** Parses and runs one KML statement, returning its receipt. */
   execute(command: string, params: JsonMap = {}): Outcome {
+    canonicalJson(params)
     const parsed: Command = parseKip(command)
     if ('Kml' in parsed) return this.mutate(parsed.Kml, params)
     throw errors.languageMismatch(
@@ -573,6 +576,7 @@ export class Session {
     params: JsonMap = {},
     read: ReadOptions = {},
   ): KqlAnswer {
+    canonicalJson(params)
     const parsed: Command = parseKip(command)
     if (!('Kql' in parsed)) {
       throw errors.languageMismatch('this command is not a KQL query')
@@ -597,6 +601,7 @@ export class Session {
     command: string,
     params: JsonMap = {},
   ): { result: Json; nextCursor: string | null; truncated: boolean } {
+    canonicalJson(params)
     const parsed: Command = parseKip(command)
     if (!('Meta' in parsed)) {
       throw errors.languageMismatch('this command is not a META command')
@@ -634,6 +639,7 @@ export class Session {
     params: JsonMap = {},
     options: Partial<KqlContext> & ReadOptions = {},
   ): KqlAnswer {
+    canonicalJson({ query, params, request: options.request, operation: options.operation })
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     // Both spellings, because both reach `executeKql`: the envelope's
@@ -677,6 +683,7 @@ export class Session {
     params: JsonMap = {},
     options: MutationOptions = {},
   ): Outcome {
+    canonicalJson({ statement, params, operation: options.operation, ingest: options.ingest })
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     const needed = kmlPermissions(statement)

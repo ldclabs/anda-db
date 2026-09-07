@@ -684,7 +684,7 @@ async fn stocked(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert("kip://profiles/cognitive-memory".into(), "2.0.0".into());
+        .insert("kip://profiles/cognitive-memory".into(), "2.1.0".into());
     lock.states.insert(
         "kip://profiles/cognitive-memory".into(),
         PackageState::Active,
@@ -2057,12 +2057,16 @@ async fn an_export_carries_only_what_the_caller_could_read() {
         exported.error
     );
     let capsule = exported.first_result().unwrap().clone();
-    let concepts = capsule["payload"]["records"]["concepts"]
-        .as_array()
-        .unwrap()
-        .clone();
+    let concepts = capsule["payload"]["records"].as_array().unwrap().clone();
     let names: Vec<&str> = concepts.iter().filter_map(|c| c["name"].as_str()).collect();
-    assert_eq!(names, vec!["Public Note"]);
+    assert!(names.is_empty()); // Origin-redacted records use an ExternalRef in the native Capsule.
+    assert_eq!(
+        capsule["payload"]["external_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3714,7 +3718,7 @@ async fn imported_cognition_arrives_at_the_bottom_of_the_authority_ladder() {
     let owner = source.system_session();
     run_as(
         &owner,
-        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure"} }"#,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
     )
     .await;
     owner
@@ -3861,7 +3865,7 @@ async fn one_of_two_approvals_is_not_partial_activation() {
     let session = nexus.session(AuthContext::principal(&steward));
     run_as(
         &session,
-        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure"} }"#,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
     )
     .await;
     let element = ElementId::new(anda_kip::ElementKind::Evidence, 1);

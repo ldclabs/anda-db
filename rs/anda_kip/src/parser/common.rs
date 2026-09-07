@@ -65,7 +65,13 @@ impl Flavor {
 /// These are top-level field names. The members inside `_system` are
 /// [`crate::types::PROTECTED_SYSTEM_FIELDS`]; nothing may write either, but
 /// only this list is reachable from a command's syntax.
-pub(crate) const PROTECTED_FIELDS: &[&str] = &["_system", "governance", "space_id", "space_seq"];
+pub(crate) const PROTECTED_FIELDS: &[&str] = &[
+    "_system",
+    "governance",
+    "space_id",
+    "space_seq",
+    "merged_into",
+];
 
 /// True when a mutation may not write this field name.
 pub(crate) fn is_protected_field(name: &str) -> bool {
@@ -97,7 +103,8 @@ pub(crate) fn fail<'a, T>(input: &'a str, ctx: &'static str) -> VResult<'a, T> {
 /// identifier character (`FIND` must not match the prefix of `FINDX`), to a
 /// variable (`INTO?b`), or to a quoted string (`WITH TYPE"Drug"`) — each of
 /// those is two tokens in the grammar.
-pub(crate) fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>> {
+pub(crate) fn word_boundary<'a>() -> impl Parser<&'a str, Output = (), Error = VerboseError<&'a str>>
+{
     not(verify(anychar, |c: &char| {
         c.is_alphanumeric() || matches!(c, '_' | '?' | '"')
     }))
@@ -160,7 +167,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// Parses `{ f }`.
-pub(crate) fn braced<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
+pub(crate) fn braced<'a, O, F>(
+    f: F,
+) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
 where
     F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
 {
@@ -1382,7 +1391,10 @@ pub(crate) fn collect_update_expr_paths<'a>(expr: &'a UpdateExpr, out: &mut Vec<
 }
 
 /// Collects the variables a mutation right-hand side reads.
-pub(crate) fn collect_mutation_value_paths<'a>(value: &'a MutationValue, out: &mut Vec<&'a DotPathVar>) {
+pub(crate) fn collect_mutation_value_paths<'a>(
+    value: &'a MutationValue,
+    out: &mut Vec<&'a DotPathVar>,
+) {
     match value {
         MutationValue::Variable(path) => out.push(path),
         MutationValue::Expr(expr) => collect_update_expr_paths(expr, out),
@@ -1716,19 +1728,18 @@ mod tests {
     }
 
     #[test]
-    fn negating_the_i64_floor_does_not_overflow() {
-        // `-i64::MIN` is not an i64; computing it as `-n` aborted the parser.
+    fn negating_unsafe_integers_is_rejected() {
+        for input in [
+            "--9223372036854775808",
+            "-9223372036854775808",
+            "-18446744073709551615",
+        ] {
+            assert!(update_expr(input).is_err(), "{input}");
+        }
         assert_eq!(
-            parse(update_expr, "--9223372036854775808"),
-            UpdateExpr::Number(Number::from(9_223_372_036_854_775_808u64))
+            parse(update_expr, "-9007199254740991"),
+            UpdateExpr::Number(Number::from(-9_007_199_254_740_991i64))
         );
-        assert_eq!(
-            parse(update_expr, "-9223372036854775808"),
-            UpdateExpr::Number(Number::from(i64::MIN))
-        );
-        // An integer above i64::MAX has no exact negation, so it is refused
-        // rather than silently stored as a different (f64) number.
-        assert!(update_expr("-18446744073709551615").is_err());
     }
 
     #[test]

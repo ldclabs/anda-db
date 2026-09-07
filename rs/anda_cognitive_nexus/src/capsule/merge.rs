@@ -232,6 +232,7 @@ pub async fn preview(
 fn collect(capsule: &Capsule) -> Result<Vec<Record>, KipError> {
     let payload = &capsule.payload;
     let mut records = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
     for (kind, views) in [
         (ElementKind::Concept, &payload.records.concepts),
         (ElementKind::Proposition, &payload.records.propositions),
@@ -247,12 +248,28 @@ fn collect(capsule: &Capsule) -> Result<Vec<Record>, KipError> {
                      to it",
                 ));
             };
+            if !ids.insert(source_id.to_string()) {
+                return Err(KipError::capsule_validation_failed(
+                    "duplicate capsule-local record id",
+                ));
+            }
             records.push(Record {
                 kind,
                 source_id: source_id.to_string(),
                 view: view.clone(),
             });
         }
+    }
+    if capsule
+        .payload
+        .manifest
+        .roots
+        .iter()
+        .any(|root| !ids.contains(root))
+    {
+        return Err(KipError::capsule_validation_failed(
+            "a selected Capsule root is unavailable or redacted; resolve it explicitly before import",
+        ));
     }
     Ok(records)
 }

@@ -1313,7 +1313,7 @@ impl Context<'_> {
                 // about nothing. A grounded tuple binds no variable, so the
                 // one answer applies to every row the block already had.
                 if found.is_empty() && self.tuple_is_grounded(triple)? {
-                    let belief = self.ungrounded_belief(&policy, &at);
+                    let belief = self.ungrounded_belief(&policy, &at)?;
                     return Ok(Solutions::column(
                         variable,
                         vec![Binding::Literal(belief.to_json())],

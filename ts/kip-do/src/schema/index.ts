@@ -120,3 +120,5 @@ export {
   COGNITIVE_MEMORY_ID,
   COGNITIVE_MEMORY_VERSION,
 } from './profiles.generated.js'
+
+export { SCHEMA_DOCUMENTS, SCHEMA_DIGESTS, validateValue, memoryBundles, validateMemoryBundles, type MemoryBundle } from './contracts.js'

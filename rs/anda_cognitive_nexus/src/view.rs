@@ -45,7 +45,7 @@ pub fn render(element: &Element) -> Json {
 /// Reads one dot path out of a rendered view, resolving a Facet's local name.
 ///
 /// A Facet is stored under its exact symbol —
-/// `kip://profiles/cognitive-memory@2.0.0/MnemonicState` — because a persisted
+/// `kip://profiles/cognitive-memory@2.1.0/MnemonicState` — because a persisted
 /// reference must name one version forever (§21). A command writes the local
 /// name the environment resolves: `?m.facets["MnemonicState"].salience`. That
 /// resolution belongs here, on the read, rather than in a second copy of the
@@ -171,6 +171,17 @@ fn envelope(row: &impl Row) -> ElementEnvelope {
             })
             .collect(),
         system: Some(SystemState {
+            input_references: origin["_kip_runtime"]["input_references"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            input_versions: origin["_kip_runtime"]["input_versions"]
+                .as_object()
+                .cloned(),
+            output_versions: origin["_kip_runtime"]["output_versions"]
+                .as_object()
+                .cloned(),
+            dependency_validity: None,
             version: Some(version),
             // Facet counters keyed by local name, so
             // `?x._system.plane_versions.facets["MnemonicState"]` reads the

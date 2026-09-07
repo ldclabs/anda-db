@@ -39,7 +39,7 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -124,7 +124,7 @@ async fn a_claim_lands_as_a_proposition_plus_an_assertion() {
         panic!("?p must be a Proposition");
     };
     assert_eq!(
-        tuple.predicate_ref, "kip://profiles/cognitive-memory@2.0.0/prefers",
+        tuple.predicate_ref, "kip://profiles/cognitive-memory@2.1.0/prefers",
         "a local predicate name is persisted as its exact symbol"
     );
     assert_eq!(tuple.subject["id"], alice.to_string());
@@ -572,7 +572,7 @@ async fn an_upsert_creates_the_type_its_match_declares() {
     };
     assert_eq!(
         row.schema_ref,
-        "kip://profiles/cognitive-memory@2.0.0/Person"
+        "kip://profiles/cognitive-memory@2.1.0/Person"
     );
 
     // The point of carrying the type: the Concept is reachable by it.

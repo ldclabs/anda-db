@@ -154,7 +154,8 @@ describe('AS OF', () => {
       // At the coordinate before the retraction, the commitment stood. A
       // projection that read today's Assertions under a past coordinate would
       // answer neither question.
-      expect(nexus.query(`${STATUS} AS OF SEQ 1`)).toEqual(['accepted'])
+      expect(() => nexus.query(`${STATUS} AS OF SEQ 1`)).toThrow('historical projection control state')
+      expect(nexus.query(`${STATUS} AS OF SEQ 1 WITH EPISTEMIC {policy: \"baseline\"}`)).toEqual(['accepted'])
     })
   })
 

@@ -1,5 +1,8 @@
 # `anda_cognitive_nexus` — Technical Reference
 
+Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI
 > agents, built on Anda DB.
 
@@ -672,7 +675,7 @@ refused rather than answered wrongly:
 | grouped aggregation          | `FIND(?c.name, COUNT(?x))` and `ORDER BY COUNT(?x)` need grouping; answering either without it returns one global row where a caller asked for one per group |
 | `SEARCH ASSERTION` / `ACTIVITY` | neither carries free text to index; refused rather than answered empty, which would read as "no such claim exists" |
 | `derive`, `share`, `manage_trust` | no gate asks for them, so §29.6 makes refusing them where a Grant names one a MUST: a permission accepted and gating nothing is authority that looks conferred and is not |
-| Capsule digest profiles      | both engines digest as sha3-256 over RFC 8785 canonical JSON and interoperate; an artifact from elsewhere under another profile is refused as unreadable, never reported as tampered with |
+| Capsule digest profiles      | both engines use kip-jcs-safe-v1 and SHA-256 over the native frame excluding integrity; an artifact from elsewhere under another profile is refused as unreadable, never reported as tampered with |
 | `options.deadline_ms`        | §80.2 makes a client timeout not an abort, and a commit here is not cancellable; accepting one would promise a cancellation that never happens |
 | artifact handles             | there is nowhere to fetch bytes from, so `payload_artifact` names content this engine cannot read |
 

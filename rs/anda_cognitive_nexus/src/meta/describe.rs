@@ -1,7 +1,7 @@
 //! # `DESCRIBE` and `LIST`
 //!
 //! Introspection returns **canonical identity** (Spec §65): a `DESCRIBE TYPE
-//! "Person"` answers with `kip://profiles/cognitive-memory@2.0.0/Person`, not
+//! "Person"` answers with `kip://profiles/cognitive-memory@2.1.0/Person`, not
 //! with the local name the caller happened to write. A caller that stored the
 //! local name would have stored something whose meaning changes when the
 //! Space's schema does.

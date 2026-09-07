@@ -22,9 +22,13 @@ export const BASELINE_ID = 'kip:policy:baseline'
  * Bumped whenever its numbers move, because that changes what a past
  * "accepted" would have meant.
  */
-export const BASELINE_VERSION = 1
+export const BASELINE_VERSION = 2
 
 export interface Policy {
+  context_refs: string[]
+  purpose: string
+  risk: string
+  explicit_selection: boolean
   id: string
   version: number
   /** The Assertion modes this policy admits as answers. */
@@ -68,6 +72,7 @@ const EPISTEMIC_SETTINGS = [
   'explanation',
   'purpose',
   'risk',
+  'context_refs',
 ] as const
 
 /**
@@ -79,6 +84,10 @@ const EPISTEMIC_SETTINGS = [
 export function baseline(): Policy {
   return {
     id: BASELINE_ID,
+    explicit_selection: false,
+    context_refs: [],
+    purpose: '',
+    risk: '',
     version: BASELINE_VERSION,
     modes: ['observed', 'stated', 'inferred', 'imported'],
     accept: 0.7,
@@ -122,6 +131,7 @@ export function policyFromSettings(settings: JsonMap): Policy {
     )
   }
 
+  policy.explicit_selection = typeof settings.policy === 'string'
   let overridden = false
   for (const key of ['accept', 'material'] as const) {
     const value = settings[key]
@@ -195,6 +205,20 @@ export function policyFromSettings(settings: JsonMap): Policy {
     }
     policy.explanation = explanation as Explanation
     overridden = true
+  }
+  if (settings.context_refs !== undefined) {
+    const refs = settings.context_refs
+    if (!Array.isArray(refs) || refs.some((r) => typeof r !== 'string' || !r)) {
+      throw errors.typeMismatch('context_refs must be exact reference strings')
+    }
+    policy.context_refs = [...new Set(refs as string[])].sort()
+  }
+  for (const name of ['purpose', 'risk'] as const) {
+    if (settings[name] !== undefined) {
+      const value = settings[name]
+      if (typeof value !== 'string' || !value) throw errors.typeMismatch(`${name} must be a nonempty string`)
+      policy[name] = value
+    }
   }
   for (const name of Object.keys(settings)) {
     if (!(EPISTEMIC_SETTINGS as readonly string[]).includes(name)) {

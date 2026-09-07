@@ -1,5 +1,8 @@
 # anda_cognitive_nexus
 
+Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+[synchronization and compatibility notes](../../docs/kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+
 The reference **KIP 2.0** Cognitive Nexus — a persistent memory brain for AI
 agents. `anda_kip` parses, classifies and validates; this crate is everything
 that needs state, and implements `anda_kip::Executor` on top of `anda_db`.

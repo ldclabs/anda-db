@@ -371,7 +371,24 @@ fn entry(row: &TransactionRow, element: Option<&str>) -> Json {
             &row.status,
         )),
     );
+    let mut controls = Vec::new();
+    if row.transaction_class == "governance"
+        && row.result.get("schema_environment_version").is_some()
+    {
+        controls.push(anda_kip::ControlChange {
+            kind: "schema".into(),
+            version: row.schema_environment_version.to_string(),
+        });
+    }
+    if row.changes.iter().any(|c| c["op"] == "merge") {
+        controls.push(anda_kip::ControlChange {
+            kind: "identity".into(),
+            version: row.seq.to_string(),
+        });
+    }
     let envelope = anda_kip::ChangeEnvelope {
+        control_changes: controls,
+        coverage: None,
         kip: Some("2.0".to_string()),
         space_id: row.space.clone(),
         space_seq: row.seq,

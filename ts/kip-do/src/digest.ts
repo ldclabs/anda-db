@@ -14,10 +14,9 @@
  * FIPS 180-4 algorithm with no tuning; `test/digest.test.ts` pins it to the
  * published vectors.
  *
- * This is deliberately **not** presented as the KIP canonicalization profile:
- * that profile is still a draft, and the Rust engine's
- * `store::schema::content_digest` makes the same reservation. Two engines are
- * not expected to produce equal digests for equal content today.
+ * Capsules and sealed Schema Packages use SHA-256 with kip-jcs-safe-v1.
+ * Receipt hashing is separately identified; local storage identities retain
+ * their existing algorithms.
  */
 
 /** SHA-256 round constants: the first 32 bits of the cube roots of the first 64 primes. */

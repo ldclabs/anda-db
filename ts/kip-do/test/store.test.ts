@@ -63,7 +63,7 @@ function envelope(space: string, id: number) {
 }
 
 function concept(space: string, id: number, extra: Partial<ConceptRow> = {}) {
-  const schemaRef = extra.schema_ref ?? 'kip://profiles/cognitive-memory@2.0.0/Person'
+  const schemaRef = extra.schema_ref ?? 'kip://profiles/cognitive-memory@2.1.0/Person'
   const row: ConceptRow = {
     ...envelope(space, id),
     client_key: '',
@@ -215,8 +215,8 @@ describe('the store', () => {
   })
 
   it('scopes a logical key to its Space and its type', async () => {
-    const PERSON = 'kip://profiles/cognitive-memory@2.0.0/Person'
-    const PREFERENCE = 'kip://profiles/cognitive-memory@2.0.0/Preference'
+    const PERSON = 'kip://profiles/cognitive-memory@2.1.0/Person'
+    const PREFERENCE = 'kip://profiles/cognitive-memory@2.1.0/Preference'
     await withStore('keys', (store) => {
       newSpace(store, 'space://a')
       newSpace(store, 'space://b')
@@ -512,8 +512,8 @@ describe('the store', () => {
     // index. Without the rebuild, a deployed Space would keep enforcing
     // `(space, key)` — and go on refusing the second-type-same-key upsert that
     // §7.3 makes legal — while the DDL in this repo said otherwise.
-    const PERSON = 'kip://profiles/cognitive-memory@2.0.0/Person'
-    const PREFERENCE = 'kip://profiles/cognitive-memory@2.0.0/Preference'
+    const PERSON = 'kip://profiles/cognitive-memory@2.1.0/Person'
+    const PREFERENCE = 'kip://profiles/cognitive-memory@2.1.0/Preference'
     const stub = env.KIP_DB.getByName('index-rebuild')
     await runInDurableObject(stub, (_instance, state) => {
       const sql = state.storage.sql

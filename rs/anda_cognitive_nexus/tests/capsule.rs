@@ -33,7 +33,7 @@ async fn fresh(name: &str, with_schema: bool) -> CognitiveNexus {
             .unwrap();
         let mut lock = SchemaLock::default();
         lock.packages
-            .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+            .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
         lock.states
             .insert(PROFILE_ID.to_string(), PackageState::Active);
         nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -82,10 +82,10 @@ async fn seeded(name: &str) -> CognitiveNexus {
             CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?e {
-                SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode."}
+                SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode.", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"}
             }
             CREATE ASSERTION ?a {
-                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9}
+                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00Z"}
                 SET STRUCTURAL { ("evidence", ?e) {role: "support"} }
             }
         }"#,
@@ -102,12 +102,44 @@ async fn an_export_carries_the_referential_closure_of_its_roots() {
     let capsule = ok(&nexus, r#"EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }"#).await;
 
     let records = &capsule["payload"]["records"];
-    assert_eq!(records["assertions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "assertion")
+            .count(),
+        1
+    );
     // The Assertion's Proposition, its Evidence and its assertor all came
     // along, and the Proposition's own endpoints with them.
-    assert_eq!(records["propositions"].as_array().unwrap().len(), 1);
-    assert_eq!(records["evidence"].as_array().unwrap().len(), 1);
-    assert_eq!(records["concepts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "proposition")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "evidence")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "concept")
+            .count(),
+        2
+    );
 
     // `closure: "selective"` exports exactly what was asked for, and says so.
     let bare = ok(
@@ -117,15 +149,15 @@ async fn an_export_carries_the_referential_closure_of_its_roots() {
     .await;
     // An empty record list is omitted from the wire form rather than written
     // as `[]`, so its absence is what "nothing of this kind" looks like.
-    assert!(bare["payload"]["records"].get("propositions").is_none());
-    assert_eq!(
-        bare["payload"]["records"]["assertions"]
+    assert!(
+        bare["payload"]["records"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .iter()
+            .all(|r| r["kind"] != "proposition")
     );
-    assert_eq!(bare["payload"]["manifest"]["completeness"], "roots_only");
+    assert_eq!(bare["payload"]["records"].as_array().unwrap().len(), 1);
+    assert_eq!(bare["payload"]["manifest"]["closure"], "selective");
 }
 
 #[tokio::test]
@@ -135,27 +167,31 @@ async fn an_export_carries_exact_schema_refs_and_the_packages_they_need() {
     let nexus = seeded("schema_refs").await;
     let capsule = ok(&nexus, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await;
 
-    let concept = &capsule["payload"]["records"]["concepts"][0];
+    let concept = &capsule["payload"]["records"][0];
     assert!(
         concept["schema_ref"]
             .as_str()
             .unwrap()
-            .starts_with("kip://profiles/cognitive-memory@2.0.0/")
+            .starts_with("kip://profiles/cognitive-memory@2.1.0/")
     );
 
-    let dependencies = capsule["payload"]["schema"].as_array().unwrap();
+    let dependencies = capsule["payload"]["schema_dependencies"]
+        .as_array()
+        .unwrap();
     assert_eq!(dependencies.len(), 1);
-    assert_eq!(dependencies[0]["package"], PROFILE_ID);
-    assert_eq!(dependencies[0]["version"], "2.0.0");
+    assert_eq!(
+        dependencies[0]["package_ref"],
+        format!("{PROFILE_ID}@2.1.0")
+    );
     // The digest the destination checks its own copy against.
-    assert!(dependencies[0]["digest"].is_string());
+    assert!(dependencies[0]["content_digest"].is_string());
 
     // The source coordinate travels too, so a destination can say where the
     // records came from without guessing.
     let source = &capsule["payload"]["source"];
-    assert_eq!(source["space_ref"], DEFAULT_SPACE);
+    assert_eq!(source["space_id"], DEFAULT_SPACE);
     assert!(source["snapshot_seq"].as_u64().unwrap() >= 1);
-    assert_eq!(source["schema_environment_version"], 1);
+    assert_eq!(source["snapshot_seq"], 1);
 }
 
 #[tokio::test]
@@ -182,7 +218,7 @@ async fn a_modified_capsule_fails_verification() {
     );
 
     let mut tampered = capsule.clone();
-    tampered["payload"]["records"]["concepts"][0]["name"] = json!("Mallory");
+    tampered["payload"]["records"][0]["name"] = json!("Mallory");
     let response = with_param(
         &nexus,
         "VERIFY CAPSULE :artifact",
@@ -267,16 +303,14 @@ async fn a_capsule_from_a_different_build_of_the_same_package_is_refused() {
     let capsule = ok(&source, r#"EXPORT CAPSULE ?c WHERE { ?c CONCEPT {} }"#).await;
 
     let mut forged = capsule.clone();
-    forged["payload"]["schema"][0]["digest"] = json!("sha3-256:0000");
+    forged["payload"]["schema_dependencies"][0]["content_digest"] =
+        json!(format!("sha256:{}", "0".repeat(64)));
     // Re-seal it so the frame digest is consistent and only the dependency
     // digest disagrees — otherwise this would fail as tampering instead.
-    let payload = forged["payload"].clone();
-    let resealed = json!({
-        "format": forged["format"],
-        "version": forged["version"],
-        "payload": payload,
-        "integrity": {"content_digest": "sha3-256:unchecked", "proofs": []},
-    });
+    let parsed: anda_kip::Capsule = serde_json::from_value(forged).unwrap();
+    let mut resealed = parsed.clone();
+    resealed.integrity.content_digest =
+        anda_cognitive_nexus::capsule::payload_digest(&parsed.payload).unwrap();
 
     let ready = fresh("digest_dest", true).await;
     let response = with_param(
@@ -413,7 +447,7 @@ async fn a_second_import_of_the_same_capsule_resolves_instead_of_duplicating() {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     destination

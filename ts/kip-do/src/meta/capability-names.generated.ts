@@ -33,12 +33,21 @@ export const CAPABILITY_REGISTRY_NAMES: readonly string[] = [
   'watch_evaluation',
   'list_dependents',
   'payload_purge',
+  'identity_repair',
+  'dependency_validity',
+  'durable_brain_runtime',
   'capsule_export',
   'capsule_import',
   'capsule_signatures',
   'derive_permission',
   'record_outcome_permission',
   'kip1_migration',
+  'memory_interface',
+  'memory_basic',
+  'memory_experience',
+  'memory_learning',
+  'memory_durable',
+  'memory_exchange',
 ]
 
 /** The engine-local names every engine in this repository answers. */

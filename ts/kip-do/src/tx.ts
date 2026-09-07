@@ -1,3 +1,5 @@
+import { validateRecord, pinnedPlane } from './schema/contracts.js'
+import { render } from './view.js'
 /**
  * # Transactions
  *
@@ -244,6 +246,7 @@ export class Transaction {
 
   private readonly handleMap = new Map<string, ElementId>()
   private readonly staged = new Map<string, Staged>()
+  private readonly referenceBindings: Json[] = []
   private readonly shells: ElementId[] = []
   private readonly warnings: string[] = []
   private actorBinding: string | null = null
@@ -656,7 +659,25 @@ export class Transaction {
    * nothing must still be able to learn that it changed nothing, rather than
    * being told its key was never seen.
    */
+  recordReference(supplied: string, resolved: string): void {
+    const identity = (this.authority.space.policies._kip_identity_changes ?? []) as number[]
+    this.referenceBindings.push({ supplied, resolved, identity_version: Math.max(0, ...identity), path: `references[${this.referenceBindings.length}]`, op_id: this.cx.tx_id })
+  }
+
   commit(idempotencyKey: string, requestDigest = ''): Outcome {
+    for (const staged of this.staged.values()) {
+      if (staged.changed && staged.verb !== 'purge' && this.referenceBindings.length) {
+        const origin = staged.element.row.origin
+        origin._kip_runtime = { ...((origin._kip_runtime ?? {}) as JsonMap), input_references: this.referenceBindings }
+      }
+    }
+    for (const staged of this.staged.values()) {
+      if (staged.changed && staged.verb !== 'purge') {
+        const old = staged.baseRow ? this.store.load({ kind: staged.element.kind, seq: staged.element.row.id }) : null
+        validateRecord(this.env, render(staged.element), old ? render(old) : null)
+      }
+    }
+    this.captureActivityVersions()
     this.requestDigest = requestDigest
     const pending = [...this.staged.entries()].filter(
       ([, staged]) => staged.changed,
@@ -684,6 +705,12 @@ export class Transaction {
     this.propagateGovernance(pending)
 
     const seq = this.store.nextSeq(this.cx.space)
+    if (pending.some(([, s]) => s.verb === 'merge')) {
+      const space = this.store.space(this.cx.space)!
+      const history = (space.policies._kip_identity_changes ?? []) as Json[]
+      space.policies = { ...space.policies, _kip_identity_changes: [...history, seq] }
+      this.store.putSpace(space)
+    }
     const committedAt = nowTime()
     const changes: ChangeEntry[] = []
     const written = new Set<string>()
@@ -704,7 +731,8 @@ export class Transaction {
       // say something was here and who wrote it — and the version log that
       // would otherwise answer that has just been destroyed.
       if (staged.verb !== 'purge') {
-        row.origin = this.cx.origin
+        const runtime = row.origin._kip_runtime
+        row.origin = { ...this.cx.origin, ...(runtime ? { _kip_runtime: runtime } : {}) }
       }
       if (staged.isNew) {
         row.created_at = committedAt
@@ -736,6 +764,61 @@ export class Transaction {
    * computes the same entry without keeping the advance: the row is discarded
    * with the transaction.
    */
+  private captureActivityVersions(): void {
+    for (const staged of this.staged.values()) {
+      const element = staged.element
+      if (!staged.changed || element.kind !== 'Activity' || !['completed', 'failed', 'cancelled'].includes(element.row.status)) continue
+      if (staged.baseRow && ['completed', 'failed', 'cancelled'].includes(String(staged.baseRow.status))) continue
+      const activity = element.row
+      const contract = Object.entries(activity.facets).find(([name]) => name.endsWith('/DependencyBasis'))?.[1] as JsonMap | undefined
+      const inputs: JsonMap = {}
+      if (contract) {
+        const seq = Number(contract.basis_seq)
+        if (!Number.isSafeInteger(seq) || seq < 0 || seq > this.store.currentSeq(this.cx.space)) throw errors.constraintViolation('DependencyBasis cannot name a future snapshot')
+        for (const group of contract.groups as JsonMap[]) {
+          for (const pin of group.pins as JsonMap[]) {
+            const id = tryParseElementId(String(pin.id))
+            if (!id) throw errors.constraintViolation('invalid DependencyBasis source')
+            const pending = this.staged.get(formatElementId(id))
+            const retained = pending?.isNew ? pending.element : this.store.elementAt(this.cx.space, id, seq)
+            if (!retained) throw errors.constraintViolation('DependencyBasis source version is unavailable')
+            if (!pending?.isNew) requirePermitted(this.authority.authorize('read', resourceOfElement(retained), this.auth))
+            const version = pending?.isNew ? 1 : retained.row.version
+            if (version !== pin.version) throw errors.versionConflict('DependencyBasis must pin the version actually read')
+            const planes = render(retained)._system as JsonMap
+            for (const [plane, expected] of Object.entries((pin.planes ?? {}) as JsonMap)) {
+              if (pinnedPlane(planes.plane_versions as JsonMap, plane) !== expected) throw errors.versionConflict('DependencyBasis plane pin does not match retained input')
+            }
+            const key = formatElementId(id)
+            if (inputs[key] !== undefined && inputs[key] !== version) throw errors.constraintViolation('conflicting DependencyBasis pins')
+            inputs[key] = version
+          }
+        }
+      }
+      for (const reference of activity.inputs) {
+        const key = referenceText(reference)
+        const id = tryParseElementId(key)
+        if (!id || inputs[key] !== undefined) continue
+        if (contract) throw errors.constraintViolation('derived Activity input is missing its read pin')
+        const pending = this.staged.get(key)
+        const version = pending ? (pending.isNew ? 1 : pending.baseVersion) : this.store.load(id)?.row.version
+        if (version === undefined) throw errors.notFoundOrNotVisible('Activity input is unavailable')
+        inputs[key] = version
+      }
+      const outputs: JsonMap = {}
+      for (const reference of activity.outputs) {
+        const key = referenceText(reference)
+        const id = tryParseElementId(key)
+        if (!id) continue
+        const pending = this.staged.get(key)
+        const version = pending?.changed ? (pending.isNew ? 1 : pending.baseVersion + 1) : this.store.load(id)?.row.version
+        if (version === undefined) throw errors.notFoundOrNotVisible('Activity output is unavailable')
+        outputs[key] = version
+      }
+      activity.origin = { ...activity.origin, _kip_runtime: { ...((activity.origin._kip_runtime ?? {}) as JsonMap), input_versions: inputs, output_versions: outputs } }
+    }
+  }
+
   private entryFor(staged: Staged, preview: boolean): ChangeEntry {
     const row = staged.element.row
     const diff = diffPlanes(staged.element, staged.baseRow)

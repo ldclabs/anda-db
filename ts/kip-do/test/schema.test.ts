@@ -39,7 +39,7 @@ import {
   type SchemaPackage,
 } from '../src/schema/index.js'
 
-const CM_REF = 'kip://profiles/cognitive-memory@2.0.0'
+const CM_REF = 'kip://profiles/cognitive-memory@2.1.0'
 
 /** A lock that activates Core and the bundled profile. */
 function activeLock(): SchemaLock {
@@ -73,7 +73,7 @@ const RIVAL: SchemaPackage = {
 
 describe('symbol identity', () => {
   it('round-trips a symbol through its canonical form', () => {
-    const text = 'kip://profiles/cognitive-memory@2.0.0/has_step'
+    const text = 'kip://profiles/cognitive-memory@2.1.0/has_step'
     const symbol = parseSymbolRef(text)
     expect(formatSymbolRef(symbol)).toBe(text)
     expect(symbol.name).toBe('has_step')

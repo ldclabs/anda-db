@@ -47,11 +47,305 @@ export interface Fixture {
 
 export const FIXTURES: readonly Fixture[] = [
   {
+    "name": "cognitive-consistency",
+    "description": "d6e3a45 Core cognitive contracts: conflict-complete belief, context inclusion, half-open clocks, protected identity and portable numeric inputs.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/consistency",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "predicates": {
+            "position": {
+              "kind": "PredicateType",
+              "functional": true,
+              "object": {
+                "literal_types": [
+                  "string"
+                ]
+              }
+            },
+            "scoped": {
+              "kind": "PredicateType",
+              "functional": true,
+              "object": {
+                "literal_types": [
+                  "string"
+                ]
+              }
+            },
+            "temporal": {
+              "kind": "PredicateType",
+              "functional": true,
+              "object": {
+                "literal_types": [
+                  "string"
+                ]
+              }
+            },
+            "likes": {
+              "kind": "PredicateType",
+              "functional": false,
+              "object": {
+                "literal_types": [
+                  "string"
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {\n CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Ada\" }\n CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n CREATE CONCEPT ?travel { TYPE \"Person\" NAME \"travel\" }\n ENSURE PROPOSITION ?home (?a, \"position\", \"home\")\n ENSURE PROPOSITION ?office (?a, \"position\", \"office\")\n ENSURE PROPOSITION ?tea (?a, \"likes\", \"tea\")\n ENSURE PROPOSITION ?coffee (?a, \"likes\", \"coffee\")\n ENSURE PROPOSITION ?w (?a, \"scoped\", \"work\")\n ENSURE PROPOSITION ?t (?a, \"scoped\", \"travel\")\n ENSURE PROPOSITION ?old (?a, \"temporal\", \"old\")\n ENSURE PROPOSITION ?new (?a, \"temporal\", \"new\")\n CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?home, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?office, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?tea, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?coffee, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?w, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?work] } }\n CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?t, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?travel] } }\n CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?old, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-01T00:00:00Z\", until: \"2026-09-07T00:00:00Z\" } } }\n CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?new, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-07T00:00:00Z\" } } }\n}"
+    ],
+    "cases": [
+      {
+        "name": "grounded conflict includes candidate diagnosis and visible slot opposition",
+        "command": "FIND(?b.status, ?b.candidate_status, ?b.slot_status, ?b.conflict_reasons, ?b.leading) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"position\", \"home\") }",
+        "expect": {
+          "result": [
+            [
+              "contested",
+              "accepted",
+              "contested",
+              [
+                "functional_value"
+              ],
+              "none"
+            ]
+          ]
+        },
+        "vectors": [
+          "MEM-001"
+        ]
+      },
+      {
+        "name": "slot conflict has no accepted values",
+        "command": "FIND(?b.status, ?b.accepted_values) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF SLOT (?a, \"position\") }",
+        "expect": {
+          "result": [
+            [
+              "contested",
+              []
+            ]
+          ]
+        },
+        "vectors": [
+          "MEM-001"
+        ]
+      },
+      {
+        "name": "LIMIT never hides a competing conflict",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"position\", ?value) } LIMIT 1",
+        "expect": {
+          "result": [
+            "contested"
+          ]
+        },
+        "vectors": [
+          "MEM-001"
+        ]
+      },
+      {
+        "name": "a multi-value preference slot remains accepted",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF SLOT (?a, \"likes\") }",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "MEM-001"
+        ]
+      },
+      {
+        "name": "scoped assertions cannot support context-free recall",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"scoped\", \"work\") }",
+        "expect": {
+          "result": [
+            "insufficient"
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "exact context includes the matching scoped claim",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"scoped\", \"work\") } WITH EPISTEMIC {context_refs: [\"C-2\"]}",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "no scoped support is borrowed; matching-context functional opposition remains",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"scoped\", \"travel\") } WITH EPISTEMIC {context_refs: [\"C-2\"]}",
+        "expect": {
+          "result": [
+            "rejected"
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "both explicit contexts disclose the conflict",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"scoped\", \"work\") } WITH EPISTEMIC {context_refs: [\"C-2\", \"C-3\"]}",
+        "expect": {
+          "result": [
+            "contested"
+          ]
+        },
+        "vectors": [
+          "MEM-001"
+        ]
+      },
+      {
+        "name": "until is excluded exactly at the boundary",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T08:00:00+08:00\"",
+        "expect": {
+          "result": [
+            "rejected"
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "the value beginning at the boundary is eligible",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"new\") } FOR TIME \"2026-09-07T00:00:00Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "basis reports normalized time and the next known invalidation",
+        "command": "FIND(?b.basis.valid_at, ?b.basis.next_invalid_at) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-06T08:00:00+08:00\"",
+        "expect": {
+          "result": [
+            [
+              "2026-09-06T00:00:00.000Z",
+              "2026-09-07T00:00:00.000Z"
+            ]
+          ]
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "invalid half-open interval ('2026-09-07T00:00:00Z', '2026-09-07T00:00:00Z')",
+        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-07T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "invalid half-open interval ('2026-09-08T00:00:00Z', '2026-09-07T00:00:00Z')",
+        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-08T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "merged_into is protected identity state",
+        "command": "UPDATE \"C-1\" SET FIELDS {merged_into: \"C-2\"}",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "portable numeric source rejects 9007199254740992",
+        "command": "CREATE CONCEPT ?x { TYPE \"Person\" SET ATTRIBUTES {n: 9007199254740992} }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-011"
+        ]
+      },
+      {
+        "name": "portable numeric source rejects 9007199254740993.0",
+        "command": "CREATE CONCEPT ?x { TYPE \"Person\" SET ATTRIBUTES {n: 9007199254740993.0} }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-011"
+        ]
+      },
+      {
+        "name": "portable numeric source rejects 9007199254740993e0",
+        "command": "CREATE CONCEPT ?x { TYPE \"Person\" SET ATTRIBUTES {n: 9007199254740993e0} }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-011"
+        ]
+      },
+      {
+        "name": "portable numeric source rejects 1e-400",
+        "command": "CREATE CONCEPT ?x { TYPE \"Person\" SET ATTRIBUTES {n: 1e-400} }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-011"
+        ]
+      },
+      {
+        "name": "unknown context is rejected without widening scope",
+        "command": "FIND(?b.status) WHERE {?a CONCEPT {name:\"Ada\"} ?b BELIEF (?a,\"scoped\",\"work\")} WITH EPISTEMIC {context_refs:[\"C-999999\"]}",
+        "expect": {
+          "error": "NotFoundOrNotVisible"
+        },
+        "vectors": [
+          "MEM-007"
+        ]
+      },
+      {
+        "name": "KIP strings reject unpaired Unicode escapes before execution",
+        "command": "CREATE CONCEPT ?x {TYPE \"Person\" NAME \"\\ud800\"}",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "MEM-011"
+        ]
+      }
+    ]
+  },
+  {
     "name": "consequence",
     "description": "The consequence channel: what the world did after the Brain acted, and what a Skill's standing is spent from. Outcome Evidence (Spec §15.7) carries an OutcomeRecord Facet — the graded index over an untouched payload — and cognition subscribes to a stream by task family rather than by reference. What an engine owes here is the Profile's schema discipline: the scoring handle a Skill cannot be compiled without, the four lifecycle states, a graded index its subject cannot rewrite, and the one guarded statement (Appendix F.6) a lifecycle verdict executes as. The verdict rule itself is Brain policy; that it lands as one recomputable transition is not.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      task_family: \"deploy/pre-flight\",\n      summary: \"Dry-run the migration before the deploy\",\n      procedure: \"1. dry-run the migration 2. deploy 3. verify\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n  }\n}",
-      "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Dry-run the migration before the deploy\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n  }\n}",
+      "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"win\", task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"loss\", task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
     ],
     "cases": [
       {
@@ -84,8 +378,8 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "a Skill must name the outcome stream that could prove it wrong",
-        "command": "MUTATE {\n  CREATE CONCEPT ?s {\n    TYPE \"Skill\"\n    NAME \"Be careful\"\n    SET ATTRIBUTES {skill_class: \"heuristic\", summary: \"Think first\", procedure: \"think\", status: \"proposed\"}\n  }\n}",
+        "name": "behavior belongs to a SkillRevision with a task_family",
+        "command": "MUTATE {\n  CREATE CONCEPT ?s {\n    TYPE \"SkillRevision\"\n    NAME \"Be careful\"\n    SET ATTRIBUTES {skill_class: \"heuristic\", summary: \"Think first\", procedure: \"think\", status: \"proposed\"}\n  }\n}",
         "expect": {
           "error": "ConstraintViolation"
         }
@@ -138,47 +432,37 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "a lifecycle move is one guarded statement: the verdict Activity and the transition commit together",
+        "name": "a verdict name and mutable tallies cannot establish validated learning",
         "command": "MUTATE {\n  CREATE ACTIVITY ?verdict {\n    SET FIELDS {\n      activity_class: \"lifecycle_verdict\",\n      status: \"completed\",\n      parameters_digest: \"sha3-256:ru1e\"\n    }\n    SET STRUCTURAL {\n      (\"inputs\", \"E-1\")\n      (\"inputs\", \"E-2\")\n      (\"outputs\", \"C-1\")\n    }\n  }\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"trialed\"}\n  SET FACET \"GradingState\" {success_count: 1, failure_count: 1, graded_count: 2}\n  EXPECT VERSION 1\n}",
-        "expect": {}
+        "expect": {
+          "error": "ConstraintViolation"
+        }
       },
       {
-        "name": "standing is what the verdict moved, the tallies count graded outcomes, and the admission bet stays on MnemonicState",
+        "name": "refused grading preserves unproven standing and independent utility",
         "command": "FIND(?s.attributes.status, ?s.facets[\"GradingState\"].graded_count, ?s.facets[\"MnemonicState\"].utility) WHERE { ?s CONCEPT {type: \"Skill\"} }",
         "expect": {
           "result": [
             [
-              "trialed",
-              2,
+              "proposed",
+              null,
               0.5
             ]
           ]
         }
       },
       {
-        "name": "replaying the same verdict against the version it already consumed is refused",
+        "name": "an unvalidated adoption cannot bypass the learning contract",
         "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n  EXPECT VERSION 1\n}",
         "expect": {
-          "error": "VersionConflict"
+          "error": "UnsupportedCapability"
         }
       },
       {
-        "name": "the verdict is recomputable: its rule and the outcomes it read are still on the record",
+        "name": "a rejected grading transaction commits no verdict Activity",
         "command": "FIND(?v.parameters_digest, ?v.inputs) WHERE { ?v ACTIVITY {activity_class: \"lifecycle_verdict\"} }",
         "expect": {
-          "result": [
-            [
-              "sha3-256:ru1e",
-              [
-                {
-                  "id": "E:<1>"
-                },
-                {
-                  "id": "E:<2>"
-                }
-              ]
-            ]
-          ]
+          "result": []
         }
       },
       {
@@ -193,19 +477,19 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?s.attributes.status) WHERE { ?s CONCEPT {type: \"Skill\"} }",
         "expect": {
           "result": [
-            "trialed"
+            "proposed"
           ]
         }
       },
       {
-        "name": "nor is the scoring handle: UPDATE cannot unset what the type requires",
-        "command": "UPDATE \"C-1\" UNSET ATTRIBUTES {task_family}",
+        "name": "UPDATE cannot unset the required Skill class",
+        "command": "UPDATE \"C-1\" UNSET ATTRIBUTES {skill_class}",
         "expect": {
           "error": "ConstraintViolation"
         }
       },
       {
-        "name": "nor is a declared type",
+        "name": "legacy behavior fields are not writable on a stable Skill",
         "command": "UPDATE \"C-1\" SET ATTRIBUTES {task_family: 7}",
         "expect": {
           "error": "ConstraintViolation"
@@ -217,9 +501,11 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {}
       },
       {
-        "name": "and the transition the verdict licensed still goes through",
+        "name": "adoption requires an available validated learning runtime",
         "command": "MUTATE {\n  UPDATE \"C-1\"\n  SET ATTRIBUTES {status: \"adopted\"}\n}",
-        "expect": {}
+        "expect": {
+          "error": "UnsupportedCapability"
+        }
       },
       {
         "name": "the Skill that came out the other side",
@@ -227,7 +513,7 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             [
-              "adopted",
+              "proposed",
               "Dry-run the migration, then deploy"
             ]
           ]
@@ -352,7 +638,7 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?p.predicate_ref) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
         "expect": {
           "result": [
-            "kip://profiles/cognitive-memory@2.0.0/prefers"
+            "kip://profiles/cognitive-memory@2.1.0/prefers"
           ]
         }
       },
@@ -361,7 +647,7 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {
           "result": [
-            "kip://profiles/cognitive-memory@2.0.0/Person"
+            "kip://profiles/cognitive-memory@2.1.0/Person"
           ]
         }
       },
@@ -510,7 +796,7 @@ export const FIXTURES: readonly Fixture[] = [
     "description": "What a Space can find out about cognition it built on something else, and what byte destruction may and may not take with it. LIST DEPENDENTS walks provenance in the derived direction so a revised root's downstream artifacts can be reviewed instead of guessed at (Spec §57.5, §63.5); reachability is topology, not a verdict. PURGE PAYLOAD destroys Evidence bytes while the record, its digest, its citations and its provenance role survive (§60.6) — the data-minimization instrument, which is a different promise from element purge.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?event {\n    TYPE \"Event\"\n    NAME \"Migration meeting\"\n    SET ATTRIBUTES {summary: \"The team agreed to migrate on Friday\"}\n  }\n  CREATE CONCEPT ?insight {\n    TYPE \"Insight\"\n    NAME \"Migrations need a rollback plan\"\n    SET ATTRIBUTES {summary: \"Every migration ships with a rollback\"}\n  }\n  CREATE ACTIVITY ?consolidate {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?event)\n      (\"outputs\", ?insight)\n    }\n  }\n}",
-      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      task_family: \"migration/rollback\",\n      summary: \"Write the rollback first\",\n      procedure: \"1. write the rollback 2. migrate\",\n      status: \"proposed\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
+      "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Write the rollback first\",\n      status: \"proposed\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
     ],
     "cases": [
@@ -1331,7 +1617,7 @@ export const FIXTURES: readonly Fixture[] = [
                 "kind": "concept",
                 "id": "C:<1>",
                 "new_version": 1,
-                "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person"
+                "schema_ref": "kip://profiles/cognitive-memory@2.1.0/Person"
               }
             ]
           }
@@ -1567,21 +1853,21 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
               "local_name": "caused_by",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/prefers",
               "local_name": "prefers",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/same_as",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/same_as",
               "local_name": "same_as",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
@@ -1600,39 +1886,87 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/AttemptRecord",
+              "local_name": "AttemptRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/CompressionRecord",
+              "local_name": "CompressionRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/DecisionRecord",
               "local_name": "DecisionRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/DependencyBasis",
+              "local_name": "DependencyBasis",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/DerivationState",
               "local_name": "DerivationState",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/EvaluationRecord",
+              "local_name": "EvaluationRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/GradingState",
               "local_name": "GradingState",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/LeaseState",
+              "local_name": "LeaseState",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/MnemonicState",
               "local_name": "MnemonicState",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord",
               "local_name": "OutcomeRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/TrialState",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/RecallCoverage",
+              "local_name": "RecallCoverage",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/TrialRecord",
+              "local_name": "TrialRecord",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/TrialState",
               "local_name": "TrialState",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.1.0/WatchState",
+              "local_name": "WatchState",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             },
             {
@@ -1651,9 +1985,9 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+              "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
               "local_name": "caused_by",
-              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
               "status": "active"
             }
           ]
@@ -1667,7 +2001,7 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             {
               "id": "kip:policy:baseline",
-              "version": 1,
+              "version": 2,
               "eligible_modes": [
                 "observed",
                 "stated",
@@ -1685,7 +2019,7 @@ export const FIXTURES: readonly Fixture[] = [
             },
             {
               "id": "kip:policy:forecast",
-              "version": 1,
+              "version": 2,
               "eligible_modes": [
                 "predicted",
                 "inferred"
@@ -1708,7 +2042,7 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": {
             "id": "kip:policy:forecast",
-            "version": 1,
+            "version": 2,
             "eligible_modes": [
               "predicted",
               "inferred"
@@ -3417,4 +3751,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 266
+export const CASE_COUNT = 286

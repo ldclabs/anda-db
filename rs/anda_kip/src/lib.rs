@@ -146,6 +146,8 @@ pub mod capsule;
 pub mod conformance;
 pub mod error;
 pub mod executor;
+pub mod json;
+pub mod memory;
 pub mod parser;
 pub mod request;
 pub mod semantics;
@@ -156,6 +158,8 @@ pub use capsule::*;
 pub use conformance::*;
 pub use error::*;
 pub use executor::*;
+pub use json::{MAX_SAFE_INTEGER, parse_canonical_json, validate_json};
+pub use memory::*;
 pub use parser::*;
 pub use request::*;
 pub use semantics::*;
@@ -268,7 +272,7 @@ mod tests {
         // shipping the prompts without a way to reach it would leave a host
         // unable to honour what they promise.
         for prompt in [SELF_INSTRUCTIONS, SYSTEM_INSTRUCTIONS] {
-            assert!(prompt.contains("profiles/CognitiveMemoryProfile-2.0.md"));
+            assert!(prompt.contains("brain/") && prompt.contains("KIP"));
         }
         assert!(COGNITIVE_MEMORY_PROFILE.contains("Cognitive Memory Profile"));
     }

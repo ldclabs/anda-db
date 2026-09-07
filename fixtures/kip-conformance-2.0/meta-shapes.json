@@ -1,6 +1,6 @@
 {
   "name": "meta-shapes",
-  "description": "The shape a META read answers in, which is a contract and not an engine choice. A client that talks to both engines parses one answer, and a divergence here is the most expensive kind to find: a reader written for one shape gets an empty result from the other, and an empty result reads as an empty Space rather than as a wrong shape — no error, no clue. So the `LIST` families pin their row shape and their order here rather than in either engine's own tests, which is where the two drifted apart in the first place. The Primer is not pinned whole here: most of it is deployment fact — a Space's name, its sequence, how many packages a host installed — and the fixtures are for behaviour, not for one engine's bootstrap. Its key structure is asserted in each engine's own tests instead.",
+  "description": "The shape a META read answers in, which is a contract and not an engine choice. A client that talks to both engines parses one answer, and a divergence here is the most expensive kind to find: a reader written for one shape gets an empty result from the other, and an empty result reads as an empty Space rather than as a wrong shape \u2014 no error, no clue. So the `LIST` families pin their row shape and their order here rather than in either engine's own tests, which is where the two drifted apart in the first place. The Primer is not pinned whole here: most of it is deployment fact \u2014 a Space's name, its sequence, how many packages a host installed \u2014 and the fixtures are for behaviour, not for one engine's bootstrap. Its key structure is asserted in each engine's own tests instead.",
   "packages": [
     {
       "format": "KIP-Schema-Package",
@@ -73,21 +73,21 @@
       "expect": {
         "result": [
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
             "local_name": "caused_by",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/prefers",
             "local_name": "prefers",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/same_as",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/same_as",
             "local_name": "same_as",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
@@ -106,39 +106,87 @@
       "expect": {
         "result": [
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/AttemptRecord",
+            "local_name": "AttemptRecord",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/CompressionRecord",
+            "local_name": "CompressionRecord",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/DecisionRecord",
             "local_name": "DecisionRecord",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/DerivationState",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/DependencyBasis",
+            "local_name": "DependencyBasis",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/DerivationState",
             "local_name": "DerivationState",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/EvaluationRecord",
+            "local_name": "EvaluationRecord",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/GradingState",
             "local_name": "GradingState",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/LeaseState",
+            "local_name": "LeaseState",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/MnemonicState",
             "local_name": "MnemonicState",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord",
             "local_name": "OutcomeRecord",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/TrialState",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/RecallCoverage",
+            "local_name": "RecallCoverage",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/TrialRecord",
+            "local_name": "TrialRecord",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/TrialState",
             "local_name": "TrialState",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+            "status": "active"
+          },
+          {
+            "ref": "kip://profiles/cognitive-memory@2.1.0/WatchState",
+            "local_name": "WatchState",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           },
           {
@@ -157,9 +205,9 @@
       "expect": {
         "result": [
           {
-            "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
+            "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
             "local_name": "caused_by",
-            "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+            "package_ref": "kip://profiles/cognitive-memory@2.1.0",
             "status": "active"
           }
         ]
@@ -173,7 +221,7 @@
         "result": [
           {
             "id": "kip:policy:baseline",
-            "version": 1,
+            "version": 2,
             "eligible_modes": [
               "observed",
               "stated",
@@ -191,7 +239,7 @@
           },
           {
             "id": "kip:policy:forecast",
-            "version": 1,
+            "version": 2,
             "eligible_modes": [
               "predicted",
               "inferred"
@@ -214,7 +262,7 @@
       "expect": {
         "result": {
           "id": "kip:policy:forecast",
-          "version": 1,
+          "version": 2,
           "eligible_modes": [
             "predicted",
             "inferred"

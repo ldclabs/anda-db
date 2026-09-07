@@ -11,10 +11,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ryu-js = "0.2.2"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 nom = { workspace = true }
 nom-language = { workspace = true }
 thiserror = { workspace = true }

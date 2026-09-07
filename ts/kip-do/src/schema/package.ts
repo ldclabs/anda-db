@@ -1,3 +1,4 @@
+import { parseCanonicalJson } from '@ldclabs/kip-lang'
 /**
  * # The Schema Package artifact
  *
@@ -48,6 +49,7 @@ export interface FieldSpec {
 
 /** The attribute contract of a Concept type (§34–§40). */
 export interface AttributeSpec {
+  value_schema?: Json
   /** Whether attributes not named here are permitted (§37). */
   open?: boolean
   fields?: Record<string, FieldSpec>
@@ -294,7 +296,7 @@ export function parsePackage(source: string | JsonMap): SchemaPackage {
   let value: unknown
   if (typeof source === 'string') {
     try {
-      value = JSON.parse(source)
+      value = parseCanonicalJson(source)
     } catch (err) {
       throw errors.artifactParseError(
         `this is not a readable Schema Package artifact: ${String(err)}`,

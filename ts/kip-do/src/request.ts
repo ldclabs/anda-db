@@ -1,3 +1,4 @@
+import { canonicalJson } from './json.js'
 /**
  * The request envelope (§71), and every invariant of it this engine checks
  * before anything runs.
@@ -110,6 +111,10 @@ function criticalExtensions(envelope: KipRequestEnvelope): string[] {
  * valid.
  */
 export function checkEnvelope(envelope: KipRequestEnvelope, space: EnvelopeSpace): void {
+  try { canonicalJson(envelope) } catch (error) {
+    throw new KipError('InvalidRequestEnvelope', String(error))
+  }
+
   // §87.1. Silently executing a request that declared another protocol
   // version is the failure this code exists for: the caller believes it is
   // talking to the version it named.

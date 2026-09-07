@@ -16,7 +16,6 @@ use nom::{
 };
 use nom_language::error::{VerboseError, VerboseErrorKind};
 use std::collections::HashSet;
-use std::str::FromStr;
 
 use crate::{Json, Map, Number};
 
@@ -24,7 +23,8 @@ use crate::{Json, Map, Number};
 /// - Allow identifier as map key (starts with a letter or underscore, followed by any combination of letters, digits, or underscores)
 /// - Allow line comment (starting with //).
 /// - Allow trailing comma
-pub(crate) fn json_value<'a>() -> impl Parser<&'a str, Output = Json, Error = VerboseError<&'a str>> {
+pub(crate) fn json_value<'a>() -> impl Parser<&'a str, Output = Json, Error = VerboseError<&'a str>>
+{
     JsonParser
 }
 
@@ -34,37 +34,7 @@ pub(crate) fn quoted_string(input: &str) -> IResult<&str, String, VerboseError<&
 }
 
 pub(crate) fn parse_number(input: &str) -> IResult<&str, Number, VerboseError<&str>> {
-    map_res(recognize_float, |literal: &str| {
-        let number = Number::from_str(literal).map_err(|err| err.to_string())?;
-        if !is_integer_literal(literal) || number.is_i64() || number.is_u64() {
-            return Ok(number);
-        }
-
-        // `Number::from_str` (serde_json without `arbitrary_precision`) converts
-        // an out-of-range integer literal to `f64`, storing a *different* value
-        // than the one written — `18446744073709551617` becomes
-        // `1.8446744073709552e19` and an EXPORT capsule no longer round-trips.
-        // Recover the exact value when it still fits (this is also what turns
-        // `-0` into the integer `0` instead of the float `-0.0`), otherwise
-        // reject, matching how an overflowing float literal is already handled.
-        literal
-            .parse::<i64>()
-            .map(Number::from)
-            .or_else(|_| literal.parse::<u64>().map(Number::from))
-            .map_err(|_| {
-                format!(
-                    "integer literal {literal} is out of range: \
-                     KIP integers must be representable as i64 or u64"
-                )
-            })
-    })
-    .parse(input)
-}
-
-/// True when a `recognize_float` literal has no fraction and no exponent, i.e.
-/// the author wrote an integer and expects an integer back.
-fn is_integer_literal(literal: &str) -> bool {
-    !literal.contains(['.', 'e', 'E'])
+    map_res(recognize_float, crate::json::portable_number).parse(input)
 }
 
 pub(crate) fn ws<'a, O, F>(f: F) -> impl Parser<&'a str, Output = O, Error = VerboseError<&'a str>>
@@ -260,7 +230,8 @@ fn unicode_escape<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseEr
     )
 }
 
-pub(crate) fn character<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>> {
+pub(crate) fn character<'a>() -> impl Parser<&'a str, Output = char, Error = VerboseError<&'a str>>
+{
     context(
         "JSON string character",
         alt((
@@ -457,21 +428,20 @@ mod tests {
             err.message
         );
 
-        // The i64/u64 boundaries themselves still parse exactly.
+        // All spellings use the safe binary64 integral range (§9.3).
+        for source in [
+            "18446744073709551615",
+            "-9223372036854775808",
+            "1.8446744073709552e19",
+            "1e400",
+            "9007199254740992.0",
+            "1e-400",
+        ] {
+            assert!(crate::parse_json(source).is_err(), "{source}");
+        }
         assert_eq!(
-            crate::parse_json("18446744073709551615").unwrap(),
-            Json::Number(Number::from(u64::MAX))
-        );
-        assert_eq!(
-            crate::parse_json("-9223372036854775808").unwrap(),
-            Json::Number(Number::from(i64::MIN))
-        );
-        // Floats are unaffected: an out-of-range float was already rejected,
-        // an in-range one still parses.
-        assert!(crate::parse_json("1e400").is_err());
-        assert_eq!(
-            crate::parse_json("1.8446744073709552e19").unwrap(),
-            Json::Number(Number::from_f64(1.8446744073709552e19).unwrap())
+            crate::parse_json("9007199254740991").unwrap(),
+            Json::from(9_007_199_254_740_991u64)
         );
         // `-0` has no fraction or exponent, so it is the integer 0.
         assert_eq!(

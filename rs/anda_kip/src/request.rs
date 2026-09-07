@@ -167,11 +167,23 @@ impl Request {
             .unwrap_or(ExecutionMode::Independent)
     }
 
+    /// Decode a wire request without losing numeric source digits or duplicate keys.
+    pub fn from_json(source: &str) -> Result<Self, KipError> {
+        let request: Self = serde_json::from_value(crate::parse_canonical_json(source)?)
+            .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?;
+        request.validate()?;
+        Ok(request)
+    }
+
     /// Checks every envelope invariant that does not need an engine.
     ///
     /// This is the structural gate: Governance, Schema resolution, snapshot
     /// alignment and commit-time revalidation all remain runtime invariants.
     pub fn validate(&self) -> Result<(), KipError> {
+        crate::validate_json(
+            &serde_json::to_value(self)
+                .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?,
+        )?;
         if self.kip != KIP_VERSION {
             return Err(KipError::unsupported_protocol_version(format!(
                 "this runtime speaks KIP {KIP_VERSION}, the request declares {:?}",

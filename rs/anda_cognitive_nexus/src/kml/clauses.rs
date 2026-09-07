@@ -760,7 +760,44 @@ async fn assertion_row(
             Ok(Json::Object(citation))
         })
         .collect::<Result<Vec<Json>, KipError>>()?;
+    let given_context = fields.json("context_refs");
+    let mut contexts = structural.values("context");
+    if !given_context.is_null() {
+        contexts.extend(
+            given_context
+                .as_array()
+                .ok_or_else(|| {
+                    KipError::type_mismatch("context_refs must be an array of Concept references")
+                })?
+                .iter()
+                .cloned(),
+        );
+    }
+    let mut context_refs = Vec::new();
+    for value in contexts {
+        let name = value
+            .as_str()
+            .or_else(|| value.get("id").and_then(Json::as_str))
+            .ok_or_else(|| {
+                KipError::type_mismatch("context_refs must contain Concept references")
+            })?;
+        let id = name.parse::<ElementId>()?;
+        if id.kind != ElementKind::Concept {
+            return Err(KipError::type_mismatch("context_refs must name Concepts"));
+        }
+        tx.load(id).await?;
+        context_refs.push(canonicalize_reference(tx, serde_json::json!({"id": name})).await?);
+    }
+    context_refs.sort_by_key(Json::to_string);
+    context_refs.dedup();
     let valid_time = fields.json("valid_time");
+    let from = valid_time_part(&valid_time, "from")?;
+    let until = valid_time_part(&valid_time, "until")?;
+    if !from.is_empty() && !until.is_empty() && from >= until {
+        return Err(KipError::constraint_violation(
+            "valid_time requires from < until",
+        ));
+    }
     let row = AssertionRow {
         _id: id.seq,
         proposition_id: proposition.to_string(),
@@ -774,7 +811,7 @@ async fn assertion_row(
         valid_until: valid_time_part(&valid_time, "until")?,
         evidence_ids: evidence.iter().filter_map(evidence_id).collect(),
         evidence_refs: evidence,
-        context_refs: structural.values("context"),
+        context_refs,
         status: "active".to_string(),
         client_key,
         facets,
@@ -2263,7 +2300,9 @@ async fn canonicalize(tx: &mut Transaction, endpoint: Endpoint) -> Result<Endpoi
         return Ok(endpoint);
     }
     let chain = canonical_chain(tx, id).await?;
-    Ok(Endpoint::Local(*chain.last().unwrap_or(&id)))
+    let resolved = *chain.last().unwrap_or(&id);
+    tx.record_reference(&id.to_string(), &resolved.to_string());
+    Ok(Endpoint::Local(resolved))
 }
 
 /// Rewrites one reference value onto the Concept a merge made canonical.
@@ -2297,6 +2336,7 @@ pub(crate) async fn canonicalize_reference(
     }
     let chain = canonical_chain(tx, id).await?;
     let canonical = *chain.last().unwrap_or(&id);
+    tx.record_reference(&text, &canonical.to_string());
     if canonical == id {
         return Ok(value);
     }

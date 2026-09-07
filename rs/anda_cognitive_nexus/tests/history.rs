@@ -38,7 +38,7 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -498,7 +498,7 @@ async fn a_projection_at_a_coordinate_sees_only_the_claims_of_its_time() {
     let then = ok(
         &nexus,
         &format!(
-            r#"FIND(?b.status) WHERE {{ ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }} AS OF SEQ {first}"#
+            r#"FIND(?b.status) WHERE {{ ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }} AS OF SEQ {first} WITH EPISTEMIC {{policy:"baseline"}}"#
         ),
     )
     .await;

@@ -33,7 +33,7 @@ use crate::error::{KipError, KipErrorCode};
 pub const CAPSULE_FORMAT: &str = "KIP-Cognitive-Capsule";
 
 /// The Capsule format version this crate writes.
-pub const CAPSULE_VERSION: &str = "2.0";
+pub const CAPSULE_VERSION: &str = "2.0-draft";
 
 /// A portable Cognitive Capsule (Spec §37.6).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -41,6 +41,7 @@ pub struct Capsule {
     /// Always [`CAPSULE_FORMAT`] for a native Capsule.
     pub format: String,
     /// The Capsule format version.
+    #[serde(rename = "format_version")]
     pub version: String,
     /// Everything the Capsule carries.
     pub payload: CapsulePayload,
@@ -50,7 +51,10 @@ pub struct Capsule {
 
 impl Capsule {
     /// Creates a Capsule frame in this crate's format and version.
-    pub fn new(payload: CapsulePayload, integrity: CapsuleIntegrity) -> Self {
+    pub fn new(payload: CapsulePayload, mut integrity: CapsuleIntegrity) -> Self {
+        if integrity.digest_profile.is_empty() {
+            integrity.digest_profile = "kip-jcs-safe-v1".into();
+        }
         Self {
             format: CAPSULE_FORMAT.to_string(),
             version: CAPSULE_VERSION.to_string(),
@@ -65,6 +69,15 @@ impl Capsule {
     /// legality, identity resolution and Governance all need an engine and a
     /// destination Space.
     pub fn validate_frame(&self) -> Result<(), KipError> {
+        if self.version != CAPSULE_VERSION || self.integrity.digest_profile != "kip-jcs-safe-v1" {
+            return Err(KipError::unsupported_capability(
+                "Capsule requires format_version 2.0-draft and kip-jcs-safe-v1; older drafts need explicit migration",
+            ));
+        }
+        crate::validate_json(
+            &serde_json::to_value(self)
+                .map_err(|e| KipError::capsule_validation_failed(e.to_string()))?,
+        )?;
         if self.format != CAPSULE_FORMAT {
             return Err(KipError::capsule_validation_failed(format!(
                 "expected format {CAPSULE_FORMAT:?}, found {:?}",
@@ -79,8 +92,8 @@ impl Capsule {
             ));
         }
         if self.payload.manifest.kind == CapsuleKind::Delta {
-            let source = &self.payload.source;
-            if source.base_seq.is_none() || source.target_seq.is_none() {
+            let manifest = &self.payload.manifest;
+            if manifest.base_seq.is_none() || manifest.target_seq.is_none() {
                 return Err(KipError::new(
                     KipErrorCode::CapsuleValidationFailed,
                     "a delta Capsule must declare base_seq and target_seq: delta application \
@@ -103,22 +116,22 @@ pub struct CapsulePayload {
     ///
     /// Embedded packages may be used validation-only and MUST NOT auto-activate
     /// at the destination (§41.3).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "schema_dependencies")]
     pub schema: Vec<SchemaDependency>,
     /// The cognitive records themselves.
     #[serde(default)]
     pub records: CapsuleRecords,
     /// Dependencies deliberately left out, named rather than dangling (§40.1).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub external_refs: Vec<ExternalRef>,
     /// Content-addressed blobs the records reference.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blobs: Vec<BlobRef>,
+    #[serde(default)]
+    pub blobs: BTreeMap<String, String>,
     /// What the source asks of anyone handling this Capsule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handling: Option<CapsuleHandling>,
+    #[serde(default)]
+    pub handling: CapsuleHandling,
     /// Namespaced extensions.
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    #[serde(skip)]
     pub extensions: Map<String, Json>,
 }
 
@@ -134,46 +147,66 @@ pub enum CapsuleKind {
 }
 
 /// What the Capsule claims about itself (Spec §37.6).
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CapsuleManifest {
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_seq: Option<u64>,
     /// Snapshot or delta.
     pub kind: CapsuleKind,
     /// When the Capsule was produced.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub created_at: Option<String>,
     /// How complete the selection is, e.g. `selection_complete`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub completeness: Option<String>,
     /// What the Capsule closes over (§40.3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closure: Option<Json>,
+    pub closure: String,
+}
+
+impl Default for CapsuleManifest {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            base_seq: None,
+            target_seq: None,
+            kind: CapsuleKind::Snapshot,
+            created_at: None,
+            completeness: None,
+            closure: "selective".into(),
+        }
+    }
 }
 
 /// Where a Capsule came from (Spec §37.6, §37.5).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct CapsuleSource {
     /// The source Nexus.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub nexus_id: Option<String>,
     /// The source Space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "space_id")]
     pub space_ref: Option<String>,
     /// The pinned source snapshot a snapshot Capsule was exported at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_seq: Option<u64>,
     /// The lower bound of a delta Capsule's lineage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub base_seq: Option<u64>,
     /// The upper bound of a delta Capsule's lineage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub target_seq: Option<u64>,
     /// Which Schema Environment version the records were written under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub schema_environment_version: Option<u64>,
 }
 
 /// One Schema Package a Capsule depends on (Spec §20.11).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(try_from = "Json", into = "Json")]
 pub struct SchemaDependency {
     /// The package path, e.g. `kip://profiles/cognitive-memory`.
     pub package: String,
@@ -186,6 +219,7 @@ pub struct SchemaDependency {
 
 /// The cognitive records a Capsule carries, grouped by Core kind.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(try_from = "Vec<Json>", into = "Vec<Json>")]
 pub struct CapsuleRecords {
     /// Concept records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -246,15 +280,15 @@ pub enum ExternalRefKind {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ExternalRef {
     /// The capsule-local reference this stands in for.
-    #[serde(rename = "ref")]
+    #[serde(rename = "id")]
     pub reference: String,
     /// What kind of omission this is.
     pub kind: ExternalRefKind,
     /// Whatever identity the source can safely disclose.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "locator", skip_serializing_if = "Option::is_none")]
     pub identity: Option<Json>,
     /// Why it was omitted, where policy permits saying.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub reason: Option<String>,
 }
 
@@ -286,6 +320,8 @@ pub struct BlobRef {
 /// trust, classification, authority, Schema and Governance policy (§39.5).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct CapsuleHandling {
+    #[serde(flatten)]
+    pub extra: Map<String, Json>,
     /// How the source classified this content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_classification: Option<String>,
@@ -297,10 +333,12 @@ pub struct CapsuleHandling {
 /// The digest and proofs over a Capsule payload (Spec §37.6).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct CapsuleIntegrity {
+    #[serde(default)]
+    pub digest_profile: String,
     /// The canonical content digest, e.g. `sha256:...`.
     pub content_digest: String,
     /// Signatures and other proofs over that digest.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "signatures")]
     pub proofs: Vec<CapsuleProof>,
 }
 
@@ -410,36 +448,26 @@ pub type CapsuleRefMap = BTreeMap<String, String>;
 /// - the shortest round-tripping number form;
 /// - the minimal string escaping JSON allows.
 ///
-/// One honest limit: `serde_json` renders floats via the shortest-round-trip
-/// algorithm JCS also specifies, but a value that arrived as an
-/// arbitrary-precision literal is rendered as it was parsed. Digest inputs
-/// should therefore stay within JSON's interoperable number range — which is
-/// what §9.3 asks of Literals anyway.
+/// Values must have passed `validate_json` at the ingestion boundary. Use
+/// `try_canonical_json` for unchecked host values.
 pub fn canonical_json(value: &Json) -> String {
     let mut out = String::new();
     write_canonical(value, &mut out);
     out
 }
 
+/// Validate an arbitrary host value before producing portable artifact bytes.
+pub fn try_canonical_json(value: &Json) -> Result<String, KipError> {
+    crate::validate_json(value)?;
+    Ok(canonical_json(value))
+}
+
 fn write_canonical(value: &Json, out: &mut String) {
     match value {
         Json::Number(number) => {
-            // JCS writes numbers as ECMAScript does: an integral value has no
-            // fraction, so `1.0` and `1` are one number (§9.6). serde_json
-            // keeps the spelling it parsed, and two engines that digested
-            // `1.0` differently would disagree about every Capsule and
-            // Schema Package that carries one.
-            match number.as_f64() {
-                Some(float)
-                    if number.is_f64()
-                        && float.is_finite()
-                        && float.fract() == 0.0
-                        && float.abs() < 1e21 =>
-                {
-                    write!(out, "{}", float as i128).expect("writing to a String cannot fail");
-                }
-                _ => write!(out, "{number}").expect("writing to a String cannot fail"),
-            }
+            out.push_str(
+                ryu_js::Buffer::new().format(number.as_f64().expect("JSON number is finite")),
+            );
         }
         Json::Null | Json::Bool(_) | Json::String(_) => {
             // serde_json already emits these in the form JCS prescribes.
@@ -514,7 +542,68 @@ impl Capsule {
     pub fn canonical_payload(&self) -> String {
         let value = serde_json::to_value(&self.payload)
             .expect("a Capsule payload is representable as JSON");
-        canonical_json(&value)
+        canonical_json(
+            &serde_json::json!({"format": self.format, "format_version": self.version, "payload": value}),
+        )
+    }
+}
+
+impl From<SchemaDependency> for Json {
+    fn from(value: SchemaDependency) -> Self {
+        let mut object = Map::new();
+        object.insert(
+            "package_ref".into(),
+            Json::String(format!("{}@{}", value.package, value.version)),
+        );
+        if let Some(digest) = value.digest {
+            object.insert("content_digest".into(), Json::String(digest));
+        }
+        Json::Object(object)
+    }
+}
+impl TryFrom<Json> for SchemaDependency {
+    type Error = String;
+    fn try_from(value: Json) -> Result<Self, Self::Error> {
+        let reference = value["package_ref"]
+            .as_str()
+            .ok_or("schema dependency needs package_ref")?;
+        let (package, version) = reference
+            .rsplit_once('@')
+            .ok_or("schema dependency needs exact version")?;
+        Ok(Self {
+            package: package.into(),
+            version: version.into(),
+            digest: value["content_digest"].as_str().map(str::to_string),
+        })
+    }
+}
+impl From<CapsuleRecords> for Vec<Json> {
+    fn from(value: CapsuleRecords) -> Self {
+        value
+            .concepts
+            .into_iter()
+            .chain(value.propositions)
+            .chain(value.assertions)
+            .chain(value.evidence)
+            .chain(value.activities)
+            .collect()
+    }
+}
+impl TryFrom<Vec<Json>> for CapsuleRecords {
+    type Error = String;
+    fn try_from(values: Vec<Json>) -> Result<Self, Self::Error> {
+        let mut out = Self::default();
+        for value in values {
+            match value["kind"].as_str() {
+                Some("concept") => out.concepts.push(value),
+                Some("proposition") => out.propositions.push(value),
+                Some("assertion") => out.assertions.push(value),
+                Some("evidence") => out.evidence.push(value),
+                Some("activity") => out.activities.push(value),
+                _ => return Err("Capsule record needs a Core kind".into()),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -527,12 +616,13 @@ mod tests {
             CapsulePayload {
                 manifest: CapsuleManifest {
                     kind: CapsuleKind::Snapshot,
-                    created_at: Some("2026-08-13T15:00:00Z".into()),
-                    completeness: Some("selection_complete".into()),
-                    closure: Some(serde_json::json!({"semantic": "closed"})),
+                    created_at: None,
+                    completeness: None,
+                    closure: "closed".into(),
+                    ..Default::default()
                 },
                 source: CapsuleSource {
-                    nexus_id: Some("nexus:source-A".into()),
+                    nexus_id: None,
                     space_ref: Some("space:project-kip".into()),
                     snapshot_seq: Some(8123),
                     ..Default::default()
@@ -543,12 +633,15 @@ mod tests {
                     digest: Some("sha256:abc".into()),
                 }],
                 records: CapsuleRecords {
-                    concepts: vec![serde_json::json!({"ref": "c:1", "name": "Alice"})],
+                    concepts: vec![
+                        serde_json::json!({"id": "c:1", "kind": "concept", "name": "Alice"}),
+                    ],
                     ..Default::default()
                 },
                 ..Default::default()
             },
             CapsuleIntegrity {
+                digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: "sha256:abc".into(),
                 proofs: vec![],
             },
@@ -560,7 +653,7 @@ mod tests {
         let capsule = snapshot();
         let json = serde_json::to_value(&capsule).unwrap();
         assert_eq!(json["format"], CAPSULE_FORMAT);
-        assert_eq!(json["version"], "2.0");
+        assert_eq!(json["format_version"], "2.0-draft");
         assert_eq!(json["payload"]["manifest"]["kind"], "snapshot");
         assert_eq!(json["payload"]["source"]["snapshot_seq"], 8123);
 
@@ -640,8 +733,8 @@ mod tests {
         capsule.payload.manifest.kind = CapsuleKind::Delta;
         assert!(capsule.validate_frame().is_err());
 
-        capsule.payload.source.base_seq = Some(8000);
-        capsule.payload.source.target_seq = Some(8123);
+        capsule.payload.manifest.base_seq = Some(8000);
+        capsule.payload.manifest.target_seq = Some(8123);
         assert!(capsule.validate_frame().is_ok());
     }
 

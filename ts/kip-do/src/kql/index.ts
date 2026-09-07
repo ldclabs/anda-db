@@ -1,3 +1,4 @@
+import { parseElementId } from '../id.js'
 /**
  * # Executing KQL
  *
@@ -142,6 +143,15 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   // axis from `AS OF` — what was *true* then, not what this Brain *held* then
   // (§36.1) — and the two never default from each other.
   const validAt = query.for_time === null ? null : time(query.for_time, b)
+
+  context.validAt = validAt ?? context.validAt
+  context.projectionPolicy = b.policy
+  b.policy.context_refs = [...new Set(b.policy.context_refs.map((id) => {
+    const parsed = parseElementId(id)
+    if (parsed.kind !== 'Concept' || context.load(parsed, false) === null) throw errors.notFoundOrNotVisible('projection context is unavailable')
+    const ref = context.canonicalEndpoint({ id }) as JsonMap
+    return String(ref.id)
+  }))].sort()
 
   const solutions = validAt === null
     ? solveAll(context, query.where_clauses, [new Map()], b)

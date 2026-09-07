@@ -32,7 +32,7 @@ async fn fresh(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -168,12 +168,12 @@ async fn describe_answers_with_canonical_identity_not_the_local_name() {
     let described = ok(&nexus, r#"DESCRIBE TYPE "Person""#).await;
     assert_eq!(
         described["ref"],
-        "kip://profiles/cognitive-memory@2.0.0/Person"
+        "kip://profiles/cognitive-memory@2.1.0/Person"
     );
     assert_eq!(described["local_name"], "Person");
     assert_eq!(
         described["package_ref"],
-        "kip://profiles/cognitive-memory@2.0.0"
+        "kip://profiles/cognitive-memory@2.1.0"
     );
     assert!(described["definition"]["attributes"]["open"].is_boolean());
 
@@ -470,7 +470,7 @@ async fn verify_schema_package_checks_the_declared_digest_and_the_installed_arti
     assert_eq!(report["valid"], true);
     assert_eq!(
         report["package_ref"],
-        "kip://profiles/cognitive-memory@2.0.0"
+        "kip://profiles/cognitive-memory@2.1.0"
     );
     assert_eq!(report["declared"]["checked"], true);
     assert_eq!(report["installed"]["known"], true);
@@ -863,9 +863,7 @@ async fn derived(name: &str) -> CognitiveNexus {
                 NAME "Plan a migration"
                 SET ATTRIBUTES {
                     skill_class: "workflow",
-                    task_family: "migration/rollback",
                     summary: "Write the rollback first",
-                    procedure: "1. write the rollback 2. migrate",
                     status: "proposed"
                 }
             }

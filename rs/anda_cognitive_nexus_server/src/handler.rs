@@ -300,11 +300,40 @@ fn error_response(code: KipErrorCode, message: impl Into<String>) -> Json<Respon
 /// handler and before the `Json` extractor parses the body.
 pub async fn post_kip(
     State(app): State<AppState>,
-    Json(req): Json<JsonRpcRequest>,
+    headers: header::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Response>), (StatusCode, Json<Response>)> {
     if app.admission.is_cancelled() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, shutting_down()));
     }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if content_type != "application/json" && !content_type.ends_with("+json") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_response(
+                KipErrorCode::InvalidRequestEnvelope,
+                "expected application/json",
+            ),
+        ));
+    }
+    let decode_error = |message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            error_response(KipErrorCode::InvalidRequestEnvelope, message),
+        )
+    };
+    let source = std::str::from_utf8(&body).map_err(|e| decode_error(e.to_string()))?;
+    let value = anda_kip::parse_canonical_json(source).map_err(|e| decode_error(e.message))?;
+    let req: JsonRpcRequest =
+        serde_json::from_value(value).map_err(|e| decode_error(e.to_string()))?;
 
     match req.method.as_str() {
         "execute_kip" => {

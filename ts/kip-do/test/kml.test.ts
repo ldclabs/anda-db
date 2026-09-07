@@ -52,7 +52,7 @@ const OPEN_PACKAGE = {
   },
 } as unknown as SchemaPackage
 
-const CM = 'kip://profiles/cognitive-memory@2.0.0'
+const CM = 'kip://profiles/cognitive-memory@2.1.0'
 
 /** The setup every fixture in the conformance suite starts from. */
 const SETUP = `MUTATE {
@@ -905,7 +905,7 @@ describe('KML', () => {
       nexus.execute(CITED_EVIDENCE)
       nexus.execute(
         'UPDATE "E-1" SET FACET "OutcomeRecord" ' +
-          '{task_family: "prefs/stated", outcome_status: "unknown"}',
+          '{task_family: "prefs/stated", outcome_status: "unknown", attempt_ref: null, metric: "completion", window: "run", terminal: true, observation_key: "prefs-1", observer_config_digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}',
       )
       nexus.execute('UPDATE "E-1" SET FACET "OutcomeRecord" {magnitude: 0.5}')
       expect(

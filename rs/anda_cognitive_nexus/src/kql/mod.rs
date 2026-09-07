@@ -167,10 +167,26 @@ impl<'a> Context<'a> {
     /// paginated over (§104). Putting the check anywhere later would mean each
     /// new pattern had to remember to apply it.
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
-        if let Some(cached) = self.loaded.get(&id) {
-            return Ok(cached.clone());
-        }
         let element = self.load_unattached(id).await?;
+        if let Some(row) = &element
+            && crate::schema::contracts::is_derived(row)
+        {
+            let policy = self.policy.clone();
+            let at = self.at.clone();
+            let validity = self.dependency_validity(row, &policy, &at).await?;
+            if self
+                .authority
+                .may_read(row, self.auth)
+                .is_some_and(|v| v.content)
+                && let Some(view) = self.views.get_mut(&id)
+            {
+                let mut json = (**view).clone();
+                if let Some(system) = json.get_mut("_system").and_then(Json::as_object_mut) {
+                    system.insert("dependency_validity".into(), validity);
+                }
+                *view = Arc::new(json);
+            }
+        }
         // §43.2: a Proposition's view keeps both readings of each endpoint —
         // `subject` / `object` as stored, `canonical_subject` /
         // `canonical_object` merge-resolved at this read's coordinate.
@@ -195,7 +211,10 @@ impl<'a> Context<'a> {
     /// The merge chain a Proposition's endpoints resolve through is walked
     /// with this, so following a pointer never re-enters the attachment that
     /// asked for it.
-    async fn load_unattached(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
+    pub(crate) async fn load_unattached(
+        &mut self,
+        id: ElementId,
+    ) -> Result<Option<Element>, KipError> {
         if let Some(cached) = self.loaded.get(&id) {
             return Ok(cached.clone());
         }
@@ -310,7 +329,7 @@ impl<'a> Context<'a> {
     }
 
     /// A stored endpoint, merge-resolved, as a read returns it.
-    async fn canonical_endpoint(&mut self, value: &Json) -> Result<Json, KipError> {
+    pub(crate) async fn canonical_endpoint(&mut self, value: &Json) -> Result<Json, KipError> {
         match crate::term::Endpoint::from_json(value) {
             Ok(crate::term::Endpoint::Local(id)) if id.kind == ElementKind::Concept => {
                 let canonical = self.canonical_of(id).await?;
@@ -344,6 +363,13 @@ impl<'a> Context<'a> {
             );
         }
         let mut view = crate::view::render(&element);
+        if crate::schema::contracts::is_derived(&element) {
+            view["_system"]["dependency_validity"] = serde_json::json!({
+                "status": "unverifiable", "action_eligible": false,
+                "reasons": ["recursive dependency validation is unavailable"],
+                "basis": self.projection_basis(&self.policy, &self.at, None),
+            });
+        }
         if visibility.content {
             crate::governance::redact::apply(&mut view, &visibility.constraints, self.read_origin);
         } else {
@@ -859,6 +885,9 @@ async fn run(
         let settings = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
         cx.policy = crate::projection::Policy::from_settings(&settings)?;
     }
+    let mut policy = cx.policy.clone();
+    cx.resolve_projection_context(&mut policy).await?;
+    cx.policy = policy;
     // `FOR TIME` names the world time a claim has to apply at, so a projection
     // in the same query answers about that instant rather than about now.
     if let Some(for_time) = &query.for_time {

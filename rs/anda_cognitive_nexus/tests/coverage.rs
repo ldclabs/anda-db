@@ -127,8 +127,8 @@ fn the_invariant_coverage_matrix_is_honest_and_does_not_shrink() {
     let registry = registry();
     assert_eq!(
         registry.len(),
-        38,
-        "§102 registers 38 Core invariants; the vendored registry parsed {} rows",
+        43,
+        "§102 registers 43 Core invariants; the vendored registry parsed {} rows",
         registry.len()
     );
 
@@ -183,7 +183,7 @@ fn the_invariant_coverage_matrix_is_honest_and_does_not_shrink() {
         );
     }
     println!(
-        "\n  {covered}/38 invariants pinned by at least one declared vector \
+        "\n  {covered}/43 invariants pinned by at least one declared vector \
          ({} vectors declared across the suite)\n",
         declared.len()
     );

@@ -1111,6 +1111,12 @@ impl Executor for Session {
         request: &Request,
         operation: &Operation,
     ) -> Response {
+        if let Err(err) = serde_json::to_value((&command, request, operation))
+            .map_err(|e| KipError::invalid_request_envelope(e.to_string()))
+            .and_then(|v| anda_kip::validate_json(&v))
+        {
+            return Response::from(err);
+        }
         let space = match self.nexus.space_of(request).await {
             Ok(space) => space,
             Err(err) => return Response::from(err),

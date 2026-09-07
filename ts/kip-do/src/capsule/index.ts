@@ -1,3 +1,5 @@
+import { validateValue } from '../schema/contracts.js'
+import { parseCanonicalJson } from '@ldclabs/kip-lang'
 /**
  * # Capsules
  *
@@ -15,7 +17,7 @@
  * and no way to notice. It is refused by name; see `DESCRIBE CAPABILITIES`.
  */
 
-import { sha3_256Text } from '../digest.js'
+import { sha256Text } from '../digest.js'
 import { errors } from '../errors.js'
 import { formatElementId, type ElementId } from '../id.js'
 import {
@@ -30,7 +32,6 @@ import { boundValue } from '../kml/value.js'
 import { Context } from '../kql/context.js'
 import { solveAll, type ReadBindings } from '../kql/matching.js'
 import { referencedIds } from '../store/index.js'
-import { nowTime } from '../time.js'
 import type { MetaContext } from '../meta/index.js'
 
 /** How far the provenance walk follows references out from the roots. */
@@ -110,6 +111,9 @@ export function exportCapsule(
     activities: [],
   }
   const schemaRefs = new Set<string>()
+  const omitted: JsonMap[] = []
+  const included = new Set<string>()
+  const sourceControl: JsonMap = {}
   const bucket: Record<string, string> = {
     Concept: 'concepts',
     Proposition: 'propositions',
@@ -128,12 +132,26 @@ export function exportCapsule(
     const view = context.view(id)
     if (element === null || view === null) continue
     collectSchemaRefs(view, schemaRefs)
-    records[bucket[element.kind] as string]?.push(view as Json)
+    const { canonical_subject: _subject, canonical_object: _object, ...record } = view
+    if (isJsonMap(record.governance)) {
+      const known = new Set(['classification', 'authority_class', 'policy_ref'])
+      const extra = Object.fromEntries(Object.entries(record.governance).filter(([k]) => !known.has(k)))
+      record.governance = Object.fromEntries(Object.entries(record.governance).filter(([k]) => known.has(k)))
+      if (Object.keys(extra).length) sourceControl[text] = extra
+    }
+    try { validateValue({ $ref: 'urn:kip:2.0:schema:element' }, record) }
+    catch {
+      if (closure === 'closed') throw errors.constraintViolation('closed Capsule requires complete, visible canonical element fields')
+      const origin = isJsonMap(record._system) ? record._system.origin : null
+      omitted.push({ id: text, kind: !isJsonMap(record._system) || (isJsonMap(origin) && origin.redacted === true) ? 'redacted' : 'unavailable', locator: { id: text } })
+      continue
+    }
+    included.add(text)
+    records[bucket[element.kind] as string]?.push(record as Json)
   }
 
-  const included = new Set(ids)
-  const externalRefs: JsonMap[] = []
-  const seenExternal = new Set<string>()
+  const externalRefs: JsonMap[] = omitted
+  const seenExternal = new Set<string>(omitted.map((r) => String(r.id)))
   for (const id of ids) {
     const element = context.load(parse(id))
     if (element === null) continue
@@ -141,10 +159,9 @@ export function exportCapsule(
       if (included.has(referenced) || seenExternal.has(referenced)) continue
       seenExternal.add(referenced)
       externalRefs.push({
-        ref: referenced,
+        id: referenced,
         kind: 'source_element',
-        identity: { id: referenced },
-        reason: `outside the ${closure} closure of this export`,
+        locator: { id: referenced },
       })
     }
   }
@@ -152,7 +169,7 @@ export function exportCapsule(
   // is part of the payload the Capsule digest covers, and an order the Rust
   // engine — which sorts by UTF-8 bytes — would not produce is a digest
   // mismatch that reads as tampering.
-  externalRefs.sort((a, b2) => compareCodePoints(String(a.ref), String(b2.ref)))
+  externalRefs.sort((a, b2) => compareCodePoints(String(a.id), String(b2.id)))
   // A `closed` Capsule promises self-containment, so it fails rather than
   // shipping the promise with a hole in it. §40.3 names the three shapes so a
   // destination can tell them apart; one that claimed `closed` and carried
@@ -161,7 +178,7 @@ export function exportCapsule(
     throw errors.constraintViolation(
       `a "closed" Capsule carries everything it references, and this export ` +
         `would leave ${externalRefs.length} reference(s) outside it — the ` +
-        `first is ${String(externalRefs[0]?.ref)}. Raise ` +
+        `first is ${String(externalRefs[0]?.id)}. Raise ` +
         `\`provenance_depth\`, widen the roots, or ask for a "referential" ` +
         `closure, which declares what it does not carry`,
     )
@@ -169,35 +186,19 @@ export function exportCapsule(
 
   const space = cx.store.space(cx.space)
   const payload: JsonMap = {
-    manifest: {
-      kind: 'snapshot',
-      created_at: nowTime(),
-      // `roots_only` unless the closure actually ran: a Capsule claiming a
-      // completeness it does not have imports as a graph the destination
-      // believes is whole.
-      completeness:
-        closure === 'closed'
-          ? 'closed'
-          : closure === 'referential'
-            ? 'referential_closure'
-            : 'roots_only',
-      closure: { mode: closure, provenance_depth: depth },
-    },
-    source: {
-      space_ref: cx.space,
-      snapshot_seq: space?.seq ?? 0,
-      schema_environment_version: cx.env.version,
-    },
+    manifest: { kind: 'snapshot', closure, roots: [...roots].sort() },
+    source: { space_id: cx.space, snapshot_seq: space?.seq ?? 0 },
     // §20.4: the exact refs travel with the records. A Capsule exporting
     // local names would arrive meaning whatever the destination happens to
     // call them.
-    schema: includeSchema ? schemaDependencies(cx, schemaRefs) : [],
-    records: records as unknown as Json,
+    schema_dependencies: includeSchema ? schemaDependencies(cx, schemaRefs) : [],
+    records: Object.values(records).flat(),
     // §40.1: what the records reference but do not carry is *declared*, not
     // dropped. A Capsule missing an edge and saying nothing imports as a graph
     // the destination believes is whole.
     external_refs: externalRefs as unknown as Json,
-    blobs: [],
+    blobs: {},
+    handling: Object.keys(sourceControl).length ? { 'anda/source_control': sourceControl } : {},
   }
 
   return {
@@ -208,15 +209,14 @@ export function exportCapsule(
     // the only thing a Capsule is for. Spec §37.6 and the Capsule design doc
     // both spell it `KIP-Cognitive-Capsule` / `2.0`.
     format: 'KIP-Cognitive-Capsule',
-    version: '2.0',
+    format_version: '2.0-draft',
     payload,
     integrity: {
       content_digest: payloadDigest(payload),
-      digest_profile:
-        'sha3-256 over RFC 8785 canonical JSON (§37.7)',
+      digest_profile: 'kip-jcs-safe-v1',
       // No proofs: this engine signs nothing, and an empty proof list is an
       // honest "unsigned" rather than a claim of provenance.
-      proofs: [],
+      signatures: [],
     },
   } as Json
 }
@@ -241,6 +241,8 @@ export function verifyCapsule(capsule: Json): Json {
     )
   }
 
+  if (artifact.format !== 'KIP-Cognitive-Capsule' || artifact.format_version !== '2.0-draft' || integrity.digest_profile !== 'kip-jcs-safe-v1') throw errors.unsupportedCapability('Capsule requires format_version 2.0-draft and kip-jcs-safe-v1; older drafts need explicit migration')
+  validateValue({ $ref: 'urn:kip:2.0:schema:capsule' }, artifact)
   const declared = integrity.content_digest
   checkDigestProfile(declared)
   const recomputed = payloadDigest(payload)
@@ -251,7 +253,7 @@ export function verifyCapsule(capsule: Json): Json {
     )
   }
 
-  const proofs = Array.isArray(integrity.proofs) ? integrity.proofs : []
+  const proofs = Array.isArray(integrity.signatures) ? integrity.signatures : []
   return {
     valid: true,
     content_digest: recomputed,
@@ -330,27 +332,20 @@ function schemaDependencies(cx: MetaContext, refs: ReadonlySet<string>): Json {
   }
   return [...packages].sort().map((reference) => {
     const row = cx.store.packageByRef(reference)
-    // `package` and `version` split rather than one `package_ref`, because
-    // that is the shape `anda_kip`'s `SchemaDependency` requires: both are
-    // non-optional there, so a dependency spelled as a single ref fails to
-    // decode and takes the whole Capsule with it. Packages persist by exact
-    // version (§20.4), so the split is lossless.
-    const at = reference.lastIndexOf('@')
-    return {
-      package: at === -1 ? reference : reference.slice(0, at),
-      version: at === -1 ? '' : reference.slice(at + 1),
-      // The digest this Nexus computed, not the one the artifact claims about
-      // itself — a destination checking the wrong one learns nothing.
-      digest: row?.content_digest ?? null,
-      installed_here: row !== null,
+    if (row === null) {
+      if (reference === 'kip://core@2.0.0') return { package_ref: reference }
+      throw errors.schemaPackageUnavailable(reference)
     }
+    const { integrity: _integrity, ...covered } = row.artifact
+    return { package_ref: reference, content_digest: 'sha256:' + sha256Text(canonicalJson(covered)) }
+
   }) as Json
 }
 
 /**
  * The digest algorithm a Capsule content digest uses.
  *
- * SHA3-256 over RFC 8785 canonical JSON, matching
+ * SHA-256 over the native frame excluding integrity, matching
  * `rs/anda_cognitive_nexus::capsule::DIGEST_PROFILE`. A Capsule is the one
  * artifact that leaves this engine and is checked by another, so the algorithm
  * is part of the interoperability contract rather than an engine choice: two
@@ -363,10 +358,10 @@ function schemaDependencies(cx: MetaContext, refs: ReadonlySet<string>): Json {
  * crosses an engine boundary, and changing them would rewrite every stored
  * `tuple_key`.
  */
-export const DIGEST_PROFILE = 'sha3-256'
+export const DIGEST_PROFILE = 'sha256'
 
 function payloadDigest(payload: Json): string {
-  return `${DIGEST_PROFILE}:${sha3_256Text(canonicalJson(payload))}`
+  return `${DIGEST_PROFILE}:${sha256Text(canonicalJson({ format: 'KIP-Cognitive-Capsule', format_version: '2.0-draft', payload }))}`
 }
 
 /**
@@ -399,16 +394,12 @@ function checkDigestProfile(declared: unknown): void {
 
 function countRecords(payload: JsonMap): number {
   const records = payload.records
-  if (!isJsonMap(records)) return 0
-  return Object.values(records).reduce<number>(
-    (total, list) => total + (Array.isArray(list) ? list.length : 0),
-    0,
-  )
+  return Array.isArray(records) ? records.length : 0
 }
 
 function parseJsonArtifact(source: string): Json {
   try {
-    return JSON.parse(source) as Json
+    return parseCanonicalJson(source) as Json
   } catch (err) {
     throw errors.artifactParseError(
       `this is not a readable Capsule artifact: ${String(err)}`,
@@ -456,7 +447,7 @@ export function describeCapsule(source: string): Json {
   const payload = isJsonMap(artifact.payload) ? artifact.payload : {}
   const integrity = isJsonMap(artifact.integrity) ? artifact.integrity : {}
   const records = isJsonMap(payload.records) ? payload.records : {}
-  const proofs = Array.isArray(integrity.proofs) ? integrity.proofs : []
+  const proofs = Array.isArray(integrity.signatures) ? integrity.signatures : []
   const externalRefs = Array.isArray(payload.external_refs)
     ? payload.external_refs.length
     : 0

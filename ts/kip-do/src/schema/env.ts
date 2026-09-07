@@ -1,3 +1,4 @@
+import { validatePackageContracts } from './contracts.js'
 /**
  * # The per-Space Schema Environment
  *
@@ -248,6 +249,7 @@ export class SchemaEnvironment {
             `installed in this Nexus`,
         )
       }
+      validatePackageContracts(artifact)
       artifacts.set(packageRef, artifact)
     }
     return new SchemaEnvironment(version, lock, artifacts)

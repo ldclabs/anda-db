@@ -155,7 +155,7 @@ describe('the Epistemic Projection', () => {
       expect(nexus.query(`FIND(?b.policy.id) ${BELIEF('Quiet')}`)).toEqual([
         'kip:policy:baseline',
       ])
-      expect(nexus.query(`FIND(?b.policy.version) ${BELIEF('Quiet')}`)).toEqual([1])
+      expect(nexus.query(`FIND(?b.policy.version) ${BELIEF('Quiet')}`)).toEqual([2])
     })
   })
 

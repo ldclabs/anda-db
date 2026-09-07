@@ -180,6 +180,14 @@ pub struct PlaneVersions {
 /// Engine-maintained state (Spec §6.3).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SystemState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_references: Vec<Json>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_versions: Option<Map<String, Json>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_versions: Option<Map<String, Json>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_validity: Option<Json>,
     /// Monotonic mutation counter; the target of a bare `EXPECT VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
@@ -613,6 +621,19 @@ pub const ACTIVITY_CLASSES: &[&str] = &[
 ///   then* are independent (§48.3).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Projection {
+    /// Complete computation coordinates; required on runtime projection results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<ProjectionBasis>,
+    /// Candidate-local diagnosis, before slot constraints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_status: Option<BeliefStatus>,
+    /// The final status after slot constraints and dependency validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_status: Option<BeliefStatus>,
+    #[serde(default)]
+    pub conflict_refs: Vec<String>,
+    #[serde(default)]
+    pub conflict_reasons: Vec<String>,
     /// The Proposition this belief is about, when one durably exists.
     ///
     /// `None` is a real answer, not a missing field: a fully grounded `BELIEF`
@@ -694,6 +715,31 @@ pub struct ProjectionTemporal {
     pub as_of_seq: Option<u64>,
 }
 
+/// KIP Cognitive Consistency §2. Opaque control identities disclose no grants.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionBasis {
+    pub space_id: String,
+    pub snapshot_seq: u64,
+    pub schema_environment_version: u64,
+    pub identity_version: u64,
+    pub policy: ProjectionPolicyVersion,
+    pub trust_version: String,
+    pub authorization_view: String,
+    pub context_refs: Vec<String>,
+    pub purpose: String,
+    pub risk: String,
+    pub valid_at: String,
+    pub next_invalid_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionPolicyVersion {
+    pub id: String,
+    pub version: String,
+}
+
 /// The score interpretations §27.3 names.
 ///
 /// A recommendation rather than a closed enum: an implementation may declare
@@ -727,6 +773,12 @@ pub const SCORE_SEMANTICS: &[&str] = &[
 /// silently lacks.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ChangeEnvelope {
+    /// Governed control-plane transitions, separate from cognitive elements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_changes: Vec<ControlChange>,
+    /// Coverage belongs to an authorization view; sequence gaps prove no silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ChangeCoverage>,
     /// The protocol version, when the runtime stamps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kip: Option<String>,
@@ -758,6 +810,21 @@ pub struct ChangeEnvelope {
     /// repository carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Map<String, Json>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ControlChange {
+    pub kind: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeCoverage {
+    pub through_seq: u64,
+    pub authorization_view: String,
+    pub complete: bool,
 }
 
 /// The extension key carrying what a transition was decided against (§36.1).
@@ -1006,7 +1073,7 @@ mod tests {
         assert_eq!(Projection::default().status, BeliefStatus::Insufficient);
         assert_eq!(
             serde_json::to_value(Projection::default()).unwrap(),
-            serde_json::json!({ "status": "insufficient" })
+            serde_json::json!({ "status": "insufficient", "conflict_refs": [], "conflict_reasons": [] })
         );
 
         // §46.4: a fully grounded BELIEF over a tuple no Proposition exists
@@ -1044,6 +1111,7 @@ mod tests {
             }),
             policy: Some(crate::request::PolicyIdentity::new("kip:policy:baseline")),
             explanation: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_value(&projection).unwrap();
@@ -1070,6 +1138,8 @@ mod tests {
             Json::Object(ChangeEnvelope::transition_detail(1500, "committed")),
         );
         let envelope = ChangeEnvelope {
+            control_changes: vec![],
+            coverage: None,
             kip: Some("2.0".into()),
             space_id: "space-1".into(),
             space_seq: 1501,

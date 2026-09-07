@@ -152,9 +152,8 @@ impl Store {
     ) -> Result<PackageRef, KipError> {
         let package_ref = package.package_ref()?;
         reject_core_shadowing(package)?;
-        let artifact = serde_json::to_value(package).map_err(|err| {
-            KipError::internal_error(format!("a parsed package failed to re-encode: {err}"))
-        })?;
+        let artifact = package.artifact()?;
+        crate::schema::contracts::verify_artifact(&artifact)?;
         let digest = content_digest(&artifact);
 
         if let Some(existing) = self.find_package_row(&package_ref.to_string()).await? {
@@ -227,12 +226,13 @@ impl Store {
         let mut packages = BTreeMap::new();
         for id in ids {
             let row: SchemaPackageRow = collection.get_as(id).await.map_err(db_error)?;
-            let package: SchemaPackage = serde_json::from_value(row.artifact).map_err(|err| {
-                KipError::new(
-                    KipErrorCode::ArtifactParseError,
-                    format!("installed package {} is unreadable: {err}", row.package_ref),
-                )
-            })?;
+            let package: SchemaPackage =
+                SchemaPackage::parse(&row.artifact.to_string()).map_err(|err| {
+                    KipError::new(
+                        KipErrorCode::ArtifactParseError,
+                        format!("installed package {} is unreadable: {err}", row.package_ref),
+                    )
+                })?;
             packages.insert(row.package_ref, Arc::new(package));
         }
         Ok(packages)

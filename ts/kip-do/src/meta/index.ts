@@ -1,3 +1,4 @@
+import { parseCanonicalJson } from '@ldclabs/kip-lang'
 /**
  * # Executing META
  *
@@ -1202,7 +1203,11 @@ function describedTransaction(row: TransactionRow): Json {
 }
 
 function changeEnvelope(row: TransactionRow, element: string | null): Json {
+  const controls: Json[] = []
+  if (row.transaction_class === 'governance' && isJsonMap(row.result) && row.result.schema_environment_version !== undefined) controls.push({ kind: 'schema', version: String(row.schema_environment_version) })
+  if (row.changes.some((c) => c.op === 'merge')) controls.push({ kind: 'identity', version: String(row.seq) })
   return {
+    ...(controls.length ? { control_changes: controls } : {}),
     kip: '2.0',
     space_id: row.space,
     space_seq: row.seq,
@@ -1521,7 +1526,7 @@ function artifactJson(value: Json, what: string): JsonMap {
   let parsed: Json
   if (typeof value === 'string') {
     try {
-      parsed = JSON.parse(value) as Json
+      parsed = parseCanonicalJson(value) as Json
     } catch (err) {
       throw errors.artifactParseError(
         `${what} takes the artifact as JSON text or as an object, and this text does not ` +
