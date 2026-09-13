@@ -208,6 +208,10 @@ impl CognitiveNexus {
         Session {
             nexus: self.clone(),
             auth: Arc::new(auth),
+            #[cfg(feature = "simulation")]
+            simulated_lifecycle_time: None,
+            #[cfg(feature = "simulation")]
+            simulated_evaluation_time: None,
         }
     }
 
@@ -382,6 +386,14 @@ impl CognitiveNexus {
         Ok(named)
     }
 
+    /// Recovers interrupted native commits and poisoned handles under the
+    /// same exclusive lock as writes. Trusted hosts use this after draining
+    /// their cancelled workers; it does not rerun model or business actions.
+    pub async fn recover(&self) -> Result<(), KipError> {
+        let _guard = self.lock.write().await;
+        self.store.reopen_if_poisoned().await
+    }
+
     /// Flushes and closes the underlying database.
     pub async fn close(&self) -> Result<(), KipError> {
         let _guard = self.lock.write().await;
@@ -403,6 +415,10 @@ impl CognitiveNexus {
 pub struct Session {
     pub(crate) nexus: CognitiveNexus,
     pub(crate) auth: Arc<AuthContext>,
+    #[cfg(feature = "simulation")]
+    simulated_lifecycle_time: Option<String>,
+    #[cfg(feature = "simulation")]
+    simulated_evaluation_time: Option<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -414,6 +430,57 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// Overrides only expiry eligibility for this trusted engine session.
+    ///
+    /// Available only with `simulation`, for isolated host-driven experiments.
+    /// Ordinary KIP requests cannot set it. It affects `sweep_expired` and
+    /// `expire_lapsed_assertions`, including the latter's per-record recheck;
+    /// authentication, grants/policies, task leases, KQL's default valid time,
+    /// transaction timestamps and Governance audit continue using real time.
+    #[cfg(feature = "simulation")]
+    pub fn with_simulated_lifecycle_time(mut self, at: &str) -> Result<Self, KipError> {
+        if self.auth.principal_id != SYSTEM_PRINCIPAL
+            || self.auth.auth_method != "engine"
+            || !self.auth.delegation_chain.is_empty()
+        {
+            return Err(KipError::not_authorized(
+                "simulated lifecycle time requires a direct engine system session",
+            ));
+        }
+        self.simulated_lifecycle_time =
+            Some(crate::time::normalize(at, "simulated lifecycle time")?);
+        Ok(self)
+    }
+
+    /// Override only EvaluationRecord cutoff eligibility in an isolated host
+    /// experiment. Audit/transaction time, observer timestamps, authentication,
+    /// policy authority and leases remain on the real clock. This cannot be set
+    /// by serialized KIP input or a delegated/service Principal.
+    #[cfg(feature = "simulation")]
+    pub fn with_simulated_evaluation_time(mut self, at: &str) -> Result<Self, KipError> {
+        if self.auth.principal_id != SYSTEM_PRINCIPAL
+            || self.auth.auth_method != "engine"
+            || !self.auth.delegation_chain.is_empty()
+        {
+            return Err(KipError::not_authorized(
+                "simulated evaluation time requires a direct engine system session",
+            ));
+        }
+        self.simulated_evaluation_time =
+            Some(crate::time::normalize(at, "simulated evaluation time")?);
+        Ok(self)
+    }
+
+    /// Business eligibility only. Never pass this value into AuthContext,
+    /// authority resolution, lease verification or transaction/audit creation.
+    fn lifecycle_time(&self) -> String {
+        #[cfg(feature = "simulation")]
+        if let Some(at) = &self.simulated_lifecycle_time {
+            return at.clone();
+        }
+        crate::time::now()
+    }
+
     /// The identity this session runs as.
     pub fn auth(&self) -> &AuthContext {
         &self.auth
@@ -597,7 +664,7 @@ impl Session {
         self.nexus.store.reopen_if_poisoned().await?;
         let authority = self.authority(space_id, &self.auth).await?;
         self.gated_under(&authority, Permission::ManageRetention, async || {
-            let now = crate::time::now();
+            let now = self.lifecycle_time();
             let mut report = RetentionSweep::default();
             let expired = self.nexus.store.expired_elements(space_id, &now).await?;
             for id in expired {
@@ -670,18 +737,19 @@ impl Session {
         let _guard = self.nexus.lock.write().await;
         self.nexus.store.reopen_if_poisoned().await?;
         let authority = self.authority(space_id, &self.auth).await?;
-        let now = crate::time::now();
+        let now = self.lifecycle_time();
         let mut expired = Vec::new();
         for id in self.nexus.store.lapsed_assertions(space_id, &now).await? {
             if expired.len() >= limit {
                 break;
             }
-            if crate::governance::element::expire_assertion(
+            if crate::governance::element::expire_assertion_at(
                 &self.nexus.store,
                 space_id,
                 id,
                 &authority,
                 &self.auth,
+                &now,
             )
             .await
             .unwrap_or(false)
@@ -1188,7 +1256,11 @@ impl Session {
             Ok(decisions) => decisions,
             Err(err) => return Response::from(err),
         };
-        let response = crate::kml::execute(
+        #[cfg(feature = "simulation")]
+        let evaluation_time = self.simulated_evaluation_time.as_deref();
+        #[cfg(not(feature = "simulation"))]
+        let evaluation_time = None;
+        let response = crate::kml::execute_at_evaluation_time(
             &self.nexus.store,
             call.space,
             statement,
@@ -1196,6 +1268,7 @@ impl Session {
             call.operation,
             &authority,
             call.auth,
+            evaluation_time,
         )
         .await;
         let response = self.settle(response, decisions).await;

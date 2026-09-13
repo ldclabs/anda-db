@@ -41,6 +41,34 @@ pub async fn execute(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> Response {
+    execute_at_evaluation_time(
+        store, space_id, statement, request, operation, authority, auth, None,
+    )
+    .await
+}
+
+/// Private host seam. The optional time is never parsed from request content.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_at_evaluation_time(
+    store: &Store,
+    space_id: &str,
+    statement: &KmlStatement,
+    request: &Request,
+    operation: &Operation,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+    evaluation_time: Option<&str>,
+) -> Response {
+    if evaluation_time.is_some()
+        && (!cfg!(feature = "simulation")
+            || auth.principal_id != crate::governance::SYSTEM_PRINCIPAL
+            || auth.auth_method != "engine"
+            || !auth.delegation_chain.is_empty())
+    {
+        return Response::from(KipError::not_authorized(
+            "simulated evaluation time requires an engine system session",
+        ));
+    }
     let dry_run = request.is_dry_run();
     let origin = origin_of(request, auth);
 
@@ -57,6 +85,8 @@ pub async fn execute(
         Ok(tx) => tx,
         Err(err) => return Response::from(err),
     };
+
+    tx.evaluation_time = evaluation_time.map(str::to_string);
 
     // Ingested Evidence is minted before the plan runs, inside this same
     // transaction, so a command can cite it as `:key` and an abort takes it

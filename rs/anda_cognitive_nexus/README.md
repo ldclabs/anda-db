@@ -1,7 +1,7 @@
 # anda_cognitive_nexus
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](../../docs/kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+[Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 The reference **KIP 2.0** Cognitive Nexus — a persistent memory brain for AI
 agents. `anda_kip` parses, classifies and validates; this crate is everything
@@ -79,6 +79,43 @@ host builds the `AuthContext` from authenticated transport state, never from the
 request body — exactly what an Agent under prompt injection controls. Embedded,
 it runs as the system Principal that owns the default Space: a real
 authorization through the same path, not a bypass.
+
+## Isolated lifecycle simulation
+
+The non-default `simulation` feature exposes a Rust host-only session builder:
+
+```toml
+anda_cognitive_nexus = { version = "0.13", features = ["simulation"] }
+```
+
+```rust
+let simulated = nexus.system_session()
+    .with_simulated_lifecycle_time("2030-01-01T00:00:00Z")?;
+simulated.expire_lapsed_assertions(DEFAULT_SPACE, 100).await?;
+simulated.sweep_expired(DEFAULT_SPACE, RetentionAction::Archive, 100).await?;
+```
+
+Only a direct engine system session may set this normalized RFC3339 value.
+It is local to that session and its clones, not global Nexus state. It changes
+only the eligibility time of these two sweeps, including the Assertion
+per-record expiry recheck. Legal holds and all operation permissions remain in
+force. Normal KIP requests have no clock-control field; other sessions retain
+the real clock.
+
+Use an isolated store: the sweeps still persist real lifecycle changes.
+Authentication, policy/Grant validity, task leases, the default KQL/BELIEF
+time, transaction timestamps and Governance audit always retain real time.
+Queries that mean a simulated world-valid time must explicitly use `FOR TIME`.
+Without `simulation` the builder and its session field do not exist, and the
+ordinary expiry behavior is unchanged.
+
+The separate `Session::with_simulated_evaluation_time(at)` builder advances only
+`EvaluationRecord.cutoff` admissibility for isolated learning experiments. It has
+the same direct engine-system restriction, cannot be enabled by request fields,
+and does not change sweep eligibility, observer timestamps, audit, authority or
+lease clocks. Trial/Attempt ordering, the complete ledger, native replay and CAS
+remain enforced. Future-cutoff records are simulation evidence, not production
+observations. Ordinary sessions still reject future cutoffs.
 
 ## Technical Reference
 

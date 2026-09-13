@@ -16,6 +16,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Trusted, session-local lifecycle eligibility time for isolated simulations.
+# It never changes authentication, authorization, lease or transaction clocks.
+simulation = []
+
 [dependencies]
 jsonschema = { version = "0.49.2", default-features = false }
 anda_db_utils = { version = "0.11", path = "../anda_db_utils" }

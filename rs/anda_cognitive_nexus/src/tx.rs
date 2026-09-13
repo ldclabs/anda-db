@@ -72,6 +72,8 @@ pub struct Transaction {
     pub authority: EffectiveAuthority,
     /// Who the caller is.
     pub auth: AuthContext,
+    /// Trusted simulation cutoff eligibility; never transaction/auth/lease time.
+    pub(crate) evaluation_time: Option<String>,
     reference_bindings: Vec<Json>,
     pub(crate) control_effects: Vec<ControlRecordRow>,
     pub(crate) identity_changed: bool,
@@ -170,6 +172,7 @@ impl Transaction {
             dry_run,
             authority,
             auth,
+            evaluation_time: None,
             handles: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             reference_bindings: Vec::new(),

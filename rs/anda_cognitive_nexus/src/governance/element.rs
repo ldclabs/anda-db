@@ -795,6 +795,19 @@ pub async fn expire_assertion(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> Result<bool, KipError> {
+    expire_assertion_at(store, space_id, id, authority, auth, &crate::time::now()).await
+}
+
+/// Session-internal eligibility clock. Authorization and `apply` below still
+/// resolve/stamp real time; callers cannot submit this through KIP content.
+pub(crate) async fn expire_assertion_at(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+    lifecycle_time: &str,
+) -> Result<bool, KipError> {
     let element = readable(store, space_id, id, authority, auth).await?;
     let Element::Assertion(row) = &element else {
         return Err(KipError::structural_reference_invalid(format!(
@@ -804,7 +817,7 @@ pub async fn expire_assertion(
     if row.status != "active" || row.valid_until.is_empty() {
         return Ok(false);
     }
-    if row.valid_until.as_str() > crate::time::now().as_str() {
+    if row.valid_until.as_str() > lifecycle_time {
         return Ok(false);
     }
     let resource = ResourceContext::of_element(&element);

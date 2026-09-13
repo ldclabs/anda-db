@@ -572,7 +572,9 @@ impl Transaction {
         if crate::time::normalize(
             evaluation["cutoff"].as_str().unwrap_or(""),
             "evaluation cutoff",
-        )? > self.cx.at
+        )?
+        .as_str()
+            > self.evaluation_time.as_deref().unwrap_or(&self.cx.at)
         {
             return Err(fail("evaluation cutoff cannot be in the future"));
         }
