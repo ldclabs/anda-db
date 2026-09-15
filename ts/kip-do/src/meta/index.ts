@@ -38,6 +38,8 @@ import {
   familyOf,
   describePermission,
   isPermitted,
+  resourceOfElement,
+  redactView,
   spaceResource,
   type AuthContext,
 } from '../governance/index.js'
@@ -99,7 +101,6 @@ import {
   pageCursorFromToken,
   pageToken,
   traversalOf,
-  searchIndex,
   snapshotToken,
   type ChangeEntry,
   type CursorFamily,
@@ -108,6 +109,7 @@ import {
   type TransactionRow,
 } from '../store/index.js'
 import { normalizeTime } from '../time.js'
+import { segment, MAX_QUERY_TOKENS } from '../tokenizer.js'
 import {
   capabilities,
   KIP_VERSION,
@@ -1386,16 +1388,25 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
   }
 
   const threshold = command.threshold === null ? 0 : readNumber(command.threshold, b, 'THRESHOLD')
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw errors.typeMismatch('THRESHOLD must be a number in [0, 1]')
+  }
+  if ((command.with_type !== null && !['Concept', 'Cognition'].includes(command.target)) ||
+      (command.with_predicate !== null && !['Proposition', 'Cognition'].includes(command.target))) {
+    throw errors.invalidSyntax('SEARCH modifier is not meaningful for this kind')
+  }
   // A count, not a number: `LIMIT -1` would reach `slice(0, -1)` and answer
   // with every hit but the last, and `LIMIT 2.5` would truncate — a mistyped
   // command answering rather than refusing. The reference engine reads this
   // slot through `scalar_usize` for the same reason (§102.28).
   const limit =
     command.limit === null ? 10 : Math.min(readCount(command.limit, b, 'LIMIT'), 100)
-  const offset =
-    command.cursor === null
-      ? 0
-      : readPageCursor(command.cursor, b, cx.space, 'search', cx.traversal ?? '').offset
+  const cursor = command.cursor === null ? null
+    : readPageCursor(command.cursor, b, cx.space, 'search', cx.traversal ?? '')
+  if (cursor !== null && cursor.snapshotSeq !== cx.store.currentSeq(cx.space)) {
+    throw detailed.cursorExpired('search', 'SEARCH index changed; start a new traversal')
+  }
+  const offset = cursor?.offset ?? 0
   // §20.14: a symbol in a search narrows to its lineage, so a hit written
   // under an earlier package version is still a hit.
   const withType =
@@ -1433,7 +1444,7 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
       // An Assertion's content is a stance and a number; an Activity's is a
       // class and two timestamps. Refusing says so; answering nothing would
       // read as "no such claim exists".
-      throw errors.searchIndexUnavailable(
+      throw errors.unsupportedCapability(
         'Assertions and Activities carry no free text, so this engine builds no ' +
           'full-text index over them; reach them through the Proposition or Evidence ' +
           'they are about',
@@ -1442,63 +1453,73 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
 
   const context = reader(cx)
   const scored: { score: number; hit: JsonMap }[] = []
+  let searchLimit = limit
+  const queryTokens = [...new Set(segment(term, MAX_QUERY_TOKENS))]
   for (const kind of kinds) {
-    // Over-fetch, because every filter below runs after scoring: the window has
-    // to be wide enough that a page survives them.
-    const window = Math.max(limit + offset, 1) * 4
-    for (const row of searchIndex(cx.store.sql, {
-      kind,
-      space: cx.space,
-      term,
-      limit: window,
-    })) {
-      if (row.score < threshold) continue
-      const id = elementId(kind, row.seq)
-      // Applies the read decision and returns the **redacted** view; `null` is
-      // an element this caller may not read, which is indistinguishable from
-      // one that does not exist and must stay that way (§95). A field a Grant
-      // masked out of a query must not come back through a search hit (§88.5).
-      const view = context.view(id)
-      if (view === null) continue
+    // Authorize and redact BEFORE building corpus statistics. Global FTS5 BM25
+    // scores leak hidden text, even when the final hit itself is readable.
+    const documents: { id: string; view: JsonMap; tokens: string[] }[] = []
+    for (const row of cx.store.sql.exec<{ id: number }>(
+      `SELECT id FROM ${TABLES[kind]} WHERE space = ? AND state = 'active' ORDER BY id`, cx.space,
+    )) {
+      context.spend('scans', 1)
+      const id = elementId(kind, row.id)
+      const element = context.load(id)
+      if (element === null) continue
+      const decision = cx.authority.authorize('search', resourceOfElement(element), cx.auth)
+      if (!isPermitted(decision.decision)) continue
+      if (decision.constraints.max_results !== null) searchLimit = Math.min(searchLimit, decision.constraints.max_results)
+      const readable = context.view(id)
+      if (readable === null) continue
+      const view = structuredClone(readable)
+      redactView(view, decision.constraints, context.readOrigin)
       if (withType !== null && lineageText(String(view.schema_ref ?? '')) !== withType) continue
-      if (
-        withPredicate !== null &&
-        lineageText(String(view.predicate_ref ?? '')) !== withPredicate
-      ) {
-        continue
+      if (withPredicate !== null && lineageText(String(view.predicate_ref ?? '')) !== withPredicate) continue
+      const tokens = segment(groundingText(kind, view))
+      if (tokens.length > 0) documents.push({id: formatElementId(id), view, tokens})
+    }
+    const avgLength = documents.reduce((n, doc) => n + doc.tokens.length, 0) / (documents.length || 1)
+    const frequencies = new Map(queryTokens.map(token => [token,
+      documents.reduce((n, doc) => n + Number(doc.tokens.includes(token)), 0)]))
+    for (const doc of documents) {
+      let rawScore = 0
+      const counts = new Map<string, number>()
+      for (const token of doc.tokens) counts.set(token, (counts.get(token) ?? 0) + 1)
+      for (const token of queryTokens) {
+        const tf = counts.get(token) ?? 0
+        if (tf === 0) continue
+        const df = frequencies.get(token) ?? 0
+        const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5))
+        rawScore += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * doc.tokens.length / avgLength))
       }
-      scored.push({
-        score: row.score,
-        hit: {
-          id: formatElementId(id),
-          kind: kind.toLowerCase(),
-          // Named `score`, never `confidence`: copying this into an Assertion
-          // would invent an epistemic commitment out of a text match (§2.10).
-          score: row.score,
-          // §66.4: a safe snippet — the indexed text of the redacted view,
-          // windowed around the term — beside the element.
-          snippet: snippetOf(kind, view, term),
-          element: view,
-        },
-      })
+      if (rawScore <= 0) continue
+      const score = rawScore / (1 + rawScore)
+      if (score < threshold) continue
+      scored.push({score, hit: {
+        id: doc.id, kind: kind.toLowerCase(), score,
+        retrieval: {score, mode: 'keyword'},
+        snippet: snippetOf(kind, doc.view, term), element: doc.view,
+      }})
     }
   }
-  // Scores from three FTS tables are not strictly comparable — each has its own
-  // corpus statistics — and the Rust engine merges three separate BM25 indexes
-  // the same way. Ordering them together is a ranking heuristic, which is
-  // exactly what `score_semantics` tells the caller it is.
-  scored.sort((a, b2) => b2.score - a.score)
+  scored.sort((a, b2) => b2.score - a.score || compareCodePoints(String(a.hit.id), String(b2.hit.id)))
 
   const total = scored.length
-  const page = scored.slice(offset, offset + limit)
+  const pageLimit = Math.min(searchLimit, context.resultLimit() ?? limit)
+  const page = scored.slice(offset, offset + pageLimit)
   const consumed = offset + page.length
   const spaceSeq = cx.store.currentSeq(cx.space)
 
+  const next = consumed < total && pageLimit > 0 ? pageToken(cx.space, {
+    family: 'search', snapshotSeq: spaceSeq, offset: consumed, traversal: cx.traversal ?? '',
+  }) : undefined
+  if (next !== undefined && cx.page !== undefined) cx.page.next_cursor = next
   return {
     hits: page.map((entry) => entry.hit),
     search_context: {
       mode: 'keyword',
       score_semantics: 'bm25_relevance_not_confidence',
+      normalization: 's / (1 + s), authorized redacted corpus only',
       // The index is written inside the same transaction as the row it
       // describes, so these are equal by construction rather than by luck
       // (§66.5, §79). A caller deciding what a miss means needs to know which.
@@ -1509,19 +1530,8 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     caveat:
       'a SEARCH score is not a confidence and a miss is not an absence; ground ' +
       'with SEARCH, then read with FIND or BELIEF',
-    // The Rust engine carries this on the operation result; this engine's
-    // envelope has no such slot, so it rides in the body — the same place
-    // `CHANGES` puts its cursor.
-    ...(consumed < total
-      ? {
-          next_cursor: pageToken(cx.space, {
-            family: 'search',
-            snapshotSeq: spaceSeq,
-            offset: consumed,
-            traversal: cx.traversal ?? '',
-          }),
-        }
-      : {}),
+    exhaustive: true,
+    ...(next === undefined ? {} : {next_cursor: next}),
   } as unknown as Json
 }
 
@@ -1699,6 +1709,10 @@ const SNIPPET_WIDTH = 200
  * same algorithm as the reference engine, so the two produce the same snippet.
  */
 function snippetOf(kind: ElementKind, view: JsonMap, term: string): string {
+  return windowOf(groundingText(kind, view), term, SNIPPET_WIDTH)
+}
+
+function groundingText(kind: ElementKind, view: JsonMap): string {
   const fields =
     kind === 'Concept'
       ? ['name', 'aliases', 'attributes']
@@ -1718,7 +1732,7 @@ function snippetOf(kind: ElementKind, view: JsonMap, term: string): string {
     }
   }
   for (const field of fields) collect(view[field])
-  return windowOf(text, term, SNIPPET_WIDTH)
+  return text
 }
 
 function windowOf(text: string, term: string, width: number): string {

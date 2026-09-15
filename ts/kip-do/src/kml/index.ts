@@ -100,6 +100,7 @@ export function executeKml(
   // Clause order carries no mutation semantics (§24), so this is a planning
   // order rather than an execution order. See `clauses.planPass`.
   for (let pass = 0; pass < PLAN_PASSES; pass++) {
+    if (pass === 3) tx.freezeHandleViews()
     for (const clause of statement.clauses) {
       if (planPass(clause) !== pass) continue
       apply(tx, clause, request, cx.operation)

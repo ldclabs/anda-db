@@ -105,7 +105,8 @@ pub struct Transaction {
     /// declarative, so two clauses may name one target, and clause order
     /// carries no mutation semantics. Two clauses that agree are fine; two
     /// that disagree have no answer that is not the engine choosing one.
-    assignments: BTreeMap<(ElementId, String), Json>,
+    assignments: BTreeMap<(ElementId, String), Option<Json>>,
+    handle_views: BTreeMap<ElementId, Element>,
     /// The ActorBinding this transaction exercised, when an Assertion was
     /// written under one (§28.3); reported in the Receipt's `origin` (§33.2).
     exercised_binding: Option<String>,
@@ -189,6 +190,7 @@ impl Transaction {
             governance_audit: Vec::new(),
             structural_positions: BTreeMap::new(),
             assignments: BTreeMap::new(),
+            handle_views: BTreeMap::new(),
             exercised_binding: None,
         }
     }
@@ -209,6 +211,11 @@ impl Transaction {
             origin: Json::Null,
         };
         Ok(Self::at_context(store, cx, env, true, authority, auth))
+    }
+
+    /// Whether this transaction formed the element, before its first commit.
+    pub fn is_new_element(&self, id: ElementId) -> bool {
+        self.staged.get(&id).is_some_and(|staged| staged.is_new)
     }
 
     /// The handles bound so far.
@@ -285,9 +292,23 @@ impl Transaction {
         path: String,
         value: &Json,
     ) -> Result<(), KipError> {
+        self.claim_final_value(id, path, Some(value.clone()))
+    }
+
+    /// Removal is a final absence, distinct from assigning JSON null (§58.3).
+    pub fn claim_removal(&mut self, id: ElementId, path: String) -> Result<(), KipError> {
+        self.claim_final_value(id, path, None)
+    }
+
+    fn claim_final_value(
+        &mut self,
+        id: ElementId,
+        path: String,
+        value: Option<Json>,
+    ) -> Result<(), KipError> {
         match self.assignments.entry((id, path.clone())) {
             std::collections::btree_map::Entry::Occupied(entry) => {
-                if entry.get() != value {
+                if entry.get() != &value {
                     return Err(KipError::new(
                         KipErrorCode::DuplicateMutationTarget,
                         format!(
@@ -302,6 +323,32 @@ impl Transaction {
             }
         }
         Ok(())
+    }
+
+    /// Freeze output records after formation, before selection mutations.
+    /// Every WHERE in this declarative plan reads the same output values.
+    pub fn freeze_handle_views(&mut self) {
+        self.handle_views = self
+            .handles
+            .values()
+            .filter_map(|id| {
+                self.staged.get(id).map(|staged| {
+                    let mut row = staged.row.clone();
+                    let envelope = row.envelope_mut();
+                    if envelope.space.is_empty() {
+                        *envelope.space = self.cx.space.clone();
+                    }
+                    if envelope.state == state::PENDING {
+                        *envelope.state = state::ACTIVE.to_string();
+                    }
+                    (*id, row)
+                })
+            })
+            .collect();
+    }
+
+    pub fn handle_view(&self, id: ElementId) -> Option<Element> {
+        self.handle_views.get(&id).cloned()
     }
 
     /// Re-points a declared handle at an element that already exists.

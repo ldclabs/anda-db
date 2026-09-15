@@ -8,7 +8,9 @@
  * Clause order carries no mutation semantics, so a sweep must not see what an
  * earlier clause of the same `MUTATE` created — if it could, order would carry
  * semantics after all. This holds by construction here: an element this
- * transaction minted is `pending`, and no pattern matches a pending row.
+ * transaction minted is `pending`, and no ordinary candidate scan matches it.
+ * Explicit output handles read their final creation views, frozen before the
+ * mutation pass and subject to the same read authority as stored rows.
  *
  * **`LIMIT` cuts in ascending element id.** §52.7 permits a runtime to document
  * an order, and documenting one is what makes a bounded sweep repeatable: run
@@ -32,6 +34,8 @@ import type { Permission } from '../governance/index.js'
 import type { ElementRef, Scalar, WhereClause } from '../kip/ast.js'
 import { Context } from '../kql/context.js'
 import { solveAll } from '../kql/matching.js'
+import { validateWhere } from '../kql/validation.js'
+import { elementBinding, type MutableSolution } from '../kql/solution.js'
 import { baseline } from '../projection/policy.js'
 import type { Transaction } from '../tx.js'
 import { handleId, parameter, scalar, type Bindings } from './value.js'
@@ -97,14 +101,24 @@ export function resolveTargets(
   }
 
   const cx = new Context(tx.store, tx.env, tx.cx.space, tx.authority, tx.auth)
-  const solutions = solveAll(
-    cx,
-    where,
-    [new Map()],
-    { request: request ?? {}, operation: operation ?? {}, policy: baseline() },
-  )
+  const initial: MutableSolution = new Map()
+  const queryBindings = {
+    request: request ?? {}, operation: operation ?? {}, policy: baseline(), ambient: initial,
+  }
+  for (const [name, wire] of Object.entries(tx.handles())) {
+    const id = parseElementId(wire)
+    const view = tx.handleView(id)
+    if (view !== null) cx.seedElement(id, view)
+    initial.set(name, elementBinding(id))
+  }
+  const scope = validateWhere(cx, where, queryBindings, new Set(initial.keys()))
+  if ('Handle' in target && !scope.has(target.Handle)) {
+    throw errors.referenceError(`the ${what} selection block does not bind ?${target.Handle}`)
+  }
+  const solutions = solveAll(cx, where, [initial], queryBindings)
+  const cap = limit === null ? null : count(b, limit, `${what} LIMIT`)
 
-  if (!('Handle' in target)) {
+  if (!('Handle' in target) || tx.handle(target.Handle) !== null) {
     // A named target keeps its identity and the block is a **guard**, the way
     // the KML grammar's note 6b and `MERGE CONCEPT` already read it: no
     // solution means the clause does nothing, which is what makes
@@ -112,9 +126,9 @@ export function resolveTargets(
     // a precondition that fails. Refusing the shape instead — as this engine
     // used to — made a statement the reference engine executes a syntax error
     // here.
-    return solutions.length === 0
+    return solutions.length === 0 || cap === 0
       ? new Targets([], true, permission)
-      : direct(parseElementId(namedId(b, target, what)))
+      : direct(parseElementId('Handle' in target ? handleId(b, target.Handle) : namedId(b, target, what)))
   }
 
   const seen = new Map<string, ElementId>()
@@ -127,7 +141,6 @@ export function resolveTargets(
   // The documented order, applied before the cap: `LIMIT` says how many are
   // affected, not which, unless the runtime says which — and this one does.
   const ids = [...seen.values()].sort(compareElementId)
-  const cap = limit === null ? null : count(b, limit, `${what} LIMIT`)
   return new Targets(cap === null ? ids : ids.slice(0, cap), false, permission)
 }
 
@@ -149,7 +162,7 @@ function namedId(
 
 function count(b: Bindings, value: Scalar, what: string): number {
   const resolved = scalar(b, value)
-  if (typeof resolved !== 'number' || !Number.isInteger(resolved) || resolved < 0) {
+  if (typeof resolved !== 'number' || !Number.isSafeInteger(resolved) || resolved < 0) {
     throw errors.typeMismatch(
       `${what} must be a non-negative integer, got ${JSON.stringify(resolved)}`,
     )

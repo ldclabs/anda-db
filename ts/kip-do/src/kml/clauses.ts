@@ -66,11 +66,13 @@ import type {
   StructuralEdge,
   Term,
   Transition,
+  UpdateAction,
 } from '../kip/ast.js'
 import {
   facetDef,
   formatSymbolRef,
   lineageOfSymbol,
+  lineageText,
   parseSymbolRef,
   predicateDef,
   structuralFieldDef,
@@ -106,6 +108,9 @@ import { normalizeTime } from '../time.js'
 import { render } from '../view.js'
 import type { Transaction, VersionGuard } from '../tx.js'
 import { resolveTargets } from './select.js'
+import { Context as QueryContext } from '../kql/context.js'
+import { matchObject } from '../kql/matching.js'
+import { baseline } from '../projection/policy.js'
 import {
   applyAction,
   carrierOf,
@@ -144,7 +149,7 @@ const CORE_STRUCTURAL: Readonly<Record<ElementKind, readonly string[]>> = {
 }
 
 /** How many planning passes {@link planPass} distributes clauses over. */
-export const PLAN_PASSES = 3
+export const PLAN_PASSES = 4
 
 /**
  * Which planning pass a clause belongs to.
@@ -156,7 +161,8 @@ export const PLAN_PASSES = 3
  * ```text
  * 0  CREATE CONCEPT       stages typed Concepts other clauses validate against
  * 1  UPSERT / ENSURE      resolve existing identity, binding their handles late
- * 2  everything else      sees a complete handle map and every staged type
+ * 2  CREATE records       finalize Evidence, Assertions and Activities
+ * 3  remaining mutations  read frozen block-output views
  * ```
  *
  * `ENSURE` is in pass 1 rather than pass 0 because checking a predicate's
@@ -168,7 +174,8 @@ export const PLAN_PASSES = 3
 export function planPass(clause: MutationClause): number {
   if ('CreateConcept' in clause) return 0
   if ('UpsertConcept' in clause || 'EnsureProposition' in clause) return 1
-  return 2
+  if ('CreateEvidence' in clause || 'CreateAssertion' in clause || 'CreateActivity' in clause) return 2
+  return 3
 }
 
 /**
@@ -271,7 +278,7 @@ export function apply(
         element.kind === 'Concept' ? { ...element.row.attributes } : {}
       // Rendered once: every action of one UPDATE reads the element as it was
       // when the statement began (§52.4).
-      const view = render(element)
+      const view = structuredClone(render(element))
       for (const action of actions) applyAction(tx, b, element, action, view)
       if (touchesAttributes(actions)) {
         checkAttributes(tx, element, attributesBefore)
@@ -818,6 +825,16 @@ function upsertConcept(
     selectorId === null
       ? resolveByKey(tx, selectorKey as string, lineage)
       : resolveById(tx, selectorId, lineage)
+  if (found !== null && Object.keys(matcher).some((key) =>
+    key !== 'type' && key !== (selectorId === null ? 'key' : 'id'))) {
+    const cx = new QueryContext(tx.store, tx.env, tx.cx.space, tx.authority, tx.auth)
+    const view = cx.view(found)
+    if (view === null || matchObject(cx, view, matcher, new Map(), {
+      request: b.request, operation: b.operation, policy: baseline(),
+    }, 'Concept') === null) {
+      throw errors.notFoundOrNotVisible('no accessible Concept satisfies the complete UPSERT selector')
+    }
+  }
   const guards = versionGuards(tx, b, clause.expect_versions)
 
   let existing: ElementId
@@ -881,58 +898,16 @@ function upsertConcept(
   const before = JSON.stringify(element.row)
   const attributesBefore = { ...element.row.attributes }
 
-  if (clause.set_attributes !== null) {
-    Object.assign(element.row.attributes, assignments(b, clause.set_attributes))
-  }
-  if (clause.unset_attributes !== null) {
-    for (const name of clause.unset_attributes)
-      delete element.row.attributes[name]
-  }
-  if (clause.set_fields !== null) {
-    applyConceptFields(
-      tx,
-      element.row,
-      new Fields(assignments(b, clause.set_fields)),
-    )
-  }
-  // An upsert's Facet clauses are the same clauses `UPDATE` runs, so they go
-  // through the same applier: merged-result validation and §39 immutability
-  // are not something a second spelling of the same write may skip.
-  const upsertView = render(element)
-  for (const assignment of clause.set_facets) {
-    applyAction(tx, b, element, { SetFacet: assignment }, upsertView)
-  }
-  for (const unset of clause.unset_facets) {
-    applyAction(tx, b, element, { UnsetFacet: unset }, upsertView)
-  }
-  if (clause.set_structural !== null) {
-    const edges = collectStructural(tx, b, clause.set_structural, [])
-    for (const [field, values] of Object.entries(edges.profile)) {
-      const current = element.row.structural[field]
-      element.row.structural[field] = [
-        ...(Array.isArray(current) ? current : []),
-        ...(values as Json[]),
-      ]
-    }
-  }
-  if (clause.unset_structural !== null) {
-    for (const removal of clause.unset_structural) {
-      const field = formatSymbolRef(
-        tx.env.resolveSymbol(
-          'StructuralField',
-          symbolName(b, removal.field),
-          'write',
-        ),
-      )
-      const target = referenceValue(mutationValue(b, removal.value), field)
-      const current = element.row.structural[field]
-      if (Array.isArray(current)) {
-        element.row.structural[field] = current.filter(
-          (value) => !jsonEquals(value, target),
-        )
-      }
-    }
-  }
+  const upsertView = structuredClone(render(element))
+  const actions: UpdateAction[] = []
+  if (clause.set_fields !== null) actions.push({ SetFields: clause.set_fields })
+  if (clause.set_attributes !== null) actions.push({ SetAttributes: clause.set_attributes })
+  if (clause.unset_attributes !== null) actions.push({ UnsetAttributes: clause.unset_attributes })
+  for (const facet of clause.set_facets) actions.push({ SetFacet: facet })
+  for (const facet of clause.unset_facets) actions.push({ UnsetFacet: facet })
+  if (clause.set_structural !== null) actions.push({ SetStructural: clause.set_structural })
+  if (clause.unset_structural !== null) actions.push({ UnsetStructural: clause.unset_structural })
+  for (const action of actions) applyAction(tx, b, element, action, upsertView)
 
   // An upsert is a create or an update (§51), and either half leaves a Concept
   // its type has to still accept. The insert half is checked even when the
@@ -1511,19 +1486,25 @@ function changeState(
   // and an illegal one is `InvalidLifecycleTransition`, whoever asks. Asking
   // about moderation first would report `NotAuthorized` for a statement the
   // engine was never going to perform.
-  if (element.row.state === state) return
+  // A newly formed Concept is semantically active while its private shell
+  // still has empty/pending engine state. This never changes Activity.status
+  // or reinterprets the state of a committed element.
+  const engineState = element.kind === 'Concept' && tx.isNewElement(id)
+    && (element.row.state === '' || element.row.state === State.PENDING)
+    ? State.ACTIVE : element.row.state
+  if (engineState === state) return
   // Only an element still in ordinary recall leaves it, and only an archived
   // one goes on to a tombstone (§60.1, §60.2). Quarantine, a merged-away
   // identity and a purged stub are Governance and identity states with their
   // own exits; archiving out of them would overwrite the reason the element is
   // where it is.
   const legal =
-    element.row.state === State.ACTIVE ||
-    (state === State.TOMBSTONED && element.row.state === State.ARCHIVED)
+    engineState === State.ACTIVE ||
+    (state === State.TOMBSTONED && engineState === State.ARCHIVED)
   if (!legal) {
     notFrom(
       id,
-      element.row.state,
+      engineState,
       state,
       state === State.TOMBSTONED ? 'active or archived' : 'active',
     )
@@ -1748,52 +1729,38 @@ function merge(
   targets: readonly ElementId[],
   guards: readonly VersionGuard[],
 ): void {
+  if (sources.length === 0 || targets.length === 0) {
+    throw errors.notFoundOrNotVisible('MERGE CONCEPT requires a visible source and target')
+  }
   if (sources.length !== 1 || targets.length !== 1) {
-    // Not a merge conflict — a selector problem. Identity is never chosen by
-    // description, and a merge that guessed which of two Concepts named
-    // "Alice" was meant would consolidate the wrong pair irreversibly.
-    throw errors.identitySelectorRequired(
-      `MERGE CONCEPT needs exactly one source and one target; this selection ` +
-        `named ${sources.length} and ${targets.length}. Name a stable ` +
-        `identity — {key: …} or {id: …} — rather than a description`,
+    throw errors.identityMergeConflict(
+      'MERGE CONCEPT requires exactly one source and one target',
     )
   }
   const source = sources[0] as ElementId
   const target = targets[0] as ElementId
-  if (elementIdEquals(source, target)) {
-    throw errors.identityMergeConflict(
-      `${formatElementId(source)} cannot be merged into itself`,
-    )
-  }
   tx.expectVersions(source, guards)
-
   const from = requireKind(tx, source, 'Concept')
-  requireKind(tx, target, 'Concept')
-
-  // §11.1: canonical resolution follows `merged_into` to its fixpoint, so a
-  // cycle would make that walk run forever. The check is on the target's
-  // chain, before anything is written.
-  if (
-    canonicalChain(tx, target).some((step) => elementIdEquals(step, source))
-  ) {
+  const into = requireKind(tx, target, 'Concept')
+  if (lineageText(from.row.schema_ref) !== lineageText(into.row.schema_ref)) {
     throw errors.identityMergeConflict(
-      `${formatElementId(target)} already resolves back to ` +
-        `${formatElementId(source)}; merging would make canonical resolution cycle`,
+      'MERGE CONCEPT endpoints have incompatible Concept Type lineages',
     )
   }
-
-  // Already pointing where this statement wants it: the merge happened, so
-  // saying so again changes nothing. A client that lost the response to a
-  // MERGE and re-sent it (§80.4) gets `no_effect` rather than a conflict —
-  // which is the answer the reference engine gives, and the only one that
-  // makes the retry §80.4 recommends safe.
-  if (from.row.merged_into === formatElementId(target)) return
-
+  if (elementIdEquals(source, target)) return
+  const chain = canonicalChain(tx, target)
+  if (chain.some((step) => elementIdEquals(step, source))) {
+    throw errors.identityMergeConflict('MERGE CONCEPT would create an identity cycle')
+  }
+  const canonicalTarget = chain[chain.length - 1]!
+  const sourceChain = canonicalChain(tx, source)
+  if (
+    sourceChain.length > 1 &&
+    elementIdEquals(sourceChain[sourceChain.length - 1]!, canonicalTarget)
+  ) return
   if (from.row.merged_into !== '') {
-    // Re-pointing an already-merged Concept somewhere *else* would make the
-    // forwarding chain say two different things about where the identity went.
     throw errors.identityMergeConflict(
-      `${formatElementId(source)} was already merged into ${from.row.merged_into}`,
+      `${formatElementId(source)} was already merged into an incompatible canonical target`,
     )
   }
   from.row.merged_into = formatElementId(target)
@@ -2165,38 +2132,6 @@ export const GOVERNANCE_FIELDS = [
   'authority_lineage',
 ]
 
-/** The subset of Concept fields an `UPSERT` may rewrite. */
-function applyConceptFields(
-  tx: Transaction,
-  row: ConceptRow,
-  fields: Fields,
-): void {
-  const name = fields.text('name')
-  if (name !== '') row.name = name
-  const canonical = fields.text('canonical_id')
-  if (canonical !== '') {
-    authorizeCanonicalIdentity(tx)
-    row.canonical_id = canonical
-  }
-  const aliases = fields.array('aliases')
-  if (aliases.length > 0) {
-    row.aliases = aliases.filter((v): v is string => typeof v === 'string')
-  }
-  const retention = fields.json('retention')
-  if (Object.keys(retention).length > 0) {
-    authorizeRetention(tx, retention)
-    row.retention = retention
-    row.expires_at = expiresAt(retention)
-  }
-  if (Object.hasOwn(fields as never, 'key')) {
-    // The logical key is the immutable Space-local identity (§5.3): rewriting
-    // it would move the element to a different identity while keeping its
-    // history, which is what a merge is for.
-    throw errors.immutableField('a Concept `key` is immutable once set')
-  }
-  fields.rest('Concept')
-}
-
 // --- facets and structural fields -------------------------------------------
 
 /**
@@ -2512,7 +2447,7 @@ function termValue(b: Bindings, term: Term, what: string): Json {
   if ('Variable' in term) return { id: handleId(b, term.Variable) }
   if ('Param' in term) {
     const value = parameter(b, term.Param)
-    return typeof value === 'string' ? { id: value } : value
+    return typeof value === 'string' && tryParseElementId(value) !== null ? { id: value } : value
   }
   if ('Literal' in term) return kipValue(term.Literal)
   if ('Match' in term) {

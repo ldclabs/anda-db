@@ -613,3 +613,25 @@ describe('a host that authenticates its callers', () => {
     expect(((await response.json()) as KipResponse).status).toBe('succeeded')
   })
 })
+
+it('does not commit a mutation when options.dry_run is requested', async () => {
+  const body = request('CREATE CONCEPT ?c {TYPE "Person" NAME "Preview Only"}')
+  const response = await post('dry-run-contract', {...body, options: {dry_run: true}})
+  const failed = await response.json() as KipResponse
+  expect(failed.status).toBe('failed')
+  expect(failed.error?.code).toBe('UnsupportedCapability')
+  const found = await post('dry-run-contract', request('FIND(?c) WHERE {?c {type: "Person"}}'))
+  expect((await found.json() as KipResponse).results[0]?.result).toEqual([])
+})
+
+it('returns separate search continuations on their operation envelopes', async () => {
+  const name = 'search-envelope-contract'
+  await post(name, request('MUTATE {CREATE CONCEPT ?a {TYPE "Person" NAME "Paging A"} CREATE CONCEPT ?b {TYPE "Person" NAME "Paging B"}}'))
+  const response = await post(name, {kip: '2.0', execution: {mode: 'independent'}, operations: [
+    {op_id: 'first', command: 'SEARCH CONCEPT "Paging" LIMIT 1'},
+    {op_id: 'second', command: 'SEARCH CONCEPT "Paging" LIMIT 1'},
+  ]})
+  const answer = await response.json() as KipResponse
+  expect(answer.results.map(result => result.op_id)).toEqual(['first', 'second'])
+  for (const result of answer.results) expect(result.next_cursor).toBeTypeOf('string')
+})

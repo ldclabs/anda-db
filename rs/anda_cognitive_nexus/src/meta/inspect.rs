@@ -28,16 +28,6 @@ use crate::id::ElementId;
 use crate::kql::Context;
 use crate::store::history::CursorFamily;
 
-/// `SEARCH <KIND> :term` — grounding.
-/// How many index hits are scored per page requested.
-const SEARCH_OVERFETCH: usize = 4;
-
-/// The smallest candidate window a search considers, whatever the page size.
-///
-/// A page of ten in a database whose index spans several Spaces would
-/// otherwise be decided by forty hits that may all belong to somebody else.
-const SEARCH_MIN_WINDOW: usize = 512;
-
 pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
     let term = scalar_str(cx, &command.term, "SEARCH")?;
     if let Some(mode) = &command.mode {
@@ -69,12 +59,41 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         },
         None => 0.0,
     };
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(KipError::type_mismatch(
+            "THRESHOLD must be a number in [0, 1]",
+        ));
+    }
+    if (command.with_type.is_some()
+        && !matches!(
+            command.target,
+            SearchTarget::Concept | SearchTarget::Cognition
+        ))
+        || (command.with_predicate.is_some()
+            && !matches!(
+                command.target,
+                SearchTarget::Proposition | SearchTarget::Cognition
+            ))
+    {
+        return Err(KipError::invalid_syntax(
+            "SEARCH modifier is not meaningful for this kind",
+        ));
+    }
     let limit = match &command.limit {
         Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?.min(100),
         None => 10,
     };
     let offset = match &command.cursor {
-        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::Search)?.offset,
+        Some(scalar) => {
+            let cursor = super::read_cursor(cx, scalar, CursorFamily::Search)?;
+            if cursor.snapshot_seq != cx.pinned_seq {
+                return Err(KipError::cursor_expired(
+                    "search",
+                    "SEARCH index changed; start a new traversal",
+                ));
+            }
+            cursor.offset
+        }
         None => 0,
     };
     let with_type = match &command.with_type {
@@ -134,73 +153,94 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         }
     };
 
-    // Over-fetch, because the filters below run after scoring: Space,
-    // lifecycle state, declared type and — most importantly — Governance
-    // visibility. The index is database-wide while a search is Space-scoped,
-    // so a narrow Space in a busy database can have its whole page crowded out
-    // by hits it may not see. The window is therefore wide in absolute terms
-    // rather than a small multiple of the page, and what still falls off the
-    // end is disclosed as a caveat rather than reported as an empty Space
-    // (§66.6).
-    let window = (limit + offset)
-        .saturating_mul(SEARCH_OVERFETCH)
-        .max(SEARCH_MIN_WINDOW);
-    let mut hits: Vec<(f32, Json)> = Vec::new();
-    let mut scanned = 0usize;
-    for (kind, fields) in kinds {
-        let collection = cx.store.elements(kind);
-        let index = collection.get_bm25_index(fields).map_err(|_| {
-            KipError::new(
-                KipErrorCode::SearchIndexUnavailable,
-                format!("no full-text index exists over {kind}"),
-            )
-        })?;
-        let candidates = index.search_advanced(&term, window, None);
-        scanned = scanned.max(candidates.len());
-        for (seq, score) in candidates {
-            if score < threshold as f32 {
-                continue;
-            }
-            let id = ElementId::new(kind, seq);
+    // Rank only the authorized, redacted corpus. Filtering global BM25 hits
+    // afterwards leaks hidden document statistics and can crowd visible hits
+    // out of an over-fetch window. This temporary index changes no stored state.
+    let mut hits: Vec<(f64, Json)> = Vec::new();
+    let mut search_limit = limit;
+    for (kind, _) in kinds {
+        let index = anda_db_tfs::BM25Index::new(
+            "authorized-search".into(),
+            anda_db_tfs::jieba_tokenizer(),
+            None,
+        );
+        let mut views = std::collections::BTreeMap::new();
+        let ids = cx.active_of(kind).await?;
+        cx.charge(ids.len())?;
+        for id in ids {
             let Some(element) = cx.load(id).await? else {
                 continue;
             };
-            if element.space() != cx.space || !element.is_active() {
+            if !element.is_active() {
                 continue;
             }
-            // The redacted view `load` cached, not a fresh render: a search
-            // snippet is a read, and a mask that hid a field from FIND must
-            // hide it from SEARCH too (§88.5).
-            let rendered = cx.view_of(id);
+            let decision = cx.authority.authorize(
+                crate::governance::Permission::Search,
+                &crate::governance::ResourceContext::of_element(&element),
+                cx.auth,
+            );
+            if !decision.is_permitted() {
+                continue;
+            }
+            if let Some(max) = decision.constraints.max_results {
+                search_limit = search_limit.min(max as usize);
+            }
+            let mut rendered = cx.view_of(id).as_ref().clone();
+            crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
+            let rendered = std::sync::Arc::new(rendered);
             if let Some(expected) = &with_type
-                && rendered["schema_ref"].as_str() != Some(expected.as_str())
+                && !rendered["schema_ref"]
+                    .as_str()
+                    .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
             {
                 continue;
             }
             if let Some(expected) = &with_predicate
-                && rendered["predicate_ref"].as_str() != Some(expected.as_str())
+                && !rendered["predicate_ref"]
+                    .as_str()
+                    .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
             {
                 continue;
             }
+            let text = grounding_text(kind, rendered.as_ref());
+            match index.insert(id.seq, &text, 0) {
+                Ok(()) => {
+                    views.insert(id.seq, rendered);
+                }
+                Err(anda_db_tfs::BM25Error::TokenizeFailed { .. }) => {}
+                Err(err) => return Err(KipError::internal_error(err.to_string())),
+            }
+        }
+        // Score all admitted documents before applying the threshold or page.
+        for (seq, raw_score) in index.search(&term, views.len(), None) {
+            let raw_score = f64::from(raw_score);
+            if !raw_score.is_finite() || raw_score < 0.0 {
+                return Err(KipError::internal_error("invalid SEARCH ranking score"));
+            }
+            let score = raw_score / (1.0 + raw_score);
+            if score < threshold {
+                continue;
+            }
+            let id = ElementId::new(kind, seq);
+            let rendered = &views[&seq];
             hits.push((
                 score,
                 serde_json::json!({
-                    "id": id.to_string(),
-                    "kind": kind.to_string(),
-                    // Named `score`, never `confidence`: copying this into an
-                    // Assertion would invent an epistemic commitment out of a
-                    // text match.
+                    "id": id.to_string(), "kind": kind.to_string(),
                     "score": score,
-                    // §66.4: a safe snippet — the indexed text of the redacted
-                    // view, windowed around the term — beside the element.
+                    "retrieval": {"score": score, "mode": "keyword"},
                     "snippet": snippet_of(kind, rendered.as_ref(), &term),
                     "element": rendered.as_ref(),
                 }),
             ));
         }
     }
-    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1["id"].as_str().cmp(&b.1["id"].as_str()))
+    });
 
+    let limit = search_limit.min(cx.governed_limit().unwrap_or(limit));
     let total = hits.len();
     let page: Vec<Json> = hits
         .into_iter()
@@ -217,6 +257,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             "search_context": {
                 "mode": "keyword",
                 "score_semantics": "bm25_relevance_not_confidence",
+                "normalization": "s / (1 + s), authorized redacted corpus only",
                 // §77: the index may lag the committed state, and a caller
                 // deciding whether a miss means anything needs to know that.
                 "index_seq": space.seq,
@@ -225,15 +266,13 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             },
             "caveat": "a SEARCH score is not a confidence and a miss is not an absence; \
                        ground with SEARCH, then read with FIND or BELIEF",
-            // §66.6 in the one place a caller can act on it: this page was cut
-            // from a bounded candidate window, so an exhaustive question needs
-            // FIND, which has no such window. The comparison is against the
-            // window that actually ran, not against its floor — a wide page
-            // raises the window, and measuring it against the floor would
-            // report a search that saw everything as one that did not.
-            "exhaustive": scanned < window,
+            "exhaustive": true,
         }),
-        next_cursor: super::next_cursor(cx, CursorFamily::Search, consumed, total),
+        next_cursor: if limit == 0 {
+            None
+        } else {
+            super::next_cursor(cx, CursorFamily::Search, consumed, total)
+        },
         warnings: Vec::new(),
     })
 }
@@ -698,6 +737,10 @@ const SNIPPET_WIDTH: usize = 200;
 /// read from the **redacted** view so a masked field stays masked (§88.5),
 /// windowed around the first occurrence of the term.
 fn snippet_of(kind: ElementKind, view: &Json, term: &str) -> String {
+    window(&grounding_text(kind, view), term, SNIPPET_WIDTH)
+}
+
+fn grounding_text(kind: ElementKind, view: &Json) -> String {
     let fields: &[&str] = match kind {
         ElementKind::Concept => &["name", "aliases", "attributes"],
         ElementKind::Proposition => &["predicate_ref"],
@@ -708,7 +751,7 @@ fn snippet_of(kind: ElementKind, view: &Json, term: &str) -> String {
     for field in fields {
         collect_text(&view[*field], &mut text);
     }
-    window(&text, term, SNIPPET_WIDTH)
+    text
 }
 
 fn collect_text(value: &Json, out: &mut String) {

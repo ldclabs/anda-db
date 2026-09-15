@@ -966,3 +966,81 @@ async fn an_unknown_dependents_root_is_answered_as_an_absent_one() {
         "InvalidIdentifier"
     );
 }
+
+#[tokio::test]
+async fn search_thresholds_are_normalized_inclusive_and_typed() {
+    let nexus = seeded("search_contract").await;
+    let before = nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq;
+    let first = ok(&nexus, r#"SEARCH CONCEPT "Anderson""#).await;
+    let score = first["hits"][0]["retrieval"]["score"].as_f64().unwrap();
+    assert!(score > 0.0 && score < 1.0);
+    assert_eq!(
+        first["hits"][0]["score"],
+        first["hits"][0]["retrieval"]["score"]
+    );
+    let mut request = Request::single(r#"SEARCH CONCEPT "Anderson" THRESHOLD :threshold"#);
+    for threshold in [
+        json!(score),
+        json!(1.0),
+        json!(-0.1),
+        json!(1.1),
+        json!("0.5"),
+    ] {
+        request.parameters = Some(serde_json::Map::from_iter([(
+            "threshold".into(),
+            threshold.clone(),
+        )]));
+        let response = nexus
+            .execute(
+                request.operations[0].parse().unwrap(),
+                &request,
+                &request.operations[0],
+            )
+            .await;
+        if threshold == json!(score) {
+            assert_eq!(response.first_result().unwrap()["hits"], first["hits"]);
+        } else if threshold == json!(1.0) {
+            assert_eq!(response.first_result().unwrap()["hits"], json!([]));
+        } else {
+            assert_eq!(response.status, TopLevelStatus::Failed);
+        }
+    }
+    for command in [
+        r#"SEARCH CONCEPT "Alice" WITH PREDICATE "prefers""#,
+        r#"SEARCH PROPOSITION "prefers" WITH TYPE "Person""#,
+        r#"SEARCH CONCEPT "Alice" LIMIT "1""#,
+    ] {
+        assert_eq!(
+            run(&nexus, command).await.status,
+            TopLevelStatus::Failed,
+            "{command}"
+        );
+    }
+    assert_eq!(
+        nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq,
+        before
+    );
+}
+
+#[tokio::test]
+async fn search_pages_refuse_a_changed_index() {
+    let nexus = seeded("search_cursor_contract").await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?c {TYPE "Person" NAME "Alice Again"}"#,
+    )
+    .await;
+    let page = run(&nexus, r#"SEARCH CONCEPT "Alice" LIMIT 1"#).await;
+    let cursor = page.results[0].next_cursor.as_ref().unwrap();
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?c {TYPE "Person" NAME "Alice New"}"#,
+    )
+    .await;
+    let response = run(
+        &nexus,
+        &format!(r#"SEARCH CONCEPT "Alice" LIMIT 1 CURSOR "{cursor}""#),
+    )
+    .await;
+    assert_eq!(response.error.unwrap().code.as_str(), "CursorExpired");
+}

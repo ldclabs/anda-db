@@ -183,21 +183,18 @@
       }
     },
     {
-      "name": "ORDER BY may name an aggregate the caller did not project",
+      "name": "ORDER BY rejects an aggregate that is not projected",
       "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY COUNT(?c) DESC, ?c.name",
       "ordered": true,
       "expect": {
-        "result": [
-          "Alice",
-          "Bob"
-        ]
+        "error": "InvalidSyntax"
       }
     },
     {
       "name": "but a sort key that varies inside a group has no value to sort by",
       "command": "FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name",
       "expect": {
-        "error": "ConstraintViolation"
+        "error": "InvalidSyntax"
       }
     },
     {

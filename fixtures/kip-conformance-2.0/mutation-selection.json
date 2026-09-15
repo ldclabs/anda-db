@@ -88,7 +88,7 @@
       "name": "a merge never picks an identity by description: two Concepts share the name",
       "command": "MERGE CONCEPT ?source INTO ?target WHERE { ?source CONCEPT {key: \"person:alice-duplicate\"} ?target CONCEPT {name: \"Alice\"} }",
       "expect": {
-        "error": "IdentitySelectorRequired"
+        "error": "IdentityMergeConflict"
       }
     },
     {

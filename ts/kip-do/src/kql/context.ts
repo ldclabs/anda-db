@@ -176,6 +176,26 @@ export class Context {
     return this.views.get(key) ?? null
   }
 
+  /**
+   * Makes an explicitly declared, resolved mutation output readable inside its
+   * transaction. This isolated copy goes through ordinary read authorization
+   * and redaction; it never publishes the draft or adds it to an unbound scan.
+   * The caller must resolve the output's fields before seeding it.
+   */
+  seedElement(id: ElementId, element: Element): void {
+    if (this.historical || id.kind !== element.kind || id.seq !== element.row.id) {
+      throw errors.internalError('a mutation output does not belong to this live query context')
+    }
+    const key = formatElementId(id)
+    const copy = structuredClone(element)
+    if (copy.row.space === '') copy.row.space = this.space
+    // PENDING is an internal reservation state, not the output's logical state
+    // once its fields are resolved. Only this private read copy is activated.
+    if (copy.row.state === State.PENDING) copy.row.state = State.ACTIVE
+    this.views.delete(key)
+    this.elements.set(key, this.admit(key, copy))
+  }
+
   /** Caches an element the caller already has, so a scan pays for it once. */
   remember(element: Element): ElementId {
     const id: ElementId = { kind: element.kind, seq: element.row.id }

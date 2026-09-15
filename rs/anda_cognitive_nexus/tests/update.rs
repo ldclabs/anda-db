@@ -558,21 +558,39 @@ async fn a_selection_block_does_not_see_the_transactions_own_writes() {
     );
 }
 
-/// One spelling, two meanings, is refused rather than silently resolved.
+/// A block output keeps its identity and is readable in its clause's guard.
 #[tokio::test]
-async fn a_handle_and_a_selection_variable_may_not_share_a_name() {
-    let (nexus, _) = seeded("selection_clash").await;
+async fn a_block_output_handle_is_available_to_its_correlated_guard() {
+    let (nexus, _) = seeded("selection_handle_guard").await;
 
-    let error = err(
+    let result = ok(
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?m { TYPE "Experience" NAME "Fifth"
               SET ATTRIBUTES {goal: "learn", outcome_status: "success"} }
-            TRANSITION ?m TO "archived" WHERE { ?m CONCEPT {type: "Experience"} }
+            UPDATE ?m SET FIELDS {name: "Guarded"} WHERE { FILTER(?m.name == "Fifth") }
         }"#,
     )
     .await;
-    assert_eq!(error.code, "ReferenceError", "{error:?}");
+    let Element::Concept(target) = nexus.store.get_element(handle(&result, "m")).await.unwrap()
+    else {
+        panic!("the output remains a Concept");
+    };
+    assert_eq!(target.state, "active");
+    assert_eq!(target.name, "Guarded");
+    let remaining = ok(
+        &nexus,
+        r#"FIND(?m.name) WHERE { ?m CONCEPT {type: "Experience"} }"#,
+    )
+    .await;
+    assert_eq!(
+        rows(&remaining).len(),
+        4,
+        "the bound handle does not become a sweep variable"
+    );
+    for name in ["First", "Second", "Third"] {
+        assert!(rows(&remaining).contains(&json!(name)));
+    }
 
     // A target the block never binds does not even parse: the grammar knows
     // that much without an engine.
@@ -696,14 +714,18 @@ async fn a_merge_that_would_cycle_or_re_point_an_identity_is_refused() {
         .expect("re-pointing a merged identity must be refused");
     assert_eq!(error.code, "IdentityMergeConflict", "{error:?}");
 
-    // Merging something into itself is not a no-op, it is a mistake.
+    // §61: self-merge has no effect and preserves the existing version.
     let response = merge(c, c).await;
-    let error = response
-        .results
-        .into_iter()
-        .find_map(|result| result.error)
-        .expect("a self-merge must be refused");
-    assert_eq!(error.code, "IdentityMergeConflict", "{error:?}");
+    assert_eq!(response.status, TopLevelStatus::Succeeded);
+    assert_eq!(
+        receipt(&response).map(|receipt| receipt.status),
+        Some(ReceiptStatus::NoEffect)
+    );
+    let Element::Concept(unchanged) = nexus.store.get_element(c).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(unchanged.version, 1);
+    assert!(unchanged.merged_into.is_empty());
 
     // The same merge twice is idempotent, though: the second one changes
     // nothing rather than conflicting with itself.
@@ -713,9 +735,8 @@ async fn a_merge_that_would_cycle_or_re_point_an_identity_is_refused() {
         Some(ReceiptStatus::NoEffect)
     );
 
-    // A guard block naming an operand that has left ordinary recall matches
-    // nothing, and a guard that matches nothing is a no-effect rather than an
-    // error — the same rule every other selection block follows.
+    // §61: MERGE requires exactly one visible endpoint on each side. A
+    // pattern that cannot name an already-merged operand fails neutrally.
     let request = serde_json::from_value::<Request>(json!({
         "kip": "2.0",
         "operations": [{
@@ -728,12 +749,14 @@ async fn a_merge_that_would_cycle_or_re_point_an_identity_is_refused() {
     let response = nexus
         .execute(parsed, &request, &request.operations[0])
         .await;
-    assert_eq!(response.status, TopLevelStatus::Succeeded);
-    assert_eq!(
-        receipt(&response).map(|receipt| receipt.status),
-        Some(ReceiptStatus::NoEffect),
-        "a guard that cannot name a merged Concept merges nothing"
-    );
+    assert_eq!(response.status, TopLevelStatus::Failed);
+    let error = response
+        .results
+        .into_iter()
+        .find_map(|result| result.error)
+        .or(response.error)
+        .unwrap();
+    assert_eq!(error.code, "NotFoundOrNotVisible");
 }
 
 /// §11.3: a new claim about a merged-away Concept is recorded about the

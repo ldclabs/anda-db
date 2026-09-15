@@ -253,6 +253,7 @@ export class Transaction {
 
   readonly declaredTypes = new Map<string, string>()
   private readonly handleMap = new Map<string, ElementId>()
+  private readonly handleViews = new Map<string, Element>()
   readonly staged = new Map<string, Staged>()
   readonly controlEffects: Omit<ControlRecord, 'id'>[] = []
   identityChanged = false
@@ -412,6 +413,11 @@ export class Transaction {
     this.warnings.push(message)
   }
 
+  /** Whether this transaction formed the element, before its first commit. */
+  isNewElement(id: ElementId): boolean {
+    return this.staged.get(formatElementId(id))?.isNew === true
+  }
+
   /** The handles bound so far, in wire form. */
   handles(): Record<string, string> {
     return Object.fromEntries(
@@ -486,9 +492,17 @@ export class Transaction {
    * @see rs/anda_cognitive_nexus/src/tx.rs — `claim_assignment`
    */
   claimAssignment(id: ElementId, path: string, value: Json): void {
+    this.claimFinalValue(id, path, `set:${canonicalJson(value)}`)
+  }
+
+  /** Final absence differs from assigning null, including across clauses. */
+  claimRemoval(id: ElementId, path: string): void {
+    this.claimFinalValue(id, path, 'unset')
+  }
+
+  private claimFinalValue(id: ElementId, path: string, token: string): void {
     const key = `${formatElementId(id)}\u0000${path}`
     const seen = this.assignments.get(key)
-    const token = canonicalJson(value)
     if (seen === undefined) {
       this.assignments.set(key, token)
       return
@@ -504,6 +518,21 @@ export class Transaction {
 
   private readonly structuralPositions = new Map<string, Set<number>>()
   private readonly assignments = new Map<string, string>()
+
+  /** Freeze formed outputs before any selection mutation can change them. */
+  freezeHandleViews(): void {
+    this.handleViews.clear()
+    for (const id of this.handleMap.values()) {
+      const key = formatElementId(id)
+      const staged = this.staged.get(key)
+      if (staged !== undefined) this.handleViews.set(key, structuredClone(staged.element))
+    }
+  }
+
+  handleView(id: ElementId): Element | null {
+    const view = this.handleViews.get(formatElementId(id))
+    return view === undefined ? null : structuredClone(view)
+  }
 
   /** Mints an element with no handle — an anonymous `ENSURE PROPOSITION`. */
   mint(kind: ElementKind): ElementId {

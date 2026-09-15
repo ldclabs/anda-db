@@ -63,3 +63,8 @@ describe('the request envelope', () => {
     ).not.toThrow()
   })
 })
+
+it('refuses envelope dry runs before any operation can commit', () => {
+  expect(() => checkEnvelope({kip: '2.0', options: {dry_run: true}, operations: [read]}, space)).toThrowError(/PREVIEW KML/)
+  expect(() => checkEnvelope({kip: '2.0', options: {dry_run: false}, operations: [read]}, space)).not.toThrow()
+})

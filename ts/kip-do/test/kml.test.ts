@@ -220,6 +220,27 @@ describe('KML', () => {
     )
   })
 
+  it('keeps ordinary string endpoint parameters as Literals, including Unicode', async () => {
+    await withNexus('literal-string-param', (nexus) => {
+      nexus.execute('CREATE CONCEPT ?c { TYPE "Person" }')
+      for (const text of ['hello', 'é', 'e\u0301', 'C-not-an-id']) {
+        const outcome = nexus.execute('ENSURE PROPOSITION ?p (:subject, "notes", :text)', {
+          subject: 'C-1', text,
+        })
+        const proposition = nexus.store.load(parseElementId(outcome.handles.p!))
+          ?.row as PropositionRow
+        expect(proposition.subject).toEqual({id: 'C-1'})
+        expect(proposition.object).toEqual({value: text.normalize('NFC'), datatype: 'kip:string'})
+      }
+      const reference = nexus.execute('ENSURE PROPOSITION ?p (:subject, "notes", :object)', {
+        subject: 'C-1', object: 'C-1',
+      })
+      const proposition = nexus.store.load(parseElementId(reference.handles.p!))
+        ?.row as PropositionRow
+      expect(proposition.object).toEqual({id: 'C-1'})
+    }, [OPEN_PACKAGE])
+  })
+
   it('refuses a Literal where the predicate declares an element reference', async () => {
     // §42–§44: `prefers` relates a Person to a Concept, so the text "dark" is
     // not a quieter version of the Preference — it is a different endpoint,

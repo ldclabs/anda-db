@@ -64,7 +64,7 @@ export interface KipRequestEnvelope {
   parameters?: JsonMap
   context?: RequestContext
   requires?: Record<string, boolean>
-  options?: { deadline_ms?: number }
+  options?: { deadline_ms?: number; dry_run?: boolean }
   extensions?: JsonMap
 }
 
@@ -294,6 +294,17 @@ export function checkEnvelope(envelope: KipRequestEnvelope, space: EnvelopeSpace
           `be ${JSON.stringify(wanted)}, and this engine reports ${have}; ` +
           `DESCRIBE CAPABILITIES lists what it does and does not implement`,
       )
+    }
+  }
+
+  // A preview request must never reach the committing mutation path (§69.4).
+  // Hosts can use PREVIEW KML; envelope-wide preview is not implemented.
+  if (envelope.options?.dry_run !== undefined) {
+    if (typeof envelope.options.dry_run !== 'boolean') {
+      throw new KipError('InvalidRequestEnvelope', 'options.dry_run must be a boolean')
+    }
+    if (envelope.options.dry_run) {
+      throw new KipError('UnsupportedCapability', 'options.dry_run is not supported; use PREVIEW KML')
     }
   }
 

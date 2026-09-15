@@ -74,6 +74,9 @@ pub async fn apply_action(
             Ok(changed)
         }
         UpdateAction::UnsetAttributes(names) => {
+            for name in names {
+                tx.claim_removal(id, format!("attributes.{name}"))?;
+            }
             let attributes = attributes_mut(tx, id, "UNSET ATTRIBUTES").await?;
             let mut changed = Applied::default();
             for name in names {
@@ -141,8 +144,11 @@ async fn set_fields(
             ("aliases", Json::Array(items)) => {
                 let aliases: Vec<String> = items
                     .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect();
+                    .map(|item| item.as_str().map(str::to_string))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| {
+                        KipError::type_mismatch("`aliases` must be an array of strings")
+                    })?;
                 if row.aliases != aliases {
                     row.aliases = aliases;
                     applied.changed = true;
@@ -196,6 +202,13 @@ async fn set_facet(
     let b = bindings(tx, request, operation);
     let facets = resolve_facets(tx, &b, std::slice::from_ref(assignment), Some(view))?;
     let pinned = facet_contract(tx, &b, &assignment.facet)?;
+    if !assignment.values.is_empty()
+        && facets
+            .values()
+            .all(|value| value.as_object().is_some_and(|map| map.is_empty()))
+    {
+        return Ok(Applied::default());
+    }
     for (facet, value) in &facets {
         if let Json::Object(members) = value {
             claim(tx, id, &format!("facets.{facet}"), members)?;
@@ -384,6 +397,9 @@ async fn unset_facet(
     let key = symbol.to_string();
 
     let pinned = facet_contract(tx, &b, &unset.facet)?;
+    for field in &unset.fields {
+        tx.claim_removal(id, format!("facets.{key}.{field}"))?;
+    }
     let facets = facets_mut(tx, id).await?;
     let mut applied = Applied::default();
     let Some(Json::Object(members)) = facets.get_mut(&key) else {
@@ -431,8 +447,25 @@ async fn set_structural(
 
     let mut applied = Applied::default();
     for edge in resolved {
+        let relation = format!(
+            "structural_relation.{}.{}",
+            edge.field,
+            crate::term::Endpoint::from_json(&edge.value)?.key()
+        );
+        tx.claim_assignment(id, relation, &edge.options)?;
+        let same_position = match tx.load(id).await? {
+            Element::Concept(row) => edge.index.is_some_and(|index| {
+                row.structural
+                    .get(&edge.field)
+                    .and_then(Json::as_array)
+                    .and_then(|items| items.get(index))
+                    .is_some_and(|held| same_reference(held, &edge.value))
+            }),
+            _ => false,
+        };
         if let Some(index) = edge.index
             && !tx.claim_position(id, &edge.field, index)
+            && !same_position
         {
             return Err(position_taken(&edge.field, index));
         }
@@ -481,6 +514,7 @@ pub(crate) struct ResolvedEdge {
     pub field: String,
     pub value: Json,
     pub index: Option<usize>,
+    pub options: Json,
     pub ordered: bool,
     /// Whether the field holds at most one reference (§17.5).
     pub single: bool,
@@ -512,6 +546,18 @@ pub(crate) fn resolve_edges(
         resolved.push(ResolvedEdge {
             field,
             value: structural_value(b.value(&edge.value, view)?),
+            options: Json::Object(
+                edge.options
+                    .as_ref()
+                    .map(|options| {
+                        options
+                            .iter()
+                            .map(|(key, value)| Ok((key.clone(), b.bound(value, view)?)))
+                            .collect::<Result<Map<_, _>, KipError>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
             index,
             ordered,
             single,
@@ -611,6 +657,14 @@ async fn unset_structural(
         ));
     }
 
+    for (field, value) in &mut resolved {
+        let canonical = super::clauses::canonicalize_reference(tx, value.clone()).await?;
+        let relation = format!(
+            "structural_relation.{field}.{}",
+            crate::term::Endpoint::from_json(&canonical)?.key()
+        );
+        tx.claim_removal(id, relation)?;
+    }
     let structural = structural_mut(tx, id).await?;
     let mut applied = Applied::default();
     for (field, value) in resolved {

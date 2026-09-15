@@ -259,14 +259,15 @@ describe('version planes', () => {
       // A merge moves `merged_into` and the engine state, and neither belongs
       // to a plane (§6.3) — so the entry names both paths and reports no
       // counters at all.
-      const merged = nexus.execute('MERGE CONCEPT "C-2" INTO "C-1"')
+      nexus.execute('CREATE CONCEPT ?canonical { TYPE "Preference" }')
+      const merged = nexus.execute('MERGE CONCEPT "C-2" INTO "C-3"')
       expect(merged.changes).toEqual([
         expect.objectContaining({
           op: 'merge',
           id: 'C-2',
           old_version: 2,
           new_version: 3,
-          refs: { merged_into: 'C-1' },
+          refs: { merged_into: 'C-3' },
           touched: ['fields.merged_into', 'state'],
         }),
       ])

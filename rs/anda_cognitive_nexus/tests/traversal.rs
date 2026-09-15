@@ -33,6 +33,12 @@ const CHAIN_PROFILE: &str = r#"{
   },
   "definitions": {
     "predicates": {
+      "about": {
+        "ref": "kip://test/chain@1.0.0/about",
+        "kind": "PredicateType",
+        "subject": {"kinds": ["Proposition"]},
+        "object": {"kinds": ["Concept"]}
+      },
       "leads_to": {
         "ref": "kip://test/chain@1.0.0/leads_to",
         "kind": "PredicateType",
@@ -218,7 +224,10 @@ async fn a_walk_runs_from_whichever_end_is_pinned() {
            ORDER BY ?from.name"#,
     )
     .await;
-    assert_eq!(rows(&ancestors), &vec![json!("A"), json!("B"), json!("C")]);
+    assert_eq!(
+        rows(&ancestors),
+        &vec![json!("A"), json!("B"), json!("C"), json!("D")]
+    );
 
     // Both ends pinned is a yes/no question about reachability.
     let connected = ok(
@@ -247,10 +256,9 @@ async fn a_walk_runs_from_whichever_end_is_pinned() {
 }
 
 /// With neither end pinned the walk enumerates every subject of the predicate,
-/// which is bounded work — but a zero-hop range would match every element in
-/// the Space against itself, and that is refused rather than answered.
+/// including the reflexive pair for every visible Element at zero hops.
 #[tokio::test]
-async fn an_unpinned_walk_enumerates_subjects_and_refuses_zero_hops() {
+async fn an_unpinned_walk_enumerates_subjects_and_zero_hops() {
     let nexus = chained("unpinned").await;
 
     let pairs = ok(
@@ -270,8 +278,12 @@ async fn an_unpinned_walk_enumerates_subjects_and_refuses_zero_hops() {
         ]
     );
 
-    let error = err(&nexus, r#"FIND(?a) WHERE { (?a, "leads_to"{0,2}, ?b) }"#).await;
-    assert_eq!(error.code, "ResourceExhausted", "{error:?}");
+    let reflexive = ok(
+        &nexus,
+        r#"FIND(?a.name) WHERE { (?a, "leads_to"{0}, ?a) ?a CONCEPT {} } ORDER BY ?a.name"#,
+    )
+    .await;
+    assert_eq!(reflexive, json!(["A", "B", "C", "D", "X", "Y"]));
 }
 
 /// A walk is not a Proposition. Binding a variable to one would name a claim
@@ -345,4 +357,85 @@ async fn a_path_reports_tuples_not_belief() {
 
     let claims = ok(&nexus, r#"FIND(COUNT(?a)) WHERE { ?a ASSERTION {} }"#).await;
     assert_eq!(rows(&claims), &vec![json!(0)]);
+}
+
+#[tokio::test]
+async fn exact_and_minimum_hops_keep_paths_that_revisit_a_vertex() {
+    let nexus = chained("cycle_hops").await;
+    let exact = ok(
+        &nexus,
+        r#"FIND(?to.name) WHERE {
+        ?from CONCEPT {name: "A"} (?from, "leads_to"{4}, ?to)
+    }"#,
+    )
+    .await;
+    assert_eq!(exact, json!(["B"]));
+    let minimum = ok(
+        &nexus,
+        r#"FIND(?to.name) WHERE {
+        ?from CONCEPT {name: "A"} (?from, "leads_to"{4,}, ?to)
+    } ORDER BY ?to.name"#,
+    )
+    .await;
+    assert_eq!(minimum, json!(["B", "C", "D"]));
+    let reflexive_cycle = ok(
+        &nexus,
+        r#"FIND(?from.name) WHERE {
+        ?from CONCEPT {name: "B"} (?from, "leads_to"{3}, ?from)
+    }"#,
+    )
+    .await;
+    assert_eq!(reflexive_cycle, json!(["B"]));
+}
+
+#[tokio::test]
+async fn nested_proposition_endpoints_match_existing_records_without_creating() {
+    let nexus = chained("nested_proposition").await;
+    let ids = ok(
+        &nexus,
+        r#"FIND(?p.id, ?x.id) WHERE {
+        ?p PROPOSITION ({name: "A"}, "leads_to", {name: "B"}) ?x CONCEPT {name: "X"}
+    }"#,
+    )
+    .await;
+    let command = r#"ENSURE PROPOSITION ?meta (:edge, "about", :target)"#;
+    let mut request = Request::single(command);
+    request.parameters =
+        Some(serde_json::from_value(json!({"edge": ids[0][0], "target": ids[0][1]})).unwrap());
+    let response = nexus
+        .execute(
+            anda_kip::parse_kip(command).unwrap(),
+            &request,
+            &request.operations[0],
+        )
+        .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded, "{response:?}");
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?name, ?target.name) WHERE {
+        (({name: "A"}, "leads_to", {name: ?name}), "about", ?target)
+    }"#
+        )
+        .await,
+        json!([["B", "X"]])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?target) WHERE {
+        (({name: "absent"}, "leads_to", {name: "B"}), "about", ?target)
+    }"#
+        )
+        .await,
+        json!([])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(COUNT(?p)) WHERE { ?p PROPOSITION (?s, ?pred, ?o) }"#
+        )
+        .await,
+        json!([6])
+    );
 }

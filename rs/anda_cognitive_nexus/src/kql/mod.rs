@@ -24,6 +24,7 @@ pub mod binding;
 pub mod filter;
 pub mod matching;
 pub mod project;
+mod validation;
 
 use anda_db_schema::Fv;
 use anda_kip::{
@@ -98,6 +99,10 @@ pub struct Context<'a> {
     pub read_origin: bool,
     governed_limit: Option<usize>,
     budget: usize,
+    /// Explicit mutation output handles are ambient values, unlike query
+    /// variables introduced by a WHERE branch. Standalone KQL has none.
+    ambient: Solutions,
+    next_internal_variable: u64,
 }
 
 impl<'a> Context<'a> {
@@ -141,6 +146,8 @@ impl<'a> Context<'a> {
                 .max_results
                 .map(|limit| limit as usize),
             budget: MAX_CANDIDATES,
+            ambient: Solutions::unit(),
+            next_internal_variable: 0,
         })
     }
 
@@ -151,7 +158,7 @@ impl<'a> Context<'a> {
             .or_else(|| self.request.and_then(|map| map.get(name)))
             .cloned()
             .ok_or_else(|| {
-                KipError::invalid_request_envelope(format!(
+                KipError::reference_error(format!(
                     "the query uses the parameter :{name}, which the request does not bind"
                 ))
             })
@@ -287,6 +294,16 @@ impl<'a> Context<'a> {
         let element = self.admit(element);
         self.loaded.insert(id, element.clone());
         Ok(element)
+    }
+
+    /// Admit an immutable, explicitly declared transaction output for a raw
+    /// WHERE read. The caller supplies the transaction Space on the snapshot;
+    /// the same authorization/redaction path as storage reads still applies.
+    pub(crate) fn seed_element(&mut self, id: ElementId, element: Element) -> bool {
+        let admitted = self.admit(Some(element));
+        let visible = admitted.is_some();
+        self.loaded.insert(id, admitted);
+        visible
     }
 
     /// Follows a Concept's `merged_into` chain to the identity that survived
@@ -711,8 +728,38 @@ impl<'a> Context<'a> {
         &'s mut self,
         clauses: &'s [WhereClause],
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Solutions, KipError>> + Send + 's>> {
+        self.solve_seeded(clauses, Solutions::unit())
+    }
+
+    /// Evaluate raw WHERE with explicit enclosing mutation output handles.
+    pub fn solve_seeded<'s>(
+        &'s mut self,
+        clauses: &'s [WhereClause],
+        incoming: Solutions,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Solutions, KipError>> + Send + 's>> {
         Box::pin(async move {
-            let mut solutions = Solutions::unit();
+            let previous = std::mem::replace(&mut self.ambient, incoming.clone());
+            let result = async {
+                let scope = incoming.vars.iter().cloned().collect();
+                let vars = validation::validate_block(self, clauses, &scope)?;
+                let mut solutions = self.solve_with(clauses, incoming).await?;
+                // Keep sites even when an empty input skipped a nested block.
+                solutions = solutions.union(Solutions::table(vars.into_iter().collect(), vec![]));
+                solutions.deduplicate();
+                Ok(solutions)
+            }
+            .await;
+            self.ambient = previous;
+            result
+        })
+    }
+
+    fn solve_with<'s>(
+        &'s mut self,
+        clauses: &'s [WhereClause],
+        mut solutions: Solutions,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Solutions, KipError>> + Send + 's>> {
+        Box::pin(async move {
             for clause in clauses {
                 solutions = self.apply_clause(solutions, clause).await?;
             }
@@ -789,19 +836,31 @@ impl<'a> Context<'a> {
                 solutions
             }
             WhereClause::Not(inner) => {
-                let table = self.solve(inner).await?;
-                solutions.anti_join(table)
+                let mut out = solutions.header();
+                for row in &solutions.rows {
+                    let incoming = solutions.with_rows(vec![row.clone()]);
+                    let table = self.solve_with(inner, incoming.clone()).await?;
+                    if incoming.clone().join(table).is_empty() {
+                        out = out.union(incoming);
+                    }
+                }
+                out
             }
             WhereClause::Optional(inner) => {
-                let table = self.solve(inner).await?;
-                solutions.left_join(table)
+                let mut out = solutions.header();
+                for row in &solutions.rows {
+                    let incoming = solutions.with_rows(vec![row.clone()]);
+                    let table = self.solve_with(inner, incoming.clone()).await?;
+                    out = out.union(incoming.left_join(table));
+                }
+                out
             }
             WhereClause::Union(inner) => {
                 // An alternative branch with its own scope: its solutions are
                 // added to what came before rather than intersected with it,
                 // so a branch binding different variables widens the result
                 // instead of filtering the other side away.
-                let branch = self.solve(inner).await?;
+                let branch = self.solve_with(inner, self.ambient.clone()).await?;
                 solutions.union(branch)
             }
             WhereClause::Belief { variable, target } => {
@@ -985,6 +1044,8 @@ async fn run(
         }
     }
 
+    let visible = validation::validate_block(&mut cx, &query.where_clauses, &Default::default())?;
+    validation::validate_projection(&cx, query, &visible)?;
     let mut solutions = cx.solve(&query.where_clauses).await?;
     let mut valid_at = None;
     if let Some(for_time) = &query.for_time {
@@ -1084,20 +1145,19 @@ fn scalar_usize(cx: &Context<'_>, scalar: &Scalar, what: &str) -> Result<usize, 
         Scalar::Param(name) => cx.param_ref(name)?,
     };
     match &value {
-        Json::Number(n) => n.as_u64().map(|n| n as usize).ok_or_else(|| {
-            KipError::type_mismatch(format!("{what} must be a non-negative integer, got {n}"))
-        }),
-        // A numeric string is accepted for the same reason `DEPTH` accepts
-        // one: a caller binding a parameter from JSON may not control its
-        // type. Anything else is a bound of the wrong type, never a cursor —
-        // `LIMIT` misuse is `TypeMismatch` (§87.7).
-        Json::String(text) => text.parse().map_err(|_| {
-            KipError::type_mismatch(format!(
-                "{what} must be a non-negative integer, got {text:?}"
-            ))
-        }),
+        Json::Number(n) => n
+            .as_f64()
+            .filter(|n| {
+                n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0 && n.fract() == 0.0
+            })
+            .and_then(|n| usize::try_from(n as u64).ok())
+            .ok_or_else(|| {
+                KipError::type_mismatch(format!(
+                    "{what} must be a non-negative safe integer, got {n}"
+                ))
+            }),
         other => Err(KipError::type_mismatch(format!(
-            "{what} must be a non-negative integer, got {other}"
+            "{what} must be a non-negative safe integer, got {other}"
         ))),
     }
 }

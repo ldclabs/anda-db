@@ -19,28 +19,34 @@ import {
   type ElementId,
 } from '../id.js'
 import { canonicalJson, type Json } from '../json.js'
+import { lineageText } from '../schema/symbol.js'
 
 /** One value a variable may be bound to. */
 export type Binding =
   /** A Cognitive Element, by identity. */
   | { kind: 'element'; id: ElementId }
   /** A Core Literal value. */
-  | { kind: 'literal'; value: Json }
+  | { kind: 'literal'; value: Json; datatype?: string }
   /** An exact schema symbol, e.g. a predicate reference. */
   | { kind: 'symbol'; value: string }
+  /** Query state has identity independent of the rendered payload. */
+  | { kind: 'virtual'; value: Json; identity: Json }
 
 export const elementBinding = (id: ElementId): Binding => ({
   kind: 'element',
   id,
 })
-export const literalBinding = (value: Json): Binding => ({
-  kind: 'literal',
-  value,
-})
+export const literalBinding = (value: Json, datatype?: string): Binding => {
+  const scalarType = value === null ? 'kip:null' : typeof value === 'string' ? 'kip:string' : typeof value === 'number' ? 'kip:number' : typeof value === 'boolean' ? 'kip:boolean' : undefined
+  const type = datatype ?? scalarType
+  return {kind: 'literal', value, ...(type === undefined ? {} : {datatype: type})}
+}
 export const symbolBinding = (value: string): Binding => ({
   kind: 'symbol',
   value,
 })
+
+export const virtualBinding = (value: Json, identity: Json): Binding => ({kind: 'virtual', value, identity})
 
 /** The deterministic key two bindings share exactly when they are equal. */
 export function bindingKey(binding: Binding): string {
@@ -48,9 +54,11 @@ export function bindingKey(binding: Binding): string {
     case 'element':
       return `e:${formatElementId(binding.id)}`
     case 'symbol':
-      return `s:${binding.value}`
+      return `s:${lineageText(binding.value)}`
+    case 'virtual':
+      return `v:${canonicalJson(binding.identity)}`
     case 'literal':
-      return `l:${canonicalJson(binding.value)}`
+      return `l:${binding.datatype ?? ''}:${canonicalJson(typeof binding.value === 'string' && binding.datatype !== undefined ? binding.value.normalize('NFC') : binding.value)}`
   }
 }
 
@@ -83,12 +91,20 @@ export function extend(
 }
 
 
+/** Combines independent branch bindings without overwriting the input. */
+export function join(left: Solution, right: Solution): MutableSolution | null {
+  let combined: MutableSolution = new Map(left)
+  for (const [name, binding] of right) {
+    const next = extend(combined, name, binding)
+    if (next === null) return null
+    combined = next
+  }
+  return combined
+}
+
 /** The identity of a whole solution, for de-duplication after a UNION. */
 export function solutionKey(solution: Solution): string {
-  return [...solution.keys()]
-    .sort()
-    .map((name) => `${name}=${bindingKey(solution.get(name) as Binding)}`)
-    .join('')
+  return JSON.stringify([...solution.keys()].sort().map((name) => [name, bindingKey(solution.get(name) as Binding)]))
 }
 
 /** Removes solutions that bind every variable the same way. */

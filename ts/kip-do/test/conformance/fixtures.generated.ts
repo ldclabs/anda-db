@@ -498,9 +498,11 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "a statement is judged by the state it ends in, not by the order of its clauses",
+        "name": "conflicting removal and assignment cannot use clause order as a tie-break",
         "command": "MUTATE {\n  UPDATE \"C-1\"\n  UNSET ATTRIBUTES {summary}\n  SET ATTRIBUTES {summary: \"Dry-run the migration, then deploy\"}\n}",
-        "expect": {}
+        "expect": {
+          "error": "DuplicateMutationTarget"
+        }
       },
       {
         "name": "adoption cannot omit the lifecycle and cache version guards",
@@ -516,7 +518,7 @@ export const FIXTURES: readonly Fixture[] = [
           "result": [
             [
               "proposed",
-              "Dry-run the migration, then deploy"
+              "Dry-run the migration before the deploy"
             ]
           ]
         }
@@ -1652,7 +1654,7 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "MUTATE {\n  ASSERT ?new (:alice, \"prefers\", :dark) { by: :alice, mode: \"stated\", confidence: 0.4 }\n    SUPERSEDING :old\n}",
         "params": {},
         "expect": {
-          "error": "InvalidRequestEnvelope"
+          "error": "ReferenceError"
         },
         "vectors": [
           "CORE-008",
@@ -1740,7 +1742,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "history keeps referring to what it referred to",
-        "command": "FIND(?s.key) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+        "command": "FIND(?raw.key) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) ?raw CONCEPT {id: ?stored, state: ?state} FILTER(?stored == ?p.subject.id) }",
         "expect": {
           "result": [
             "al",
@@ -1776,10 +1778,10 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "a Concept cannot be merged into itself",
+        "name": "merging a Concept into itself has no effect",
         "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
         "expect": {
-          "error": "IdentityMergeConflict"
+          "result": null
         }
       }
     ]
@@ -2156,7 +2158,7 @@ export const FIXTURES: readonly Fixture[] = [
         "name": "a merge never picks an identity by description: two Concepts share the name",
         "command": "MERGE CONCEPT ?source INTO ?target WHERE { ?source CONCEPT {key: \"person:alice-duplicate\"} ?target CONCEPT {name: \"Alice\"} }",
         "expect": {
-          "error": "IdentitySelectorRequired"
+          "error": "IdentityMergeConflict"
         }
       },
       {
@@ -2268,6 +2270,233 @@ export const FIXTURES: readonly Fixture[] = [
               null,
               true
             ]
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "name": "query-scope-contracts",
+    "description": "KIP 2.0 §§42.4–45: correlated scopes, independent union, complete-solution identity, null logic and empty aggregates, exercised identically by both engines.",
+    "setup": [
+      "MUTATE { CREATE CONCEPT ?alice {TYPE \"Person\" NAME \"Alice\"} CREATE CONCEPT ?bob {TYPE \"Person\" NAME \"Bob\"} CREATE CONCEPT ?tea {TYPE \"Preference\" NAME \"Tea\"} CREATE CONCEPT ?coffee {TYPE \"Preference\" NAME \"Coffee\"} ENSURE PROPOSITION ?t (?alice,\"prefers\",?tea) ENSURE PROPOSITION ?c (?alice,\"prefers\",?coffee) }"
+    ],
+    "cases": [
+      {
+        "name": "NOT filters each incoming binding",
+        "command": "FIND(?p.name) WHERE { ?p {type:\"Person\"} NOT { FILTER(?p.name == \"Alice\") } }",
+        "expect": {
+          "result": [
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "OPTIONAL preserves Bob and every compatible Alice match",
+        "command": "FIND(?p.name, ?t.name) WHERE { ?p {type:\"Person\"} OPTIONAL { FILTER(?p.name == \"Alice\") (?p,\"prefers\",?t) } }",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              "Tea"
+            ],
+            [
+              "Alice",
+              "Coffee"
+            ],
+            [
+              "Bob",
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "NOT locals are not optional outputs",
+        "command": "FIND(?t) WHERE { ?p {type:\"Person\"} NOT { (?p,\"prefers\",?t) } }",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "an unmatched optional variable can be bound by a later pattern",
+        "command": "FIND(?p.name,?t.name) WHERE { ?p {name:\"Bob\"} OPTIONAL { (?p,\"prefers\",?t) } ?t {name:\"Tea\"} }",
+        "expect": {
+          "result": [
+            [
+              "Bob",
+              "Tea"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "UNION branches do not unify same-named bindings",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Alice\"} UNION { ?p {name:\"Bob\"} } }",
+        "expect": {
+          "result": [
+            "Alice",
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "UNION executes after an empty left branch",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Nobody\"} UNION { ?p {name:\"Bob\"} } }",
+        "expect": {
+          "result": [
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "branch-only variables project as null",
+        "command": "FIND(?p.name,?t.name) WHERE { ?p {name:\"Alice\"} UNION { ?t {name:\"Tea\"} } }",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              null
+            ],
+            [
+              null,
+              "Tea"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "filters after UNION apply to all accumulated rows",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Alice\"} UNION { ?p {name:\"Bob\"} } FILTER(?p.name == \"Bob\") }",
+        "expect": {
+          "result": [
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "the right branch needs its own expression binding sites",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Alice\"} UNION { FILTER(?p.name == \"Alice\") } }",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "nested UNION cannot overwrite an OPTIONAL input",
+        "command": "FIND(?p.name,?t.name) WHERE { ?p {name:\"Alice\"} OPTIONAL { ?t {name:\"Nobody\"} UNION { ?p {name:\"Bob\"} ?t {name:\"Tea\"} } } }",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "compatible independent nested UNION extends the OPTIONAL input",
+        "command": "FIND(?p.name,?t.name) WHERE { ?p {name:\"Alice\"} OPTIONAL { ?t {name:\"Nobody\"} UNION { ?t {name:\"Tea\"} } } }",
+        "expect": {
+          "result": [
+            [
+              "Alice",
+              "Tea"
+            ]
+          ]
+        }
+      },
+      {
+        "name": "identical complete UNION solutions count once",
+        "command": "FIND(COUNT(?p)) WHERE { ?p {name:\"Alice\"} UNION { ?p {name:\"Alice\"} } }",
+        "expect": {
+          "result": [
+            1
+          ]
+        }
+      },
+      {
+        "name": "nonprojected bindings keep complete solutions distinct",
+        "command": "FIND(COUNT(?p),COUNT(DISTINCT ?p)) WHERE { ?p {name:\"Alice\"} ?link (?p,\"prefers\",?t) }",
+        "expect": {
+          "result": [
+            [
+              2,
+              1
+            ]
+          ]
+        }
+      },
+      {
+        "name": "empty global group counts zero and has no numeric sum",
+        "command": "FIND(COUNT(?p),SUM(?p.attributes.display_name),AVG(?p.attributes.display_name)) WHERE { ?p {name:\"Nobody\"} }",
+        "expect": {
+          "result": [
+            [
+              0,
+              null,
+              null
+            ]
+          ]
+        }
+      },
+      {
+        "name": "empty grouped query produces no groups",
+        "command": "FIND(?p.name,COUNT(?p)) WHERE { ?p {name:\"Nobody\"} }",
+        "expect": {
+          "result": []
+        }
+      },
+      {
+        "name": "numeric aggregates cannot silently ignore a string",
+        "command": "FIND(SUM(?p.name)) WHERE { ?p {name:\"Alice\"} }",
+        "expect": {
+          "error": "TypeMismatch"
+        }
+      },
+      {
+        "name": "negating a null string test stays unknown",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Bob\"} OPTIONAL { (?p,\"prefers\",?t) } FILTER(!CONTAINS(?t.name,\"Tea\")) }",
+        "expect": {
+          "result": []
+        }
+      },
+      {
+        "name": "unknown OR true retains the fallback row",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Bob\"} OPTIONAL { (?p,\"prefers\",?t) } FILTER(?t.name == \"Tea\" || ?p.name == \"Bob\") }",
+        "expect": {
+          "result": [
+            "Bob"
+          ]
+        }
+      },
+      {
+        "name": "missing parameters fail even when prior matches are empty",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Nobody\"} FILTER(?p.name == :missing) }",
+        "expect": {
+          "error": "ReferenceError"
+        }
+      },
+      {
+        "name": "invalid constant regex is rejected before matching",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Nobody\"} FILTER(REGEX(?p.name,\"[\")) }",
+        "expect": {
+          "error": "InvalidSyntax"
+        }
+      },
+      {
+        "name": "name equality cannot deduplicate separate identities",
+        "command": "MUTATE {CREATE CONCEPT ?a {TYPE \"Person\" NAME \"Same\"} CREATE CONCEPT ?b {TYPE \"Person\" NAME \"Same\"}}",
+        "expect": {
+          "result": null
+        }
+      },
+      {
+        "name": "equal projected names remain two rows",
+        "command": "FIND(?p.name) WHERE { ?p {name:\"Same\"} }",
+        "expect": {
+          "result": [
+            "Same",
+            "Same"
           ]
         }
       }
@@ -2458,21 +2687,18 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "ORDER BY may name an aggregate the caller did not project",
+        "name": "ORDER BY rejects an aggregate that is not projected",
         "command": "FIND(?c.name) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY COUNT(?c) DESC, ?c.name",
         "ordered": true,
         "expect": {
-          "result": [
-            "Alice",
-            "Bob"
-          ]
+          "error": "InvalidSyntax"
         }
       },
       {
         "name": "but a sort key that varies inside a group has no value to sort by",
         "command": "FIND(?c.name, COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} } ORDER BY ?c.attributes.display_name",
         "expect": {
-          "error": "ConstraintViolation"
+          "error": "InvalidSyntax"
         }
       },
       {
@@ -3679,7 +3905,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "tuple-endpoints",
-    "description": "What may stand in a Proposition tuple's subject/object slot, and what happens to the ones an engine cannot resolve. The grammar's `term` admits an object pattern and a nested Proposition expression; only two spellings of an object pattern name an endpoint (§8.1, §8.2), and a term an engine cannot resolve has to be refused rather than treated as an open slot — an unconstrained endpoint silently matches every tuple under its predicate (§43.2).",
+    "description": "KQL endpoint patterns constrain visible Concepts, nested Propositions and canonical references; KML creation endpoints still require stable identity. An extra field is never silently ignored.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  ENSURE PROPOSITION ?p (?alice, \"same_as\", {canonical_id: \"urn:x:alice\"})\n  ENSURE PROPOSITION ?q (?bob, \"same_as\", {canonical_id: \"urn:x:bob\"})\n}"
     ],
@@ -3701,27 +3927,27 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "an object endpoint that describes rather than names is refused",
+        "name": "an inline Concept pattern does not match a canonical reference",
         "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {name: \"Alice\"}) }",
         "expect": {
-          "error": "IdentitySelectorRequired"
+          "result": []
         }
       },
       {
-        "name": "an identity member that is itself a pattern is refused",
+        "name": "a variable canonical_id matches local Concepts, not nonlocal reference objects",
         "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: ?whatever}) }",
         "expect": {
-          "error": "IdentitySelectorRequired"
+          "result": []
         }
       },
       {
-        "name": "a nested Proposition endpoint is refused, never silently unconstrained",
+        "name": "a nested Proposition endpoint matches no canonical reference",
         "command": "FIND(?s.name) WHERE { ?meta PROPOSITION (?s, \"same_as\", (id: :other)) }",
         "params": {
           "other": "P-1"
         },
         "expect": {
-          "error": "UnsupportedCapability"
+          "result": []
         }
       },
       {
@@ -3746,10 +3972,10 @@ export const FIXTURES: readonly Fixture[] = [
         }
       },
       {
-        "name": "an identity endpoint carrying more than the identity is refused, never half-honoured",
+        "name": "additional endpoint fields are constraints, never ignored",
         "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: \"urn:x:alice\", name: \"Zed\"}) }",
         "expect": {
-          "error": "IdentitySelectorRequired"
+          "result": []
         }
       }
     ]
@@ -3757,4 +3983,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 286
+export const CASE_COUNT = 308

@@ -523,6 +523,13 @@ pub struct OrderByItem {
     pub direction: OrderDirection,
     /// The aggregate applied before sorting, when the key is an aggregate.
     pub aggregation: Option<AggregationFunction>,
+    /// Deduplicate the aggregate's non-null inputs before sorting.
+    #[serde(default, skip_serializing_if = "order_distinct_is_false")]
+    pub distinct: bool,
+}
+
+fn order_distinct_is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Sort direction.

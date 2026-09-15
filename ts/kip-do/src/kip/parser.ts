@@ -35,7 +35,7 @@ import {
 } from '@ldclabs/kip-lang'
 import type { Program } from '@ldclabs/kip-lang'
 import { KipError, errors, type KipErrorCode } from '../errors.js'
-import type { Command } from './ast.js'
+import type { Command, KqlQuery } from './ast.js'
 import { checkSemantics } from './semantics.js'
 
 /**
@@ -99,7 +99,9 @@ function parseProgram(source: string): Program {
  */
 export function parseKip(source: string): Command {
   try {
-    const command = lower(parseProgram(source))
+    const program = parseProgram(source)
+    const command = lower(program)
+    preserveDistinctOrdering(program, [command])
     checkPortableAst(command)
     checkSemantics(command)
     return command
@@ -143,11 +145,34 @@ export function parseKipBatch(
  */
 export function parseKipAll(source: string): Command[] {
   try {
-    const commands = lowerAll(parseProgram(source))
+    const program = parseProgram(source)
+    const commands = lowerAll(program)
+    preserveDistinctOrdering(program, commands)
     for (const command of commands) { checkPortableAst(command); checkSemantics(command) }
     return commands
   } catch (err) {
     throw toKipError(err)
+  }
+}
+
+/**
+ * kip-lang's syntax tree records ORDER BY COUNT(DISTINCT ...), but its current
+ * executable lowering drops the flag. Keep the written operand in both the
+ * single-command and folded multi-command paths.
+ */
+function preserveDistinctOrdering(program: Program, commands: Command[]): void {
+  const finds = program.statements.filter((statement) => statement.kind === 'FindStatement')
+  let next = 0
+  for (const command of commands) {
+    if (!('Kql' in command)) continue
+    const syntax = finds[next++]
+    const query: KqlQuery = command.Kql
+    for (const [index, item] of (syntax?.orderBy?.items ?? []).entries()) {
+      if (item.expression.kind === 'AggregateExpr' && item.expression.distinct) {
+        const sort = query.order_by?.[index]
+        if (sort !== undefined) sort.distinct = true
+      }
+    }
   }
 }
 

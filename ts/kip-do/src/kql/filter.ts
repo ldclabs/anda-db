@@ -7,8 +7,8 @@
  * not.
  *
  * The comparison rule is the one worth stating: **a comparison between unlike
- * types decides nothing**, so it is false, and so is its negation's counterpart
- * — `?c.name > 5` and `?c.name <= 5` are both false for a string name. An
+ * types decides nothing**, including under negation: neither `?c.name > 5`
+ * nor `!(?c.name > 5)` accepts a row whose name is a string. An
  * engine that coerced would answer a question nobody asked.
  */
 
@@ -24,34 +24,79 @@ import type { Context } from './context.js'
 import { kipLiteral, parameterValue, readVariable, type ReadBindings } from './matching.js'
 import type { Solution } from './solution.js'
 
-export function evaluateFilter(
-  cx: Context,
-  expression: FilterExpression,
-  solution: Solution,
-  b: ReadBindings,
-): boolean {
+/** Three-valued truth: null means the operands could not decide a condition. */
+type Truth = boolean | null
+
+export function evaluateFilter(cx: Context, expression: FilterExpression, solution: Solution, b: ReadBindings): boolean {
+  return truth(cx, expression, solution, b) === true
+}
+
+function truth(cx: Context, expression: FilterExpression, solution: Solution, b: ReadBindings): Truth {
   if ('Not' in expression) {
-    return !evaluateFilter(cx, expression.Not, solution, b)
+    const value = truth(cx, expression.Not, solution, b)
+    return value === null ? null : !value
   }
   if ('Logical' in expression) {
     const { left, operator, right } = expression.Logical
-    const first = evaluateFilter(cx, left, solution, b)
-    // Short-circuiting is observable here only through cost, but a query that
-    // pays for the second half of an already-decided `OR` pays it per row.
-    if (operator === 'And') {
-      return first && evaluateFilter(cx, right, solution, b)
-    }
-    return first || evaluateFilter(cx, right, solution, b)
+    const first = truth(cx, left, solution, b)
+    if (operator === 'And' && first === false) return false
+    if (operator === 'Or' && first === true) return true
+    const second = truth(cx, right, solution, b)
+    if (operator === 'And') return second === false ? false : first === null || second === null ? null : true
+    return second === true ? true : first === null || second === null ? null : false
   }
   if ('Comparison' in expression) {
     const { left, operator, right } = expression.Comparison
-    return compare(
-      operand(cx, left, solution, b),
-      operator,
-      operand(cx, right, solution, b),
-    )
+    return compare(operand(cx, left, solution, b), operator, operand(cx, right, solution, b))
   }
   return callFunction(cx, expression.Function, solution, b)
+}
+
+const ARITY: Readonly<Record<string, number>> = { IsNull: 1, IsNotNull: 1, IsLiteral: 1, IsElement: 1, Contains: 2, StartsWith: 2, EndsWith: 2, Regex: 2, In: 2, IsKind: 2, LiteralType: 2 }
+
+/** Inspect every branch before evaluation, including constant REGEX arguments. */
+export function validateFilter(cx: Context, expression: FilterExpression, b: ReadBindings, variable: (value: { var: string; path: import('../kip/ast.js').PathStep[] }) => void): void {
+  const inspect = (value: FilterOperand): boolean => {
+    if ('Variable' in value) { variable(value.Variable); return false }
+    if ('Param' in value) { parameterValue(b, value.Param); return true }
+    if ('List' in value) return value.List.map(inspect).every(Boolean)
+    if ('Negate' in value) return inspect(value.Negate)
+    return true
+  }
+  if ('Not' in expression) validateFilter(cx, expression.Not, b, variable)
+  else if ('Logical' in expression) {
+    validateFilter(cx, expression.Logical.left, b, variable)
+    validateFilter(cx, expression.Logical.right, b, variable)
+  } else if ('Comparison' in expression) {
+    const { left, operator, right } = expression.Comparison
+    const leftConstant = inspect(left)
+    const rightConstant = inspect(right)
+    if (leftConstant && rightConstant) compare(operand(cx, left, new Map(), b), operator, operand(cx, right, new Map(), b))
+  } else {
+    const call = expression.Function
+    if (ARITY[call.func] === undefined || (call.args.length !== ARITY[call.func] && !(call.func === 'LiteralType' && call.args.length === 1))) throw errors.invalidSyntax(`invalid function or arity: ${call.func}`)
+    const constant = call.args.map(inspect)
+    const stringPositions = ['Contains', 'StartsWith', 'EndsWith', 'Regex'].includes(call.func) ? [0, 1] : ['IsKind', 'LiteralType'].includes(call.func) ? [1] : []
+    for (const index of stringPositions) {
+      if (!constant[index]) continue
+      const value = operand(cx, call.args[index]!, new Map(), b)
+      if (value !== null && typeof value !== 'string') throw errors.typeMismatch(`${call.func} requires a string input`)
+    }
+    if (call.func === 'In' && constant[1]) {
+      const list = operand(cx, call.args[1]!, new Map(), b)
+      if (list !== null && !Array.isArray(list)) throw errors.typeMismatch('IN requires a list as its second argument')
+    }
+    if (call.func === 'Regex' && constant[1]) {
+      const pattern = operand(cx, call.args[1]!, new Map(), b)
+      if (pattern !== null && typeof pattern !== 'string') throw errors.typeMismatch('REGEX requires a string pattern')
+      if (typeof pattern === 'string') regex(pattern)
+    }
+  }
+}
+
+function regex(pattern: string): RegExp {
+  try { return new RegExp(pattern) }
+  catch { throw errors.invalidSyntax(`${JSON.stringify(pattern)} is not a valid regular expression`) }
 }
 
 /** One side of a comparison, or one argument of a function. */
@@ -73,21 +118,23 @@ function operand(
   return typeof inner === 'number' ? -inner : null
 }
 
-function compare(left: Json, operator: ComparisonOperator, right: Json): boolean {
-  if (operator === 'Equal') return jsonEquals(left, right)
-  if (operator === 'NotEqual') return !jsonEquals(left, right)
+function compare(left: Json, operator: ComparisonOperator, right: Json): Truth {
+  if (left === null || right === null || typeof left !== typeof right) return null
+  const equal = typeof left === 'string' && typeof right === 'string' ? left.normalize('NFC') === right.normalize('NFC') : jsonEquals(left, right)
+  if (operator === 'Equal') return equal
+  if (operator === 'NotEqual') return !equal
 
   // Ordering is only defined within one type. Comparing across two — or
   // against a null nobody bound — decides nothing, which is false in both
   // directions rather than an arbitrary winner.
-  if (typeof left !== typeof right) return false
   if (typeof left === 'number' && typeof right === 'number') {
     return order(left - right, operator)
   }
   if (typeof left === 'string' && typeof right === 'string') {
     return order(left < right ? -1 : left > right ? 1 : 0, operator)
   }
-  return false
+  if (typeof left === 'boolean' && typeof right === 'boolean') return order(Number(left) - Number(right), operator)
+  throw errors.typeMismatch('ordering requires comparable scalar inputs')
 }
 
 function order(sign: number, operator: ComparisonOperator): boolean {
@@ -110,66 +157,64 @@ function callFunction(
   call: { func: string; args: FilterOperand[] },
   solution: Solution,
   b: ReadBindings,
-): boolean {
+): Truth {
   const args = call.args.map((arg) => operand(cx, arg, solution, b))
   const [first, second] = args
-  const text = (value: Json): string | null =>
-    typeof value === 'string' ? value : null
+  const text = (value: Json): string => {
+    if (typeof value !== 'string') throw errors.typeMismatch(`${call.func} requires a string input`)
+    return value
+  }
 
+  const isNull = (value: Json | undefined): boolean => value === null || value === undefined
+  if (call.func !== 'IsNull' && call.func !== 'IsNotNull' && args.some(isNull)) return null
   switch (call.func) {
     case 'IsNull':
-      return first === null || first === undefined
+      return isNull(first)
     case 'IsNotNull':
-      return first !== null && first !== undefined
+      return !isNull(first)
     case 'Contains': {
       const haystack = text(first as Json)
       const needle = text(second as Json)
-      return haystack !== null && needle !== null && haystack.includes(needle)
+      return haystack === null || needle === null ? null : haystack.includes(needle)
     }
     case 'StartsWith': {
       const haystack = text(first as Json)
       const needle = text(second as Json)
-      return haystack !== null && needle !== null && haystack.startsWith(needle)
+      return haystack === null || needle === null ? null : haystack.startsWith(needle)
     }
     case 'EndsWith': {
       const haystack = text(first as Json)
       const needle = text(second as Json)
-      return haystack !== null && needle !== null && haystack.endsWith(needle)
+      return haystack === null || needle === null ? null : haystack.endsWith(needle)
     }
     case 'Regex': {
       const haystack = text(first as Json)
       const pattern = text(second as Json)
-      if (haystack === null || pattern === null) return false
-      try {
-        return new RegExp(pattern).test(haystack)
-      } catch {
-        throw errors.invalidSyntax(
-          `${JSON.stringify(pattern)} is not a valid regular expression`,
-        )
-      }
+      if (haystack === null || pattern === null) return null
+      return regex(pattern).test(haystack)
     }
     case 'In': {
       const list = second
       return Array.isArray(list)
-        ? list.some((item) => jsonEquals(item as Json, first as Json))
-        : false
+        ? list.some((item) => item !== null && compare(first as Json, 'Equal', item as Json) === true)
+        : (() => { throw errors.typeMismatch('IN requires a list as its second argument') })()
     }
     case 'IsLiteral':
       // An element reference is not a Literal, whatever its text looks like.
-      return !isElement(first as Json)
+      return !argumentIsElement(call.args[0]!, first as Json, solution)
     case 'IsElement':
-      return isElement(first as Json)
+      return argumentIsElement(call.args[0]!, first as Json, solution)
     case 'IsKind': {
       const value = first as Json
       const kind = text(second as Json)
-      if (!isElement(value) || kind === null) return false
+      if (!argumentIsElement(call.args[0]!, value, solution) || kind === null) return false
       const id = tryParseElementId(
         typeof value === 'string' ? value : String((value as { id: string }).id),
       )
       return id !== null && id.kind.toLowerCase() === kind.toLowerCase()
     }
     case 'LiteralType':
-      return literalType(first as Json) === text(second as Json)
+      return second === undefined ? !argumentIsElement(call.args[0]!, first as Json, solution) : literalType(first as Json) === text(second as Json)
     default:
       throw errors.unsupportedCapability(
         `the filter function ${call.func} is not implemented by this engine yet`,
@@ -177,9 +222,8 @@ function callFunction(
   }
 }
 
-/** Whether a value is an element reference rather than a Literal. */
-function isElement(value: Json): boolean {
-  if (typeof value === 'string') return tryParseElementId(value) !== null
+function argumentIsElement(arg: FilterOperand, value: Json, solution: Solution): boolean {
+  if ('Variable' in arg && arg.Variable.path.length === 0) return solution.get(arg.Variable.var)?.kind === 'element'
   return isJsonMap(value) && typeof value.id === 'string'
 }
 

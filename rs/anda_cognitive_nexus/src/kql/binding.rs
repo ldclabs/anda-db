@@ -22,7 +22,7 @@ use anda_kip::{ElementKind, Json};
 use crate::id::ElementId;
 
 /// What one variable is bound to in one solution.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Binding {
     /// A Cognitive Element.
     Element(ElementId),
@@ -30,18 +30,68 @@ pub enum Binding {
     Literal(Json),
     /// A schema symbol, when a predicate slot was written as a variable.
     Symbol(String),
+    /// Virtual query state, whose identity need not equal its rendered data.
+    Virtual { identity: String, value: Json },
     /// Unbound. Produced only by `OPTIONAL`, which pads the rows it could not
     /// extend rather than dropping them.
     Null,
 }
 
+impl PartialEq for Binding {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Element(a), Self::Element(b)) => a == b,
+            (Self::Literal(a), Self::Literal(b)) => value_key(a) == value_key(b),
+            (Self::Symbol(a), Self::Symbol(b)) => crate::schema::same_lineage(a, b),
+            (Self::Virtual { identity: a, .. }, Self::Virtual { identity: b, .. }) => a == b,
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Canonical value identity: numeric spelling and object-key order do not
+/// introduce another solution, while array order remains meaningful.
+pub fn value_key(value: &Json) -> String {
+    fn canonical(value: &Json) -> Json {
+        match value {
+            Json::Array(values) => Json::Array(values.iter().map(canonical).collect()),
+            Json::Object(values) => {
+                let sorted: std::collections::BTreeMap<_, _> = values
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical(value)))
+                    .collect();
+                serde_json::to_value(sorted).expect("JSON object")
+            }
+            value => {
+                crate::term::Literal::from_scalar(value.clone())
+                    .expect("a JSON scalar")
+                    .value
+            }
+        }
+    }
+    serde_json::to_string(&canonical(value)).expect("JSON value")
+}
+
 impl Binding {
+    /// Identity with the binding category preserved (not its projected value).
+    pub fn identity_key(&self) -> String {
+        match self {
+            Self::Element(id) => format!("element:{id}"),
+            Self::Literal(value) => format!("value:{}", value_key(value)),
+            Self::Symbol(symbol) => format!("symbol:{}", crate::schema::lineage_of(symbol)),
+            Self::Virtual { identity, .. } => format!("virtual:{identity}"),
+            Self::Null => "unbound".into(),
+        }
+    }
+
     /// The value a projection or a filter sees.
     pub fn to_json(&self) -> Json {
         match self {
             Binding::Element(id) => Json::String(id.to_string()),
             Binding::Literal(value) => value.clone(),
             Binding::Symbol(symbol) => Json::String(symbol.clone()),
+            Binding::Virtual { value, .. } => value.clone(),
             Binding::Null => Json::Null,
         }
     }
@@ -61,7 +111,7 @@ impl Binding {
 
     /// Whether this is a Literal value rather than a reference.
     pub fn is_literal(&self) -> bool {
-        matches!(self, Binding::Literal(_))
+        matches!(self, Binding::Literal(value) if !value.is_array() && !value.is_object())
     }
 
     /// The Core kind name, when this binding names an element.
@@ -235,6 +285,11 @@ impl Solutions {
                     continue;
                 }
                 let mut row = left.clone();
+                for (left_index, right_index) in &shared {
+                    if matches!(row[*left_index], Binding::Null) {
+                        row[*left_index] = right[*right_index].clone();
+                    }
+                }
                 for index in &carried {
                     row.push(right[*index].clone());
                 }
@@ -250,42 +305,17 @@ impl Solutions {
     /// turn "we have no birth date for Bob" into "Bob does not exist", which
     /// is the open-world mistake in miniature.
     pub fn left_join(self, other: Solutions) -> Solutions {
-        if other.is_empty() && other.vars.is_empty() {
-            return self;
-        }
-        let extended = self.clone().join(other.clone());
-        let added: Vec<String> = other
-            .vars
-            .iter()
-            .filter(|name| !self.binds(name))
-            .cloned()
-            .collect();
-        if added.is_empty() {
-            // The optional block bound nothing new, so it can only filter —
-            // and an OPTIONAL must never filter. Keep the left side.
-            return self;
-        }
-
-        let mut vars = self.vars.clone();
-        vars.extend(added.clone());
-        let mut rows: Vec<Vec<Binding>> = Vec::new();
+        let mut out = self.header().union(other.header());
         for left in &self.rows {
-            let matches: Vec<&Vec<Binding>> = extended
-                .rows
-                .iter()
-                .filter(|row| row[..left.len()] == left[..])
-                .collect();
-            if matches.is_empty() {
-                let mut padded = left.clone();
-                padded.extend(std::iter::repeat_n(Binding::Null, added.len()));
-                rows.push(padded);
+            let incoming = self.with_rows(vec![left.clone()]);
+            let matches = incoming.clone().join(other.clone());
+            out = out.union(if matches.is_empty() {
+                incoming
             } else {
-                for row in matches {
-                    rows.push(row.clone());
-                }
-            }
+                matches
+            });
         }
-        Solutions { vars, rows }
+        out
     }
 
     /// Anti-join: keep the left rows that the right side cannot extend.
@@ -293,22 +323,27 @@ impl Solutions {
     /// This is `NOT { ... }`. It asks about the *recorded* graph, never about
     /// the world: "no Assertion says so" is not "it is false" (§24).
     pub fn anti_join(self, other: Solutions) -> Solutions {
-        if other.is_empty() {
-            return self;
-        }
-        let extended = self.clone().join(other);
-        let vars = self.vars.clone();
         let rows = self
             .rows
-            .into_iter()
+            .iter()
             .filter(|left| {
-                !extended
-                    .rows
-                    .iter()
-                    .any(|row| row[..left.len()] == left[..])
+                self.with_rows(vec![(*left).clone()])
+                    .join(other.clone())
+                    .is_empty()
             })
+            .cloned()
             .collect();
-        Solutions { vars, rows }
+        Solutions {
+            vars: self.vars,
+            rows,
+        }
+    }
+
+    /// Deduplicate complete bindings before projection or aggregation (§42.5).
+    pub fn deduplicate(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.rows
+            .retain(|row| seen.insert(row.iter().map(Binding::identity_key).collect::<Vec<_>>()));
     }
 
     /// Union: both sides' rows, widened to the same columns.
@@ -443,6 +478,29 @@ mod tests {
         // pattern that does bind it must still be able to.
         let padded = table(&["a", "b"], vec![vec![concept(1), Binding::Null]]);
         let bound = table(&["b"], vec![vec![concept(5)]]);
-        assert_eq!(padded.join(bound).rows.len(), 1);
+        assert_eq!(padded.join(bound).rows, vec![vec![concept(1), concept(5)]]);
+    }
+    #[test]
+    fn dedup_preserves_missing_null_and_binding_categories() {
+        let mut values = table(
+            &["value"],
+            vec![
+                vec![Binding::Null],
+                vec![Binding::Literal(Json::Null)],
+                vec![Binding::Literal(Json::from(1))],
+                vec![Binding::Literal(Json::from(1.0))],
+            ],
+        );
+        values.deduplicate();
+        assert_eq!(values.rows.len(), 3);
+        assert_eq!(
+            Binding::Literal(Json::from("é")),
+            Binding::Literal(Json::from("e\u{301}"))
+        );
+        assert!(!Binding::Literal(serde_json::json!({"id": "C-1"})).is_literal());
+        assert_ne!(
+            Binding::Literal(serde_json::json!({"id": "C-1"})),
+            concept(1)
+        );
     }
 }

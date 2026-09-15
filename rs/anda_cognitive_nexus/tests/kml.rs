@@ -1242,8 +1242,17 @@ async fn tombstoning_is_reachable_from_archived_but_not_the_other_way() {
 #[tokio::test]
 async fn removal_starts_from_a_state_that_still_holds_the_element() {
     let nexus = lifecycle_ground("transition_removal_legality").await;
-
-    ok(&nexus, r#"MERGE CONCEPT "C-1" INTO "C-2""#).await;
+    // A merge requires compatible type lineages; this lifecycle test needs a
+    // second Person rather than the Preference in the common setup.
+    let duplicate = ok(&nexus, r#"CREATE CONCEPT ?duplicate { TYPE "Person" }"#).await;
+    ok(
+        &nexus,
+        &format!(
+            r#"MERGE CONCEPT "C-1" INTO "{}""#,
+            handle(&duplicate, "duplicate")
+        ),
+    )
+    .await;
     for state in ["tombstoned", "archived"] {
         let refused = run(&nexus, &format!(r#"TRANSITION "C-1" TO "{state}""#)).await;
         let error = refused.error.as_ref().unwrap();

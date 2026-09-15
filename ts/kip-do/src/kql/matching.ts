@@ -26,7 +26,7 @@ import {
   type ElementId,
   type ElementKind,
 } from '../id.js'
-import { isJsonMap, type Json, type JsonMap } from '../json.js'
+import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
 import type {
   BeliefTarget,
   Scalar,
@@ -60,15 +60,17 @@ import {
   type Policy,
   type Slot,
 } from '../projection/index.js'
-import { nowTime } from '../time.js'
 import { Context, LIMITS } from './context.js'
 import { evaluateFilter } from './filter.js'
+import { validateWhere } from './validation.js'
 import {
   distinct,
   elementBinding,
   extend,
   literalBinding,
+  join,
   symbolBinding,
+  virtualBinding,
   type Binding,
   type MutableSolution,
   type Solution,
@@ -80,12 +82,14 @@ export interface ReadBindings {
   operation: JsonMap
   /** The Epistemic Policy a BELIEF in this query projects under. */
   policy: Policy
+  /** Explicit KML output handles, available in every independent query arm. */
+  ambient?: Solution
 }
 
 export function parameterValue(b: ReadBindings, name: string): Json {
   if (Object.hasOwn(b.operation, name)) return b.operation[name] as Json
   if (Object.hasOwn(b.request, name)) return b.request[name] as Json
-  throw errors.invalidRequestEnvelope(
+  throw errors.referenceError(
     `the command reads :${name}, which the request does not bind`,
   )
 }
@@ -189,17 +193,22 @@ export function solveAll(
   incoming: readonly Solution[],
   b: ReadBindings,
 ): Solution[] {
+  validateWhere(cx, clauses, b, new Set(incoming.flatMap((solution) => [...solution.keys()])))
+  return solveBlock(cx, clauses, incoming, b)
+}
+
+function solveBlock(cx: Context, clauses: readonly WhereClause[], incoming: readonly Solution[], b: ReadBindings): Solution[] {
   let solutions = [...incoming]
   for (const clause of clauses) {
     if ('Union' in clause) {
       // A UNION is an alternative to everything the block has said so far, not
-      // a further narrowing of it. So its arm is evaluated against what entered
-      // the block — evaluating it against the accumulated solutions would make
+      // a further narrowing of it. So its arm is evaluated against an empty solution
+      // independent of the enclosing block — evaluating it against the accumulated solutions would make
       // `{ A UNION { B } }` mean `A AND B`, which is the opposite of widening
       // and returns nothing whenever the two arms disagree.
       solutions = distinct([
         ...solutions,
-        ...solveAll(cx, clause.Union, incoming, b),
+        ...solveBlock(cx, clause.Union, [b.ambient ?? new Map()], b),
       ])
     } else {
       solutions = solveClause(cx, clause, solutions, b)
@@ -208,7 +217,7 @@ export function solveAll(
       cx.spend('scans', solutions.length)
     }
   }
-  return solutions
+  return distinct(solutions)
 }
 
 function solveClause(
@@ -226,13 +235,16 @@ function solveClause(
     // The record, never the world: a solution survives when the inner block
     // finds nothing to extend it with.
     return incoming.filter(
-      (solution) => solveAll(cx, clause.Not, [solution], b).length === 0,
+      (solution) => !solveBlock(cx, clause.Not, [solution], b).some((row) => join(solution, row) !== null),
     )
   }
   if ('Optional' in clause) {
     const out: Solution[] = []
     for (const solution of incoming) {
-      const extended = solveAll(cx, clause.Optional, [solution], b)
+      const extended = solveBlock(cx, clause.Optional, [solution], b).flatMap((row) => {
+        const compatible = join(solution, row)
+        return compatible === null ? [] : [compatible]
+      })
       // Padding rather than dropping is the whole point: the row survives with
       // the optional variables simply unbound, and a projection of one reads
       // null.
@@ -395,57 +407,69 @@ function checkMatcher(
     if (element === null || element.row.state !== State.ACTIVE) return null
   }
 
+  return matchObject(cx, view, matcher, solution, b, id.kind)
+}
+
+/** A nested object matcher is a conjunction over its supplied members. */
+export function matchObject(cx: Context, actual: Json, matcher: ObjectMatcher, solution: Solution, b: ReadBindings, kind?: ElementKind, symbolMap?: 'Facet' | 'StructuralField'): Solution | null {
+  if (!isJsonMap(actual)) return null
   let current: Solution = solution
   for (const [field, expected] of Object.entries(matcher)) {
-    const path = FIELD_PATHS[field] ?? [field]
-    const actual = readField(view, path)
-    const asReference = REFERENCE_FIELDS[id.kind].includes(field)
-
-    if ('Variable' in expected) {
-      const binding = bindingOf(actual, asReference)
-      if (binding === null) return null
-      const next = extend(current, expected.Variable, binding)
-      if (next === null) return null
-      current = next
-      continue
-    }
-
-    const wanted = literalOf(expected, current, b)
-    if (wanted === undefined) {
-      throw errors.unsupportedCapability(
-        `a ${field} matcher of this shape is not implemented by this engine ` +
-          `yet; see DESCRIBE CAPABILITIES`,
-      )
-    }
-    if (LINEAGE_FIELDS.has(field) && typeof wanted === 'string') {
-      // The view carries the exact reference; the pattern names a lineage.
-      if (typeof actual !== 'string' || lineageText(actual) !== resolveSymbol(cx, field, wanted)) {
-        return null
+    const key = symbolMap === undefined || (symbolMap === 'StructuralField' && Object.hasOwn(CORE_STRUCTURAL_FIELDS, field))
+      ? field : formatSymbolRef(cx.env.resolveSymbol(symbolMap, field, 'read'))
+    const path = kind === undefined ? [key] : FIELD_PATHS[field] ?? [key]
+    const value = readField(actual, path)
+    if (value === undefined) return null
+    if (kind !== undefined && SYMBOL_FIELDS.has(field) && !('Variable' in expected)) {
+      const wanted = literalOf(expected, current, b)
+      if (typeof wanted === 'string') {
+        const resolved = resolveSymbol(cx, field, wanted)
+        if (typeof value !== 'string' || (LINEAGE_FIELDS.has(field) ? lineageText(value) : value) !== resolved) return null
+        continue
       }
-      continue
     }
-    const resolved =
-      SYMBOL_FIELDS.has(field) && typeof wanted === 'string'
-        ? resolveSymbol(cx, field, wanted)
-        : wanted
-    if (!sameValue(actual, resolved, asReference)) return null
+    const next = matchValue(cx, value, expected, current, b,
+      kind !== undefined && REFERENCE_FIELDS[kind].includes(field),
+      kind !== undefined && field === 'facets' ? 'Facet' : kind !== undefined && field === 'structural' ? 'StructuralField' : undefined)
+    if (next === null) return null
+    current = next
   }
   return current
 }
 
+function matchValue(cx: Context, actual: Json, expected: MatchValue, solution: Solution, b: ReadBindings, asReference = false, symbolMap?: 'Facet' | 'StructuralField'): Solution | null {
+  if ('Variable' in expected) {
+    const binding = bindingOf(actual, asReference)
+    return binding === null ? null : extend(solution, expected.Variable, binding)
+  }
+  if ('Match' in expected) return matchObject(cx, actual, expected.Match, solution, b, undefined, symbolMap)
+  if ('Array' in expected) {
+    if (!Array.isArray(actual) || actual.length !== expected.Array.length) return null
+    let current: Solution = solution
+    for (let i = 0; i < expected.Array.length; i++) {
+      const next = matchValue(cx, actual[i]!, expected.Array[i]!, current, b)
+      if (next === null) return null
+      current = next
+    }
+    return current
+  }
+  if ('Proposition' in expected) return bindTerm(cx, solution, expected, actual, b)
+  const wanted = 'Param' in expected ? parameterValue(b, expected.Param) : kipLiteral(expected.Literal)
+  return sameValue(actual, wanted, asReference) ? solution : null
+}
+
 /** Reads a matcher field, following the path the view actually stores it at. */
-function readField(view: JsonMap, path: readonly string[]): Json {
+function readField(view: JsonMap, path: readonly string[]): Json | undefined {
   let current: Json = view
   for (const step of path) {
-    if (!isJsonMap(current)) return null
-    current = (current[step] ?? null) as Json
+    if (!isJsonMap(current) || !Object.hasOwn(current, step)) return undefined
+    current = current[step] as Json
   }
   return current
 }
 
 /** The binding a view value produces, as an element or as a Literal. */
 function bindingOf(value: Json, asReference: boolean): Binding | null {
-  if (value === null) return null
   if (asReference) {
     const id =
       typeof value === 'string'
@@ -471,11 +495,7 @@ function sameValue(actual: Json, expected: Json, asReference: boolean): boolean 
           formatElementId((right as { id: ElementId }).id)
       : false
   }
-  if (isJsonMap(actual) && isJsonMap(expected)) {
-    // A reference-shaped expectation compares by identity, not by member.
-    return JSON.stringify(actual) === JSON.stringify(expected)
-  }
-  return actual === expected
+  return typeof actual === 'string' && typeof expected === 'string' ? actual.normalize('NFC') === expected.normalize('NFC') : jsonEquals(actual, expected)
 }
 
 /** The literal a matcher value carries, or `undefined` when it carries none. */
@@ -727,7 +747,9 @@ function termEndpoint(
     if (bound === undefined) return null
     return bound.kind === 'element'
       ? { id: formatElementId(bound.id) }
-      : (bound.value as Json)
+      : bound.kind === 'literal' && bound.datatype !== undefined
+        ? { value: bound.value, datatype: bound.datatype }
+        : (bound.value as Json)
   }
   if ('Literal' in term) return kipLiteral(term.Literal)
   if ('Param' in term) {
@@ -737,81 +759,27 @@ function termEndpoint(
       : value
   }
   if ('Match' in term) return matcherEndpoint(term.Match, b)
-  // §43.2 blesses `(id: …)` as a `term`, which is how a statement about a
-  // statement names an existing Proposition. Not built here yet — and refused
-  // rather than ignored, for the reason above.
-  throw errors.unsupportedCapability(
-    'a nested Proposition in a tuple endpoint (§43.2) is not implemented by ' +
-      'this engine yet; bind the Proposition with its own pattern and pass ' +
-      'the variable',
-  )
+  // A nested Proposition pattern is checked against each stored endpoint by
+  // bindTerm. It is not a single pinned lookup before those matches exist.
+  return null
 }
 
-/**
- * The endpoint an inline `{...}` matcher names (§8.1, §8.2).
- *
- * Only two spellings of an object pattern *name* something: `{id: …}` is a
- * Local Element Reference and `{canonical_id: …}` is a Canonical Identity
- * Reference. Every other matcher describes a search, and resolving one would
- * pick a winner among the Concepts a description is allowed to match — the
- * arbitrary choice §7.2 forbids for names. The same two fields, in the same
- * order, that `termValue` accepts on the mutation path.
- *
- * The refusal is `IdentitySelectorRequired` and not `UnsupportedCapability`:
- * no engine should ever resolve a description to one endpoint, so this is not
- * a gap that a later version closes.
- */
-function matcherEndpoint(matcher: ObjectMatcher, b: ReadBindings): Json {
+/** Only a single stable identity narrows candidates before matching. */
+function matcherEndpoint(matcher: ObjectMatcher, b: ReadBindings): Json | null {
+  if (Object.keys(matcher).length !== 1) return null
   for (const field of ['id', 'canonical_id'] as const) {
     const member = matcher[field]
-    if (member === undefined) continue
-    // An identity resolves the endpoint; it does not also filter it. A matcher
-    // carrying more than the identity asked for something this position cannot
-    // do, and answering it by dropping the rest would let
-    // `{id: "C-1", name: "Zed"}` match C-1 whatever C-1 is called — the silent
-    // wrong answer an unconstrained endpoint gives, one member in.
-    const extra = Object.keys(matcher).filter((key) => key !== field)
-    if (extra.length > 0) {
-      throw errors.identitySelectorRequired(
-        `a tuple endpoint names \`${field}\`, so it is resolved by identity ` +
-          `and not matched by description; ${extra.join(', ')} would be ` +
-          `silently ignored. Drop ${extra.length === 1 ? 'it' : 'them'} or ` +
-          `bind the element with its own pattern`,
-      )
-    }
-    // Read off the member itself rather than through `literalOf`, which
-    // collapses an unbound variable to `undefined` — indistinguishable here
-    // from "no such field", and this position has no open-slot reading: an
-    // identity is written down or it is not one.
-    const value =
-      'Literal' in member
-        ? kipLiteral(member.Literal)
-        : 'Param' in member
-          ? parameterValue(b, member.Param)
-          : undefined
-    if (value === undefined) {
-      throw errors.identitySelectorRequired(
-        `\`${field}\` in a tuple endpoint must be a literal identity or a ` +
-          `parameter, not a pattern`,
-      )
-    }
-    if (typeof value !== 'string') {
-      throw errors.identitySelectorRequired(
-        `\`${field}\` in a tuple endpoint must be a string, got ` +
-          JSON.stringify(value),
-      )
-    }
+    if (member === undefined || 'Variable' in member) continue
+    const value = 'Literal' in member ? kipLiteral(member.Literal) : 'Param' in member ? parameterValue(b, member.Param) : undefined
+    if (typeof value !== 'string') throw errors.typeMismatch(`${field} must be a string`)
     return { [field]: value }
   }
-  throw errors.identitySelectorRequired(
-    'a tuple endpoint written as an object must name a stable identity: ' +
-      '{id: "…"} or {canonical_id: "…"}; matching one by description would ' +
-      'pick a winner among the Concepts a description is allowed to share',
-  )
+  return null
 }
 
 /** Binds a tuple endpoint's variable, or checks it against what it holds. */
 function bindTerm(
+  cx: Context,
   solution: Solution,
   term: Term,
   value: Json,
@@ -822,8 +790,40 @@ function bindTerm(
     : null
 
   if ('Variable' in term) {
-    const binding = local !== null ? elementBinding(local) : literalBinding(value)
+    const endpoint = endpointFromJson(value)
+    const binding = local !== null ? elementBinding(local) : endpoint.kind === 'literal'
+      ? literalBinding(endpoint.literal.value, endpoint.literal.datatype) : literalBinding(value)
     return extend(solution, term.Variable, binding)
+  }
+  if ('Match' in term) {
+    if (local === null) {
+      // A literal canonical reference is an identity selector. Broad inline
+      // object patterns describe local Concepts, not the JSON encoding of a
+      // remote/canonical reference.
+      const selected = matcherEndpoint(term.Match, b)
+      return selected !== null && endpointKey(endpointFromJson(selected)) === endpointKey(endpointFromJson(value)) ? solution : null
+    }
+    const direct = literalOf(term.Match.id, solution, b)
+    if (typeof direct === 'string') {
+      const wanted = tryParseElementId(direct)
+      if (wanted === null || !canonicalKeys(cx, endpointFromJson({id: direct})).includes(endpointKey(endpointFromJson(value)))) return null
+      const remaining = {...term.Match}
+      delete remaining.id
+      return checkMatcher(cx, cx.canonicalOf(local), remaining, solution, b)
+    }
+    return checkMatcher(cx, local, term.Match, solution, b)
+  }
+  if ('Proposition' in term) {
+    if (local?.kind !== 'Proposition') return null
+    const temporary = '\u0000nested_proposition'
+    for (const row of propositions(cx, temporary, term.Proposition, [solution], b)) {
+      const matched = row.get(temporary)
+      if (matched?.kind !== 'element' || formatElementId(matched.id) !== formatElementId(local)) continue
+      const result = new Map(row)
+      result.delete(temporary)
+      return result
+    }
+    return null
   }
   const expected = termEndpoint(term, solution, b)
   if (expected === null) return solution
@@ -845,7 +845,7 @@ function bindTupleTerm(
   value: Json,
   b: ReadBindings,
 ): Solution | null {
-  if ('Variable' in term) return bindTerm(solution, term, value, b)
+  if ('Variable' in term || 'Match' in term || 'Proposition' in term) return bindTerm(cx, solution, term, value, b)
   const expected = termEndpoint(term, solution, b)
   if (expected === null) return solution
   const stored = endpointKey(endpointFromJson(value))
@@ -999,13 +999,10 @@ function structural(
     source: string,
     target: Json,
     index: number | null,
-  ): Json =>
-    ({
-      source: { id: source },
-      field: plane.field,
-      target,
-      index: plane.ordered ? index : null,
-    }) as Json
+  ): Binding => virtualBinding({
+    source: {id: source}, field: plane.field, target,
+    index: plane.ordered ? index : null,
+  }, ['structural', source, lineageText(plane.field), endpointKey(endpointFromJson(target)), plane.ordered ? index : null])
 
   const out: Solution[] = []
   if (cx.historical) {
@@ -1042,17 +1039,15 @@ function structural(
             const dst = tryParseElementId(reference.id)
             if (dst === null || cx.view(dst) === null) continue
             let current: Solution | null = solution
-            current = bindTerm(current, clause.subject, { id: formatElementId(src) }, b)
+            current = bindTerm(cx, current, clause.subject, { id: formatElementId(src) }, b)
             if (current === null) continue
-            current = bindTerm(current, clause.object, reference as Json, b)
+            current = bindTerm(cx, current, clause.object, reference as Json, b)
             if (current === null) continue
             if (clause.variable !== null) {
               current = extend(
                 current,
                 clause.variable,
-                literalBinding(
-                  edge(plane, formatElementId(src), reference as Json, position),
-                ),
+                edge(plane, formatElementId(src), reference as Json, position),
               )
               if (current === null) continue
             }
@@ -1093,15 +1088,15 @@ function structural(
         const dst = parseElementId(row.to_id)
         if (cx.view(src) === null || cx.view(dst) === null) continue
         let current: Solution | null = solution
-        current = bindTerm(current, clause.subject, { id: row.from_id }, b)
+        current = bindTerm(cx, current, clause.subject, { id: row.from_id }, b)
         if (current === null) continue
-        current = bindTerm(current, clause.object, { id: row.to_id }, b)
+        current = bindTerm(cx, current, clause.object, { id: row.to_id }, b)
         if (current === null) continue
         if (clause.variable !== null) {
           current = extend(
             current,
             clause.variable,
-            literalBinding(edge(plane, row.from_id, { id: row.to_id } as Json, row.ord)),
+            edge(plane, row.from_id, { id: row.to_id } as Json, row.ord),
           )
           if (current === null) continue
         }
@@ -1147,18 +1142,19 @@ function belief(
         // Only a *fully grounded* tuple earns the §46.4 answer. A tuple with
         // an unbound end asked about a family of slots, and "no Proposition"
         // there is an empty match, not one belief about nothing.
-        if (!tupleIsGrounded(clause.target.Tuple, solution, b)) {
-          throw errors.notFoundOrNotVisible(
-            'the BELIEF tuple names no Proposition on record here',
-          )
-        }
-        const next = extend(
-          solution,
-          clause.variable,
-          literalBinding(
-            beliefToJson(ungroundedBelief(cx, b.policy, nowTime())) as Json,
-          ),
-        )
+        if (!tupleIsGrounded(clause.target.Tuple, solution, b)) continue
+        const value = beliefToJson(ungroundedBelief(cx, b.policy, cx.validAt))
+        const tuple = clause.target.Tuple
+        const atom = 'Atom' in tuple.predicate ? tuple.predicate.Atom : null
+        if (atom === null || 'Variable' in atom) throw errors.internalError('ungrounded BELIEF target has no exact predicate')
+        const name = 'Literal' in atom ? atom.Literal : parameterValue(b, atom.Param)
+        if (typeof name !== 'string') throw errors.typeMismatch('a predicate must be a symbol string')
+        const target = [
+          endpointKey(endpointFromJson(cx.canonicalEndpoint(termEndpoint(tuple.subject, solution, b)))),
+          resolveSymbol(cx, 'predicate', name),
+          endpointKey(endpointFromJson(cx.canonicalEndpoint(termEndpoint(tuple.object, solution, b)))),
+        ]
+        const next = extend(solution, clause.variable, virtualBinding(value, ['belief', target, value.basis ?? null]))
         if (next !== null) out.push(next)
         continue
       }
@@ -1167,22 +1163,16 @@ function belief(
         if (bound === undefined || bound.kind !== 'element') continue
         const carried: MutableSolution = new Map(row)
         carried.delete(BELIEF_TARGET)
-        const next = extend(
-          carried,
-          clause.variable,
-          literalBinding(beliefToJson(project(cx, bound.id, b.policy)) as Json),
-        )
+        const value = beliefToJson(project(cx, bound.id, b.policy))
+        const next = extend(carried, clause.variable, virtualBinding(value, ['belief', formatElementId(bound.id), value.basis ?? null]))
         if (next !== null) out.push(next)
       }
       continue
     }
 
     const target = beliefTarget(clause.target, solution, b)
-    const next = extend(
-      solution,
-      clause.variable,
-      literalBinding(beliefToJson(project(cx, target, b.policy)) as Json),
-    )
+    const value = beliefToJson(project(cx, target, b.policy))
+    const next = extend(solution, clause.variable, virtualBinding(value, ['belief', formatElementId(target), value.basis ?? null]))
     if (next !== null) out.push(next)
   }
   return out
@@ -1304,11 +1294,8 @@ function beliefSlot(
           'counted for its independence, never for how good it is',
       ],
     }
-    const next = extend(
-      solution,
-      clause.variable,
-      literalBinding(slotToJson(subject, predicateLineage, slot) as Json),
-    )
+    const value = slotToJson(subject, predicateLineage, slot)
+    const next = extend(solution, clause.variable, virtualBinding(value, ['belief-slot', endpointKey(endpointFromJson(cx.canonicalEndpoint(subject))), predicateLineage, value.basis ?? null]))
     if (next !== null) out.push(next)
   }
   return out
@@ -1328,7 +1315,7 @@ export function readVariable(
   if (bound === undefined) return null
   if (path.length === 0) {
     return bound.kind === 'element'
-      ? formatElementId(bound.id)
+      ? cx.view(bound.id)
       : (bound.value as Json)
   }
   if (bound.kind === 'element') {
@@ -1369,9 +1356,9 @@ export function readCount(
   what: string,
 ): number {
   const value = scalarValue(scalar, b)
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw errors.typeMismatch(
-      `${what} must be a non-negative integer, got ${JSON.stringify(value)}`,
+      `${what} must be a non-negative safe integer, got ${JSON.stringify(value)}`,
     )
   }
   return value

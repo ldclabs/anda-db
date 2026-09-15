@@ -27,7 +27,7 @@ than an absent one. It is recoverable from this branch's history.
 What works today: the storage layer, Schema Packages and symbol resolution,
 transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
 Capsule export and verification, the Governance control plane, and the
-historical read path. **All 224 shared conformance cases pass** — the list in
+historical read path. **All 308 shared conformance cases pass** — the list in
 `test/conformance.test.ts` names what is not built rather than counting it, so
 closing the last gap meant deleting a name and a new one cannot hide inside a
 number that happens to match.
@@ -221,13 +221,13 @@ leaking into it is a failing test.
 
 ## Full-text search and multilingual text
 
-`SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION` is built, in keyword mode,
-over SQLite FTS5 with BM25 ranking. The corpus mirrors the Rust engine's field
-for field — Concept `name` / `aliases` / `attributes`, Proposition
-`predicate_ref` / `attributes`, Evidence `payload_inline` — because two engines
-ranking the same corpus differently is a quality difference a caller can live
-with, and two engines searching *different text* is a correctness difference
-nobody can debug from the outside.
+`SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION` supports keyword retrieval.
+The corpus contains visible Concept `name` / `aliases` / `attributes`,
+Proposition `predicate_ref`, and Evidence payload text. Each query applies
+Governance and field redaction before building BM25 statistics in memory.
+Hidden documents and masked fields cannot change visible hit membership,
+scores, or ranking. The query scans its eligible corpus within the read budget;
+exhaustion is an explicit `ResourceExhausted`, not an incomplete search miss.
 
 **The index is maintained inside the write transaction.** Maintenance hangs off
 `Store.put`, the single funnel every write passes through, so an index entry
@@ -244,10 +244,10 @@ scripts that write spaces and fails completely for the ones that do not: a whole
 Han run collapses into one token, so `深色模式` would index as a single term that
 no realistic query matches.
 
-So the boundaries are inserted before the text reaches SQLite, by
-`Intl.Segmenter` — ICU's dictionary breaking, in process and synchronous. FTS5
-still does the final tokenization on both paths, which keeps the index and the
-query in step through everything the segmenter does not touch (case folding,
+`Intl.Segmenter` supplies word boundaries for both query-local ranking and
+the maintained FTS5 index, using ICU's dictionary breaking in process.
+Query-local ranking tokenizes both the query and visible documents with the
+same segmenter. FTS5 still applies its own final tokenization (case folding,
 apostrophes, hyphens).
 
 KIP 1.x delegated this to [`cf-tokenizer`](../../rs/cf-tokenizer), an external
@@ -273,8 +273,14 @@ indexed under the old one is unreachable rather than merely ranked worse.
 
 ### What a score is
 
-`retrieval.score` is `-bm25()`, so bigger is better and the default
-`THRESHOLD 0.0` keeps everything. It is relevance, never confidence: copying one
+`retrieval.score` normalizes the visible-corpus BM25 score `s` as `s / (1 + s)`
+into `[0, 1]`. Higher scores rank first, with stable ID ties. `THRESHOLD t`
+keeps scores greater than or equal to `t`, before the page limit; thresholds
+outside `[0, 1]` are rejected. Both read and search field/result constraints
+apply. A search cursor fails with `CursorExpired` when the index coordinate
+changes; start a new search instead of continuing against different scores.
+The legacy top-level hit `score` carries the same normalized value.
+It is relevance, never confidence: copying one
 into an Assertion would invent an epistemic commitment out of a text match
 (§2.10). Scores may be compared *within* one answer and never across engines.
 

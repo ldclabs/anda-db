@@ -273,11 +273,11 @@ describe('KQL', () => {
       // `ORDER BY` may name an aggregate the caller did not project: it
       // orders the groups, and sorting by the bare variable instead would
       // answer a question nobody asked.
-      expect(
+      expect(() =>
         nexus.query(
           'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } ORDER BY COUNT(?c) DESC',
         ),
-      ).toEqual(['Alice', 'Bob'])
+      ).toThrowError(/projected columns/)
       // A key that varies inside a group has no value to sort by.
       expect(() =>
         nexus.query(

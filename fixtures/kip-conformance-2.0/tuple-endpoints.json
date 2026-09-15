@@ -1,6 +1,6 @@
 {
   "name": "tuple-endpoints",
-  "description": "What may stand in a Proposition tuple's subject/object slot, and what happens to the ones an engine cannot resolve. The grammar's `term` admits an object pattern and a nested Proposition expression; only two spellings of an object pattern name an endpoint (§8.1, §8.2), and a term an engine cannot resolve has to be refused rather than treated as an open slot — an unconstrained endpoint silently matches every tuple under its predicate (§43.2).",
+  "description": "KQL endpoint patterns constrain visible Concepts, nested Propositions and canonical references; KML creation endpoints still require stable identity. An extra field is never silently ignored.",
   "setup": [
     "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  ENSURE PROPOSITION ?p (?alice, \"same_as\", {canonical_id: \"urn:x:alice\"})\n  ENSURE PROPOSITION ?q (?bob, \"same_as\", {canonical_id: \"urn:x:bob\"})\n}"
   ],
@@ -22,27 +22,27 @@
       }
     },
     {
-      "name": "an object endpoint that describes rather than names is refused",
+      "name": "an inline Concept pattern does not match a canonical reference",
       "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {name: \"Alice\"}) }",
       "expect": {
-        "error": "IdentitySelectorRequired"
+        "result": []
       }
     },
     {
-      "name": "an identity member that is itself a pattern is refused",
+      "name": "a variable canonical_id matches local Concepts, not nonlocal reference objects",
       "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: ?whatever}) }",
       "expect": {
-        "error": "IdentitySelectorRequired"
+        "result": []
       }
     },
     {
-      "name": "a nested Proposition endpoint is refused, never silently unconstrained",
+      "name": "a nested Proposition endpoint matches no canonical reference",
       "command": "FIND(?s.name) WHERE { ?meta PROPOSITION (?s, \"same_as\", (id: :other)) }",
       "params": {
         "other": "P-1"
       },
       "expect": {
-        "error": "UnsupportedCapability"
+        "result": []
       }
     },
     {
@@ -67,10 +67,10 @@
       }
     },
     {
-      "name": "an identity endpoint carrying more than the identity is refused, never half-honoured",
+      "name": "additional endpoint fields are constraints, never ignored",
       "command": "FIND(?s.name) WHERE { ?p PROPOSITION (?s, \"same_as\", {canonical_id: \"urn:x:alice\", name: \"Zed\"}) }",
       "expect": {
-        "error": "IdentitySelectorRequired"
+        "result": []
       }
     }
   ]

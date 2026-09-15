@@ -40,11 +40,9 @@
 //!   a move is legal from. §52.5 makes that the engine's check
 //!   (`InvalidLifecycleTransition`); only the state *vocabulary* is fixed by
 //!   the language, and only that is checked.
-//! - `SEARCH ... THRESHOLD`. A threshold is compared against a retrieval
-//!   score, and §66.5 makes an engine *declare* its score semantics rather
-//!   than adopt one — §27.3 lists `log_odds` among them, which is not bounded
-//!   at all. A `[0,1]` ceiling here would refuse a legal threshold against a
-//!   perfectly conforming ranker.
+//! - `SEARCH ... THRESHOLD`. The engine checks the `[0,1]` retrieval-score
+//!   contract in §66.4 after binding, identically for literal and parameter
+//!   operands. Syntactic acceptance here is not execution-time validity.
 
 use std::fmt;
 
@@ -550,9 +548,8 @@ fn analyze_kql(query: &KqlQuery, out: &mut Vec<Diagnostic>) {
 
 fn analyze_meta(meta: &MetaCommand, out: &mut Vec<Diagnostic>) {
     match meta {
-        // `THRESHOLD` is compared against a retrieval score whose semantics
-        // the engine declares (§66.5) rather than inherits, so it carries no
-        // protocol-fixed range to check it against.
+        // The engine checks literal and parameter thresholds together after
+        // binding against the normalized retrieval-score range in §66.4.
         MetaCommand::Search(search) => check_enum(
             search.mode.as_ref().and_then(scalar_str),
             SEARCH_MODES,
@@ -613,11 +610,9 @@ mod tests {
     }
 
     #[test]
-    fn a_search_threshold_is_not_forced_into_the_unit_interval() {
-        // A threshold is compared against a retrieval score, and §66.5 has an
-        // engine declare its score semantics rather than adopt one — §27.3
-        // lists `log_odds`, which is unbounded. Capping this at 1 would
-        // refuse a legal threshold against a conforming ranker.
+    fn search_threshold_execution_validation_belongs_to_the_engine() {
+        // The syntax layer preserves numeric operands; engine tests reject
+        // out-of-range values under §66.4 after all operands are bound.
         for input in [
             r#"SEARCH CONCEPT "x" THRESHOLD 0.5"#,
             r#"SEARCH CONCEPT "x" THRESHOLD 1000"#,

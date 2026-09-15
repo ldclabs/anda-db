@@ -4499,3 +4499,93 @@ async fn quarantine_holds_only_an_active_element_and_leaves_its_status_alone() {
     .await;
     assert_eq!(still.status, TopLevelStatus::Succeeded, "{:?}", still.error);
 }
+
+#[tokio::test]
+async fn hidden_search_text_cannot_change_visible_scores() {
+    let nexus = stocked("search_rank_visibility").await;
+    two_classified_concepts(&nexus).await;
+    let reader = agent(nexus.governance(), "kip:principal:rank-reader").await;
+    grant_read(&nexus, &reader, "public").await;
+    let session = nexus.session(AuthContext::principal(&reader));
+    let before = run_as(&session, r#"SEARCH CONCEPT "Note""#).await;
+    assert_eq!(
+        before.first_result().unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let changed = run_as(
+        &nexus.system_session(),
+        r#"UPDATE "C-2" SET FIELDS {name: "Note Note Note Note Note confidential ranking words"}"#,
+    )
+    .await;
+    assert_eq!(changed.status, TopLevelStatus::Succeeded);
+    let after = run_as(&session, r#"SEARCH CONCEPT "Note""#).await;
+    assert_eq!(
+        before.first_result().unwrap()["hits"],
+        after.first_result().unwrap()["hits"]
+    );
+}
+
+#[tokio::test]
+async fn search_enforces_its_own_field_mask_and_result_limit() {
+    let nexus = stocked("search_constraints").await;
+    let owner = nexus.system_session();
+    for id in 1..=2 {
+        let made = run_as(&owner, &format!(r#"CREATE CONCEPT ?c {{TYPE "Person" NAME "Visible Note {id}" SET ATTRIBUTES {{display_name:"maskedword"}}}}"#)).await;
+        assert_eq!(made.status, TopLevelStatus::Succeeded);
+        owner
+            .classify(
+                DEFAULT_SPACE,
+                ElementId::new(anda_kip::ElementKind::Concept, id),
+                "public",
+            )
+            .await
+            .unwrap();
+    }
+    let reader = agent(nexus.governance(), "kip:principal:search-mask-reader").await;
+    for (actions, fields, max_results) in [
+        (vec!["read".into(), "discover".into()], vec![], None),
+        (
+            vec!["search".into()],
+            vec!["name".into(), "schema_ref".into()],
+            Some(1),
+        ),
+    ] {
+        nexus
+            .governance()
+            .create_grant(
+                GrantDraft {
+                    space_id: DEFAULT_SPACE.into(),
+                    grantee_principal: reader.clone(),
+                    actions,
+                    constraints: AuthorityConstraints {
+                        max_classification: "public".into(),
+                        fields,
+                        max_results,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                SYSTEM_PRINCIPAL,
+            )
+            .await
+            .unwrap();
+    }
+    let session = nexus.session(AuthContext::principal(&reader));
+    let masked = run_as(&session, r#"SEARCH CONCEPT "maskedword""#).await;
+    assert_eq!(
+        masked.first_result().unwrap()["hits"],
+        serde_json::json!([])
+    );
+    let visible = run_as(&session, r#"SEARCH CONCEPT "Note" LIMIT 10"#).await;
+    assert_eq!(
+        visible.first_result().unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(visible.results[0].next_cursor.is_some());
+}

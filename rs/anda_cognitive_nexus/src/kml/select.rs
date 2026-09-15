@@ -18,9 +18,10 @@
 //!   something different depending on where it sat in the `MUTATE` — which is
 //!   exactly the dependency §24 exists to deny.
 //!
-//! Elements this transaction minted are `pending` and no pattern matches them,
-//! so the rule holds by construction rather than by a filter someone must
-//! remember to write.
+//! Ordinary candidate scans exclude transaction-local `pending` creations.
+//! Explicit block output handles are a separate read surface: their final
+//! creation views are frozen before mutation selection begins, made available
+//! under those names, and governed by the same read authority as stored rows.
 //!
 //! ## The order a `LIMIT` cuts
 //!
@@ -140,23 +141,28 @@ pub async fn targets(
         &tx.auth,
     )
     .await?;
-    let solutions = cx.solve(clauses).await?;
+    let vars: Vec<_> = tx.handles().keys().cloned().collect();
+    let row = tx
+        .handles()
+        .values()
+        .map(|id| {
+            if let Some(element) = tx.handle_view(*id) {
+                cx.seed_element(*id, element.clone());
+            }
+            kql::binding::Binding::Element(*id)
+        })
+        .collect();
+    let solutions = cx
+        .solve_seeded(clauses, kql::binding::Solutions::table(vars, vec![row]))
+        .await?;
     let limit = limit
         .map(|scalar| b.scalar_u64(scalar, "LIMIT"))
         .transpose()?
         .map(|limit| limit as usize);
 
     let variable = match target {
-        // A handle this transaction already bound is a different element from
-        // whatever the block selects, and silently preferring one of them would
-        // make the statement mean something the author cannot see. Two names,
-        // two meanings, one spelling: refuse.
-        ElementRef::Handle(name) if tx.handles().contains_key(name.as_str()) => {
-            return Err(KipError::reference_error(format!(
-                "?{name} is bound both by a clause in this transaction and by the {what} \
-                 selection block; give the selection variable a different name"
-            )));
-        }
+        // A block output is a bound operand: WHERE guards its fixed identity.
+        ElementRef::Handle(name) if tx.handles().contains_key(name.as_str()) => None,
         ElementRef::Handle(name) => Some(name.as_str()),
         _ => None,
     };
@@ -179,7 +185,7 @@ pub async fn targets(
         }
         None => {
             // A guard: the statement already names its target.
-            if solutions.is_empty() {
+            if solutions.is_empty() || limit == Some(0) {
                 Vec::new()
             } else {
                 vec![b.element_ref(target)?]

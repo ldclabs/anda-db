@@ -34,7 +34,7 @@
     },
     {
       "name": "history keeps referring to what it referred to",
-      "command": "FIND(?s.key) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
+      "command": "FIND(?raw.key) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) ?raw CONCEPT {id: ?stored, state: ?state} FILTER(?stored == ?p.subject.id) }",
       "expect": {
         "result": [
           "al",
@@ -70,10 +70,10 @@
       }
     },
     {
-      "name": "a Concept cannot be merged into itself",
+      "name": "merging a Concept into itself has no effect",
       "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
       "expect": {
-        "error": "IdentityMergeConflict"
+        "result": null
       }
     }
   ]

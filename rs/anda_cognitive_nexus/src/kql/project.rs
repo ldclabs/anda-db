@@ -38,6 +38,7 @@ impl Context<'_> {
         offset: Option<usize>,
         pinned_seq: u64,
     ) -> Result<Projected, KipError> {
+        solutions.deduplicate();
         // Every row this engine returns leaves through here, so the cap an
         // authority carries is merged in at this one place rather than by each
         // output path — an aggregate is still output, and a `max_results: 0`
@@ -130,7 +131,9 @@ impl Context<'_> {
             // A projection result is a value, not an element, and `?b.status`
             // has to read out of it exactly as `?c.name` reads out of a
             // Concept.
-            Binding::Literal(value) => crate::view::read_path_in(&self.env, value, &path.path),
+            Binding::Literal(value) | Binding::Virtual { value, .. } => {
+                crate::view::read_path_in(&self.env, value, &path.path)
+            }
             _ => match binding.element().and_then(|id| self.cached_view(id)) {
                 Some(view) => crate::view::read_path_in(&self.env, &view, &path.path),
                 None => Json::Null,
@@ -167,6 +170,14 @@ impl Context<'_> {
                 (resolved, row)
             })
             .collect();
+
+        for (keys, _) in &decorated {
+            if keys.iter().any(|key| key.is_object() || key.is_array()) {
+                return Err(KipError::type_mismatch(
+                    "ORDER BY requires comparable scalar values; use an Element field path",
+                ));
+            }
+        }
 
         decorated.sort_by(|(left_keys, left), (right_keys, right)| {
             for (index, (_, direction)) in keys.iter().enumerate() {
@@ -237,7 +248,7 @@ impl Context<'_> {
                 .iter()
                 .map(|path| self.read_variable(&solutions, row, path))
                 .collect();
-            let token = serde_json::to_string(&key).unwrap_or_default();
+            let token = super::binding::value_key(&Json::Array(key.clone()));
             match index.get(&token) {
                 Some(at) => groups[*at].1.push(row.clone()),
                 None => {
@@ -273,9 +284,11 @@ impl Context<'_> {
                     continue;
                 };
                 if !plan.iter().any(|(applied, path, distinct)| {
-                    *applied == func && !*distinct && same_path(path, &item.variable)
+                    *applied == func
+                        && *distinct == item.distinct
+                        && same_path(path, &item.variable)
                 }) {
-                    plan.push((func, &item.variable, false));
+                    plan.push((func, &item.variable, item.distinct));
                 }
             }
         }
@@ -362,14 +375,14 @@ impl Context<'_> {
             Some(items) => {
                 for item in items {
                     let position = match item.aggregation {
-                        // `!distinct`, matching the plan above: `ORDER BY
-                        // COUNT(?x)` beside a projected `COUNT(DISTINCT ?x)`
-                        // names a different number, and sorting by the
-                        // distinct one would answer a question nobody asked.
+                        // DISTINCT is part of the aggregate identity: the
+                        // distinct and ordinary counts can order differently.
                         Some(func) => aggregates
                             .iter()
                             .position(|(applied, path, distinct)| {
-                                *applied == func && !*distinct && same_path(path, &item.variable)
+                                *applied == func
+                                    && *distinct == item.distinct
+                                    && same_path(path, &item.variable)
                             })
                             .map(|index| (index, true)),
                         None => keys
@@ -439,21 +452,24 @@ impl Context<'_> {
         var: &anda_kip::DotPathVar,
         distinct: bool,
     ) -> Result<Json, KipError> {
-        let mut column: Vec<Json> = group
-            .rows
-            .iter()
-            .map(|row| self.read_variable(group, row, var))
-            .collect();
-        if distinct {
-            let mut seen: Vec<Json> = Vec::new();
-            column.retain(|value| {
-                if seen.contains(value) {
-                    false
+        let mut seen = std::collections::HashSet::new();
+        let mut column = Vec::new();
+        for row in &group.rows {
+            let value = self.read_variable(group, row, var);
+            if distinct {
+                let key = if var.path.is_empty() {
+                    group
+                        .get(row, &var.var)
+                        .unwrap_or(&Binding::Null)
+                        .identity_key()
                 } else {
-                    seen.push(value.clone());
-                    true
+                    super::binding::value_key(&value)
+                };
+                if !seen.insert(key) {
+                    continue;
                 }
-            });
+            }
+            column.push(value);
         }
         aggregate(func, &column)
     }
@@ -464,48 +480,70 @@ fn same_path(left: &anda_kip::DotPathVar, right: &anda_kip::DotPathVar) -> bool 
     left.var == right.var && left.path == right.path
 }
 
-/// Applies one aggregate to a column.
-///
-/// `COUNT` counts rows that have a value; the others ignore non-numbers rather
-/// than failing, because a column may legitimately mix types and an aggregate
-/// over the numeric part is still an answer.
+/// Apply an aggregate to the non-null values, rejecting incompatible inputs.
 fn aggregate(func: AggregationFunction, column: &[Json]) -> Result<Json, KipError> {
-    let numbers: Vec<f64> = column.iter().filter_map(Json::as_f64).collect();
-    let finish = |value: f64| {
-        serde_json::Number::from_f64(value)
-            .map(Json::Number)
-            .unwrap_or(Json::Null)
+    let values: Vec<&Json> = column.iter().filter(|value| !value.is_null()).collect();
+    if func == AggregationFunction::Count {
+        return Ok(Json::from(values.len()));
+    }
+    if values.is_empty() {
+        return Ok(Json::Null);
+    }
+    let finish = |value: f64| -> Result<Json, KipError> {
+        if !value.is_finite() || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0) {
+            return Err(KipError::type_mismatch(
+                "aggregate result must be a finite portable number with safe integer precision",
+            ));
+        }
+        Ok(Json::Number(
+            serde_json::Number::from_f64(value).expect("finite number"),
+        ))
     };
-    Ok(match func {
-        AggregationFunction::Count => {
-            Json::from(column.iter().filter(|value| !value.is_null()).count())
-        }
-        AggregationFunction::Sum => finish(numbers.iter().sum()),
-        AggregationFunction::Avg => {
-            if numbers.is_empty() {
-                // The average of nothing is not zero; zero would be a claim.
-                Json::Null
+    match func {
+        AggregationFunction::Sum | AggregationFunction::Avg => {
+            let numbers = values
+                .iter()
+                .map(|value| {
+                    value.as_f64().ok_or_else(|| {
+                        KipError::type_mismatch("SUM and AVG require numeric inputs")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let sum: f64 = numbers.iter().sum();
+            finish(if func == AggregationFunction::Avg {
+                sum / numbers.len() as f64
             } else {
-                finish(numbers.iter().sum::<f64>() / numbers.len() as f64)
-            }
+                sum
+            })
         }
-        AggregationFunction::Min => numbers
-            .iter()
-            .copied()
-            .fold(None::<f64>, |acc, value| {
-                Some(acc.map_or(value, |acc| acc.min(value)))
-            })
-            .map(finish)
-            .unwrap_or(Json::Null),
-        AggregationFunction::Max => numbers
-            .iter()
-            .copied()
-            .fold(None::<f64>, |acc, value| {
-                Some(acc.map_or(value, |acc| acc.max(value)))
-            })
-            .map(finish)
-            .unwrap_or(Json::Null),
-    })
+        AggregationFunction::Min | AggregationFunction::Max => {
+            let first = values[0];
+            if !first.is_boolean() && !first.is_number() && !first.is_string()
+                || values
+                    .iter()
+                    .any(|value| type_rank(value) != type_rank(first))
+            {
+                return Err(KipError::type_mismatch(
+                    "MIN and MAX require mutually comparable scalar inputs",
+                ));
+            }
+            let selected = values
+                .into_iter()
+                .reduce(|left, right| {
+                    let order = compare_json(left, right);
+                    if (func == AggregationFunction::Min && order.is_gt())
+                        || (func == AggregationFunction::Max && order.is_lt())
+                    {
+                        right
+                    } else {
+                        left
+                    }
+                })
+                .expect("nonempty column");
+            Ok(selected.clone())
+        }
+        AggregationFunction::Count => unreachable!(),
+    }
 }
 
 /// Total order over projected values, with nulls last.
@@ -564,8 +602,12 @@ fn compare_rows(left: &[Binding], right: &[Binding]) -> Ordering {
         if ordering != Ordering::Equal {
             return ordering;
         }
+        let identity = a.identity_key().cmp(&b.identity_key());
+        if identity != Ordering::Equal {
+            return identity;
+        }
     }
-    Ordering::Equal
+    left.len().cmp(&right.len())
 }
 
 #[cfg(test)]
@@ -611,10 +653,10 @@ mod tests {
             aggregate(AggregationFunction::Min, &[]).unwrap(),
             Json::Null
         );
-        // A sum over nothing is genuinely zero, which is not the same claim.
+        // SUM follows the same empty-group null rule as AVG/MIN/MAX.
         assert_eq!(
             aggregate(AggregationFunction::Sum, &[]).unwrap(),
-            Json::from(0.0)
+            Json::Null
         );
     }
 

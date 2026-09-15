@@ -55,6 +55,7 @@ import { readPath } from '../view.js'
 import {
   assignments,
   mutationValue,
+  options,
   referenceValue,
   symbolName,
   type Bindings,
@@ -181,9 +182,10 @@ export function applyAction(
           element.row[name] = value
           break
         case 'aliases':
-          element.row.aliases = (Array.isArray(value) ? value : [value]).filter(
-            (item): item is string => typeof item === 'string',
-          )
+          if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+            throw errors.typeMismatch('`aliases` must be an array of strings')
+          }
+          element.row.aliases = value as string[]
           break
         default:
           // §31.3: a Governance member spelled as a field is refused under its
@@ -220,6 +222,7 @@ export function applyAction(
       throw immutableTarget(element, 'UNSET ATTRIBUTES')
     }
     for (const name of action.UnsetAttributes) {
+      tx.claimRemoval({kind: element.kind, seq: element.row.id}, `attributes.${name}`)
       delete element.row.attributes[name]
     }
     return
@@ -233,6 +236,7 @@ export function applyAction(
     const facet = resolveFacetText(tx, b, action.SetFacet.facet)
     const values = assignments(b, action.SetFacet.values, read)
     normalizeRecordRefs(facet, values)
+    if (action.SetFacet.values.length > 0 && Object.keys(values).length === 0) return
     claim(tx, element, `facets.${facet}`, values)
     mergeFacet(
       tx,
@@ -253,6 +257,9 @@ export function applyAction(
       'write',
     )
     const symbolText = formatSymbolRef(symbol)
+    for (const field of action.UnsetFacet.fields) {
+      tx.claimRemoval({kind: element.kind, seq: element.row.id}, `facets.${symbolText}.${field}`)
+    }
     const facet = row.facets[symbolText]
     if (isJsonMap(facet)) {
       // Erasing an immutable member is rewriting it to absent (§39), judged
@@ -291,11 +298,17 @@ export function applyAction(
       const current = row.structural[field]
       const items = Array.isArray(current) ? [...current] : []
       const index = edgeIndex(b, edge)
+      tx.claimAssignment(
+        {kind: element.kind, seq: element.row.id},
+        `structural_relation.${field}.${endpointKey(endpointFromJson(value))}`,
+        options(b, edge.options),
+      )
       const ordered = orderedField(tx, field)
       // §17.4 forbids conflicting explicit positions *in one mutation plan*,
       // and a plan is free to spread them across clauses — so the claim is
       // tracked on the transaction rather than per clause.
-      if (index !== null && !tx.claimPosition(element.row.id, field, index)) {
+      if (index !== null && !tx.claimPosition(element.row.id, field, index)
+          && (items[index] === undefined || !sameReference(items[index]!, value))) {
         throw positionTaken(field, index)
       }
       // §17.5: on a single-cardinality field, `SET STRUCTURAL` *replaces*.
@@ -328,6 +341,11 @@ export function applyAction(
   for (const removal of action.UnsetStructural) {
     const field = resolveStructural(tx, b, removal)
     const target = referenceValue(mutationValue(b, removal.value, read), field)
+    const canonical = canonicalizeReference(tx, target)
+    tx.claimRemoval(
+      {kind: element.kind, seq: element.row.id},
+      `structural_relation.${field}.${endpointKey(endpointFromJson(canonical))}`,
+    )
     const current = row.structural[field]
     if (Array.isArray(current)) {
       // Ordered fields re-densify: removing the second of three leaves two,

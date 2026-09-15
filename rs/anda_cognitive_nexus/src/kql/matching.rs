@@ -38,15 +38,27 @@ use crate::term::Endpoint;
 /// Named rather than spelled inline because it is a variable name that must not
 /// collide with a caller's: it is stripped from the result before the join, and
 /// a query that happened to use the same spelling would lose its own column.
-const BELIEF_TARGET: &str = "__belief_target";
+const BELIEF_TARGET: &str = "\0belief_target";
 
 /// One matcher entry, once its value has been classified.
 enum Slot {
     /// A concrete value the pattern constrains.
     Value(Json),
-    /// A variable the pattern binds.
-    Bind(String),
+    /// A nested subset pattern or an array with binding sites.
+    Pattern,
 }
+
+/// How a field's JSON representation participates in binding and matching.
+#[derive(Clone, Copy, Default)]
+struct FieldSemantics {
+    is_reference: bool,
+    is_symbol: bool,
+    facet_map: bool,
+}
+
+type EndpointExpansion = (Term, Solutions, Option<String>);
+type EndpointExpansionFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<EndpointExpansion, KipError>> + Send + 'a>>;
 
 /// The columns a matcher key selects on, per element kind.
 ///
@@ -86,6 +98,7 @@ fn column_of(kind: ElementKind, key: &str) -> Option<&'static str> {
 /// `FIND(?a.proposition)` reads the same field the pattern matched on.
 fn view_key(kind: ElementKind, key: &str) -> String {
     match (kind, key) {
+        (_, "state") => "_system.state".to_string(),
         (ElementKind::Concept, "type") => "schema_ref".to_string(),
         (ElementKind::Evidence, "class") => "evidence_class".to_string(),
         (ElementKind::Activity, "class") => "activity_class".to_string(),
@@ -121,7 +134,111 @@ fn is_symbol_key(kind: ElementKind, key: &str) -> bool {
 }
 
 impl Context<'_> {
-    /// Matches a typed element pattern: `?c CONCEPT {...}` and its siblings.
+    /// Resolve command-determined pattern errors even when no row reaches it.
+    pub(super) fn validate_pattern(
+        &mut self,
+        clause: &anda_kip::WhereClause,
+    ) -> Result<(), KipError> {
+        use anda_kip::WhereClause;
+        match clause {
+            WhereClause::Concept { matcher, .. }
+            | WhereClause::Assertion { matcher, .. }
+            | WhereClause::Evidence { matcher, .. }
+            | WhereClause::Activity { matcher, .. } => {
+                let kind = match clause {
+                    WhereClause::Concept { .. } => ElementKind::Concept,
+                    WhereClause::Assertion { .. } => ElementKind::Assertion,
+                    WhereClause::Evidence { .. } => ElementKind::Evidence,
+                    _ => ElementKind::Activity,
+                };
+                for (key, value) in matcher {
+                    if let Slot::Value(value) = self.classify(value)? {
+                        if key == "id" {
+                            let text = value.as_str().ok_or_else(|| {
+                                KipError::type_mismatch("id must be an element id string")
+                            })?;
+                            ElementId::parse_kind(text, kind)?;
+                        } else if is_symbol_key(kind, key) || column_of(kind, key).is_some() {
+                            self.matcher_text(kind, key, &value)?;
+                        }
+                    }
+                }
+            }
+            WhereClause::Proposition { variable, matcher } => {
+                self.validate_proposition(variable.as_deref(), matcher)?
+            }
+            WhereClause::Belief { target, .. } => match target {
+                anda_kip::BeliefTarget::Id(id) => {
+                    self.scalar_element(id, ElementKind::Proposition)?;
+                }
+                anda_kip::BeliefTarget::Tuple(triple) => {
+                    self.validate_proposition(None, &PropositionMatcher::Tuple(triple.clone()))?
+                }
+                _ => {}
+            },
+            WhereClause::BeliefSlot {
+                subject, predicate, ..
+            } => {
+                self.endpoint_slot(subject)?;
+                self.predicate_atom(predicate)?;
+            }
+            WhereClause::Structural {
+                subject,
+                field,
+                object,
+                ..
+            } => {
+                self.validate_endpoint(subject)?;
+                self.validate_endpoint(object)?;
+                let name = match field {
+                    AstSymbolRef::Name(name) => name.clone(),
+                    AstSymbolRef::Param(name) => self
+                        .param_ref(name)?
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            KipError::type_mismatch("a structural field must be a symbol string")
+                        })?,
+                };
+                if core_structural_field(&name).is_none() {
+                    self.env
+                        .resolve_symbol(SymbolKind::StructuralField, &name, Intent::Read)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_proposition(
+        &mut self,
+        variable: Option<&str>,
+        matcher: &PropositionMatcher,
+    ) -> Result<(), KipError> {
+        match matcher {
+            PropositionMatcher::Id(id) => {
+                self.scalar_element(id, ElementKind::Proposition)?;
+            }
+            PropositionMatcher::Tuple(triple) => {
+                self.validate_endpoint(&triple.subject)?;
+                self.validate_endpoint(&triple.object)?;
+                if self.traversal_of(&triple.predicate)?.is_some() {
+                    if variable.is_some() {
+                        return Err(KipError::invalid_syntax(
+                            "a raw path cannot bind a Proposition variable",
+                        ));
+                    }
+                } else {
+                    self.predicate_slot(&triple.predicate)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Match every supplied field against the same authorized element view.
+    /// Index predicates narrow candidates; the complete matcher is still
+    /// checked when an explicit id bypasses those indexes.
     pub async fn match_element(
         &mut self,
         kind: ElementKind,
@@ -129,71 +246,39 @@ impl Context<'_> {
         matcher: &ObjectMatcher,
     ) -> Result<Solutions, KipError> {
         let mut filters = vec![eq_field("space", Fv::Text(self.space.clone()))];
-        let mut post: Vec<(String, Slot)> = Vec::new();
-        let mut constrains_state = false;
-        let mut by_id: Option<ElementId> = None;
-
-        // §20.14, §43.1: `type:` names a lineage, and a Concept written under
-        // any readable version of it is a match. The index is ranged over the
-        // package and the symbol checked afterwards.
-        let mut type_lineages: Vec<String> = Vec::new();
-
+        let mut by_id = None;
+        let mut type_lineages = Vec::new();
         let historical = self.is_historical();
         for (key, value) in matcher {
-            let slot = self.classify(value)?;
-            if key == "state" {
-                constrains_state = true;
-            }
-            if is_symbol_key(kind, key)
-                && let Slot::Value(value) = &slot
-            {
-                let symbol = self.matcher_text(kind, key, value)?;
+            let Slot::Value(value) = self.classify(value)? else {
+                continue;
+            };
+            if is_symbol_key(kind, key) {
+                let symbol = self.matcher_text(kind, key, &value)?;
                 if !historical && let Some((low, high)) = crate::schema::lineage_range(&symbol) {
                     filters.push(Filter::Field((
-                        "schema_ref".to_string(),
+                        "schema_ref".into(),
                         RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
                     )));
                 }
                 type_lineages.push(symbol);
-                continue;
-            }
-            // At a past coordinate the indexes describe the present, so every
-            // constraint is decided against the historical element instead —
-            // after the same normalization the index path applies, or a local
-            // type name would be compared against the exact symbol it
-            // resolves to and never match.
-            if historical && !matches!(column_of(kind, key), Some("__id")) {
-                let slot = match slot {
-                    Slot::Value(value) => {
-                        Slot::Value(Json::String(self.matcher_text(kind, key, &value)?))
-                    }
-                    bind => bind,
-                };
-                post.push((key.clone(), slot));
-                continue;
-            }
-            match (&slot, column_of(kind, key)) {
-                (Slot::Value(value), Some("__id")) => {
-                    let Json::String(text) = value else {
-                        return Err(KipError::type_mismatch("`id` must be an element id string"));
-                    };
-                    by_id = Some(ElementId::parse_kind(text, kind)?);
-                }
-                (Slot::Value(value), Some(column)) => {
-                    let text = self.matcher_text(kind, key, value)?;
-                    filters.push(eq_field(column, Fv::Text(text)));
-                }
-                _ => post.push((key.clone(), slot)),
+            } else if key == "id" {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| KipError::type_mismatch("id must be an element id string"))?;
+                by_id = Some(ElementId::parse_kind(text, kind)?);
+            } else if !historical && let Some(column) = column_of(kind, key) {
+                filters.push(eq_field(
+                    column,
+                    Fv::Text(self.matcher_text(kind, key, &value)?),
+                ));
             }
         }
+        let constrains_state = matcher.contains_key("state");
         if !constrains_state {
-            filters.push(eq_field("state", Fv::Text("active".to_string())));
+            filters.push(eq_field("state", Fv::Text("active".into())));
         }
-
-        let ids: Vec<ElementId> = match by_id {
-            // Naming an id is the narrowest possible pattern, so it skips the
-            // index entirely — but the remaining constraints still apply, or
-            // `{id: "C-1", state: "archived"}` would match an active element.
+        let ids = match by_id {
             Some(id) => vec![id],
             None => {
                 self.candidates(
@@ -204,64 +289,169 @@ impl Context<'_> {
             }
         };
         self.charge(ids.len())?;
-
         let mut vars = vec![variable.to_string()];
-        for (_, slot) in &post {
-            if let Slot::Bind(name) = slot
-                && !vars.contains(name)
-            {
-                vars.push(name.clone());
-            }
-        }
-
+        collect_matcher_vars(matcher, &mut vars);
         let mut rows = Vec::new();
         'candidates: for id in ids {
             let Some(element) = self.load(id).await? else {
                 continue;
             };
-            if by_id.is_some() || historical {
-                // The id path bypassed the filters, so re-check the ones that
-                // would have been applied.
-                if element.space() != self.space {
-                    continue;
-                }
-                if !constrains_state && !element.is_active() {
-                    continue;
-                }
+            if element.space() != self.space || (!constrains_state && !element.is_active()) {
+                continue;
             }
-            if !type_lineages.is_empty() {
-                let schema_ref = element.schema_ref();
-                if !type_lineages
-                    .iter()
-                    .all(|symbol| crate::schema::same_lineage(schema_ref, symbol))
-                {
-                    continue;
-                }
+            if !type_lineages
+                .iter()
+                .all(|symbol| crate::schema::same_lineage(element.schema_ref(), symbol))
+            {
+                continue;
             }
-            // The cached view, not a fresh render: `load` redacted it, and a
-            // matcher reading the unredacted row would let a masked field be
-            // probed through which rows come back (§29.2).
             let rendered = self.view_of(id);
-            let mut row = vec![Binding::Element(id)];
-            row.resize(vars.len(), Binding::Null);
-
-            for (key, slot) in &post {
-                let read = read_view(&rendered, &view_key(kind, key));
-                match slot {
-                    Slot::Value(expected) => {
-                        if !matches_value(&read, expected) {
-                            continue 'candidates;
-                        }
-                    }
-                    Slot::Bind(name) => {
-                        let index = vars.iter().position(|v| v == name).expect("declared above");
-                        row[index] = value_binding(read, is_reference_key(kind, key));
-                    }
+            let mut row = vec![Binding::Null; vars.len()];
+            set(&vars, &mut row, variable, Binding::Element(id));
+            for (key, value) in matcher {
+                if is_symbol_key(kind, key) && matches!(self.classify(value)?, Slot::Value(_)) {
+                    continue;
+                }
+                let Some(read) = read_view_ref(&rendered, &view_key(kind, key)) else {
+                    // Absence neither binds a field variable nor satisfies a
+                    // literal-null constraint. OPTIONAL supplies missing rows.
+                    continue 'candidates;
+                };
+                if !self.match_field_value(
+                    value,
+                    read,
+                    FieldSemantics {
+                        is_reference: is_reference_key(kind, key),
+                        is_symbol: is_symbol_key(kind, key),
+                        facet_map: key == "facets",
+                    },
+                    &vars,
+                    &mut row,
+                )? {
+                    continue 'candidates;
                 }
             }
             rows.push(row);
         }
         Ok(Solutions::table(vars, rows))
+    }
+
+    /// Apply a complete matcher to an already authorized view, without the
+    /// ordinary query's implicit active-state restriction (used by UPSERT).
+    pub(crate) fn matches_element_view(
+        &mut self,
+        kind: ElementKind,
+        view: &Json,
+        matcher: &ObjectMatcher,
+    ) -> Result<bool, KipError> {
+        let mut vars = Vec::new();
+        collect_matcher_vars(matcher, &mut vars);
+        let mut row = vec![Binding::Null; vars.len()];
+        for (key, matcher) in matcher {
+            let Some(value) = read_view_ref(view, &view_key(kind, key)) else {
+                return Ok(false);
+            };
+            if is_symbol_key(kind, key)
+                && let Slot::Value(expected) = self.classify(matcher)?
+            {
+                let symbol = self.matcher_text(kind, key, &expected)?;
+                if !value
+                    .as_str()
+                    .is_some_and(|stored| crate::schema::same_lineage(stored, &symbol))
+                {
+                    return Ok(false);
+                }
+            } else if !self.match_field_value(
+                matcher,
+                value,
+                FieldSemantics {
+                    is_reference: is_reference_key(kind, key),
+                    is_symbol: is_symbol_key(kind, key),
+                    facet_map: key == "facets",
+                },
+                &vars,
+                &mut row,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn match_field_value(
+        &mut self,
+        matcher: &MatchValue,
+        value: &Json,
+        semantics: FieldSemantics,
+        vars: &[String],
+        row: &mut [Binding],
+    ) -> Result<bool, KipError> {
+        Ok(match matcher {
+            MatchValue::Variable(name) => {
+                let binding = if semantics.is_symbol
+                    && let Json::String(symbol) = value
+                {
+                    Binding::Symbol(symbol.clone())
+                } else {
+                    value_binding(value.clone(), semantics.is_reference)
+                };
+                set(vars, row, name, binding)
+            }
+            MatchValue::Literal(literal) => matches_value(value, &Json::from(literal.clone())),
+            MatchValue::Param(name) => matches_value(value, &self.param_ref(name)?),
+            MatchValue::Match(fields) => {
+                if !value.is_object() {
+                    return Ok(false);
+                }
+                for (key, matcher) in fields {
+                    let key = if semantics.facet_map {
+                        self.env
+                            .resolve_symbol(SymbolKind::Facet, key, Intent::Read)?
+                            .to_string()
+                    } else {
+                        key.clone()
+                    };
+                    let Some(read) = value.get(&key) else {
+                        return Ok(false);
+                    };
+                    if !self.match_field_value(
+                        matcher,
+                        read,
+                        FieldSemantics::default(),
+                        vars,
+                        row,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            MatchValue::Array(items) => {
+                let Json::Array(values) = value else {
+                    return Ok(false);
+                };
+                if items.len() != values.len() {
+                    return Ok(false);
+                }
+                for (matcher, value) in items.iter().zip(values) {
+                    if !self.match_field_value(
+                        matcher,
+                        value,
+                        FieldSemantics::default(),
+                        vars,
+                        row,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            MatchValue::Proposition(_) => {
+                return Err(KipError::unsupported_capability(
+                    "a nested Proposition in a field matcher must be bound in a separate Proposition pattern",
+                ));
+            }
+        })
     }
 
     /// Matches `?p PROPOSITION (s, p, o)` or `?p PROPOSITION "P-1"`.
@@ -288,7 +478,83 @@ impl Context<'_> {
         }
     }
 
+    fn validate_endpoint(&mut self, term: &Term) -> Result<(), KipError> {
+        match term {
+            Term::Match(matcher) if !identity_matcher(matcher) => {
+                self.validate_pattern(&anda_kip::WhereClause::Concept {
+                    variable: String::new(),
+                    matcher: matcher.clone(),
+                })
+            }
+            Term::Proposition(matcher) => self.validate_proposition(None, matcher),
+            _ => {
+                self.endpoint_slot(term)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn expand_endpoint<'s>(
+        &'s mut self,
+        term: &'s Term,
+        known: &'s Solutions,
+    ) -> EndpointExpansionFuture<'s> {
+        Box::pin(async move {
+            let is_pattern = matches!(term, Term::Proposition(_))
+                || matches!(term, Term::Match(matcher) if !identity_matcher(matcher));
+            if !is_pattern {
+                return Ok((term.clone(), Solutions::unit(), None));
+            }
+            let variable = format!("\0inline{}", self.next_internal_variable);
+            self.next_internal_variable += 1;
+            let mut table = match term {
+                Term::Match(matcher) => {
+                    self.match_element(ElementKind::Concept, &variable, matcher)
+                        .await?
+                }
+                Term::Proposition(matcher) => {
+                    self.match_proposition(Some(&variable), matcher, known)
+                        .await?
+                }
+                _ => unreachable!(),
+            };
+            let index = table.vars.iter().position(|name| name == &variable);
+            if let Some(index) = index {
+                for row in &mut table.rows {
+                    if let Some(id) = row[index].element() {
+                        row[index] = Binding::Element(self.canonical_of(id).await?);
+                    }
+                }
+            }
+            Ok((Term::Variable(variable.clone()), table, Some(variable)))
+        })
+    }
+
     async fn match_tuple(
+        &mut self,
+        variable: Option<&str>,
+        triple: &PropositionTriple,
+        known: &Solutions,
+    ) -> Result<Solutions, KipError> {
+        let (subject, left, left_var) = self.expand_endpoint(&triple.subject, known).await?;
+        let scope = known.clone().join(left.clone());
+        let (object, right, right_var) = self.expand_endpoint(&triple.object, &scope).await?;
+        let expanded = left.join(right);
+        let scoped = known.clone().join(expanded.clone());
+        let triple = PropositionTriple {
+            subject,
+            predicate: triple.predicate.clone(),
+            object,
+        };
+        let mut result = self
+            .match_tuple_simple(variable, &triple, &scoped)
+            .await?
+            .join(expanded);
+        remove_internal(&mut result, left_var.iter().chain(right_var.iter()));
+        Ok(result)
+    }
+
+    async fn match_tuple_simple(
         &mut self,
         variable: Option<&str>,
         triple: &PropositionTriple,
@@ -367,7 +633,7 @@ impl Context<'_> {
         }
 
         let mut rows = Vec::new();
-        for id in ids {
+        'candidates: for id in ids {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
@@ -384,22 +650,32 @@ impl Context<'_> {
                 continue;
             }
             let mut solution = vec![Binding::Null; vars.len()];
-            if let Some(var) = variable {
-                set(&vars, &mut solution, var, Binding::Element(id));
+            if let Some(var) = variable
+                && !set(&vars, &mut solution, var, Binding::Element(id))
+            {
+                continue 'candidates;
             }
             if let EndpointSlot::Bind(name) = &subject {
-                set(&vars, &mut solution, name, endpoint_binding(&row.subject));
+                let endpoint = self.canonical_endpoint(&row.subject).await?;
+                if !set(&vars, &mut solution, name, endpoint_binding(&endpoint)) {
+                    continue 'candidates;
+                }
             }
             if let EndpointSlot::Bind(name) = &object {
-                set(&vars, &mut solution, name, endpoint_binding(&row.object));
+                let endpoint = self.canonical_endpoint(&row.object).await?;
+                if !set(&vars, &mut solution, name, endpoint_binding(&endpoint)) {
+                    continue 'candidates;
+                }
             }
-            if let PredicateSlot::Bind(name) = &predicates {
-                set(
+            if let PredicateSlot::Bind(name) = &predicates
+                && !set(
                     &vars,
                     &mut solution,
                     name,
                     Binding::Symbol(row.predicate_ref.clone()),
-                );
+                )
+            {
+                continue 'candidates;
             }
             rows.push(solution);
         }
@@ -425,6 +701,23 @@ impl Context<'_> {
     /// pattern reports how records are assembled, and a claim *about* that
     /// relation would be a separate Proposition plus Assertion.
     pub async fn match_structural(
+        &mut self,
+        edge: Option<&str>,
+        subject: &Term,
+        field: &AstSymbolRef,
+        object: &Term,
+    ) -> Result<Solutions, KipError> {
+        let (subject, left, left_var) = self.expand_endpoint(subject, &Solutions::unit()).await?;
+        let (object, right, right_var) = self.expand_endpoint(object, &left).await?;
+        let mut result = self
+            .match_structural_simple(edge, &subject, field, &object)
+            .await?
+            .join(left.join(right));
+        remove_internal(&mut result, left_var.iter().chain(right_var.iter()));
+        Ok(result)
+    }
+
+    async fn match_structural_simple(
         &mut self,
         edge: Option<&str>,
         subject: &Term,
@@ -555,7 +848,7 @@ impl Context<'_> {
                     Some(value @ Json::Object(_)) => vec![value.clone()],
                     _ => continue,
                 };
-                for (position, reference) in refs.iter().enumerate() {
+                'references: for (position, reference) in refs.iter().enumerate() {
                     let bound = endpoint_binding(reference);
                     if let EndpointSlot::Fixed(expected) = &target
                         && endpoint_binding(&expected.to_json()) != bound
@@ -569,23 +862,39 @@ impl Context<'_> {
                         // Cognitive Element" — so it binds as the value it is,
                         // describing the reference rather than standing in for
                         // a record Core does not keep.
-                        set(
+                        let mut value = serde_json::json!({
+                            "source": {"id": id.to_string()},
+                            "field": plane.field.clone(),
+                            "target": reference.clone(),
+                        });
+                        if plane.ordered {
+                            value["index"] = Json::from(position);
+                        }
+                        let identity = super::binding::value_key(&serde_json::json!([
+                            "structural",
+                            value["source"],
+                            crate::schema::lineage_of(&plane.field),
+                            value["target"],
+                            value.get("index")
+                        ]));
+                        if !set(
                             &vars,
                             &mut solution,
                             edge,
-                            Binding::Literal(serde_json::json!({
-                                "source": {"id": id.to_string()},
-                                "field": plane.field.clone(),
-                                "target": reference.clone(),
-                                "index": plane.ordered.then_some(position),
-                            })),
-                        );
+                            Binding::Virtual { identity, value },
+                        ) {
+                            continue 'references;
+                        }
                     }
-                    if let EndpointSlot::Bind(name) = &source {
-                        set(&vars, &mut solution, name, Binding::Element(id));
+                    if let EndpointSlot::Bind(name) = &source
+                        && !set(&vars, &mut solution, name, Binding::Element(id))
+                    {
+                        continue 'references;
                     }
-                    if let EndpointSlot::Bind(name) = &target {
-                        set(&vars, &mut solution, name, bound);
+                    if let EndpointSlot::Bind(name) = &target
+                        && !set(&vars, &mut solution, name, bound)
+                    {
+                        continue 'references;
                     }
                     rows.push(solution);
                 }
@@ -606,26 +915,24 @@ impl Context<'_> {
 
     fn classify(&mut self, value: &MatchValue) -> Result<Slot, KipError> {
         Ok(match value {
-            MatchValue::Variable(name) => Slot::Bind(name.clone()),
+            MatchValue::Variable(_) => Slot::Pattern,
             MatchValue::Param(name) => Slot::Value(self.param_ref(name)?),
             MatchValue::Literal(literal) => Slot::Value(Json::from(literal.clone())),
             MatchValue::Array(items) => {
-                let mut values = Vec::new();
                 for item in items {
-                    match self.classify(item)? {
-                        Slot::Value(value) => values.push(value),
-                        Slot::Bind(_) => {
-                            return Err(KipError::unsupported_capability(
-                                "a variable inside a matcher array is not supported",
-                            ));
-                        }
-                    }
+                    self.classify(item)?;
                 }
-                Slot::Value(Json::Array(values))
+                Slot::Pattern
             }
-            MatchValue::Match(_) | MatchValue::Proposition(_) => {
+            MatchValue::Match(fields) => {
+                for value in fields.values() {
+                    self.classify(value)?;
+                }
+                Slot::Pattern
+            }
+            MatchValue::Proposition(_) => {
                 return Err(KipError::unsupported_capability(
-                    "a nested matcher inside a field matcher is not supported by this engine yet",
+                    "a nested Proposition in a field matcher must be bound in a separate Proposition pattern",
                 ));
             }
         })
@@ -657,6 +964,12 @@ impl Context<'_> {
     /// Proposition, so only a fully grounded tuple can be answered with one
     /// belief about the Proposition that is missing.
     fn tuple_is_grounded(&mut self, triple: &PropositionTriple) -> Result<bool, KipError> {
+        if [&triple.subject, &triple.object].iter().any(|term| {
+            matches!(term, Term::Proposition(_))
+                || matches!(term, Term::Match(matcher) if !identity_matcher(matcher))
+        }) {
+            return Ok(false);
+        }
         let ends = [
             self.endpoint_slot(&triple.subject)?,
             self.endpoint_slot(&triple.object)?,
@@ -726,6 +1039,14 @@ impl Context<'_> {
         let PredTerm::Path(atoms) = predicate else {
             return Ok(None);
         };
+        if atoms
+            .iter()
+            .any(|atom| matches!(atom.predicate, PredAtom::Variable(_)))
+        {
+            return Err(KipError::invalid_syntax(
+                "predicate variables cannot have quantifiers or alternatives",
+            ));
+        }
         if !atoms.iter().any(|atom| {
             atom.hops
                 .is_some_and(|hops| hops.min != 1 || hops.max != Some(1))
@@ -771,6 +1092,18 @@ impl Context<'_> {
         walks: &[Walk],
         known: &Solutions,
     ) -> Result<Solutions, KipError> {
+        let subject = match subject {
+            EndpointSlot::Fixed(endpoint) => EndpointSlot::Fixed(Endpoint::from_json(
+                &self.canonical_endpoint(&endpoint.to_json()).await?,
+            )?),
+            other => other,
+        };
+        let object = match object {
+            EndpointSlot::Fixed(endpoint) => EndpointSlot::Fixed(Endpoint::from_json(
+                &self.canonical_endpoint(&endpoint.to_json()).await?,
+            )?),
+            other => other,
+        };
         let zero_hop = walks.iter().any(|walk| walk.hops.min == 0);
         // Walking backwards from a fixed object costs the same as forwards
         // from a fixed subject, and either beats enumerating every subject in
@@ -779,26 +1112,55 @@ impl Context<'_> {
         let (starts, forward) = match (&subject, &object) {
             (EndpointSlot::Fixed(from), _) => (vec![from.clone()], true),
             (EndpointSlot::Bind(_), EndpointSlot::Fixed(to)) => (vec![to.clone()], false),
-            (EndpointSlot::Bind(name), _) if known.binds(name) => (seeds(known, name), true),
-            (_, EndpointSlot::Bind(name)) if known.binds(name) => (seeds(known, name), false),
+            (EndpointSlot::Bind(name), _)
+                if known.binds(name) && !known.values_of(name).contains(&Binding::Null) =>
+            {
+                (seeds(known, name), true)
+            }
+            (_, EndpointSlot::Bind(name))
+                if known.binds(name) && !known.values_of(name).contains(&Binding::Null) =>
+            {
+                (seeds(known, name), false)
+            }
             _ => {
                 if zero_hop {
-                    // Every element in the Space matches itself at zero hops.
-                    return Err(KipError::resource_exhausted(
-                        "a path whose minimum is 0 hops matches every element against itself; \
-                         bind one endpoint before asking for it",
-                    ));
+                    let mut elements = Vec::new();
+                    for kind in [
+                        ElementKind::Concept,
+                        ElementKind::Proposition,
+                        ElementKind::Assertion,
+                        ElementKind::Evidence,
+                        ElementKind::Activity,
+                    ] {
+                        elements
+                            .extend(self.active_of(kind).await?.into_iter().map(Endpoint::Local));
+                    }
+                    self.charge(elements.len())?;
+                    (elements, true)
+                } else {
+                    let symbols: Vec<String> = walks
+                        .iter()
+                        .flat_map(|walk| walk.symbols.iter().cloned())
+                        .collect();
+                    (self.tuple_subjects(&symbols).await?, true)
                 }
-                let symbols: Vec<String> = walks
-                    .iter()
-                    .flat_map(|walk| walk.symbols.iter().cloned())
-                    .collect();
-                (self.tuple_subjects(&symbols).await?, true)
             }
         };
 
         let mut pairs: Vec<(Endpoint, Endpoint)> = Vec::new();
         for start in starts {
+            if let Endpoint::Local(id) = &start {
+                if self
+                    .load(*id)
+                    .await?
+                    .is_none_or(|element| element.space() != self.space || !element.is_active())
+                {
+                    continue;
+                }
+            } else if forward {
+                continue;
+            }
+            let start = Endpoint::from_json(&self.canonical_endpoint(&start.to_json()).await?)?;
             for walk in walks {
                 let reached = self.walk_from(&start, walk, forward).await?;
                 for endpoint in reached {
@@ -842,13 +1204,17 @@ impl Context<'_> {
         }
 
         let mut rows = Vec::new();
-        for (from, to) in pairs {
+        'pairs: for (from, to) in pairs {
             let mut solution = vec![Binding::Null; vars.len()];
-            if let EndpointSlot::Bind(name) = &subject {
-                set(&vars, &mut solution, name, endpoint_to_binding(&from));
+            if let EndpointSlot::Bind(name) = &subject
+                && !set(&vars, &mut solution, name, endpoint_to_binding(&from))
+            {
+                continue 'pairs;
             }
-            if let EndpointSlot::Bind(name) = &object {
-                set(&vars, &mut solution, name, endpoint_to_binding(&to));
+            if let EndpointSlot::Bind(name) = &object
+                && !set(&vars, &mut solution, name, endpoint_to_binding(&to))
+            {
+                continue 'pairs;
             }
             rows.push(solution);
         }
@@ -867,34 +1233,44 @@ impl Context<'_> {
         forward: bool,
     ) -> Result<Vec<Endpoint>, KipError> {
         let mut reached: Vec<Endpoint> = Vec::new();
-        if walk.hops.min == 0 {
+        if walk.hops.min == 0 && matches!(start, Endpoint::Local(_)) {
             reached.push(start.clone());
         }
-        let mut visited: Vec<Endpoint> = vec![start.clone()];
+        let mut visited = std::collections::HashSet::new();
+        visited.insert((start.key(), 0));
         let mut frontier: Vec<Endpoint> = vec![start.clone()];
-
         let mut depth = 0u32;
         while !frontier.is_empty() {
-            depth += 1;
-            if walk.hops.max.is_some_and(|max| depth > max) {
+            if walk.hops.max.is_some_and(|max| depth >= max) {
                 break;
             }
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| KipError::resource_exhausted("raw path hop limit exceeded"))?;
             let mut next: Vec<Endpoint> = Vec::new();
             for endpoint in &frontier {
-                // A literal has no outgoing tuples: `"+08:00"` is a value, not
-                // a place the walk can continue from.
-                let Endpoint::Local(_) = endpoint else {
+                // Forward traversal ends at a Literal. Reverse traversal may
+                // still follow an edge whose object is that Literal.
+                if forward && !matches!(endpoint, Endpoint::Local(_)) {
                     continue;
-                };
+                }
                 for neighbour in self.neighbours(endpoint, &walk.symbols, forward).await? {
-                    if visited.contains(&neighbour) {
+                    // Bounded paths retain depth, because reaching a node at
+                    // one hop does not answer whether it is reachable at two.
+                    // Unbounded paths need only distinguish depths below min;
+                    // afterwards ordinary reachability makes cycles terminate.
+                    let state_depth = if walk.hops.max.is_some() {
+                        depth
+                    } else {
+                        depth.min(walk.hops.min)
+                    };
+                    if !visited.insert((neighbour.key(), state_depth)) {
                         continue;
                     }
-                    visited.push(neighbour.clone());
-                    next.push(neighbour.clone());
-                    if depth >= walk.hops.min {
-                        reached.push(neighbour);
+                    if depth >= walk.hops.min && !reached.contains(&neighbour) {
+                        reached.push(neighbour.clone());
                     }
+                    next.push(neighbour);
                 }
             }
             self.charge(next.len())?;
@@ -955,7 +1331,8 @@ impl Context<'_> {
             } else {
                 &row.subject
             };
-            if let Ok(endpoint) = Endpoint::from_json(value) {
+            let canonical = self.canonical_endpoint(value).await?;
+            if let Ok(endpoint) = Endpoint::from_json(&canonical) {
                 out.push(endpoint);
             }
         }
@@ -988,7 +1365,8 @@ impl Context<'_> {
             {
                 continue;
             }
-            if let Ok(endpoint) = Endpoint::from_json(&row.subject)
+            let canonical = self.canonical_endpoint(&row.subject).await?;
+            if let Ok(endpoint) = Endpoint::from_json(&canonical)
                 && !subjects.contains(&endpoint)
             {
                 subjects.push(endpoint);
@@ -1181,10 +1559,16 @@ enum PredicateSlot {
     Bind(String),
 }
 
-fn set(vars: &[String], row: &mut [Binding], name: &str, value: Binding) {
-    if let Some(index) = vars.iter().position(|v| v == name) {
-        row[index] = value;
+fn set(vars: &[String], row: &mut [Binding], name: &str, value: Binding) -> bool {
+    let index = vars
+        .iter()
+        .position(|var| var == name)
+        .expect("declared binding");
+    if !matches!(row[index], Binding::Null) && row[index] != value {
+        return false;
     }
+    row[index] = value;
+    true
 }
 
 fn endpoint_of(value: &Json) -> Result<Endpoint, KipError> {
@@ -1211,10 +1595,11 @@ fn endpoint_binding(value: &Json) -> Binding {
 /// anything else is a value. Getting this wrong would make `IS_ELEMENT` lie
 /// about half the graph.
 fn value_binding(value: Json, is_reference: bool) -> Binding {
-    if let Some(id) = value
-        .get("id")
-        .and_then(Json::as_str)
-        .and_then(|text| text.parse::<ElementId>().ok())
+    if is_reference
+        && let Some(id) = value
+            .get("id")
+            .and_then(Json::as_str)
+            .and_then(|text| text.parse::<ElementId>().ok())
     {
         return Binding::Element(id);
     }
@@ -1230,20 +1615,63 @@ fn value_binding(value: Json, is_reference: bool) -> Binding {
     Binding::Literal(value)
 }
 
-fn read_view(view: &Json, path: &str) -> Json {
-    let mut cursor = view;
-    for step in path.split('.') {
-        cursor = match cursor.get(step) {
-            Some(value) => value,
-            None => return Json::Null,
-        };
+fn belief_binding(target: Json, value: Json) -> Binding {
+    let identity =
+        super::binding::value_key(&serde_json::json!(["belief", target, value.get("basis")]));
+    Binding::Virtual { identity, value }
+}
+
+fn identity_matcher(matcher: &ObjectMatcher) -> bool {
+    matcher.len() == 1
+        && ["id", "canonical_id"].iter().any(|key| {
+            matches!(
+                matcher.get(*key),
+                Some(MatchValue::Literal(_) | MatchValue::Param(_))
+            )
+        })
+}
+
+fn collect_matcher_vars(matcher: &ObjectMatcher, vars: &mut Vec<String>) {
+    fn collect(value: &MatchValue, vars: &mut Vec<String>) {
+        match value {
+            MatchValue::Variable(name) => {
+                if !vars.contains(name) {
+                    vars.push(name.clone());
+                }
+            }
+            MatchValue::Match(matcher) => collect_matcher_vars(matcher, vars),
+            MatchValue::Array(items) => {
+                for item in items {
+                    collect(item, vars);
+                }
+            }
+            _ => {}
+        }
     }
-    cursor.clone()
+    for value in matcher.values() {
+        collect(value, vars);
+    }
+}
+
+fn remove_internal<'a>(solutions: &mut Solutions, vars: impl Iterator<Item = &'a String>) {
+    for name in vars {
+        if let Some(index) = solutions.vars.iter().position(|var| var == name) {
+            solutions.vars.remove(index);
+            for row in &mut solutions.rows {
+                row.remove(index);
+            }
+        }
+    }
+}
+
+fn read_view_ref<'a>(view: &'a Json, path: &str) -> Option<&'a Json> {
+    path.split('.')
+        .try_fold(view, |value, step| value.get(step))
 }
 
 /// Whether a read value satisfies a matcher constraint.
 fn matches_value(read: &Json, expected: &Json) -> bool {
-    if read == expected {
+    if super::binding::value_key(read) == super::binding::value_key(expected) {
         return true;
     }
     // A reference compares equal to the id it carries, so `{by: "C-1"}` works
@@ -1314,9 +1742,27 @@ impl Context<'_> {
                 // one answer applies to every row the block already had.
                 if found.is_empty() && self.tuple_is_grounded(triple)? {
                     let belief = self.ungrounded_belief(&policy, &at)?;
+                    let EndpointSlot::Fixed(subject) = self.endpoint_slot(&triple.subject)? else {
+                        unreachable!()
+                    };
+                    let EndpointSlot::Fixed(object) = self.endpoint_slot(&triple.object)? else {
+                        unreachable!()
+                    };
+                    let PredicateSlot::Fixed(predicates) =
+                        self.predicate_slot(&triple.predicate)?
+                    else {
+                        unreachable!()
+                    };
+                    let subject = self.canonical_endpoint(&subject.to_json()).await?;
+                    let object = self.canonical_endpoint(&object.to_json()).await?;
+                    let target = serde_json::json!([
+                        subject,
+                        crate::schema::lineage_of(&predicates[0]),
+                        object
+                    ]);
                     return Ok(Solutions::column(
                         variable,
-                        vec![Binding::Literal(belief.to_json())],
+                        vec![belief_binding(target, belief.to_json())],
                     ));
                 }
                 return self.project_table(variable, found, &policy, &at).await;
@@ -1330,7 +1776,10 @@ impl Context<'_> {
         let mut rows = Vec::with_capacity(propositions.len());
         for id in propositions {
             let belief = self.project_belief(id, &policy, &at).await?;
-            let mut row = vec![Binding::Literal(belief.to_json())];
+            let mut row = vec![belief_binding(
+                Json::String(id.to_string()),
+                belief.to_json(),
+            )];
             if carried.is_some() {
                 row.push(Binding::Element(id));
             }
@@ -1371,7 +1820,10 @@ impl Context<'_> {
                 continue;
             };
             let belief = self.project_belief(id, policy, at).await?;
-            let mut out = vec![Binding::Literal(belief.to_json())];
+            let mut out = vec![belief_binding(
+                Json::String(id.to_string()),
+                belief.to_json(),
+            )];
             for (index, name) in found.vars.iter().enumerate() {
                 if name.as_str() != BELIEF_TARGET {
                     out.push(row.get(index).cloned().unwrap_or(Binding::Null));
@@ -1454,7 +1906,12 @@ impl Context<'_> {
                 .project_slot(&endpoint, &predicate_ref, &policy, &at)
                 .await?;
             let rendered = crate::projection::slot_to_json(&endpoint, &predicate_ref, &slot);
-            let mut row = vec![Binding::Literal(rendered)];
+            let target = serde_json::json!([
+                "slot",
+                endpoint.to_json(),
+                crate::schema::lineage_of(&predicate_ref)
+            ]);
+            let mut row = vec![belief_binding(target, rendered)];
             if let Some(binding) = binding {
                 row.push(binding);
             }

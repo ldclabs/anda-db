@@ -97,9 +97,11 @@ fn find_expression(input: &str) -> VResult<'_, FindExpression> {
 
 /// `order_item = projection_expression [ "ASC" | "DESC" ]`
 fn order_item(input: &str) -> VResult<'_, OrderByItem> {
-    let (input, (variable, aggregation)) = alt((
-        map(aggregate_call, |(func, _, var)| (var, Some(func))),
-        map(dot_path_var, |var| (var, None)),
+    let (input, (variable, aggregation, distinct)) = alt((
+        map(aggregate_call, |(func, distinct, var)| {
+            (var, Some(func), distinct)
+        }),
+        map(dot_path_var, |var| (var, None, false)),
     ))
     .parse(input)?;
     let (input, direction) = opt(ws(alt((
@@ -114,6 +116,7 @@ fn order_item(input: &str) -> VResult<'_, OrderByItem> {
             variable,
             direction: direction.unwrap_or_default(),
             aggregation,
+            distinct,
         },
     ))
 }
@@ -248,5 +251,19 @@ mod tests {
             "#);
         assert_eq!(query.where_clauses.len(), 1);
         assert!(query.limit.is_some());
+    }
+    #[test]
+    fn order_by_preserves_distinct_without_changing_plain_key_json() {
+        let query = kql(
+            "FIND(COUNT(DISTINCT ?x.name)) WHERE { ?x CONCEPT {} } ORDER BY COUNT(DISTINCT ?x.name) DESC, ?x.name",
+        );
+        let order = query.order_by.unwrap();
+        assert!(order[0].distinct);
+        assert!(!order[1].distinct);
+        let json = serde_json::to_value(&order).unwrap();
+        assert_eq!(json[0]["distinct"], true);
+        assert!(json[1].get("distinct").is_none());
+        let roundtrip: Vec<OrderByItem> = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, order);
     }
 }

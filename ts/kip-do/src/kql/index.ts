@@ -12,7 +12,7 @@ import { parseElementId } from '../id.js'
 
 import { detailed, errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
-import type { Json, JsonMap } from '../json.js'
+import { canonicalJson, type Json, type JsonMap } from '../json.js'
 import type {
   AsOf,
   AggregationFunction,
@@ -26,6 +26,7 @@ import type {
 import type { SchemaEnvironment } from '../schema/index.js'
 import type { Store } from '../store/index.js'
 import { Context } from './context.js'
+import { validateQuery } from './validation.js'
 import {
   coordinateFromToken,
   pageCursorFromToken,
@@ -41,7 +42,7 @@ import {
   solveAll,
   type ReadBindings,
 } from './matching.js'
-import { compareSolutions, type Solution } from './solution.js'
+import { bindingKey, compareSolutions, type Solution } from './solution.js'
 import { policyFromSettings } from '../projection/index.js'
 import { boundValue } from '../kml/value.js'
 
@@ -155,6 +156,7 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
     return String(ref.id)
   }))].sort()
 
+  validateQuery(context, query, b)
   const solutions = validAt === null
     ? solveAll(context, query.where_clauses, [new Map()], b)
     : restrictToValidTime(
@@ -237,7 +239,7 @@ function answer<T>(
     snapshotSeq: pinnedSeq,
     validAt,
     nextCursor:
-      query.limit !== null && consumed < paged.total
+      paged.rows.length > 0 && consumed < paged.total
         ? pageToken(cx.space, {
             family: 'kql',
             snapshotSeq: pinnedSeq,
@@ -419,7 +421,7 @@ function aggregate(
     const key = keys.map((path) =>
       readVariable(cx, solution, path.var, path.path),
     )
-    const token = JSON.stringify(key)
+    const token = canonicalJson(key.map((value) => typeof value === 'string' ? value.normalize('NFC') : value))
     const seen = index.get(token)
     if (seen === undefined) {
       const group = { key, rows: [solution] }
@@ -447,34 +449,31 @@ function aggregate(
     const already = plan.some(
       (entry) =>
         entry.func === item.aggregation &&
-        !entry.distinct &&
+        entry.distinct === (item.distinct ?? false) &&
         samePath(entry.var, item.variable),
     )
     if (!already) {
-      plan.push({ func: item.aggregation, var: item.variable, distinct: false })
+      plan.push({ func: item.aggregation, var: item.variable, distinct: item.distinct ?? false })
     }
   }
 
   const resolved = groups.map((group) => ({
     key: group.key,
     aggregates: plan.map(({ func, var: variable, distinct: isDistinct }) => {
-      let read = group.rows.map((solution) =>
-        readVariable(cx, solution, variable.var, variable.path),
-      )
-      if (func !== 'Count') {
-        // Only COUNT is defined over an unbound variable: the others need a
-        // value, and a row that has none contributes nothing rather than zero.
-        read = read.filter((value) => value !== null)
-      }
+      let inputs = group.rows.map((solution) => ({
+        value: readVariable(cx, solution, variable.var, variable.path),
+        binding: variable.path.length === 0 ? solution.get(variable.var) : undefined,
+      })).filter(({ value }) => value !== null)
       if (isDistinct) {
         const seen = new Set<string>()
-        read = read.filter((value) => {
-          const token = JSON.stringify(value)
+        inputs = inputs.filter(({ value, binding }) => {
+          const token = binding === undefined ? canonicalJson(typeof value === 'string' ? value.normalize('NFC') : value) : bindingKey(binding)
           if (seen.has(token)) return false
           seen.add(token)
           return true
         })
       }
+      const read = inputs.map(({ value }) => value)
       return reduce(func, read)
     }),
   }))
@@ -541,7 +540,7 @@ function sortGroups(
               index: plan.findIndex(
                 (entry) =>
                   entry.func === item.aggregation &&
-                  !entry.distinct &&
+                  entry.distinct === (item.distinct ?? false) &&
                   samePath(entry.var, item.variable),
               ),
               isAggregate: true,
@@ -592,17 +591,18 @@ function reduce(func: AggregationFunction, values: readonly Json[]): Json {
       return values.filter((value) => value !== null).length
     case 'Sum':
     case 'Avg': {
-      const numbers = values.filter(
-        (value): value is number => typeof value === 'number',
-      )
-      if (func === 'Sum') return numbers.reduce((a, b) => a + b, 0)
-      return numbers.length === 0
-        ? null
-        : numbers.reduce((a, b) => a + b, 0) / numbers.length
+      if (values.length === 0) return null
+      if (values.some((value) => typeof value !== 'number')) throw errors.typeMismatch(`${func.toUpperCase()} requires numeric inputs`)
+      const sum = (values as number[]).reduce((a, b) => a + b, 0)
+      const result = func === 'Sum' ? sum : sum / values.length
+      if (!Number.isFinite(result) || (Number.isInteger(result) && !Number.isSafeInteger(result))) throw errors.typeMismatch('aggregate result is outside the portable numeric domain')
+      return result
     }
     case 'Min':
     case 'Max': {
       if (values.length === 0) return null
+      const type = typeof values[0]
+      if (!['number', 'string', 'boolean'].includes(type) || values.some((value) => typeof value !== type)) throw errors.typeMismatch(`${func.toUpperCase()} requires mutually comparable scalar inputs`)
       const sorted = [...values].sort(compareValues)
       return (func === 'Min' ? sorted[0] : sorted[sorted.length - 1]) ?? null
     }

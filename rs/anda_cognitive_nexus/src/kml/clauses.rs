@@ -36,7 +36,7 @@ use super::update;
 use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::governance::Permission;
 use crate::id::ElementId;
-use crate::schema::{EndpointFacts, Intent, SymbolKind};
+use crate::schema::{EndpointFacts, Intent, SymbolKind, same_lineage};
 use crate::store::planes::{self, PlaneKey};
 use crate::store::rows::*;
 use crate::store::{Element, Store};
@@ -100,7 +100,8 @@ pub(crate) fn declare_concept_type(
 /// ```text
 /// 0  CREATE CONCEPT       stages typed Concepts other clauses validate against
 /// 1  UPSERT / ENSURE      resolve existing identity, binding their handles late
-/// 2  everything else      sees a complete handle map and every staged type
+/// 2  CREATE records       finalize Evidence, Assertions and Activities
+/// 3  remaining mutations  read frozen block-output views
 /// ```
 ///
 /// `ENSURE` is in pass 1 rather than pass 0 because checking a predicate's
@@ -112,12 +113,15 @@ pub fn plan_pass(clause: &MutationClause) -> u8 {
     match clause {
         MutationClause::CreateConcept(_) => 0,
         MutationClause::UpsertConcept(_) | MutationClause::EnsureProposition(_) => 1,
-        _ => 2,
+        MutationClause::CreateEvidence(_)
+        | MutationClause::CreateAssertion(_)
+        | MutationClause::CreateActivity(_) => 2,
+        _ => 3,
     }
 }
 
 /// How many planning passes [`plan_pass`] distributes clauses over.
-pub const PLAN_PASSES: u8 = 3;
+pub const PLAN_PASSES: u8 = 4;
 
 /// Interprets one clause against a plan with every handle already bound.
 pub async fn apply(
@@ -1322,7 +1326,7 @@ async fn upsert_concept(
                 // map the Space by reading the difference (§86.4) — and an
                 // upsert by id may not create, so this still fails loudly.
                 Ok(row) => match &declared_type {
-                    Some(declared) if &row.schema_ref != declared => None,
+                    Some(declared) if !same_lineage(&row.schema_ref, declared) => None,
                     _ => Some(id),
                 },
                 // Only absence is "no match". A poisoned collection or a row
@@ -1338,6 +1342,28 @@ async fn upsert_concept(
             .await?
             .map(|row| ElementId::new(ElementKind::Concept, row._id)),
     };
+
+    if let Some(id) = existing
+        && matcher.keys().any(|key| key != "type" && key != selector.0)
+    {
+        let mut cx = crate::kql::Context::open(
+            store,
+            &tx.cx.space,
+            request,
+            operation,
+            &tx.authority,
+            &tx.auth,
+        )
+        .await?;
+        let loaded = cx.load(id).await?;
+        if loaded.is_none()
+            || !cx.matches_element_view(ElementKind::Concept, &cx.view_of(id), matcher)?
+        {
+            return Err(KipError::not_found_or_not_visible(
+                "no accessible Concept satisfies the complete UPSERT selector",
+            ));
+        }
+    }
 
     let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
     let id = match existing {
@@ -1461,11 +1487,8 @@ async fn apply_concept_assignments(
     // outside UPDATE — but the appliers still take the view, so the same
     // function serves both.
     let view = crate::view::render(tx.load(id).await?);
-    let mut changed = false;
     for action in &actions {
-        changed |= update::apply_action(tx, id, action, &view, request, operation)
-            .await?
-            .changed;
+        update::apply_action(tx, id, action, &view, request, operation).await?;
     }
     // The insert half is a create, and a create leaves a Concept its type
     // accepts or it does not happen (§36) — `CREATE CONCEPT` has always been
@@ -1479,7 +1502,7 @@ async fn apply_concept_assignments(
 
     // A no-effect final state changes nothing: no version bump, no change
     // record, no receipt claiming a transition that did not happen (§32.8).
-    if changed {
+    if crate::view::render(tx.load(id).await?) != view {
         tx.mark_changed(id, ChangeOp::Update);
     }
     Ok(())
@@ -1523,11 +1546,8 @@ async fn update_elements(
         // compound, or the second would silently operate on what the first
         // just wrote for reasons the author cannot see in the text.
         let view = crate::view::render(tx.load(id).await?);
-        let mut changed = false;
         for action in &clause.actions {
-            changed |= update::apply_action(tx, id, action, &view, request, operation)
-                .await?
-                .changed;
+            update::apply_action(tx, id, action, &view, request, operation).await?;
         }
         if update::touches_attributes(&clause.actions) {
             update::check_attributes(tx, id, &view).await?;
@@ -1535,7 +1555,7 @@ async fn update_elements(
         if update::touches_structural(&clause.actions) {
             check_structural(store, tx, id).await?;
         }
-        if changed {
+        if crate::view::render(tx.load(id).await?) != view {
             tx.mark_changed(id, ChangeOp::Update);
         }
     }
@@ -1690,7 +1710,7 @@ async fn move_element(
     mv: &LifecycleMove<'_>,
 ) -> Result<(), KipError> {
     use transition_state as ts;
-    let (kind, current, engine_state) = {
+    let (kind, mut current, mut engine_state) = {
         let element = tx.load(mv.id).await?;
         (
             element.kind(),
@@ -1698,6 +1718,16 @@ async fn move_element(
             element.state().to_string(),
         )
     };
+    // Formation has semantic state active; empty/pending is only the private
+    // shell marker until the first commit. Normalize the validation view,
+    // leaving the stored marker and every committed/Activity state untouched.
+    if kind == ElementKind::Concept
+        && tx.is_new_element(mv.id)
+        && (engine_state.is_empty() || engine_state == state::PENDING)
+    {
+        current = state::ACTIVE.to_string();
+        engine_state = state::ACTIVE.to_string();
+    }
     let fits = match mv.state {
         ts::RETRACTED | ts::SUPERSEDED => kind == ElementKind::Assertion,
         ts::CORRECTED => kind == ElementKind::Evidence,
@@ -2212,25 +2242,9 @@ async fn merge_concept(
         let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
         (source, target, guards)
     };
-    let source = match source {
-        Some(targets) => targets.authorized(tx).await?.into_iter().next(),
-        None => None,
-    };
-    let target = match target {
-        Some(targets) => targets.authorized(tx).await?.into_iter().next(),
-        None => None,
-    };
-    let (Some(source), Some(target)) = (source, target) else {
-        // The guard block matched nothing: no merge, no error.
-        return Ok(());
-    };
+    let source = source.authorized(tx).await?.into_iter().next().unwrap();
+    let target = target.authorized(tx).await?.into_iter().next().unwrap();
 
-    if source == target {
-        return Err(KipError::new(
-            KipErrorCode::IdentityMergeConflict,
-            "a Concept cannot be merged into itself",
-        ));
-    }
     if source.kind != ElementKind::Concept || target.kind != ElementKind::Concept {
         return Err(KipError::structural_reference_invalid(
             "MERGE CONCEPT consolidates Concepts; other element kinds have no merged identity",
@@ -2240,37 +2254,44 @@ async fn merge_concept(
     // moves.
     tx.expect_versions(source, &guards).await?;
 
-    // §11.1: canonical resolution follows `merged_into` to its fixpoint, so a
-    // cycle would make that walk run forever. The check is on the target's
-    // chain, before anything is written.
+    // Identity compatibility is schema-lineage identity, not the display name
+    // or the exact package version. Authorization above also enforces Space.
+    let source_type = match tx.load(source).await? {
+        Element::Concept(row) => row.schema_ref.clone(),
+        _ => unreachable!(),
+    };
+    let target_type = match tx.load(target).await? {
+        Element::Concept(row) => row.schema_ref.clone(),
+        _ => unreachable!(),
+    };
+    if !same_lineage(&source_type, &target_type) {
+        return Err(KipError::new(
+            KipErrorCode::IdentityMergeConflict,
+            "MERGE CONCEPT endpoints have incompatible Concept Type lineages",
+        ));
+    }
+    if source == target {
+        return Ok(());
+    }
     let chain = canonical_chain(tx, target).await?;
     if chain.contains(&source) {
         return Err(KipError::new(
             KipErrorCode::IdentityMergeConflict,
-            format!(
-                "{target} already resolves back to {source}; merging would make canonical \
-                 resolution cycle"
-            ),
+            "MERGE CONCEPT would create an identity cycle",
         ));
     }
-
-    let element = tx.load(source).await?;
-    let Element::Concept(row) = element else {
-        return Err(KipError::structural_reference_invalid(format!(
-            "{source} is not a Concept"
-        )));
-    };
-    if row.merged_into == target.to_string() {
+    let canonical_target = *chain.last().unwrap_or(&target);
+    let source_chain = canonical_chain(tx, source).await?;
+    if source_chain.len() > 1 && source_chain.last() == Some(&canonical_target) {
         return Ok(());
     }
+    let Element::Concept(row) = tx.load(source).await? else {
+        unreachable!()
+    };
     if !row.merged_into.is_empty() {
         return Err(KipError::new(
             KipErrorCode::IdentityMergeConflict,
-            format!(
-                "{source} is already merged into {}; re-pointing it would rewrite an identity \
-                 decision that other writes have since canonicalized through",
-                row.merged_into
-            ),
+            format!("{source} is already merged into an incompatible canonical target"),
         ));
     }
     row.merged_into = target.to_string();
@@ -2291,7 +2312,7 @@ async fn one_operand(
     target: &anda_kip::ElementRef,
     where_clauses: Option<&Vec<anda_kip::WhereClause>>,
     b: &Bindings<'_>,
-) -> Result<Option<Targets>, KipError> {
+) -> Result<Targets, KipError> {
     let targets: Targets = select::targets(
         store,
         tx,
@@ -2306,10 +2327,12 @@ async fn one_operand(
     )
     .await?;
     match targets.len() {
-        0 => Ok(None),
-        1 => Ok(Some(targets)),
+        0 => Err(KipError::not_found_or_not_visible(format!(
+            "the {what} block does not select a visible Concept",
+        ))),
+        1 => Ok(targets),
         n => Err(KipError::new(
-            KipErrorCode::IdentitySelectorRequired,
+            KipErrorCode::IdentityMergeConflict,
             format!("the {what} block binds {n} elements; it must name exactly one"),
         )),
     }

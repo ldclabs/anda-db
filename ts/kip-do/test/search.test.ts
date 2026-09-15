@@ -1,6 +1,8 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
-import { CognitiveNexus } from '../src/nexus.js'
+import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
+import { principalAuth } from '../src/governance/index.js'
+import { parseElementId } from '../src/id.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { segment, segmenterMark } from '../src/tokenizer.js'
 
@@ -30,6 +32,7 @@ interface Answer {
     id: string
     kind: string
     score: number
+    retrieval: {score: number; mode: string}
     snippet: string
     element: Record<string, unknown>
   }[]
@@ -337,7 +340,7 @@ describe('SEARCH', () => {
       // Above every real score, so the filter is doing something rather than
       // being satisfied by everything.
       const none = nexus.describe(
-        'SEARCH CONCEPT "Alice" THRESHOLD 1000',
+        'SEARCH CONCEPT "Alice" THRESHOLD 1',
       ) as unknown as Answer
       expect(none.hits).toHaveLength(0)
       // 100 is the ceiling; asking past it is bounded rather than refused.
@@ -353,10 +356,10 @@ describe('SEARCH', () => {
       // The reference engine reads this slot as a `usize`, so refusing is also
       // what keeps the two engines agreeing on the same text (§102.28).
       expect(() => nexus.describe('SEARCH CONCEPT "Alice" LIMIT -1')).toThrowError(
-        /non-negative integer/,
+        /non-negative (?:safe )?integer/,
       )
       expect(() => nexus.describe('SEARCH CONCEPT "Alice" LIMIT 2.5')).toThrowError(
-        /non-negative integer/,
+        /non-negative (?:safe )?integer/,
       )
       // The bound that is a count still works, and still bounds.
       const one = nexus.describe(
@@ -376,5 +379,77 @@ describe('SEARCH', () => {
       // row is in and this filter cannot drift away from `FIND`'s.
       expect(other.hits[0]?.element.space_id).toBe(nexus.space)
     })
+  })
+  it('normalizes scores, includes threshold equality and rejects invalid modifiers', async () => {
+    await withNexus('score-contract', (nexus) => {
+      nexus.execute(SETUP)
+      const seq = nexus.store.currentSeq(nexus.space)
+      const first = nexus.describe('SEARCH CONCEPT "Alice"') as unknown as Answer
+      const score = first.hits[0]!.retrieval.score
+      expect(score).toBeGreaterThan(0)
+      expect(score).toBeLessThan(1)
+      expect(first.hits[0]!.score).toBe(score)
+      const same = nexus.describe('SEARCH CONCEPT "Alice" THRESHOLD :threshold', {threshold: score}) as unknown as Answer
+      expect(same.hits).toEqual(first.hits)
+      for (const threshold of [-0.1, 1.1, '0.5']) {
+        expect(() => nexus.describe('SEARCH CONCEPT "Alice" THRESHOLD :threshold', {threshold})).toThrow()
+      }
+      expect(() => nexus.describe('SEARCH CONCEPT "Alice" WITH PREDICATE "prefers"')).toThrow()
+      expect(() => nexus.describe('SEARCH PROPOSITION "prefers" WITH TYPE "Person"')).toThrow()
+      expect(nexus.store.currentSeq(nexus.space)).toBe(seq)
+    })
+  })
+
+  it('keeps hidden text out of hit membership and visible ranking statistics', async () => {
+    await withNexus('rank-visibility', (nexus) => {
+      const publicId = nexus.execute('CREATE CONCEPT ?c {TYPE "Person" NAME "Public Note"}').handles.c!
+      const secretId = nexus.execute('CREATE CONCEPT ?c {TYPE "Person" NAME "Secret Note"}').handles.c!
+      const owner = nexus.systemSession()
+      owner.classify(parseElementId(publicId), 'public')
+      owner.classify(parseElementId(secretId), 'secret')
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({principal_id: 'kip:principal:rank-reader'})
+      gov.createGrant({space_id: nexus.space, grantee_principal: 'kip:principal:rank-reader',
+        actions: ['read', 'discover', 'search'], constraints: {max_classification: 'public'}}, SYSTEM_PRINCIPAL)
+      const reader = nexus.session(principalAuth('kip:principal:rank-reader'))
+      const first = reader.describe('SEARCH CONCEPT "Note"') as unknown as Answer
+      expect(first.hits).toHaveLength(1)
+      nexus.execute(`UPDATE "${secretId}" SET FIELDS {name: "Note Note Note Note confidential ranking words"}`)
+      const after = reader.describe('SEARCH CONCEPT "Note"') as unknown as Answer
+      expect(after.hits).toEqual(first.hits)
+    })
+  })
+
+  it('refuses continuation after the search index changes', async () => {
+    await withNexus('stale-search-cursor', (nexus) => {
+      for (let i = 0; i < 3; i++) nexus.execute(`CREATE CONCEPT ?c {TYPE "Person" NAME "Paging ${i}"}`)
+      const first = nexus.describePage('SEARCH CONCEPT "Paging" LIMIT 1')
+      expect(first.nextCursor).not.toBeNull()
+      nexus.execute('CREATE CONCEPT ?c {TYPE "Person" NAME "Paging New"}')
+      expect(() => nexus.describe('SEARCH CONCEPT "Paging" LIMIT 1 CURSOR :cursor', {cursor: first.nextCursor!})).toThrow(/index changed/)
+    })
+  })
+
+})
+
+it('applies search-specific masks and result limits in addition to read grants', async () => {
+  await withNexus('search-own-constraints', (nexus) => {
+    const owner = nexus.systemSession()
+    for (let i = 0; i < 2; i++) {
+      const id = nexus.execute(`CREATE CONCEPT ?c {TYPE "Person" NAME "Visible Note ${i}" SET ATTRIBUTES {display_name:"maskedword"}}`).handles.c!
+      owner.classify(parseElementId(id), 'public')
+    }
+    const principal = 'kip:principal:search-mask-reader'
+    const gov = nexus.store.governance
+    gov.ensurePrincipal({principal_id: principal})
+    gov.createGrant({space_id: nexus.space, grantee_principal: principal,
+      actions: ['read', 'discover'], constraints: {max_classification: 'public'}}, SYSTEM_PRINCIPAL)
+    gov.createGrant({space_id: nexus.space, grantee_principal: principal,
+      actions: ['search'], constraints: {max_classification: 'public', fields: ['name', 'schema_ref'], max_results: 1}}, SYSTEM_PRINCIPAL)
+    const reader = nexus.session(principalAuth(principal))
+    expect((reader.describe('SEARCH CONCEPT "maskedword"') as unknown as Answer).hits).toEqual([])
+    const page = reader.describePage('SEARCH CONCEPT "Note" LIMIT 10')
+    expect((page.result as unknown as Answer).hits).toHaveLength(1)
+    expect(page.nextCursor).not.toBeNull()
   })
 })

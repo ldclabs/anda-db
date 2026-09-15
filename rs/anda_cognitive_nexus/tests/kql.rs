@@ -545,10 +545,7 @@ async fn an_aggregate_groups_by_the_projected_expressions() {
 #[tokio::test]
 async fn ordering_by_an_aggregate_orders_the_groups_it_counts() {
     let nexus = seeded("unit").await;
-    // `ORDER BY COUNT(?a)` is a grouped sort over an aggregate the caller did
-    // not project. The failure mode it replaced is the dangerous one: the
-    // aggregation dropped and the rows sorted by the bare variable, which is a
-    // plausible-looking answer to a question nobody asked.
+    // ORDER BY counts the same groups as the projected aggregate.
     let ordered = ok(
         &nexus,
         r#"FIND(?c.name, COUNT(?a))
@@ -569,8 +566,8 @@ async fn ordering_by_an_aggregate_orders_the_groups_it_counts() {
     descending.sort_unstable_by(|a, b| b.cmp(a));
     assert_eq!(counts, descending);
 
-    // And the aggregate does not have to be projected to be sorted by.
-    let names = ok(
+    // The portable aggregate sort expression must also appear in FIND.
+    let names = run(
         &nexus,
         r#"FIND(?c.name)
            WHERE {
@@ -580,7 +577,10 @@ async fn ordering_by_an_aggregate_orders_the_groups_it_counts() {
            ORDER BY COUNT(?a) DESC"#,
     )
     .await;
-    assert!(names.as_array().is_some_and(|rows| !rows.is_empty()));
+    assert_eq!(
+        names.error.expect("invalid aggregate sort").code,
+        "InvalidSyntax"
+    );
 }
 
 #[tokio::test]
@@ -601,7 +601,7 @@ async fn a_sort_key_that_varies_inside_a_group_is_refused() {
     .await;
     assert_eq!(response.status, TopLevelStatus::Failed);
     let error = response.error.expect("a refusal carries an error");
-    assert_eq!(error.code, "ConstraintViolation");
+    assert_eq!(error.code, "InvalidSyntax");
 }
 
 #[tokio::test]
@@ -647,4 +647,455 @@ async fn a_cursor_continues_only_the_traversal_that_issued_it() {
         Some("CursorMismatch"),
         "{elsewhere:?}"
     );
+}
+
+#[tokio::test]
+async fn nested_blocks_correlate_filters_and_preserve_outer_bindings() {
+    let nexus = seeded("nested_scope").await;
+    let optional = ok(
+        &nexus,
+        r#"FIND(?p.name, ?o.name) WHERE {
+        ?p CONCEPT {type: "Person"}
+        OPTIONAL { FILTER(?p.name == "Alice") ?o CONCEPT {name: "Dark mode"} }
+    } ORDER BY ?p.name"#,
+    )
+    .await;
+    assert_eq!(optional, json!([["Alice", "Dark mode"], ["Bob", null]]));
+    let negated = ok(
+        &nexus,
+        r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {type: "Person"} NOT { FILTER(?p.name == "Alice") }
+    }"#,
+    )
+    .await;
+    assert_eq!(negated, json!(["Bob"]));
+    let independent_nested = ok(
+        &nexus,
+        r#"FIND(?p.name, ?x.name) WHERE {
+        ?p CONCEPT {type: "Person"}
+        OPTIONAL {
+            ?x CONCEPT {name: "absent"}
+            UNION { ?p CONCEPT {name: "Alice"} ?x CONCEPT {name: "Dark mode"} }
+        }
+    } ORDER BY ?p.name"#,
+    )
+    .await;
+    assert_eq!(
+        independent_nested,
+        json!([["Alice", "Dark mode"], ["Bob", null]])
+    );
+    let nested_not = ok(
+        &nexus,
+        r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {type: "Person"}
+        NOT { ?x CONCEPT {name: "absent"} UNION { ?p CONCEPT {name: "Alice"} } }
+    }"#,
+    )
+    .await;
+    assert_eq!(nested_not, json!(["Bob"]));
+}
+
+#[tokio::test]
+async fn optional_failure_does_not_leak_partial_bindings_and_can_rebind() {
+    let nexus = seeded("optional_bindings").await;
+    let result = ok(
+        &nexus,
+        r#"FIND(?p.name, ?o.name) WHERE {
+        ?p CONCEPT {name: "Alice"}
+        OPTIONAL { ?o CONCEPT {name: "Dark mode"} FILTER(?o.name == "missing") }
+        ?o CONCEPT {name: "Light mode"}
+    }"#,
+    )
+    .await;
+    assert_eq!(result, json!([["Alice", "Light mode"]]));
+    let result = ok(
+        &nexus,
+        r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {name: "Alice"}
+        OPTIONAL { ?o CONCEPT {name: "missing"} }
+        FILTER(?o.name == "anything")
+    }"#,
+    )
+    .await;
+    assert_eq!(result, json!([]));
+}
+
+#[tokio::test]
+async fn union_survives_empty_left_and_deduplicates_complete_bindings() {
+    let nexus = seeded("union_sets").await;
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name, ?o.name) WHERE {
+        ?p CONCEPT {name: "missing"} UNION { ?o CONCEPT {name: "Dark mode"} }
+    }"#
+        )
+        .await,
+        json!([[null, "Dark mode"]])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(COUNT(?p)) WHERE {
+        ?p CONCEPT {name: "Alice"} UNION { ?p CONCEPT {name: "Alice"} }
+    }"#
+        )
+        .await,
+        json!([1])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {type: "Person"} ?a ASSERTION {asserted_by: ?p}
+    } ORDER BY ?p.name"#
+        )
+        .await,
+        json!(["Alice", "Bob", "Bob"])
+    );
+}
+
+#[tokio::test]
+async fn expression_variables_obey_not_and_union_scope_boundaries() {
+    let nexus = seeded("static_scope").await;
+    for command in [
+        r#"FIND(?local) WHERE { ?p CONCEPT {name: "Alice"} NOT { ?local CONCEPT {name: "absent"} } }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "Alice"} UNION { FILTER(?p.name == "Alice") } }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "absent"} FILTER(IS_NULL(?unknown)) }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {} OPTIONAL { NOT { ?local CONCEPT {} } } } ORDER BY ?local.name"#,
+    ] {
+        let error = run(&nexus, command).await.error.expect(command);
+        assert_eq!(error.code, "InvalidSyntax", "{command}: {error:?}");
+    }
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?local.name) WHERE {
+        NOT { ?local CONCEPT {name: "absent"} }
+        ?local CONCEPT {name: "Alice"}
+    }"#
+        )
+        .await,
+        json!(["Alice"])
+    );
+}
+
+#[tokio::test]
+async fn null_filters_preserve_unknown_through_negation_and_string_tests() {
+    let nexus = seeded("filter_unknown").await;
+    for condition in [
+        "!(?p.attributes.missing == 3)",
+        "!CONTAINS(?p.attributes.missing, \"x\")",
+        "!STARTS_WITH(?p.attributes.missing, \"\")",
+        "!IN(?p.attributes.missing, [null])",
+        "!(?p.attributes.missing > 3 || ?p.name == \"missing\")",
+    ] {
+        let command =
+            format!("FIND(?p.name) WHERE {{ ?p CONCEPT {{name: \"Alice\"}} FILTER({condition}) }}");
+        assert_eq!(ok(&nexus, &command).await, json!([]), "{condition}");
+    }
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {name: "Alice"}
+        FILTER(?p.name == "Alice" || ?p.attributes.missing == 3)
+    }"#
+        )
+        .await,
+        json!(["Alice"])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name) WHERE {
+        ?p CONCEPT {name: "Alice"}
+        FILTER(!(?p.name == "missing" && ?p.attributes.missing == 3))
+    }"#
+        )
+        .await,
+        json!(["Alice"])
+    );
+}
+
+#[tokio::test]
+async fn static_filter_errors_are_not_hidden_by_absent_rows_or_short_circuit() {
+    let nexus = seeded("filter_static_errors").await;
+    for command in [
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "absent"} FILTER(REGEX(?p.name, "(")) }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "Alice"} FILTER(?p.name == "Alice" || REGEX(?p.name, "(")) }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "absent"} OPTIONAL { FILTER(REGEX(?p.name, "(")) } }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "Alice"} NOT { FILTER(REGEX(?p.name, "(")) } }"#,
+        r#"FIND(?p) WHERE { ?p CONCEPT {name: "absent"} FILTER(IS_NULL(?p, ?p)) }"#,
+    ] {
+        assert_eq!(
+            run(&nexus, command).await.error.expect(command).code,
+            "InvalidSyntax",
+            "{command}"
+        );
+    }
+    let schema_error = run(
+        &nexus,
+        r#"FIND(?p) WHERE {
+        ?p CONCEPT {name: "absent"} OPTIONAL { ?x CONCEPT {type: "NotASchemaType"} }
+    }"#,
+    )
+    .await;
+    assert_eq!(schema_error.status, TopLevelStatus::Failed);
+}
+
+#[tokio::test]
+async fn aggregates_apply_null_empty_and_scalar_type_contracts() {
+    let nexus = seeded("aggregate_contracts").await;
+    assert_eq!(ok(&nexus, r#"FIND(COUNT(?p), SUM(?p.attributes.n), AVG(?p.attributes.n), MIN(?p.name), MAX(?p.name))
+        WHERE { ?p CONCEPT {name: "absent"} }"#).await, json!([[0, null, null, null, null]]));
+    assert_eq!(ok(&nexus, r#"FIND(MIN(?p.name), MAX(?p.name), COUNT(?p.attributes.missing), SUM(?p.attributes.missing))
+        WHERE { ?p CONCEPT {type: "Person"} }"#).await, json!([["Alice", "Bob", 0, null]]));
+    assert_eq!(
+        run(
+            &nexus,
+            r#"FIND(SUM(?p.name)) WHERE { ?p CONCEPT {type: "Person"} }"#
+        )
+        .await
+        .error
+        .unwrap()
+        .code,
+        "TypeMismatch"
+    );
+}
+
+#[tokio::test]
+async fn repeated_variable_positions_are_constraints() {
+    let nexus = seeded("repeated_positions").await;
+    assert_eq!(
+        ok(&nexus, r#"FIND(?p) WHERE { (?p, "prefers", ?p) }"#).await,
+        json!([])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p) WHERE { ?p CONCEPT {type: "Person", name: ?p} }"#
+        )
+        .await,
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn zero_hop_paths_need_visible_elements_but_no_edges() {
+    let nexus = seeded("zero_hop").await;
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name, ?q.name) WHERE {
+        ?p CONCEPT {name: "Dark mode"} (?p, "prefers"{0}, ?q)
+    }"#
+        )
+        .await,
+        json!([["Dark mode", "Dark mode"]])
+    );
+    assert_eq!(ok(&nexus, r#"FIND(?p.name) WHERE { (?p, "prefers"{0}, ?p) ?p CONCEPT {type: "Person"} } ORDER BY ?p.name"#).await, json!(["Alice", "Bob"]));
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p) WHERE { ({id: "C-99999999"}, "prefers"{0}, ?p) }"#
+        )
+        .await,
+        json!([])
+    );
+    assert_eq!(
+        run(
+            &nexus,
+            r#"FIND(?p) WHERE { ?p CONCEPT {name: "absent"} (?p, ?pred{1}, ?o) }"#
+        )
+        .await
+        .error
+        .unwrap()
+        .code,
+        "InvalidSyntax"
+    );
+}
+
+#[tokio::test]
+async fn limit_requires_a_nonnegative_safe_number() {
+    let nexus = seeded("safe_limit").await;
+    for limit in [json!("1"), json!(-1), json!(0.5)] {
+        let command = r#"FIND(?p) WHERE { ?p CONCEPT {} } LIMIT :limit"#;
+        let mut request = Request::single(command);
+        request.parameters = Some(serde_json::from_value(json!({"limit": limit})).unwrap());
+        let response = nexus
+            .execute(
+                anda_kip::parse_kip(command).unwrap(),
+                &request,
+                &request.operations[0],
+            )
+            .await;
+        assert_eq!(response.error.expect("invalid limit").code, "TypeMismatch");
+    }
+    assert_eq!(
+        ok(&nexus, r#"FIND(?p) WHERE { ?p CONCEPT {} } LIMIT 0"#).await,
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn nested_object_patterns_are_subsets_with_compatible_field_bindings() {
+    let nexus = seeded("nested_field_patterns").await;
+    assert_eq!(ok(&nexus, r#"FIND(?p.name, ?version) WHERE {
+        ?p CONCEPT {type: "Person", _system: {version: ?version}, attributes: {display_name: "Alice A"}}
+    }"#).await, json!([["Alice", 1]]));
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name, ?display) WHERE {
+        ?p CONCEPT {type: "Person", attributes: {display_name: ?display}}
+    }"#
+        )
+        .await,
+        json!([["Alice", "Alice A"]])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p) WHERE {
+        ?p CONCEPT {type: "Person", attributes: {missing: null}}
+    }"#
+        )
+        .await,
+        json!([])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p) WHERE {
+        ?p CONCEPT {type: "Person", _system: {version: ?p}}
+    }"#
+        )
+        .await,
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn inline_endpoint_patterns_find_existing_elements_and_export_fields() {
+    let nexus = seeded("inline_endpoints").await;
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?person, ?preference) WHERE {
+        ({type: "Person", name: ?person}, "prefers", {type: "Preference", name: ?preference})
+    } ORDER BY ?person"#
+        )
+        .await,
+        json!([["Alice", "Dark mode"], ["Bob", "Light mode"]])
+    );
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name) WHERE {
+        ({type: "Person", name: "Alice"}, "prefers", ?p)
+    }"#
+        )
+        .await,
+        json!(["Dark mode"])
+    );
+    let alice = ok(
+        &nexus,
+        r#"FIND(?p.id) WHERE { ?p CONCEPT {name: "Alice"} }"#,
+    )
+    .await[0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let query = format!(r#"FIND(?p) WHERE {{ ?p CONCEPT {{id: "{alice}", name: "Bob"}} }}"#);
+    assert_eq!(ok(&nexus, &query).await, json!([]));
+    let query = format!(r#"FIND(?p) WHERE {{ ({{id: "{alice}", name: "Bob"}}, "prefers", ?p) }}"#);
+    assert_eq!(ok(&nexus, &query).await, json!([]));
+    assert_eq!(
+        ok(&nexus, r#"FIND(COUNT(?p)) WHERE { ?p CONCEPT {} }"#).await,
+        json!([4])
+    );
+}
+
+#[tokio::test]
+async fn order_by_distinct_uses_the_distinct_aggregate_identity() {
+    let nexus = seeded("distinct_sort").await;
+    let identities = ok(
+        &nexus,
+        r#"FIND(?a.proposition.id, ?a.asserted_by.id) WHERE { ?a ASSERTION {confidence: 0.9} }"#,
+    )
+    .await;
+    let command = r#"CREATE ASSERTION ?extra { SET FIELDS {
+        proposition: :proposition, asserted_by: :actor, stance: "support", mode: "stated", confidence: 0.7
+    }}"#;
+    let mut request = Request::single(command);
+    request.parameters = Some(
+        serde_json::from_value(json!({"proposition": identities[0][0], "actor": identities[0][1]}))
+            .unwrap(),
+    );
+    let response = nexus
+        .execute(
+            anda_kip::parse_kip(command).unwrap(),
+            &request,
+            &request.operations[0],
+        )
+        .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded, "{response:?}");
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?p.name, COUNT(?a.stance), COUNT(DISTINCT ?a.stance)) WHERE {
+        ?p CONCEPT {type: "Person"} ?a ASSERTION {asserted_by: ?p}
+    } ORDER BY COUNT(DISTINCT ?a.stance) DESC, ?p.name"#
+        )
+        .await,
+        json!([["Bob", 2, 2], ["Alice", 2, 1]])
+    );
+}
+
+#[tokio::test]
+async fn virtual_beliefs_deduplicate_by_target_and_basis() {
+    let nexus = seeded("virtual_identity").await;
+    let ids = ok(&nexus, r#"FIND(?c.name, ?c.id) WHERE { ?c CONCEPT {} }"#).await;
+    let get = |name: &str| {
+        ids.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[0] == name)
+            .unwrap()[1]
+            .clone()
+    };
+    let command = r#"FIND(COUNT(?b), COUNT(DISTINCT ?b)) WHERE {
+        ?b BELIEF (:alice, "prefers", :light)
+        UNION { ?b BELIEF (:bob, "prefers", :dark) }
+        UNION { ?b BELIEF (:alice, "prefers", :light) }
+    }"#;
+    let mut request = Request::single(command);
+    request.parameters = Some(serde_json::from_value(json!({
+        "alice": get("Alice"), "bob": get("Bob"), "dark": get("Dark mode"), "light": get("Light mode")
+    })).unwrap());
+    let response = nexus
+        .execute(
+            anda_kip::parse_kip(command).unwrap(),
+            &request,
+            &request.operations[0],
+        )
+        .await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded, "{response:?}");
+    assert_eq!(response.first_result(), Some(&json!([[2, 2]])));
+}
+
+#[tokio::test]
+async fn known_function_argument_types_are_validated_without_rows() {
+    let nexus = seeded("known_filter_types").await;
+    for expression in ["IN(?p.name, 1)", "IS_KIND(?p, 1)"] {
+        let command =
+            format!(r#"FIND(?p) WHERE {{ ?p CONCEPT {{name: "absent"}} FILTER({expression}) }}"#);
+        let response = run(&nexus, &command).await;
+        assert_eq!(
+            response.error.expect(&command).code,
+            "TypeMismatch",
+            "{expression}"
+        );
+    }
 }

@@ -56,7 +56,7 @@ impl Context<'_> {
                 return false;
             }
             match evaluate(self, &snapshot, row, expression) {
-                Ok(keep) => keep,
+                Ok(keep) => keep == Some(true),
                 Err(err) => {
                     failure = Some(err);
                     false
@@ -75,23 +75,32 @@ fn evaluate(
     solutions: &Solutions,
     row: &[Binding],
     expression: &FilterExpression,
-) -> Result<bool, KipError> {
+) -> Result<Option<bool>, KipError> {
     Ok(match expression {
-        FilterExpression::Not(inner) => !evaluate(cx, solutions, row, inner)?,
+        FilterExpression::Not(inner) => evaluate(cx, solutions, row, inner)?.map(|value| !value),
         FilterExpression::Logical {
             left,
             operator,
             right,
-        } => match operator {
-            // Short-circuiting is not an optimization here: the right branch
-            // may be unevaluable for a row the left branch already decided.
-            LogicalOperator::And => {
-                evaluate(cx, solutions, row, left)? && evaluate(cx, solutions, row, right)?
+        } => {
+            let left = evaluate(cx, solutions, row, left)?;
+            match (operator, left) {
+                (LogicalOperator::And, Some(false)) => Some(false),
+                (LogicalOperator::Or, Some(true)) => Some(true),
+                _ => {
+                    let right = evaluate(cx, solutions, row, right)?;
+                    match (operator, left, right) {
+                        (LogicalOperator::And, _, Some(false)) => Some(false),
+                        (LogicalOperator::Or, _, Some(true)) => Some(true),
+                        (_, Some(left), Some(right)) => Some(match operator {
+                            LogicalOperator::And => left && right,
+                            LogicalOperator::Or => left || right,
+                        }),
+                        _ => None,
+                    }
+                }
             }
-            LogicalOperator::Or => {
-                evaluate(cx, solutions, row, left)? || evaluate(cx, solutions, row, right)?
-            }
-        },
+        }
         FilterExpression::Comparison {
             left,
             operator,
@@ -105,14 +114,26 @@ fn evaluate(
                     "a comparison takes single values, not lists",
                 ));
             };
-            compare(&left, &right, *operator)
+            if is_null(&left) || is_null(&right) {
+                None
+            } else {
+                if [left.to_json(), right.to_json()]
+                    .iter()
+                    .any(|value| value.is_array() || value.is_object())
+                {
+                    return Err(KipError::type_mismatch(
+                        "FILTER comparisons require scalar operands",
+                    ));
+                }
+                Some(compare(&left, &right, *operator))
+            }
         }
         FilterExpression::Function { func, args } => {
             let values: Vec<Value> = args
                 .iter()
                 .map(|arg| operand(cx, solutions, row, arg))
                 .collect::<Result<_, _>>()?;
-            call(*func, &values)?
+            nullable_call(*func, &values)?
         }
     })
 }
@@ -139,7 +160,7 @@ fn operand(
             // A dot path reads either a projection result — which is already
             // a value — or an element's rendered view, which is why the
             // element has to be loaded before a filter can mention it.
-            if let Binding::Literal(value) = &binding {
+            if let Binding::Literal(value) | Binding::Virtual { value, .. } = &binding {
                 return Ok(Value::One(Binding::Literal(crate::view::read_path_in(
                     &cx.env, value, &path.path,
                 ))));
@@ -173,7 +194,12 @@ fn operand(
                         .unwrap_or(Json::Null),
                 ))
             }
-            _ => Value::One(Binding::Null),
+            Value::One(value) if is_null(&value) => Value::One(Binding::Null),
+            _ => {
+                return Err(KipError::type_mismatch(
+                    "unary minus requires a numeric operand",
+                ));
+            }
         },
     })
 }
@@ -214,8 +240,8 @@ fn compare(left: &Binding, right: &Binding, operator: ComparisonOperator) -> boo
     }
     let (a, b) = (left.to_json(), right.to_json());
     match operator {
-        ComparisonOperator::Equal => a == b,
-        ComparisonOperator::NotEqual => a != b,
+        ComparisonOperator::Equal => left == right,
+        ComparisonOperator::NotEqual => left != right,
         _ => {
             let ordering = match (&a, &b) {
                 (Json::Number(x), Json::Number(y)) => x
@@ -240,7 +266,186 @@ fn compare(left: &Binding, right: &Binding, operator: ComparisonOperator) -> boo
     }
 }
 
+fn arity(func: FilterFunction, count: usize) -> Result<(), KipError> {
+    let valid = match func {
+        FilterFunction::IsNull
+        | FilterFunction::IsNotNull
+        | FilterFunction::IsElement
+        | FilterFunction::IsLiteral => count == 1,
+        FilterFunction::LiteralType => count == 1 || count == 2,
+        _ => count == 2,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(KipError::invalid_syntax(format!(
+            "invalid {func:?} argument count: {count}"
+        )))
+    }
+}
+
+fn nullable_call(func: FilterFunction, args: &[Value]) -> Result<Option<bool>, KipError> {
+    arity(func, args.len())?;
+    if matches!(
+        func,
+        FilterFunction::Contains
+            | FilterFunction::StartsWith
+            | FilterFunction::EndsWith
+            | FilterFunction::Regex
+            | FilterFunction::In
+    ) && args
+        .iter()
+        .any(|arg| matches!(arg, Value::One(value) if is_null(value)))
+    {
+        return Ok(None);
+    }
+    let result = call(func, args)?;
+    if func == FilterFunction::In && !result {
+        let unknown_member = match args.get(1) {
+            Some(Value::List(values)) => values.iter().any(is_null),
+            Some(Value::One(Binding::Literal(Json::Array(values)))) => {
+                values.iter().any(Json::is_null)
+            }
+            _ => false,
+        };
+        if unknown_member {
+            return Ok(None);
+        }
+    }
+    Ok(Some(result))
+}
+
+fn compiled_regex(pattern: &str) -> Result<regex::Regex, KipError> {
+    let mut cache = REGEX_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(regex) = cache.get(pattern) {
+        return Ok(regex.clone());
+    }
+    let regex = regex::Regex::new(pattern).map_err(|err| {
+        KipError::invalid_syntax(format!("REGEX pattern {pattern:?} is invalid: {err}"))
+    })?;
+    if cache.len() >= MAX_CACHED_REGEXES {
+        cache.clear();
+    }
+    cache.insert(pattern.to_string(), regex.clone());
+    Ok(regex)
+}
+
+/// Check command/parameter-determined errors before reading any solutions.
+pub fn validate_expression(
+    cx: &Context<'_>,
+    expression: &FilterExpression,
+) -> Result<(), KipError> {
+    fn static_operand(cx: &Context<'_>, arg: &FilterOperand) -> Result<Option<Value>, KipError> {
+        match arg {
+            FilterOperand::Variable(_) => Ok(None),
+            FilterOperand::List(items) => {
+                let mut values = Vec::new();
+                let mut complete = true;
+                for item in items {
+                    match static_operand(cx, item)? {
+                        Some(Value::One(value)) => values.push(value),
+                        Some(Value::List(_)) => {
+                            return Err(KipError::type_mismatch(
+                                "IN requires a flat candidate list",
+                            ));
+                        }
+                        None => complete = false,
+                    }
+                }
+                Ok(complete.then_some(Value::List(values)))
+            }
+            FilterOperand::Negate(inner) => {
+                if static_operand(cx, inner)?.is_none() {
+                    return Ok(None);
+                }
+                operand(cx, &Solutions::unit(), &[], arg).map(Some)
+            }
+            _ => operand(cx, &Solutions::unit(), &[], arg).map(Some),
+        }
+    }
+    match expression {
+        FilterExpression::Not(inner) => validate_expression(cx, inner),
+        FilterExpression::Logical { left, right, .. } => {
+            validate_expression(cx, left)?;
+            validate_expression(cx, right)
+        }
+        FilterExpression::Comparison {
+            left,
+            right,
+            operator,
+        } => {
+            let values = (static_operand(cx, left)?, static_operand(cx, right)?);
+            for value in [&values.0, &values.1].into_iter().flatten() {
+                if matches!(value, Value::List(_))
+                    || matches!(value, Value::One(binding) if binding.to_json().is_array() || binding.to_json().is_object())
+                {
+                    return Err(KipError::type_mismatch(
+                        "FILTER comparisons require scalar operands",
+                    ));
+                }
+            }
+            if let (Some(Value::One(left)), Some(Value::One(right))) = values {
+                compare(&left, &right, *operator);
+            }
+            Ok(())
+        }
+        FilterExpression::Function { func, args } => {
+            arity(*func, args.len())?;
+            let values = args
+                .iter()
+                .map(|arg| static_operand(cx, arg))
+                .collect::<Result<Vec<_>, _>>()?;
+            if matches!(
+                func,
+                FilterFunction::Contains
+                    | FilterFunction::StartsWith
+                    | FilterFunction::EndsWith
+                    | FilterFunction::Regex
+            ) {
+                for value in values.iter().flatten() {
+                    match value {
+                        Value::One(value) if is_null(value) || value.to_json().is_string() => {}
+                        _ => {
+                            return Err(KipError::type_mismatch(
+                                "string tests require string operands",
+                            ));
+                        }
+                    }
+                }
+            }
+            if *func == FilterFunction::In
+                && let Some(Some(Value::One(value))) = values.get(1)
+                && !is_null(value)
+                && !value.to_json().is_array()
+            {
+                return Err(KipError::type_mismatch(
+                    "IN requires a candidate list as its second argument",
+                ));
+            }
+            if matches!(func, FilterFunction::IsKind | FilterFunction::LiteralType)
+                && let Some(Some(value)) = values.get(1)
+                && !matches!(value, Value::One(binding) if binding.to_json().is_string())
+            {
+                return Err(KipError::type_mismatch(format!(
+                    "{func:?} requires a string as its second argument"
+                )));
+            }
+            if *func == FilterFunction::Regex
+                && let Some(Some(Value::One(binding))) = values.get(1)
+                && let Json::String(pattern) = binding.to_json()
+            {
+                compiled_regex(&pattern)?;
+            }
+            if let Some(values) = values.into_iter().collect::<Option<Vec<_>>>() {
+                nullable_call(*func, &values)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
+    arity(func, args.len())?;
     let single = |index: usize| -> Result<&Binding, KipError> {
         match args.get(index) {
             Some(Value::One(binding)) => Ok(binding),
@@ -253,7 +458,11 @@ fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
     let text = |index: usize| -> Result<String, KipError> {
         Ok(match single(index)?.to_json() {
             Json::String(text) => text,
-            other => other.to_string(),
+            other => {
+                return Err(KipError::type_mismatch(format!(
+                    "{func:?} requires a string, got {other}"
+                )));
+            }
         })
     };
 
@@ -271,7 +480,11 @@ fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
         FilterFunction::LiteralType => {
             // Registered as a function rather than an operator, and it answers
             // a question about representation: what datatype family a value is.
-            let expected = text(1).unwrap_or_default();
+            let expected = if args.len() == 2 {
+                text(1)?
+            } else {
+                String::new()
+            };
             let actual = literal_type(single(0)?);
             if expected.is_empty() {
                 !actual.is_empty()
@@ -279,45 +492,27 @@ fn call(func: FilterFunction, args: &[Value]) -> Result<bool, KipError> {
                 actual == expected
             }
         }
-        FilterFunction::Contains => matches!(single(0)?, Binding::Null)
-            .then_some(false)
-            .unwrap_or_else(|| {
-                text(0)
-                    .unwrap_or_default()
-                    .contains(&text(1).unwrap_or_default())
-            }),
+        FilterFunction::Contains => text(0)?.contains(&text(1)?),
         FilterFunction::StartsWith => text(0)?.starts_with(&text(1)?),
         FilterFunction::EndsWith => text(0)?.ends_with(&text(1)?),
-        FilterFunction::Regex => {
-            // Compiled once per distinct pattern rather than once per row: the
-            // pattern is almost always a literal, and compiling it is more
-            // expensive than the match it enables.
-            let pattern = text(1)?;
-            let subject = text(0)?;
-            let mut cache = REGEX_CACHE.lock().unwrap_or_else(|err| err.into_inner());
-            let regex = match cache.get(&pattern) {
-                Some(regex) => regex.clone(),
-                None => {
-                    let regex = regex::Regex::new(&pattern).map_err(|err| {
-                        KipError::invalid_syntax(format!(
-                            "REGEX pattern {pattern:?} is invalid: {err}"
-                        ))
-                    })?;
-                    if cache.len() >= MAX_CACHED_REGEXES {
-                        cache.clear();
-                    }
-                    cache.insert(pattern, regex.clone());
-                    regex
-                }
-            };
-            regex.is_match(&subject)
-        }
+        FilterFunction::Regex => compiled_regex(&text(1)?)?.is_match(&text(0)?),
         FilterFunction::In => {
-            let needle = single(0)?.to_json();
+            let needle = single(0)?;
+            if is_null(needle) {
+                return Ok(false);
+            }
             match args.get(1) {
-                Some(Value::List(items)) => items.iter().any(|item| item.to_json() == needle),
-                Some(Value::One(item)) => item.to_json() == needle,
-                None => false,
+                Some(Value::List(items)) => {
+                    items.iter().any(|item| !is_null(item) && item == needle)
+                }
+                Some(Value::One(Binding::Literal(Json::Array(items)))) => items
+                    .iter()
+                    .any(|item| !item.is_null() && Binding::Literal(item.clone()) == *needle),
+                _ => {
+                    return Err(KipError::type_mismatch(
+                        "IN requires a candidate list as its second argument",
+                    ));
+                }
             }
         }
     })

@@ -21,8 +21,8 @@
  *   §52.5 makes that the engine's check (`InvalidLifecycleTransition`); only
  *   the state *vocabulary* is fixed by the language, and only that is checked
  *   here;
- * - it caps `THRESHOLD` at 1, but §66.5 has an engine *declare* its score
- *   semantics rather than adopt one, and §27.3 lists `log_odds` among them;
+ * - SEARCH threshold validation runs at the engine boundary, after parameter
+ *   binding; §66.4 requires both literal and bound thresholds in `[0,1]`;
  * - it enforces the Cognitive Memory Profile's `[0,1]` signals, which belong
  *   to a *package* rather than to the protocol. A Space running a different
  *   Profile may mean something else by `salience`, and only the active Schema

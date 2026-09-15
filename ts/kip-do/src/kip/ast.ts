@@ -41,12 +41,10 @@ export type {
   MatchValue,
   PropositionMatcher,
   // KQL
-  KqlQuery,
   FindClause,
   FindExpression,
   AggregationFunction,
   AsOf,
-  OrderByItem,
   OrderDirection,
   ExecWhereClause as WhereClause,
   BeliefTarget,
@@ -113,3 +111,9 @@ export type PropositionTriple = Extract<
   PropositionMatcher,
   { Tuple: unknown }
 >['Tuple']
+
+/** Preserve DISTINCT sort operands until kip-lang's executable AST carries it. */
+export type OrderByItem = import('@ldclabs/kip-lang').OrderByItem & { distinct?: boolean }
+export type KqlQuery = Omit<import('@ldclabs/kip-lang').KqlQuery, 'order_by'> & {
+  order_by: OrderByItem[] | null
+}

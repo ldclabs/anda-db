@@ -214,6 +214,9 @@ async fn plan(
     // Clause order carries no mutation semantics (§24), so this is a planning
     // order rather than an execution order. See `clauses::plan_pass`.
     for pass in 0..clauses::PLAN_PASSES {
+        if pass == 3 {
+            tx.freeze_handle_views();
+        }
         for clause in &statement.clauses {
             if clauses::plan_pass(clause) != pass {
                 continue;

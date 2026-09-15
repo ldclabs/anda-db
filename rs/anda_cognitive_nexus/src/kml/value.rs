@@ -46,7 +46,7 @@ impl Bindings<'_> {
             .or_else(|| self.request.and_then(|map| map.get(name)))
             .cloned()
             .ok_or_else(|| {
-                KipError::invalid_request_envelope(format!(
+                KipError::reference_error(format!(
                     "the command uses the parameter :{name}, which the request does not bind"
                 ))
             })
@@ -292,45 +292,65 @@ fn endpoint_from_json(value: &Json) -> Result<Endpoint, KipError> {
 }
 
 fn apply_function(func: UpdateFunction, args: &[Json]) -> Result<Json, KipError> {
-    let number = |value: &Json, position: usize| -> Result<f64, KipError> {
-        value.as_f64().ok_or_else(|| {
-            KipError::type_mismatch(format!(
-                "{func:?} takes numbers; argument {} is {value}",
-                position + 1
-            ))
-        })
+    // Validate even a COALESCE fallback that this target does not use.
+    for value in args {
+        if let Some(number) = value.as_f64() {
+            finite(number)?;
+        }
+    }
+    if func == UpdateFunction::Coalesce {
+        return Ok(if args[0].is_null() {
+            args[1].clone()
+        } else {
+            args[0].clone()
+        });
+    }
+    if func == UpdateFunction::Clamp
+        && let (Some(low), Some(high)) = (args[1].as_f64(), args[2].as_f64())
+        && low > high
+    {
+        return Err(KipError::invalid_syntax(
+            "CLAMP lower bound exceeds upper bound",
+        ));
+    }
+    let Some(values) = args.iter().map(Json::as_f64).collect::<Option<Vec<_>>>() else {
+        // Missing/null/non-numeric operands skip the assigned key (§59).
+        return Ok(Json::Null);
     };
-    Ok(match func {
-        UpdateFunction::Coalesce => {
-            // The only function that is not arithmetic: it picks the first
-            // value that exists, which is how a clause supplies a default
-            // without reading the row twice.
-            if args[0].is_null() {
-                args[1].clone()
-            } else {
-                args[0].clone()
+    let value = match func {
+        UpdateFunction::Add => values[0] + values[1],
+        UpdateFunction::Mul => {
+            let result = values[0] * values[1];
+            if result == 0.0 && values[0] != 0.0 && values[1] != 0.0 {
+                return Err(KipError::type_mismatch(
+                    "UPDATE multiplication underflows a nonzero number to zero",
+                ));
             }
+            result
         }
-        UpdateFunction::Add => finite(number(&args[0], 0)? + number(&args[1], 1)?)?,
-        UpdateFunction::Mul => finite(number(&args[0], 0)? * number(&args[1], 1)?)?,
         UpdateFunction::Clamp => {
-            let (value, low, high) = (
-                number(&args[0], 0)?,
-                number(&args[1], 1)?,
-                number(&args[2], 2)?,
-            );
-            if low > high {
-                return Err(KipError::invalid_syntax(format!(
-                    "CLAMP was given the empty range [{low}, {high}]"
-                )));
+            if values[1] > values[2] {
+                return Err(KipError::invalid_syntax(
+                    "CLAMP lower bound exceeds upper bound",
+                ));
             }
-            finite(value.clamp(low, high))?
+            values[0].clamp(values[1], values[2])
         }
-    })
+        UpdateFunction::Coalesce => unreachable!(),
+    };
+    finite(value)
 }
 
-/// Rejects a result that is not a valid Core JSON number (Spec §9.4).
+/// Rejects non-finite and unsafe integral results (Spec §9.3).
 fn finite(value: f64) -> Result<Json, KipError> {
+    if !value.is_finite() || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0) {
+        return Err(KipError::type_mismatch(
+            "UPDATE result must be finite and use safe integral values",
+        ));
+    }
+    if value.fract() == 0.0 {
+        return Ok(Json::Number(Number::from(value as i64)));
+    }
     Number::from_f64(value)
         .map(Json::Number)
         .ok_or_else(|| KipError::type_mismatch(format!("{value} is not a finite KIP number")))
@@ -344,7 +364,15 @@ pub fn assignments_to_json(
 ) -> Result<Map<String, Json>, KipError> {
     let mut map = Map::new();
     for (name, value) in assignments {
-        map.insert(name.clone(), bindings.value(value, target)?);
+        let resolved = bindings.value(value, target)?;
+        // Literal null remains a real assignment; only expressions skip keys.
+        if matches!(value, MutationValue::Expr(_)) {
+            let Some(number) = resolved.as_f64() else {
+                continue;
+            };
+            finite(number)?;
+        }
+        map.insert(name.clone(), resolved);
     }
     Ok(map)
 }
@@ -386,10 +414,7 @@ mod tests {
         assert_eq!(b.param("only").unwrap(), json!(1));
         // An unbound parameter is an envelope error, not an empty value: a
         // silently-null parameter would write nonsense instead of failing.
-        assert_eq!(
-            b.param("missing").unwrap_err().name(),
-            "InvalidRequestEnvelope"
-        );
+        assert_eq!(b.param("missing").unwrap_err().name(), "ReferenceError");
     }
 
     #[test]

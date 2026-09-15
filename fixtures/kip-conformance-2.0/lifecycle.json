@@ -19,7 +19,7 @@
       "command": "MUTATE {\n  ASSERT ?new (:alice, \"prefers\", :dark) { by: :alice, mode: \"stated\", confidence: 0.4 }\n    SUPERSEDING :old\n}",
       "params": {},
       "expect": {
-        "error": "InvalidRequestEnvelope"
+        "error": "ReferenceError"
       },
       "vectors": [
         "CORE-008",

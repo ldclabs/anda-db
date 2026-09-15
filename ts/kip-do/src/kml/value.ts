@@ -50,7 +50,7 @@ export function bindings(
 export function parameter(b: Bindings, name: string): Json {
   if (Object.hasOwn(b.operation, name)) return b.operation[name] as Json
   if (Object.hasOwn(b.request, name)) return b.request[name] as Json
-  throw errors.invalidRequestEnvelope(
+  throw errors.referenceError(
     `the command reads :${name}, which the request does not bind`,
   )
 }
@@ -161,23 +161,42 @@ function updateExpr(
       ),
     )
   }
-  const args = expr.Function.args.map((arg) => updateExpr(b, arg, read))
-  const numeric = (index: number, fallback = 0): number => {
-    const value = args[index]
-    return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+  const { func, args: inputs } = expr.Function
+  const arity = func === 'Clamp' ? 3 : 2
+  if (!['Add', 'Mul', 'Clamp', 'Coalesce'].includes(func)) {
+    throw errors.invalidSyntax(`unsupported UPDATE function ${func}`)
   }
-  switch (expr.Function.func) {
-    case 'Add':
-      return numeric(0) + numeric(1)
-    case 'Mul':
-      return numeric(0) * numeric(1)
-    case 'Clamp':
-      return Math.min(Math.max(numeric(0), numeric(1)), numeric(2))
-    case 'Coalesce':
-      // The first argument that is actually there. A missing field reads as
-      // null, which is exactly what this exists to replace.
-      return args.find((value) => value !== null && value !== undefined) ?? null
+  if (inputs.length !== arity) {
+    throw errors.invalidSyntax(`${func} takes ${arity} arguments, got ${inputs.length}`)
   }
+  const args = inputs.map((arg) => updateExpr(b, arg, read))
+  // Even an unused COALESCE fallback must contain portable numbers (§9.3).
+  for (const value of args) if (typeof value === 'number') portableNumber(value)
+  if (func === 'Coalesce') return args[0] === null ? args[1]! : args[0]!
+  // Null/non-numeric input skips this expression's assigned key; it is never
+  // coerced to zero and never turns an otherwise valid bulk update into failure.
+  if (func === 'Clamp' && typeof args[1] === 'number' && typeof args[2] === 'number' && args[1] > args[2]) {
+    throw errors.invalidSyntax('CLAMP lower bound exceeds upper bound')
+  }
+  if (args.some((value) => typeof value !== 'number')) return null
+  const [left, right, high] = args as number[]
+  if (func === 'Clamp') {
+    if (right! > high!) throw errors.invalidSyntax('CLAMP lower bound exceeds upper bound')
+    return portableNumber(Math.min(Math.max(left!, right!), high!))
+  }
+  const value = func === 'Add' ? left! + right! : left! * right!
+  if (func === 'Mul' && value === 0 && left !== 0 && right !== 0) {
+    throw errors.typeMismatch('UPDATE multiplication underflows a nonzero number to zero')
+  }
+  return portableNumber(value)
+}
+
+/** Numeric expressions must preserve KIP's portable number domain (§9.3). */
+function portableNumber(value: number): number {
+  if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+    throw errors.typeMismatch('UPDATE result must be finite and use safe integral values')
+  }
+  return value
 }
 
 /**
@@ -215,7 +234,12 @@ export function assignments(
 ): JsonMap {
   const out: JsonMap = {}
   for (const [name, value] of list) {
-    out[name] = mutationValue(b, value, read)
+    const resolved = mutationValue(b, value, read)
+    // A literal null remains a real assignment. Only numeric expressions use
+    // §59's key-skip rule, including a non-numeric COALESCE result.
+    if ('Expr' in value && typeof resolved !== 'number') continue
+    if ('Expr' in value) portableNumber(resolved as number)
+    out[name] = resolved
   }
   return out
 }

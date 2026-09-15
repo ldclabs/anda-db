@@ -5,9 +5,7 @@ This is the complete command-family reference. Business Agents may use the small
 [Recall](./brain/KIPRecall.md), [Formation](./brain/KIPFormation.md) or
 [Maintenance](./brain/KIPMaintenance.md) and load this reference only as needed.
 
-**[English](./KIPSyntax.md) | [中文](./KIPSyntax_CN.md)**
-
-**Scope**: this is the full command-family, LLM-facing reference. It covers every current KQL/KML/META statement family, but it is **not** an exhaustive replacement for the normative [Specification](./KIP-2.0-SPECIFICATION.md), the formal [KQL](./grammar/KIP-2.0-KQL.ebnf) / [KML](./grammar/KIP-2.0-KML.ebnf) / [META](./grammar/KIP-2.0-META.ebnf) grammars, or the complete [request](./schemas/kip-request.schema.json) / [response](./schemas/kip-response.schema.json) wire schemas. If they conflict, the Specification wins.
+**Scope**: this is the full command-family, LLM-facing reference. It covers every current KQL/KML/META statement family, but it is **not** an exhaustive replacement for the normative [Specification](./SPECIFICATION.md), the formal [KQL](./grammar/KIP-2.0-KQL.ebnf) / [KML](./grammar/KIP-2.0-KML.ebnf) / [META](./grammar/KIP-2.0-META.ebnf) grammars, or the complete [request](./schemas/kip-request.schema.json) / [response](./schemas/kip-response.schema.json) wire schemas. If they conflict, the Specification wins.
 
 KIP 2.0 is a cognitive state protocol between an Agent and a persistent **Cognitive Nexus**. You read with **KQL** (`FIND`), change cognition with **KML** (`ASSERT` / `MUTATE` / ...), and ground/introspect with **META** (`DESCRIBE` / `SEARCH` / `VERIFY` / ...). Assignment and envelope values are JSON-compatible; Proposition endpoints are narrower (see §1.6). Keywords are ASCII case-insensitive (canonical UPPERCASE); schema symbols and strings stay case-sensitive.
 
@@ -174,9 +172,15 @@ UNION { ... }                      // alternative branch (independent scope)
 
 Dot paths: `?x.id` `?x.name` `?x.attributes.goal` `?a.lifecycle.status` `?x._system.version` `?x.facets["MnemonicState"].memory_strength` `?x["exact-key"]` `?edge.index`; whole objects too (`?x.attributes`).
 
+**Scope** ([Spec §42.4–§44.5](./SPECIFICATION.md#424-solutions-bindings-and-scope)): ordinary patterns unify existing bindings. `NOT` reads incoming bindings but exports no new variables. `OPTIONAL` reads incoming bindings and exports every compatible match; on a miss it keeps the input once, with new variables unbound and their projected paths null. A filter inside `OPTIONAL` restricts optional matches; the same filter outside can remove the fallback row. Each `UNION` right branch starts independently, even when the preceding result is empty; repeat constraints needed there. Branch-only variables project as null in other rows. Clauses after `UNION` apply to its combined results. These rules nest; no binding escapes an enclosing `NOT`.
+
+Identical complete solutions deduplicate before aggregation/projection/pagination. Different elements with equal projected names remain separate rows; use `COUNT(DISTINCT ?x)` for distinct aggregate inputs. An aggregate-only query has one group even on no matches: COUNT is 0, other aggregates null. With grouping expressions, no matches means no rows. Null comparisons do not pass filters; use `IS_NULL` / `IS_NOT_NULL` explicitly.
+
 Aggregates: `COUNT(?x)` `COUNT(DISTINCT ?x)` `SUM/AVG/MIN/MAX`. `COUNT = 0` never proves falsehood.
 
 Raw paths (traversal only, no belief propagation): `(?x, "is_subclass_of"{0,5}, ?anc)` — quantifiers `{n}` `{m,}` `{m,n}`; alternatives `(?x, "related_to" | "depends_on", ?y)`.
+
+Zero hops include the same visible endpoint without requiring a self-edge. Quantified/alternative paths use exact Predicate symbols or symbol parameters, not predicate variables. `LIMIT` bounds output rows, not traversal work or Projection Evidence.
 
 Cursors are opaque, snapshot-pinned, family-specific; current Governance still applies on continuation.
 

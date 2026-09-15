@@ -225,9 +225,36 @@ Two rules a caller will otherwise get wrong:
 - patterns match `active` elements unless the pattern says otherwise. That is
   what archiving *means*.
 
-Every candidate a pattern loads is charged against one budget
-(`MAX_CANDIDATES`), and exhausting it is an explicit `ResourceExhausted` rather
-than an engine that stops responding.
+`NOT` and `OPTIONAL` evaluate their complete inner blocks for each incoming
+solution. An independent `UNION` branch starts with an empty binding; when it
+is nested, the enclosing operator joins only results compatible with its
+incoming binding. `NOT` locals stay inside their block. Missing optional or
+branch variables can be bound by a later pattern. Complete solutions are
+deduplicated before projection and grouping; repeated projected values can
+remain when their unprojected bindings differ.
+
+Filters use three-valued logic: comparisons and string tests on null produce
+unknown, and negating unknown does not make it true. Function arity, constant
+regular expressions, bound parameters, visible binding sites, and Schema
+symbols are checked even when a branch has no rows. Empty or all-null
+aggregates produce `0` for `COUNT` and null for `SUM`, `AVG`, `MIN`, and `MAX`;
+non-null incompatible inputs fail with `TypeMismatch`. Aggregate sort keys
+must also appear in `FIND`.
+
+`REGEX` uses Rust's `regex` crate syntax: Unicode-aware regular expressions,
+without backreferences or look-around. Compiled expressions use the crate's
+default 10 MiB compiled-size limit and nesting limit of 250; the process caches
+at most 256 distinct patterns. Invalid or oversized expressions fail with
+`InvalidSyntax`.
+
+Raw paths support exact, bounded, and unbounded hop counts. Zero hops include
+the same visible Element at both endpoints without requiring an edge. A path
+can revisit a vertex when its hop count requires it; endpoint solutions are
+deduplicated. Multi-hop and zero-hop paths cannot bind a Proposition variable.
+Every candidate load and expanded path frontier is charged against the shared
+100,000-candidate budget (`MAX_CANDIDATES`). Exhaustion fails explicitly with
+`ResourceExhausted`; `LIMIT` applies after solving and does not truncate a walk.
+Unbound zero-hop queries enumerate visible Elements and consume that budget.
 
 **`Context::load` is the read path's authorization choke point.** Every pattern,
 filter, projection, aggregate, search hit and capsule root reaches an element
@@ -418,6 +445,15 @@ discovers it will read an absent feature as an absent fact.
 
 `PREVIEW KML` runs the real dry-run path rather than a separate simulation, so
 the preview cannot drift from what a commit would do.
+
+Keyword `SEARCH` builds a temporary BM25 corpus from the caller's authorized,
+field-redacted views. Hidden text therefore cannot affect membership or scores.
+The engine converts the non-negative BM25 score `s` to `s / (1 + s)` and applies
+stable identity tie-breakers. It scans the corpus within the shared candidate
+budget before ranking; large Spaces can return `ResourceExhausted` even with a
+small `LIMIT`. Persistent global ranks are not used to answer restricted views.
+A search continuation fails with `CursorExpired` when its index coordinate has
+changed, because historical search remains unsupported.
 
 ---
 

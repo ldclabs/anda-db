@@ -988,15 +988,15 @@ pub(super) fn scalar_usize(
     what: &str,
 ) -> Result<usize, KipError> {
     match scalar_json(cx, scalar)? {
-        Json::Number(n) => n.as_u64().map(|n| n as usize).ok_or_else(|| {
-            KipError::type_mismatch(format!("{what} takes a non-negative integer, got {n}"))
-        }),
-        // A numeric string is accepted because a caller binding a parameter
-        // from JSON may not control its type; anything else is a bound of the
-        // wrong type (`TypeMismatch`, §87.7), never a cursor.
-        Json::String(text) => text.parse().map_err(|_| {
-            KipError::type_mismatch(format!("{what} takes a non-negative integer, got {text:?}"))
-        }),
+        Json::Number(n) => n
+            .as_f64()
+            .filter(|n| {
+                n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0 && n.fract() == 0.0
+            })
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                KipError::type_mismatch(format!("{what} takes a non-negative integer, got {n}"))
+            }),
         other => Err(KipError::type_mismatch(format!(
             "{what} takes a non-negative integer, got {other}"
         ))),
