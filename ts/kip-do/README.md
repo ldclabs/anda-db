@@ -1,7 +1,7 @@
 # @ldclabs/kip-do
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](../../docs/kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+[Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
 
 A [KIP](https://github.com/ldclabs/KIP) Cognitive Nexus running inside a
 SQLite-backed **Cloudflare Durable Object**. One Nexus per Durable Object.
@@ -116,7 +116,7 @@ The oracle currently reports no divergences in either direction across the
 whole corpus. The four it found on the way — the worst of which rounded an
 out-of-range integer instead of refusing it, so a command executed with a
 different number than it said — were fixed upstream in
-`@ldclabs/kip-lang@2.0.1`. The package now tracks the 2.0 draft at 2.2.0.
+`@ldclabs/kip-lang@2.0.1`. The package now depends on `@ldclabs/kip-lang@^2.3.1` for KIP 2.0.
 
 ### The error registry
 

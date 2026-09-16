@@ -1,6 +1,6 @@
 # AndaDB Technical Documentation
 
-Version: 0.7.26
+Version: 0.13.0
 
 ## Overview
 

@@ -3732,6 +3732,15 @@ export const FIXTURES: readonly Fixture[] = [
     ],
     "cases": [
       {
+        "name": "an omitted assertion time defaults to the engine transaction time",
+        "command": "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00Z\") }",
+        "expect": {
+          "result": [
+            1
+          ]
+        }
+      },
+      {
         "name": "a clause that fails undoes the clauses that already ran beside it",
         "command": "MUTATE {\n  CREATE CONCEPT ?ok { TYPE \"Person\" NAME \"Rollback probe\" }\n  CREATE CONCEPT ?bad { TYPE \"Spaceship\" NAME \"Serenity\" }\n}",
         "expect": {
@@ -3983,4 +3992,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 308
+export const CASE_COUNT = 309

@@ -1,7 +1,7 @@
 # anda_kip
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](../../docs/kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+[Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 `anda_kip` is the protocol SDK of the AndaDB workspace: the parser, executable
 AST, runtime envelope, error registry and executor seam for **KIP 2.0**
@@ -95,7 +95,7 @@ assert!(write.is_mutation());
 ## Command-line syntax check
 
 ```bash
-cargo run -p anda_kip --bin kip_cli -- path/to/commands
+cargo run -p anda_kip --bin kip-cli -- path/to/commands
 ```
 
 ## Technical reference

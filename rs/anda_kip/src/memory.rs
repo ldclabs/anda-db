@@ -13,6 +13,8 @@ pub const COGNITIVE_RECORDS_SCHEMA: &str =
 pub const ELEMENT_SCHEMA: &str = include_str!("../schemas/kip-element.schema.json");
 pub const CAPSULE_SCHEMA: &str = include_str!("../schemas/kip-capsule.schema.json");
 pub const SCHEMA_PACKAGE_SCHEMA: &str = include_str!("../schemas/kip-schema-package.schema.json");
+/// The pinned Change Envelope schema, bundled for downstream contract validation.
+pub const CHANGE_ENVELOPE_SCHEMA: &str = include_str!("../schemas/kip-change-envelope.schema.json");
 pub const MEMORY_BUNDLES: &str = include_str!("../profiles/memory-bundles.json");
 pub const MEMORY_AGENT_CARD: &str = include_str!("../brain/MemoryInterface.md");
 pub const KIP_RECALL_CARD: &str = include_str!("../brain/KIPRecall.md");

@@ -143,6 +143,7 @@ lib.rs: use request::*;
 lib.rs: use semantics::*;
 lib.rs: use types::*;
 memory.rs: const CAPSULE_SCHEMA
+memory.rs: const CHANGE_ENVELOPE_SCHEMA
 memory.rs: const COGNITIVE_CONSISTENCY
 memory.rs: const COGNITIVE_RECORDS_SCHEMA
 memory.rs: const ELEMENT_SCHEMA

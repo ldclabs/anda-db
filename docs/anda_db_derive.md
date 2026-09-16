@@ -1,6 +1,6 @@
 # `anda_db_derive` Technical Documentation
 
-**Crate version**: 0.11
+**Crate version**: 0.13
 **Last updated**: 2026-09-06
 
 ---

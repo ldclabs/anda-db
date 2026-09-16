@@ -1,5 +1,7 @@
 # anda_cognitive_nexus_server
 
+The executable is `anda-cognitive-nexus-server`; the Cargo package name remains `anda_cognitive_nexus_server`.
+
 `anda_cognitive_nexus_server` is the HTTP/JSON-RPC deployment layer for the
 Cognitive Nexus. It exposes KIP execution over the network so non-Rust clients,
 agent frameworks, and service integrations can use the reference AI-memory

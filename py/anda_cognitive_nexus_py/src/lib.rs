@@ -997,7 +997,9 @@ mod tests {
             CREATE EVIDENCE ?said {
                 SET FIELDS {
                     evidence_class: "user_statement",
-                    payload: "I prefer dark mode."
+                    payload: "I prefer dark mode.",
+                    observed_at: "2026-09-07T00:00:00Z",
+                    content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"
                 }
             }
             ASSERT ?a (?alice, "prefers", ?dark) {

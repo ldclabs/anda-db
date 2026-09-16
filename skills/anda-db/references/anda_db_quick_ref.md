@@ -8,15 +8,15 @@ examples that used unwrapped object stores, borrowed `Query` values, or direct
 
 ```toml
 [dependencies]
-anda_db = { version = "0.11", features = ["full"] }
+anda_db = { version = "0.13", features = ["full"] }
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Optional direct dependencies for low-level APIs
-anda_db_hnsw = "0.11"
-anda_object_store = "0.11"
+anda_db_hnsw = "0.13"
+anda_object_store = "0.13"
 cbor2 = "1"
 tokio-util = "0.7" # CancellationToken, for AndaDB::auto_flush
 ```

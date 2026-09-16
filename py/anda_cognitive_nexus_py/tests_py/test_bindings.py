@@ -18,4 +18,4 @@ def test_the_bundled_profile_is_available_to_hosts():
 
     profile = json.loads(anda.COGNITIVE_MEMORY_PROFILE)
     assert profile["manifest"]["package_id"] == "kip://profiles/cognitive-memory"
-    assert profile["manifest"]["version"] == "2.0.0"
+    assert profile["manifest"]["version"] == "2.1.0"

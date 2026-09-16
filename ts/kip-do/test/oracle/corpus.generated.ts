@@ -694,6 +694,7 @@ const CORPUS: readonly string[] = [
   "FIND(?x._system.input_versions, ?x._system.output_versions) WHERE { ?x ACTIVITY {} }",
   "FIND(?x.status, ?x.ended_at) WHERE { ?x ACTIVITY {} }",
   "FIND(AVG(?a.confidence)) WHERE { ?a ASSERTION {} }",
+  "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00Z\") }",
   "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} }",
   "FIND(COUNT(?b), COUNT(DISTINCT ?b)) WHERE {\n        ?b BELIEF (:alice, \"prefers\", :light)\n        UNION { ?b BELIEF (:bob, \"prefers\", :dark) }\n        UNION { ?b BELIEF (:alice, \"prefers\", :light) }\n    }",
   "FIND(COUNT(?c)) WHERE {\n  ?c CONCEPT {type: \"Person\"}\n  OPTIONAL { ?p PROPOSITION (?c, \"prefers\", ?o) }\n}",

@@ -20,7 +20,7 @@ members = [
 # builds because it links against a Python interpreter. To build or test it,
 # temporarily uncomment the member above, then:
 #   cargo test -p anda_cognitive_nexus_py --lib
-# The binding is pinned to the pyo3 0.20 line (see `[workspace.dependencies]`),
+# The binding is pinned to the pyo3 0.20 line (see its Cargo.toml),
 # which supports CPython 3.7-3.12. If the `python3` on PATH is newer, point the
 # build at a supported interpreter:
 #   PYO3_PYTHON=python3.12 cargo test -p anda_cognitive_nexus_py --lib
@@ -28,7 +28,6 @@ members = [
 [workspace.package]
 description = "Anda DB is a Rust library designed as a specialized database for AI Agents, focusing on knowledge & memory."
 repository = "https://github.com/ldclabs/anda-db"
-homepage = "https://github.com/ldclabs/anda-db"
 keywords = ["ai-agent", "object_store", "hnsw", "database"]
 categories = [
   "accessibility",
@@ -37,10 +36,9 @@ categories = [
   "text-processing",
 ]
 edition = "2024"
-# let-chains in edition 2024 (`if let ... && ...`) are used across the KIP
-# crates and were stabilized in 1.88. Without this, an older toolchain reports
-# a syntax error instead of a version mismatch.
-rust-version = "1.88"
+# The current dependency set requires Rust 1.95 (croaring 2.7; sqlx 0.9
+# requires 1.94). Keep the declared floor aligned with release builds.
+rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
@@ -70,6 +68,7 @@ chrono = { version = "0.4", default-features = false }
 futures = { version = "0.3", default-features = false, features = [
   "async-await",
 ] }
+jsonschema = { version = "0.49", default-features = false }
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 cbor2 = "1"
@@ -83,6 +82,7 @@ serde = { version = "1", default-features = false, features = [
 ] }
 serde_bytes = "0.11"
 serde_json = { version = "1", default-features = false, features = ["std"] }
+sha2 = "0.11"
 sha3 = "0.12"
 thiserror = { version = "2", default-features = false }
 parking_lot = "0.12"
@@ -113,18 +113,7 @@ regex = { version = "1.11", default-features = false }
 rustc-hash = { version = "2", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1", features = ["v3"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
-
-# Python bindings (used only by `py/anda_cognitive_nexus_py`, which is not a
-# default workspace member). These stay on the pyo3 0.20 line because
-# `pyo3-asyncio` — the async bridge the binding is written against — was never
-# released for pyo3 0.21+; moving off 0.20 means porting to
-# `pyo3-async-runtimes` and the `Bound<'py, T>` API at the same time.
-# pyo3 0.20 supports CPython 3.7–3.12; set `PYO3_PYTHON` when the default
-# `python3` on PATH is newer.
-pyo3 = { version = "0.20" }
-pyo3-asyncio = { version = "0.20", default-features = false }
-pyo3-build-config = { version = "0.20" }
-serde-pyobject = { version = "0.2" }
+unicode-normalization = "0.1"
 
 [workspace.metadata.cargo-shear]
 ignored = []

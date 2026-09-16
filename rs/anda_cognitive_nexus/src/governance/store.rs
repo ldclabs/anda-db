@@ -146,7 +146,7 @@ macro_rules! collections {
                 values.insert("space".into(),crate::store::space::authorization_config(space));
                 use sha2::Digest;
                 let bytes=serde_json::to_vec(&Json::Object(values)).map_err(|e|KipError::internal_error(e.to_string()))?;
-                Ok(format!("sha256:{:x}",sha2::Sha256::digest(bytes)))
+                Ok(format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes))))
             }
 
         }

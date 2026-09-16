@@ -687,7 +687,9 @@ function assertionRow(
     stance: fields.registry('stance', STANCES, 'CREATE ASSERTION'),
     mode: fields.registry('mode', ASSERTION_MODES, 'CREATE ASSERTION'),
     confidence,
-    asserted_at: fields.timestamp('asserted_at'),
+    // ASSERT lowers to CREATE ASSERTION; §55.1 uses transaction time when
+    // `at` is omitted, independently of any simulated evaluation clock.
+    asserted_at: fields.timestamp('asserted_at') || tx.cx.at,
     valid_from: validTimePart(validTime, 'from'),
     valid_until: validTimePart(validTime, 'until'),
     evidence_refs: evidence,

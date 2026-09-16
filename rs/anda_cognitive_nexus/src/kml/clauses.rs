@@ -824,6 +824,9 @@ async fn assertion_row(
             "valid_time requires from < until",
         ));
     }
+    // ASSERT lowers to CREATE ASSERTION; §55.1 defaults its omitted `at`
+    // to the engine transaction time, never a simulated evaluation clock.
+    let asserted_at = fields.timestamp("asserted_at")?;
     let row = AssertionRow {
         _id: id.seq,
         proposition_id: proposition.to_string(),
@@ -832,7 +835,11 @@ async fn assertion_row(
         stance: require_registry(fields, "stance", STANCES, "CREATE ASSERTION")?,
         mode: require_registry(fields, "mode", ASSERTION_MODES, "CREATE ASSERTION")?,
         confidence: read_confidence(fields)?,
-        asserted_at: fields.timestamp("asserted_at")?,
+        asserted_at: if asserted_at.is_empty() {
+            tx.cx.at.clone()
+        } else {
+            asserted_at
+        },
         valid_from: valid_time_part(&valid_time, "from")?,
         valid_until: valid_time_part(&valid_time, "until")?,
         evidence_ids: evidence.iter().filter_map(evidence_id).collect(),

@@ -21,7 +21,7 @@ nom-language = { workspace = true }
 thiserror = { workspace = true }
 
 [[bin]]
-name = "kip_cli"
+name = "kip-cli"
 path = "src/bin/kip_cli.rs"
 
 [dev-dependencies]

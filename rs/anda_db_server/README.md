@@ -1,5 +1,7 @@
 # anda_db_server
 
+The executable is `anda-db-server`; the Cargo package name remains `anda_db_server`.
+
 `anda_db_server` wraps the embedded [`anda_db`](../anda_db) engine behind an
 HTTP service with a **CBOR-first** RPC API. JSON is supported as a secondary
 format for debugging and non-CBOR clients.

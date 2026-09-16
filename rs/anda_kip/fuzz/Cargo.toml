@@ -17,28 +17,28 @@ anda_kip = { path = ".." }
 members = ["."]
 
 [[bin]]
-name = "fuzz_kip"
+name = "fuzz-kip"
 path = "fuzz_targets/fuzz_kip.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_kql"
+name = "fuzz-kql"
 path = "fuzz_targets/fuzz_kql.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_kml"
+name = "fuzz-kml"
 path = "fuzz_targets/fuzz_kml.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_meta"
+name = "fuzz-meta"
 path = "fuzz_targets/fuzz_meta.rs"
 test = false
 doc = false

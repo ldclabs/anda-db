@@ -73,6 +73,10 @@
 //!
 //! See the crate README for parameter shapes and examples.
 
+// The RPC dispatcher nests async handlers, cancellation and timeouts. Allow
+// enough trait-solver depth to verify Send for the composed handler futures.
+#![recursion_limit = "256"]
+
 use axum::{Router, extract::DefaultBodyLimit, middleware, routing};
 
 pub mod api;

@@ -1,25 +1,26 @@
 [package]
 name = "anda_cognitive_nexus_py"
-version = "0.6.0"
+version = "0.13.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 
 [lib]
 name = "anda_cognitive_nexus_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Python Bindings
-pyo3 = { workspace = true, features = ["extension-module", "serde"] }
-pyo3-asyncio = { workspace = true, features = ["tokio-runtime"] }
+# Python bindings are local to this optional crate, not default workspace dependencies.
+# pyo3-asyncio requires PyO3 0.20, which supports CPython through 3.12.
+pyo3 = { version = "0.20", features = ["extension-module", "serde"] }
+pyo3-asyncio = { version = "0.20", default-features = false, features = ["tokio-runtime"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde-pyobject = { workspace = true }
+serde-pyobject = { version = "0.2" }
 
 # Anda
 anda_cognitive_nexus = { version = "0.13", path = "../../rs/anda_cognitive_nexus" }
 anda_kip = { version = "0.13", path = "../../rs/anda_kip" }
-anda_db = { version = "0.11", path = "../../rs/anda_db", features = ["full"] }
-anda_object_store = { version = "0.11", path = "../../rs/anda_object_store" }
+anda_db = { version = "0.13", path = "../../rs/anda_db", features = ["full"] }
+anda_object_store = { version = "0.13", path = "../../rs/anda_object_store" }
 
 # Other Crates
 serde = { workspace = true }
@@ -29,4 +30,4 @@ log = { workspace = true }
 structured-logger = { workspace = true }
 
 [build-dependencies]
-pyo3-build-config = { workspace = true }
+pyo3-build-config = { version = "0.20" }

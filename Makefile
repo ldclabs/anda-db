@@ -1,7 +1,7 @@
 BUILD_ENV := rust
 KIP_FUZZ_RUNS ?= 1000
 KIP_FUZZ_ARGS ?= -runs=$(KIP_FUZZ_RUNS)
-KIP_FUZZ_TARGETS ?= fuzz_kip fuzz_kql fuzz_kml fuzz_meta
+KIP_FUZZ_TARGETS ?= fuzz-kip fuzz-kql fuzz-kml fuzz-meta
 
 .PHONY: build-wasm build-did lint fix test test-all test-full test-ts test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-agents-doc check-agents-doc
 

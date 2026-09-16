@@ -28,7 +28,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_object_store = "0.11"
+anda_object_store = "0.13"
 object_store = { version = "0.14", features = ["fs"] }
 ```
 

@@ -6,7 +6,7 @@
 |                 |                                                                                          |
 | :-------------- | :--------------------------------------------------------------------------------------- |
 | Crate           | [`anda_db_schema`](../rs/anda_db_schema/)                                                |
-| Version         | `0.11.x`                                                                                  |
+| Version         | `0.13.x`                                                                                  |
 | Companion crate | [`anda_db_derive`](../rs/anda_db_derive/) (re-exported as `AndaDBSchema` / `FieldTyped`) |
 
 ---

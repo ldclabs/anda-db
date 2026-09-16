@@ -1,14 +1,16 @@
 [package]
 name = "anda_db_shard_proxy"
-version = "0.11.0"
+version = "0.13.0"
 description = "A reverse proxy service for Anda DB shard routing"
-readme = "README.md"
 publish = false
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "anda-db-shard-proxy"
+path = "src/main.rs"
 
 [dependencies]
 axum = { workspace = true }

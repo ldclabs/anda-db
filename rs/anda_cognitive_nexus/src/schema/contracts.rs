@@ -10,13 +10,13 @@ use std::{
 };
 
 const DOCUMENTS: &[&str] = &[
-    include_str!("../../../anda_kip/schemas/kip-projection.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-cognitive-records.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-element.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-capsule.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-schema-package.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-change-envelope.schema.json"),
-    include_str!("../../../anda_kip/schemas/kip-memory.schema.json"),
+    anda_kip::PROJECTION_SCHEMA,
+    anda_kip::COGNITIVE_RECORDS_SCHEMA,
+    anda_kip::ELEMENT_SCHEMA,
+    anda_kip::CAPSULE_SCHEMA,
+    anda_kip::SCHEMA_PACKAGE_SCHEMA,
+    anda_kip::CHANGE_ENVELOPE_SCHEMA,
+    anda_kip::MEMORY_SCHEMA,
 ];
 
 static CATALOG: LazyLock<BTreeMap<String, Json>> = LazyLock::new(|| {
@@ -45,8 +45,10 @@ impl Retrieve for Locked {
 
 pub fn digest(value: &Json) -> Result<String, KipError> {
     Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest(anda_kip::try_canonical_json(value)?.as_bytes())
+        "sha256:{}",
+        hex::encode(Sha256::digest(
+            anda_kip::try_canonical_json(value)?.as_bytes()
+        ))
     ))
 }
 

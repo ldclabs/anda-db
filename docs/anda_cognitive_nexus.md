@@ -1,7 +1,7 @@
 # `anda_cognitive_nexus` — Technical Reference
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) and the
+[KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI

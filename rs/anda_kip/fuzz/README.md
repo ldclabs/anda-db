@@ -17,11 +17,20 @@ Requires nightly and [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz):
 cargo install cargo-fuzz
 
 cd rs/anda_kip
-# Seed with the shipped knowledge capsules for deep grammar coverage:
-cargo +nightly fuzz run fuzz_kml fuzz/corpus/fuzz_kml capsules
-cargo +nightly fuzz run fuzz_kql
-cargo +nightly fuzz run fuzz_meta
-cargo +nightly fuzz run fuzz_kip
+cargo +nightly fuzz run fuzz-kml
+cargo +nightly fuzz run fuzz-kql
+cargo +nightly fuzz run fuzz-meta
+cargo +nightly fuzz run fuzz-kip
+```
+
+The binary target names use hyphens; the Rust source files keep underscores.
+When upgrading an existing checkout, rename each `fuzz/corpus/fuzz_<language>`
+directory to `fuzz/corpus/fuzz-<language>` to retain its accumulated inputs. If
+both directories already exist, keep both and pass the old corpus as an extra
+input, for example:
+
+```bash
+cargo +nightly fuzz run fuzz-kml fuzz/corpus/fuzz-kml fuzz/corpus/fuzz_kml
 ```
 
 Found crashes are minimized into `fuzz/artifacts/<target>/`; turn every fix

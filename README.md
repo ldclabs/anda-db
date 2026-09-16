@@ -16,6 +16,13 @@ persistence layer, a declarative knowledge protocol called [KIP](https://github.
 reference Cognitive Nexus runtime that turns the database into a persistent
 knowledge graph for AI agents.
 
+## v0.13.0 upgrade
+
+Rust 1.95 or newer is required. This is the breaking KIP 1.x → 2.0 release;
+package versions are aligned at 0.13.0 while the KIP protocol stays at 2.0.
+Read the [release notes](CHANGELOG.md#0130--2026-09-16) and
+[v1 migration guide](docs/kip-v1-migration.md) before upgrading an existing Nexus.
+
 ## What Anda DB Is For
 
 Anda DB is designed for applications that need more than a plain key-value
@@ -139,8 +146,8 @@ Add the core dependencies to your `Cargo.toml`.
 
 ```toml
 [dependencies]
-anda_db = { version = "0.11", features = ["full"] }
-anda_object_store = "0.11"
+anda_db = { version = "0.13", features = ["full"] }
+anda_object_store = "0.13"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

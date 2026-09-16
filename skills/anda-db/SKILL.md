@@ -110,8 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-anda_db = { version = "0.11", features = ["full"] }
-anda_object_store = "0.11"
+anda_db = { version = "0.13", features = ["full"] }
+anda_object_store = "0.13"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -120,7 +120,7 @@ serde = { version = "1", features = ["derive"] }
 Add direct low-level crates only when using their public APIs directly:
 
 ```toml
-anda_db_hnsw = "0.11"       # e.g. DistanceMetric
+anda_db_hnsw = "0.13"       # e.g. DistanceMetric
 cbor2 = "1"               # direct CBOR values, readers, writers, size
 ```
 

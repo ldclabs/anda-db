@@ -22,7 +22,7 @@ fn generation_at(ms: u64, salt: u128) -> String {
     // Unique within a process even after clock rollback or RNG repetition.
     // Across processes the random 128-bit component provides isolation.
     let sequence = SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .expect("generation sequence exhausted");
     format!("{ms:016x}-{salt:032x}-{sequence:016x}")
 }

@@ -62,7 +62,11 @@ cargo test -p anda_cognitive_nexus_py --doc
 
 These instructions will guide you through setting up a local development environment to work on the `anda_cognitive_nexus_py` bindings.
 
-All commands should be run from the **root of the `anda` repository**.
+Start from the **root of the `anda-db` repository**, using Rust 1.95 or newer.
+The binding is excluded from the default Rust workspace: temporarily uncomment
+`"py/anda_cognitive_nexus_py"` in the root `Cargo.toml` members before running
+Maturin or the Rust binding tests. Restore that comment after building; the
+standard workspace and crates.io release do not include the Python extension.
 
 **1. Create Virtual Environment**
 

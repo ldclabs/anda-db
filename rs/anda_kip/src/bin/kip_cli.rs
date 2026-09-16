@@ -9,11 +9,11 @@ use std::{env, fs, path::Path, process};
 use anda_kip::{CommandType, parse_kip};
 
 /// A simple CLI tool to parse .kip files and report syntax errors.
-/// Build: `cargo build --bin kip_cli --release`
+/// Build: `cargo build --bin kip-cli --release`
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: kip_cli <file_or_dir> [file_or_dir ...]");
+        eprintln!("Usage: kip-cli <file_or_dir> [file_or_dir ...]");
         process::exit(1);
     }
 

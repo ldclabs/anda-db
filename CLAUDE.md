@@ -63,8 +63,8 @@ That skill contains the current API patterns for:
 For embedded database usage, start with:
 
 ```toml
-anda_db = { version = "0.11", features = ["full"] }
-anda_object_store = "0.11"
+anda_db = { version = "0.13", features = ["full"] }
+anda_object_store = "0.13"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -201,7 +201,7 @@ make test-ts
 `corpus.generated.ts`) are committed; regenerate them with `pnpm run codegen`
 after changing their sources, or CI will fail on the drift.
 
-The workspace MSRV is 1.88 (let-chains in edition 2024).
+The workspace MSRV is 1.95 (required by the current dependency set).
 
 The Python binding under `py/anda_cognitive_nexus_py` is not part of the default
 Rust workspace member list.

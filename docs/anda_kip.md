@@ -1,7 +1,7 @@
 # `anda_kip` — Technical Reference
 
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
-[synchronization and compatibility notes](kip-v2-d6e3a45-sync.md) for implemented contracts and capability boundaries.
+[Cognitive Nexus documentation](anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 `anda_kip` is the protocol layer of the AndaDB workspace: it turns KIP 2.0
 command text into a closed, executable AST, models the runtime envelope, and
@@ -27,7 +27,7 @@ decisions.
 11. [Cognitive Capsules](#11-cognitive-capsules)
 12. [Function-calling integration](#12-function-calling-integration)
 13. [Implementer's checklist](#13-implementers-checklist)
-14. [`kip_cli`](#14-kip_cli)
+14. [`kip-cli`](#14-kip-cli)
 15. [Migrating from `anda_kip` 0.11 (KIP 1.x)](#15-migrating-from-anda_kip-011-kip-1x)
 
 ---
@@ -719,10 +719,10 @@ for you because each needs state.
 
 ---
 
-## 14. `kip_cli`
+## 14. `kip-cli`
 
 ```bash
-cargo run -p anda_kip --bin kip_cli -- path/to/file.kip path/to/dir
+cargo run -p anda_kip --bin kip-cli -- path/to/file.kip path/to/dir
 ```
 
 Walks files and directories, parses every `.kip` file, prints the classified
@@ -736,7 +736,7 @@ non-zero if anything failed.
 This is a breaking rewrite. The 1.x API is gone rather than deprecated, because
 the semantics behind it are gone.
 
-| 0.11 (KIP 1.x) | 0.12+ (KIP 2.0) |
+| 0.11 (KIP 1.x) | 0.13 (KIP 2.0) |
 | --- | --- |
 | `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
 | `DELETE` | `TRANSITION … TO "archived"` / `TO "tombstoned"` / `PURGE` / `TO "retracted"` — classify the intent |

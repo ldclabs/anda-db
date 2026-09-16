@@ -76,7 +76,7 @@ mod tests {
         let instructions = format!(
             "{}\n{}",
             anda_kip::KIP_SYNTAX,
-            include_str!("../../anda_kip/profiles/CognitiveMemoryProfile-2.0.md")
+            anda_kip::COGNITIVE_MEMORY_PROFILE
         );
         let words: std::collections::BTreeSet<&str> = instructions
             .split(|c: char| !c.is_alphanumeric() && c != '_')

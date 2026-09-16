@@ -23,16 +23,16 @@ default = []
 simulation = []
 
 [dependencies]
-jsonschema = { version = "0.49.2", default-features = false }
-anda_db_utils = { version = "0.11", path = "../anda_db_utils" }
-anda_db_schema = { version = "0.11", path = "../anda_db_schema" }
+anda_db_utils = { version = "0.13", path = "../anda_db_utils" }
+anda_db_schema = { version = "0.13", path = "../anda_db_schema" }
 anda_kip = { version = "0.13", path = "../anda_kip" }
-anda_db = { version = "0.11", path = "../anda_db", features = ["full"] }
-anda_db_tfs = { version = "0.11", path = "../anda_db_tfs", features = ["full"] }
+anda_db = { version = "0.13", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.13", path = "../anda_db_tfs", features = ["full"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+jsonschema = { workspace = true }
 # The 1.x migration rewrites a production database at startup; that has to be
 # visible in the operator's log rather than inferred from a changed row count.
 log = { workspace = true }
@@ -41,15 +41,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 rustc-hash = { workspace = true }
+sha2 = { workspace = true }
 sha3 = { workspace = true }
-sha2 = "0.10"
 tokio = { workspace = true, features = ["sync"] }
 # §9.6: a string Literal is canonicalized to NFC on write, so NFC/NFD twins
 # resolve to one Proposition.
-unicode-normalization = "0.1"
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
-anda_object_store = { path = "../anda_object_store", version = "0.11" }
+anda_object_store = { path = "../anda_object_store", version = "0.13" }
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true, features = ["fs"] }
 structured-logger = { workspace = true }

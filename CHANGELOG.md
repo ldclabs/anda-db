@@ -2,16 +2,167 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — tracking the KIP 2.0 draft, `40e655f` → `793af73`
+## [0.13.0] — 2026-09-16
 
-`anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
-`anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
-unpublished, so this accumulates into the same version),
-`anda_cognitive_nexus_py` 0.6.0.
+This release moves AndaDB from KIP 1.x to **KIP 2.0** and aligns every AndaDB
+Rust package, the Python binding and `@ldclabs/kip-do` at **0.13.0**. It is a
+breaking release: update clients, Schema Packages and host integration together.
+The protocol version remains `2.0`; the bundled CognitiveMemory Schema Package
+is `2.1.0`, and the TypeScript parser dependency is `@ldclabs/kip-lang@^2.3.1`.
+These version numbers describe different contracts and are not package-release
+versions.
 
-Eight changes accumulate here. The latest one first.
+### Breaking changes
 
-## 2026-09-07 — Brain release migration and transaction identity
+- **KIP data model and API rewritten.** Concept, Proposition, Assertion,
+  Evidence and Activity are separate Core kinds. A Proposition is a
+  truth-neutral tuple; belief is projected from attributed Assertions under a
+  policy. Immutable Schema Packages replace the authoritative schema graph.
+  The v1 `ConceptNode`, `PropositionLink`, metadata bags, genesis UPSERT
+  scripts and numeric `KIP_xxxx` errors are removed. Use the v2 KQL/KML/META
+  parsers, named error registry and `Executor` APIs.
+- **Request and response contracts replaced.** Requests use `operations[]`
+  and explicit execution modes; responses use `status`, `results[]` and
+  receipts. One `MUTATE` block is a transaction; a multi-operation batch is
+  not implicitly atomic. Lifecycle mutations use `TRANSITION ... TO ...`.
+  Read-only calls reject writes and ingestion. Adapt HTTP/JSON-RPC, Python
+  and TypeScript consumers to the same v2 envelope.
+- **Portable values and artifacts tightened.** Portable JSON numbers follow
+  the safe-number contract; JSON/JCS canonicalization, pinned validation
+  schemas and `kip-jcs-safe-v1` digests are checked consistently by both
+  engines. Earlier draft artifacts with incompatible digest/numeric contracts
+  require explicit migration. CognitiveMemory 2.1 adds validated record,
+  dependency and runtime contracts; installing its vocabulary does not turn
+  a raw Nexus into an Anda Brain host.
+- **Public Rust APIs tightened.** `anda_kip` exposes validated parser entry
+  points instead of internal grammar and validation helpers.
+  `anda_db_tfs::PostingValue` uses a `Vec`, `QueryType::Or`/`And` hold
+  `Vec<QueryType>`, token helpers use `FxHashMap`, and
+  `may_materialize_not_complement` is removed. `index::extract_json_text`
+  is removed from `anda_db`; missing HNSW fields now return `DBError::Schema`.
+- **Schema and index validation strengthened.** Invalid declarations,
+  malformed documents, unsafe vector values and incomplete writable index
+  loads fail explicitly. HNSW rejects `top_k > 4096`; interrupted boolean
+  flush callbacks no longer report success. Code relying on previously
+  accepted invalid input must be updated.
+- **CLI and fuzz target names use hyphens.** Run `kip-cli` (formerly
+  `kip_cli`); fuzz targets are `fuzz-kip`, `fuzz-kql`, `fuzz-kml` and `fuzz-meta`.
+  Server executables are `anda-db-server`, `anda-cognitive-nexus-server` and
+  `anda-db-shard-proxy`; their Cargo package names retain underscores. Update
+  scripts that invoke the old names; see the [fuzzing guide](rs/anda_kip/fuzz/README.md)
+  for preserving existing seed corpora.
+- **Rust minimum version is 1.95.** This matches the current dependency
+  requirements (`croaring` 2.7 needs 1.95; `sqlx` 0.9 needs 1.94). The earlier
+  1.88 declaration no longer described a buildable dependency set. Python
+  remains on PyO3 0.20 and requires CPython 3.10–3.12.
+
+### Added and changed
+
+- **Two KIP 2.0 engines:** the Rust Cognitive Nexus and the SQLite-backed
+  Durable Objects engine share conformance fixtures, capability/error
+  registries and a differential WASM parser oracle. The HTTP server and
+  Python binding expose the v2 runtime; the WASM crate remains a test oracle.
+- **Cognitive runtime:** versioned projection/trust/evaluation control state,
+  immutable artifacts, dependency revalidation, identity withdrawal,
+  validated learning/replay records, fenced task leases, Watch progression,
+  dispatch recovery and erasure-plan validation. Rust persists commit plans
+  and control checkpoints for recovery. See the
+  [host-contract guide](docs/anda-brain-nexus-contracts.zh.md).
+- **Trusted simulation clocks** behind the Rust `simulation` feature support
+  lifecycle and evaluation-cutoff experiments while authentication, leases,
+  audit and transaction timestamps retain their real clocks.
+- **History and interoperability:** Change Envelopes, independent version
+  planes, read pins, `AS OF SEQ` history, conflict-complete/scoped belief
+  projections, native Cognitive Capsules, Evidence payload purge and
+  retention/lifecycle enforcement.
+- **Core database and indexes:** bounded recovery I/O and streaming budgets,
+  selective boolean/search execution, streamed B-Tree/BM25 persistence,
+  shared HNSW vectors and reusable query workspaces, bounded concurrent HNSW
+  uploads, and an optional `release-speed` build profile. Workload-specific
+  benchmark reports document both improvements and costs.
+
+### Fixed
+
+- KQL scope for `NOT`/`OPTIONAL`/`UNION`, three-valued filters, solution
+  deduplication, aggregates including `DISTINCT`, nested patterns and paths
+  now agree across engines. Numeric mutations, frozen handles, merge
+  identity, newly created Concept archival, authorization before search
+  limiting and dry-run behavior follow the protocol contracts.
+- Assertions without an explicit `at` now receive the real engine transaction
+  time in both engines, as required by the ASSERT expansion. They can be
+  exported and imported as complete Capsule records instead of being marked
+  unavailable for a missing `asserted_at`.
+- Ingestion refuses a reused key with different observation content or
+  provenance, and deduplicates identical keys within a transaction.
+  `ENSURE`/`ASSERT` reuse already-staged tuples. Reference audits are scoped
+  to their writes, hidden references are filtered on reads, lease instants
+  are normalized and Watch status transitions are guarded.
+- Core database recovery reserves unique keys through commits, publishes
+  index references after persistence, preserves checkpoints on transient
+  read failures, restores tokenizers on reopen and normalizes compatible
+  older-schema documents before indexing. Failed streaming writes cannot
+  publish partial data; corrupt compressed objects are distinguished from
+  transient storage errors. Query pagination selects the promised end of
+  the document-ID range, and `_id` updates are rejected.
+- Schema upgrades preserve allocation watermarks and retired nested-field
+  paths, recover legacy history before writes and persist upgrades before
+  open callbacks. CBOR/JSON coercion, F32 round trips, byte-map keys,
+  duplicate-key/depth checks and derive diagnostics are corrected.
+- B-Tree and BM25 recovery distinguish empty manifests from legacy layouts,
+  reject incomplete writable loads and preserve dirty state until commit.
+  Hot postings no longer create an unbounded chain of empty buckets;
+  compaction commits rebuilt layouts even when bucket counts do not change.
+  BM25 document stripes protect concurrent remove/reinsert operations and
+  boolean scoring normalizes tokens consistently.
+- HNSW repairs ID reuse, stale edges, numeric bounds, entry points, partial
+  bootstrap and snapshot acknowledgements; read-only orphan cleanup waits
+  for a writable flush. Object-store wrappers validate sidecar references,
+  recover uncertain commits, bound resources and track multipart failures
+  and retries without publishing incomplete objects.
+- Release packaging uses schemas exported by `anda_kip` instead of reading
+  sibling-crate files at compile time. SHA-256 digest formatting is compatible
+  with `sha2` 0.11 while preserving its lowercase hexadecimal wire format.
+  Server/proxy versions, current documentation, broken guide links and the
+  Python bundled-profile assertion are synchronized with this release. Python
+  Capsule fixtures now supply the required Evidence observation metadata. Added
+  the `v0_13` persisted-format fixture while retaining older compatibility
+  snapshots, and granted the Docker release workflow GHCR package-write
+  permission. Python build instructions now state the workspace opt-in.
+
+### Upgrading and release scope
+
+1. Stop old writers, take a consistent object-store backup and rehearse the
+   complete host startup on a copy. The Rust Nexus detects published v1
+   collection layouts and stages original rows in `kip_legacy_v1` before
+   replacing the old collections. Rollback requires restoring the backup;
+   reopening migrated data with an old binary is not a rollback path.
+2. Activate the host's Schema Packages to finish migration. The generated
+   `kip://legacy/nexus@1.1.0` package and exact mappings are checkpointed for
+   resumable loading. Compatible types, attribution, retention and lifecycle
+   exclusions are preserved; unsupported or ambiguous source semantics stay
+   in legacy records without acquiring invented Evidence or authority.
+   Malformed IDs and dangling references can still block migration. See the
+   [migration operations and limitations](docs/kip-v1-migration.md).
+3. Update Rust dependencies together to `0.13`, port v1 queries/envelopes and
+   Python calls, and review `DESCRIBE CAPABILITIES` on the chosen engine.
+   Atomic multi-operation batches, semantic/historical KIP search, Capsule
+   signatures/restore and Space-wide retention defaults remain unsupported.
+   Core AndaDB HNSW/hybrid retrieval is separate from KIP's search capabilities.
+4. The tag workflow publishes the ten public Rust libraries. The three
+   server/proxy packages and `anda_kip_wasm` have `publish = false`; npm,
+   Python wheels and Docker images use separate release steps. The standalone
+   `cf-tokenizer` service keeps its independent `1.0.0` version, and the
+   private fuzz harness keeps `0.0.0`.
+
+### Pre-release development record
+
+The dated notes below preserve the development history folded into 0.13.0,
+including the initial KIP 2.0 rewrite. Version numbers, draft revisions and
+capability limitations in those notes describe their original development
+snapshots; the release summary above and current documentation describe the
+shipped contracts.
+
+### 2026-09-07 — Brain release migration and transaction identity
 
 - Read the published v1 `a` / `m` property aliases and preserve source data in
   LegacyRecord. Normalize compatible Brain fields, validity, retention and
@@ -29,13 +180,13 @@ Eight changes accumulate here. The latest one first.
   conflict at commit.
 - See [migration operations and limitations](docs/kip-v1-migration.md).
 
-## The 2026-09-06 review of `anda_db`
+### The 2026-09-06 review of `anda_db`
 
 `anda_db` (still 0.11.1; the version bump is left to the release — the
 removed `index::extract_json_text` and the changed `create_hnsw_index` error
 make it a minor one).
 
-### Fixed — `anda_db`
+#### Fixed — `anda_db`
 
 - **`query_ids` / `query_last_ids` on a bare B-tree field filter kept the
   wrong page.** The scan walked the key space and stopped after `limit`
@@ -63,7 +214,7 @@ make it a minor one).
   the value fails to serialize instead of dropping it silently, matching
   `set_extension_from`.
 
-### Changed — `anda_db`
+#### Changed — `anda_db`
 
 - `Collection::flush` returns `Ok(false)` while the collection or its
   database is read-only instead of failing with "Collection is read-only";
@@ -102,12 +253,12 @@ make it a minor one).
   cancel-guard boilerplate is a single `guarded` call, and the `BTree`
   wrapper dispatches through a macro instead of four-way matches.
 
-## The 2026-09-06 review of `anda_db_btree`
+### The 2026-09-06 review of `anda_db_btree`
 
 `anda_db_btree` (still 0.11.1) and `anda_db` (still 0.11.1); the version
 bumps are left to the release.
 
-### Fixed — `anda_db_btree`
+#### Fixed — `anda_db_btree`
 
 - **A hot posting no longer spawns a bucket per append.** `insert` migrated
   an existing posting out of a full bucket even when that posting was the
@@ -135,7 +286,7 @@ bumps are left to the release.
 - `flush` calls `Write::flush` on the metadata writer after `write_all`, so
   a buffered writer cannot hold the commit back.
 
-### Changed — `anda_db_btree`
+#### Changed — `anda_db_btree`
 
 - `compact_buckets` packs with best-fit-decreasing over a capacity index
   (`O(keys × log buckets)` instead of the first-fit `O(keys × buckets)`
@@ -154,7 +305,7 @@ bumps are left to the release.
 - `dashmap`'s `serde` feature is a dev-dependency (only the test-only bucket
   serializer used it); the README's dependency snippet says `0.11`.
 
-### Fixed — `anda_db`
+#### Fixed — `anda_db`
 
 - **`BTree::compact` committed nothing when compaction split a bucket.** The
   wrapper treated any non-decreasing bucket count as "compaction did
@@ -163,12 +314,12 @@ bumps are left to the release.
   mark and the bumped version left uncommitted. It commits whenever the count
   changed.
 
-## The 2026-09-05 review of `anda_db_schema` and `anda_db_derive`
+### The 2026-09-05 review of `anda_db_schema` and `anda_db_derive`
 
 `anda_db_schema` and `anda_db_derive` (both still 0.11.0; the version bump
 is left to the release).
 
-### Fixed — `anda_db_schema`
+#### Fixed — `anda_db_schema`
 
 - **Schema-history recovery preserves an existing allocation watermark.** A
   scan used to raise a trustworthy `next_idx` to every undeclared index it
@@ -224,7 +375,7 @@ is left to the release).
   shape stops being accepted: a `Bytes` / `Vector` value on a `Json` field,
   which the create path always rejected.
 
-### Changed — `anda_db_schema`
+#### Changed — `anda_db_schema`
 
 - `FieldType::validate_declaration` (new) rejects `Option<Option<T>>`, a
   `Map` that mixes a wildcard key with other keys, and nesting beyond
@@ -250,7 +401,7 @@ is left to the release).
 - `SchemaBuilder::build` drops a field-count check `add_field` already
   makes; it keeps its `Result` signature.
 
-### Changed — `anda_db_derive`
+#### Changed — `anda_db_derive`
 
 - Inference covers tuples of two or more elements (`(A, B)` → the tuple-like
   `Array([A, B])`), `VecDeque` / `LinkedList` / `BinaryHeap`, and `[u8; N]`
@@ -264,12 +415,12 @@ is left to the release).
   (`String` / `Text` / `Bytes` / `I64` plus `i8` … `isize`), the only key
   variants `FieldKey` has.
 
-## `anda_db_tfs` review: leaner postings, one `NOT` guard, no dead migration
+### `anda_db_tfs` review: leaner postings, one `NOT` guard, no dead migration
 
 `anda_db_tfs` needs a minor bump at release (its public surface changes);
 `anda_db` only consumes it through unchanged signatures.
 
-### Changed (breaking) — `anda_db_tfs`
+#### Changed (breaking) — `anda_db_tfs`
 
 - `PostingValue` is `(u32, Vec<(u64, usize)>)`: the posting list was a
   `UniqueVec` keyed by the whole `(doc, tf)` pair, which enforced nothing
@@ -287,7 +438,7 @@ is left to the release).
   for `inclusive`) — the hot path was hashing with SipHash.
 - `BM25Index<T>` no longer spells `+ Clone`; `Tokenizer` already implies it.
 
-### Fixed — `anda_db_tfs`
+#### Fixed — `anda_db_tfs`
 
 - `insert` re-reads which bucket owns an existing token instead of trusting
   the id read before the bucket lock: a concurrent insert migrating the same
@@ -319,7 +470,7 @@ is left to the release).
 - `BM25Error`'s `Display` prints the source error's `Display`, not its
   `Debug`; `TokenizeFailed` carries at most 256 bytes of the document text.
 
-### Changed — `anda_db_tfs`
+#### Changed — `anda_db_tfs`
 
 - `search_advanced("quick fox")` scores an `OR` made only of words in one
   pass, exactly like `search("quick fox")`: one tokenizer clone and one score
@@ -342,9 +493,9 @@ is left to the release).
   `remove_array` (never existed) and no longer claims `compact_buckets`
   prunes stale postings (a reload does).
 
-## `anda_kip` narrows what it exports
+### `anda_kip` narrows what it exports
 
-### Changed (breaking) — `anda_kip`
+#### Changed (breaking) — `anda_kip`
 
 The public surface goes from 277 items to 217. `lib.rs` still re-exports
 every module wholesale; what changed is that the items no consumer could
@@ -372,12 +523,12 @@ oracle and the five sibling repositories that depend on this crate use is
 still public, and so are the wire types, the §20.13 registries, the parser
 limits, the bundled prompts and the Capsule model.
 
-## The 2026-09-05 review, second half: the shapes the code repeated
+### The 2026-09-05 review, second half: the shapes the code repeated
 
 No behaviour changes. Each item states once what the code had been saying
 two or three times, and pins what it exposes.
 
-### Changed — `anda_cognitive_nexus`
+#### Changed — `anda_cognitive_nexus`
 
 - **One lifecycle move per state.** `TRANSITION` ran through a 234-line
   `move_element` whose `superseded` and `corrected` arms were the same
@@ -403,7 +554,7 @@ two or three times, and pins what it exposes.
   literals; the drift tests against `UNSUPPORTED_NAMES` are unchanged.
   `meta/mod.rs` is 106 lines shorter.
 
-### Changed — `anda_kip`
+#### Changed — `anda_kip`
 
 - `variable_led_clause` reads the four `?v KIND {...}` patterns from one
   keyword table instead of four copies of the same branch.
@@ -418,7 +569,7 @@ two or three times, and pins what it exposes.
   (`UPDATE_SURFACE=1 cargo test -p anda_kip --test surface`). Narrowing the
   surface remains a separate, breaking decision.
 
-### Changed — `@ldclabs/kip-do`
+#### Changed — `@ldclabs/kip-do`
 
 - **The envelope check is a pure function.** `checkEnvelope` (300 lines
   inside the Durable Object class) is `src/request.ts`, over the envelope and
@@ -429,14 +580,14 @@ two or three times, and pins what it exposes.
   in `evidenceRow`, `assertionRow` or `activityRow`, mirroring the reference
   engine.
 
-## The 2026-09-05 review: a lighter Specification, and four gaps nobody had declared
+### The 2026-09-05 review: a lighter Specification, and four gaps nobody had declared
 
 The 2.0 draft moved with `ldclabs/KIP` — the profile list, the VERIFY targets,
 the Literal model, the permission tiers and the conformance harness were all
 simplified upstream — and the two engines close the four Specification gaps a
 line-by-line review found that neither `DESCRIBE CAPABILITIES` admitted to.
 
-### Changed (breaking) — the Specification
+#### Changed (breaking) — the Specification
 
 - **Nine conformance profiles (§89).** `KIP-Capsule`, `KIP-Historical`,
   `KIP-High-Assurance` and `KIP-1-Migration` are no longer profiles; what they
@@ -460,7 +611,7 @@ line-by-line review found that neither `DESCRIBE CAPABILITIES` admitted to.
   and against the artifact installed under the same reference. Neither engine
   checks signatures, and both say so in the report.
 
-### Changed (breaking) — the engines
+#### Changed (breaking) — the engines
 
 - **An idempotency key belongs to the Principal that used it (§34.2).** Both
   engines journalled the client's key bare, scoped to the Space alone, so a
@@ -488,7 +639,7 @@ line-by-line review found that neither `DESCRIBE CAPABILITIES` admitted to.
   released came back into ordinary recall. Placing a hold on anything but an
   active element now fails `InvalidLifecycleTransition`.
 
-### Added
+#### Added
 
 - **Search hits carry a `snippet` (§66.4)**: the indexed text of the redacted
   view, windowed around the term, the same character-based algorithm on both
@@ -502,7 +653,7 @@ line-by-line review found that neither `DESCRIBE CAPABILITIES` admitted to.
   reference engine.
 
 
-## The Python binding reaches the runtime surface it was declaring
+### The Python binding reaches the runtime surface it was declaring
 
 `anda_cognitive_nexus_py` executed KIP 2.0 through a single-command entry
 point: one command, a `dry_run` flag and parameters. Everything else §71 puts
@@ -519,7 +670,7 @@ The engine behind the binding already implemented all of it. Nothing here is
 new engine behaviour; it is the binding no longer standing between a caller
 and the protocol.
 
-### Added — `anda_kip::execute_request_readonly` (§76)
+#### Added — `anda_kip::execute_request_readonly` (§76)
 
 The envelope counterpart of `execute_readonly`, so a read-only endpoint that
 takes whole envelopes does not have to re-implement the admission rule. Every
@@ -534,7 +685,7 @@ share one `admits_readonly`; a `language` label still cannot downgrade a write
 inside its loop: the gate and the executor must classify the same way, and two
 parses are two chances to disagree.
 
-### Added — the Python surface (`anda_cognitive_nexus_py`)
+#### Added — the Python surface (`anda_cognitive_nexus_py`)
 
 - **`execute_request(envelope)` / `execute_request_readonly(envelope)`** take
   the §71 envelope as a dict and return the §81 response — the shape the HTTP
@@ -568,7 +719,7 @@ parses are two chances to disagree.
   `sum_as_string` demo function, which was the module's only documented
   "quick check" and taught a reader nothing about KIP.
 
-### Changed — breaking (`anda_cognitive_nexus_py` 0.6.0)
+#### Changed — breaking (`anda_cognitive_nexus_py` 0.6.0)
 
 - `sum_as_string` is removed.
 - `AndaDbConfig.__init__` takes a sixth optional argument, `schema_packages`.
@@ -580,13 +731,13 @@ parses are two chances to disagree.
   resolution. The repository URL in the same file pointed at a repository name
   that does not exist (`anda_db`).
 
-## Conformance pass: the gaps the 2026-09-03 review found
+### Conformance pass: the gaps the 2026-09-03 review found
 
 A review of the three KIP 2.0 libraries against `793af73` closed the
 undeclared cross-engine divergences and three unimplemented MUSTs. Both
 engines run the shared fixtures, so every item below is pinned by one.
 
-### Added — the shared capability vocabulary (`anda_kip`, both engines)
+#### Added — the shared capability vocabulary (`anda_kip`, both engines)
 
 - **`rs/anda_kip/capabilities.json`** is now the one list of §67.4 registry
   names and of the engine-local names every engine here answers.
@@ -604,7 +755,7 @@ engines run the shared fixtures, so every item below is pinned by one.
   parsed semantics rather than on a declared label, matching
   `anda_kip::execute_readonly`.
 
-### Fixed — protocol MUSTs
+#### Fixed — protocol MUSTs
 
 - **`IdempotencyConflict` (§34.4).** Both engines journalled an empty
   `request_digest` and replayed under a key without looking at it, so the same
@@ -626,7 +777,7 @@ engines run the shared fixtures, so every item below is pinned by one.
 - **`UnsupportedIsolation` (§32.2)** in `anda_cognitive_nexus`: an
   `execution.isolation` other than `serializable` was echoed back and ignored.
 
-### Fixed — cross-engine divergence
+#### Fixed — cross-engine divergence
 
 - **A `WHERE` on a directly named mutation target is a guard**, in both
   engines. `ts/kip-do` refused the shape as `InvalidSyntax`; the KML grammar
@@ -645,7 +796,7 @@ engines run the shared fixtures, so every item below is pinned by one.
   the digest covers) and the `LIST TYPES` / `PREDICATES` / `FACETS` /
   `STRUCTURAL FIELDS` answers.
 
-### Added — `KIP-KQL` (§96), claimed by both engines
+#### Added — `KIP-KQL` (§96), claimed by both engines
 
 - **Grouped aggregation** (§44.6). Grouping is implicit: the non-aggregated
   projected expressions are the key, so `FIND(?c.name, COUNT(?a))` is one row
@@ -658,7 +809,7 @@ engines run the shared fixtures, so every item below is pinned by one.
   `KIP-KQL`. `nested_proposition_endpoint`, `hop_quantifiers` and the
   projection ledger are outside that list and stay in `unsupported`.
 
-### Fixed — the Change Envelope against its own schema
+#### Fixed — the Change Envelope against its own schema
 
 `schemas/kip-change-envelope.schema.json` is `additionalProperties: false`,
 and both engines emitted `snapshot_seq` and `status` beside the members §36.1
@@ -675,13 +826,13 @@ land" should not be answered from inside an extension. Both engines answer the
 same shape now — `ts/kip-do` was returning its raw storage row, whose `seq`,
 `space` and `idempotency_key` are not envelope members at all.
 
-### Fixed — an unregistered Activity status
+#### Fixed — an unregistered Activity status
 
 `CREATE ACTIVITY … SET FIELDS {status: "banana"}` parsed and stored in both
 engines. §16's status registry is Core's, so it is checked at execution, where
 a `:parameter` status is bound.
 
-### Fixed — self-description
+#### Fixed — self-description
 
 - `anda_cognitive_nexus` documents `artifact_store` and `deadlines` in
   `unsupported`, where it had names with no entry; both engines now test that
@@ -695,7 +846,7 @@ a `:parameter` status is bound.
   exactly like a right one, and a script that rewrote those would produce
   confidently wrong references.
 
-### Added — the §27 invariant coverage matrix
+#### Added — the §27 invariant coverage matrix
 
 A shared fixture case may now declare the normative vectors it pins
 (`"vectors": ["CORE-001"]`), and `cargo test -p anda_cognitive_nexus --test
@@ -711,7 +862,7 @@ state fixtures and a harness contract (conformance §5), and running it needs an
 out-of-band `seed_fixture` / `set_governance_fixture` path neither engine has.
 The matrix is what makes the size of that gap visible instead of unstated.
 
-### Fixed — §53.4, conflicting mutation specifications
+#### Fixed — §53.4, conflicting mutation specifications
 
 `MUTATE { UPDATE :X SET FIELDS {name:"A"}  UPDATE :X SET FIELDS {name:"B"} }`
 was last-write-wins by clause order in both engines — the hidden behaviour
@@ -721,7 +872,7 @@ way conflicting ordered structural positions already were. Two clauses writing
 the *same* value still agree, and two clauses writing different paths of one
 target still both apply.
 
-### Fixed — toolchain
+#### Fixed — toolchain
 
 - `pnpm-workspace.yaml`'s `minimumReleaseAgeExclude` entries were
   `name@version`; pnpm matches package *names*, so the exclusion did nothing
@@ -729,14 +880,14 @@ target still both apply.
   pnpm 10, did not apply the policy at all. Name only now, and CI moves to
   pnpm 11 so both halves run the same check.
 
-### Removed
+#### Removed
 
 - Three unused `ts/kip-do` exports (`emptySolution`, `extendAll`, `kindTag`,
   and the `SYMBOL_KINDS` list nothing named); `BELIEF_STATUSES` is now read
   where `DESCRIBE CAPABILITIES` used to spell the five statuses by hand.
 
 
-### Changed — `anda_kip` declares each vocabulary once
+#### Changed — `anda_kip` declares each vocabulary once
 
 A refactor. It adds no types and changes no command's meaning; the two wire
 effects it does have are called out at the end of this section.
@@ -788,7 +939,7 @@ and the vendored wire schemas type as `string`; that form is now refused.
 deserializer had always been string-only, and a derive would have widened it.
 
 
-### Changed — `anda_cognitive_nexus` states each repeated shape once
+#### Changed — `anda_cognitive_nexus` states each repeated shape once
 
 A refactor of the engine crate. It moves no logic between layers and changes
 no command's meaning; the one behavioural change it does make is called out at
@@ -839,7 +990,7 @@ consequence of running the same gate as the other eleven, these two also now
 write the Governance audit entries a denial or an `audit` obligation calls
 for, where they previously wrote none.
 
-## Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
+### Sync: KIP 2.0 `793af73` — one TRANSITION, version planes, AS OF SEQ
 
 Syncs upstream [KIP 2.0 `793af73`](https://github.com/ldclabs/kip), the
 consolidation of the 2.0 draft that closed its 2026-09-02 review, in the
@@ -848,7 +999,7 @@ that tracks it, so nothing below keeps a compatibility path for earlier
 2.0-draft storage or wire shapes; the KIP 1.x → 2.0 migration in
 `anda_cognitive_nexus` is the one path that stays.
 
-### Changed — breaking: the language (`anda_kip`, `@ldclabs/kip-lang` 2.2.0)
+#### Changed — breaking: the language (`anda_kip`, `@ldclabs/kip-lang` 2.2.0)
 
 - **One lifecycle statement.** `TRANSITION <target> TO "<state>" [BY <ref>]
   [SET FIELDS] [SET STRUCTURAL] [WHERE] [LIMIT] {EXPECT VERSION}` replaces
@@ -895,7 +1046,7 @@ that tracks it, so nothing below keeps a compatibility path for earlier
   `ACTIVITY_STATUS` (`pending | running | completed | failed | cancelled`) and
   `TRANSITION_STATES`.
 
-### Changed — breaking: the wire (`anda_kip`)
+#### Changed — breaking: the wire (`anda_kip`)
 
 - `_system.plane_versions { attributes, structural, retention, facets{} }`
   beside `version` (§6.3) — `SystemState.plane_versions`, `PlaneVersions`.
@@ -919,7 +1070,7 @@ that tracks it, so nothing below keeps a compatibility path for earlier
   `receipt_digest` and `origin { principal_id, actor_binding_id,
   delegation_digest }` (§33.2).
 
-### Changed — vendored artifacts (`793af73`)
+#### Changed — vendored artifacts (`793af73`)
 
 - `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,
   `grammar/*.ebnf`, `profiles/CognitiveMemoryProfile-2.0.md`, `brain/*.md`,
@@ -950,7 +1101,7 @@ that tracks it, so nothing below keeps a compatibility path for earlier
   `descriptive` by default, `source_actor` as an element reference, and the
   six Profile Facets `LIST FACETS` now reports.
 
-### Changed — breaking: the engines execute one `TRANSITION`
+#### Changed — breaking: the engines execute one `TRANSITION`
 
 Both engines drop the six lifecycle statements and execute the single one.
 `retracted` and `superseded` still ask for `retract_own` / `supersede_own`,
@@ -967,7 +1118,7 @@ the removed `SNAPSHOT` statement; `DESCRIBE EXECUTION CONTEXT` and
 `DESCRIBE PROJECTION CAPABILITY` are gone, the latter's answer folded into
 `DESCRIBE CAPABILITIES`.
 
-### Added — version planes, and one spelling of what a commit touched
+#### Added — version planes, and one spelling of what a commit touched
 
 Every element carries `_system.plane_versions` beside `_system.version`: one
 counter for `attributes`, one for `structural`, one for `retention` and one per
@@ -990,7 +1141,7 @@ and `governance.<member>`. Lifecycle columns and Governance members are named in
 and `touched` and reports no `planes`. Profile fields and Facets are named by
 local name rather than by resolved symbol.
 
-### Fixed — a recovered receipt was not the receipt that was sealed
+#### Fixed — a recovered receipt was not the receipt that was sealed
 
 `anda_cognitive_nexus` journalled a transaction without `Receipt.origin`, so a
 client recovering a lost response under §80.4 got a replayed receipt whose
@@ -1014,7 +1165,7 @@ Four more, all in `anda_cognitive_nexus`:
   because the self-supersession check ran before the lifecycle check. §52.5
   makes current-state validation the engine's first job.
 
-### Fixed — a batch after the first operation committed nothing
+#### Fixed — a batch after the first operation committed nothing
 
 `@ldclabs/kip-do` handed the envelope's `execution.idempotency_key` verbatim to
 every operation of a batch, so operations after the first replayed the first
@@ -1033,7 +1184,7 @@ Three more, all in `@ldclabs/kip-do`:
 - an Assertion written without `by:` was reported as a Schema failure; §55.1
   makes it required, and the shared grammar refuses it as `InvalidSyntax`.
 
-### Changed — the §67.4 capability registry reads the same on both engines
+#### Changed — the §67.4 capability registry reads the same on both engines
 
 The 24 registry names are fixed by the Specification, but the two engines
 reported them from different places: `anda_cognitive_nexus` under
@@ -1052,7 +1203,7 @@ whose value is a detail object still answers as supported, an unsupported name
 is refused before the command runs, and a name no registry knows fails the same
 way instead of passing unrecognized.
 
-### Fixed — the two conformance harnesses read the same suite differently
+#### Fixed — the two conformance harnesses read the same suite differently
 
 The Rust harness renumbers a fixture's own `C:<1>` placeholders through the same
 aliasing it applies to real ids, so it tolerates an ordinal an author guessed
@@ -1063,7 +1214,7 @@ divergence between engines. The ordinals are corrected and the rule — one glob
 counter, sorted-key walk order, write what the walk produces — is now stated in
 `fixtures/kip-conformance-2.0/README.md`.
 
-### Fixed — an `ingest` block on a read-only request was silently dropped
+#### Fixed — an `ingest` block on a read-only request was silently dropped
 
 Both engines minted ingested Evidence on the KML path only, so a request that
 paired an `ingest` block with a `FIND` or a `DESCRIBE` minted nothing and still
@@ -1091,7 +1242,7 @@ answer rather than a gap: neither engine distinguishes a derived write, and
 §29.6 makes rejecting `derive` where a Grant names it a MUST for exactly that
 case. Both engines have a test on the rejection.
 
-## Sync: KIP 2.0 `40e655f` — the proactivity gap, and the consequence channel
+### Sync: KIP 2.0 `40e655f` — the proactivity gap, and the consequence channel
 
 Syncs upstream [KIP 2.0 `40e655f`](https://github.com/ldclabs/kip) and
 implements the two statements it adds, in both engines — and, following the
@@ -1125,7 +1276,7 @@ task class and four Activity classes (`watch_fire`, `action_gate`,
 not engine behaviour: both engines resolve them because they ship the artifact,
 and neither has an opinion about them.
 
-### Added — closing the gaps `anda-brain` found between the two engines
+#### Added — closing the gaps `anda-brain` found between the two engines
 
 An audit from the client side compared what each engine *declares* in
 `DESCRIBE CAPABILITIES` and took the difference. Six gaps came out of it, and
@@ -1194,7 +1345,7 @@ when `ARCHIVE` or `TOMBSTONE` reaches an Assertion the caller neither wrote nor
 represents — archiving one's own record is tidying, and administratively
 excluding a third party's claim is moderation.
 
-### Changed — breaking: a permission is registered only where a gate asks for it
+#### Changed — breaking: a permission is registered only where a gate asks for it
 
 Three names were left over after the control-plane work: `derive`, `share` and
 `manage_trust`. Both engines accepted them in a Grant and no gate ever asked for
@@ -1224,7 +1375,7 @@ and the trigger is stated — an element recorded as an output of an Activity th
 has at least one input — which is Core-level, decidable at commit, and not every
 write. Neither engine gates on it yet; both say so.
 
-### Changed — breaking: META reads answer in one shape
+#### Changed — breaking: META reads answer in one shape
 
 Two `LIST` families disagreed between the engines, and both disagreements were
 silent — a reader written for one shape gets an *empty result* from the other,
@@ -1256,7 +1407,7 @@ pinned by a shared `meta-shapes` fixture rather than by each engine's own tests.
   and its `packages` is a flat list of `package_id@version` rather than a map to
   reassemble.
 
-### Fixed — a legal hold could be lifted by a block that never mentioned it
+#### Fixed — a legal hold could be lifted by a block that never mentioned it
 
 `SET RETENTION` replaces the retention block rather than patching it, so a
 caller holding only `manage_retention` could clear a hold by simply omitting
@@ -1266,7 +1417,7 @@ now gated on the transition rather than on the words in the block, so placing a
 hold needs `legal_hold` and so does any `SET RETENTION` over an element that
 currently holds one.
 
-### Fixed — a search that can never work told the caller to retry
+#### Fixed — a search that can never work told the caller to retry
 
 `anda_cognitive_nexus` refused `SEARCH ASSERTION` and `SEARCH ACTIVITY` with
 `SearchIndexUnavailable`, whose registry entry carries the `safe_same_request`
@@ -1276,7 +1427,7 @@ being reported as a transient one — a retry loop wearing a diagnosis. It now
 answers `UnsupportedCapability`, matching `@ldclabs/kip-do` and matching the
 capability the engine declares.
 
-### Fixed — an ingest key could be shadowed by an operation parameter
+#### Fixed — an ingest key could be shadowed by an operation parameter
 
 `anda_cognitive_nexus` checked an ingest key against the *request*-level
 parameters only. §74 merges request-level and operation-level parameters into
@@ -1284,7 +1435,7 @@ one binding environment, so an operation-level parameter of the same name would
 shadow the ingested reference and leave the Evidence minted, unused and uncited.
 Both levels are checked now.
 
-### Fixed — the journal recorded the key but not the answer
+#### Fixed — the journal recorded the key but not the answer
 
 `anda_cognitive_nexus`'s `TransactionRow.result` was documented as "the response
 this transaction produced, replayed on idempotent retry" and nothing populated
@@ -1292,7 +1443,7 @@ it, so a caller that found its transaction still could not learn what it bound.
 The result body is now journalled through the same function that builds the
 response, so the two are one shape by construction.
 
-### Changed — the capability registries answer the same questions
+#### Changed — the capability registries answer the same questions
 
 `requires` (§67) is a fail-fast check, and a name one engine does not recognize
 fails the request rather than answering it — so a `requires` block written
@@ -1304,7 +1455,7 @@ and `@ldclabs/kip-do` registers `trust_governance`, `retention_policy` and
 `capsule_import` and `hop_quantifiers` are built in `anda_cognitive_nexus` and
 not in `@ldclabs/kip-do`.
 
-### Added — conformance: `retention`, `structural-core-fields`, `meta-shapes`, `request-envelope`
+#### Added — conformance: `retention`, `structural-core-fields`, `meta-shapes`, `request-envelope`
 
 Four fixtures, and one harness change that made two of them possible: a case may
 now carry an `envelope` block, merged over the request the harness builds. Most
@@ -1314,7 +1465,7 @@ cross-engine contracts too.
 
 The suite is 224 cases across 17 fixtures, and both engines pass all of them.
 
-### Added — `LIST DEPENDENTS` (§63.5)
+#### Added — `LIST DEPENDENTS` (§63.5)
 
 - Both engines walk the closure, bounded by `DEPTH` (default 1, capped at 8)
   and paged by `LIMIT` / `CURSOR` like every other `LIST`. A row carries the
@@ -1342,7 +1493,7 @@ The suite is 224 cases across 17 fixtures, and both engines pass all of them.
   element's *sources* where it promised its dependents, which sends a reviewer
   to the wrong artifacts.
 
-### Added — `PURGE PAYLOAD` (§60.6)
+#### Added — `PURGE PAYLOAD` (§60.6)
 
 - The target MUST be Evidence; other kinds are refused rather than succeeding
   vacuously over a set that never had bytes. `CONFIRM "PURGE"` is required, the
@@ -1364,7 +1515,7 @@ The suite is 224 cases across 17 fixtures, and both engines pass all of them.
   surviving record keeps one. Neither engine mints a substitute — two engines
   would have to agree on the exact bytes for it to mean anything.
 
-### Changed — breaking: `HISTORY` and `CHANGES` answer in Change Envelopes
+#### Changed — breaking: `HISTORY` and `CHANGES` answer in Change Envelopes
 
 §68.1 defines `HISTORY` as *transition chronology* and §36.2 defines a
 transition as one Change Envelope, so `HISTORY ELEMENT`, `HISTORY SPACE` and
@@ -1403,7 +1554,7 @@ used it.
   engines hand the same consumer, so a field one invents is a field the other
   silently lacks.
 
-### Fixed — Clippy hangs on `anda_kip` under Rust 1.98.0
+#### Fixed — Clippy hangs on `anda_kip` under Rust 1.98.0
 
 `clippy::needless_borrows_for_generic_args` asks whether a bound would still
 hold with the `&` removed, which re-enters trait selection with the borrow
@@ -1418,7 +1569,7 @@ commit fails the same way when its job is re-run on the newer runner image
 which builds and runs everything, passes on the same image. The one lint is
 allowed in `anda_kip` alone; every other Clippy lint still runs there.
 
-### Fixed — `@ldclabs/kip-do` stored no scalar Evidence payload
+#### Fixed — `@ldclabs/kip-do` stored no scalar Evidence payload
 
 `CREATE EVIDENCE ?e { SET FIELDS { payload: "she said yes" } }` committed and
 kept nothing: the payload was read through a JSON-*object* accessor, so any
@@ -1427,7 +1578,7 @@ payload the observation and invariant 33 forbids re-typing a transport-supplied
 one. The reference engine always stored it. A conformance case now pins the
 inline payload across both engines, which is what would have caught this.
 
-### Added — the consequence channel (§15.7) and the outcome-graded Skill lifecycle
+#### Added — the consequence channel (§15.7) and the outcome-graded Skill lifecycle
 
 Syncs upstream [KIP 2.0 `12cfd4d`](https://github.com/ldclabs/kip). Everything
 the draft had so far let the system watch the world; nothing let the world vote
@@ -1460,7 +1611,7 @@ Neither engine implements a verdict rule, and neither should: how a comparison
 is constructed is Brain policy. What the engines owe is the schema discipline
 and the guarantee that the transition lands as one recomputable commit.
 
-### Changed — breaking: the Skill lifecycle vocabulary
+#### Changed — breaking: the Skill lifecycle vocabulary
 
 The Cognitive Memory Profile moves to an outcome-graded lifecycle, so a Space
 holding Skills written against the old vocabulary needs a migration:
@@ -1479,7 +1630,7 @@ holding Skills written against the old vocabulary needs a migration:
   standing, exactly as source trust (§39.5) and source authority (§41.4) never
   transfer.
 
-### Fixed — a Facet assignment is judged as the merge it is
+#### Fixed — a Facet assignment is judged as the merge it is
 
 Both engines validated `UPDATE ... SET FACET` in ways that no Profile had yet
 exercised, because no shipped Facet had required or immutable members. The
@@ -1503,7 +1654,7 @@ first one that does — `OutcomeRecord` — found three things:
   `InvalidLifecycleTransition`), and Facets — representation-local state, none
   of it truth (§18.1) — are reachable on every kind.
 
-### Fixed — a schema contract that only held at creation
+#### Fixed — a schema contract that only held at creation
 
 Both engines validated a Concept's attributes when it was created and never
 again, so every constraint a type declares was one `UPDATE` away from being
@@ -1539,7 +1690,7 @@ had already written and never called (the Facet twins landed with
   refusing them.
 - `UPSERT CONCEPT` goes through the same check on both halves in both engines.
 
-### Fixed — `@ldclabs/kip-do` never asked what a reference pointed at
+#### Fixed — `@ldclabs/kip-do` never asked what a reference pointed at
 
 A Schema Package says what may occupy each end of a tuple and what kind of
 element may carry a Facet (§41–§44, §58). The reference engine checks those;
@@ -1565,7 +1716,7 @@ itself. It is wired at the two places the reference engine wires it — a
 predicate's subject and object, and a Facet's carrier — and violations arrive
 as `ConstraintViolation` like every other schema refusal.
 
-### Fixed — a Facet is state about the Concept type it names, not just the kind
+#### Fixed — a Facet is state about the Concept type it names, not just the kind
 
 The carrier check only ever saw the element's Core kind, in both engines: the
 reference engine passed `schema_ref: None`, so `SkillUtility` — which declares
@@ -1575,7 +1726,7 @@ carrier's own type, so a Facet declaring Concept types refuses a record (which
 cannot be a Concept of any type) *and* a Concept of another type. A carrier
 whose type was not supplied is still not a Concept of the wrong one.
 
-### Fixed — structural fields are held to the ends they declare
+#### Fixed — structural fields are held to the ends they declare
 
 `has_step` says an Experience holds ordered, distinct ExperienceSteps. Neither
 engine checked the ends: `@ldclabs/kip-do` validated cardinality and uniqueness
@@ -1595,14 +1746,14 @@ same reference twice remains one edge rather than a duplicate — which is why a
 `unique` declaration is not violable through a set clause, and the suite now
 says so.
 
-### Fixed — `UPSERT CONCEPT` no longer mints an unvalidated Concept
+#### Fixed — `UPSERT CONCEPT` no longer mints an unvalidated Concept
 
 An upsert's insert half wrote a Concept without checking it against its type in
 either engine, so required attributes could be skipped by spelling a create as
 an upsert. `CREATE CONCEPT` has always been held to §36; the insert half now is
 too, whether or not the clause writes attributes.
 
-### Fixed — `@ldclabs/kip-do` had two spellings of "write mutable Concept state"
+#### Fixed — `@ldclabs/kip-do` had two spellings of "write mutable Concept state"
 
 Its `UPSERT` merged Facets inline instead of running the clauses `UPDATE` runs,
 so an upsert skipped the merged-result validation and the §39 immutability check
@@ -1619,7 +1770,7 @@ reference engine's behaviour:
 - **An emptied Facet is removed rather than left as `{}`.** A Facet present
   with no members reads as "carried, and every member unknown".
 
-### Fixed — an endpoint declaration now reads the same in both directions
+#### Fixed — an endpoint declaration now reads the same in both directions
 
 An `EndpointSpec` naming only `datatypes` refused a Literal of the wrong
 datatype and then let an element reference through, in both engines: the
@@ -1633,7 +1784,7 @@ that names both still accepts both, and an end this Space cannot resolve is
 still unknown rather than wrong. Only a package that declares a datatype-only
 endpoint is affected; nothing in the bundled Profile does.
 
-### Added — conformance: `schema-endpoints`
+#### Added — conformance: `schema-endpoints`
 
 `fixtures/kip-conformance-2.0/schema-endpoints.json`, 21 cases over a Schema
 Package the fixture declares itself: a tuple whose ends match, a subject and an
@@ -1645,7 +1796,7 @@ kind it declares and by neither a record nor a Concept of another type, a
 structural edge held to both of its ends, and the cardinality and idempotent-set
 behaviour of a field declared unique.
 
-### Added — conformance: `consequence`
+#### Added — conformance: `consequence`
 
 `fixtures/kip-conformance-2.0/consequence.json`, 24 cases run by both engines:
 the graded index and the family it joins on, the scoring handle a Skill cannot
@@ -1662,7 +1813,7 @@ Evidence rather than on the cognition it grades, the tallies on the Skill rather
 than on the outcome that moved them. With `schema-endpoints`, the suite goes
 115 → 162 cases.
 
-### Changed — vendored artifacts
+#### Changed — vendored artifacts
 
 - `rs/anda_kip/{SPECIFICATION,KIPSyntax,SelfInstructions,SystemInstructions}.md`,
   `grammar/{KML,META}.ebnf`, `profiles/CognitiveMemoryProfile-2.0.md` and
@@ -1681,7 +1832,7 @@ than on the outcome that moved them. With `schema-endpoints`, the suite goes
   gains `element` and `depth`, `ListTarget` gains `Dependents`, and
   `MutationClause` gains `PurgePayload`.
 
-## Earlier in this cycle — holding the engines to the Specification, below the syntax
+### Earlier in this cycle — holding the engines to the Specification, below the syntax
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
@@ -1722,7 +1873,7 @@ used by neither engine, which is how `support.root_groups` came to be spelled
 
 KIP 2.0 is unreleased, so these are fixed rather than carried forward.
 
-### Changed — breaking
+#### Changed — breaking
 
 - **A Proposition has no author-writable attribute bag.** §6.4 removed the
   universal metadata bag and §12.2 gives a Proposition its tuple and the common
@@ -1746,7 +1897,7 @@ KIP 2.0 is unreleased, so these are fixed rather than carried forward.
 - **`options.deadline_ms` is refused** rather than accepted and ignored (§80.1,
   §80.2).
 
-### Fixed — the Core registries reach the values a command actually carries
+#### Fixed — the Core registries reach the values a command actually carries
 
 `stance`, `mode`, an Evidence citation `role` and an Assertion's lifecycle
 status are checked against §20.13 wherever they are written: a literal, a bound
@@ -1760,7 +1911,7 @@ The Activity terminal states are the Core Package's, from
 disagreed: `cancelled` froze an Activity in Rust and not in TypeScript, and
 `aborted` froze it in both while §20.13 does not name it.
 
-### Fixed — §17.4 ordered structural references
+#### Fixed — §17.4 ordered structural references
 
 An explicit `{index: n}` declares a position; a position outside the dense
 range `0..len` fails validation; two references claiming one position in a
@@ -1770,7 +1921,7 @@ a durable Cognitive Element", which is what it now is rather than a reason to
 refuse it. A single-cardinality field replaces on `SET STRUCTURAL` (§17.5)
 instead of appending and failing its own cardinality check.
 
-### Fixed — the request envelope
+#### Fixed — the request envelope
 
 `preconditions.space_seq` and `preconditions.schema_environment_version` are
 checked before the command runs (§35.4). `requires` is checked against the
@@ -1782,7 +1933,7 @@ parameter (§71.1), which is the Specification's answer to §88.12: an
 observation reaches Evidence from the transport rather than through
 model-written command text that can truncate or invent it.
 
-### Added — §5.6 Space self identity, and §64.2
+#### Added — §5.6 Space self identity, and §64.2
 
 A Space may designate one Concept as its semantic `$self`. It is protected
 Space configuration reached through `Session::designate_self` /
@@ -1792,7 +1943,7 @@ the Brain's own identity would be content deciding who the Brain is.
 self as the two different things §64.2 requires it to distinguish, and carries
 §64.3's safety reminders in full rather than half of them.
 
-### Added — retention expiry and the `expired` lifecycle
+#### Added — retention expiry and the `expired` lifecycle
 
 `retention.expires_at` was stored, indexed, and read by nothing. `sweep_expired`
 acts on what lapsed, and `expire_lapsed_assertions` marks the Assertions whose
@@ -1813,7 +1964,7 @@ A projection still admits an `expired` Assertion at a coordinate its window
 covered, so `FOR TIME` in the past does not lose every claim that has since
 lapsed.
 
-### Added — the conflict shape §92 requires and §29's permission split
+#### Added — the conflict shape §92 requires and §29's permission split
 
 A Schema Package may declare `exclusive_values`: groups of object values that
 cannot hold together for one subject (§25.1, §12.7). It is the weaker sibling of
@@ -1825,14 +1976,14 @@ and §92 requires both.
 nothing about what it says; `read` subsumes `discover`, because content nobody
 may know exists is not content anybody can read.
 
-### Fixed — merged references canonicalize on every write
+#### Fixed — merged references canonicalize on every write
 
 §11.3 was implemented for `ENSURE PROPOSITION` endpoints only, which left a
 merge decorative everywhere else: new Assertions kept accumulating under
 `asserted_by: :A` after A was merged into B, and the two identities the merge
 declared to be one never met again. Every reference slot canonicalizes now.
 
-### Fixed — smaller things
+#### Fixed — smaller things
 
 - **A Capsule written by either engine verifies in the other.** The digest is
   taken over `anda_kip::canonical_json` (RFC 8785, §37.7) rather than each
@@ -1859,7 +2010,7 @@ declared to be one never met again. Every reference slot canonicalizes now.
   MUST that neither engine met — and splits `available` and `limits` from
   `supported` (§67).
 
-## Earlier in this cycle — logical keys, `SEARCH` in `@ldclabs/kip-do`, and the Core registries
+### Earlier in this cycle — logical keys, `SEARCH` in `@ldclabs/kip-do`, and the Core registries
 
 `anda_kip` 0.13.0, `anda_cognitive_nexus` 0.13.0,
 `anda_cognitive_nexus_server` 0.13.0, `@ldclabs/kip-do` 0.13.0 (still
@@ -1876,7 +2027,7 @@ TypeScript engine. Keyword search is now built; the remaining gaps
 (`SET RETENTION`, Capsule import, hop quantifiers, atomic multi-operation
 batches) are still reported by `DESCRIBE CAPABILITIES`.
 
-### Added — full-text `SEARCH` in `@ldclabs/kip-do`
+#### Added — full-text `SEARCH` in `@ldclabs/kip-do`
 
 `SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION`, keyword mode, on SQLite
 FTS5 with BM25 ranking (§66).
@@ -1932,7 +2083,7 @@ The cross-engine conformance fixtures carry no `SEARCH` case today. One added
 later must assert the contract — refusals, defaults, hit shape — and must not
 assert scores.
 
-### Removed — `@ldclabs/kip-do` tokenizer client
+#### Removed — `@ldclabs/kip-do` tokenizer client
 
 `AlinkTokenizer`, `SimpleTokenizer`, `Tokenizer`, `FetcherLike`,
 `TokenizeResult` and `MAX_TEXTS_PER_BATCH` are gone, and so is the `TOKENIZER`
@@ -1941,7 +2092,7 @@ segmentation authority reachable would invite exactly the write/read asymmetry
 that makes an indexed document unreachable forever. `extractJsonText` stays,
 because it is the shape both engines' corpora are built from.
 
-### Added — the Core Package registries are enforced before an engine sees them
+#### Added — the Core Package registries are enforced before an engine sees them
 
 `kip://core@2.0.0` is a virtual Schema Package the Specification defines itself
 (§20.13): implicitly active everywhere, never deactivated, never shadowed. Its
@@ -1976,7 +2127,7 @@ broken.
 without `LIMIT`, a `mode: "observed"` that cites no Evidence — for a tool that
 shows findings rather than rejecting.
 
-### Added — the wire schemas are now tested against, not just shipped
+#### Added — the wire schemas are now tested against, not just shipped
 
 `schemas/kip-request.schema.json` and `kip-response.schema.json` are the
 normative description of what goes on the wire, and nothing validated the Rust
@@ -1985,7 +2136,7 @@ serialized output must satisfy the schema, and a payload using every field the
 schema defines must survive the round trip. It found three divergences on its
 first run, all fixed below.
 
-### Added
+#### Added
 
 - **`anda_kip::conformance`** — the thirteen profile names §89 requires an
   implementation to declare, so an engine answering `DESCRIBE CAPABILITIES` and
@@ -2002,7 +2153,7 @@ first run, all fixed below.
   precondition rather than a hint, so a runtime has to be able to find them all
   before deciding whether it can honour the request.
 
-### Changed — the Core elements use the field names the Specification gives them
+#### Changed — the Core elements use the field names the Specification gives them
 
 Four slots were spelled the way an older draft of the wire shape spelled them,
 and both engines had grown compensating machinery around it — `anda_cognitive_nexus`
@@ -2040,7 +2191,7 @@ field by field — a malformed entry surfaces as an empty id rather than
 disappearing, because an Assertion that looks like it cited less than it did is
 the one direction an evidence list must never be wrong in.
 
-### Changed — `BELIEF SLOT` states its own status
+#### Changed — `BELIEF SLOT` states its own status
 
 §47.3 puts `status` at the head of a slot projection and §47.4 asks a grounded
 empty slot to answer `insufficient` with an empty `accepted_values` "rather
@@ -2056,7 +2207,7 @@ This also fixes a divergence between the two engines that predates the change:
 and `@ldclabs/kip-do` did not. Two accepted values in a functional slot is a
 contradiction the caller has to see, so both count it now.
 
-### Changed
+#### Changed
 
 - **`ExecutionTimeout` and `InternalError` are now
   `outcome_lookup_required`,** not `safe_same_request`. That class states that
@@ -2115,7 +2266,7 @@ contradiction the caller has to see, so both count it now.
   policy are checked in with the tree they apply to. `make test-ts` and the CI
   job are unchanged: pnpm finds the root by walking up.
 
-### Fixed
+#### Fixed
 
 - **`ResultContext` can report `valid_at` again.** The wire schema defines it —
   the world valid-time a projection was evaluated for, present whenever
@@ -2177,7 +2328,7 @@ contradiction the caller has to see, so both count it now.
   `evidence`, which §20.13 reserves for `Evidence` elements.
 - `py/anda_cognitive_nexus_py` follows the workspace to 0.13.
 
-### Upgrading
+#### Upgrading
 
 - **An existing `anda_cognitive_nexus` database may already hold duplicate
   keys.** Before this release nothing checked a logical key on the way in —
@@ -2220,7 +2371,7 @@ contradiction the caller has to see, so both count it now.
 
 ---
 
-## [KIP 2.0] — 2026-08-17
+### Initial KIP 2.0 rewrite — 2026-08-17 (development snapshot)
 
 `anda_kip` 0.12.0, `anda_cognitive_nexus` 0.12.0,
 `anda_cognitive_nexus_server` 0.12.0, `@ldclabs/kip-do` 0.13.0.
@@ -2240,7 +2391,7 @@ The workspace now declares `rust-version = "1.88"`, which is what let-chains in
 edition 2024 need. Without it an older toolchain reports a syntax error instead
 of a version mismatch.
 
-### Why it is a rewrite
+#### Why it is a rewrite
 
 KIP 1.x kept meaning, belief, evidence, provenance, retention and governance in
 one self-describing graph, where a Proposition carried `metadata.confidence`, an
@@ -2257,7 +2408,7 @@ commitment about it — stance, mode, confidence, Evidence, valid time. What is
 is why correcting a claim records a new Assertion with `SUPERSEDING` instead of
 rewriting the old one.
 
-### Added
+#### Added
 
 - **Three new grammars** implementing `v2/grammar/KIP-2.0-{KQL,KML,META}.ebnf`.
   KQL gains `ASSERTION` / `EVIDENCE` / `ACTIVITY` / `STRUCTURAL` patterns,
@@ -2308,7 +2459,7 @@ rewriting the old one.
   `tests/syntax_docs.rs`, which parses every executable example in the bundled
   `KIPSyntax.md`.
 
-### Changed
+#### Changed
 
 - **`Response` is a struct, not an enum**: `{status, results[], receipt,
   warnings, ...}` per §81, with `succeeded` / `failed` / `partial` /
@@ -2323,7 +2474,7 @@ rewriting the old one.
   `FunctionDefinitionReadonly.json` are new, and `KIP_SYNTAX` is exported
   alongside the existing statics.
 
-### Removed
+#### Removed
 
 - **The genesis capsules** (`capsules/*.kip`, `GENESIS_KIP`, `PERSON_KIP`, the
   `*_PROP_KIP` predicate sources, `META_CONCEPT_TYPE` and friends). KIP 2.0
@@ -2334,7 +2485,7 @@ rewriting the old one.
   `metadata.*` constants**, superseded by the five Core element kinds.
 - **The numeric `KIP_xxxx` error codes**, superseded by the named registry.
 
-### Downstream ports
+#### Downstream ports
 
 - **`anda_cognitive_nexus` was rewritten, not migrated.** The 1.x engine that
   lived here is deleted; 2.0 is a different data model, and a renamed 1.x engine

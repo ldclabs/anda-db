@@ -283,16 +283,16 @@ const LANES: usize = 8;
 #[inline]
 fn euclidean_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     let mut acc = [0.0f32; LANES];
-    let mut chunks_a = a.chunks_exact(LANES);
-    let mut chunks_b = b.chunks_exact(LANES);
-    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+    let (chunks_a, remainder_a) = a.as_chunks::<LANES>();
+    let (chunks_b, remainder_b) = b.as_chunks::<LANES>();
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
         for i in 0..LANES {
             let d = ca[i].as_f32() - cb[i].as_f32();
             acc[i] += d * d;
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+    for (&x, &y) in remainder_a.iter().zip(remainder_b) {
         let d = x.as_f32() - y.as_f32();
         sum += d * d;
     }
@@ -317,9 +317,9 @@ fn cosine_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     let mut dot = [0.0f32; LANES];
     let mut norm_a2 = [0.0f32; LANES];
     let mut norm_b2 = [0.0f32; LANES];
-    let mut chunks_a = a.chunks_exact(LANES);
-    let mut chunks_b = b.chunks_exact(LANES);
-    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+    let (chunks_a, remainder_a) = a.as_chunks::<LANES>();
+    let (chunks_b, remainder_b) = b.as_chunks::<LANES>();
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
         for i in 0..LANES {
             let x = ca[i].as_f32();
             let y = cb[i].as_f32();
@@ -331,7 +331,7 @@ fn cosine_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     let mut dot_sum: f32 = dot.iter().sum();
     let mut norm_a2_sum: f32 = norm_a2.iter().sum();
     let mut norm_b2_sum: f32 = norm_b2.iter().sum();
-    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+    for (&x, &y) in remainder_a.iter().zip(remainder_b) {
         let x = x.as_f32();
         let y = y.as_f32();
         dot_sum += x * y;
@@ -436,15 +436,15 @@ impl<'a> PreparedQuery<'a> {
 #[inline]
 fn inner_product<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     let mut acc = [0.0f32; LANES];
-    let mut chunks_a = a.chunks_exact(LANES);
-    let mut chunks_b = b.chunks_exact(LANES);
-    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+    let (chunks_a, remainder_a) = a.as_chunks::<LANES>();
+    let (chunks_b, remainder_b) = b.as_chunks::<LANES>();
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
         for i in 0..LANES {
             acc[i] += ca[i].as_f32() * cb[i].as_f32();
         }
     }
     let mut dot: f32 = acc.iter().sum();
-    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+    for (&x, &y) in remainder_a.iter().zip(remainder_b) {
         dot += x.as_f32() * y.as_f32();
     }
     -dot
@@ -453,15 +453,15 @@ fn inner_product<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
 #[inline]
 fn manhattan_distance<A: AsF32, B: AsF32>(a: &[A], b: &[B]) -> f32 {
     let mut acc = [0.0f32; LANES];
-    let mut chunks_a = a.chunks_exact(LANES);
-    let mut chunks_b = b.chunks_exact(LANES);
-    for (ca, cb) in (&mut chunks_a).zip(&mut chunks_b) {
+    let (chunks_a, remainder_a) = a.as_chunks::<LANES>();
+    let (chunks_b, remainder_b) = b.as_chunks::<LANES>();
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
         for i in 0..LANES {
             acc[i] += (ca[i].as_f32() - cb[i].as_f32()).abs();
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder()) {
+    for (&x, &y) in remainder_a.iter().zip(remainder_b) {
         sum += (x.as_f32() - y.as_f32()).abs();
     }
     sum

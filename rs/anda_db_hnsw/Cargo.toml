@@ -2,7 +2,7 @@
 name = "anda_db_hnsw"
 description = "A high-performance vector search library in Rust."
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_hnsw"
-version = "0.11.0"
+version = "0.13.0"
 publish = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,7 +26,7 @@ log = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-anda_object_store = { path = "../anda_object_store", version = "0.11" }
+anda_object_store = { path = "../anda_object_store", version = "0.13" }
 object_store = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["full"] }
 structured-logger = { workspace = true }

@@ -63,9 +63,9 @@ every corroboration group counts equally — and every projection says so.
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = "0.12"
-anda_kip = "0.12"
-anda_db = { version = "0.11", features = ["full"] }
+anda_cognitive_nexus = "0.13"
+anda_kip = "0.13"
+anda_db = { version = "0.13", features = ["full"] }
 ```
 
 ```rust

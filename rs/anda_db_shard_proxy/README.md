@@ -1,5 +1,7 @@
 # anda_db_shard_proxy
 
+The executable is `anda-db-shard-proxy`; the Cargo package name remains `anda_db_shard_proxy`.
+
 `anda_db_shard_proxy` is the shard-routing service layer of the AndaDB
 workspace. It gives multi-tenant deployments a single stable HTTP entrypoint
 while resolving logical database names to shard backends through PostgreSQL-

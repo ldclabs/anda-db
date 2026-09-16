@@ -288,10 +288,13 @@ fn kip_status(response: &Response) -> StatusCode {
     }
 }
 
+// Keep the handler's error variant small without changing the JSON envelope.
+type KipHttpError = (StatusCode, Json<Box<Response>>);
+
 /// A single-error response body, for the failures the HTTP layer itself
 /// produces before or around execution.
-fn error_response(code: KipErrorCode, message: impl Into<String>) -> Json<Response> {
-    Json(Response::failed(KipError::new(code, message)))
+fn error_response(code: KipErrorCode, message: impl Into<String>) -> Json<Box<Response>> {
+    Json(Box::new(Response::failed(KipError::new(code, message))))
 }
 
 /// POST /kip
@@ -302,7 +305,7 @@ pub async fn post_kip(
     State(app): State<AppState>,
     headers: header::HeaderMap,
     body: axum::body::Bytes,
-) -> Result<(StatusCode, Json<Response>), (StatusCode, Json<Response>)> {
+) -> Result<(StatusCode, Json<Response>), KipHttpError> {
     if app.admission.is_cancelled() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, shutting_down()));
     }
@@ -384,8 +387,10 @@ pub async fn post_kip(
                     // must look the outcome up, not re-issue the write.
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Response::outcome_unknown(KipError::outcome_unknown(
-                            "the KIP execution task failed before reporting its outcome",
+                        Json(Box::new(Response::outcome_unknown(
+                            KipError::outcome_unknown(
+                                "the KIP execution task failed before reporting its outcome",
+                            ),
                         ))),
                     )
                 }
@@ -400,7 +405,7 @@ pub async fn post_kip(
             })?;
             match kip_status(&response) {
                 status if status.is_success() => Ok((status, Json(response))),
-                status => Err((status, Json(response))),
+                status => Err((status, Json(Box::new(response)))),
             }
         }
         "list_logs" => {
@@ -493,7 +498,7 @@ pub async fn total_timeout(
     }
 }
 
-fn timeout_error(message: impl Into<String>) -> (StatusCode, Json<Response>) {
+fn timeout_error(message: impl Into<String>) -> KipHttpError {
     (
         StatusCode::REQUEST_TIMEOUT,
         error_response(KipErrorCode::ExecutionTimeout, message),
@@ -508,13 +513,15 @@ fn timeout_error(message: impl Into<String>) -> (StatusCode, Json<Response>) {
 /// retry class says. For a mutation it is §80.3's unknown outcome — the write
 /// may still commit — and answering with a `safe_same_request` class would be
 /// an invitation to commit the same cognition twice.
-fn abandoned_response(has_mutation: bool) -> (StatusCode, Json<Response>) {
+fn abandoned_response(has_mutation: bool) -> KipHttpError {
     if has_mutation {
         (
             StatusCode::REQUEST_TIMEOUT,
-            Json(Response::outcome_unknown(KipError::outcome_unknown(
-                "the response deadline elapsed while the mutation was still running; it may \
+            Json(Box::new(Response::outcome_unknown(
+                KipError::outcome_unknown(
+                    "the response deadline elapsed while the mutation was still running; it may \
                  still commit. Look the transaction up instead of re-issuing it",
+                ),
             ))),
         )
     } else {
@@ -530,7 +537,7 @@ fn abandoned_response(has_mutation: bool) -> (StatusCode, Json<Response>) {
 /// `InternalError` rather than a bespoke code: its registered retry class is
 /// `safe_same_request`, which is exactly right here — nothing was executed, so
 /// re-sending the identical envelope to another instance is safe.
-fn shutting_down() -> Json<Response> {
+fn shutting_down() -> Json<Box<Response>> {
     error_response(KipErrorCode::InternalError, "server is shutting down")
 }
 
@@ -570,7 +577,7 @@ async fn require_api_key(
     State(api_key): State<Arc<Option<String>>>,
     request: HttpRequest,
     next: Next,
-) -> Result<axum::response::Response, (StatusCode, Json<Response>)> {
+) -> Result<axum::response::Response, KipHttpError> {
     if !authorize_api_key(api_key.as_deref(), request.headers()) {
         return Err((
             StatusCode::UNAUTHORIZED,
