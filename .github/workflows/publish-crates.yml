@@ -3,12 +3,76 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: katyo/publish-crates@v2
-        with:
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          ignore-unpublished-changes: true
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t packages < <(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '
+                .packages[]
+                | select(.publish == null or (.publish | index("crates-io")))
+                | "\(.name)@\(.version)"
+              '
+          )
+
+          publish_args=()
+          for package in "${packages[@]}"; do
+            name="${package%@*}"
+            version="${package##*@}"
+            url="https://crates.io/api/v1/crates/${name}/${version}"
+
+            if ! status="$(curl \
+                --silent \
+                --show-error \
+                --retry 5 \
+                --retry-all-errors \
+                --connect-timeout 10 \
+                --max-time 60 \
+                --output /dev/null \
+                --write-out '%{http_code}' \
+                --header 'User-Agent: anda-db-release-workflow (https://github.com/ldclabs/anda-db)' \
+                "$url"
+            )"; then
+              echo "::error::Failed to query crates.io for ${package}"
+              exit 1
+            fi
+
+            case "$status" in
+              200)
+                echo "Skipping ${package}: already published"
+                ;;
+              404)
+                publish_args+=(--package "$package")
+                ;;
+              *)
+                echo "::error::crates.io returned HTTP ${status} for ${package}"
+                exit 1
+                ;;
+            esac
+          done
+
+          if (( ${#publish_args[@]} == 0 )); then
+            echo "All workspace crates are already published"
+            exit 0
+          fi
+
+          cargo publish "${publish_args[@]}"
