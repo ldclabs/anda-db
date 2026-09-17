@@ -510,7 +510,9 @@ async fn prepared_before_deadline_cannot_claim_deadline_coverage_after_waiting()
     f.nexus.close().await.unwrap();
 }
 
-async fn lookup_fixture() -> (
+async fn lookup_fixture(
+    register_observer: bool,
+) -> (
     Fixture,
     String,
     String,
@@ -538,7 +540,11 @@ async fn lookup_fixture() -> (
             GrantDraft {
                 space_id: DEFAULT_SPACE.into(),
                 grantee_principal: principal.into(),
-                actions: vec!["read".into(), "record_outcome".into()],
+                actions: vec![
+                    "read".into(),
+                    "record_outcome".into(),
+                    "read_governance_history".into(),
+                ],
                 ..Default::default()
             },
             "kip:principal:system",
@@ -555,17 +561,19 @@ async fn lookup_fixture() -> (
     s.set_attention_config(DEFAULT_SPACE, saved.version, cfg)
         .await
         .unwrap();
-    s.set_dispatch_lookup_observer(
-        DEFAULT_SPACE,
-        0,
-        DispatchLookupObserver {
-            binding: pin("lookup-executor"),
-            principal_id: principal.into(),
-            configuration_digest: pin("observer").digest,
-        },
-    )
-    .await
-    .unwrap();
+    if register_observer {
+        s.set_dispatch_lookup_observer(
+            DEFAULT_SPACE,
+            0,
+            DispatchLookupObserver {
+                binding: pin("lookup-executor"),
+                principal_id: principal.into(),
+                configuration_digest: pin("observer").digest,
+            },
+        )
+        .await
+        .unwrap();
+    }
     let armed = s
         .arm_watch(DEFAULT_SPACE, &f.watch, f.version)
         .await
@@ -621,7 +629,7 @@ async fn lookup_fixture() -> (
 async fn not_started_reconciliation_is_authenticated_cas_guarded_and_not_an_outcome() {
     // Poll the large setup future as a separate task so its stack frame does
     // not nest under the reconciliation test's own future.
-    let (f, wake, attempt, observer) = tokio::spawn(lookup_fixture()).await.unwrap();
+    let (f, wake, attempt, observer) = tokio::spawn(lookup_fixture(true)).await.unwrap();
     let s = f.nexus.system_session();
     let first = s
         .begin_wake_dispatch(DEFAULT_SPACE, &wake, 2, 1, &attempt, false, true)
@@ -629,6 +637,12 @@ async fn not_started_reconciliation_is_authenticated_cas_guarded_and_not_an_outc
         .unwrap();
     assert_eq!(first["action"], "dispatch");
     let reference = first["dispatch_ref"].as_str().unwrap();
+    assert!(
+        observer
+            .read_control(DEFAULT_SPACE, reference, None)
+            .await
+            .is_err()
+    );
     let next = s
         .begin_wake_dispatch(DEFAULT_SPACE, &wake, 2, 1, &attempt, false, true)
         .await
@@ -723,6 +737,29 @@ async fn not_started_reconciliation_is_authenticated_cas_guarded_and_not_an_outc
             .is_err()
     );
     f.nexus.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn lookup_dispatch_requires_a_registered_observer() {
+    let (fixture, wake, attempt, _) = tokio::spawn(lookup_fixture(false)).await.unwrap();
+    let error = fixture
+        .nexus
+        .system_session()
+        .begin_wake_dispatch(DEFAULT_SPACE, &wake, 2, 1, &attempt, false, true)
+        .await
+        .unwrap_err();
+    assert_eq!(error.name(), "UnsupportedCapability");
+    for id in fixture.nexus.store.control_records().ids() {
+        let row: anda_cognitive_nexus::store::rows::ControlRecordRow = fixture
+            .nexus
+            .store
+            .control_records()
+            .get_as(id)
+            .await
+            .unwrap();
+        assert!(!(row.kind == "dispatch" && row.key.starts_with("dispatch/v1/")));
+    }
+    fixture.nexus.close().await.unwrap();
 }
 
 #[tokio::test]

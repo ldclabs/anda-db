@@ -593,9 +593,14 @@ impl Session {
                 &self.auth,
             )
             .into_result()?;
-        self.nexus
+        let row = self
+            .nexus
             .store
             .control_at(space, key, seq.unwrap_or(u64::MAX))
-            .await
+            .await?;
+        if let Some(row) = &row {
+            crate::attention::authorize_control_read(self, &authority, space, row).await?;
+        }
+        Ok(row)
     }
 }

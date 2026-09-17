@@ -89,8 +89,14 @@ Trusted hosts use these `Session` methods:
 | `set_dispatch_lookup_observer` / `reconcile_wake_lookup` | Pin an authenticated lookup authority before dispatch. Only its current, CAS-guarded NotStarted receipt can reopen the same dispatch identity; Finished is not a success Outcome. |
 | `prepare_watch_page` / `read_prepared_watch_page` / `commit_watch_page` | Persist an authorized semantic page, evaluate outside the lock, then verify exact candidates and current generation/basis before atomic advancement. |
 
+Generic `read_control` also checks maintenance and source access for wake and
+wake-dispatch records. Prepared pages and operation receipts use their dedicated
+read or replay APIs; evaluation material remains subject to source access.
+
 The initial Watch wake uses `anda-brain:attention-v1`; follow-up work uses the
 separate `anda-brain:attention-continuation-v1` format and retains its parent.
+An armed silence Watch must have a deadline; `rearm_watch` rejects a missing one.
+Dispatches that declare outcome lookup require a registered lookup observer.
 Completion accepts up to 64 KiB of KML, 128 clauses/outputs and 16 continuations.
 Current authorization and the lease fence are checked before the redo commit.
 

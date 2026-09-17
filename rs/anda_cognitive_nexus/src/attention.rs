@@ -373,6 +373,68 @@ pub(crate) async fn validate_commit_leases(
     Ok(())
 }
 
+/// The generic Governance control reader must not bypass the permissions on
+/// work records or the cognitive elements they describe.
+pub(crate) async fn authorize_control_read(
+    session: &Session,
+    authority: &EffectiveAuthority,
+    space: &str,
+    row: &ControlRecordRow,
+) -> Result<(), KipError> {
+    if row.kind == "wake" {
+        work::load(session, authority, space, &row.key).await?;
+    } else if row.kind == "dispatch" && row.key.starts_with("dispatch/v1/") {
+        let request = &row.value["request"];
+        let wake_ref = request["wake_ref"]
+            .as_str()
+            .ok_or_else(|| invalid("dispatch lacks wake reference"))?;
+        work::load(session, authority, space, wake_ref).await?;
+        let attempt_ref = request["attempt_ref"]
+            .as_str()
+            .ok_or_else(|| invalid("dispatch lacks attempt reference"))?;
+        let attempt = session
+            .nexus
+            .store
+            .get_element(attempt_ref.parse()?)
+            .await?;
+        if attempt.space() != space || attempt.state() != crate::store::rows::state::ACTIVE {
+            return Err(KipError::not_found_or_not_visible(
+                "dispatch attempt unavailable",
+            ));
+        }
+        authority
+            .authorize(
+                Permission::Read,
+                &ResourceContext::of_element(&attempt),
+                &session.auth,
+            )
+            .into_result()?;
+        if !authority
+            .may_read(&attempt, &session.auth)
+            .is_some_and(|v| v.content && v.constraints.fields.is_empty())
+        {
+            return Err(KipError::not_found_or_not_visible(
+                "dispatch attempt is not fully visible",
+            ));
+        }
+    } else if row.kind == "runtime" && row.key != CONFIG {
+        if !row.key.starts_with("watch-evaluation/v1/") {
+            return Err(KipError::not_authorized(
+                "attention runtime records use their dedicated read or replay API",
+            ));
+        }
+        let material = row.value["material"]["artifact_ref"]
+            .as_str()
+            .ok_or_else(|| invalid("evaluation material reference missing"))?;
+        session
+            .nexus
+            .store
+            .authorized_artifact(space, material, authority, &session.auth)
+            .await?;
+    }
+    Ok(())
+}
+
 impl Session {
     /// Pins trusted host configuration. Scope is immutable after first arming;
     /// config changes invalidate old observation bases, never silently re-arm.

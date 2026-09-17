@@ -240,6 +240,67 @@ async fn fired_watch_atomically_creates_one_activity_and_one_wake() {
 }
 
 #[tokio::test]
+async fn governance_history_alone_cannot_read_a_wake_record() {
+    use anda_cognitive_nexus::governance::{
+        AuthContext,
+        store::{GrantDraft, PrincipalDraft},
+    };
+    let fixture = Fixture::new().await;
+    let fired = fixture.advance().await;
+    let wake = fired["wake_ref"].as_str().unwrap();
+    let principal = "kip:principal:attention-auditor";
+    fixture
+        .nexus
+        .governance()
+        .ensure_principal(PrincipalDraft {
+            principal_id: principal.into(),
+            principal_class: "service".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    fixture
+        .nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: principal.into(),
+                actions: vec!["read".into(), "read_governance_history".into()],
+                ..Default::default()
+            },
+            "kip:principal:system",
+        )
+        .await
+        .unwrap();
+    let auditor = fixture.nexus.session(AuthContext::principal(principal));
+    assert!(
+        auditor
+            .read_control(DEFAULT_SPACE, wake, None)
+            .await
+            .is_err()
+    );
+    assert!(auditor.read_wake(DEFAULT_SPACE, wake).await.is_err());
+    let checkpoint = format!("attention/watch/{}/{}", fixture.watch, fixture.generation);
+    assert!(
+        auditor
+            .read_control(DEFAULT_SPACE, &checkpoint, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .nexus
+            .system_session()
+            .read_control(DEFAULT_SPACE, wake, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fixture.nexus.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn committed_handoff_survives_database_reopen() {
     let fixture = Fixture::new().await;
     let fired = fixture.advance().await;
@@ -683,6 +744,43 @@ async fn silence_distinguishes_before_equal_and_after_deadline() {
 }
 
 #[tokio::test]
+async fn silence_rearm_cannot_clear_its_deadline() {
+    let fixture = Fixture::new().await;
+    let reference = silence_fixture(&fixture).await;
+    let version = fixture
+        .nexus
+        .store
+        .get_element(reference.parse().unwrap())
+        .await
+        .unwrap()
+        .version();
+    let result = fixture
+        .nexus
+        .system_session()
+        .rearm_watch(
+            DEFAULT_SPACE,
+            &reference,
+            version,
+            json!({"element":fixture.target,"ops":["update"]}),
+            None,
+        )
+        .await;
+    assert!(result.is_err());
+    let watch = fixture
+        .nexus
+        .store
+        .get_element(reference.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(watch.version(), version);
+    assert_eq!(
+        anda_cognitive_nexus::view::render(&watch)["attributes"]["due_at"],
+        "2000-01-01T00:00:01.000Z"
+    );
+    fixture.nexus.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn silence_finishes_fixed_coverage_despite_newer_traffic() {
     let fixture = Fixture::new().await;
     let reference = silence_fixture(&fixture).await;
@@ -851,7 +949,7 @@ async fn history_gap_and_prose_conditions_cannot_invent_coverage() {
 
 #[tokio::test]
 async fn wake_dispatch_rechecks_native_attempt_and_never_replays_a_send_permission() {
-    use anda_cognitive_nexus::attention::{AttentionConfig, RuntimePin};
+    use anda_cognitive_nexus::attention::{AttentionConfig, DispatchLookupObserver, RuntimePin};
     for (idempotent, lookup, second_action) in [
         (false, true, "lookup"),
         (false, false, "outcome_unknown"),
@@ -865,14 +963,29 @@ async fn wake_dispatch_rechecks_native_attempt_and_never_replays_a_send_permissi
             .unwrap()
             .unwrap();
         let mut config: AttentionConfig = serde_json::from_value(saved.value).unwrap();
-        config.pins.binding = Some(RuntimePin {
+        let binding = RuntimePin {
             id: "test-executor".into(),
             digest: format!("sha256:{}", "a".repeat(64)),
-        });
+        };
+        config.pins.binding = Some(binding.clone());
         session
             .set_attention_config(DEFAULT_SPACE, saved.version, config)
             .await
             .unwrap();
+        if lookup {
+            session
+                .set_dispatch_lookup_observer(
+                    DEFAULT_SPACE,
+                    0,
+                    DispatchLookupObserver {
+                        binding,
+                        principal_id: "kip:principal:test-lookup".into(),
+                        configuration_digest: format!("sha256:{}", "b".repeat(64)),
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let armed = session
             .arm_watch(DEFAULT_SPACE, &fixture.watch, fixture.version)
             .await

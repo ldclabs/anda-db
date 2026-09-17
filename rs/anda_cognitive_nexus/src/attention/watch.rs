@@ -133,6 +133,9 @@ impl Session {
                     .transpose()?,
                 None => due(old)?,
             };
+            if old.attributes["watch_class"] == "silence" && deadline.is_none() {
+                return Err(invalid("silence Watch requires a deadline"));
+            }
             let pinned_basis = basis(&cx);
             let generation = next(old_state["arm_generation"].as_u64().unwrap_or(0))?;
             let mut tx = Transaction::begin(

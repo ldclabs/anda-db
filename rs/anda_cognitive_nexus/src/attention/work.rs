@@ -1,6 +1,6 @@
 use super::*;
 
-async fn load(
+pub(super) async fn load(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
@@ -192,6 +192,11 @@ impl Session {
             let old = store.control_at(space, &dispatch_ref, u64::MAX).await?;
             let lookup_observer =
                 super::lookup::observer(store, space, wake.pins.binding.as_ref().unwrap()).await?;
+            if supports_outcome_lookup && lookup_observer.is_null() {
+                return Err(KipError::unsupported_capability(
+                    "wake dispatch outcome lookup requires a registered observer",
+                ));
+            }
             if let Some(old) = &old
                 && old.value["lookup_observer"] != lookup_observer
             {
