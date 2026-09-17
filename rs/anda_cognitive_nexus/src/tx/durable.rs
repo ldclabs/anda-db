@@ -230,6 +230,17 @@ impl Transaction {
     }
 
     pub(crate) fn validate_durable(&mut self) -> Result<(), KipError> {
+        for (id, staged) in &self.staged {
+            if staged.is_new
+                && let Element::Activity(row) = &staged.row
+                && row.client_key.starts_with("watch_fire:")
+                && !self.authorized_watch_fires.contains(id)
+            {
+                return Err(KipError::not_authorized(
+                    "watch_fire client keys are reserved for protected Watch advancement",
+                ));
+            }
+        }
         for staged in self.staged.values_mut() {
             let Element::Concept(row) = &mut staged.row else {
                 continue;
@@ -310,6 +321,17 @@ impl Transaction {
                     ));
                 }
                 if let Some(new) = new {
+                    if !self.authorized_watch_updates.contains(id)
+                        && let Some(before) = &s.before
+                        && ["watch_class", "due_at"].iter().any(|field| {
+                            crate::view::render(before)["attributes"][*field]
+                                != row.attributes.get(*field).cloned().unwrap_or(Json::Null)
+                        })
+                    {
+                        return Err(KipError::not_authorized(
+                            "changing an armed Watch deadline/class requires a protected new generation",
+                        ));
+                    }
                     if new["condition_digest"].as_str()
                         != Some(
                             crate::schema::contracts::digest(

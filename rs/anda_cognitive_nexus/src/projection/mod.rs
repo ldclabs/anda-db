@@ -713,6 +713,32 @@ impl Context<'_> {
             return reject(policy.mode_exclusion(mode));
         }
 
+        let actor_ref = row
+            .asserted_by
+            .as_str()
+            .or_else(|| row.asserted_by["id"].as_str())
+            .unwrap_or("");
+        let global_trust = policy
+            .trust_weights
+            .get(actor_ref)
+            .copied()
+            .unwrap_or(policy.default_trust_weight);
+        let trust = if policy.contextual_trust_rules.is_empty() {
+            global_trust
+        } else {
+            let Some(Element::Proposition(proposition)) =
+                self.load(row.proposition_id.parse()?).await?
+            else {
+                return reject("proposition_unavailable");
+            };
+            crate::trust::weight(
+                &policy.contextual_trust_rules,
+                global_trust,
+                actor_ref,
+                &proposition.predicate_ref,
+                &policy.context_refs,
+            )?
+        };
         Ok(Ok(Candidate {
             id,
             actor: if row.asserted_by_key.is_empty() {
@@ -739,16 +765,7 @@ impl Context<'_> {
                 policy.unstated_confidence
             } else {
                 row.confidence
-            }) * policy
-                .trust_weights
-                .get(
-                    row.asserted_by
-                        .as_str()
-                        .or_else(|| row.asserted_by["id"].as_str())
-                        .unwrap_or(""),
-                )
-                .copied()
-                .unwrap_or(policy.default_trust_weight),
+            }) * trust,
             opposes_target: false,
         }))
     }

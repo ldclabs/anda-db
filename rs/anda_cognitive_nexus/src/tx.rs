@@ -76,8 +76,11 @@ pub struct Transaction {
     pub(crate) evaluation_time: Option<String>,
     reference_bindings: Vec<Json>,
     pub(crate) control_effects: Vec<ControlRecordRow>,
+    pub(crate) runtime_result: Option<Json>,
+    pub(crate) attention_leases: Vec<(String, u64, u64)>,
     pub(crate) identity_changed: bool,
     pub(crate) authorized_watch_updates: BTreeSet<ElementId>,
+    pub(crate) authorized_watch_fires: BTreeSet<ElementId>,
     guarded: BTreeMap<ElementId, BTreeSet<String>>,
     handles: BTreeMap<String, ElementId>,
     pub(crate) declared_types: BTreeMap<ElementId, String>,
@@ -178,8 +181,11 @@ impl Transaction {
             declared_types: BTreeMap::new(),
             reference_bindings: Vec::new(),
             control_effects: Vec::new(),
+            runtime_result: None,
+            attention_leases: Vec::new(),
             identity_changed: false,
             authorized_watch_updates: BTreeSet::new(),
+            authorized_watch_fires: BTreeSet::new(),
             guarded: BTreeMap::new(),
             staged: BTreeMap::new(),
             shells: Vec::new(),
@@ -1044,21 +1050,42 @@ impl Transaction {
         // instead of committed half-formed.
         self.discard_unstaged_shells(&changes).await;
 
-        let status = if written == 0 {
+        let status = if written == 0 && self.control_effects.is_empty() {
             ReceiptStatus::NoEffect
         } else {
             ReceiptStatus::Committed
+        };
+        let transaction_class = if written == 0
+            && self.control_effects.iter().any(|c| {
+                matches!(
+                    c.kind.as_str(),
+                    "schema" | "identity" | "policy" | "trust" | "authorization"
+                )
+            }) {
+            "governance"
+        } else if written == 0 && !self.control_effects.is_empty() {
+            "service"
+        } else {
+            "cognitive"
         };
         // The response body, journalled rather than only returned: it is what
         // a resend under the same idempotency key replays, and a journal that
         // recorded the key but not the answer would let a caller find its
         // transaction and still not learn what it bound (§34, §33).
         let mut result = result_body(&self.handles, &changes);
+        if let Some(runtime) = self.runtime_result.take() {
+            result["runtime"] = runtime;
+        }
         if !self.control_effects.is_empty() {
             result["control_changes"] = Json::Array(
                 self.control_effects
                     .iter()
-                    .filter(|c| c.kind != "erasure")
+                    .filter(|c| {
+                        matches!(
+                            c.kind.as_str(),
+                            "schema" | "identity" | "policy" | "trust" | "authorization"
+                        )
+                    })
                     .map(|c| serde_json::json!({"kind":c.kind,"version":self.cx.seq.to_string()}))
                     .collect(),
             );
@@ -1077,13 +1104,24 @@ impl Transaction {
                 ..Default::default()
             })
             .collect();
+        if let Err(error) = crate::attention::validate_commit_leases(
+            &self.store,
+            &self.cx.space,
+            &self.auth.principal_id,
+            &self.attention_leases,
+        )
+        .await
+        {
+            self.discard_shells().await;
+            return Err(error);
+        }
         let journalled = self
             .store
             .commit_plan(crate::store::control::CommitPlan {
                 cx: self.cx.clone(),
                 journal: JournalEntry {
                     status: receipt_status_name(status).to_string(),
-                    transaction_class: "cognitive".into(),
+                    transaction_class: transaction_class.into(),
                     schema_environment_version: self.env.version,
                     changes: changes.clone(),
                     result,

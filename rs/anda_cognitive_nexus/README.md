@@ -52,12 +52,101 @@ by the last writer — and to get the reference KIP engine rather than write an
 `DESCRIBE CAPABILITIES` is the machine-readable answer: every gap as structured
 data with a reason, so an Agent reads what is missing instead of discovering it
 by triggering an error — or, worse, reading an absent feature as an absent fact.
-Gaps are refused as `UnsupportedCapability` rather than answered wrongly: atomic
-batches; idempotency keys, recorded but not replayed, so a resend re-executes;
-grouped aggregation; `STRUCTURAL` over Core reference fields; semantic and hybrid
-`SEARCH`, and `SEARCH … AS OF SEQ`; Capsule signatures; Space-level retention
-defaults. There is no trust model and no evidence-quality evaluation either, so
-every corroboration group counts equally — and every projection says so.
+Gaps are refused as `UnsupportedCapability`. Host methods do not install a
+scheduler, executor or independent observer, and installing a Schema Package
+does not advertise a complete Brain or the optional Memory Interface.
+
+## Durable Watch handoff (0.13.1)
+
+`Session::advance_watch` now commits the Watch's fired state, a `watch_fire`
+Activity and a protected wake record in one redo plan. Delta keys use the actual
+matching envelope sequence; silence keys use the generation and normalized
+deadline, with a fixed `due_seq` coverage target. Newer traffic cannot extend
+that target indefinitely. Identical arm/advance retries return the retained
+receipt, including after reopening the database; replay does not re-arm or renew
+anything. The `watch_fire:` Activity client-key namespace is reserved for this
+native operation.
+
+The response retains `status`, `watch`, `coverage` and `receipt`; fired responses
+also contain `fire_key`, `fire_activity_ref` and `wake_ref`. Wake records are
+protected runtime state, not SleepTask or LeaseState Facets. Existing SleepTask
+APIs remain available.
+
+Trusted hosts use these `Session` methods:
+
+| Method | Contract |
+| --- | --- |
+| `arm_watch` / `rearm_watch` | Start a new generation; rearm may replace condition/deadline. Ordinary KML cannot change a retained Watch's deadline/class or protected progress. |
+| `set_attention_config` | Requires `manage_policy`; pins host scope/policy/evaluator/binding identities. The instance cannot be replaced in place. Pins do not install executable code or grant permissions. |
+| `read_wake` | Requires maintenance authority and current read access to Watch/fire; does not claim work. |
+| `claim_wake` / `renew_wake` | Exact record version and fence; real-time lease of at most five minutes. Takeover after expiry increments the fence. |
+| `block_wake` / `resume_wake` | Persist reason and retry condition. Timed retries resume when due; `on_change` invokes explicitly registered Rust verifier code outside the write lock, then rechecks the wake. |
+| `finish_wake` | Commit a bounded KML output block, continuation wakes and terminal receipt together; reject expired/stale leases and unresolved dispatches. |
+| `cancel_wake` | Fence future work and retain its receipt and any unresolved dispatch obligation. |
+| `begin_wake_dispatch` | Recheck the live lease, original act/attempt, revision authority, policy and dependencies. Persist intent before returning dispatch; retries return lookup/unknown unless the actual binding supports idempotency. |
+| `reconcile_wake_dispatch` | Requires an authorized terminal Outcome for the same attempt; no executor ACK is an Outcome. |
+| `list_wakes` | Bounded snapshot pagination with scope/instance/basis cursors; empty intermediate pages remain resumable. Discovery does not claim processing coverage. |
+| `set_dispatch_lookup_observer` / `reconcile_wake_lookup` | Pin an authenticated lookup authority before dispatch. Only its current, CAS-guarded NotStarted receipt can reopen the same dispatch identity; Finished is not a success Outcome. |
+| `prepare_watch_page` / `read_prepared_watch_page` / `commit_watch_page` | Persist an authorized semantic page, evaluate outside the lock, then verify exact candidates and current generation/basis before atomic advancement. |
+
+The initial Watch wake uses `anda-brain:attention-v1`; follow-up work uses the
+separate `anda-brain:attention-continuation-v1` format and retains its parent.
+Completion accepts up to 64 KiB of KML, 128 clauses/outputs and 16 continuations.
+Current authorization and the lease fence are checked before the redo commit.
+
+Text and mixed selectors require a pinned evaluator. The two-phase API accepts
+up to 200 envelopes, 512 candidates and 512 KiB per prepared page. The returned
+candidate IDs must each receive exactly one match/no-match/unknown judgment;
+each judgment includes a nonempty rationale of at most 4 KiB. Candidates include
+authorized before/after Core views at the event sequence, not current values or
+belief projections. There is no caller-authored `complete` flag. Unknown results retain the original
+Watch checkpoint. A page prepared before its deadline cannot later claim deadline
+coverage merely because model evaluation took time. Material is retained as a
+governed artifact, as are judgment rationales (at most 512 KiB per evaluation),
+so erasure revokes them instead of leaving plaintext in the
+transaction replay. Legacy synchronous `advance_watch_with` remains available;
+plain `advance_watch` has no semantic evaluator. Hosts supply actual model calls,
+global due scheduling and outward delivery.
+
+Evaluation control records contain a material pin readable with `read_artifact`;
+their content remains subject to current source permissions and erasure. A
+NotStarted lookup must be observed after the latest dispatch intent, so delayed
+observations from before a resend cannot reopen it again under a new event key.
+
+Register `WakeResumeVerifier` implementations with
+`CognitiveNexus::register_wake_resume_verifier` once per live instance and after
+restart. An absent verifier remains unsupported; a supplied boolean or stored
+condition digest is not evidence that a condition holds. Cancellation or version
+change during an asynchronous check prevents its later result from resuming work.
+
+Scope instances must not be copied into independently executable forks. Keep one
+live writer process per database. After uncertain native writes, read/reconcile
+the same identity; historical receipts do not confer current execution authority.
+Target-system authorization and idempotency must also be enforced by the actual
+executor; Nexus atomicity alone does not imply exactly-once external effects.
+
+## Contextual trust and atomic calibration provenance
+
+`trust::TrustConfiguration` retains global actor weights and optionally adds up
+to 128 explicit actor/predicate/context rules. Contexts are visible Concept refs;
+predicates use exact Schema refs. Rules only apply within their declared scope.
+The most specific matching rules win, and conflicting equally specific weights
+produce an error rather than depending on array order. BELIEF records the context
+and protected trust version; Assertion confidence is never changed.
+
+`Session::set_contextual_trust` explicitly replaces a complete configuration and
+requires `manage_trust`. The legacy `set_trust` updates global weights while
+retaining scoped rules. Both use version CAS. `apply_trust_calibration` consumes a
+governed `TrustCalibrationProposal` artifact with the exact configuration, method
+pin, eligible Evidence refs and explicit uncertainty. It commits trust, proposal
+references and the native Governance audit together and replays one receipt after
+an uncertain response. It needs `manage_trust` and material read access; no broad
+cognitive `create` permission is inferred just to write the Governance audit.
+
+These APIs do not estimate causal credit, run calibration or automatically adopt
+trust suggestions. The Brain host owns those decisions and must keep them opt-in.
+For Brain host integration contracts, see
+[the host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md).
 
 ## Getting Started
 

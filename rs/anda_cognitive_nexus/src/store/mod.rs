@@ -231,6 +231,7 @@ collections! {
 }
 
 async fn init_control(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["kind"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
     c.create_btree_index_nx(&["key"]).await?;
     c.create_btree_index_nx(&["seq"]).await?;

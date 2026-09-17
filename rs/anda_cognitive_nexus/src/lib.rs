@@ -111,6 +111,7 @@
 // to fit a default would scatter the one document a caller reads as a whole.
 #![recursion_limit = "256"]
 
+pub mod attention;
 pub mod capsule;
 pub mod control;
 pub mod error;
@@ -129,6 +130,7 @@ pub mod schema;
 pub mod store;
 pub mod term;
 pub mod time;
+pub mod trust;
 pub mod tx;
 pub mod view;
 

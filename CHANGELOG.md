@@ -2,6 +2,29 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.13.1] — 2026-09-17
+
+- Commit Watch firing, its reserved `watch_fire` Activity and a protected wake
+  in one recoverable transaction. Retain exact replies for native arm/advance
+  retries and freeze silence coverage at the deadline's native sequence.
+- Add native wake leases, bounded atomic completion/continuations, cancellation,
+  persistent operation receipts and fenced dispatch admission/reconciliation.
+  These host APIs do not install a Brain scheduler or external executor.
+- Protect Watch deadline/class updates and the `watch_fire:` Activity client-key
+  namespace. Text/mixed callbacks now require a pinned host evaluator; selector
+  and history errors cannot become complete silence coverage.
+- Keep the R0 Watch-wake wire format; follow-up work uses an explicit separate
+  continuation format. KIP remains 2.0 and CognitiveMemory remains 2.1.0; other
+  workspace packages remain 0.13.0.
+- Add bounded wake discovery, registered asynchronous resume verifiers and
+  directly authenticated NotStarted lookup reconciliation for Brain's R2/R3
+  host workflows; lookup completion never fabricates an Outcome.
+- Add two-phase semantic Watch pages with frozen cutoffs, complete candidate
+  judgments, current-basis validation and erasable material artifacts. Model
+  calls run outside the native write lock.
+- Add opt-in contextual trust and atomic calibration provenance/Governance
+  audit, preserving raw Assertion confidence and historical trust projections.
+
 ## [0.13.0] — 2026-09-16
 
 This release moves AndaDB from KIP 1.x to **KIP 2.0** and aligns every AndaDB

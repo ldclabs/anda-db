@@ -261,6 +261,14 @@ impl Store {
         policy.trust_weights = serde_json::from_value(trust.value["weights"].clone())
             .map_err(|e| KipError::internal_error(e.to_string()))?;
         policy.default_trust_weight = trust.value["default_weight"].as_f64().unwrap_or(1.0);
+        policy.contextual_trust_rules = serde_json::from_value(
+            trust
+                .value
+                .get("rules")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|e| KipError::internal_error(e.to_string()))?;
         policy.trust_version = digest(&trust.value)?;
         Ok(policy)
     }
@@ -535,6 +543,16 @@ impl Session {
             ));
         }
         self.governed(space, Permission::ManageTrust, async || {
+            let mut value = json!({"weights":weights,"default_weight":default_weight});
+            if let Some(old) = self
+                .nexus
+                .store
+                .control_at(space, "trust", u64::MAX)
+                .await?
+                && let Some(rules) = old.value.get("rules")
+            {
+                value["rules"] = rules.clone();
+            }
             self.nexus
                 .store
                 .publish_control(
@@ -542,7 +560,7 @@ impl Session {
                     "trust",
                     "trust",
                     expected_version,
-                    json!({"weights":weights,"default_weight":default_weight}),
+                    value,
                     json!({"principal_id":self.auth.principal_id}),
                 )
                 .await

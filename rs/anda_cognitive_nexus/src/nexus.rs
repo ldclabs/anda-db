@@ -54,6 +54,7 @@ pub struct CognitiveNexus {
     default_space: String,
     pub(crate) lock: Arc<RwLock<()>>,
     approval_lock: Arc<Mutex<()>>,
+    pub(crate) resume_verifiers: Arc<crate::attention::resume::ResumeVerifiers>,
 }
 
 impl std::fmt::Debug for CognitiveNexus {
@@ -143,6 +144,7 @@ impl CognitiveNexus {
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
             approval_lock: Arc::new(Mutex::new(())),
+            resume_verifiers: Arc::new(Default::default()),
         };
         // A staged 1.x migration is finished here only when this Space already
         // has a Schema Environment — meaning a previous run activated the
@@ -195,6 +197,7 @@ impl CognitiveNexus {
             default_space: DEFAULT_SPACE.to_string(),
             lock: Arc::new(RwLock::new(())),
             approval_lock: Arc::new(Mutex::new(())),
+            resume_verifiers: Arc::new(Default::default()),
         }
     }
 

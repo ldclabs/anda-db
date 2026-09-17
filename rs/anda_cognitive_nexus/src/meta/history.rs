@@ -144,7 +144,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
     rows.sort_by_key(|row| row.seq);
     // Before the total is computed, so a page count cannot report entries the
     // page itself will not contain (§104).
-    visible_changes(cx, &mut rows).await;
+    visible_changes(cx, &mut rows).await?;
 
     let total = rows.len();
     let page: Vec<Json> = rows
@@ -207,7 +207,7 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     // would leave it exactly where it started, and the follower would re-read
     // the same hidden window forever instead of walking past it.
     let consumed = rows.last().map(|row| row.seq);
-    visible_changes(cx, &mut rows).await;
+    visible_changes(cx, &mut rows).await?;
 
     let coverage = serde_json::json!({"through_seq":if complete {cx.pinned_seq} else {consumed.unwrap_or(after)},"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
     let page: Vec<Json> = rows
@@ -327,9 +327,12 @@ async fn journal(cx: &Context<'_>, filter: Filter) -> Result<Vec<TransactionRow>
 /// against. That is the conservative direction, and it is why the check is
 /// skipped entirely for the unrestricted case rather than being applied
 /// uniformly and losing history for everyone.
-async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
+async fn visible_changes(
+    cx: &mut Context<'_>,
+    rows: &mut Vec<TransactionRow>,
+) -> Result<(), KipError> {
     if cx.authority.reads_whole_space(cx.auth) {
-        return;
+        return Ok(());
     }
     for row in rows.iter_mut() {
         let mut kept = Vec::with_capacity(row.changes.len());
@@ -340,10 +343,8 @@ async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
                 kept.push(change.clone());
                 continue;
             };
-            let Ok(parsed) = id.parse::<crate::id::ElementId>() else {
-                continue;
-            };
-            if let Ok(Some(element)) = cx.load_unattached(parsed).await
+            let parsed = id.parse::<crate::id::ElementId>()?;
+            if let Some(element) = cx.load_unattached(parsed).await?
                 && let Some(visibility) = cx
                     .authority
                     .may_read(&element, cx.auth)
@@ -386,6 +387,7 @@ async fn visible_changes(cx: &mut Context<'_>, rows: &mut Vec<TransactionRow>) {
                 .is_some_and(|c| !c.is_empty())
             || row.result.get("schema_environment_version").is_some()
     });
+    Ok(())
 }
 
 /// Host page shape also carries coverage when no visible commits were returned.
@@ -394,7 +396,17 @@ pub(crate) async fn change_page(
     after: u64,
     limit: usize,
 ) -> Result<Json, KipError> {
-    if limit == 0 || limit > 10000 || after > cx.pinned_seq {
+    change_page_through(cx, after, cx.pinned_seq, limit).await
+}
+
+/// A fixed inclusive coverage target; later commits cannot move a deadline.
+pub(crate) async fn change_page_through(
+    cx: &mut Context<'_>,
+    after: u64,
+    target: u64,
+    limit: usize,
+) -> Result<Json, KipError> {
+    if limit == 0 || limit > 10000 || after > target || target > cx.pinned_seq {
         return Err(KipError::constraint_violation("invalid change page bounds"));
     }
     let mut rows = journal(
@@ -404,6 +416,10 @@ pub(crate) async fn change_page(
             Box::new(Filter::Field((
                 "seq".into(),
                 RangeQuery::Gt(Fv::U64(after)),
+            ))),
+            Box::new(Filter::Field((
+                "seq".into(),
+                RangeQuery::Le(Fv::U64(target)),
             ))),
         ]),
     )
@@ -418,11 +434,11 @@ pub(crate) async fn change_page(
     let complete = rows.len() <= limit && after >= floor;
     rows.truncate(limit);
     let through = if complete {
-        cx.pinned_seq
+        target
     } else {
         rows.last().map_or(after, |r| r.seq)
     };
-    visible_changes(cx, &mut rows).await;
+    visible_changes(cx, &mut rows).await?;
     let coverage = serde_json::json!({"through_seq":through,"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
     let changes: Vec<_> = rows
         .iter()

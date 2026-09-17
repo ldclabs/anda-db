@@ -1,5 +1,9 @@
 # `anda_cognitive_nexus` — Technical Reference
 
+For the 0.13.1 protected Watch/wake host APIs, atomicity guarantees, real-time
+lease bounds and remaining host responsibilities, see
+[Durable Watch handoff](../rs/anda_cognitive_nexus/README.md#durable-watch-handoff-0131).
+
 Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).

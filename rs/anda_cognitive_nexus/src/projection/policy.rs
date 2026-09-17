@@ -35,6 +35,8 @@ pub struct Policy {
     pub trust_weights: std::collections::BTreeMap<String, f64>,
     #[serde(default = "default_trust_weight")]
     pub default_trust_weight: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contextual_trust_rules: Vec<crate::trust::ContextualTrustRule>,
     #[serde(default)]
     pub trust_version: String,
     pub context_refs: Vec<String>,
@@ -109,6 +111,7 @@ impl Policy {
             explicit_selection: false,
             trust_weights: Default::default(),
             default_trust_weight: 1.0,
+            contextual_trust_rules: Vec::new(),
             trust_version: String::new(),
             context_refs: Vec::new(),
             purpose: String::new(),

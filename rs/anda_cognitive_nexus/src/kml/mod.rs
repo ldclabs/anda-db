@@ -198,7 +198,7 @@ fn merge_parameters(
     Some(merged)
 }
 
-async fn plan(
+pub(crate) async fn plan(
     store: &Store,
     tx: &mut Transaction,
     statement: &KmlStatement,
