@@ -24,11 +24,16 @@
 //! one over `(space, state)` would assert that a Space contains at most one
 //! active element.
 //!
-//! Only three combinations in this schema really are unique — a Proposition's
-//! `tuple_key`, a Space's `space_id`, a transaction's `tx_id` — and each is
-//! already one column, marked `#[unique]`. Everything else is indexed per
-//! column and intersected with [`Filter::And`] at query time, which costs an
+//! Identity constraints such as a Proposition's `tuple_key`, a Space's
+//! `space_id`, and a transaction's `tx_id` are already single columns marked
+//! `#[unique]`. Everything else is indexed per column and intersected with
+//! [`Filter::And`] at query time, which costs an
 //! intersection and buys the ability to have two active elements.
+//!
+//! Optional text indexes omit the empty-string sentinel for "not supplied".
+//! This avoids a posting containing every keyless or non-expiring row. The
+//! stored values and rendered KIP views are unchanged; the index hook is
+//! installed before index creation or recovery on every open.
 //!
 //! ## Why the handles live in swappable slots
 //!
@@ -52,11 +57,13 @@ use anda_db::{
     collection::{Collection, CollectionConfig},
     database::AndaDB,
     error::DBError,
+    index::{BTree, DefaultIndexHooks, IndexHooks},
     query::{Filter, RangeQuery},
 };
-use anda_db_schema::Fv;
+use anda_db_schema::{Document, Fv};
 use anda_db_tfs::jieba_tokenizer;
 use anda_kip::{ElementKind, KipError, KipErrorCode};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -169,8 +176,8 @@ macro_rules! collections {
             ///
             /// Idempotent, and safe to call when nothing is poisoned: reopening a
             /// healthy handle costs a reload and changes no state. Each setup closure
-            /// runs again, which is what reinstalls the jieba tokenizer a freshly
-            /// loaded handle does not carry.
+            /// runs again, reinstalling the sparse index hooks and jieba
+            /// tokenizer before the freshly loaded handle recovers mutations.
             pub async fn reopen(&self) -> Result<(), KipError> {
                 $(self.$field.set(self.reload($name, $init).await?);)*
                 self.governance.reopen().await
@@ -230,6 +237,37 @@ collections! {
     commit_log: CommitLogRow = (COMMIT_LOG, init_commit_log, "Recoverable multi-collection commits"),
 }
 
+/// Used only for Core elements and the transaction journal. These fields use
+/// empty text for absence: optional view fields render it as absent, identity
+/// lookups reject it, and expiry scans only range over nonempty timestamps.
+/// Other fields, including state/status and required identity keys, retain
+/// the default indexing semantics. BM25 and HNSW also keep their defaults.
+struct SparseIndexHooks;
+
+impl IndexHooks for SparseIndexHooks {
+    fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+        let value = DefaultIndexHooks.btree_index_value(index, doc)?;
+        if matches!(
+            index.name(),
+            "expires_at"
+                | "client_key"
+                | "schema_ref"
+                | "key"
+                | "name"
+                | "canonical_id"
+                | "merged_into"
+                | "valid_until"
+                | "content_digest"
+                | "idempotency_key"
+        ) && matches!(value.as_ref(), Fv::Text(text) if text.is_empty())
+        {
+            None
+        } else {
+            Some(value)
+        }
+    }
+}
+
 async fn init_control(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["kind"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
@@ -246,18 +284,18 @@ async fn init_commit_log(c: &mut Collection) -> Result<(), DBError> {
 
 /// The columns every element kind is indexed on.
 ///
-/// `space` and `state` are the two predicates almost every query carries, and
-/// `seq` and `expires_at` are what the `CHANGES` cursor and the retention
-/// sweep range over.
+/// `space` and `state` are the two predicates almost every query carries;
+/// retention sweeps range over `expires_at`. `CHANGES` uses the transaction
+/// journal's `seq`, so current element rows do not need a `seq` index.
 ///
 /// The per-kind setups below are named functions rather than closures inlined
 /// at the open site because every *re*-open must run exactly the same setup:
 /// `create_*_nx` is a no-op once the index exists, but a freshly loaded handle
-/// starts with the default tokenizer and needs the jieba chain reinstalled.
+/// starts with default hooks and tokenizer and needs both reinstalled.
 async fn init_envelope(c: &mut Collection) -> Result<(), DBError> {
+    c.set_index_hooks(Arc::new(SparseIndexHooks));
     c.create_btree_index_nx(&["space"]).await?;
     c.create_btree_index_nx(&["state"]).await?;
-    c.create_btree_index_nx(&["seq"]).await?;
     c.create_btree_index_nx(&["expires_at"]).await?;
     Ok(())
 }
@@ -266,8 +304,8 @@ async fn init_concepts(c: &mut Collection) -> Result<(), DBError> {
     c.set_tokenizer(jieba_tokenizer());
     init_envelope(c).await?;
     // `key` is the logical identity `UPSERT ... MATCH {key: ...}` resolves. It
-    // is Space-local, so the lookup intersects this with `space`; it cannot be
-    // a unique composite because most Concepts carry no logical key at all.
+    // is Space-local and type-lineage scoped, so lookup intersects this with
+    // `space` and optionally `schema_ref`. Keyless Concepts are not indexed.
     c.create_btree_index_nx(&["key"]).await?;
     c.create_btree_index_nx(&["client_key"]).await?;
     c.create_btree_index_nx(&["schema_ref"]).await?;
@@ -308,16 +346,12 @@ async fn init_assertions(c: &mut Collection) -> Result<(), DBError> {
     // Projection's first move is always "every Assertion about this
     // Proposition", so this index is the one that has to be fast.
     c.create_btree_index_nx(&["proposition_id"]).await?;
-    c.create_btree_index_nx(&["asserted_by_key"]).await?;
     c.create_btree_index_nx(&["client_key"]).await?;
     c.create_btree_index_nx(&["status"]).await?;
     c.create_btree_index_nx(&["mode"]).await?;
     c.create_btree_index_nx(&["stance"]).await?;
-    c.create_btree_index_nx(&["evidence_ids"]).await?;
-    c.create_btree_index_nx(&["superseded_by"]).await?;
-    // Temporal eligibility ranges over these (§60). They are normalized UTC
-    // text, so lexicographic range *is* chronological range.
-    c.create_btree_index_nx(&["valid_from"]).await?;
+    // The lifecycle sweep ranges over closed validity windows. Projection
+    // checks valid_from on the Assertions fetched by proposition_id.
     c.create_btree_index_nx(&["valid_until"]).await?;
     Ok(())
 }
@@ -330,9 +364,6 @@ async fn init_evidence(c: &mut Collection) -> Result<(), DBError> {
     // Indexed for lookup, never for identity: two independent observations of
     // the same bytes are two observations (§73).
     c.create_btree_index_nx(&["content_digest"]).await?;
-    c.create_btree_index_nx(&["generated_by"]).await?;
-    c.create_btree_index_nx(&["corrected_by"]).await?;
-    c.create_btree_index_nx(&["observed_at"]).await?;
     c.create_bm25_index_nx(&["payload_inline"]).await?;
     Ok(())
 }
@@ -345,7 +376,6 @@ async fn init_activities(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["status"]).await?;
     // The provenance DAG is walked backward from outputs to inputs (§62).
     c.create_btree_index_nx(&["input_keys"]).await?;
-    c.create_btree_index_nx(&["output_keys"]).await?;
     Ok(())
 }
 
@@ -378,12 +408,12 @@ async fn init_element_versions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
+    c.set_index_hooks(Arc::new(SparseIndexHooks));
     c.create_btree_index_nx(&["tx_id"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
     // Idempotency is per Space — two Spaces may reuse a key — so the lookup
-    // intersects this with `space` (§80.4). It cannot be a unique composite:
-    // the empty string stands for "no key was supplied", and most
-    // transactions carry it.
+    // intersects this with `space` (§80.4). Keyless transactions are omitted
+    // from this index rather than sharing one large empty-string posting.
     c.create_btree_index_nx(&["idempotency_key"]).await?;
     c.create_btree_index_nx(&["seq"]).await?;
     c.create_btree_index_nx(&["changed_ids"]).await?;
@@ -915,9 +945,8 @@ impl Store {
                 Box::new(eq_field("space", Fv::Text(space.to_string()))),
                 Box::new(eq_field("state", Fv::Text("active".to_string()))),
                 Box::new(eq_field("status", Fv::Text("active".to_string()))),
-                // The empty string stores "no window", and sorts below every
-                // timestamp, so the range starts just above it rather than
-                // sweeping every claim that never declared one.
+                // Open-ended windows are absent from the sparse index; this
+                // range selects actual normalized timestamps through `now`.
                 Box::new(anda_db::query::Filter::Field((
                     "valid_until".to_string(),
                     anda_db::query::RangeQuery::Between(
@@ -959,9 +988,8 @@ impl Store {
                 .query_all_ids(anda_db::query::Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(space.to_string()))),
                     Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                    // The empty string stores "no expiry", and it sorts below
-                    // every timestamp — so the range starts just above it
-                    // rather than sweeping every element that never had one.
+                    // Elements without an expiry are absent from this sparse
+                    // index; range over actual timestamps through `now`.
                     Box::new(anda_db::query::Filter::Field((
                         "expires_at".to_string(),
                         anda_db::query::RangeQuery::Between(

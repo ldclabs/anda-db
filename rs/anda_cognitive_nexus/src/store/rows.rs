@@ -9,19 +9,17 @@
 //! **The envelope is repeated, not shared.** `space`, `state`, `version` and
 //! the `_system` columns appear in each struct instead of a nested block. A
 //! B-Tree index is built over a named column, so a nested envelope would put
-//! every selective predicate the engine has — Space, lifecycle state, change
-//! sequence — behind a JSON path.
+//! Space and lifecycle-state predicates behind a JSON path.
 //!
 //! **Every reference gets a key column beside its JSON.** The JSON is the
 //! record; the key is [`Endpoint::key`](crate::term::Endpoint::key), the
-//! deterministic string that makes reference equality an index lookup rather
-//! than a scan-and-compare.
+//! deterministic string used for reference equality. Only the columns used by
+//! indexed lookups need B-Tree indexes; other keys are read with their rows.
 //!
-//! **Absence is the empty string, not `Option`.** An `Option<T>` column is a
-//! `FieldType::Option`, which a B-Tree index cannot range over as one ordered
-//! domain. Since no legal value of these columns — an element id, a schema
-//! symbol, a normalized timestamp — is ever empty, `""` is an unambiguous
-//! "unset" that still sorts.
+//! **Absence is the empty string, not `Option`.** Optional text columns use
+//! `""` as their storage sentinel. The view omits absent values, and the
+//! store's sparse index hook omits these sentinels from B-Tree postings.
+//! Timestamp range scans therefore only visit actual normalized timestamps.
 
 use anda_db_schema::{AndaDBSchema, Json, Map};
 use serde::{Deserialize, Serialize};
@@ -244,7 +242,7 @@ pub struct AssertionRow {
     pub valid_until: String,
     /// The Evidence cited, with roles: `[{evidence_id, role}]`.
     pub evidence_refs: Vec<Json>,
-    /// The cited Evidence ids alone, for reverse lookup.
+    /// The cited Evidence ids alone, for projection and reference checks.
     pub evidence_ids: Vec<String>,
     /// The context this claim was made in.
     pub context_refs: Vec<Json>,
@@ -628,8 +626,8 @@ pub struct TransactionRow {
     pub transaction_class: String,
     /// The idempotency key, empty when the caller supplied none.
     ///
-    /// Scoped per Space by the composite index rather than by this column, so
-    /// two Spaces may reuse a key without colliding.
+    /// Lookup intersects this sparse index with `space`, so two Spaces may
+    /// reuse a key without colliding.
     pub idempotency_key: String,
     /// A digest of the request that produced it.
     pub request_digest: String,

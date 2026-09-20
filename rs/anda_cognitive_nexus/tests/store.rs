@@ -16,7 +16,11 @@ use anda_cognitive_nexus::{
     term::{Endpoint, Literal, tuple_key},
     time,
 };
-use anda_db::database::{AndaDB, DBConfig};
+use anda_db::{
+    collection::Collection,
+    database::{AndaDB, DBConfig},
+};
+use anda_db_schema::Fv;
 use anda_kip::ElementKind;
 use object_store::memory::InMemory;
 use serde_json::json;
@@ -429,6 +433,238 @@ async fn reopening_the_store_keeps_its_data_and_its_indexes() {
     // The Space sequence survived the reopen rather than restarting.
     let space = store.get_space(SPACE).await.unwrap();
     assert_eq!(space.seq, cx2.seq);
+}
+
+fn posting_ids(collection: &Collection, field: &str, value: &str) -> Vec<u64> {
+    collection
+        .get_btree_index(&[field])
+        .unwrap()
+        .query_with(&Fv::Text(value.into()), |ids| Some(ids.clone()))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn optional_element_indexes_stay_sparse_through_crud_and_recovery() {
+    let store = fresh_store("sparse_elements").await;
+    let cx = begin(&store).await;
+    // Default rows deliberately leave every optional string unset. Testing
+    // all five kinds also guards against installing the hook in only one
+    // collection's setup callback.
+    let cases: [(ElementId, &[&str], &[&str]); 5] = [
+        (
+            store.insert(&cx, &mut ConceptRow::default()).await.unwrap(),
+            &[
+                "expires_at",
+                "client_key",
+                "schema_ref",
+                "key",
+                "name",
+                "canonical_id",
+                "merged_into",
+            ],
+            &["seq"],
+        ),
+        (
+            store
+                .insert(&cx, &mut PropositionRow::default())
+                .await
+                .unwrap(),
+            &["expires_at"],
+            &["seq"],
+        ),
+        (
+            store
+                .insert(&cx, &mut AssertionRow::default())
+                .await
+                .unwrap(),
+            &["expires_at", "client_key", "valid_until"],
+            &[
+                "seq",
+                "asserted_by_key",
+                "evidence_ids",
+                "superseded_by",
+                "valid_from",
+            ],
+        ),
+        (
+            store
+                .insert(&cx, &mut EvidenceRow::default())
+                .await
+                .unwrap(),
+            &["expires_at", "client_key", "content_digest"],
+            &["seq", "generated_by", "corrected_by", "observed_at"],
+        ),
+        (
+            store
+                .insert(&cx, &mut ActivityRow::default())
+                .await
+                .unwrap(),
+            &["expires_at", "client_key"],
+            &["seq", "output_keys"],
+        ),
+    ];
+
+    for (id, sparse, removed) in &cases {
+        let collection = store.elements(id.kind);
+        for field in *sparse {
+            assert_eq!(
+                collection
+                    .get_btree_index(&[field])
+                    .unwrap()
+                    .stats()
+                    .num_elements,
+                0,
+                "{field}"
+            );
+        }
+        for field in *removed {
+            assert!(
+                collection.get_btree_index(&[field]).is_err(),
+                "unused index {field}"
+            );
+        }
+        assert_eq!(posting_ids(&collection, "state", "active"), vec![id.seq]);
+    }
+    // Empty values in ordinary indexes must not be skipped globally.
+    assert_eq!(
+        posting_ids(&store.assertions(), "status", ""),
+        vec![cases[2].0.seq]
+    );
+    store.flush(1_755_000_000_000).await.unwrap();
+
+    let values = ["", "2026-01-01T00:00:00.000Z", "2027-01-01T00:00:00.000Z"];
+    for (current, checkpoint) in [(values[1], false), (values[2], true), (values[0], false)] {
+        for (id, sparse, _) in &cases {
+            let collection = store.elements(id.kind);
+            collection
+                .update(
+                    id.seq,
+                    sparse
+                        .iter()
+                        .map(|field| (field.to_string(), Fv::Text(current.into())))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            for field in *sparse {
+                for value in values {
+                    let expected = if !value.is_empty() && value == current {
+                        vec![id.seq]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        posting_ids(&collection, field, value),
+                        expected,
+                        "{field} = {value:?}"
+                    );
+                }
+            }
+        }
+        if checkpoint {
+            store.flush(1_755_000_000_001).await.unwrap();
+        }
+        // With no checkpoint this replays durable mutation intents over the
+        // previous index snapshot, which must use the same sparse hook.
+        store.reopen().await.unwrap();
+        for (id, sparse, _) in &cases {
+            let collection = store.elements(id.kind);
+            for field in *sparse {
+                for value in values {
+                    let expected = if !value.is_empty() && value == current {
+                        vec![id.seq]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        posting_ids(&collection, field, value),
+                        expected,
+                        "reopened {field} = {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    for (id, sparse, _) in &cases {
+        let collection = store.elements(id.kind);
+        collection
+            .update(
+                id.seq,
+                sparse
+                    .iter()
+                    .map(|field| (field.to_string(), Fv::Text(values[1].into())))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        collection.remove(id.seq).await.unwrap().unwrap();
+    }
+    store.reopen().await.unwrap();
+    for (id, sparse, _) in &cases {
+        let collection = store.elements(id.kind);
+        assert!(!collection.contains(id.seq));
+        for field in *sparse {
+            assert_eq!(
+                collection
+                    .get_btree_index(&[field])
+                    .unwrap()
+                    .stats()
+                    .num_elements,
+                0,
+                "deleted {field}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyless_transactions_do_not_accumulate_an_empty_posting() {
+    let store = fresh_store("sparse_transactions").await;
+    for _ in 0..16 {
+        let cx = begin(&store).await;
+        store.journal(&cx, JournalEntry::default()).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .transactions()
+            .get_btree_index(&["idempotency_key"])
+            .unwrap()
+            .stats()
+            .num_elements,
+        0
+    );
+    store.flush(1_755_000_000_000).await.unwrap();
+    store.reopen().await.unwrap();
+
+    let cx = begin(&store).await;
+    store
+        .journal(
+            &cx,
+            JournalEntry {
+                idempotency_key: "retry-1".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Replaying an unflushed journal insert must reinstall the journal hook,
+    // independently of the hook on the five element collections.
+    store.reopen().await.unwrap();
+    assert!(posting_ids(&store.transactions(), "idempotency_key", "").is_empty());
+    assert_eq!(
+        store
+            .find_transaction_by_idempotency_key(SPACE, "retry-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .tx_id,
+        cx.tx_id
+    );
+    let cx = begin(&store).await;
+    store.journal(&cx, JournalEntry::default()).await.unwrap();
+    assert!(posting_ids(&store.transactions(), "idempotency_key", "").is_empty());
+    assert!(store.find_transaction(&cx.tx_id).await.unwrap().is_some());
 }
 
 #[tokio::test]

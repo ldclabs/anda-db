@@ -62,6 +62,39 @@ async fn ok(nexus: &CognitiveNexus, command: &str) -> Json {
     response.first_result().cloned().unwrap_or(Json::Null)
 }
 
+#[tokio::test]
+async fn sparse_concept_fields_preserve_absence_and_nonempty_matching() {
+    let nexus = nexus("sparse_concept_matching").await;
+    ok(&nexus, r#"CREATE CONCEPT ?c { TYPE "Person" }"#).await;
+    let all = ok(&nexus, r#"FIND(?c) WHERE { ?c CONCEPT {} }"#).await;
+    assert_eq!(all.as_array().unwrap().len(), 1);
+
+    // An absent optional field never matched a literal empty string in the
+    // rendered view. Omitting the sentinel from its index must preserve that.
+    for field in ["name", "key", "canonical_id"] {
+        let found = ok(
+            &nexus,
+            &format!(r#"FIND(?c) WHERE {{ ?c CONCEPT {{{field}: ""}} }}"#),
+        )
+        .await;
+        assert!(found.as_array().unwrap().is_empty(), "{field}");
+    }
+
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?named { TYPE "Person" NAME "Alice" SET FIELDS {key: "alice"} }"#,
+    )
+    .await;
+    for matcher in [r#"name: "Alice""#, r#"key: "alice""#] {
+        let found = ok(
+            &nexus,
+            &format!("FIND(?c) WHERE {{ ?c CONCEPT {{{matcher}}} }}"),
+        )
+        .await;
+        assert_eq!(found.as_array().unwrap().len(), 1, "{matcher}");
+    }
+}
+
 /// Two people, two preferences, three claims with different stances.
 async fn seeded(name: &str) -> CognitiveNexus {
     let nexus = nexus(name).await;
