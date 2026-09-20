@@ -213,7 +213,7 @@ N = indexed FVs, D = IDs in one posting, B = buckets, K = visited matches.
 |---|---|
 | Point lookup | Average O(1) |
 | Posting add/remove by ID | Average O(1); bounded scan for tiny vectors |
-| New/last-removed FV | Additional O(log N) ordered-key change; removing FV membership can scan its bucket |
+| New/last-removed FV | Additional O(log N) ordered-key change; average O(1) bucket membership insertion/removal |
 | Primitive range/prefix page | O(log N + K) |
 | Boolean range | Input-dependent interval algebra, then range scans; no full-index candidate materialization |
 | Include | Input sort/deduplication plus lookups/interval traversal |
@@ -221,10 +221,12 @@ N = indexed FVs, D = IDs in one posting, B = buckets, K = visited matches.
 | Flush | Dirty data serialization and O(B) bookkeeping, one bucket buffer |
 | Load | Read/decode referenced objects, rebuild posting and ordered-key structures |
 
-FVs exist in the posting map, ordered set and bucket membership vector/set:
-long keys can have several copies. Larger postings have an auxiliary PK map;
-small postings avoid it. Hash-table capacity and membership structures are
-material memory costs.
+FVs exist in the posting map, ordered set and bucket membership hash set:
+long keys have three owned copies. Bucket membership has no insertion-order
+contract; queries use the global ordered key set. Larger postings have a boxed
+auxiliary PK map, so small postings only reserve one optional pointer for it.
+Hash-table capacity remains a material memory cost; bucket iteration during
+flush can scan unused capacity after extensive deletions.
 
 Run `ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads`.
 The explicit opt-in keeps harness-free benchmarks out of release-mode

@@ -89,7 +89,6 @@
 //! - [`BTreeIndex::compact_buckets`] re-packs fragmented buckets using
 //!   best-fit-decreasing bin packing.
 
-use anda_db_utils::UniqueVec;
 mod posting;
 use posting::PostingList;
 mod state;
@@ -118,7 +117,7 @@ where
 {
     index: &'a BTreeIndex<PK, FV>,
     id: u32,
-    fields: &'a UniqueVec<FV>,
+    fields: &'a FxHashSet<FV>,
 }
 impl<PK, FV> Serialize for BucketView<'_, PK, FV>
 where
@@ -594,13 +593,18 @@ where
                 // Born dirty, so the hint is raised here rather than through
                 // `mark_bucket_dirty` (same ordering rationale).
                 self.dirty_hint.store(true, Ordering::Release);
-                entry.insert(BucketState::new(size, true, vec![field_value].into(), 1));
+                entry.insert(BucketState::new(
+                    size,
+                    true,
+                    FxHashSet::from_iter([field_value]),
+                    1,
+                ));
             }
             dashmap::Entry::Occupied(mut entry) => {
                 let bucket = entry.get_mut();
                 bucket.size = bucket.size.saturating_add(size);
                 self.mark_bucket_dirty(bucket);
-                bucket.fields.push(field_value);
+                bucket.fields.insert(field_value);
             }
         }
     }
@@ -636,10 +640,7 @@ where
         let previous_bucket_id = previous.bucket_id;
         if previous_bucket_id != current_bucket_id
             && let Some(mut previous_bucket) = self.buckets.get_mut(&previous_bucket_id)
-            && previous_bucket
-                .fields
-                .swap_remove_if(|key| key == field_value)
-                .is_some()
+            && previous_bucket.fields.remove(field_value)
         {
             let previous_size = posting_entry_size(field_value, previous);
             previous_bucket.size = previous_bucket.size.saturating_sub(previous_size);

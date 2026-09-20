@@ -90,7 +90,7 @@ where
         if fv_sizes.is_empty() {
             self.buckets.clear();
             self.buckets
-                .insert(0, BucketState::new(0, true, UniqueVec::default(), 1));
+                .insert(0, BucketState::new(0, true, FxHashSet::default(), 1));
             self.dirty_hint.store(true, Ordering::Release);
             self.max_bucket_id.store(0, Ordering::Relaxed);
             self.update_metadata(|m| {
@@ -189,7 +189,7 @@ where
 
             self.buckets.insert(
                 bucket_id,
-                BucketState::new(size, true, field_values.into(), 1),
+                BucketState::new(size, true, field_values.into_iter().collect(), 1),
             );
         }
         self.dirty_hint.store(true, Ordering::Release);

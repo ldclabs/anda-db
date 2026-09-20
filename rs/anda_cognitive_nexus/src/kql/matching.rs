@@ -30,7 +30,7 @@ use super::Context;
 use super::binding::{Binding, Solutions};
 use crate::id::ElementId;
 use crate::schema::{Intent, SymbolKind};
-use crate::store::eq_field;
+use crate::store::{eq_field, key_filter};
 use crate::term::Endpoint;
 
 /// The internal handle a `BELIEF (triple)` binds its resolved Proposition to.
@@ -1487,14 +1487,6 @@ fn tuple_matches(
         return false;
     }
     true
-}
-
-/// An index filter over one endpoint key column for a merge class.
-fn key_filter(column: &str, keys: &[String]) -> Filter {
-    Filter::Field((
-        column.to_string(),
-        RangeQuery::Include(keys.iter().map(|key| Fv::Text(key.clone())).collect()),
-    ))
 }
 
 /// An index filter over `predicate_ref` for every version of each lineage

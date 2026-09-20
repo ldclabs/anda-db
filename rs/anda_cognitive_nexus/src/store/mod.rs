@@ -618,6 +618,18 @@ pub fn eq_field(field: &str, value: Fv) -> Filter {
     Filter::Field((field.to_string(), RangeQuery::Eq(value)))
 }
 
+/// Matches an endpoint's merge-class keys. A singleton uses Eq so the
+/// collection can estimate its selectivity before intersecting space/state.
+pub(crate) fn key_filter(field: &str, keys: &[String]) -> Filter {
+    match keys {
+        [key] => eq_field(field, Fv::Text(key.clone())),
+        _ => Filter::Field((
+            field.to_string(),
+            RangeQuery::Include(keys.iter().cloned().map(Fv::Text).collect()),
+        )),
+    }
+}
+
 /// A filter matching several columns at once, by intersecting their indexes.
 ///
 /// This is the composite lookup, spelled as a conjunction rather than as a

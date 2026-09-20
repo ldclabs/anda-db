@@ -2870,7 +2870,7 @@ async fn test_load_buckets_reconciles_duplicate_postings_from_newer_bucket() {
         old_bucket.dirty,
         "stale source bucket should be marked dirty"
     );
-    assert!(!old_bucket.fields.contains(&"same".to_string()));
+    assert!(!old_bucket.fields.contains("same"));
     assert!(loaded.has_dirty_buckets());
 }
 
@@ -3267,7 +3267,7 @@ async fn test_load_buckets_empty_posting_tombstones_stale_lower_bucket_copy() {
         stale_bucket.dirty,
         "stale lower bucket must be marked dirty"
     );
-    assert!(!stale_bucket.fields.contains(&"same".to_string()));
+    assert!(!stale_bucket.fields.contains("same"));
     drop(stale_bucket);
     assert!(loaded.has_dirty_buckets());
 }
@@ -3335,7 +3335,7 @@ async fn test_flush_skips_posting_listed_by_a_non_owning_bucket() {
         .get_mut(&1)
         .unwrap()
         .fields
-        .push(apple.clone());
+        .insert(apple.clone());
 
     flush_to(&index, &mut store, now_ms()).await;
     assert!(!index.has_dirty_buckets());

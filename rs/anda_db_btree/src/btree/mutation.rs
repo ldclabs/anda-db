@@ -66,10 +66,7 @@ where
         if self.postings.get(key).is_some_and(|p| p.bucket_id == id) {
             return false;
         }
-        bucket
-            .fields
-            .swap_remove_if(|candidate| candidate == key)
-            .is_some()
+        bucket.fields.remove(key)
     }
 
     /// Inserts a document_id-field_value pair to the index
@@ -166,7 +163,7 @@ where
                 // Mark as dirty, needs to be persisted
                 self.mark_bucket_dirty(&mut b);
                 // Add field value to bucket if not already present
-                b.fields.push(field_value.clone());
+                b.fields.insert(field_value.clone());
             } else {
                 // If the current bucket is full, create a new one.
                 //
@@ -489,7 +486,7 @@ where
                         || bucket_entry.size < self.config.bucket_overload_size)
                 {
                     // Bucket has room (size already includes this fv via size_delta).
-                    bucket_entry.fields.push(fv);
+                    bucket_entry.fields.insert(fv);
                 } else {
                     // Bucket is over the soft limit; migrate this fv to a fresh
                     // bucket. A new posting was never listed by this bucket, so
@@ -539,7 +536,7 @@ where
                         // Bucket has enough space, update directly
                         nb.size = nb.size.saturating_add(size);
                         self.mark_bucket_dirty(&mut nb);
-                        nb.fields.push(field_value.clone());
+                        nb.fields.insert(field_value.clone());
                     } else {
                         // Bucket doesn't have enough space, need to migrate to the next bucket
                         new_bucket = true;

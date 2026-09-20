@@ -9,7 +9,9 @@ const SMALL_LIMIT: usize = 8;
 #[derive(Clone, Debug)]
 pub(super) struct PostingList<PK> {
     ids: Vec<PK>,
-    positions: Option<FxHashMap<PK, usize>>,
+    // Most distinct keys have short postings. Keep the hash-table header
+    // out of every posting until membership checks need a position map.
+    positions: Option<Box<FxHashMap<PK, usize>>>,
 }
 impl<PK> Default for PostingList<PK> {
     fn default() -> Self {
@@ -57,7 +59,7 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
                 .map(|(i, id)| (id, i))
                 .collect();
             self.ids.reserve(1);
-            self.positions = Some(positions);
+            self.positions = Some(Box::new(positions));
         }
         self.ids.push(id);
         true
@@ -123,7 +125,7 @@ impl<PK: Eq + Hash + Clone> From<Vec<PK>> for PostingList<PK> {
                     false
                 }
             });
-            let positions = (ids.len() > SMALL_LIMIT).then_some(positions);
+            let positions = (ids.len() > SMALL_LIMIT).then(|| Box::new(positions));
             Self { ids, positions }
         }
     }
@@ -147,6 +149,15 @@ mod tests {
         cell::Cell,
         hash::{Hash, Hasher},
     };
+
+    #[test]
+    fn short_postings_only_pay_for_a_vector_and_optional_pointer() {
+        assert_eq!(
+            std::mem::size_of::<PostingList<u64>>(),
+            std::mem::size_of::<Vec<u64>>() + std::mem::size_of::<usize>(),
+            "an unused position table must not inflate every distinct key"
+        );
+    }
 
     thread_local! {
         static HASH_PANIC_AFTER: Cell<Option<usize>> = const { Cell::new(None) };

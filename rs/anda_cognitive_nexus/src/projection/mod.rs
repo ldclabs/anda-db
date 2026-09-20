@@ -899,15 +899,7 @@ impl Context<'_> {
                         "state",
                         anda_db_schema::Fv::Text("active".to_string()),
                     )),
-                    Box::new(anda_db::query::Filter::Field((
-                        "subject_key".to_string(),
-                        anda_db::query::RangeQuery::Include(
-                            subject_keys
-                                .iter()
-                                .map(|key| anda_db_schema::Fv::Text(key.clone()))
-                                .collect(),
-                        ),
-                    ))),
+                    Box::new(crate::store::key_filter("subject_key", &subject_keys)),
                     Box::new(predicate),
                 ])),
             )

@@ -59,7 +59,6 @@ invalid query must be distinguished from an empty result.
 ## Related Crates
 
 - `anda_db` for collection-level query execution
-- `anda_db_utils` for supporting utilities such as `UniqueVec`
 
 ## License
 

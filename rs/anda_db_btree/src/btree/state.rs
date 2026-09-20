@@ -5,16 +5,18 @@ use super::*;
 pub(super) struct BucketState<FV> {
     pub(super) size: usize,
     pub(super) dirty: bool,
-    pub(super) fields: UniqueVec<FV>,
+    // Bucket membership has no ordering contract; queries use the global
+    // BTreeSet, and the bucket payload is serialized as a map.
+    pub(super) fields: FxHashSet<FV>,
     pub(super) dirty_version: u64,
 }
 impl<FV> Default for BucketState<FV> {
     fn default() -> Self {
-        Self::new(0, false, UniqueVec::default(), 0)
+        Self::new(0, false, FxHashSet::default(), 0)
     }
 }
 impl<FV> BucketState<FV> {
-    pub(super) fn new(size: usize, dirty: bool, fields: UniqueVec<FV>, dirty_version: u64) -> Self {
+    pub(super) fn new(size: usize, dirty: bool, fields: FxHashSet<FV>, dirty_version: u64) -> Self {
         Self {
             size,
             dirty,

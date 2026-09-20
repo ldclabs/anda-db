@@ -204,7 +204,8 @@ where
                     name: self.name.clone(),
                     source: err.into(),
                 })?;
-            let mut bks = UniqueVec::with_capacity(bucket.postings.len());
+            let mut bks =
+                FxHashSet::with_capacity_and_hasher(bucket.postings.len(), Default::default());
             let mut loaded_keys = Vec::with_capacity(bucket.postings.len());
             // Set when this bucket file contains stale entries (an empty
             // posting persisted by a pre-manifest release); the bucket is
@@ -241,7 +242,7 @@ where
                     self.detach_superseded_posting(&field_value, &previous, i);
                 }
 
-                bks.push(field_value.clone());
+                bks.insert(field_value.clone());
                 loaded_keys.push(field_value);
             }
 
