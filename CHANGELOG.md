@@ -2,6 +2,29 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.13.2] — 2026-09-20
+
+- Stop creating 13 unused B-Tree indexes on Core element collections. Keep
+  sequence indexes on the transaction journal and element version log for
+  change streams and historical reads.
+- Make 17 optional-text indexes sparse by omitting empty-string sentinels.
+  Install the same index hooks before index creation and mutation recovery on
+  every open, preserving stored rows and KIP absence semantics.
+- Use equality filters for singleton endpoint merge classes in KQL traversal
+  and `BELIEF SLOT`, allowing the existing query planner to estimate their
+  selectivity before intersecting Space and lifecycle filters.
+
+## [anda_db 0.13.1, anda_db_btree 0.13.1] — 2026-09-20
+
+- Replace bucket membership `UniqueVec` values with `FxHashSet`, eliminating
+  one owned copy of each field value and making membership removal average
+  constant time. Query ordering still comes from the global B-Tree key set.
+- Box optional posting position maps so short postings reserve only a pointer
+  for the map, while large postings retain fast membership checks and deletion.
+- Remove the unused `anda_db_utils` dependency from `anda_db_btree` and document
+  the memory/flush trade-off: hash-set traversal can increase flush CPU costs
+  for large or sparse buckets despite reducing resident index memory.
+
 ## [anda_cognitive_nexus 0.13.1] — 2026-09-17
 
 - Commit Watch firing, its reserved `watch_fire` Activity and a protected wake
