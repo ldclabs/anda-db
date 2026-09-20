@@ -148,9 +148,9 @@ async fn execute(
     // `source_actor` an element reference (`{id}` or `{type, key}`), so a bare
     // string is `InvalidRequestEnvelope` before any command runs — which is
     // exactly what a transport that deserializes the body reports.
-    let request: Request = match serde_json::from_value(body) {
+    let request = match Request::from_value(body) {
         Ok(request) => request,
-        Err(_) => return (None, Some("InvalidRequestEnvelope".to_string())),
+        Err(err) => return (None, Some(err.name().to_string())),
     };
 
     // The structural gate a real transport runs before dispatch

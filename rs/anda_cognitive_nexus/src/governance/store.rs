@@ -635,6 +635,7 @@ impl GovernanceStore {
 
     /// Creates a Grant.
     pub async fn create_grant(&self, draft: GrantDraft, actor: &str) -> Result<GrantRow, KipError> {
+        validate_condition_times(&draft.conditions)?;
         let now = time::now();
         let row = GrantRow {
             _id: 0,
@@ -868,6 +869,7 @@ impl GovernanceStore {
         draft: DelegationDraft,
         actor: &str,
     ) -> Result<DelegationRow, KipError> {
+        validate_condition_times(&draft.conditions)?;
         let now = time::now();
         let row = DelegationRow {
             _id: 0,
@@ -970,6 +972,9 @@ impl GovernanceStore {
         draft: PolicyDraft,
         actor: &str,
     ) -> Result<GovernancePolicyRow, KipError> {
+        for statement in &draft.statements {
+            validate_condition_times(&statement.conditions)?;
+        }
         let version = self
             .active_policy(&draft.policy_id)
             .await?
@@ -1062,6 +1067,9 @@ impl GovernanceStore {
         draft: ApprovalDraft,
         actor: &str,
     ) -> Result<ApprovalRow, KipError> {
+        if !draft.expires_at.is_empty() {
+            time::normalize(&draft.expires_at, "approval.expires_at")?;
+        }
         let now = time::now();
         let row = ApprovalRow {
             _id: 0,
@@ -1703,6 +1711,18 @@ pub struct ApprovalDraft {
     pub allow_self_approval: bool,
     /// When the approval stops being usable; empty for no expiry.
     pub expires_at: String,
+}
+
+fn validate_condition_times(conditions: &AuthorityConditions) -> Result<(), KipError> {
+    for (field, value) in [
+        ("conditions.valid_from", &conditions.valid_from),
+        ("conditions.valid_until", &conditions.valid_until),
+    ] {
+        if !value.is_empty() {
+            time::normalize(value, field)?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether a record with these timestamps was in force at an instant.

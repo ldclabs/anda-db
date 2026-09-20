@@ -14,7 +14,7 @@ async function withNexus(name: string, body: (nexus: CognitiveNexus) => void): P
 }
 const original: IngestEvidence = {
   key: 'msg1', client_key: 'thread:submission:message', evidence_class: 'user_statement',
-  payload: {text: 'first message'}, observed_at: '2026-09-07T00:00:00Z',
+  payload: {text: 'first message'}, observed_at: '2026-09-07T00:00:00.000Z',
 }
 function mint(nexus: CognitiveNexus, evidence: IngestEvidence[]) {
   const command = parseKip('UPSERT CONCEPT ?c { MATCH {type: "Person", key: "actor"} SET FIELDS {name: "Actor"} }')
@@ -29,7 +29,7 @@ it('rejects a reused key whose observation changed, while keeping retries idempo
     for (const conflicting of [
       {...original, payload: {text: 'changed message'}},
       {...original, evidence_class: 'tool_result'},
-      {...original, observed_at: '2026-09-08T00:00:00Z'},
+      {...original, observed_at: '2026-09-08T00:00:00.000Z'},
     ]) expect(() => mint(nexus, [conflicting])).toThrowError(/different observation/)
     expect(nexus.query('FIND(COUNT(?e)) WHERE { ?e EVIDENCE {} }')).toEqual([1])
   })

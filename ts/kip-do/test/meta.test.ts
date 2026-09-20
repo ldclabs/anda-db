@@ -55,7 +55,7 @@ const SETUP = `MUTATE {
   CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE ASSERTION ?a {
-    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00Z" }
+    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00.000Z" }
   }
 }`
 

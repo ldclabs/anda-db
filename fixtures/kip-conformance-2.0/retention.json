@@ -7,7 +7,7 @@
   "cases": [
     {
       "name": "a retention block is written onto the element the target names",
-      "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+      "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2030-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
       "expect": {}
     },
     {
@@ -39,7 +39,7 @@
     },
     {
       "name": "a member outside the hook's shape is refused, not stored and lost",
-      "command": "SET RETENTION ?c {retention_class: \"standard\", review_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+      "command": "SET RETENTION ?c {retention_class: \"standard\", review_at: \"2030-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
       "expect": {
         "error": "SchemaFieldNotFound"
       }
@@ -55,7 +55,7 @@
       "name": "an expires_at that is not a timestamp is refused",
       "command": "SET RETENTION ?c {expires_at: \"whenever\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
       "expect": {
-        "error": "TypeMismatch"
+        "error": "ConstraintViolation"
       }
     },
     {
@@ -69,7 +69,7 @@
     },
     {
       "name": "the block replaces rather than patches",
-      "command": "SET RETENTION ?c {expires_at: \"2031-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+      "command": "SET RETENTION ?c {expires_at: \"2031-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
       "expect": {}
     },
     {
@@ -83,7 +83,7 @@
     },
     {
       "name": "a lapsed retention is a sweep's business, not recall's",
-      "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2020-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Bob\"} }",
+      "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2020-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Bob\"} }",
       "expect": {}
     },
     {

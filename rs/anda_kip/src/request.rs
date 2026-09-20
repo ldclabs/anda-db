@@ -169,7 +169,19 @@ impl Request {
 
     /// Decode a wire request without losing numeric source digits or duplicate keys.
     pub fn from_json(source: &str) -> Result<Self, KipError> {
-        let request: Self = serde_json::from_value(crate::parse_canonical_json(source)?)
+        Self::from_value(crate::parse_canonical_json(source)?)
+    }
+
+    /// Decode an envelope while preserving protocol timestamp error classes.
+    pub fn from_value(value: Json) -> Result<Self, KipError> {
+        if let Some(entries) = value.pointer("/ingest/evidence").and_then(Json::as_array) {
+            for entry in entries {
+                if let Some(at) = entry.get("observed_at") {
+                    crate::timestamp::validate_value(at, "ingest.observed_at")?;
+                }
+            }
+        }
+        let request: Self = serde_json::from_value(value)
             .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?;
         request.validate()?;
         Ok(request)
@@ -883,7 +895,9 @@ impl IngestEvidence {
             limits::OPAQUE_TOKEN,
         )?;
         validate_optional_non_empty(&self.media_type, "ingest media_type", limits::SHORT_LABEL)?;
-        validate_optional_non_empty(&self.observed_at, "ingest observed_at", limits::SHORT_LABEL)?;
+        if let Some(at) = &self.observed_at {
+            crate::timestamp::parse(at, "ingest.observed_at")?;
+        }
         if let Some(source_actor) = &self.source_actor {
             source_actor.validate("ingest source_actor")?;
         }
@@ -2089,7 +2103,7 @@ mod tests {
                 space_seq: Some(4201),
                 snapshot_seq: Some(4200),
                 space_id: Some("space-1".into()),
-                committed_at: Some("2026-08-16T00:00:00Z".into()),
+                committed_at: Some("2026-08-16T00:00:00.000Z".into()),
                 transaction_class: None,
                 request_digest: None,
                 semantic_plan_digest: None,

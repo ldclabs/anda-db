@@ -663,7 +663,7 @@ async fn a_retention_member_the_hook_does_not_have_is_refused() {
     let (nexus, created) = seeded("retention_shape").await;
     let error = err(
         &nexus,
-        r#"SET RETENTION :x {retention_class: "standard", review_at: "2030-01-01T00:00:00Z"}"#,
+        r#"SET RETENTION :x {retention_class: "standard", review_at: "2030-01-01T00:00:00.000Z"}"#,
         json!({"x": handle(&created, "alice")}),
     )
     .await;
@@ -679,13 +679,13 @@ async fn a_retention_sweep_acts_on_what_lapsed_and_reports_what_it_left() {
     let dark = handle(&created, "dark");
     ok(
         &nexus,
-        r#"SET RETENTION :x {retention_class: "short", expires_at: "2020-01-01T00:00:00Z"}"#,
+        r#"SET RETENTION :x {retention_class: "short", expires_at: "2020-01-01T00:00:00.000Z"}"#,
         json!({"x": alice.clone()}),
     )
     .await;
     ok(
         &nexus,
-        r#"SET RETENTION :x {expires_at: "2020-01-01T00:00:00Z", legal_hold: true}"#,
+        r#"SET RETENTION :x {expires_at: "2020-01-01T00:00:00.000Z", legal_hold: true}"#,
         json!({"x": dark.clone()}),
     )
     .await;

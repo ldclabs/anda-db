@@ -79,11 +79,7 @@ pub fn validate_lease_transition(
     now: &str,
 ) -> Result<(), KipError> {
     let fail = |message: &str| Err(KipError::constraint_violation(message));
-    let instant = |value: &str| {
-        chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
-            KipError::constraint_violation("lease expiry must be an RFC 3339 timestamp")
-        })
-    };
+    let instant = |value: &str| crate::timestamp::parse(value, "lease expiry");
     let now = instant(now)?;
     let Some(after) = after else {
         if before.is_some() || matches!(after_status, "running" | "completed" | "failed") {
@@ -96,11 +92,13 @@ pub fn validate_lease_transition(
     }
     let fence = after["fencing_token"].as_u64().unwrap_or(0);
     let attempts = after["attempt_count"].as_u64().unwrap_or(0);
-    let expiry = instant(after["expires_at"].as_str().unwrap_or(""))?;
+    crate::timestamp::validate_value(&after["expires_at"], "lease expiry")?;
+    let expiry = instant(after["expires_at"].as_str().unwrap())?;
     if let Some(before) = before {
         let old_fence = before["fencing_token"].as_u64().unwrap_or(0);
         let old_attempts = before["attempt_count"].as_u64().unwrap_or(0);
-        let old_expiry = instant(before["expires_at"].as_str().unwrap_or(""))?;
+        crate::timestamp::validate_value(&before["expires_at"], "lease expiry")?;
+        let old_expiry = instant(before["expires_at"].as_str().unwrap())?;
         let expired = old_expiry <= now;
         if after_status == "running" && (expired || before_status != "running") {
             if fence != old_fence + 1
@@ -267,9 +265,9 @@ mod tests {
 
     #[test]
     fn lease_expiry_and_takeover_reject_old_worker_completion() {
-        let old = json!({"owner":"worker-a","fencing_token":1,"attempt_count":1,"expires_at":"2026-09-07T00:00:00Z"});
-        let new = json!({"owner":"worker-b","fencing_token":2,"attempt_count":2,"expires_at":"2026-09-09T00:00:00Z"});
-        let now = "2026-09-08T00:00:00Z";
+        let old = json!({"owner":"worker-a","fencing_token":1,"attempt_count":1,"expires_at":"2026-09-07T00:00:00.000Z"});
+        let new = json!({"owner":"worker-b","fencing_token":2,"attempt_count":2,"expires_at":"2026-09-09T00:00:00.000Z"});
+        let now = "2026-09-08T00:00:00.000Z";
         assert!(
             validate_lease_transition(
                 "running",

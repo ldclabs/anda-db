@@ -1,9 +1,15 @@
 # Anda Brain 对接 Nexus：KIP CognitiveMemory 2.1
 
-本次实现对应 KIP `d6e3a45`。协议版本仍是 KIP 2.0，标准包是
+本次实现对应 KIP `dcde1de`。协议版本仍是 KIP 2.0，标准包是
 `kip://profiles/cognitive-memory@2.1.0`。Rust 与 SQLite/Durable Object 引擎均已提供
 下列接口。Brain 的检索策略、调度循环、工具适配器与五意图 Memory Interface
 由 Anda Brain 接入；数据库负责权限、引用、版本、事务和记录有效性。
+
+所有协议时间输入必须是 `YYYY-MM-DDTHH:mm:ss.SSSZ`，整秒也必须写成
+`.000Z`。非规范字符串（包括时区偏移和非法日期）返回 `ConstraintViolation`，
+数字等非字符串返回 `TypeMismatch`；只有字段契约允许时才能省略或传 `null`。
+宿主接口、Profile 字段和查询时间参数遵循同一规则。引擎生成时间截断到毫秒，
+不自动转换客户端输入；提交顺序仍以 `space_seq` 为准，不能依赖时间戳唯一。
 
 ## 宿主初始化
 
@@ -122,7 +128,7 @@ Trial 的重放内容必须包含 `rule`、`parameters`、`basis`、`baseline_at
       "status": "active",
       "corrected_by": [],
       "principal_id": "实际观察者身份",
-      "observed_at": "2026-09-07T00:00:00Z"
+      "observed_at": "2026-09-07T00:00:00.000Z"
     }
   }
 }

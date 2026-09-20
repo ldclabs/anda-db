@@ -674,7 +674,7 @@ async fn an_instant_resolves_to_the_sequence_it_names() {
     // committed at or before it, which is the head — not a future coordinate.
     let later = ok(
         &nexus,
-        r#"DESCRIBE SNAPSHOT AT TIME "2999-01-01T00:00:00Z""#,
+        r#"DESCRIBE SNAPSHOT AT TIME "2999-01-01T00:00:00.000Z""#,
     )
     .await;
     assert_eq!(later["space_seq"], serde_json::json!(seq));
@@ -684,7 +684,7 @@ async fn an_instant_resolves_to_the_sequence_it_names() {
     // retention floor.
     let before = ok(
         &nexus,
-        r#"DESCRIBE SNAPSHOT AT TIME "1990-01-01T00:00:00Z""#,
+        r#"DESCRIBE SNAPSHOT AT TIME "1990-01-01T00:00:00.000Z""#,
     )
     .await;
     assert_eq!(before["space_seq"], serde_json::json!(0));

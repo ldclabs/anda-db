@@ -455,12 +455,12 @@ describe('KML', () => {
         const alice = nexus.execute(SETUP).handles.alice!
         const before = concept(nexus, alice)
         nexus.execute(
-          `SET RETENTION "${alice}" {retention_class: "short", expires_at: "2030-01-01T00:00:00Z"}`,
+          `SET RETENTION "${alice}" {retention_class: "short", expires_at: "2030-01-01T00:00:00.000Z"}`,
         )
         const after = concept(nexus, alice)
         expect(after.retention).toEqual({
           retention_class: 'short',
-          expires_at: '2030-01-01T00:00:00Z',
+          expires_at: '2030-01-01T00:00:00.000Z',
         })
         // Lifted out of the block so the sweep can index it (§19.2), and
         // normalized on the way — the sweep compares strings.
@@ -503,7 +503,7 @@ describe('KML', () => {
       await withNexus('set-retention-shape', (nexus) => {
         const alice = nexus.execute(SETUP).handles.alice!
         const result = nexus.tryExecute(
-          `SET RETENTION "${alice}" {retention_class: "standard", review_at: "2030-01-01T00:00:00Z"}`,
+          `SET RETENTION "${alice}" {retention_class: "standard", review_at: "2030-01-01T00:00:00.000Z"}`,
         )
         expect('error' in result && result.error.code).toBe('SchemaFieldNotFound')
       })
@@ -801,7 +801,7 @@ describe('KML', () => {
       payload: "I prefer dark mode, and my address is 12 Elm Street.",
       content_digest: "sha3-256:d1ge5t",
       media_type: "text/plain",
-      observed_at: "2026-08-16T09:00:00Z"
+      observed_at: "2026-08-16T09:00:00.000Z"
     }
   }
   CREATE ASSERTION ?a {

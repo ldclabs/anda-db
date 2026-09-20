@@ -203,14 +203,14 @@ export function validateDurable(tx: Transaction): void {
           fail('running and terminal tasks require retained fenced lease')
         continue
       }
-      const expiry = normalizeTime(String(lease.expires_at), 'lease expiry')
+      const expiry = normalizeTime(lease.expires_at, 'lease expiry')
       lease.expires_at = expiry
       if (status === 'completed' && beforeStatus !== 'running')
         fail('only a leased running task can complete')
       const fence = Number(lease.fencing_token),
         attempts = Number(lease.attempt_count)
       if (old) {
-        const oldExpiry = normalizeTime(String(old.expires_at), 'lease expiry'),
+        const oldExpiry = normalizeTime(old.expires_at, 'lease expiry'),
           expired = oldExpiry <= tx.cx.at
         if (status === 'running' && (expired || beforeStatus !== 'running')) {
           if (
@@ -502,7 +502,7 @@ export function leaseTask(
     const takeover =
       row.attributes.status !== 'running' ||
       (!!old &&
-        normalizeTime(String(old.expires_at), 'lease expiry') <= tx.cx.at)
+        normalizeTime(old.expires_at, 'lease expiry') <= tx.cx.at)
     const lease = {
       owner: session.auth.principal_id,
       fencing_token: Number(old?.fencing_token ?? 0) + Number(takeover || !old),
@@ -690,7 +690,7 @@ function checkDispatch(
     !lease ||
     lease.owner !== session.auth.principal_id ||
     lease.fencing_token !== request.fencing_token ||
-    normalizeTime(String(lease.expires_at), 'lease expiry') <= nowTime()
+    normalizeTime(lease.expires_at, 'lease expiry') <= nowTime()
   )
     throw errors.versionConflict(
       'dispatch requires current unexpired lease fence',

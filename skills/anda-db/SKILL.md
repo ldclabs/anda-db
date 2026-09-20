@@ -1,24 +1,63 @@
 ---
 name: anda-db
-description: Use this skill whenever you need to help users work with AndaDB in Rust programs or update AndaDB repository documentation. This includes creating databases and collections, deriving schemas, CRUD operations, B-Tree filters, BM25 full-text search, HNSW vector search, hybrid retrieval, object-store persistence, encrypted storage, KIP/Cognitive Nexus integration, and avoiding outdated ciborium-era examples. Invoke it when users mention AndaDB, AI agent memory, embedding storage, hybrid search, KIP, or Cognitive Nexus in this repository.
+description: Build and maintain Rust applications using AndaDB, including schemas, document CRUD, indexed retrieval, persistence, and object-store wrappers. Use when updating AndaDB examples or API documentation, or integrating this repository's KIP and Cognitive Nexus engines.
 ---
 
-# AndaDB Skill
+# AndaDB
 
-This skill provides source-aligned guidance for working with the current Anda DB
-workspace. Prefer the patterns below over older examples that used direct
-`AndaDB::create(store, ...)`, unwrapped `LocalFileSystem`, `Vec<bf16>` literals,
-or `ciborium`.
+Use the checked-out source as the authority for API signatures and behavior.
+This skill targets the workspace's 0.13 release family (Rust edition 2024,
+MSRV 1.95). Crate patch versions differ; check each `Cargo.toml` when pinning
+versions. Examples use the public `anda_db` re-exports.
 
-## Quick Start Template
+## Choose the relevant reference
+
+- [Core API](references/anda_db_quick_ref.md): collection lifecycle, CRUD,
+  B-Tree/BM25/HNSW indexes, filtered search, pagination, and maintenance.
+- [Schemas and CBOR](references/schema_and_cbor.md): nested `FieldTyped`
+  structs, type overrides, serialization, and schema upgrades.
+- [Storage and recovery](references/storage_and_recovery.md): local or cloud
+  backends, encryption, cache budgets, cancellation, and graceful shutdown.
+- [KIP and Cognitive Nexus](references/kip_and_nexus.md): protocol versus
+  engine APIs, the TypeScript engine, host integration, and conformance checks.
+
+Read the reference needed for the task; ordinary document storage needs only
+the core API. Repository links resolve relative to this skill's files; they
+require an AndaDB checkout.
+
+## Dependencies and features
+
+For a local embedded application:
+
+```toml
+[package]
+name = "anda-memory-example"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+anda_db = { version = "0.13", features = ["full"] }
+anda_object_store = "0.13"
+object_store = { version = "0.14", features = ["fs"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+`anda_db/full` only enables `object_store/fs`. B-Tree, BM25, HNSW and Jieba
+are already available without it. Add `anda_db_hnsw = "0.13"` only for direct
+low-level types such as `DistanceMetric`; add `cbor2 = "1"` for direct CBOR
+work and `tokio-util = "0.7"` for `CancellationToken` with `auto_flush`.
+
+## Working example
 
 ```rust
 use anda_db::{
     collection::CollectionConfig,
     database::{AndaDB, DBConfig},
     index::HnswConfig,
-    query::{Query, Search},
-    schema::{AndaDBSchema, Vector, vector_from_f32},
+    query::{Filter, Query, RangeQuery, Search},
+    schema::{AndaDBSchema, Fv, Vector, vector_from_f32},
     storage::StorageConfig,
 };
 use anda_object_store::MetaStoreBuilder;
@@ -29,7 +68,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize, AndaDBSchema)]
 struct Memory {
     _id: u64,
-    title: String,
+    topic: String,
     body: String,
     embedding: Vector,
 }
@@ -40,16 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(
         MetaStoreBuilder::new(
             LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
-            10000,
-        ).build(),
+            10_000,
+        )
+        .build(),
     );
-
     let db = AndaDB::connect(
         store,
         DBConfig {
             name: "agent_memory".into(),
             description: "Embedded AI memory".into(),
-            storage: StorageConfig::default(),
+            storage: StorageConfig::default().with_cache_max_bytes(64 * 1024 * 1024),
             lock: None,
         },
     )
@@ -63,7 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 description: "Long-term memory collection".into(),
             },
             async |c| {
-                c.create_bm25_index_nx(&["title", "body"]).await?;
+                // Install a custom tokenizer/hooks here, before index creation.
+                c.create_btree_index_nx(&["topic"]).await?;
+                c.create_bm25_index_nx(&["topic", "body"]).await?;
                 c.create_hnsw_index_nx(
                     "embedding",
                     HnswConfig {
@@ -79,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let id = memories
         .add_from(&Memory {
-            _id: 0,
-            title: "Rust".into(),
+            _id: 0, // The collection allocates the real id.
+            topic: "rust".into(),
             body: "Rust is well suited to embedded AI memory services.".into(),
             embedding: vector_from_f32(vec![0.1, 0.2, 0.3, 0.4]),
         })
@@ -93,233 +134,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
                 ..Default::default()
             }),
+            filter: Some(Filter::Field((
+                "topic".into(),
+                RangeQuery::Eq(Fv::Text("rust".into())),
+            ))),
             limit: Some(10),
-            ..Default::default()
         })
         .await?;
 
     let loaded: Memory = memories.get_as(id).await?;
-    println!("Loaded {}, found {}", loaded.title, results.len());
-
+    println!("Loaded {}, found {}", loaded.topic, results.len());
     db.close().await?;
     Ok(())
 }
 ```
 
-## Core Dependencies
+## Essential constraints
 
-```toml
-[dependencies]
-anda_db = { version = "0.13", features = ["full"] }
-anda_object_store = "0.13"
-object_store = { version = "0.14", features = ["fs"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+- Share one live writer instance per database namespace, including within a
+  process. Clone `AndaDB` / `Arc<Collection>` for concurrent tasks. `DBConfig::lock`
+  is a stored token check, not a distributed writer lease.
+- Await mutating operations to completion. Dropping an in-flight mutation can
+  poison the collection; recover by reopening it through the database. See
+  [cancellation and shutdown](references/storage_and_recovery.md#cancellation-and-shutdown).
+- Configure indexes in the `&mut Collection` open callback. An already active
+  cached handle is returned without running that callback again. Close with
+  `db.close_collection(name).await?` before reopening to change configuration.
+- Use stored `Vector` values via `vector_from_f32`; queries use `Vec<f32>`.
+  Match the embedding model's dimension and metric explicitly.
+- Filters name B-Tree indexes; `_id` is queryable without creating one.
+  Multi-field B-Tree indexes are always unique and support tuple equality,
+  not tuple-ordered ranges.
+- Use `cbor2`; do not introduce direct `ciborium` usage. Encoded sizes use
+  `cbor2::serialized_size`.
+
+## Source and validation
+
+Check implementations as well as prose when changing examples:
+
+- [Core example](../../rs/anda_db/examples/db_demo.rs) and
+  [core documentation](../../docs/anda_db.md).
+- [Database lifecycle](../../rs/anda_db/src/database.rs),
+  [collection operations](../../rs/anda_db/src/collection/), and
+  [query types](../../rs/anda_db/src/query.rs).
+- [Schema implementation](../../rs/anda_db_schema/src/),
+  [derive implementation](../../rs/anda_db_derive/src/), and
+  [storage wrappers](../../rs/anda_object_store/src/).
+
+For documentation-only changes, compile/run changed runnable examples against
+local path dependencies in a temporary project; Markdown code fences in this
+skill are not Cargo doctests. For code changes, run affected crate tests, then
+the workspace checks required by the task:
+
+```bash
+cargo check --workspace --all-features
+cargo test --workspace --all-features
+cargo run -p anda_db --example db_demo --features full
 ```
 
-Add direct low-level crates only when using their public APIs directly:
-
-```toml
-anda_db_hnsw = "0.13"       # e.g. DistanceMetric
-cbor2 = "1"               # direct CBOR values, readers, writers, size
-```
-
-## Current API Rules
-
-- Use `Arc<dyn object_store::ObjectStore>` when opening a database.
-- Prefer `AndaDB::connect` for application startup; use `create` or `open` only
-  when the failure mode matters.
-- Prefer `open_or_create_collection` plus `_nx` index creation methods for
-  idempotent startup.
-- Use `add_from(&typed_value)`, `get_as::<T>(id)`, and `search_as::<T>(query)`
-  for typed application structs.
-- `search_as`, `search`, and `search_ids` take `Query` by value, not `&Query`.
-- Stored vector fields use `anda_db::schema::Vector`; query vectors use
-  `Vec<f32>`. Convert stored vectors with `vector_from_f32`.
-- For filters, wrap values in `Fv`/`FieldValue`, for example
-  `RangeQuery::Eq(Fv::Text("active".into()))`.
-- Never wrap mutating calls (`add*`, `update`, `remove`, `flush`, `close`,
-  extension writes) in `tokio::select!`/`timeout`: dropping such a future
-  mid-operation poisons the collection handle (cancellation is treated as a
-  crash). A poisoned handle rejects further mutations; reads can lag storage. Reopen it via
-  `db.open_collection(...)`, which discards the poisoned handle and recovers
-  from storage. Storage failures with unknown outcomes poison the handle the
-  same way.
-- Wrap `LocalFileSystem` with `MetaStoreBuilder`: the native 0.14 backend does not implement conditional PUT updates.
-- Local deployments needing durable writes should enable `LocalFileSystem::with_fsync(true)`. In object_store 0.14.1 this does not cover standalone deletes; do not claim complete host-power-loss durability from this setting alone.
-- One live writer process per database: this is a deployment contract. A
-  `Precondition` error from flush means a second writer touched the storage.
-
-## Type Mapping (Rust -> AndaDB)
-
-| Rust Type | AndaDB FieldType |
-|-----------|------------------|
-| `bool` | `Bool` |
-| `i8` through `i64`, `isize` | `I64` |
-| `u8` through `u64`, `usize` | `U64` |
-| `f32` | `F32` |
-| `f64` | `F64` |
-| `String`, `&str` | `Text` |
-| `Vec<u8>`, `[u8; N]` | `Bytes` |
-| `Vector` / `Vec<bf16>` | `Vector` |
-| `Vec<T>` | `Array(T)` |
-| `BTreeMap<String, V>` / `HashMap<String, V>` | `Map(String, V)` |
-| `Option<T>` | `Option(T)` |
-| `serde_json::Value` | `Json` |
-
-For arbitrary binary payloads serialized through Serde, use explicit bytes
-types such as `FieldValue::Bytes` or Serde byte helpers where appropriate. Do
-not assume every `Vec<u8>` inside a nested arbitrary type will be treated as a
-CBOR byte string.
-
-## Derive Macro Attributes
-
-```rust
-use anda_db::schema::{AndaDBSchema, Vector};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, AndaDBSchema)]
-struct Doc {
-    _id: u64,                 // reserved document id field
-    #[serde(rename = "name")] // schema field name follows serde rename
-    title: String,
-    #[field_type = "Bytes"]   // override inferred field type
-    #[unique]                 // enforce uniqueness when indexed
-    checksum: [u8; 32],
-    /// Used by LLM context and schema documentation.
-    embedding: Vector,
-}
-```
-
-## Index Types
-
-Create indexes during `open_or_create_collection` startup. Prefer `_nx` methods
-when startup can run repeatedly.
-
-**HNSW (vector search)**
-
-```rust
-c.create_hnsw_index_nx(
-    "embedding",
-    HnswConfig {
-        dimension: 384,
-        ..Default::default()
-    },
-)
-.await?;
-```
-
-If you need a non-default distance metric, add `anda_db_hnsw` as a direct
-dependency and set `distance_metric: anda_db_hnsw::DistanceMetric::Cosine`.
-
-**B-Tree (exact match / range filters)**
-
-```rust
-c.create_btree_index_nx(&["category"]).await?;
-c.create_btree_index_nx(&["tenant", "created_at"]).await?;
-```
-
-**BM25 (full-text search)**
-
-```rust
-c.create_bm25_index_nx(&["title", "body"]).await?;
-```
-
-For Chinese tokenization, pass `anda_db::index::jieba_tokenizer()` to
-`Collection::set_tokenizer` at the start of every open callback, before any
-query, mutation or index creation triggers recovery — it is always
-available and needs no cargo feature. See `rs/anda_db/examples/db_demo.rs`
-(the example itself requires `--features full`, which only enables
-`object_store/fs`).
-
-## Document CRUD
-
-```rust
-use anda_db::schema::Fv;
-use std::collections::BTreeMap;
-
-let id = collection.add_from(&doc).await?;
-let loaded: MyDoc = collection.get_as(id).await?;
-
-let mut fields = BTreeMap::new();
-fields.insert("status".to_string(), Fv::Text("archived".into()));
-let updated = collection.update(id, fields).await?;
-
-let removed = collection.remove(id).await?;
-```
-
-Use `collection.add(document)` only when you are already working with an
-`anda_db::schema::Document`.
-
-## Search with Filters
-
-```rust
-use anda_db::query::{Filter, Query, RRFReranker, RangeQuery, Search};
-use anda_db::schema::Fv;
-
-let results: Vec<MyDoc> = collection
-    .search_as(Query {
-        search: Some(Search {
-            text: Some("query text".into()),
-            vector: Some(vec![0.1_f32; 384]),
-            reranker: Some(RRFReranker::default()),
-            ..Default::default()
-        }),
-        filter: Some(Filter::Field((
-            "category".into(),
-            RangeQuery::Eq(Fv::Text("news".into())),
-        ))),
-        limit: Some(20),
-    })
-    .await?;
-```
-
-## CBOR Rules
-
-Use `cbor2` directly:
-
-```rust
-use cbor2::{from_reader, serialized_size, to_writer};
-
-let mut buf = Vec::new();
-to_writer(&value, &mut buf)?;
-let size = serialized_size(&value)?;
-let decoded = from_reader(buf.as_slice())?;
-```
-
-Do not introduce new direct `ciborium` usage. The old `cbor_size` helper module
-has been replaced by `cbor2::serialized_size`.
-
-## Workspace Crates
-
-| Crate | Purpose |
-|-------|---------|
-| `anda_db` | Core embedded database |
-| `anda_db_schema` | Schema, field values, documents |
-| `anda_db_derive` | Derive macros |
-| `anda_db_btree` | Exact-match and range index |
-| `anda_db_tfs` | BM25 full-text search |
-| `anda_db_hnsw` | HNSW vector index |
-| `anda_db_utils` | Shared utilities |
-| `anda_object_store` | Metadata and encrypted object-store wrappers |
-| `anda_kip` | Knowledge Interaction Protocol |
-| `anda_cognitive_nexus` | Reference AI memory graph runtime |
-| `anda_db_server` | HTTP server for core database APIs |
-| `anda_cognitive_nexus_server` | HTTP/JSON-RPC server for Cognitive Nexus |
-| `anda_db_shard_proxy` | Shard proxy for multi-tenant deployments |
-
-## Reference Documentation
-
-Read these before making broad API or documentation changes:
-
-- `references/anda_db_quick_ref.md` - compact API reference for agents
-- `README.md` - workspace overview and current quick start
-- `docs/anda_db.md` - core database design and usage
-- `docs/anda_db_schema.md` - field types, values, schemas, documents
-- `docs/anda_db_derive.md` - derive macro behavior
-- `docs/anda_db_btree.md` - B-Tree index behavior
-- `docs/anda_db_tfs.md` - BM25 full-text engine
-- `docs/anda_db_hnsw.md` - HNSW vector search
-- `docs/anda_object_store.md` - metadata and encryption wrappers
-- `docs/anda_kip.md` - KIP protocol
-- `docs/anda_cognitive_nexus.md` - Cognitive Nexus runtime
+The demo creates data under `./debug/metastore`. KIP cross-engine checks are
+listed in the [KIP reference](references/kip_and_nexus.md).

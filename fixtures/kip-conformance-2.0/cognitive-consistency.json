@@ -51,7 +51,7 @@
     }
   ],
   "setup": [
-    "MUTATE {\n CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Ada\" }\n CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n CREATE CONCEPT ?travel { TYPE \"Person\" NAME \"travel\" }\n ENSURE PROPOSITION ?home (?a, \"position\", \"home\")\n ENSURE PROPOSITION ?office (?a, \"position\", \"office\")\n ENSURE PROPOSITION ?tea (?a, \"likes\", \"tea\")\n ENSURE PROPOSITION ?coffee (?a, \"likes\", \"coffee\")\n ENSURE PROPOSITION ?w (?a, \"scoped\", \"work\")\n ENSURE PROPOSITION ?t (?a, \"scoped\", \"travel\")\n ENSURE PROPOSITION ?old (?a, \"temporal\", \"old\")\n ENSURE PROPOSITION ?new (?a, \"temporal\", \"new\")\n CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?home, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?office, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?tea, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?coffee, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?w, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?work] } }\n CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?t, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?travel] } }\n CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?old, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-01T00:00:00Z\", until: \"2026-09-07T00:00:00Z\" } } }\n CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?new, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-07T00:00:00Z\" } } }\n}"
+    "MUTATE {\n CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Ada\" }\n CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n CREATE CONCEPT ?travel { TYPE \"Person\" NAME \"travel\" }\n ENSURE PROPOSITION ?home (?a, \"position\", \"home\")\n ENSURE PROPOSITION ?office (?a, \"position\", \"office\")\n ENSURE PROPOSITION ?tea (?a, \"likes\", \"tea\")\n ENSURE PROPOSITION ?coffee (?a, \"likes\", \"coffee\")\n ENSURE PROPOSITION ?w (?a, \"scoped\", \"work\")\n ENSURE PROPOSITION ?t (?a, \"scoped\", \"travel\")\n ENSURE PROPOSITION ?old (?a, \"temporal\", \"old\")\n ENSURE PROPOSITION ?new (?a, \"temporal\", \"new\")\n CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?home, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?office, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?tea, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?coffee, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?w, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?work] } }\n CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?t, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?travel] } }\n CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?old, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-01T00:00:00.000Z\", until: \"2026-09-07T00:00:00.000Z\" } } }\n CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?new, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-07T00:00:00.000Z\" } } }\n}"
   ],
   "cases": [
     {
@@ -163,7 +163,7 @@
     },
     {
       "name": "until is excluded exactly at the boundary",
-      "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T08:00:00+08:00\"",
+      "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T00:00:00.000Z\"",
       "expect": {
         "result": [
           "rejected"
@@ -175,7 +175,7 @@
     },
     {
       "name": "the value beginning at the boundary is eligible",
-      "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"new\") } FOR TIME \"2026-09-07T00:00:00Z\"",
+      "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"new\") } FOR TIME \"2026-09-07T00:00:00.000Z\"",
       "expect": {
         "result": [
           "accepted"
@@ -186,8 +186,8 @@
       ]
     },
     {
-      "name": "basis reports normalized time and the next known invalidation",
-      "command": "FIND(?b.basis.valid_at, ?b.basis.next_invalid_at) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-06T08:00:00+08:00\"",
+      "name": "basis preserves canonical time and the next known invalidation",
+      "command": "FIND(?b.basis.valid_at, ?b.basis.next_invalid_at) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-06T00:00:00.000Z\"",
       "expect": {
         "result": [
           [
@@ -201,8 +201,8 @@
       ]
     },
     {
-      "name": "invalid half-open interval ('2026-09-07T00:00:00Z', '2026-09-07T00:00:00Z')",
-      "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-07T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+      "name": "invalid half-open interval ('2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z')",
+      "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-07T00:00:00.000Z\", \"until\": \"2026-09-07T00:00:00.000Z\"} } }",
       "expect": {
         "error": "ConstraintViolation"
       },
@@ -211,8 +211,8 @@
       ]
     },
     {
-      "name": "invalid half-open interval ('2026-09-08T00:00:00Z', '2026-09-07T00:00:00Z')",
-      "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-08T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+      "name": "invalid half-open interval ('2026-09-08T00:00:00.000Z', '2026-09-07T00:00:00.000Z')",
+      "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-08T00:00:00.000Z\", \"until\": \"2026-09-07T00:00:00.000Z\"} } }",
       "expect": {
         "error": "ConstraintViolation"
       },

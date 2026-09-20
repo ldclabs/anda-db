@@ -506,7 +506,7 @@ async fn set_retention_accepts_a_selection_block() {
 
     ok(
         &nexus,
-        r#"SET RETENTION ?m {retention_class: "standard", expires_at: "2030-01-01T00:00:00Z"}
+        r#"SET RETENTION ?m {retention_class: "standard", expires_at: "2030-01-01T00:00:00.000Z"}
            WHERE { ?m CONCEPT {type: "Experience"} }
            LIMIT 1"#,
     )

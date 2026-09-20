@@ -1,6 +1,6 @@
 # @ldclabs/kip-do
 
-Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
 [Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
 
 A [KIP](https://github.com/ldclabs/KIP) Cognitive Nexus running inside a
@@ -17,6 +17,15 @@ grammar's behaviour by a differential test.
 npm install @ldclabs/kip-do
 ```
 
+## Timestamp inputs
+
+KIP §6.5 requires valid UTC timestamps with exactly three fractional digits:
+`YYYY-MM-DDTHH:mm:ss.SSSZ`, including `.000Z` for whole seconds. Invalid
+strings return `ConstraintViolation`; non-string timestamps return
+`TypeMismatch`. Optional/null values follow each field's contract. The engines
+validate inputs without padding fractions or converting offsets; generated
+clock values truncate to milliseconds. Use `space_seq` for commit order.
+
 ## Status
 
 The 1.x executor was **deleted, not ported**. KIP 2.0 is a different data model
@@ -27,7 +36,7 @@ than an absent one. It is recoverable from this branch's history.
 What works today: the storage layer, Schema Packages and symbol resolution,
 transactions and the KML mutation clauses, KQL, the Epistemic Projection, META,
 Capsule export and verification, the Governance control plane, and the
-historical read path. **All 308 shared conformance cases pass** — the list in
+historical read path. **The shared conformance suite passes** — the list in
 `test/conformance.test.ts` names what is not built rather than counting it, so
 closing the last gap meant deleting a name and a new one cannot hide inside a
 number that happens to match.

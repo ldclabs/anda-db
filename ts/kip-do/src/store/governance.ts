@@ -73,7 +73,14 @@ import {
 import { tryParseElementId } from '../id.js'
 import type { Json, JsonMap } from '../json.js'
 import { endpointKey } from '../term.js'
-import { nowTime } from '../time.js'
+import { normalizeTime, nowTime } from '../time.js'
+
+function validateConditionTimes(conditions: Partial<AuthorityConditions> | undefined): void {
+  for (const name of ['valid_from', 'valid_until'] as const) {
+    const value = conditions?.[name]
+    if (value !== undefined && value !== '') normalizeTime(value, `conditions.${name}`)
+  }
+}
 import { RowStore } from './table.js'
 import type { SpaceRow } from './rows.js'
 
@@ -478,6 +485,7 @@ export class GovernanceStore extends RowStore {
 
   /** Creates a Grant. */
   createGrant(draft: GrantDraft, actor: string): GrantRow {
+    validateConditionTimes(draft.conditions)
     const at = nowTime()
     const row: Omit<GrantRow, 'id'> = {
       space_id: draft.space_id,
@@ -599,6 +607,7 @@ export class GovernanceStore extends RowStore {
 
   /** Creates a Delegation. */
   createDelegation(draft: DelegationDraft, actor: string): DelegationRow {
+    validateConditionTimes(draft.conditions)
     const at = nowTime()
     const row: Omit<DelegationRow, 'id'> = {
       space_id: draft.space_id,
@@ -687,6 +696,7 @@ export class GovernanceStore extends RowStore {
    * would retroactively change what every audit record citing it means.
    */
   publishPolicy(draft: PolicyDraft, actor: string): GovernancePolicyRow {
+    for (const statement of draft.statements) validateConditionTimes(statement.conditions)
     const version = (this.activePolicy(draft.policy_id)?.version ?? 0) + 1
     const row: Omit<GovernancePolicyRow, 'id'> = {
       policy_ref: `${draft.policy_id}@${version}`,
@@ -745,6 +755,7 @@ export class GovernanceStore extends RowStore {
 
   /** Opens an approval request for one concrete operation. */
   requestApproval(draft: ApprovalDraft, actor: string): ApprovalRow {
+    if (draft.expires_at !== undefined && draft.expires_at !== '') normalizeTime(draft.expires_at, 'approval.expires_at')
     const at = nowTime()
     const row: Omit<ApprovalRow, 'id'> = {
       space_id: draft.space_id,

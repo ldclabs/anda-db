@@ -82,10 +82,10 @@ async fn seeded(name: &str) -> CognitiveNexus {
             CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?e {
-                SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode.", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"}
+                SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode.", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"}
             }
             CREATE ASSERTION ?a {
-                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00Z"}
+                SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00.000Z"}
                 SET STRUCTURAL { ("evidence", ?e) {role: "support"} }
             }
         }"#,

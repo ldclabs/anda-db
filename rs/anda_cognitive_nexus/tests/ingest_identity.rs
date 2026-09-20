@@ -29,7 +29,7 @@ fn observation() -> IngestEvidence {
         client_key: Some("thread:submission:message".into()),
         evidence_class: "user_statement".into(),
         payload: Some(json!({"text":"first message"})),
-        observed_at: Some("2026-09-07T00:00:00Z".into()),
+        observed_at: Some("2026-09-07T00:00:00.000Z".into()),
         ..Default::default()
     }
 }
@@ -74,7 +74,7 @@ async fn replay_checks_observation_identity_before_binding_evidence() {
     let mut class = original.clone();
     class.evidence_class = "tool_result".into();
     let mut time = original.clone();
-    time.observed_at = Some("2026-09-08T00:00:00Z".into());
+    time.observed_at = Some("2026-09-08T00:00:00.000Z".into());
     for conflicting in [payload, class, time] {
         let response = execute_request(&nexus, &request(vec![conflicting])).await;
         assert_eq!(

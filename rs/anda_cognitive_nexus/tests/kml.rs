@@ -99,7 +99,7 @@ async fn a_claim_lands_as_a_proposition_plus_an_assertion() {
                 SET FIELDS {
                     evidence_class: "user_statement",
                     payload: "I prefer dark mode.",
-                    observed_at: "2026-08-16T09:00:00Z"
+                    observed_at: "2026-08-16T09:00:00.000Z"
                 }
             }
             CREATE ASSERTION ?a {
@@ -938,7 +938,7 @@ async fn with_cited_evidence(name: &str) -> CognitiveNexus {
                     payload: "I prefer dark mode, and my address is 12 Elm Street.",
                     content_digest: "sha3-256:d1ge5t",
                     media_type: "text/plain",
-                    observed_at: "2026-08-16T09:00:00Z"
+                    observed_at: "2026-08-16T09:00:00.000Z"
                 }
             }
             CREATE ASSERTION ?a {
@@ -1318,7 +1318,7 @@ async fn an_activity_finalizes_its_fields_in_the_statement_that_completes_it() {
     ok(
         &nexus,
         r#"TRANSITION "X-1" TO "completed"
-             SET FIELDS {ended_at: "2026-01-01T00:00:00Z"}
+             SET FIELDS {ended_at: "2026-01-01T00:00:00.000Z"}
              SET STRUCTURAL { ("outputs", "C-3") {} }"#,
     )
     .await;

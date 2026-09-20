@@ -97,7 +97,16 @@ impl Validation {
             .map(|v| format!("{}: {}", v.path, v.message))
             .collect::<Vec<_>>()
             .join("; ");
-        Err(KipError::new(KipErrorCode::ConstraintViolation, summary)
+        let code = if self
+            .violations
+            .iter()
+            .any(|v| v.code == "SCHEMA_TIMESTAMP_TYPE_MISMATCH")
+        {
+            KipErrorCode::TypeMismatch
+        } else {
+            KipErrorCode::ConstraintViolation
+        };
+        Err(KipError::new(code, summary)
             .with_details(serde_json::to_value(&self).unwrap_or(Json::Null)))
     }
 }
@@ -136,8 +145,8 @@ fn matches_type_name(name: &str, value: &Json) -> bool {
         "array" => value.is_array(),
         "object" => value.is_object(),
         "null" => value.is_null(),
-        // A timestamp is carried as a string; its shape is checked where it is
-        // normalized, so that one parser decides what a timestamp is.
+        // A timestamp is carried as a string; its shape is checked by the
+        // shared canonical timestamp validator.
         "timestamp" => value.is_string(),
         // An unrecognized type name is a package this engine does not fully
         // understand. Accepting the value is the conservative reading: it
@@ -163,11 +172,33 @@ fn validate_field(
     value: &Json,
     into: &mut Validation,
 ) {
+    let timestamp = declares_timestamp(&spec.r#type)
+        || spec.extra.get("format").and_then(Json::as_str) == Some("timestamp");
+    if timestamp
+        && !(value.is_null() && matches_type(&spec.r#type, value))
+        && let Err(err) = anda_kip::timestamp::validate_value(value, path)
+    {
+        into.push(error(
+            if err.code == KipErrorCode::TypeMismatch {
+                "SCHEMA_TIMESTAMP_TYPE_MISMATCH"
+            } else {
+                "SCHEMA_FORMAT_VIOLATION"
+            },
+            schema_ref,
+            path,
+            err.message,
+        ));
+        return;
+    }
     if let Some(schema) = spec.extra.get("value_schema")
         && let Err(err) = super::contracts::validate_value(schema, value)
     {
         into.push(error(
-            "SCHEMA_VALUE_NOT_ALLOWED",
+            if err.code == KipErrorCode::TypeMismatch {
+                "SCHEMA_TIMESTAMP_TYPE_MISMATCH"
+            } else {
+                "SCHEMA_VALUE_NOT_ALLOWED"
+            },
             schema_ref,
             path,
             err.message,
@@ -219,6 +250,13 @@ fn validate_field(
             format!("{value} is not one of the declared values"),
         ));
     }
+}
+
+fn declares_timestamp(declared: &Json) -> bool {
+    declared.as_str() == Some("timestamp")
+        || declared
+            .as_array()
+            .is_some_and(|types| types.iter().any(declares_timestamp))
 }
 
 fn json_kind(value: &Json) -> &'static str {
@@ -288,7 +326,11 @@ pub fn validate_attributes(
             super::contracts::validate_value(schema, &Json::Object(attributes.clone()))
     {
         result.push(error(
-            "SCHEMA_VALUE_NOT_ALLOWED",
+            if err.code == KipErrorCode::TypeMismatch {
+                "SCHEMA_TIMESTAMP_TYPE_MISMATCH"
+            } else {
+                "SCHEMA_VALUE_NOT_ALLOWED"
+            },
             schema_ref,
             "attributes",
             err.message,
@@ -389,7 +431,11 @@ pub fn validate_facet(schema_ref: &str, def: &FacetDef, values: &Map<String, Jso
         && let Err(err) = super::contracts::validate_value(schema, &Json::Object(values.clone()))
     {
         result.push(error(
-            "SCHEMA_VALUE_NOT_ALLOWED",
+            if err.code == KipErrorCode::TypeMismatch {
+                "SCHEMA_TIMESTAMP_TYPE_MISMATCH"
+            } else {
+                "SCHEMA_VALUE_NOT_ALLOWED"
+            },
             schema_ref,
             "facets",
             err.message,
@@ -504,12 +550,13 @@ mod tests {
     fn a_nullable_field_accepts_both_of_its_declared_types() {
         let package = profile();
         let def = package.facet("MnemonicState").unwrap();
-        for value in [json!(null), json!("2026-08-16T00:00:00Z")] {
+        for value in [json!(null), json!("2026-08-16T00:00:00.000Z")] {
             let result = validate_facet("f", def, &map(json!({"last_metabolized_at": value})));
             assert!(result.is_valid(), "{result:?}");
         }
         let result = validate_facet("f", def, &map(json!({"last_metabolized_at": 17})));
-        assert_eq!(codes(&result), ["SCHEMA_TYPE_MISMATCH"]);
+        assert_eq!(codes(&result), ["SCHEMA_TIMESTAMP_TYPE_MISMATCH"]);
+        assert_eq!(result.into_result().unwrap_err().name(), "TypeMismatch");
     }
 
     #[test]

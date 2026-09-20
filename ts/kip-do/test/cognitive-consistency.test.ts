@@ -10,11 +10,11 @@ const SETUP = `MUTATE {
  CREATE CONCEPT ?a { TYPE "Person" NAME "Ada" }
  CREATE CONCEPT ?p { TYPE "Preference" NAME "tea" }
  ENSURE PROPOSITION ?claim (?a, "prefers", ?p)
- CREATE EVIDENCE ?source { SET FIELDS {evidence_class: "observation", payload: "source", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d"} }
+ CREATE EVIDENCE ?source { SET FIELDS {evidence_class: "observation", payload: "source", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d"} }
 }`
 const BELIEF = 'FIND(?b) WHERE { ?p PROPOSITION (id: "P-1") ?b BELIEF (?p) }'
 const DERIVE = `MUTATE {
- CREATE ASSERTION ?a { SET FIELDS {proposition: "P-1", asserted_by: "C-1", stance: "support", mode: "inferred", confidence: 0.9, asserted_at: "2026-09-07T00:00:00Z"} SET STRUCTURAL {("evidence", "E-1") {role: "support"}} }
+ CREATE ASSERTION ?a { SET FIELDS {proposition: "P-1", asserted_by: "C-1", stance: "support", mode: "inferred", confidence: 0.9, asserted_at: "2026-09-07T00:00:00.000Z"} SET STRUCTURAL {("evidence", "E-1") {role: "support"}} }
  CREATE ACTIVITY ?work {
   SET FIELDS {activity_class: "semantic_consolidation", status: "completed"}
   SET FACET "DependencyBasis" {basis_seq: :seq, groups: [{role: "all_of", pins: [{id: "E-1", version: :version}]}], policy_basis: :basis}

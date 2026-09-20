@@ -151,6 +151,7 @@ pub mod memory;
 pub mod parser;
 pub mod request;
 pub mod semantics;
+pub mod timestamp;
 pub mod types;
 
 pub use ast::*;

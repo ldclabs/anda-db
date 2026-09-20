@@ -119,7 +119,7 @@ fn every_request_this_crate_builds_matches_the_wire_schema() {
             payload: Some(json!({ "text": "hi" })),
             payload_artifact: None,
             media_type: Some("application/json".into()),
-            observed_at: Some("2026-01-01T00:00:00Z".into()),
+            observed_at: Some("2026-01-01T00:00:00.000Z".into()),
             source_actor: Some(ElementReference::by_id("C-alice")),
             facets: Default::default(),
             client_key: Some("msg-1".into()),
@@ -204,12 +204,12 @@ fn minimally_constructed_contexts_still_match_the_schema() {
 fn a_result_context_can_report_its_world_valid_time() {
     let context = ResultContext {
         snapshot_seq: Some(1500),
-        valid_at: Some("2026-01-01T00:00:00Z".into()),
+        valid_at: Some("2026-01-01T00:00:00.000Z".into()),
         ..Default::default()
     };
     assert_eq!(
         encode(&context),
-        json!({ "snapshot_seq": 1500, "valid_at": "2026-01-01T00:00:00Z" })
+        json!({ "snapshot_seq": 1500, "valid_at": "2026-01-01T00:00:00.000Z" })
     );
     response_schema().assert_valid(
         "a ResultContext reporting valid_at",
@@ -251,7 +251,7 @@ fn exhaustive_response() -> Value {
             "space_id": "space-1",
             "snapshot_seq": 1498,
             "space_seq": 1499,
-            "committed_at": "2026-01-01T00:00:00Z",
+            "committed_at": "2026-01-01T00:00:00.000Z",
             "status": "committed",
             "transaction_class": "cognitive",
             "schema_environment_version": 3
@@ -261,7 +261,7 @@ fn exhaustive_response() -> Value {
             "snapshot_seq": 1500,
             "schema_environment_version": 3,
             "epistemic_policy": { "id": "policy-1", "version": "2.0" },
-            "valid_at": "2026-01-01T00:00:00Z",
+            "valid_at": "2026-01-01T00:00:00.000Z",
             "search": {
               "index_seq": 1490,
               "current_space_seq": 1500,
@@ -304,7 +304,7 @@ fn exhaustive_response() -> Value {
         "space_id": "space-1",
         "snapshot_seq": 1499,
         "space_seq": 1500,
-        "committed_at": "2026-01-01T00:00:01Z",
+        "committed_at": "2026-01-01T00:00:01.000Z",
         "status": "committed",
         "transaction_class": "cognitive",
         "request_digest": "sha256:aa",
@@ -352,7 +352,7 @@ fn exhaustive_request() -> Value {
             "evidence_class": "user_statement",
             "payload": { "text": "hi" },
             "media_type": "application/json",
-            "observed_at": "2026-01-01T00:00:00Z",
+            "observed_at": "2026-01-01T00:00:00.000Z",
             "source_actor": { "id": "C-alice" },
             "client_key": "msg-1",
             "facets": { "OutcomeRecord": { "task_family": "deploy/rollback", "outcome_status": "success" } },

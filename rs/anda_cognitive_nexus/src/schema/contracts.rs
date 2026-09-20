@@ -80,6 +80,12 @@ fn compile(schema: &Json, resources: &BTreeMap<String, Json>) -> Result<Validato
     jsonschema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .should_validate_formats(true)
+        .with_format("date-time", |value| {
+            anda_kip::timestamp::parse(value, "value_schema").is_ok()
+        })
+        .with_format("timestamp", |value| {
+            anda_kip::timestamp::parse(value, "value_schema").is_ok()
+        })
         .with_retriever(Locked(resources.clone()))
         .build(schema)
         .map_err(|e| {
@@ -218,9 +224,38 @@ pub fn validate_value(schema: &Json, value: &Json) -> Result<(), KipError> {
             validator
         }
     };
-    validator
-        .validate(value)
-        .map_err(|e| KipError::constraint_violation(format!("value_schema: {e}")))
+    validator.validate(value).map_err(|e| {
+        if timestamp_type_error(&e, schema) {
+            KipError::type_mismatch(format!("value_schema: {e}"))
+        } else {
+            KipError::constraint_violation(format!("value_schema: {e}"))
+        }
+    })
+}
+
+// A nullable timestamp may fail inside anyOf. Identify the actual declared
+// schema node, not the input field name: arbitrary payload text is unaffected.
+fn timestamp_type_error(error: &jsonschema::ValidationError<'_>, schema: &Json) -> bool {
+    use jsonschema::error::ValidationErrorKind;
+    if let ValidationErrorKind::AnyOf { context } = error.kind() {
+        return context
+            .iter()
+            .flatten()
+            .any(|e| timestamp_type_error(e, schema));
+    }
+    if !matches!(error.kind(), ValidationErrorKind::Type { .. }) {
+        return false;
+    }
+    let location = error.absolute_keyword_location().map(|uri| uri.as_str());
+    let (root, path) = match location.and_then(|s| s.split_once('#')) {
+        Some((id, path)) => (CATALOG.get(id).unwrap_or(schema), path.to_string()),
+        None => (schema, error.schema_path().to_string()),
+    };
+    path.rsplit_once('/')
+        .and_then(|(parent, _)| root.pointer(parent))
+        .and_then(|node| node.get("format"))
+        .and_then(Json::as_str)
+        .is_some_and(|format| matches!(format, "timestamp" | "date-time"))
 }
 
 /// Runtime attachment and immutable record checks run on the final transaction
@@ -411,4 +446,42 @@ pub(crate) fn normalize_record_refs(name: &str, members: &mut anda_kip::Map<Stri
         visit(&mut value, &path.split('.').collect::<Vec<_>>());
     }
     *members = value.as_object().cloned().unwrap_or_default();
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pinned_timestamp_contracts_preserve_error_classes() {
+        let schema = json!({"$ref":"urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/started_at"});
+        validate_value(&schema, &json!("2024-02-29T00:00:00.123Z")).unwrap();
+        for value in [
+            json!("2026-01-01T00:00:00Z"),
+            json!("2026-02-30T00:00:00.000Z"),
+        ] {
+            assert_eq!(
+                validate_value(&schema, &value).unwrap_err().name(),
+                "ConstraintViolation"
+            );
+        }
+        assert_eq!(
+            validate_value(&schema, &json!(0)).unwrap_err().name(),
+            "TypeMismatch"
+        );
+
+        let nullable = json!({"anyOf":[{"type":"string","format":"date-time"},{"type":"null"}]});
+        validate_value(&nullable, &Json::Null).unwrap();
+        assert_eq!(
+            validate_value(&nullable, &json!(0)).unwrap_err().name(),
+            "TypeMismatch"
+        );
+        assert_eq!(
+            validate_value(&nullable, &json!("2026-01-01T00:00:00Z"))
+                .unwrap_err()
+                .name(),
+            "ConstraintViolation"
+        );
+    }
 }

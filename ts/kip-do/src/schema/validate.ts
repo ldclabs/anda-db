@@ -26,7 +26,7 @@ import { validateValue } from './contracts.js'
  * `model_hints` is read by this module at all.
  */
 
-import { errors } from '../errors.js'
+import { errors, KipError } from '../errors.js'
 import { canonicalJson, jsonEquals, type Json, type JsonMap } from '../json.js'
 import type {
   AttributeSpec,
@@ -91,6 +91,9 @@ export class Validation {
     const summary = this.violations
       .map((v) => `${v.path}: ${v.message}`)
       .join('; ')
+    if (this.violations.some((v) => v.code === 'SCHEMA_TIMESTAMP_TYPE_MISMATCH')) {
+      throw errors.typeMismatch(summary, this.toJSON() as unknown as Json)
+    }
     throw errors.constraintViolation(summary, this.toJSON() as unknown as Json)
   }
 }
@@ -138,8 +141,8 @@ function matchesTypeName(name: string, value: Json): boolean {
       return typeof value === 'object' && value !== null && !Array.isArray(value)
     case 'null':
       return value === null
-    // A timestamp is carried as a string; its shape is checked where it is
-    // normalized, so that one parser decides what a timestamp is.
+    // A timestamp is carried as a string; its shape is checked by the
+    // shared canonical timestamp validator.
     case 'timestamp':
       return typeof value === 'string'
     // An unrecognized type name is a package this engine does not fully
@@ -172,9 +175,18 @@ function validateField(
   value: Json,
   into: Validation,
 ): void {
+  const declaresTimestamp = (type: Json | undefined): boolean =>
+    type === 'timestamp' || Array.isArray(type) && type.some(declaresTimestamp)
+  if ((declaresTimestamp(spec.type) || spec.format === 'timestamp') &&
+      !(value === null && matchesType(spec.type, value))) {
+    try { normalizeTime(value, path) } catch (err) {
+      into.push(error(typeof value === 'string' ? 'SCHEMA_FORMAT_VIOLATION' : 'SCHEMA_TIMESTAMP_TYPE_MISMATCH', schemaRef, path, String(err)))
+      return
+    }
+  }
   if (spec.value_schema !== undefined) {
     try { validateValue(spec.value_schema, value) } catch (err) {
-      into.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, path, String(err)))
+      into.push(error(err instanceof KipError && err.code === 'TypeMismatch' ? 'SCHEMA_TIMESTAMP_TYPE_MISMATCH' : 'SCHEMA_VALUE_NOT_ALLOWED', schemaRef, path, String(err)))
     }
   }
   if (!matchesType(spec.type, value)) {
@@ -280,7 +292,7 @@ export function validateAttributes(
   )
   if (spec?.value_schema !== undefined) {
     try { validateValue(spec.value_schema, attributes) } catch (err) {
-      result.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'attributes', String(err)))
+      result.push(error(err instanceof KipError && err.code === 'TypeMismatch' ? 'SCHEMA_TIMESTAMP_TYPE_MISMATCH' : 'SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'attributes', String(err)))
     }
   }
   return result
@@ -414,6 +426,10 @@ export function checkEndpoint(
     case 'unresolved':
       return
     case 'literal':
+      if (spec?.format === 'timestamp' && !sameDatatype('string', facts.datatype) && !sameDatatype('null', facts.datatype)) {
+        into.push(error('SCHEMA_TIMESTAMP_TYPE_MISMATCH', schemaRef, path, 'timestamp Literals must be strings (§6.5)'))
+        return
+      }
       if (datatypes.length === 0) {
         refuse(
           'the schema declares this endpoint an element reference, not a Literal',
@@ -519,6 +535,10 @@ export function validatePredicateObjectLiteral(
     return result
   }
   const format = spec?.format
+  if (format === 'timestamp' && typeof value !== 'string') {
+    result.push(error('SCHEMA_TIMESTAMP_TYPE_MISMATCH', schemaRef, 'object', 'timestamp Literals must be strings (§6.5)'))
+    return result
+  }
   if (typeof format !== 'string' || typeof value !== 'string') return result
   if (format === 'timestamp') {
     try {
@@ -616,7 +636,7 @@ export function validateFacet(
   )
   if (def.value_schema !== undefined) {
     try { validateValue(def.value_schema as Json, values) } catch (err) {
-      result.push(error('SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'facets', String(err)))
+      result.push(error(err instanceof KipError && err.code === 'TypeMismatch' ? 'SCHEMA_TIMESTAMP_TYPE_MISMATCH' : 'SCHEMA_VALUE_NOT_ALLOWED', schemaRef, 'facets', String(err)))
     }
   }
   return result

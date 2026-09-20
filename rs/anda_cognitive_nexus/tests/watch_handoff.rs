@@ -1101,7 +1101,7 @@ async fn ordinary_writes_cannot_preempt_fire_identity_or_change_armed_deadlines(
             json!({"key":key}),
         ),
         (
-            r#"UPDATE :watch SET ATTRIBUTES {due_at:"2099-01-01T00:00:00Z"} EXPECT VERSION :version"#,
+            r#"UPDATE :watch SET ATTRIBUTES {due_at:"2099-01-01T00:00:00.000Z"} EXPECT VERSION :version"#,
             json!({"watch":fixture.watch,"version":fixture.version}),
         ),
     ] {

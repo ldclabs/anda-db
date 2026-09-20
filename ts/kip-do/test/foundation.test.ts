@@ -15,7 +15,7 @@ import {
   UNREACHABLE_SEQ,
 } from '../src/id.js'
 import { canonicalJson, jsonEquals } from '../src/json.js'
-import { normalizeTime, TIME_MAX, TIME_MIN } from '../src/time.js'
+import { formatTime, normalizeTime, nowTime, parseTime, TIME_MAX, TIME_MIN } from '../src/time.js'
 import {
   endpointFromJson,
   endpointKey,
@@ -165,19 +165,35 @@ describe('element ids', () => {
 })
 
 describe('time', () => {
-  it('treats an offset as a spelling, not a different instant', () => {
-    const utc = normalizeTime('2026-08-16T02:00:00Z', 'observed_at')
-    expect(normalizeTime('2026-08-16T10:00:00+08:00', 'observed_at')).toBe(utc)
-    expect(utc).toBe('2026-08-16T02:00:00.000Z')
+  it('preserves canonical milliseconds and refuses other spellings', () => {
+    const utc = '2026-08-16T02:00:00.123Z'
+    expect(normalizeTime(utc, 'observed_at')).toBe(utc)
+    expect(formatTime(parseTime(utc))).toBe(utc)
+    for (const value of [
+      '2026-08-16T02:00:00Z', '2026-08-16T02:00:00.1Z',
+      '2026-08-16T02:00:00.12Z', '2026-08-16T02:00:00.1234Z',
+      '2026-08-16T02:00:00.000+00:00', '2026-08-16T10:00:00.000+08:00',
+      '2026-08-16t02:00:00.000z', '2026-08-16 02:00:00.000Z',
+      '2026-02-29T00:00:00.000Z', '2024-02-30T00:00:00.000Z',
+      '2026-08-16T24:00:00.000Z', '2026-08-16T02:00:60.000Z',
+      '2026-08-16T02:00:00.000Z\n',
+    ]) expect(() => normalizeTime(value, 'at'), value).toThrowError(expect.objectContaining({ code: 'ConstraintViolation' }))
+    for (const value of [0, null, true, [], {}]) {
+      expect(() => normalizeTime(value, 'at')).toThrowError(expect.objectContaining({ code: 'TypeMismatch' }))
+    }
+    expect(normalizeTime('2024-02-29T00:00:00.000Z', 'at')).toBe('2024-02-29T00:00:00.000Z')
+    expect(normalizeTime(nowTime(), 'clock')).toBeTypeOf('string')
+    expect(formatTime(123.999)).toBe('1970-01-01T00:00:00.123Z')
+    expect(formatTime(-0.001)).toBe('1969-12-31T23:59:59.999Z')
   })
 
   it('makes lexicographic order chronological order', () => {
     // This is the property every temporal range query depends on.
     const stamps = [
-      '2026-01-01T00:00:00Z',
+      '2026-01-01T00:00:00.000Z',
       '2025-12-31T23:59:59.999Z',
       '2026-01-01T00:00:00.001Z',
-      '2099-12-31T23:59:59Z',
+      '2099-12-31T23:59:59.000Z',
     ].map((s) => normalizeTime(s, 't'))
     const lexicographic = [...stamps].sort()
     const chronological = [...stamps].sort(
@@ -187,8 +203,8 @@ describe('time', () => {
   })
 
   it('sorts the open-ended sentinel above every real timestamp', () => {
-    expect(TIME_MAX > normalizeTime('9999-12-31T23:59:59Z', 't')).toBe(true)
-    expect(TIME_MIN < normalizeTime('0001-01-01T00:00:00Z', 't')).toBe(true)
+    expect(TIME_MAX > normalizeTime('9999-12-31T23:59:59.999Z', 't')).toBe(true)
+    expect(TIME_MIN < normalizeTime('0000-01-01T00:00:00.000Z', 't')).toBe(true)
   })
 
   it('refuses what Date.parse would happily invent', () => {
@@ -197,7 +213,7 @@ describe('time', () => {
     // was is worse than one that refuses.
     for (const bad of ['yesterday', '2026-8-1T00:00:00Z', '2026/08/01', '12:00']) {
       expect(() => normalizeTime(bad, 'valid_from'), bad).toThrowError(
-        /must be an RFC 3339 timestamp/,
+        /must be a valid UTC timestamp/,
       )
     }
   })
@@ -207,7 +223,7 @@ describe('time', () => {
   })
 
   it('is idempotent', () => {
-    const once = normalizeTime('2026-08-16T10:00:00+08:00', 't')
+    const once = normalizeTime('2026-08-16T02:00:00.123Z', 't')
     expect(normalizeTime(once, 't')).toBe(once)
   })
 })

@@ -1106,7 +1106,7 @@ mod tests {
                 reasons: vec!["conflicting independent roots".into()],
             }),
             temporal: Some(ProjectionTemporal {
-                valid_at: Some("2026-01-01T00:00:00Z".into()),
+                valid_at: Some("2026-01-01T00:00:00.000Z".into()),
                 as_of_seq: Some(1500),
             }),
             policy: Some(crate::request::PolicyIdentity::new("kip:policy:baseline")),
@@ -1144,7 +1144,7 @@ mod tests {
             space_id: "space-1".into(),
             space_seq: 1501,
             tx_id: "tx-900".into(),
-            committed_at: Some("2026-01-01T00:00:00Z".into()),
+            committed_at: Some("2026-01-01T00:00:00.000Z".into()),
             transaction_class: Some("cognitive".into()),
             schema_environment_version: Some(1),
             extensions: Some(extensions),
@@ -1290,11 +1290,11 @@ mod tests {
     fn retention_and_valid_time_are_different_fields() {
         // Spec §19.2: one is storage lifecycle, the other world applicability.
         let retention = Retention {
-            expires_at: Some("2027-01-01T00:00:00Z".into()),
+            expires_at: Some("2027-01-01T00:00:00.000Z".into()),
             ..Default::default()
         };
         let valid = ValidTime {
-            until: Some("2026-06-01T00:00:00Z".into()),
+            until: Some("2026-06-01T00:00:00.000Z".into()),
             ..Default::default()
         };
         assert_ne!(retention.expires_at, valid.until);

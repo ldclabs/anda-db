@@ -77,6 +77,12 @@ fn check_endpoint(
     match facts {
         EndpointFacts::Unresolved => {}
         EndpointFacts::Literal { datatype, value } => {
+            if spec.format == "timestamp" && !value.is_null() && !value.is_string() {
+                let mut violation = refuse("timestamp Literals must be strings (§6.5)".into());
+                violation.code = "SCHEMA_TIMESTAMP_TYPE_MISMATCH".into();
+                into.push(violation);
+                return;
+            }
             let datatype = crate::term::normalize_datatype(datatype);
             let allowed = spec.literal_datatypes();
             // §9.5: `null` is a semantic Literal only where the Predicate
@@ -167,7 +173,7 @@ fn check_endpoint(
 /// Checks a string Literal against the `format` its Predicate declares
 /// (§9.2, §20.15).
 ///
-/// `timestamp` is an RFC 3339 instant and `uri` a string with a scheme; any
+/// `timestamp` is a canonical UTC millisecond instant (§6.5), and `uri` a string with a scheme; any
 /// other name is package-defined, which this engine cannot check and so
 /// accepts — inventing a failure out of a name it has not implemented would
 /// reject data on the strength of a word. A format constrains the shape of

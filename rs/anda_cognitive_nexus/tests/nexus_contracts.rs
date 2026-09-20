@@ -65,7 +65,7 @@ CREATE EVIDENCE ?e { SET FIELDS {evidence_class:"observation",payload:"material"
 }"#;
 const BELIEF: &str = r#"FIND(?b) WHERE { ?p PROPOSITION (id:"P-1") ?b BELIEF (?p) }"#;
 const DERIVE: &str = r#"MUTATE {
-CREATE ASSERTION ?a {SET FIELDS {proposition:"P-1",asserted_by:"C-1",mode:"inferred",stance:"support",confidence:0.9,asserted_at:"2026-01-01T00:00:00Z"}}
+CREATE ASSERTION ?a {SET FIELDS {proposition:"P-1",asserted_by:"C-1",mode:"inferred",stance:"support",confidence:0.9,asserted_at:"2026-01-01T00:00:00.000Z"}}
 CREATE ACTIVITY ?work {SET FIELDS {activity_class:"semantic_consolidation",status:"completed"}
  SET FACET "DependencyBasis" {basis_seq: :seq,groups:[{role:"all_of",pins:[{id:"C-1",version:1}]}],policy_basis: :basis}
  SET STRUCTURAL {("inputs","C-1") ("outputs",?a)} }
@@ -324,13 +324,13 @@ async fn task_leases_and_watch_generations_are_persistent_cas() {
     }"#,Json::Null).await;
     let leased = n
         .system_session()
-        .lease_task(DEFAULT_SPACE, "C-3", 1, "2099-01-01T00:00:00Z")
+        .lease_task(DEFAULT_SPACE, "C-3", 1, "2099-01-01T00:00:00.000Z")
         .await
         .unwrap();
     assert_eq!(leased["lease"]["fencing_token"], 1);
     assert!(
         n.system_session()
-            .lease_task(DEFAULT_SPACE, "C-3", 1, "2099-02-01T00:00:00Z")
+            .lease_task(DEFAULT_SPACE, "C-3", 1, "2099-02-01T00:00:00.000Z")
             .await
             .is_err()
     );
@@ -418,9 +418,17 @@ async fn lease_expiry_compares_instants_and_persists_utc() {
         .status,
         TopLevelStatus::Failed
     );
+    assert_eq!(
+        n.system_session()
+            .lease_task(DEFAULT_SPACE, "C-1", 1, "2099-01-01T02:00:00.000+02:00")
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
     let future = n
         .system_session()
-        .lease_task(DEFAULT_SPACE, "C-1", 1, "2099-01-01T02:00:00+02:00")
+        .lease_task(DEFAULT_SPACE, "C-1", 1, "2099-01-01T00:00:00.000Z")
         .await
         .unwrap();
     assert_eq!(future["lease"]["expires_at"], "2099-01-01T00:00:00.000Z");
@@ -680,7 +688,7 @@ async fn dispatch_keeps_external_identity_and_never_upgrades_a_stale_fence() {
     ok(&n, SETUP, Json::Null).await;
     ok(&n,r#"CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}"#,Json::Null).await;
     let s = n.system_session();
-    s.lease_task(DEFAULT_SPACE, "C-3", 1, "2099-01-01T00:00:00Z")
+    s.lease_task(DEFAULT_SPACE, "C-3", 1, "2099-01-01T00:00:00.000Z")
         .await
         .unwrap();
     let selection = s
@@ -736,7 +744,7 @@ async fn dispatch_keeps_external_identity_and_never_upgrades_a_stale_fence() {
     )
     .await;
     let lease = s
-        .lease_task(DEFAULT_SPACE, "C-3", 4, "2099-02-01T00:00:00Z")
+        .lease_task(DEFAULT_SPACE, "C-3", 4, "2099-02-01T00:00:00.000Z")
         .await
         .unwrap();
     assert_eq!(lease["lease"]["fencing_token"], 2);

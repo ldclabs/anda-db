@@ -186,6 +186,21 @@ describe('review regressions', () => {
     })
   })
 
+  it('validates control-plane timestamp inputs before writing', async () => {
+    await withRegression('canonical-governance-times', (nexus) => {
+      const gov = nexus.store.governance
+      const conditions = { ...emptyConditions(), valid_until: '2099-01-01T00:00:00Z' }
+      const constraint = expect.objectContaining({ code: 'ConstraintViolation' })
+      expect(() => gov.createGrant({ space_id: nexus.space, actions: ['read'], conditions }, SYSTEM_PRINCIPAL)).toThrowError(constraint)
+      expect(() => gov.createDelegation({ space_id: nexus.space, delegator_principal: SYSTEM_PRINCIPAL, delegate_principal: 'other', actions: ['read'], conditions }, SYSTEM_PRINCIPAL)).toThrowError(constraint)
+      expect(() => gov.publishPolicy({ policy_id: 'time', statements: [{ effect: 'allow', conditions }] }, SYSTEM_PRINCIPAL)).toThrowError(constraint)
+      const approval = { space_id: nexus.space, operation: 'read', resource: 'test', subject_digest: 'test', expires_at: '2099-02-30T00:00:00.000Z' }
+      expect(() => gov.requestApproval(approval, SYSTEM_PRINCIPAL)).toThrowError(constraint)
+      approval.expires_at = '2099-01-01T00:00:00.123Z'
+      expect(gov.requestApproval(approval, SYSTEM_PRINCIPAL).expires_at).toBe(approval.expires_at)
+    })
+  })
+
   it('caps query rows and refuses an unavailable redaction obligation', async () => {
     await withRegression('read-constraints', (nexus) => {
       nexus.execute(`MUTATE {
@@ -2849,11 +2864,11 @@ describe('the host operations no command can reach', () => {
       const created = nexus.execute(`MUTATE {
         CREATE CONCEPT ?stale {
           TYPE "Person" NAME "Stale"
-          SET FIELDS { retention: { retention_class: "short", expires_at: "2020-01-01T00:00:00Z" } }
+          SET FIELDS { retention: { retention_class: "short", expires_at: "2020-01-01T00:00:00.000Z" } }
         }
         CREATE CONCEPT ?held {
           TYPE "Person" NAME "Held"
-          SET FIELDS { retention: { expires_at: "2020-01-01T00:00:00Z", legal_hold: true } }
+          SET FIELDS { retention: { expires_at: "2020-01-01T00:00:00.000Z", legal_hold: true } }
         }
         CREATE CONCEPT ?fresh { TYPE "Person" NAME "Fresh" }
       }`)
@@ -2888,7 +2903,7 @@ describe('the host operations no command can reach', () => {
         CREATE ASSERTION ?a {
           SET FIELDS {
             proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
-            confidence: 0.9, valid_time: { until: "2020-01-01T00:00:00Z" }
+            confidence: 0.9, valid_time: { until: "2020-01-01T00:00:00.000Z" }
           }
         }
       }`)

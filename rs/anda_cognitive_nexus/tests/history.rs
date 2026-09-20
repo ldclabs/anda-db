@@ -188,7 +188,7 @@ async fn a_transaction_and_an_instant_each_resolve_to_a_sequence() {
     // coordinate 0 — an empty Space, not an error.
     let before = ok(
         &nexus,
-        r#"DESCRIBE SNAPSHOT AT TIME "2000-01-01T00:00:00Z""#,
+        r#"DESCRIBE SNAPSHOT AT TIME "2000-01-01T00:00:00.000Z""#,
     )
     .await;
     assert_eq!(before["space_seq"], json!(0));
@@ -201,7 +201,7 @@ async fn a_transaction_and_an_instant_each_resolve_to_a_sequence() {
 
     let head = ok(
         &nexus,
-        r#"DESCRIBE SNAPSHOT AT TIME "2099-01-01T00:00:00Z""#,
+        r#"DESCRIBE SNAPSHOT AT TIME "2099-01-01T00:00:00.000Z""#,
     )
     .await;
     let now = ok(
@@ -223,7 +223,7 @@ async fn a_transaction_and_an_instant_each_resolve_to_a_sequence() {
     // where the coordinate now comes from.
     for gone in [
         r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TX "kip:space:default#1""#,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TIME "2099-01-01T00:00:00Z""#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } AS OF TIME "2099-01-01T00:00:00.000Z""#,
     ] {
         let refused = anda_kip::parse_kip(gone).expect_err("AS OF SEQ is the only axis");
         assert_eq!(refused.code, anda_kip::KipErrorCode::InvalidSyntax);

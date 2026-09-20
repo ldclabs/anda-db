@@ -1,6 +1,6 @@
 # anda_cognitive_nexus
 
-Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 The reference **KIP 2.0** Cognitive Nexus — a persistent memory brain for AI
@@ -154,6 +154,15 @@ trust suggestions. The Brain host owns those decisions and must keep them opt-in
 For Brain host integration contracts, see
 [the host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md).
 
+## Timestamp inputs
+
+KIP §6.5 requires valid UTC timestamps with exactly three fractional digits:
+`YYYY-MM-DDTHH:mm:ss.SSSZ`, including `.000Z` for whole seconds. Invalid
+strings return `ConstraintViolation`; non-string timestamps return
+`TypeMismatch`. Optional/null values follow each field's contract. The engines
+validate inputs without padding fractions or converting offsets; generated
+clock values truncate to milliseconds. Use `space_seq` for commit order.
+
 ## Getting Started
 
 ```toml
@@ -185,12 +194,12 @@ anda_cognitive_nexus = { version = "0.13", features = ["simulation"] }
 
 ```rust
 let simulated = nexus.system_session()
-    .with_simulated_lifecycle_time("2030-01-01T00:00:00Z")?;
+    .with_simulated_lifecycle_time("2030-01-01T00:00:00.000Z")?;
 simulated.expire_lapsed_assertions(DEFAULT_SPACE, 100).await?;
 simulated.sweep_expired(DEFAULT_SPACE, RetentionAction::Archive, 100).await?;
 ```
 
-Only a direct engine system session may set this normalized RFC3339 value.
+Only a direct engine system session may set this canonical UTC millisecond value.
 It is local to that session and its clones, not global Nexus state. It changes
 only the eligibility time of these two sweeps, including the Assertion
 per-record expiry recheck. Legal holds and all operation permissions remain in

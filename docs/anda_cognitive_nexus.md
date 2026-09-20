@@ -4,7 +4,7 @@ For the 0.13.1 protected Watch/wake host APIs, atomicity guarantees, real-time
 lease bounds and remaining host responsibilities, see
 [Durable Watch handoff](../rs/anda_cognitive_nexus/README.md#durable-watch-handoff-0131).
 
-Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
 
@@ -141,7 +141,7 @@ unambiguous "unset" that still sorts.
 the key is `Endpoint::key`, a deterministic string that makes reference equality
 an index lookup rather than a scan-and-compare.
 
-**Timestamps are one normalized UTC form** — `YYYY-MM-DDTHH:MM:SS.sssZ` — so
+**Timestamps use canonical UTC milliseconds** — `YYYY-MM-DDTHH:mm:ss.SSSZ` — so
 lexicographic order *is* chronological order and a temporal range query is a
 B-Tree range over text.
 

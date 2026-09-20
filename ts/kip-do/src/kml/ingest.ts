@@ -132,7 +132,7 @@ function checkEntry(entry: IngestEvidence): void {
   bounded(entry.evidence_class, 'ingest evidence_class', LIMITS.SHORT_LABEL)
   optional(entry.payload_artifact, 'ingest payload_artifact', LIMITS.OPAQUE_TOKEN)
   optional(entry.media_type, 'ingest media_type', LIMITS.SHORT_LABEL)
-  optional(entry.observed_at, 'ingest observed_at', LIMITS.SHORT_LABEL)
+  if (entry.observed_at !== undefined) normalizeTime(entry.observed_at, 'ingest.observed_at')
   optional(entry.client_key, 'ingest client_key', LIMITS.CLIENT_KEY)
   if (entry.source_actor !== undefined) {
     checkElementReference(entry.source_actor, 'ingest source_actor')

@@ -43,6 +43,73 @@ async fn fresh(name: &str) -> CognitiveNexus {
     CognitiveNexus::connect(Arc::new(db)).await.unwrap()
 }
 
+#[tokio::test]
+async fn control_plane_timestamp_inputs_are_validated_before_writing() {
+    let nexus = fresh("canonical_governance_times").await;
+    let gov = nexus.governance();
+    let conditions = AuthorityConditions {
+        valid_until: "2099-01-01T00:00:00Z".into(),
+        ..Default::default()
+    };
+    let grant = GrantDraft {
+        conditions: conditions.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        gov.create_grant(grant, SYSTEM_PRINCIPAL)
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    let delegation = DelegationDraft {
+        conditions: conditions.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        gov.create_delegation(delegation, SYSTEM_PRINCIPAL)
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    let policy = PolicyDraft {
+        statements: vec![PolicyStatement {
+            conditions,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        gov.publish_policy(policy, SYSTEM_PRINCIPAL)
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    let approval = ApprovalDraft {
+        expires_at: "2099-02-30T00:00:00.000Z".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        gov.request_approval(approval, SYSTEM_PRINCIPAL)
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    let approval = ApprovalDraft {
+        expires_at: "2099-01-01T00:00:00.123Z".into(),
+        ..Default::default()
+    };
+    let saved = gov
+        .request_approval(approval, SYSTEM_PRINCIPAL)
+        .await
+        .unwrap();
+    assert_eq!(saved.expires_at, "2099-01-01T00:00:00.123Z");
+    assert!(anda_kip::timestamp::parse(&saved.created_at, "created_at").is_ok());
+}
+
 async fn agent(gov: &GovernanceStore, id: &str) -> String {
     gov.ensure_principal(PrincipalDraft {
         principal_id: id.to_string(),
@@ -2204,7 +2271,7 @@ async fn setting_retention_in_a_create_asks_what_set_retention_asks() {
     let smuggled = run_as(
         &session,
         r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
-           SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00Z"}} }"#,
+           SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00.000Z"}} }"#,
     )
     .await;
     assert_eq!(error_code(&smuggled), "NotAuthorized");
@@ -2229,7 +2296,7 @@ async fn setting_retention_in_a_create_asks_what_set_retention_asks() {
         run_as(
             &nexus.session(AuthContext::principal(&custodian)),
             r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Alice"
-               SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00Z"}} }"#,
+               SET FIELDS {retention: {expires_at: "2030-01-01T00:00:00.000Z"}} }"#,
         )
         .await
         .status,
@@ -3723,7 +3790,7 @@ async fn imported_cognition_arrives_at_the_bottom_of_the_authority_ladder() {
     let owner = source.system_session();
     run_as(
         &owner,
-        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
     )
     .await;
     owner
@@ -3870,7 +3937,7 @@ async fn one_of_two_approvals_is_not_partial_activation() {
     let session = nexus.session(AuthContext::principal(&steward));
     run_as(
         &session,
-        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
+        r#"CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "Document", payload: "a procedure", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:1fd3e68a87f7cec89c2d571adc839ecff2da5e81fe56f553ccae57339963f0d7"} }"#,
     )
     .await;
     let element = ElementId::new(anda_kip::ElementKind::Evidence, 1);

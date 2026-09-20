@@ -2,6 +2,27 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_kip 0.13.1, @ldclabs/kip-do 0.13.1] — 2026-09-20
+
+KIP remains `2.0` and the CognitiveMemory package remains `2.1.0`.
+This release tightens timestamp input compatibility; update clients that sent
+whole seconds or timezone offsets before adopting it.
+
+- Sync KIP `dcde1de` (§6.5): both Nexus engines require canonical UTC
+  millisecond timestamps (`YYYY-MM-DDTHH:mm:ss.SSSZ`). Clients must include
+  `.000Z` for whole seconds; offsets, other fractional widths and invalid
+  dates are rejected instead of normalized. Invalid strings report
+  `ConstraintViolation`; non-string timestamps report `TypeMismatch`.
+- Apply the contract to Core writes, time-valued queries, ingest, Profile and
+  pinned JSON Schema fields, leases and Governance time bounds. Engine clocks
+  truncate to milliseconds; commit order continues to use `space_seq`.
+  Explicit KIP 1.x migration still converts legacy timestamp representations.
+- Add 47 shared timestamp conformance cases, refresh the TypeScript static
+  validators/corpus, and expose the Rust SDK's shared timestamp validator.
+- Refresh the AndaDB skill against current APIs, split detailed guidance into
+  focused references, and synchronize `CLAUDE.md` / `AGENTS.md` with the
+  repository's lifecycle constraints, test commands and generated-file workflow.
+
 ## [anda_cognitive_nexus 0.13.2] — 2026-09-20
 
 - Stop creating 13 unused B-Tree indexes on Core element collections. Keep

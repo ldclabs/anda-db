@@ -1,3 +1,4 @@
+import { validateValue } from '../src/schema/contracts.js'
 import { describe, expect, it } from 'vitest'
 import * as validators from '../src/schema/validate.js'
 import {
@@ -368,7 +369,8 @@ describe('package validation', () => {
   it('treats a declared type list as a union', () => {
     const spec = { fields: { at: { type: ['timestamp', 'null'] } } }
     expect(validateAttributes('t', spec, { at: null }).valid).toBe(true)
-    expect(validateAttributes('t', spec, { at: '2026-01-01' }).valid).toBe(true)
+    expect(validateAttributes('t', spec, { at: '2026-01-01T00:00:00.000Z' }).valid).toBe(true)
+    expect(validateAttributes('t', spec, { at: '2026-01-01' }).valid).toBe(false)
     expect(validateAttributes('t', spec, { at: 7 }).valid).toBe(false)
   })
 
@@ -562,4 +564,13 @@ describe('package validation', () => {
     expect(warned.valid).toBe(true)
     expect(warned.throwIfInvalid().warnings).toHaveLength(1)
   })
+})
+
+it('applies the canonical timestamp contract inside pinned JSON Schemas', () => {
+  const schema = { $ref: 'urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/started_at' }
+  expect(() => validateValue(schema, '2024-02-29T00:00:00.123Z')).not.toThrow()
+  for (const value of ['2026-01-01T00:00:00Z', '2026-02-30T00:00:00.000Z']) {
+    expect(() => validateValue(schema, value)).toThrowError(expect.objectContaining({ code: 'ConstraintViolation' }))
+  }
+  expect(() => validateValue(schema, 0)).toThrowError(expect.objectContaining({ code: 'TypeMismatch' }))
 })

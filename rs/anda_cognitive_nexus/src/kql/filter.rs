@@ -608,7 +608,11 @@ mod tests {
             ComparisonOperator::NotEqual,
             ComparisonOperator::LessThan,
         ] {
-            assert!(!compare(&absent, &text("2026-01-01T00:00:00Z"), operator));
+            assert!(!compare(
+                &absent,
+                &text("2026-01-01T00:00:00.000Z"),
+                operator
+            ));
         }
     }
 

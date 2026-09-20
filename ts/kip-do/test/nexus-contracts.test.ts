@@ -142,7 +142,7 @@ describe('Nexus host contracts', () => {
           'CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}',
         )
         const s = n.systemSession()
-        s.leaseTask('C-3', 1, '2099-01-01T00:00:00Z')
+        s.leaseTask('C-3', 1, '2099-01-01T00:00:00.000Z')
         const selection = s.putArtifact(
             { selection: 'explicit action without a Skill' },
             [],
@@ -203,7 +203,7 @@ describe('Nexus host contracts', () => {
           'UPDATE "C-3" SET ATTRIBUTES {status:"pending"} EXPECT VERSION 3',
         )
         expect(
-          (s.leaseTask('C-3', 4, '2099-02-01T00:00:00Z').lease as JsonMap)
+          (s.leaseTask('C-3', 4, '2099-02-01T00:00:00.000Z').lease as JsonMap)
             .fencing_token,
         ).toBe(2)
         expect(() => s.beginDispatch('idempotent-effect', 2, 1)).toThrow()
@@ -348,10 +348,10 @@ describe('Nexus host contracts', () => {
       }`)
         const s = n.systemSession()
         expect(
-          (s.leaseTask('C-3', 1, '2099-01-01T00:00:00Z').lease as JsonMap)
+          (s.leaseTask('C-3', 1, '2099-01-01T00:00:00.000Z').lease as JsonMap)
             .fencing_token,
         ).toBe(1)
-        expect(() => s.leaseTask('C-3', 1, '2099-02-01T00:00:00Z')).toThrow()
+        expect(() => s.leaseTask('C-3', 1, '2099-02-01T00:00:00.000Z')).toThrow()
         s.armWatch('C-4', 1)
         expect(() =>
           n.execute(
@@ -391,10 +391,12 @@ describe('Nexus host contracts', () => {
             `UPDATE "C-1" SET ATTRIBUTES {status:"running"} SET FACET "LeaseState" {owner:"${SYSTEM_PRINCIPAL}",fencing_token:1,attempt_count:1,expires_at:"${expires}"} EXPECT VERSION 1`,
           ),
         ).toThrow()
+        expect(() => n.systemSession().leaseTask('C-1', 1, '2099-01-01T02:00:00.000+02:00'))
+          .toThrowError(expect.objectContaining({ code: 'ConstraintViolation' }))
         expect(
           (n
             .systemSession()
-            .leaseTask('C-1', 1, '2099-01-01T02:00:00+02:00')
+            .leaseTask('C-1', 1, '2099-01-01T00:00:00.000Z')
             .lease as JsonMap).expires_at,
         ).toBe('2099-01-01T00:00:00.000Z')
       },

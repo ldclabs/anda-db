@@ -472,13 +472,13 @@ async fn for_time_restricts_by_world_validity() {
             CREATE ASSERTION ?old {
                 SET FIELDS {
                     proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
-                    valid_time: {from: "2020-01-01T00:00:00Z", until: "2023-01-01T00:00:00Z"}
+                    valid_time: {from: "2020-01-01T00:00:00.000Z", until: "2023-01-01T00:00:00.000Z"}
                 }
             }
             CREATE ASSERTION ?new {
                 SET FIELDS {
                     proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
-                    valid_time: {from: "2023-01-01T00:00:00Z"}
+                    valid_time: {from: "2023-01-01T00:00:00.000Z"}
                 }
             }
         }"#,
@@ -487,14 +487,14 @@ async fn for_time_restricts_by_world_validity() {
 
     let then = ok(
         &nexus,
-        r#"FIND(?a.valid_time.from) WHERE { ?a ASSERTION {} } FOR TIME "2021-06-01T00:00:00Z""#,
+        r#"FIND(?a.valid_time.from) WHERE { ?a ASSERTION {} } FOR TIME "2021-06-01T00:00:00.000Z""#,
     )
     .await;
     assert_eq!(rows(&then), &vec![json!("2020-01-01T00:00:00.000Z")]);
 
     let now = ok(
         &nexus,
-        r#"FIND(?a.valid_time.from) WHERE { ?a ASSERTION {} } FOR TIME "2026-06-01T00:00:00Z""#,
+        r#"FIND(?a.valid_time.from) WHERE { ?a ASSERTION {} } FOR TIME "2026-06-01T00:00:00.000Z""#,
     )
     .await;
     assert_eq!(rows(&now), &vec![json!("2023-01-01T00:00:00.000Z")]);

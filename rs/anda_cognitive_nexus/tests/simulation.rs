@@ -204,7 +204,7 @@ async fn simulation_is_not_a_request_option_or_an_ordinary_principal_capability(
             .with_simulated_lifecycle_time("tomorrow")
             .unwrap_err()
             .name(),
-        "TypeMismatch"
+        "ConstraintViolation"
     );
     assert!(
         serde_json::from_value::<Request>(
@@ -330,7 +330,7 @@ async fn rewinding_lifecycle_time_never_revives_an_expired_grant() {
     nexus.store.put_space(&space).await.unwrap();
     let simulated = nexus
         .system_session()
-        .with_simulated_lifecycle_time("1990-01-01T00:00:00Z")
+        .with_simulated_lifecycle_time("1990-01-01T00:00:00.000Z")
         .unwrap();
     assert!(
         simulated

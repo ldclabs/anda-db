@@ -205,7 +205,7 @@ describe('TRANSITION', () => {
       // A terminal move finalizes fields and topology in the same statement
       // (§52.5), and the entry names what it finalized.
       const done = nexus.execute(`TRANSITION "X-1" TO "completed"
-        SET FIELDS { ended_at: "2026-09-01T00:00:00Z", parameters_digest: "sha3-256:abc" }
+        SET FIELDS { ended_at: "2026-09-01T00:00:00.000Z", parameters_digest: "sha3-256:abc" }
         SET STRUCTURAL { ("outputs", "E-1") }`)
       expect(done.status).toBe('committed')
       const row = activity()
@@ -344,7 +344,7 @@ describe('TRANSITION', () => {
       )
       expect(parsed('TRANSITION "A-1" TO :s', { s: 'superseded' }).code).toBe('InvalidSyntax')
       expect(
-        parsed('TRANSITION "A-1" TO :s SET FIELDS { ended_at: "2026-01-01T00:00:00Z" }', {
+        parsed('TRANSITION "A-1" TO :s SET FIELDS { ended_at: "2026-01-01T00:00:00.000Z" }', {
           s: 'archived',
         }).code,
       ).toBe('InvalidSyntax')

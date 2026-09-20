@@ -135,7 +135,7 @@ describe('Predicate definition fields', () => {
       (nexus) => {
         nexus.execute('CREATE CONCEPT ?c { TYPE "Person" NAME "Alice" }')
         expect(
-          nexus.execute('ENSURE PROPOSITION ?p ({id: "C-1"}, "born", "1990-01-01T00:00:00Z")').status,
+          nexus.execute('ENSURE PROPOSITION ?p ({id: "C-1"}, "born", "1990-01-01T00:00:00.000Z")').status,
         ).toBe('committed')
         expect(
           refused(() => nexus.execute('ENSURE PROPOSITION ?p ({id: "C-1"}, "born", "yesterday")')).code,
@@ -155,7 +155,7 @@ describe('Predicate definition fields', () => {
         ).toBe('ConstraintViolation')
         // The format is not part of identity: the same string is one tuple.
         expect(
-          nexus.execute('ENSURE PROPOSITION ?p ({id: "C-1"}, "born", "1990-01-01T00:00:00Z")').status,
+          nexus.execute('ENSURE PROPOSITION ?p ({id: "C-1"}, "born", "1990-01-01T00:00:00.000Z")').status,
         ).toBe('no_effect')
       },
       [OPEN],

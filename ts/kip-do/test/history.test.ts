@@ -287,13 +287,13 @@ describe('DESCRIBE SNAPSHOT', () => {
 
       // Before anything was committed: coordinate 0, an empty Space and not
       // an error.
-      expect(at('2000-01-01T00:00:00Z').space_seq).toBe(0)
+      expect(at('2000-01-01T00:00:00.000Z').space_seq).toBe(0)
       // At the first commit's own instant, that commit; after the second,
       // the second.
       expect(at(first.committed_at!).space_seq).toBeGreaterThanOrEqual(1)
       expect(at(second.committed_at!).space_seq).toBe(2)
       expect(at(second.committed_at!).tx_id).toBe(second.tx_id)
-      expect(at('2999-01-01T00:00:00Z').space_seq).toBe(2)
+      expect(at('2999-01-01T00:00:00.000Z').space_seq).toBe(2)
       expect(() => nexus.describe('DESCRIBE SNAPSHOT AT TIME "yesterday"')).toThrowError()
     })
   })
@@ -369,7 +369,7 @@ describe('FOR TIME', () => {
           SET FIELDS {
             proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
             confidence: 0.9,
-            valid_time: {from: "2020-01-01T00:00:00Z", until: "2021-01-01T00:00:00Z"}
+            valid_time: {from: "2020-01-01T00:00:00.000Z", until: "2021-01-01T00:00:00.000Z"}
           }
         }
       }`)
@@ -378,12 +378,12 @@ describe('FOR TIME', () => {
       expect(nexus.query(FIND)).toHaveLength(1)
       // Inside the interval the claim applied…
       expect(
-        nexus.query(`${FIND} FOR TIME "2020-06-01T00:00:00Z"`),
+        nexus.query(`${FIND} FOR TIME "2020-06-01T00:00:00.000Z"`),
       ).toHaveLength(1)
       // …and outside it, it did not. The Assertion is still recorded and still
       // readable: `FOR TIME` narrows what applied, not what exists.
-      expect(nexus.query(`${FIND} FOR TIME "2022-01-01T00:00:00Z"`)).toEqual([])
-      expect(nexus.query(`${FIND} FOR TIME "2019-01-01T00:00:00Z"`)).toEqual([])
+      expect(nexus.query(`${FIND} FOR TIME "2022-01-01T00:00:00.000Z"`)).toEqual([])
+      expect(nexus.query(`${FIND} FOR TIME "2019-01-01T00:00:00.000Z"`)).toEqual([])
     })
   })
 
@@ -396,7 +396,7 @@ describe('FOR TIME', () => {
         CREATE ASSERTION ?a {
           SET FIELDS {
             proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated",
-            confidence: 0.9, valid_time: {from: "2020-01-01T00:00:00Z"}
+            confidence: 0.9, valid_time: {from: "2020-01-01T00:00:00.000Z"}
           }
         }
       }`)
@@ -407,7 +407,7 @@ describe('FOR TIME', () => {
         nexus.query('FIND(?a) WHERE { ?a ASSERTION {} } AS OF SEQ 1'),
       ).toHaveLength(1)
       expect(
-        nexus.query('FIND(?a) WHERE { ?a ASSERTION {} } FOR TIME "2019-01-01T00:00:00Z"'),
+        nexus.query('FIND(?a) WHERE { ?a ASSERTION {} } FOR TIME "2019-01-01T00:00:00.000Z"'),
       ).toEqual([])
     })
   })

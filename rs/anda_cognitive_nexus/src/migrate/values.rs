@@ -166,9 +166,12 @@ fn alias(attrs: &mut Map<String, Json>, old: &str, new: &str) {
 }
 
 pub(super) fn timestamp(value: &Json) -> Option<String> {
+    // Migration is an explicit conversion of legacy data, not a protocol input
+    // path. Preserve valid old offsets/whole seconds while emitting §6.5 form.
     value
         .as_str()
-        .and_then(|v| crate::time::normalize(v, "legacy timestamp").ok())
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|at| crate::time::format(at.with_timezone(&chrono::Utc)))
 }
 
 pub(super) fn retention(metadata: &Json) -> Json {

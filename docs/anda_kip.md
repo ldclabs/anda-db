@@ -1,6 +1,7 @@
 # `anda_kip` — Technical Reference
 
-Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP at `dcde1de`, including the 2.1.0 memory vocabulary and the strict
+UTC millisecond timestamp contract (§6.5). See the
 [Cognitive Nexus documentation](anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 `anda_kip` is the protocol layer of the AndaDB workspace: it turns KIP 2.0
@@ -272,7 +273,7 @@ use anda_kip::{parse_kip, parse_kql, parse_kml, parse_meta, parse_json};
 let command = parse_kip(r#"DESCRIBE PRIMER"#)?;          // any surface
 let query   = parse_kql(r#"FIND(?x) WHERE { ?x {a: 1} }"#)?;
 let mutation = parse_kml(r#"TRANSITION :old TO "archived""#)?;
-let meta    = parse_meta(r#"DESCRIBE SNAPSHOT AT TIME "2026-01-01T00:00:00Z""#)?;
+let meta    = parse_meta(r#"DESCRIBE SNAPSHOT AT TIME "2026-01-01T00:00:00.000Z""#)?;
 let value   = parse_json(r#"{ a: 1, /* not JSON5 */ }"#).is_err();
 # Ok::<(), anda_kip::KipError>(())
 ```
@@ -514,7 +515,7 @@ through model-generated command text:
     "key": "msg",
     "evidence_class": "user_statement",
     "payload": "I prefer dark mode.",
-    "observed_at": "2026-08-14T01:00:00Z"
+    "observed_at": "2026-08-14T01:00:00.000Z"
   }]},
   "operations": [{
     "language": "KML",

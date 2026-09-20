@@ -7,7 +7,7 @@
   "cases": [
     {
       "name": "an omitted assertion time defaults to the engine transaction time",
-      "command": "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00Z\") }",
+      "command": "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00.000Z\") }",
       "expect": {
         "result": [
           1

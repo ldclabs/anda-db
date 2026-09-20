@@ -99,7 +99,7 @@ export const FIXTURES: readonly Fixture[] = [
       }
     ],
     "setup": [
-      "MUTATE {\n CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Ada\" }\n CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n CREATE CONCEPT ?travel { TYPE \"Person\" NAME \"travel\" }\n ENSURE PROPOSITION ?home (?a, \"position\", \"home\")\n ENSURE PROPOSITION ?office (?a, \"position\", \"office\")\n ENSURE PROPOSITION ?tea (?a, \"likes\", \"tea\")\n ENSURE PROPOSITION ?coffee (?a, \"likes\", \"coffee\")\n ENSURE PROPOSITION ?w (?a, \"scoped\", \"work\")\n ENSURE PROPOSITION ?t (?a, \"scoped\", \"travel\")\n ENSURE PROPOSITION ?old (?a, \"temporal\", \"old\")\n ENSURE PROPOSITION ?new (?a, \"temporal\", \"new\")\n CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?home, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?office, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?tea, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?coffee, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?w, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?work] } }\n CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?t, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?travel] } }\n CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?old, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-01T00:00:00Z\", until: \"2026-09-07T00:00:00Z\" } } }\n CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?new, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-07T00:00:00Z\" } } }\n}"
+      "MUTATE {\n CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Ada\" }\n CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n CREATE CONCEPT ?travel { TYPE \"Person\" NAME \"travel\" }\n ENSURE PROPOSITION ?home (?a, \"position\", \"home\")\n ENSURE PROPOSITION ?office (?a, \"position\", \"office\")\n ENSURE PROPOSITION ?tea (?a, \"likes\", \"tea\")\n ENSURE PROPOSITION ?coffee (?a, \"likes\", \"coffee\")\n ENSURE PROPOSITION ?w (?a, \"scoped\", \"work\")\n ENSURE PROPOSITION ?t (?a, \"scoped\", \"travel\")\n ENSURE PROPOSITION ?old (?a, \"temporal\", \"old\")\n ENSURE PROPOSITION ?new (?a, \"temporal\", \"new\")\n CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?home, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?office, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?tea, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?coffee, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?w, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?work] } }\n CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?t, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, context_refs: [?travel] } }\n CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?old, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-01T00:00:00.000Z\", until: \"2026-09-07T00:00:00.000Z\" } } }\n CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?new, asserted_by: ?a, stance: \"support\", mode: \"stated\", confidence: 0.9, valid_time: { from: \"2026-09-07T00:00:00.000Z\" } } }\n}"
     ],
     "cases": [
       {
@@ -211,7 +211,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "until is excluded exactly at the boundary",
-        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T08:00:00+08:00\"",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T00:00:00.000Z\"",
         "expect": {
           "result": [
             "rejected"
@@ -223,7 +223,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "the value beginning at the boundary is eligible",
-        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"new\") } FOR TIME \"2026-09-07T00:00:00Z\"",
+        "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"new\") } FOR TIME \"2026-09-07T00:00:00.000Z\"",
         "expect": {
           "result": [
             "accepted"
@@ -234,8 +234,8 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "basis reports normalized time and the next known invalidation",
-        "command": "FIND(?b.basis.valid_at, ?b.basis.next_invalid_at) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-06T08:00:00+08:00\"",
+        "name": "basis preserves canonical time and the next known invalidation",
+        "command": "FIND(?b.basis.valid_at, ?b.basis.next_invalid_at) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-06T00:00:00.000Z\"",
         "expect": {
           "result": [
             [
@@ -249,8 +249,8 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "invalid half-open interval ('2026-09-07T00:00:00Z', '2026-09-07T00:00:00Z')",
-        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-07T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+        "name": "invalid half-open interval ('2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z')",
+        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-07T00:00:00.000Z\", \"until\": \"2026-09-07T00:00:00.000Z\"} } }",
         "expect": {
           "error": "ConstraintViolation"
         },
@@ -259,8 +259,8 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "invalid half-open interval ('2026-09-08T00:00:00Z', '2026-09-07T00:00:00Z')",
-        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-08T00:00:00Z\", \"until\": \"2026-09-07T00:00:00Z\"} } }",
+        "name": "invalid half-open interval ('2026-09-08T00:00:00.000Z', '2026-09-07T00:00:00.000Z')",
+        "command": "CREATE ASSERTION ?x { SET FIELDS { proposition: \"P-7\", asserted_by: \"C-1\", stance: \"support\", mode: \"stated\", valid_time: {\"from\": \"2026-09-08T00:00:00.000Z\", \"until\": \"2026-09-07T00:00:00.000Z\"} } }",
         "expect": {
           "error": "ConstraintViolation"
         },
@@ -345,7 +345,7 @@ export const FIXTURES: readonly Fixture[] = [
     "description": "The consequence channel: what the world did after the Brain acted, and what a Skill's standing is spent from. Outcome Evidence (Spec §15.7) carries an OutcomeRecord Facet — the graded index over an untouched payload — and cognition subscribes to a stream by task family rather than by reference. What an engine owes here is the Profile's schema discipline: the scoring handle a Skill cannot be compiled without, the four lifecycle states, a graded index its subject cannot rewrite, and the one guarded statement (Appendix F.6) a lifecycle verdict executes as. The verdict rule itself is Brain policy; that it lands as one recomputable transition is not.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Skill\"\n    NAME \"Deploy behind a pre-flight migration check\"\n    SET ATTRIBUTES {\n      skill_class: \"workflow\",\n      summary: \"Dry-run the migration before the deploy\",\n      status: \"proposed\"\n    }\n    SET FACET \"MnemonicState\" {utility: 0.5}\n    SET STRUCTURAL {(\"current_revision\",?revision)}\n  }\n  CREATE CONCEPT ?revision {TYPE \"SkillRevision\" SET ATTRIBUTES {task_family:\"deploy/pre-flight\",procedure:\"dry-run migration before deploy\",behavior_digest:\"sha256:045d856aa6d929d266e7b68583ab860353254097da85f7f4969499ab535bb7b3\"} SET STRUCTURAL {(\"revision_of\",?skill)}}\n}",
-      "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"win\", task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"loss\", task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
+      "MUTATE {\n  CREATE EVIDENCE ?win {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 41: the pre-flight check caught the drift, rollout clean\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-20T09:00:00.000Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"win\", task_family: \"deploy/pre-flight\", outcome_status: \"success\", magnitude: 0.8}\n  }\n  CREATE EVIDENCE ?loss {\n    SET FIELDS {\n      evidence_class: \"outcome\",\n      payload: \"deploy 42: pre-flight passed, rollout still failed on a stale replica\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-21T09:00:00.000Z\"\n    }\n    SET FACET \"OutcomeRecord\" {attempt_ref: null, metric: \"completion\", window: \"run\", terminal: true, observer_config_digest: \"sha256:0000000000000000000000000000000000000000000000000000000000000000\", observation_key: \"loss\", task_family: \"deploy/pre-flight\", outcome_status: \"failure\"}\n  }\n  CREATE ACTIVITY ?observed {\n    SET FIELDS {activity_class: \"outcome_observation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"outputs\", ?win)\n      (\"outputs\", ?loss)\n    }\n  }\n}"
     ],
     "cases": [
       {
@@ -801,7 +801,7 @@ export const FIXTURES: readonly Fixture[] = [
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?event {\n    TYPE \"Event\"\n    NAME \"Migration meeting\"\n    SET ATTRIBUTES {summary: \"The team agreed to migrate on Friday\"}\n  }\n  CREATE CONCEPT ?insight {\n    TYPE \"Insight\"\n    NAME \"Migrations need a rollback plan\"\n    SET ATTRIBUTES {summary: \"Every migration ships with a rollback\"}\n  }\n  CREATE ACTIVITY ?consolidate {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?event)\n      (\"outputs\", ?insight)\n    }\n  }\n}",
       "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Insight\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      summary: \"Write the rollback first\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
     ],
     "cases": [
       {
@@ -3085,7 +3085,7 @@ export const FIXTURES: readonly Fixture[] = [
     "cases": [
       {
         "name": "a retention block is written onto the element the target names",
-        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2030-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {}
       },
       {
@@ -3117,7 +3117,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a member outside the hook's shape is refused, not stored and lost",
-        "command": "SET RETENTION ?c {retention_class: \"standard\", review_at: \"2030-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "command": "SET RETENTION ?c {retention_class: \"standard\", review_at: \"2030-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {
           "error": "SchemaFieldNotFound"
         }
@@ -3133,7 +3133,7 @@ export const FIXTURES: readonly Fixture[] = [
         "name": "an expires_at that is not a timestamp is refused",
         "command": "SET RETENTION ?c {expires_at: \"whenever\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {
-          "error": "TypeMismatch"
+          "error": "ConstraintViolation"
         }
       },
       {
@@ -3147,7 +3147,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "the block replaces rather than patches",
-        "command": "SET RETENTION ?c {expires_at: \"2031-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
+        "command": "SET RETENTION ?c {expires_at: \"2031-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {}
       },
       {
@@ -3161,7 +3161,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a lapsed retention is a sweep's business, not recall's",
-        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2020-01-01T00:00:00Z\"} WHERE { ?c CONCEPT {name: \"Bob\"} }",
+        "command": "SET RETENTION ?c {retention_class: \"short\", expires_at: \"2020-01-01T00:00:00.000Z\"} WHERE { ?c CONCEPT {name: \"Bob\"} }",
         "expect": {}
       },
       {
@@ -3627,7 +3627,7 @@ export const FIXTURES: readonly Fixture[] = [
       }
     ],
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?note { TYPE \"Note\" NAME \"A note\" }\n  CREATE CONCEPT ?citing {\n    TYPE \"Note\"\n    NAME \"Citing note\"\n    SET STRUCTURAL { (\"evidence\", ?note) }\n  }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n  CREATE ACTIVITY ?run {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?alice)\n      (\"outputs\", ?dark)\n      (\"associated_actors\", ?alice)\n      (\"reviewed\", ?note)\n    }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?note { TYPE \"Note\" NAME \"A note\" }\n  CREATE CONCEPT ?citing {\n    TYPE \"Note\"\n    NAME \"Citing note\"\n    SET STRUCTURAL { (\"evidence\", ?note) }\n  }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n  CREATE ACTIVITY ?run {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?alice)\n      (\"outputs\", ?dark)\n      (\"associated_actors\", ?alice)\n      (\"reviewed\", ?note)\n    }\n  }\n}"
     ],
     "cases": [
       {
@@ -3725,6 +3725,560 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "timestamps",
+    "description": "KIP dcde1de §6.5: strict UTC millisecond inputs, exact error classes, calendar validation and preserved values.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://test/timestamps",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "TimestampProbe": {
+              "kind": "ConceptType",
+              "attributes": {
+                "open": false,
+                "fields": {
+                  "at": {
+                    "type": "timestamp"
+                  },
+                  "nullable_at": {
+                    "type": [
+                      "timestamp",
+                      "null"
+                    ]
+                  },
+                  "formatted": {
+                    "type": "string",
+                    "format": "timestamp"
+                  }
+                }
+              }
+            }
+          },
+          "predicates": {
+            "moment": {
+              "kind": "PredicateType",
+              "object": {
+                "literal_types": [
+                  "string"
+                ],
+                "format": "timestamp"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {CREATE CONCEPT ?a {TYPE \"Person\" NAME \"clock\"} ENSURE PROPOSITION ?p (?a, \"moment\", \"2024-02-29T12:34:56.123Z\")}"
+    ],
+    "cases": [
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00.1Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00.1Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00.12Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00.12Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00.1234Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00.1234Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00.000+00:00'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00.000+00:00"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T08:00:00.000+08:00'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T08:00:00.000+08:00"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01t00:00:00.000z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01t00:00:00.000z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01 00:00:00.000Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01 00:00:00.000Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-02-29T00:00:00.000Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-02-29T00:00:00.000Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2024-02-30T00:00:00.000Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2024-02-30T00:00:00.000Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T24:00:00.000Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T24:00:00.000Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:60.000Z'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:60.000Z"
+        }
+      },
+      {
+        "name": "reject noncanonical observed_at '2026-01-01T00:00:00.000Z\\n'",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00.000Z\n"
+        }
+      },
+      {
+        "name": "reject non-string observed_at 0",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "reject non-string observed_at True",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": true
+        }
+      },
+      {
+        "name": "reject non-string observed_at []",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": []
+        }
+      },
+      {
+        "name": "reject non-string observed_at {}",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": {}
+        }
+      },
+      {
+        "name": "accept canonical observed_at 2024-02-29T12:34:56.000Z",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "result": null
+        },
+        "params": {
+          "at": "2024-02-29T12:34:56.000Z"
+        }
+      },
+      {
+        "name": "accept canonical observed_at 2024-02-29T12:34:56.123Z",
+        "command": "CREATE EVIDENCE ?e {SET FIELDS {evidence_class:\"timestamp_test\",payload:\"arbitrary text 2026-01-01T00:00:00Z\",observed_at::at}}",
+        "expect": {
+          "result": null
+        },
+        "params": {
+          "at": "2024-02-29T12:34:56.123Z"
+        }
+      },
+      {
+        "name": "preserve milliseconds on read",
+        "command": "FIND(?e.observed_at) WHERE {?e EVIDENCE {evidence_class:\"timestamp_test\"}}",
+        "expect": {
+          "result": [
+            "2024-02-29T12:34:56.000Z",
+            "2024-02-29T12:34:56.123Z"
+          ]
+        }
+      },
+      {
+        "name": "leave payload timestamps untouched",
+        "command": "FIND(?e.payload.inline) WHERE {?e EVIDENCE {evidence_class:\"timestamp_test\"}}",
+        "expect": {
+          "result": [
+            "arbitrary text 2026-01-01T00:00:00Z",
+            "arbitrary text 2026-01-01T00:00:00Z"
+          ]
+        }
+      },
+      {
+        "name": "asserted_at rejects whole seconds",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", asserted_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "asserted_at rejects epoch values",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", asserted_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "valid_time.from rejects whole seconds",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", valid_time:{from::at}}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "valid_time.from rejects epoch values",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", valid_time:{from::at}}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "valid_time.until rejects whole seconds",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", valid_time:{until::at}}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "valid_time.until rejects epoch values",
+        "command": "CREATE ASSERTION ?x {SET FIELDS {proposition:\"P-1\",asserted_by:\"C-1\",stance:\"support\",mode:\"stated\", valid_time:{until::at}}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "Activity.started_at rejects whole seconds",
+        "command": "CREATE ACTIVITY ?x {SET FIELDS {activity_class:\"timestamp_test\",started_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "Activity.started_at rejects epoch values",
+        "command": "CREATE ACTIVITY ?x {SET FIELDS {activity_class:\"timestamp_test\",started_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "Activity.ended_at rejects whole seconds",
+        "command": "CREATE ACTIVITY ?x {SET FIELDS {activity_class:\"timestamp_test\",ended_at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "Activity.ended_at rejects epoch values",
+        "command": "CREATE ACTIVITY ?x {SET FIELDS {activity_class:\"timestamp_test\",ended_at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "retention.expires_at rejects whole seconds",
+        "command": "SET RETENTION \"C-1\" {expires_at::at}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "retention.expires_at rejects epoch values",
+        "command": "SET RETENTION \"C-1\" {expires_at::at}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "FOR TIME rejects whole seconds",
+        "command": "FIND(?c.name) WHERE {?c CONCEPT {id:\"C-1\"}} FOR TIME :at",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "FOR TIME rejects epoch values",
+        "command": "FIND(?c.name) WHERE {?c CONCEPT {id:\"C-1\"}} FOR TIME :at",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "DESCRIBE SNAPSHOT AT TIME rejects whole seconds",
+        "command": "DESCRIBE SNAPSHOT AT TIME :at",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "DESCRIBE SNAPSHOT AT TIME rejects epoch values",
+        "command": "DESCRIBE SNAPSHOT AT TIME :at",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "profile timestamp rejects whole seconds",
+        "command": "CREATE CONCEPT ?c {TYPE \"TimestampProbe\" SET ATTRIBUTES {at::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "profile timestamp rejects epoch values",
+        "command": "CREATE CONCEPT ?c {TYPE \"TimestampProbe\" SET ATTRIBUTES {at::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "profile format timestamp rejects whole seconds",
+        "command": "CREATE CONCEPT ?c {TYPE \"TimestampProbe\" SET ATTRIBUTES {formatted::at}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z"
+        }
+      },
+      {
+        "name": "profile format timestamp rejects epoch values",
+        "command": "CREATE CONCEPT ?c {TYPE \"TimestampProbe\" SET ATTRIBUTES {formatted::at}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0
+        }
+      },
+      {
+        "name": "predicate timestamp rejects whole seconds",
+        "command": "ENSURE PROPOSITION ?p (:actor, \"moment\", :at)",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "params": {
+          "at": "2026-01-01T00:00:00Z",
+          "actor": {
+            "id": "C-1"
+          }
+        }
+      },
+      {
+        "name": "predicate timestamp rejects epoch values",
+        "command": "ENSURE PROPOSITION ?p (:actor, \"moment\", :at)",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "params": {
+          "at": 0,
+          "actor": {
+            "id": "C-1"
+          }
+        }
+      },
+      {
+        "name": "nullable profile timestamp permits null",
+        "command": "CREATE CONCEPT ?c {TYPE \"TimestampProbe\" SET ATTRIBUTES {nullable_at:null}}",
+        "expect": {
+          "result": null
+        }
+      },
+      {
+        "name": "ingest observed_at rejects '2026-01-01T00:00:00Z'",
+        "command": "FIND(?c) WHERE {?c CONCEPT {id:\"C-1\"}}",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "entry",
+                "evidence_class": "user_statement",
+                "payload": "text",
+                "observed_at": "2026-01-01T00:00:00Z"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "ingest observed_at rejects 0",
+        "command": "FIND(?c) WHERE {?c CONCEPT {id:\"C-1\"}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "entry",
+                "evidence_class": "user_statement",
+                "payload": "text",
+                "observed_at": 0
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "ingest observed_at rejects None",
+        "command": "FIND(?c) WHERE {?c CONCEPT {id:\"C-1\"}}",
+        "expect": {
+          "error": "TypeMismatch"
+        },
+        "envelope": {
+          "ingest": {
+            "evidence": [
+              {
+                "key": "entry",
+                "evidence_class": "user_statement",
+                "payload": "text",
+                "observed_at": null
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
     "name": "transactions",
     "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it. EXPECT VERSION is the one guard, and it is always the trailing clause (Spec §52.8); there is no EXPECT STATE — TRANSITION validates the target's current lifecycle state itself and fails InvalidLifecycleTransition from the wrong one (§35.3, §52.5), while a move to the state already held is a no_effect rather than an error.",
     "setup": [
@@ -3733,7 +4287,7 @@ export const FIXTURES: readonly Fixture[] = [
     "cases": [
       {
         "name": "an omitted assertion time defaults to the engine transaction time",
-        "command": "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00Z\") }",
+        "command": "FIND(COUNT(?a)) WHERE { ?a ASSERTION {} FILTER(?a.asserted_at >= \"1970-01-01T00:00:00.000Z\") }",
         "expect": {
           "result": [
             1
@@ -3992,4 +4546,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 309
+export const CASE_COUNT = 356

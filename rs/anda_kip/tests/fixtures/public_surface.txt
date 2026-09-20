@@ -124,6 +124,7 @@ lib.rs: mod memory
 lib.rs: mod parser
 lib.rs: mod request
 lib.rs: mod semantics
+lib.rs: mod timestamp
 lib.rs: mod types
 lib.rs: static COGNITIVE_MEMORY_PROFILE
 lib.rs: static KIP_FUNCTION_DEFINITION
@@ -218,6 +219,9 @@ semantics.rs: enum Severity
 semantics.rs: fn analyze
 semantics.rs: fn core_structural_owner
 semantics.rs: struct Diagnostic
+timestamp.rs: const FORMAT
+timestamp.rs: fn parse
+timestamp.rs: fn validate_value
 types.rs: const ACTIVITY_CLASSES
 types.rs: const AUTHORITY_CLASSES
 types.rs: const CHANGE_TRANSITION_EXTENSION

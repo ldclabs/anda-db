@@ -1,6 +1,6 @@
 # anda_kip
 
-Tracks KIP v2 at `d6e3a45`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 `anda_kip` is the protocol SDK of the AndaDB workspace: the parser, executable
@@ -58,6 +58,15 @@ erase the audit trail.
 
 This crate is protocol-only. Everything that needs state — Schema resolution,
 Governance, transactions, projection — belongs to an engine behind `Executor`.
+
+## Timestamp inputs
+
+KIP §6.5 requires valid UTC timestamps with exactly three fractional digits:
+`YYYY-MM-DDTHH:mm:ss.SSSZ`, including `.000Z` for whole seconds. Invalid
+strings return `ConstraintViolation`; non-string timestamps return
+`TypeMismatch`. Optional/null values follow each field's contract. The engines
+validate inputs without padding fractions or converting offsets; generated
+clock values truncate to milliseconds. Use `space_seq` for commit order.
 
 ## Getting started
 

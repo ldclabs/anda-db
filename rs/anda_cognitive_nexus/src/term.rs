@@ -487,10 +487,10 @@ mod tests {
     fn a_datatype_must_agree_with_its_value() {
         // §9.2: the four baseline names, and nothing finer — a timestamp is a
         // `format` the Predicate declares, never a datatype of its own.
-        let value = json!({"value": "2026-08-13T10:00:00Z", "datatype": "string"});
+        let value = json!({"value": "2026-08-13T10:00:00.000Z", "datatype": "string"});
         let endpoint = Endpoint::from_json(&value).unwrap();
         assert_eq!(endpoint.to_json(), value);
-        assert_eq!(endpoint.key(), key_of(json!("2026-08-13T10:00:00Z")));
+        assert_eq!(endpoint.key(), key_of(json!("2026-08-13T10:00:00.000Z")));
         let err = Endpoint::from_json(&json!({"value": 3, "datatype": "string"})).unwrap_err();
         assert_eq!(err.name(), "TypeMismatch");
     }

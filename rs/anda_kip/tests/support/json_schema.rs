@@ -12,9 +12,8 @@
 //! A schema update that introduces a new keyword fails loudly instead of
 //! quietly validating nothing.
 //!
-//! Not implemented, deliberately: `format` is an annotation rather than an
-//! assertion under draft 2020-12's default vocabulary, so it is ignored the
-//! way a conforming validator ignores it.
+//! KIP §6.5 requires `date-time`/`timestamp` format assertions. Other format
+//! names retain draft 2020-12's default annotation behavior.
 
 #![allow(dead_code)]
 
@@ -33,7 +32,6 @@ const ANNOTATIONS: &[&str] = &[
     "deprecated",
     "readOnly",
     "writeOnly",
-    "format",
     "$defs",
 ];
 
@@ -107,6 +105,14 @@ impl Schema {
                     self.check(target, instance, path, errors);
                 }
                 "type" => self.check_type(value, instance, path, errors),
+                "format" => {
+                    if matches!(value.as_str(), Some("date-time" | "timestamp"))
+                        && let Some(text) = instance.as_str()
+                        && let Err(err) = anda_kip::timestamp::parse(text, at(path))
+                    {
+                        errors.push(err.message);
+                    }
+                }
                 "const" => {
                     if instance != value {
                         errors.push(format!("{}: must equal {value}", at(path)));

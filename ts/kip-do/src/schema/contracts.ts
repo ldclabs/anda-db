@@ -76,7 +76,16 @@ export function validatePackageContracts(package_: SchemaPackage): void {
 export function validateValue(schema: Json, value: Json): void {
   const validate = validators[canonicalJson(schema)]
   if (!validate) throw errors.unsupportedCapability('value_schema is not in the static validator catalog')
-  if (!validate(value)) throw errors.constraintViolation('value_schema validation failed: ' + JSON.stringify(validate.errors), validate.errors as Json)
+  if (!validate(value)) {
+    const findings = validate.errors as { keyword: string; parentSchema?: { format?: string }; [key: string]: unknown }[]
+    const timestampType = findings.some((e) => e.keyword === 'type' &&
+      ['timestamp', 'date-time'].includes(e.parentSchema?.format ?? ''))
+    // Keep the existing compact error surface; verbose metadata is only used
+    // internally to distinguish timestamp type errors from format errors.
+    const details = findings.map(({ parentSchema: _parent, schema: _schema, data: _data, ...e }) => e) as Json
+    const message = 'value_schema validation failed: ' + JSON.stringify(details)
+    throw timestampType ? errors.typeMismatch(message, details) : errors.constraintViolation(message, details)
+  }
 }
 
 export { SCHEMA_DOCUMENTS, SCHEMA_DIGESTS }

@@ -6,202 +6,180 @@
 
 # AndaDB - AI Agent Database
 
-Anda DB is a modular Rust workspace for embedded AI memory systems. The core
-crate is a schema-aware document database with B-Tree, BM25, and HNSW retrieval,
-backed by the `object_store` abstraction.
+AndaDB is a modular Rust workspace for embedded AI memory systems. The core
+`anda_db` crate is a schema-aware document database with B-Tree, BM25, and HNSW
+retrieval, backed by `object_store`. `anda_kip` is the protocol SDK;
+`anda_cognitive_nexus` is the stateful KIP executor over AndaDB. The independent
+TypeScript engine in `ts/kip-do` uses SQLite-backed Cloudflare Durable Objects.
 
-## Project Structure
+## Start with the local skill
+
+Before writing Rust code that uses AndaDB, or changing its API examples, read
+[skills/anda-db/SKILL.md](skills/anda-db/SKILL.md). It owns the dependency
+template and runnable quick start; keep examples there instead of duplicating
+them in this document. Read supporting references only as needed:
+
+| Task | Reference |
+| --- | --- |
+| Lifecycle, CRUD, indexes, search, pagination | [Core API](skills/anda-db/references/anda_db_quick_ref.md) |
+| Derives, type mapping, schema upgrades, serialization | [Schemas and CBOR](skills/anda-db/references/schema_and_cbor.md) |
+| Backends, encryption, cache budgets, recovery, shutdown | [Storage and recovery](skills/anda-db/references/storage_and_recovery.md) |
+| KIP, Nexus, Brain host integration, cross-engine checks | [KIP and Cognitive Nexus](skills/anda-db/references/kip_and_nexus.md) |
+
+Use the checked-out implementations and manifests as the authority when prose
+or older examples disagree. Update affected documentation alongside public API
+or behavior changes.
+
+## Project structure
 
 ```text
 rs/
-├── anda_db/                      # Core embedded database library
+├── anda_db/                      # Core embedded database
 ├── anda_db_schema/               # Schema, FieldType, FieldValue, Document
-├── anda_db_derive/               # Derive macros: AndaDBSchema, FieldTyped
+├── anda_db_derive/               # AndaDBSchema and FieldTyped derives
 ├── anda_db_btree/                # Exact-match and range index
 ├── anda_db_tfs/                  # BM25 full-text search
 ├── anda_db_hnsw/                 # HNSW vector index
 ├── anda_db_utils/                # Shared utilities
-├── anda_object_store/            # Metadata and encrypted object-store wrappers
-├── anda_kip/                     # Knowledge Interaction Protocol — KIP 2.0
-├── anda_cognitive_nexus/         # Reference KIP 2.0 Cognitive Nexus runtime
+├── anda_object_store/            # Metadata and encrypted storage wrappers
+├── anda_kip/                     # KIP SDK, specs, grammar, wire schemas
+├── anda_cognitive_nexus/         # Stateful Rust KIP executor
 ├── anda_db_server/               # HTTP server for core database APIs
-├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Cognitive Nexus — KIP 2.0
-├── anda_db_shard_proxy/          # Shard proxy for multi-tenant deployments
-├── anda_kip_wasm/                # WASM wrapper of the KIP parser, test oracle for ts/kip-do — KIP 2.0
-└── cf-tokenizer/                 # Stateless jieba segmentation HTTP service (own nested workspace)
+├── anda_cognitive_nexus_server/  # HTTP/JSON-RPC server for Nexus
+├── anda_db_shard_proxy/          # Multi-tenant shard proxy
+├── anda_kip_wasm/                # Parser test oracle; separate workspace
+└── cf-tokenizer/                 # Stateless Jieba HTTP service; separate workspace
 
-ts/
-└── kip-do/                       # @ldclabs/kip-do: KIP 2.0 engine on SQLite-backed Durable Objects
-
-py/
-└── anda_cognitive_nexus_py/      # Python binding crate, excluded from workspace by default
-
-fixtures/
-└── kip-conformance-2.0/          # KIP 2.0 cross-engine fixtures (both engines run them)
+ts/kip-do/                       # Independent TypeScript KIP engine
+py/anda_cognitive_nexus_py/      # Python binding; not a default workspace member
+fixtures/kip-conformance-2.0/    # Shared cross-engine conformance fixtures
+skills/anda-db/                 # Agent-facing API usage guidance
+docs/                          # Technical and maintenance guides
 ```
 
-## Working with AndaDB
+Root `cargo --workspace` commands do not include the separate WASM/tokenizer
+workspaces, TypeScript, or the Python binding.
 
-When writing Rust code that uses AndaDB, read the local skill first:
+## Dependencies and implementation constraints
 
-```text
-skills/anda-db/SKILL.md
-```
+The root workspace uses Rust edition 2024 with MSRV **1.95**. Rust crates are
+in the **0.13** release family, with different patch versions; read each
+`Cargo.toml` instead of assuming a shared patch version. Use workspace
+dependencies and existing feature conventions when editing workspace crates.
 
-That skill contains the current API patterns for:
+- `object_store` is on 0.14. `anda_db/full` only enables `object_store/fs`;
+  core indexes and Jieba are already available without that feature.
+- Use `cbor2` for CBOR, `cbor2::serialized_size` for encoded sizes, and
+  `cbor2::to_canonical_vec` where deterministic bytes are required. Do not
+  introduce direct `ciborium` usage.
+- Stored embeddings use `Vector` and `vector_from_f32`; query vectors use
+  `Vec<f32>`. Preserve the embedding model's dimension and metric.
+- Share one live writer instance per database namespace. Clone database and
+  collection handles for concurrent tasks; `DBConfig::lock` is not a writer
+  lease. Await mutations, flushes, and closes to completion; cancellation can
+  poison a handle, requiring reopen/recovery through the database.
+- Install tokenizers and deterministic index hooks at the start of each fresh
+  open callback, before recovery-triggering operations. Active cached handles
+  skip callbacks. Use `db.close_collection(name)` before reopening to change
+  schema/index configuration.
+- Multi-field B-Tree indexes are always unique. Their encoded keys support
+  tuple equality, not tuple-ordered ranges. `_id` is queryable without an
+  explicit B-Tree index.
+- Schema upgrades preserve persisted field indexes and require a higher
+  version; new fields must be optional. Storage settings are fixed on first
+  initialization and are not changed by passing a different startup config.
+  See the references before implementing migrations or storage reconfiguration.
 
-- database and collection lifecycle
-- typed schema derivation
-- document CRUD
-- B-Tree, BM25, and HNSW indexes
-- hybrid search with filters
-- storage backends and object-store wrappers
-- CBOR serialization conventions
+## KIP and Brain boundaries
 
-## Key Dependencies
+KIP protocol versions are distinct from Cargo package versions. The repository
+implements KIP 2.0 with the vendored 2.1.0 memory vocabulary; use the
+[vendored specification](rs/anda_kip/SPECIFICATION.md) and
+[syntax reference](rs/anda_kip/KIPSyntax.md).
 
-For embedded database usage, start with:
+Protocol timestamps follow §6.5: UTC strings in `YYYY-MM-DDTHH:mm:ss.SSSZ`
+form, including `.000Z` for whole seconds. Reject noncanonical inputs;
+truncate engine clocks to milliseconds. Use `space_seq` for commit order.
 
-```toml
-anda_db = { version = "0.13", features = ["full"] }
-anda_object_store = "0.13"
-object_store = { version = "0.14", features = ["fs"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-```
+A Proposition is truth-neutral; Assertions record claims and `BELIEF` projects
+them under a policy. Governance and Schema Packages have separate control
+planes. Hosts construct authenticated session context; user request fields
+must not choose their own authority.
 
-Use `cbor2` for CBOR work. Do not add new direct `ciborium` usage. Use
-`cbor2::serialized_size` when encoded-size calculation is needed.
+Check `DESCRIBE CAPABILITIES` on the relevant engine before relying on optional
+behavior. Parsing a command or installing a profile does not install an
+embedding model, scheduler, evaluator, or executor. For Watch/wake/dispatch and
+learning integration, read the [Brain host contracts](docs/anda-brain-nexus-contracts.zh.md).
+For old stores, follow the [KIP 1.x migration guide](docs/kip-v1-migration.md).
 
-## Documentation
+## Build and validation
 
-- [Main documentation](docs/README.md)
-- [Core database](docs/anda_db.md)
-- [Schema model](docs/anda_db_schema.md)
-- [Derive macros](docs/anda_db_derive.md)
-- [B-Tree index](docs/anda_db_btree.md)
-- [BM25 full-text search](docs/anda_db_tfs.md)
-- [HNSW vector search](docs/anda_db_hnsw.md)
-- [Object store wrappers](docs/anda_object_store.md)
-- [KIP](docs/anda_kip.md)
-- [Cognitive Nexus](docs/anda_cognitive_nexus.md)
+Run commands from the repository root unless stated otherwise. Choose checks
+for the changed behavior; documentation-only edits need link/consistency
+checks and compilation of changed runnable examples, not unrelated full suites.
 
-## Quick Start
+| Scope | Command |
+| --- | --- |
+| Rust workspace compile | `cargo check --workspace --all-features` |
+| Rust workspace tests | `cargo test --workspace --all-features` |
+| Core database unit and integration tests | `cargo test -p anda_db --all-features` |
+| Core crash recovery and format compatibility | `cargo test -p anda_db --test crash_recovery --test format_compat` |
+| Schema and derive changes | `cargo test -p anda_db_schema -p anda_db_derive` |
+| KIP SDK and Rust executor | `cargo test -p anda_kip -p anda_cognitive_nexus` |
+| TypeScript typecheck and tests | `make test-ts` |
+| Formatting, Clippy, agent-doc consistency | `make lint` |
 
-```rust
-use anda_db::{
-    collection::CollectionConfig,
-    database::{AndaDB, DBConfig},
-    index::HnswConfig,
-    query::{Query, Search},
-    schema::{AndaDBSchema, Vector, vector_from_f32},
-    storage::StorageConfig,
-};
-use anda_object_store::MetaStoreBuilder;
-use object_store::local::LocalFileSystem;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+`make lint` runs `cargo fmt` and can change files. For a formatting check
+without edits, use `cargo fmt --all -- --check`.
 
-#[derive(Debug, Clone, Serialize, Deserialize, AndaDBSchema)]
-struct Memory {
-    _id: u64,
-    title: String,
-    body: String,
-    embedding: Vector,
-}
+`make test-all` adds format-compatibility checks and KIP fuzzing to Rust tests.
+`make test-full` also runs TypeScript checks. Fuzzing requires nightly and
+cargo-fuzz; TypeScript checks require installed dependencies and pnpm. The
+current TypeScript CI uses Node 24 and pnpm 11; see
+[the CI workflow](.github/workflows/test.yml) for the matching setup.
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    std::fs::create_dir_all("./db")?;
-    let store = Arc::new(
-        MetaStoreBuilder::new(
-            LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
-            10000,
-        ).build(),
-    );
-    let db = AndaDB::connect(
-        store,
-        DBConfig {
-            name: "agent_memory".into(),
-            description: "Embedded AI memory".into(),
-            storage: StorageConfig::default(),
-            lock: None,
-        },
-    )
-    .await?;
+When changing persistence/recovery, verify crash consistency and existing
+format fixtures. For index algorithm changes, run the affected index crate's
+tests, including its property/recall checks. See [testing guidance](docs/testing.md).
+Do not regenerate old fixtures merely to make an incompatible change pass.
 
-    let memories = db
-        .open_or_create_collection(
-            Memory::schema()?,
-            CollectionConfig {
-                name: "memories".into(),
-                description: "Long-term memory collection".into(),
-            },
-            async |c| {
-                c.create_bm25_index_nx(&["title", "body"]).await?;
-                c.create_hnsw_index_nx(
-                    "embedding",
-                    HnswConfig {
-                        dimension: 4,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                Ok(())
-            },
-        )
-        .await?;
+The runnable core example is
+`cargo run -p anda_db --example db_demo --features full`; it creates data under
+`./debug/metastore`. Keep documentation-example test data in a temporary
+directory. For Python tests, follow the root `Cargo.toml` / `make test-py`
+instructions to enable the binding member and select its supported interpreter.
 
-    memories
-        .add_from(&Memory {
-            _id: 0,
-            title: "Rust".into(),
-            body: "Rust is well suited to embedded AI memory services.".into(),
-            embedding: vector_from_f32(vec![0.1, 0.2, 0.3, 0.4]),
-        })
-        .await?;
+## Generated files and protocol changes
 
-    let results: Vec<Memory> = memories
-        .search_as(Query {
-            search: Some(Search {
-                text: Some("embedded AI memory".into()),
-                vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }),
-            limit: Some(10),
-            ..Default::default()
-        })
-        .await?;
+`ts/kip-do` tests shared conformance fixtures and compares its parser against
+the committed Rust WASM oracle. Protocol changes should be checked in both
+engines; a default Rust workspace test does not exercise TypeScript.
 
-    println!("Found {} results", results.len());
-    db.close().await?;
-    Ok(())
-}
-```
+When generation sources change, run `pnpm run codegen` **from `ts/kip-do`**
+and include the generated diff:
 
-## Building and Testing
+- `src/errors.generated.ts`
+- `src/meta/capability-names.generated.ts`
+- `src/schema/profiles.generated.ts`
+- `src/schema/contracts.generated.ts`
+- `test/conformance/fixtures.generated.ts`
+- `test/oracle/corpus.generated.ts`
+
+When the Rust KIP parser changes, also run `pnpm run build:oracle-wasm` from
+`ts/kip-do` and include the updated `vendor/anda_kip_wasm/` artifacts. This
+requires wasm-pack and the WASM target toolchain. `pnpm run codegen` does not
+rebuild the oracle. Then run `make test-ts` from the repository root. CI
+regenerates the TypeScript files and rejects drift.
+
+## Maintaining these instructions
+
+Edit `CLAUDE.md`, then run:
 
 ```bash
-cargo check --workspace --all-features
-cargo test --workspace --all-features
-cargo test -p anda_db --lib
-cargo run -p anda_db --example db_demo --features full
+make sync-agents-doc
+make check-agents-doc
 ```
 
-`ts/kip-do` is the second KIP 2.0 engine and has its own suite, including the
-shared conformance fixtures and a differential parser oracle against
-`anda_kip` compiled to WASM:
-
-```bash
-make test-ts
-```
-
-`make test-full` runs both halves. The generated files under `ts/kip-do`
-(`errors.generated.ts`, `profiles.generated.ts`, `contracts.generated.ts`, `fixtures.generated.ts`,
-`corpus.generated.ts`) are committed; regenerate them with `pnpm run codegen`
-after changing their sources, or CI will fail on the drift.
-
-The workspace MSRV is 1.95 (required by the current dependency set).
-
-The Python binding under `py/anda_cognitive_nexus_py` is not part of the default
-Rust workspace member list.
+Keep `AGENTS.md` byte-identical. For detailed API examples, update the local
+skill; for design and implementation details, use the
+[technical documentation index](docs/README.md).

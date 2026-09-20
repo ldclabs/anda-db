@@ -106,7 +106,7 @@ async fn a_minimal_epistemic_graph_round_trips() {
         evidence_class: "user_statement".to_string(),
         payload_mode: "inline".to_string(),
         payload_inline: json!("I prefer dark mode."),
-        observed_at: time::normalize("2026-08-16T09:00:00Z", "observed_at").unwrap(),
+        observed_at: time::normalize("2026-08-16T09:00:00.000Z", "observed_at").unwrap(),
         status: "active".to_string(),
         ..Default::default()
     };

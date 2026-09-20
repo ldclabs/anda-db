@@ -340,13 +340,10 @@ pub async fn post_kip(
 
     match req.method.as_str() {
         "execute_kip" => {
-            let params: Request = serde_json::from_value(req.params).map_err(|e| {
+            let params = Request::from_value(req.params).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
-                    error_response(
-                        KipErrorCode::InvalidRequestEnvelope,
-                        format!("invalid parameters: {e}"),
-                    ),
+                    error_response(e.code, format!("invalid parameters: {e}")),
                 )
             })?;
 
