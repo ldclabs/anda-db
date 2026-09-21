@@ -52,7 +52,9 @@ const MIGRATION_ACTOR_KEY: &str = "kip:migrate:v1:actor";
 /// everything would be fast and would make a single bad legacy row undo the
 /// whole migration. Batching keeps a failure's blast radius readable in the log
 /// while a resumed run still skips what landed.
-const BATCH: usize = 64;
+// A relation expands to a Proposition, an Assertion and their persisted
+// transaction images. Keep normal batches below the storage node budget.
+const BATCH: usize = 16;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct FrozenPlan {

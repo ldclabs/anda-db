@@ -678,3 +678,193 @@ async fn an_unambiguous_legacy_author_becomes_the_speaker() {
         "an unresolvable one stays the migration actor: {speakers:?}"
     );
 }
+
+#[tokio::test]
+async fn staged_inventory_includes_more_than_search_limit_per_kind() {
+    use anda_cognitive_nexus::migrate::{self, LEGACY_STAGING, LegacyRow};
+    use anda_db::{
+        collection::{Collection, CollectionConfig},
+        database::{AndaDB, DBConfig},
+    };
+    use object_store::memory::InMemory;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let db = Arc::new(
+        AndaDB::connect(Arc::new(InMemory::new()), DBConfig::default())
+            .await
+            .unwrap(),
+    );
+    let staging = db
+        .open_or_create_collection(
+            LegacyRow::schema().unwrap(),
+            CollectionConfig {
+                name: LEGACY_STAGING.into(),
+                description: String::new(),
+            },
+            async |c| {
+                c.create_btree_index_nx(&["kind"]).await?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let count = Collection::MAX_SEARCH_LIMIT + 1;
+    for i in 1..=count {
+        for (kind, doc) in [
+            (
+                "concept",
+                json!({"_id": i, "type": "Person", "name": format!("person-{i}"), "attributes": {}, "metadata": {}}),
+            ),
+            (
+                "proposition",
+                json!({"_id": i, "subject": format!("C:{i}"), "object": "C:1", "predicates": ["knows"], "properties": {"knows": {"a": {}, "m": {}}}}),
+            ),
+        ] {
+            staging
+                .add_from(&LegacyRow {
+                    _id: 0,
+                    kind: kind.into(),
+                    legacy_id: i as u64,
+                    doc,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    staging.flush(1).await.unwrap();
+    let plan = migrate::plan(&db).await.unwrap().unwrap();
+    assert_eq!(plan.concepts, count);
+    assert_eq!(plan.proposition_rows, count);
+    assert_eq!(plan.propositions, count);
+    assert_eq!(plan.assertions, count);
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn migration_preserves_large_collections_through_restart() {
+    let name = "large_legacy";
+    let store = write_v1(name).await;
+    let db = open_raw(store.clone(), name).await;
+    let concepts = db
+        .open_collection("concepts".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    let propositions = db
+        .open_collection("propositions".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    for i in 0..=anda_db::collection::Collection::MAX_SEARCH_LIMIT {
+        let id = concepts
+            .add_from(&V1Concept {
+                _id: 0,
+                r#type: "Topic".into(),
+                name: format!("bulk-{i}"),
+                attributes: json!({}),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        propositions
+            .add_from(&V1Proposition {
+                _id: 0,
+                subject: "C:1".into(),
+                object: format!("C:{id}"),
+                predicates: json!(["bulk_link"]),
+                properties: json!({"bulk_link":{"a":{},"m":{}}}),
+            })
+            .await
+            .unwrap();
+    }
+    let expected = (concepts.len(), propositions.len());
+    let tuples = anda_cognitive_nexus::migrate::plan(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .propositions;
+    db.close().await.unwrap();
+    drop(db);
+    let nexus = open_v2(store.clone(), name).await;
+    assert_eq!(nexus.store.concepts().len(), expected.0 + 1); // migration actor
+    assert_eq!(nexus.store.propositions().len(), tuples);
+    assert_eq!(nexus.store.assertions().len(), tuples);
+    let staging = nexus
+        .store
+        .db
+        .open_collection(LEGACY_STAGING.into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(staging.len(), expected.0 + expected.1 + 2); // extracted + complete
+    nexus.close().await.unwrap();
+    drop(nexus);
+    let nexus = open_v2(store, name).await;
+    assert_eq!(nexus.store.concepts().len(), expected.0 + 1);
+    assert_eq!(nexus.store.propositions().len(), tuples);
+    assert_eq!(nexus.store.assertions().len(), tuples);
+    nexus.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_task_execution_states_are_preserved_without_fabricated_leases() {
+    let name = "legacy_task_states";
+    let store = write_v1(name).await;
+    let db = open_raw(store.clone(), name).await;
+    let concepts = db
+        .open_collection("concepts".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    let mut originals = std::collections::BTreeMap::new();
+    for status in [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "blocked",
+    ] {
+        let id = concepts.add_from(&V1Concept {
+            _id: 0, r#type: "SleepTask".into(), name: format!("task-{status}"),
+            attributes: json!({"status":status,"description":"Historical task","result":{"note":"original result"}}),
+            metadata: json!({}),
+        }).await.unwrap();
+        originals.insert(
+            format!("kip:migrate:v1:C:{id}"),
+            concepts.get_as::<Json>(id).await.unwrap(),
+        );
+    }
+    db.close().await.unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let nexus = open_v2(store.clone(), name).await;
+        let mut seen = 0;
+        for id in nexus.store.concepts().ids() {
+            let row: Json = nexus.store.concepts().get_as(id).await.unwrap();
+            let Some(original) = row["client_key"]
+                .as_str()
+                .and_then(|key| originals.get(key))
+            else {
+                continue;
+            };
+            seen += 1;
+            let before = original["attributes"]["status"].as_str().unwrap();
+            let expected = if ["running", "completed", "failed"].contains(&before) {
+                "blocked"
+            } else {
+                before
+            };
+            assert_eq!(row["attributes"]["status"], expected);
+            assert_eq!(
+                &row["facets"]["kip://legacy/nexus@1.1.0/LegacyRecord"]["record"],
+                original
+            );
+            assert!(
+                row["facets"]
+                    .get("kip://profiles/cognitive-memory@2.1.0/LeaseState")
+                    .is_none()
+            );
+        }
+        assert_eq!(seen, originals.len());
+        nexus.close().await.unwrap();
+    }
+}

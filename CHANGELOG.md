@@ -2,6 +2,24 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.13.3, anda_db 0.13.2, anda_db_schema 0.13.1] — 2026-09-21
+
+- Preserve already-stored wide fields when reading, recovering or rebuilding
+  indexes; write-admission node/container limits no longer make older Brain
+  conversation histories unreadable. Nesting safety and schema checks remain.
+  Partial updates validate changed fields without rejecting unchanged legacy
+  history. New inserts and replacements still enforce the original limits.
+
+- Read all staged KIP 1.x rows through the unbounded native ID API; ordinary
+  search limits no longer truncate migration verification, inventory or import
+  at 1000 rows. Fetch staged objects with bounded concurrency while preserving
+  strict source-copy verification and read failures.
+- Bound migration batches to 16 source records so ordinary relationship
+  imports fit the persisted transaction-plan node budget.
+- Import legacy SleepTask execution states as blocked native tasks without
+  inventing leases, retaining original statuses and results in LegacyRecord.
+  Cover large imports, historical task states and restart idempotency.
+
 ## [anda_kip 0.13.1, @ldclabs/kip-do 0.13.1] — 2026-09-20
 
 KIP remains `2.0` and the CognitiveMemory package remains `2.1.0`.

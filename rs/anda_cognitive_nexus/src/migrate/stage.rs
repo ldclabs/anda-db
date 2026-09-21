@@ -8,6 +8,7 @@ use anda_db::{
     schema::{AndaDBSchema, Ft, Fv, Json, Schema},
 };
 use anda_kip::{KipError, KipErrorCode};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -15,6 +16,9 @@ use crate::store::{CONCEPTS, PROPOSITIONS};
 
 /// Where the 1.x rows live between phase 1 and phase 3, and after it.
 pub const LEGACY_STAGING: &str = "kip_legacy_v1";
+
+/// Bound object-store reads while still overlapping remote round trips.
+const STAGING_READ_CONCURRENCY: usize = 8;
 
 /// What a staged row was in 1.x.
 pub mod kind {
@@ -342,17 +346,26 @@ pub(crate) async fn rows(
     staging: &Arc<anda_db::collection::Collection>,
     kind: LegacyKind,
 ) -> Result<Vec<LegacyRow>, KipError> {
-    let mut rows: Vec<LegacyRow> = staging
-        .search_as(Query {
-            filter: Some(Filter::Field((
-                "kind".to_string(),
-                RangeQuery::Eq(Fv::Text(kind.as_str().to_string())),
-            ))),
-            limit: Some(usize::MAX),
-            ..Default::default()
-        })
+    // Search results are capped even when the caller requests usize::MAX.
+    // Migration needs every row, and must propagate read errors rather than
+    // silently skip records that cannot be read.
+    let ids = staging
+        .query_all_ids(Filter::Field((
+            "kind".to_string(),
+            RangeQuery::Eq(Fv::Text(kind.as_str().to_string())),
+        )))
         .await
         .map_err(db_error)?;
+    let mut rows: Vec<LegacyRow> = Vec::with_capacity(ids.len());
+    let mut reads = futures::stream::iter(ids)
+        .map(|id| {
+            let staging = Arc::clone(staging);
+            async move { staging.get_as(id).await.map_err(db_error) }
+        })
+        .buffered(STAGING_READ_CONCURRENCY);
+    while let Some(row) = reads.next().await {
+        rows.push(row?);
+    }
     rows.sort_by_key(|row| row.legacy_id);
     Ok(rows)
 }

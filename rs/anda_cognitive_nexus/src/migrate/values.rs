@@ -91,13 +91,14 @@ pub(super) fn attributes(
                 .get("status")
                 .and_then(Json::as_str)
                 .unwrap_or("pending");
-            // An interrupted v1 job holds no authenticated v2 lease.
-            let status =
-                if ["pending", "completed", "cancelled", "blocked", "failed"].contains(&status) {
-                    status
-                } else {
-                    "blocked"
-                };
+            // V1 execution states have no authenticated v2 lease, including
+            // terminal states. Keep their original status/result in LegacyRecord;
+            // the native task remains blocked until explicitly reviewed.
+            let status = if ["pending", "cancelled", "blocked"].contains(&status) {
+                status
+            } else {
+                "blocked"
+            };
             attrs.insert("status".into(), json!(status));
         }
         _ => {}

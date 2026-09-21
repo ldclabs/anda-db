@@ -217,9 +217,8 @@ impl Document {
 
             let field = schema.get_field_or_err(&k)?;
             let value = field.extract(v, false)?;
-            // `extract` is strict about types, but the structural complexity
-            // budget still has to be enforced here: a value that exceeds it
-            // could be written but would fail validation on read-back.
+            // Typed extraction also enforces the write-admission budget for
+            // newly supplied values.
             value.validate_complexity().map_err(|err| {
                 SchemaError::FieldValue(format!("field {k:?} is invalid, error: {err}"))
             })?;

@@ -224,9 +224,8 @@ impl FieldEntry {
             .map_err(|err| {
                 SchemaError::FieldValue(format!("field {} is invalid, error: {err}", self.name))
             })?;
-        // Mirrors `Document::try_from`: `extract` is strict about types, but
-        // the structural complexity budget still has to be enforced, or the
-        // value could be written and then fail validation on read-back.
+        // Mirrors `Document::try_from`: typed coercion also enforces the
+        // write-admission budget for newly supplied values.
         value.validate_complexity().map_err(|err| {
             SchemaError::FieldValue(format!("field {} is invalid, error: {err}", self.name))
         })?;
@@ -237,7 +236,15 @@ impl FieldEntry {
     /// complexity check. The caller commits the document only on success.
     pub(crate) fn prepare_read(&self, value: FieldValue) -> Result<FieldValue, SchemaError> {
         let value = self.r#type.prepare(value, 0, ValueMode::Read)?;
-        value.validate_complexity()?;
+        // Persisted values may predate write-admission size limits. Enforce
+        // nesting safety while preserving those already-stored wide values.
+        // New inserts and changed fields still use the default write budget.
+        value.validate_complexity_with(super::FieldValueBudget {
+            max_nodes: usize::MAX,
+            max_array_len: usize::MAX,
+            max_map_entries: usize::MAX,
+            ..Default::default()
+        })?;
         Ok(value)
     }
 

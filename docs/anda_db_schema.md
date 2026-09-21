@@ -406,8 +406,11 @@ array of `0..=255`, a float field an integer, an `I64` field a non-negative
 complexity budget. `Document::set_field` goes through it, so creating and
 updating a document accept the same shapes. Canonical values retain their
 buffers; typed containers are traversed directly, and read materialization
-combines pruning, normalization and type checking before a single complexity
-check per field.
+combines pruning, normalization and type checking before a single nesting-depth
+check per field. Already-stored values may predate node and container-size
+admission limits, so reads, recovery and index rebuilding preserve those wide
+values. New inserts and replacement fields still enforce the full default
+budget; a partial update leaves unchanged legacy fields intact.
 
 ---
 

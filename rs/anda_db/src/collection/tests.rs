@@ -5395,3 +5395,87 @@ async fn test_btree_index_on_primary_key_is_rejected() -> Result<(), DBError> {
     db.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn oversized_legacy_history_can_reindex_and_update_status_but_not_be_newly_written()
+-> Result<(), DBError> {
+    #[derive(Clone, Serialize, Deserialize, AndaDBSchema)]
+    struct History {
+        _id: u64,
+        status: String,
+        messages: Json,
+    }
+    let db = setup_test_db().await?;
+    let config = CollectionConfig {
+        name: "legacy_history".into(),
+        description: String::new(),
+    };
+    let collection = db
+        .open_or_create_collection(History::schema()?, config.clone(), async |_| Ok(()))
+        .await?;
+    let id = collection
+        .add_from(&History {
+            _id: 0,
+            status: "running".into(),
+            messages: serde_json::json!([]),
+        })
+        .await?;
+    collection.flush(unix_ms()).await?;
+    let messages = serde_json::json!(vec![vec!["original history"; 50]; 400]);
+    let mut stored: DocumentOwned = collection.get(id).await?.into();
+    stored.fields.insert(
+        collection.schema().get_field("messages").unwrap().idx(),
+        Fv::Json(messages.clone()),
+    );
+    // Reproduce bytes an older writer accepted; do not relax current admission.
+    collection
+        .storage
+        .put(&Collection::doc_path(id), &stored, None)
+        .await?;
+    db.close_collection("legacy_history").await?;
+    let mut schema = History::schema()?;
+    schema.with_version(1);
+    let collection = db
+        .open_or_create_collection(schema, config, async |c| {
+            c.create_btree_index_nx(&["status"]).await?;
+            Ok(())
+        })
+        .await?;
+    let read: History = collection.get_as(id).await?;
+    assert_eq!(read.messages, messages);
+    collection
+        .update(
+            id,
+            BTreeMap::from([("status".into(), Fv::Text("completed".into()))]),
+        )
+        .await?;
+    assert_eq!(
+        collection
+            .query_all_ids(Filter::Field((
+                "status".into(),
+                RangeQuery::Eq(Fv::Text("completed".into()))
+            )))
+            .await?,
+        vec![id]
+    );
+    assert!(collection.add_from(&read).await.is_err());
+    assert!(collection.add(collection.get(id).await?).await.is_err());
+    assert!(
+        collection
+            .update(
+                id,
+                BTreeMap::from([("messages".into(), Fv::Json(messages.clone()))])
+            )
+            .await
+            .is_err()
+    );
+    db.close_collection("legacy_history").await?;
+    let collection = db
+        .open_collection("legacy_history".into(), async |_| Ok(()))
+        .await?;
+    let read: History = collection.get_as(id).await?;
+    assert_eq!(read.status, "completed");
+    assert_eq!(read.messages, messages);
+    db.close().await?;
+    Ok(())
+}

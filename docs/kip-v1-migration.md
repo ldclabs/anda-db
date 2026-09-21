@@ -26,7 +26,9 @@ provenance, not independent Evidence or permission.
 
 - Person, Event, Preference, Insight, Commitment and SleepTask adopt compatible
   native types. Summary, time and task fields are normalized; a previously
-  running v1 task becomes blocked without acquiring a v2 lease.
+  running, completed or failed v1 task becomes blocked without acquiring a v2
+  lease. Its original execution status and result remain in LegacyRecord; the
+  native task requires explicit review rather than resuming automatically.
 - Optional values incompatible with native field types remain in LegacyRecord.
   Unsupported old learning/runtime artifacts receive distinct Legacy types,
   retaining their content without receiving validated standing. Generated names
@@ -56,7 +58,9 @@ also be exercised before production cutover.
 Anda Brain's regression fixture is a complete object-store snapshot generated
 using the published Nexus/KIP 0.11.0 and AndaDB 0.11.1 versions in Brain
 v0.11.0's lockfile. Application-specific conversation queues, caches and
-bookkeeping remain the host's responsibility.
+bookkeeping remain the host's responsibility. Older wide conversation fields
+remain readable and can receive status-only updates without truncation; new
+field writes still enforce the current structural admission limits.
 
 ## 中文说明
 
@@ -72,11 +76,13 @@ bookkeeping remain the host's responsibility.
 来源记录，不是独立证据、身份认证或治理授权。
 
 常见 Brain 类型转换为兼容的原生类型；旧 Insight 描述、SleepTask 原因/动作及时间
-字段会转换，未完成的旧运行任务进入 blocked，不获得虚构租约。不能安全采用的学习/
-运行类型保留为 Legacy 类型；端点不符合新约束的旧关系使用独立 Legacy 谓词。有效期、
+字段会转换。旧任务的 running、completed、failed 状态在原生任务上转为 blocked，
+原始执行状态和结果完整保留在 LegacyRecord；任务需要显式复核，不获得虚构租约或自动恢复执行。
+不能安全采用的学习/运行类型保留为 Legacy 类型；端点不符合新约束的旧关系使用独立 Legacy 谓词。有效期、
 保留期、pinned 和记忆强度各自映射，绝不把 confidence 当作记忆强度。
 
 可确认的撤回以及同 actor、同 Proposition 的无环替代链会重建；跨命题更正或不明确的
 失效记录带着原注释归档，不重新进入当前正面信念。错误标识符和悬空引用仍可能阻止
 迁移，应检查错误指出的源行并在备份副本上修复。通用 `migrate::plan` 只是清点，还应
-验证目标宿主的实际 Schema 和完整启动路径。
+验证目标宿主的实际 Schema 和完整启动路径。旧会话中较大的历史字段可以完整读取、
+重建索引和更新状态；新插入或替换的字段仍受当前结构大小限制。

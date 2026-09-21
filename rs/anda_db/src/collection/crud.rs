@@ -285,8 +285,10 @@ impl Collection {
             fields_keys.insert(field_name);
         }
 
-        // validate the updated document
-        self.schema.validate(doc.fields())?;
+        // The stored document was structurally validated above, and set_field
+        // validates every replacement against the write budget. Revalidating
+        // unchanged fields against newer admission limits would prevent even
+        // a status update on a valid, oversized legacy conversation.
 
         let _keys = self.unique_key_lease(&[&old_doc, &doc]).await?;
 

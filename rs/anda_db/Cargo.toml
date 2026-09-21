@@ -1,6 +1,6 @@
 [package]
 name = "anda_db"
-version = "0.13.1"
+version = "0.13.2"
 description.workspace = true
 keywords = ["database", "vector", "search", "embedding", "ai"]
 categories = ["database", "data-structures", "text-processing"]
