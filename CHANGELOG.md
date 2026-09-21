@@ -2,6 +2,12 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.13.4] — 2026-09-21
+
+- Map legacy Commitment `completed` to native `fulfilled`. On migrated stores,
+  repair the old blocked mapping once through version-guarded native writes,
+  preserving original provenance, archived state and later attribute edits.
+
 ## [anda_cognitive_nexus 0.13.3, anda_db 0.13.2, anda_db_schema 0.13.1] — 2026-09-21
 
 - Preserve already-stored wide fields when reading, recovering or rebuilding

@@ -868,3 +868,102 @@ async fn legacy_task_execution_states_are_preserved_without_fabricated_leases() 
         nexus.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn completed_commitments_migrate_and_old_untouched_rows_are_repaired_once() {
+    use anda_db::schema::Fv;
+    let name = "completed_commitment_repair";
+    let store = write_v1(name).await;
+    let db = open_raw(store.clone(), name).await;
+    let concepts = db
+        .open_collection("concepts".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    for label in ["untouched", "edited", "archived"] {
+        concepts
+            .add_from(&V1Concept {
+                _id: 0,
+                r#type: "Commitment".into(),
+                name: label.into(),
+                attributes: json!({"status":"completed","description":"Delivered the report"}),
+                metadata: if label == "archived" {
+                    json!({"expires_at":"2020-01-01T00:00:00Z"})
+                } else {
+                    json!({})
+                },
+            })
+            .await
+            .unwrap();
+    }
+    db.close().await.unwrap();
+    let nexus = open_v2(store.clone(), name).await;
+    let mut ids = std::collections::BTreeMap::new();
+    for id in nexus.store.concepts().ids() {
+        let row: Json = nexus.store.concepts().get_as(id).await.unwrap();
+        if !["untouched", "edited", "archived"].contains(&row["name"].as_str().unwrap_or("")) {
+            continue;
+        }
+        assert_eq!(row["attributes"]["status"], "fulfilled");
+        assert_eq!(
+            row["facets"]["kip://legacy/nexus@1.1.0/LegacyRecord"]["record"]["attributes"]["status"],
+            "completed"
+        );
+        ids.insert(row["name"].as_str().unwrap().to_string(), id);
+        // Reproduce 0.13.3's stored state, including the attributes plane version.
+        let mut attrs = row["attributes"].clone();
+        attrs["status"] = json!("blocked");
+        nexus
+            .store
+            .concepts()
+            .update(
+                id,
+                std::collections::BTreeMap::from([(
+                    "attributes".into(),
+                    Fv::from(attrs.as_object().unwrap().clone()),
+                )]),
+            )
+            .await
+            .unwrap();
+    }
+    query(
+        &nexus,
+        &format!(
+            r#"UPDATE "C-{}" SET ATTRIBUTES {{summary: "Later user edit"}}"#,
+            ids["edited"]
+        ),
+    )
+    .await;
+    let staging = nexus
+        .store
+        .db
+        .open_collection(LEGACY_STAGING.into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    staging
+        .remove_extension("completed_commitments_repaired_v1")
+        .await
+        .unwrap();
+    nexus.close().await.unwrap();
+    drop(nexus);
+    for _ in 0..2 {
+        let nexus = open_v2(store.clone(), name).await;
+        for (name, id) in &ids {
+            let row: Json = nexus.store.concepts().get_as(*id).await.unwrap();
+            assert_eq!(
+                row["attributes"]["status"],
+                if name == "edited" {
+                    "blocked"
+                } else {
+                    "fulfilled"
+                }
+            );
+            if name == "archived" {
+                assert_eq!(row["state"], "archived");
+            }
+            if name != "edited" {
+                assert_eq!(row["plane_versions"]["attributes"], 2);
+            }
+        }
+        nexus.close().await.unwrap();
+    }
+}

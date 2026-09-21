@@ -52,12 +52,11 @@ pub(super) fn attributes(
                 .get("status")
                 .and_then(Json::as_str)
                 .unwrap_or("pending");
-            let status =
-                if ["pending", "fulfilled", "cancelled", "expired", "blocked"].contains(&status) {
-                    status
-                } else {
-                    "blocked"
-                };
+            let status = match status {
+                "completed" => "fulfilled",
+                "pending" | "fulfilled" | "cancelled" | "expired" | "blocked" => status,
+                _ => "blocked",
+            };
             attrs.insert("status".into(), json!(status));
         }
         "SleepTask" => {

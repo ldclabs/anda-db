@@ -114,7 +114,7 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         return Ok(());
     };
     if stage::is_complete(&staging).await? {
-        return Ok(());
+        return repair_completed_commitments(nexus, &staging).await;
     }
 
     let concepts = stage::rows(&staging, LegacyKind::Concept).await?;
@@ -210,6 +210,7 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         }),
     )
     .await?;
+    repair_completed_commitments(nexus, &staging).await?;
     log::warn!(
         action = "migrate::load",
         concepts = concept_ids.len(),
@@ -219,6 +220,59 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         concept_ids.len(),
         stage::LEGACY_STAGING,
     );
+    Ok(())
+}
+
+/// Fix the old completed -> blocked mapping without replacing later edits.
+/// The durable marker makes this a one-time scan, including already migrated stores.
+async fn repair_completed_commitments(
+    nexus: &CognitiveNexus,
+    staging: &std::sync::Arc<anda_db::collection::Collection>,
+) -> Result<(), KipError> {
+    const MARKER: &str = "completed_commitments_repaired_v1";
+    if staging.get_extension_as::<bool>(MARKER) == Some(true) {
+        return Ok(());
+    }
+    for source in stage::rows(staging, LegacyKind::Concept).await? {
+        if source.doc["type"] != "Commitment" || source.doc["attributes"]["status"] != "completed" {
+            continue;
+        }
+        let Some(id) = nexus
+            .store
+            .find_by_client_key(
+                DEFAULT_SPACE,
+                anda_kip::ElementKind::Concept,
+                &concept_key(source.legacy_id),
+            )
+            .await?
+        else {
+            continue;
+        };
+        let crate::store::Element::Concept(row) = nexus.store.get_element(id).await? else {
+            continue;
+        };
+        if row.schema_ref != "kip://profiles/cognitive-memory@2.1.0/Commitment"
+            || row.attributes.get("status").and_then(Json::as_str) != Some("blocked")
+            || row.plane_versions["attributes"].as_u64() != Some(1)
+            || !row.facets.iter().any(|(name, value)| {
+                name.starts_with("kip://legacy/nexus@")
+                    && name.ends_with("/LegacyRecord")
+                    && value["record"] == source.doc
+            })
+        {
+            continue;
+        }
+        run(
+            nexus,
+            "UPDATE :id SET ATTRIBUTES {status: \"fulfilled\"} EXPECT VERSION 1 OF ATTRIBUTES",
+            Map::from_iter([("id".into(), json!(id.to_string()))]),
+        )
+        .await?;
+    }
+    staging
+        .save_extension_from(MARKER.to_string(), &true)
+        .await
+        .map_err(internal)?;
     Ok(())
 }
 
