@@ -1,5 +1,7 @@
 # AndaDB Documentation Hub
 
+[中文版](README.zh.md)
+
 This directory is the technical documentation hub for the AndaDB workspace.
 Each document focuses on one layer of the stack, from the embedded database
 engine to schema derivation, index internals, object-store-backed persistence,

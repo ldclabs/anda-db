@@ -1,66 +1,53 @@
-**anda_db_hnsw 审查清单完成记录**
+# anda_db_hnsw Review Checklist and Implementation Report
 
-2026-09-06。18 项及提交 `8bc6d8b` 的复审问题均已处理；实现、回归测试、主库适配、示例和文档已落地。未使用 subagents；本次工作仅包含 HNSW 及相应的主库适配、测试和文档，其他任务的 BM25/TFS、utils/object_store 修改不纳入此次提交。
+[中文版](anda_db_hnsw_review.zh.md)
 
-审查基线为 ac19bc06d4e5fac8a3a569e4764d6a3eb0605186 下的 HNSW 代码。原有 HnswNode 公开字段及旧数据读取能力保留；需要迁移注意的行为见下文。
+Dated 2026-09-06. All 18 review checklist items and subsequent questions from commit `8bc6d8b` have been resolved; implementations, regressions, database core adaptations, examples, and documentation are committed. Executed without subagents; scope was confined strictly to HNSW and corresponding core bindings, tests, and documentation.
 
-**正确性与恢复**
+Baseline: HNSW implementation at commit `ac19bc06d4e5fac8a3a569e4764d6a3eb0605186`. Public fields of `HnswNode` and backward compatibility for existing serialized data are preserved; notable behavioral changes are detailed below.
 
-- [x] **R1：修复 ID 复用的旧边和重复邻居。** 按“目标节点＋层”维护完整反向引用，删除清除所有入边；邻接列表按 ID 排序、去重，反向边更新采用 upsert。多轮重插、两种策略、两种删除模式及主库更新/重开均有回归。[实现](../rs/anda_db_hnsw/src/hnsw.rs#L670) · [回归](../rs/anda_db_hnsw/tests/regressions.rs#L237)
+## Correctness and Recovery
 
-- [x] **R2：修复数值溢出和平方下溢。** 普通值保留 f32 路径，边界使用宽精度计算；公开距离接口拒绝非有限输入及不可表示结果。入库前按距离类型检查向量幅值，保证成功入库的节点间边距离可用 bf16 表示。旧快照中的有限向量仍可加载；不可表示的遗留边会移除并等待重写。覆盖四种距离、极大值、极小值、零向量、失败时状态不变及保存重开。[距离实现](../rs/anda_db_hnsw/src/distance.rs)
+- [x] **R1: Eliminate stale edges and duplicate neighbors on ID reuse.** Maintain comprehensive reverse references per target node and layer; deletion clears all inbound edges; adjacency lists are sorted by ID and deduplicated; reverse edges update via upsert semantics. Regression coverage includes multi-round re-insertions, dual heuristics, dual deletion modes, and Collection update/reopen tests. [Implementation](../rs/anda_db_hnsw/src/hnsw.rs#L670) · [Regressions](../rs/anda_db_hnsw/tests/regressions.rs#L237)
+- [x] **R2: Eliminate numerical overflow and squared underflow.** Retain f32 paths for common values while using wide precision for boundary calculations; public distance APIs reject non-finite inputs and non-representable results. Validate vector magnitudes prior to storage to guarantee edge distances fit within bf16 representation. Legacy snapshots with finite vectors remain readable; unrepresentable legacy edges are purged pending recalculation. Covers 4 distance metrics, extreme values, zero vectors, failure-induced state preservation, and persistence reopen roundtrips. [Distance Implementation](../rs/anda_db_hnsw/src/distance.rs)
+- [x] **R3: Propagate buffered write errors.** Writer interfaces confirm success only after checking `write_all` and `Write::flush`; asynchronous callbacks verify backend outcomes. Parallel node writers drain all active tasks before returning error or halt states. `metadata_bytes` provides pure serialization without advancing sequence watermarks. Added regressions for buffered metadata/IDs writes and flush failures. [Persistence Implementation](../rs/anda_db_hnsw/src/hnsw/persistence.rs)
+- [x] **R4: Explicit flush outcome and tombstone eligibility.** Added `FlushOutcome`; legacy bool interfaces return errors upon early termination. Tombstones are reclaimed only after full snapshots confirm their exact deletion instance; saving metadata alone does not grant reclamation eligibility. Covers cross-I/O deletions, halts, cancellations, re-insertions, and guarantees new deletions are not consumed by stale acknowledgements.
+- [x] **R5: Detectable partial-write recovery.** Node objects carry backward-compatible generational tags; when node generations outpace metadata, state is rebuilt from ID-referenced vectors; interrupted deletions recover via differences between IDs, node references, and metadata stats. IDs remain a single CBOR byte sequence. The core database uses Create/Update CAS per node object; stale tokens conflict if async results are lost, preventing delayed writes from overwriting newer nodes. Valid disconnected graphs are not rebuilt from scratch due to missing legacy generational tags. `RecoveryReport` exposes repair status; covers failures and lost acknowledgements at all write boundaries. [Fault Matrix](../rs/anda_db_hnsw/tests/regressions.rs#L508)
+- [x] **R6: Loading validation and entry-point repair.** Strictly validate persisted configurations, node IDs, dimensions, layer counts, degrees, and numerical domains. Repair self-loops, duplicate edges, invalid references, and incorrect layer allocations; recompute legacy edge distances during migration. Entry points and top-layer assignments repair to actual valid nodes. Deterministically select entry points by ID when multiple candidates exist on the top layer.
+- [x] **R7: Staged load retries ensure consistency.** IDs stage in a temporary buffer; nodes build in an isolated map; active state replaces only after full validation and recovery succeed. Disappearing nodes during failure, cancellation, or retries leave no phantom nodes or desynchronized IDs.
+- [x] **R8: Capture discarded errors in tests.** Concurrency tests check both `JoinError` and internal `HnswError` levels, verifying final node counts. Added crate regressions and real Collection update/save/reopen integration tests. [Core Regressions](../rs/anda_db/tests/hnsw_updates.rs)
+- [x] **R9: Unified query boundaries.** Both query inputs return unconditionally empty results when `top_k=0`; requests exceeding 4,096 reject with explicit errors; `SearchOptions` supports per-query `ef` configuration with range validation. [Search Interface](../rs/anda_db_hnsw/src/hnsw/search.rs#L49)
 
-- [x] **R3：修复缓冲写入错误被忽略。** writer 接口检查 write_all 和 Write::flush 后才确认成功；异步回调确认后端结果。并行节点写在返回错误或停止状态前排空所有已启动任务。metadata_bytes 提供不推进水位的纯序列化。新增 metadata/IDs 的缓冲写入及 flush 故障回归。[持久化实现](../rs/anda_db_hnsw/src/hnsw/persistence.rs)
+## Performance
 
-- [x] **R4：明确 flush 完成状态和墓碑资格。** 新增 FlushOutcome；旧 bool 接口中途停止返回错误。墓碑只有在完整快照确认其确切删除实例后才可清理，单独保存 metadata 不授予清理资格。覆盖跨 I/O 删除、停止、取消、重插及新删除不能被旧确认消费。
+- [x] **O1: Remove full-graph scans on non-entry deletions.** Preserve top layer directly if surviving entry points exist; only deleting the actual entry point searches for replacements. Verified scale characteristics via single-layer sparse benchmarks.
+- [x] **O2: Compact adjacency storage.** Internal representation uses capacity-bounded `Vec`, removing fixed 1,040-byte inline arrays per layer; maintains reverse references via linear diff merges over sorted adjacencies, avoiding dual temporary hash sets per update. Public `HnswNode` preserves `SmallVec` compatibility. [Internal Node](../rs/anda_db_hnsw/src/node.rs)
+- [x] **O3: Shared immutable vectors.** Edge updates copy only adjacency structures; vectors share via `Arc`. Loading decodes directly into internal representations, bypassing Serde flatten intermediate trees and public `SmallVec` allocations. `get_node_with` materializes public nodes for inspection/export, while hot search paths operate on internal views.
+- [x] **O4: Snapshotting and upload pipeline.** Locks protect only immutable reference capture, moving encoding outside critical sections. Dirty state tracks per-node by `Arc` identity, avoiding bulk re-writes on localized changes. Pre-allocates buffers based on serialized size; uploads throttle by concurrency and byte budget bounds. Database adapter uses 8-way concurrent uploads. Commit order is preserved on completion, cancellation, and error paths.
+- [x] **O5: Reduce search allocations and redundant computations.** Upper layers employ dedicated greedy paths; thread-local/caller workspaces reuse heaps and sets; query vector norms compute once; node vector norms are cached. Euclidean distance preserves original units; squared L2 was evaluated but deferred to avoid mixed edge cache units. Platform-specific SIMD was not added without benchmark justification.
+- [x] **O6: Comprehensive benchmarks.** Evaluated across 1,000, 10,000, and 100,000 nodes across all distance metrics. Fixed data and layer random seeds cover distance, build, query, save, load, delete, and re-insert operations. Records latency quantiles, throughput, allocations, heap memory, serialized bytes, and recall against an independent f64 brute-force oracle. Supports full parameter matrices and real embedding CSV inputs. [Benchmark Guide](../rs/anda_db_hnsw/benches/README.md) · [Measurements](anda_db_hnsw_benchmarks.md)
 
-- [x] **R5：提供可检测的部分写入恢复。** 节点对象带兼容的代际标记；节点代际领先元数据时从 IDs 引用的向量重建，删除中断则由 IDs、节点引用和元数据统计差异修复。IDs 保持单一 CBOR 字节串。主库对每个固定节点对象使用 Create/Update CAS，异步结果丢失后旧 token 会冲突，不能用迟到写覆盖新节点。合法断连图不因缺少旧代际标记而全量重建。RecoveryReport 暴露修复情况；覆盖各写入边界的失败/结果丢失。[故障矩阵](../rs/anda_db_hnsw/tests/regressions.rs#L508)
+## Simplification and Maintenance
 
-- [x] **R6：完善加载校验与入口修复。** 严格验证持久化配置、节点 ID、维度、层数、度数、数值域；修复自环、重复边、失效引用及错误层级，迁移时重算旧边距离。入口和最高层按实际节点修复。最高层有多个替代节点时按 ID 确定性选择。
+- [x] **S1: Unified snapshotting, encoding, and acknowledgement.** Both upload adapters share snapshot capture, metadata/IDs serialization, completion states, and acknowledgement logic. Retains independent borrowed `AsyncFnMut` sequential adapters to preserve caller borrowing ergonomics.
+- [x] **S2: Modular decomposition.** Reduced `hnsw.rs` from 4,566 to 1,146 lines; separated config, public/internal nodes, search, persistence, and tests into dedicated modules. Reuses layer capacity and candidate cleanup routines. Recovery and regression code resides in corresponding modules.
+- [x] **S3: Synchronize documentation, examples, and randomized tests.** Updated README dependency versions, memory estimation formulas, concurrency, persistence, numerical, and query contracts; removed stale references to nonexistent locks and layered trackers. Examples wrap `object_store::LocalFileSystem` with `anda_object_store::MetaStore` to exercise atomic object replacement, conditional commits, deletion, purging, and reopening. Fixed random seeds govern layer and distance tests; distribution tests use statistical tolerance thresholds. [Technical Reference](anda_db_hnsw.md)
 
-- [x] **R7：分步加载重试保持一致。** IDs 先暂存，节点在独立表中构建；只有全部验证/恢复成功后替换现有状态。失败、取消及重试期间节点消失不会留下幽灵节点或不同步的 IDs。
+## Verification Summary
 
-- [x] **R8：修复测试丢弃错误。** 并发测试检查 JoinError 和任务内 HnswError 两层结果，并验证最终节点数。新增子库回归及真实 Collection 更新/保存/重开测试。[主库回归](../rs/anda_db/tests/hnsw_updates.rs)
+- Crate tests: 50 unit tests, 6 recall tests, and 22 regression tests passed clean; examples and benchmarks compile without warnings.
+- Core database integration: 8 HNSW adapter tests, Collection vector update regressions, 4 crash-recovery tests, and format compatibility tests passed.
+- At commit `8bc6d8b`, full Rust workspace checks (`--all-features`) passed 1,584 tests with 0 failures; re-verified after post-review fixes.
+- Clippy: passed with `-D warnings` on `--all-targets`.
+- Documentation: 3 embedded Rust examples compile and pass doc-tests; rustdoc link validation clean.
+- File system validation: verified 1,000 inserts, 100 deletes, tombstone reclamation, and 900-node search on `MetaStore<LocalFileSystem>`.
+- Backward compatibility: verified pre-modification Rust reader loads and queries the 900 nodes generated by the new implementation.
+- Regenerated `v0_11` HNSW fixtures covering `g` fields; earlier historical snapshots remain untouched.
 
-- [x] **R9：统一查询边界。** 两种输入在 top_k=0 时均无条件返回空结果；超过 4,096 明确报错；SearchOptions 支持按查询配置 ef，并校验范围。[查询接口](../rs/anda_db_hnsw/src/hnsw/search.rs#L49)
+## Compatibility and Tradeoffs
 
-**性能**
-
-- [x] **O1：去掉非入口删除的全表扫描。** 最高层仍有入口时直接保留层级，仅删除入口需要寻找替代节点。提供单层稀疏图基准验证规模增长。
-
-- [x] **O2：紧凑邻接存储。** 内部改用按实际容量配置的 Vec，消除每层 1,040 字节的固定内联数组；对有序邻接做线性差异合并来维护反向引用，避免每次更新构造两份临时哈希集合。公开 HnswNode 的 SmallVec 类型保持兼容。[内部节点](../rs/anda_db_hnsw/src/node.rs)
-
-- [x] **O3：共享不可变向量。** 修边只复制邻接，向量使用 Arc 共享；加载也直接解码为内部表示，避免 Serde flatten 中间树及公共 SmallVec 的临时分配。get_node_with 为兼容旧类型会物化公开节点，适用于检查/导出，搜索热路径使用内部视图。
-
-- [x] **O4：优化快照与上传。** 锁内只捕获不可变引用，锁外编码；按 Arc 身份逐节点确认脏状态，避免一次无关修改导致整批重写。按实际编码大小预分配并移动缓冲；上传同时受并发数及字节预算约束。主库适配器使用 8 路上传。完成、取消及错误路径保留正确提交次序。
-
-- [x] **O5：减少搜索分配和重复计算。** 上层使用专门的贪心路径，线程局部/调用方工作区复用堆与集合，查询范数只准备一次，存储范数缓存。欧氏距离仍保持原单位；平方 L2 方案已评估，本轮未启用，避免混用旧边缓存单位。没有未经测量地加入平台专用 SIMD。
-
-- [x] **O6：建立并执行基准。** 实测包括 1,000、10,000、100,000 节点及全部距离类型；固定数据及图层种子，覆盖距离、构建、查询、保存、加载、删除、重插；记录延迟分位数、吞吐、分配、堆内存、序列化字节及独立 f64 oracle 的召回。支持全部参数矩阵和实际 embedding CSV 输入。[基准说明](../rs/anda_db_hnsw/benches/README.md) · [测量记录](anda_db_hnsw_benchmarks.md)
-
-**简化与维护**
-
-- [x] **S1：统一快照、编码和确认逻辑。** 两类上传适配器共用快照捕获、metadata/IDs 编码、完成状态及确认逻辑；保留独立的借用型 AsyncFnMut 顺序适配器，避免为统一签名破坏现有调用方的借用能力。
-
-- [x] **S2：按职责拆分。** 原 hnsw.rs 从 4,566 行降为1,146 行；配置、公开/内部节点、查询、持久化和单元测试分别成模块。复用层容量计算和候选清理逻辑。增加的恢复及回归代码保留在对应模块。
-
-- [x] **S3：同步文档、示例和随机测试。** 更新 README 依赖版本、内存估算、并发/持久化/数值/查询契约；移除不存在的锁及分层 tracker 描述。示例通过 `anda_object_store::MetaStore` 包装 `object_store::LocalFileSystem`，执行跨平台原子对象替换、条件提交、删除、purge 和重开。图层和距离测试采用固定种子，分布测试采用统计容差。[技术文档](anda_db_hnsw.md)
-
-**验证结果**
-
-- 子库：50 项单元测试、6 项召回测试、22 项回归全部通过；示例和基准均可编译。
-- 主库：8 项 HNSW 适配器测试、Collection 向量更新回归、4 项崩溃恢复测试、历史格式兼容测试通过。
-- `8bc6d8b` 初次提交时全 Rust 工作区 all-features 共 1,584 项测试通过，0 失败；复审修复后重新执行上述相关套件。
-- Clippy：子库 all-targets、-D warnings 通过。
-- 技术文档中的 3 个 Rust 示例编译测试通过；Rustdoc 链接检查通过。
-- 文件示例以 `MetaStore<LocalFileSystem>` 插入 1,000 条、删除 100 条，清理墓碑后重开 900 条并正常搜索。
-- 使用本次改动前的子库代码，成功读取新示例生成的全部 900 个节点并搜索，验证旧 Rust reader 对新代际扩展的兼容性。
-- 重新生成当前 `v0_11` 的 HNSW 节点对象以覆盖 `g` 字段；更早的历史快照保持不变并继续作为兼容输入。未运行与本次 Rust 改动无关的 TypeScript 套件。
-
-**兼容性及取舍**
-
-1. 持久化提供可恢复的部分进度，不承诺跨对象原子事务或回滚到上次完整快照。主库仍依靠文档意图重放恢复业务状态。
-2. 新节点增加可忽略的 `g` 字段；IDs 仍是恰好一个 CBOR 字节串，旧 reader 和严格单项 CBOR 校验器均可读取。
-3. 超限 top_k、非法持久化配置及超出安全幅值的向量现在明确拒绝；旧 bool flush 中途停止现在报错。调用方应采用显式完成状态。
-4. 完整入边维护和恢复校验有成本：没有宣称所有操作都变快。默认稠密图的部分构建/删除/加载路径比旧实现更重；查询分配、快照内存、特定删除规模及有延迟的并行上传有实测收益。详见基准记录。
-5. 基准框架支持建议矩阵，但不声称穷举所有组合；真实 embedding 未由用户提供，当前记录区分合成数据与真实业务数据。
+1. Persistence guarantees recoverable partial progress without promising cross-object atomic transactions or rollbacks to prior full snapshots. The core database recovers application state via document intent replay.
+2. New nodes introduce an ignorable `g` field; IDs remain a single CBOR byte sequence readable by legacy readers and strict single-item CBOR decoders.
+3. Requests exceeding `top_k` bounds, invalid persistence configurations, or vectors with non-finite/overflowing magnitudes are rejected; legacy bool flush early-exits now return errors. Callers should consume explicit `FlushOutcome`.
+4. Maintaining inbound edges and recovery invariants incurs runtime overhead: build, delete, and load paths on default dense graphs require more work than legacy unchecked implementations. Query allocations, snapshot memory, and concurrent uploads under latency show verified gains (see benchmark notes).
+5. The benchmark harness supports recommended parameter matrices but does not claim exhaustive parameter coverage; synthetic data is explicitly distinguished from real-world embedding corpora.

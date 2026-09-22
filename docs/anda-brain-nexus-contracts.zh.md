@@ -1,5 +1,7 @@
 # Anda Brain 对接 Nexus：KIP CognitiveMemory 2.1
 
+[English](anda-brain-nexus-contracts.md)
+
 本次实现对应 KIP `dcde1de`。协议版本仍是 KIP 2.0，标准包是
 `kip://profiles/cognitive-memory@2.1.0`。Rust 与 SQLite/Durable Object 引擎均已提供
 下列接口。Brain 的检索策略、调度循环、工具适配器与五意图 Memory Interface

@@ -1,5 +1,7 @@
 # AndaDB Technical Documentation
 
+[中文版](anda_db.zh.md)
+
 Version: 0.13.0
 
 ## Overview

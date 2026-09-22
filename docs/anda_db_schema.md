@@ -1,5 +1,7 @@
 # `anda_db_schema` — Technical Reference
 
+[中文版](anda_db_schema.zh.md)
+
 > Type system, schema definitions and document model used across all
 > [Anda DB](https://github.com/ldclabs/anda-db) sub-crates.
 

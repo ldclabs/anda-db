@@ -1,0 +1,143 @@
+# anda_db_btree
+
+[English](anda_db_btree.md)
+
+本文档描述当前 0.13 工作区版本的实现机制。
+该索引将有序字段值 (FV) 映射至唯一文档 ID (PK)。
+精确查找使用分片哈希表；范围查询与字符串前缀匹配使用独立的有序键集合。持久化存储由调用方提供。
+
+## 配置与数据变更
+
+`BTreeConfig` 包含两个配置项：
+
+| 字段 | 默认值 | 语义 |
+|---|---|---|
+| `bucket_overload_size` | 512 KiB | 分桶软限制容量目标，强制限制不低于 64 字节 |
+| `allow_duplicates` | true | 是否允许一个 FV 对应多个不同的 PK |
+
+相同的 (PK, FV) 二元组操作始终具备幂等性。当 `allow_duplicates=false` 时，若针对已占用的 FV 写入不同 PK，将返回 `BTreeError::AlreadyExists`。
+`len()` 统计不同 FV 的数量，而非文档数或关联总数。
+
+- `insert(pk, fv, now_ms) -> Result<bool, BTreeError>`：添加单个关联。
+- `remove(pk, fv, now_ms) -> bool`：移除单个关联。
+- `insert_array(pk, values, now_ms) -> Result<usize, BTreeError>` 与 `remove_array(...) -> usize`：批量处理关联并合并重复项。
+- `batch_update(pk, old, new, now_ms) -> Result<(removed, inserted), BTreeError>`：应用差量变更。调用方应传入文档实际的旧值集合。
+
+批量接口能够摊薄有序键锁、分桶记账和统计信息的开销。它们不是严格的数据库事务。在前置检查通过后，若并发发生唯一性冲突，或在插入中途出现序列化失败，可能会留下部分已应用的变更前缀；系统在返回错误前会完成相应记账。批量更新采用“先插入后删除”策略；若插入失败，旧关联保持原样。
+
+ID 集合具有唯一性。追加操作保持顺序，但删除操作采用将尾部元素交换至被删除位置的策略 (swap-remove)；调用方在发生删除后不能依赖原有插入顺序。小型倒排表直接使用紧凑的 Vector；较大倒排表引入“ID→数组位置”索引，以保证平均常数级成员判定与删除复杂度。磁盘序列化仅保留 ID 列表。
+
+## 查询与分页
+
+`RangeQuery<FV>` 支持 `Eq`、`Gt`、`Ge`、`Lt`、`Le`、包含边界的 `Between`、`Include`、`And`、`Or` 与 `Not`。这些谓词直接作用于字段值，而非文档 ID 集合。即使单个文档同时包含两个值，对两个不同 Eq 取 And 的结果也无法匹配任何单个 FV。
+
+倒置的 Between 范围为空。`And([])` 与 `Or([])` 为空；`Not` 计算相对于当前索引键集合的补集。`Include` 与 `Or` 会自动对键去重。
+
+| 方法 | 遍历顺序 | 返回顺序 |
+|---|---|---|
+| `range_query_with` / `try_range_query_with` | 最小匹配项优先 | 键升序 |
+| `range_query_rev_with` / `try_range_query_rev_with` | 最大匹配项优先 | 键升序 |
+| `prefix_query_with` | 升序 | 升序 |
+| `keys(cursor, limit)` | 升序，不含 cursor | 升序 |
+
+范围查询回调接收 `(&FV, &Vec<PK>)` 并返回 `(continue, Vec<R>)`。当 `continue=false` 时，当前回调返回的结果仍被保留。反向扫描会对分组进行逆序，同时保留每个回调内部的结果顺序。前缀查询回调接收 `(&str, &Vec<PK>)` 并返回 `(continue, Option<R>)`。
+
+布尔谓词仅基于查询输入编译为已排序的互不相交区间。And 求区间交集，Or 求区间并集，Not 求补集。无需物化全索引候选键集合，嵌套的 Include 也不会对每个候选执行线性成员扫描。当回调中止时页面停止扫描；区间编译过程仍会处理完整的输入表达式。
+
+字符串前缀从借用的 `&str` 下界开始扫描，遇到首个不满足 `starts_with` 的键即终止。空前缀扫描所有键。支持包含 `char::MAX` 及其后续后缀的键。
+
+### 资源限制
+
+`RangeQuery::MAX_DEPTH = 64`、`MAX_NODES = 4096` 与 `MAX_INCLUDE_KEYS = 65_536` 限制查询中 Include 条目的总数。自定义 Serde 解码在构造语法树时强制执行这些限制，保留外部标记的 JSON/CBOR 枚举表示。
+
+编程式构建的查询在转换或求值前通过 `validate()` 检查。被拒绝的拥有所有权的查询对象会通过迭代方式析构释放（包括在空索引上）；`discard()` 为处理自定义编程输入的调用方暴露安全的迭代清理能力。
+
+可失败查询方法在输入无效时返回 `BTreeError`；不可失败方法记录警告日志并返回空向量。当需要严格区分“输入非法”与“无匹配结果”时，应使用可失败方法。`try_convert_from` 校验表达式复杂度并进行键类型转换。
+
+## 并发控制
+
+通过 `Arc` 共享索引实例。写入变更持有共享模式的 mutation gate，更新倒排表/分桶分片并短暂锁定元数据以更新统计信息。新增或彻底移除有序键需要获取 B-tree 写入排他锁。压缩操作独占持有 mutation gate；期间只读查询仍可正常并发执行。
+
+回调在内部锁保护下运行。范围/前缀回调可能同时持有有序键读锁与倒排表保护锁。回调逻辑绝不能重入同一个索引；耗时过长的回调会阻塞写操作。
+
+调用方在执行整个 flush 期间（包括异步回调阶段）必须排斥数据变更、压缩和其他 flush。AndaDB 的 Collection 操作门和外层 flush 门提供此类协调机制。仅依赖脏版本号无法保证无协调 flush 的安全性。并发查询不提供跨操作的快照隔离。每个持久化索引要求单一活跃写进程。
+
+## 加载与故障恢复
+
+`load_metadata(reader)` 返回 `LoadState::MetadataOnly`。
+`load_buckets(loader)` 完成初始化；`load_all(reader, loader)` 将二者合一。加载器接收 `BucketObject { bucket_id, generation }` 并返回 `Result<Option<Vec<u8>>, BoxError>`。
+
+缺失 `buckets` 字段时自动走旧格式兼容加载路径。若该字段存在且为空 map，表示现代全新空索引，绝不会扫描遗留文件。旧格式加载在 generation 0 上探测 ID `0..=max_bucket_id`；允许稀疏缺失的 ID，水位上限为 `1 << 20`。编号更高的旧 ID 会替换陈旧倒排表；空倒排表作为墓碑处理。旧格式加载成功后会调度元数据持久化，即使无新数据写入，下一次 flush 也会自动完成格式升级。
+
+清单中引用的对象缺失属于错误，包括升级后清单显式引用的 generation 0 对象。`load_buckets_partial` 专用于诊断，允许对象缺失并返回其标识。未完成、失败或被取消的加载过程停留在 `LoadState::Partial` 状态。
+
+仅处于 `Ready` 状态的索引才接收变更：
+
+| 对只读句柄执行的操作 | 结果 |
+|---|---|
+| insert / insert_array / batch_update / flush | 返回错误 |
+| remove / remove_array | 返回 false / 0 |
+| compaction | 空操作 (No-op) |
+
+部分加载状态下的查询仅反映当前已加载的倒排表，非完整结果。修复对象后重新调用 `load_buckets` 会丢弃未完成的尝试并重建完整索引。拒绝在已处于 Ready 状态的索引上重复加载；需显式重新打开以丢弃当前活跃状态。
+
+## 持久化模型
+
+元数据保留 `{"metadata": ...}` 外层包装。每个桶包含一个从 FV 到 `(bucket_id, posting_version, [PK...])` 的 `p` 映射。运行时的命名类型不改变线上的元组/数组布局；CBOR map 可使用定长或不定长编码。
+
+Generation 0 用于寻址无后缀的旧对象。元数据中的 buckets map 是桶 ID 到对象 generation 的唯一权威映射。
+
+`flush_owned_with(now_ms, metadata_writer, bucket_writer)` 执行流程：
+
+1. 捕获脏桶标识并准备清单数据。
+2. 逐个对桶进行编码和写入，不克隆倒排表或其辅助成员映射。
+3. 在所有必要桶写入成功后，调用 `metadata_writer`。
+4. 确认成功后，发布新清单，清除对应的脏标记，并返回 `FlushOutcome { saved, obsolete }`。
+
+索引在内存中仅持有一个编码后的桶缓冲区以及 O(分桶数) 的元数据与标识记录。孤立的超大倒排表仍需要相应大小的单次缓冲。调用方的上传缓冲会占用额外内存。
+
+干净无脏数据的 flush 返回 `saved=false`，且不调用任何 writer。在清单正式提交之前，新写入的桶对外不可见，上一快照仍可正常读取。在确认提交后，以尽力而为的方式删除废弃对象。垃圾回收必须与写入进程协调：未被当前清单引用的对象可能属于正在进行的提交。
+
+Generation 编号派生自元数据版本。未发生新变更时的重试可复用相同的 generation 和内容；重试并不一定会递增版本。Writer 必须对指定对象执行创建或覆盖。
+
+元数据写入成功意味着持久化的原子替换已完成。请求发出后，存储错误可能导致结果处于未知状态；返回 `Err` 并不证明未发生提交。生产环境适配器在结果不确定时应执行重新打开并恢复。
+
+### 文件系统集成
+
+推荐使用 `flush_owned_with`。仅在其回调内部打开并写入元数据：先写入同目录下的临时文件，执行 fsync，原子替换重命名，并在支持的平台上对父目录执行 fsync。必须先确保数据桶已完成落盘，再提交其清单。
+
+可运行的 [示例](../rs/anda_db_btree/examples/btree_demo.rs) 采用 [atomic_file.rs](../rs/anda_db_btree/examples/support/atomic_file.rs)。其测试覆盖了空操作 flush、桶写入失败以及元数据替换前失败等场景。
+
+`flush(writer, ...)` 仍适用于自身已具备耐久性与原子性的输出目标或内存缓冲区。`Write::flush` 无法使任意 `Write` 具备原子性或真正落盘。在调用前切勿直接在现有元数据文件上执行 `File::create`：即使是空操作 flush 也会导致原文件被提前截断。
+
+## 空间压缩 (Compaction)
+
+桶大小软限制仅为建议值。共享已满桶中的增长倒排表会迁移至新桶；独占单桶的倒排表则就地增长。软限制不会将单个倒排表切分至多个桶。
+
+`compact_buckets_with_outcome()` 返回 `CompactionOutcome { old_bucket_count, new_bucket_count, changed }`。
+采用确定性的装箱递减算法 (best-fit-decreasing) 重新整理归属并将重建的桶标记为 dirty。已处于规范布局的压缩为真正的空操作；重新整理后的布局可能保持相同的桶数量。
+
+`compact_buckets() -> (usize, usize)` 是兼容性包装接口，其返回的计数无法识别所有内部调整。在决定是否保存时，应检查 `changed` 状态或待 flush 标记。AndaDB 的 `compact_index` 即使在桶数量未变时也会提交发生了内部重排的布局。
+
+## 算法复杂度与内存开销
+
+符号定义：N = 已索引 FV 数量，D = 单个倒排表中的 ID 数，B = 桶数量，K = 遍历到的匹配项数量。
+
+| 操作 | 核心开销（不含回调） |
+|---|---|
+| 点查 (Point lookup) | 平均 O(1) |
+| 按 ID 增删倒排项 | 平均 O(1)；微型向量为有界扫描 |
+| 新增/彻底删除 FV | 额外的 O(log N) 有序键变更；平均 O(1) 桶成员增删 |
+| 原生范围/前缀分页 | O(log N + K) |
+| 布尔范围查询 | 输入相关的区间代数计算，随后进行范围扫描；不物化全量候选集 |
+| Include 查询 | 输入排序/去重，随后进行查找/区间遍历 |
+| 空间压缩 (Compaction) | 遍历编码大小、FV 排序、O(log B) 装箱放置 |
+| Flush 持久化 | 脏数据序列化与 O(B) 记账，单桶缓冲区 |
+| 加载 (Load) | 读取/解码引用的对象，重建倒排表与有序键结构 |
+
+FV 同时存在于倒排表映射、有序键集合与分桶成员哈希表中：长字符串键在内存中持有三份副本。分桶成员不保证插入顺序；查询使用全局有序键集合。较大倒排表使用堆分配的辅助 PK map，小型倒排表仅为此保留一个可选指针。哈希表容量是不可忽略的内存开销；在大批量删除后，flush 期间的分桶迭代仍可能遍历未释放的哈希槽位。
+
+运行基准命令：`ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads`。
+显式环境变量门禁可避免在 release 模式的 `cargo test --all-targets` 中运行无 harness 的基准。基准套件输出中位数/p95/p99 延迟、吞吐量、分配次数/字节数、峰值额外堆内存及序列化字节数。覆盖高/低基数、大倒排表删除、首页/尾页扫描、多线程读写以及 4 KiB 键。Flush 测试夹具隔离单桶单倒排表，断言恰好 10% 或 100% 脏桶，并支持注入单桶 I/O 延迟。设置 `ANDA_BTREE_BENCH_NO_IO_DELAY=1` 可进行纯 CPU 性能对比。
+
+两版本对比必须使用相同的统计分配器与构建配置。实测对比、已完成的清单及后续优化决策请参考 [维护结果记录](anda_db_btree-maintenance.zh.md)。

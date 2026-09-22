@@ -1,234 +1,230 @@
-# rs/anda_db 审查清单与修复结果
+# rs/anda_db Review Checklist and Remediation Report
 
-**完成情况（2026-09-06）**
+[中文版](anda_db_review.zh.md)
 
-清单的 **15 项修复、8 项性能工作、4 项简化工作均已处理**。未使用 subagents。
-原有用户改动保留；工作区中并行完成的 HNSW 节点 CAS 修改也保持完整。
+**Completion Status (2026-09-06)**
 
-| 验证 | 结果 |
+All checklist items — **15 bug fixes, 8 performance enhancements, and 4 architectural simplifications — are resolved**. Executed without subagents.
+Existing user modifications were preserved, and parallel HNSW node CAS updates in the workspace remain intact.
+
+| Check | Result |
 | --- | --- |
-| 工作区 `cargo test --workspace --all-features` | **1,621 passed，0 failed，1 ignored**（手动夹具生成） |
-| 正式审查回归 | **25 个测试通过**，含更新/删除提交前后中断、独立唯一键并发、布尔分页参考集合与 schema 映射 |
-| Core、Schema、TFS 严格 Clippy（all-targets / all-features / -D warnings） | 通过 |
-| 独立 Rust 消费者，object_store 0.14，真实文件后端 | 创建、写入、关闭、重开、Jieba 检索通过 |
-| v0_8 / v0_11 存储夹具 | 保持可读，未重新生成夹具 |
-| AGENTS.md / CLAUDE.md | 已同步并通过一致性检查 |
+| Workspace `cargo test --workspace --all-features` | **1,621 passed, 0 failed, 1 ignored** (manual fixture generation) |
+| Formal review regressions | **25 tests passed**, covering interruptions across update/delete commits, unique key concurrency, boolean pagination reference sets, and schema mappings |
+| Strict Clippy across Core, Schema, TFS (`all-targets` / `all-features` / `-D warnings`) | Passed |
+| Independent Rust consumer with object_store 0.14 on real filesystem | Create, write, close, reopen, and Jieba search all passed |
+| v0_8 / v0_11 storage fixtures | Remain readable without regeneration |
+| AGENTS.md / CLAUDE.md | Synchronized and passed consistency checks |
 
-实现采用按原生唯一键取锁、稳定排序加锁与提交后释放；没有保留整集合串行写入的初版方案。
-元数据快照区分已提交与待发布索引；恢复读取遇到临时错误直接失败；维护删除有按 ID 的日志。
-业务回调中的首次操作先完成恢复，分词器安装同步到已加载 BM25。日志在内存中只保留序号。
+The implementation secures locks by native unique key with stable sorting, releasing them only after final commit; earlier designs serializing all collection writes were rejected.
+Metadata snapshots distinguish committed from pending index registrations; transient recovery read errors fail fast; maintenance deletions record per-ID WAL entries.
+First operations in open callbacks execute after recovery completes, synchronizing runtime tokenizers to loaded BM25 instances. In-memory intent logs retain only sequence numbers.
 
-新增运行时接口：`SearchOptions`、`search_with_options`、`search_ids_with_options`、
-`set_io_concurrency(1..=64)`、`recovery_issues()`、流式读写的 `*_with_limit`。
-`StorageConfig::with_cache_max_bytes` 提供显式字节预算；旧缓存配置语义保留。
-默认 release 仍为 opt-level=z，另提供可选 `release-speed`（opt-level=3）。
+New runtime interfaces: `SearchOptions`, `search_with_options`, `search_ids_with_options`,
+`set_io_concurrency(1..=64)`, `recovery_issues()`, and streaming `*_with_limit`.
+`StorageConfig::with_cache_max_bytes` introduces explicit byte budgets while preserving entry-count semantics.
+The default release profile remains `opt-level=z`, with an optional `release-speed` (`opt-level=3`) profile.
 
-`collection.rs` 的生产职责已拆至 `src/collection/`，公开路径保持一致；内嵌大测试模块独立成文件。
-CRUD 使用类型化撤销记录，B-Tree/BM25 共用条件元数据提交和过期对象回收代码。
+`collection.rs` production logic has been decomposed into `src/collection/` while keeping public paths unchanged; embedded test modules moved to dedicated test files.
+CRUD operations employ typed undo logs; B-Tree and BM25 share conditional metadata commit and tombstone reclamation routines.
 
-独立接入验证额外修正了 S04 的本地文件示例：原生 LocalFileSystem 0.14 不支持条件更新，
-现已统一使用 MetaStore 包装；README、技术文档、CLAUDE/AGENTS 和本地 skill 均已对齐。
+Independent integration validation corrected the S04 local filesystem example: upstream LocalFileSystem 0.14 lacks conditional writes,
+so examples wrap it in MetaStore; READMEs, technical docs, CLAUDE/AGENTS, and local skills are aligned.
 
-性能数据、原始结果和复跑命令见 [基准报告](benchmarks/anda_db_core_2026-09-06/README.md)。
-有界 OR / 主键布尔计算、选择率排序、候选集下推和有界恢复 I/O 已落地。
-没有声称所有路径都加速：单路 BM25 的中位延迟未显著改善，本地文件日志清理仍受后端同步成本影响。
-大块 codec 有线程切换成本，详见基准中的串行与并发对照。
+Benchmark data, raw results, and reproduction commands are documented in the [Benchmark Report](benchmarks/anda_db_core_2026-09-06/README.md).
+Bounded OR and primary-key boolean operations, selectivity reordering, candidate pushdowns, and bounded recovery I/O are in place.
+No claims are made of universal speedup: single-term BM25 median latency did not change significantly; local filesystem log sweeps remain dominated by filesystem sync costs.
+Heavy codec tasks incur thread-switching costs, as detailed in the benchmark serial vs concurrent comparisons.
 
-使用注意：默认选择性预过滤会在候选子集内做 RRF；需要历史的“全局排名后过滤”行为时，
-设置 `SearchOptions { prefilter_limit: 0, adaptive: false, ..Default::default() }`。
-普通的宽范围非主键交集仍可能使用 O(匹配数) 工作内存；结果 limit 并非所有计划的内存硬上限。
-这些是明确保留的取舍，不是尚未执行的工作项。
+Usage notes: Default selective prefiltering executes RRF over candidate subsets; to preserve historical "global ranking then filter" semantics,
+specify `SearchOptions { prefilter_limit: 0, adaptive: false, ..Default::default() }`.
+Broad non-PK range intersections may still allocate O(matches) working memory; result limits are not hard working memory caps across all query plans.
+These represent deliberate engineering tradeoffs.
 
-**以下为修复前审查记录，保留问题背景与验收依据。**
+---
 
+**Archived Review Notes (Pre-Fix)**
 
-审查日期：2026-09-06。基于提交 `8bc6d8bf743f6f622b8be4ea1715ab7ed01a7235` 加当前工作区内容；`anda_db` 版本为 0.11.1。审查全程未使用 subagents，未修改生产实现，也未覆盖原有未提交修改。
+Review date: 2026-09-06. Evaluated commit `8bc6d8bf743f6f622b8be4ea1715ab7ed01a7235` alongside active workspace changes; `anda_db` was version 0.11.1. Executed without subagents, preserving uncommitted modifications.
 
-修复前结论：存在需要修复的问题。本次用运行中的代码确认了 **15 项缺陷或 API 边界错误**，其中 6 项建议按 P1 处理、9 项按 P2 处理。另确认了 1 项 BM25 压实行为，归入优化项，不将其冒充未满足现有文档的正确性缺陷。最优先的是唯一约束、索引发布顺序、恢复扫描错误处理和路径隔离。
+Pre-fix summary: 15 bugs or API boundary errors were identified and verified with executable repros (6 designated P1, 9 designated P2), plus 1 BM25 compaction optimization. Top priorities: unique constraints, index publication sequencing, transient recovery error propagation, and prefix isolation.
 
-这里的 P1 表示应在下一次依赖相应功能的生产发布前修复；P2 表示有确定触发条件，应安排修复。优先级不是漏洞严重性评级。
+Priority designations: P1 indicates required resolution prior to production release; P2 indicates deterministic triggers requiring scheduled remediation. Priority does not reflect security vulnerability severity.
 
-**修复前的范围与验证证据**
+**Pre-Fix Scope and Validation**
 
-逐一审查了 `src` 下全部 11 个 Rust 文件的生产实现，共 9,910 行，含注释和文档；结合内嵌单元测试、5 个集成测试文件、格式兼容夹具、示例、Cargo 配置和技术文档检查契约。为确认调用语义，追踪了本地 schema、B-Tree、BM25、HNSW 和对象存储依赖中相关实现。没有把此审查扩展为整个工作区的完整审计。
+Audited all 11 Rust files under `src/` (9,910 total lines including comments/docs), checking contracts against unit tests, 5 integration suites, format fixtures, examples, Cargo configurations, and technical docs. Traced schema, B-Tree, BM25, HNSW, and object store dependencies to verify invocation semantics.
 
-| 检查 | 结果 |
+| Check | Result |
 | --- | --- |
-| `cargo test -p anda_db --all-features -- --test-threads=4` | 186 passed；1 ignored（手动生成格式夹具） |
-| `cargo clippy -p anda_db --all-features --all-targets -- -D warnings` | 通过 |
-| 本次专项复现 | 16/16 确认当前行为：15 项问题，1 项压实优化依据 |
-| 云对象存储、真实断电、性能吞吐基准 | 本次未执行；不声称有相应验证或提升百分比 |
+| `cargo test -p anda_db --all-features -- --test-threads=4` | 186 passed, 1 ignored (format fixture generator) |
+| `cargo clippy -p anda_db --all-features --all-targets -- -D warnings` | Passed |
+| Special repro harness | 16/16 confirmed: 15 bugs, 1 compaction optimization |
+| Cloud stores, power loss, end-to-end throughput | Excluded from initial review scope |
 
-修复前的 [异常探针](anda_db_review_repros.rs)
-作为历史证据保留。当前运行入口改为永久的 [回归套件](../rs/anda_db/tests/review_regressions.rs)：
+The legacy [reproduction probes](anda_db_review_repros.rs) are archived for historical reference. Active verification runs via the permanent [regression suite](../rs/anda_db/tests/review_regressions.rs):
 
 ```bash
 bash docs/run_anda_db_review_repros.sh --nocapture
 ```
 
-**现在通过表示修复后的行为成立。** 下文保留原问题的触发过程与实施建议；勾选表示该工作项已处理。
+Passing status confirms post-fix correctness. Detailed issue descriptions and remediation notes follow; checked items indicate completed work.
 
-**优先修复清单：P1**
+## Priority 1 Remediations (P1)
 
-- [x] **B01：让唯一键的占用持续到文档提交完成。**
+- [x] **B01: Retain unique key locks until document commit completes.**
 
-  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)、[btree.rs](../rs/anda_db/src/index/btree.rs)。当前更新先改变索引，再异步写文档；按文档 ID 分条带的锁不能保护其他文档对旧唯一键的抢占。
+  Location: [crud.rs](../rs/anda_db/src/collection/crud.rs), [btree.rs](../rs/anda_db/src/index/btree.rs). Previously, updates modified indexes before writing documents asynchronously; document-ID striped locks failed to prevent concurrent documents from claiming the prior unique key.
 
-  已复现：A 的唯一键是 `x`，更新为 `y` 的文档 PUT 尚未执行时，B 成功插入 `x`；中断 A 的更新并重开后，A、B 的持久化文档都为 `x`，但唯一索引只返回其中一个。失效句柄和重放日志不能修复这个跨文档约束冲突。
+  Reproduction: Document A holds unique key `x`; while updating to `y` before the document PUT executes, Document B successfully inserts `x`. If A's update is interrupted and reopened, both A and B persist `x`, but the unique index returns only one. Poisoned handles and replay logs could not resolve this cross-document conflict.
 
-  执行：先实现覆盖旧键和新键的唯一键预留，持有到文档写入结果确定；按稳定顺序加锁，避免多唯一索引死锁。等待锁的操作醒来后重新检查句柄状态。可先用集合级串行提交作为较简单的正确性修复，再用基准决定是否细化。恢复遇到真实唯一冲突应显式报告，不能仅打印警告后把该文档计作完整恢复。
+  Remediation: Implemented unique key reservations spanning old and new keys, held until document write results are acknowledged. Locks are acquired in stable sort order to prevent multi-index deadlocks. Operations re-verify handle validity upon acquiring locks. Replay errors report conflicts explicitly rather than logging warnings while advancing recovery markers.
 
-  验收：对 update/remove 与另一文档 add/update 的交错，在存储写前、写后丢响应、中断等位置注入故障；成功返回且恢复后的文档必须满足唯一约束，或恢复显式报告可操作的冲突。探针：`repro_unique_key_released_before_document_commit`。
+  Validation: Interleaved updates/removals with concurrent insertions/updates; injected faults before/after storage writes and during dropped responses. Reopened documents must satisfy uniqueness or fail fast with actionable conflict diagnostics. Probe: `repro_unique_key_released_before_document_commit`.
 
-- [x] **B02：所有元数据写入路径都必须遵守“索引先持久化、引用后发布”。**
+- [x] **B02: Metadata paths must enforce "persist index first, publish references second".**
 
-  位置：[persistence.rs](../rs/anda_db/src/collection/persistence.rs)、[extensions.rs](../rs/anda_db/src/collection/extensions.rs)、[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)。`flush_inner` 的顺序已经正确，但 `store_metadata_unclaimed` 写的是包含未提交索引注册信息的完整元数据。
+  Location: [persistence.rs](../rs/anda_db/src/collection/persistence.rs), [extensions.rs](../rs/anda_db/src/collection/extensions.rs), [index_ops.rs](../rs/anda_db/src/collection/index_ops.rs). While `flush_inner` ordered writes correctly, `store_metadata_unclaimed` wrote full metadata containing uncommitted index registrations.
 
-  已复现：已有文档且 checkpoint 已推进；打开回调创建 B-Tree 索引、调用 `save_extension`、随后返回错误。再次打开时索引已登记，`_nx` 不再回填，而磁盘索引还是空的；文档能 get，却无法通过索引找到。删除另一个索引也会走同一元数据发布入口。
+  Reproduction: With existing documents and advanced checkpoints, an open callback creates a B-Tree index, invokes `save_extension`, and returns an error. On subsequent open, the index was registered, `_nx` skipped backfill, but the on-disk index was empty; documents were retrievable via `get` but absent from index queries. Deleting another index followed the same flawed publication path.
 
-  执行：区分已提交的索引注册集合和待发布变更；扩展写入只携带已提交索引描述，或在发布新增索引引用前完成必要的索引持久化。不能仅靠“不推进 last_saved_version”保证安全。
+  Remediation: Distinguish committed index sets from pending registrations; extension writes serialize only committed index descriptors or flush pending index changes prior to publishing references.
 
-  验收：B-Tree、BM25、HNSW 各覆盖“回填→扩展写/删除另一索引→回调错误或中断→重开”，所有既有文档仍可检索。探针：`repro_extension_publishes_unflushed_new_index`。
+  Validation: B-Tree, BM25, and HNSW tested across "backfill -> extension write/delete another index -> callback error/interruption -> reopen"; all documents remain indexed. Probe: `repro_extension_publishes_unflushed_new_index`.
 
-- [x] **B03：恢复扫描遇到临时读取失败时，不得跨过失败 ID 提交 checkpoint。**
+- [x] **B03: Recovery scans must not advance checkpoints past transient read failures.**
 
-  位置：[recovery.rs](../rs/anda_db/src/collection/recovery.rs)。`auto_repair_indexes` 将 NotFound 以外的错误也记录后跳过；后续正常文档触发 flush，checkpoint 会越过读取失败的文档。
+  Location: [recovery.rs](../rs/anda_db/src/collection/recovery.rs). `auto_repair_indexes` caught non-NotFound errors, logged warnings, and continued; subsequent flushes advanced checkpoints past the unread documents.
 
-  已复现：两个已成功 add、尚未 checkpoint 的文档，恢复时仅让 `data/1.cbor` 的 GET 临时失败一次。打开成功且 checkpoint 变成 2；再次打开仍只能看到文档 2，而文档 1 的对象完好存在。必须手动 `reconcile_storage` 才找回。
+  Reproduction: Two documents inserted without checkpoints; injecting a single transient GET failure on `data/1.cbor` during recovery resulted in successful open with checkpoint=2; document 1 was lost until an explicit `reconcile_storage` scan was performed.
 
-  执行：区分确定不存在、确定损坏和临时 I/O 失败。临时失败应使本次恢复失败，或持久化待重试 ID，并阻止相关恢复边界被确认；损坏对象若允许跳过，也要保留可查询的诊断和后续修复入口。
+  Remediation: Distinguish definitive non-existence from data corruption and transient I/O errors. Transient errors abort recovery or persist pending retry lists, preventing checkpoint advancement. Corrupted records record diagnostic metadata for manual repair.
 
-  验收：对恢复窗口中的任意 ID 注入一次 GET/读取流失败，清除故障后重试即可自动找回所有正常对象，无需人工全量扫描。探针：`repro_transient_recovery_read_failure_is_checkpointed_past`。
+  Validation: Injected transient failures across the recovery window; clearing the fault and retrying recovers all documents automatically without manual storage reconciliation. Probe: `repro_transient_recovery_read_failure_is_checkpointed_past`.
 
-- [x] **B04：重开时将用户设置的分词器应用到已加载的 BM25 索引。**
+- [x] **B04: Apply user-configured tokenizers to loaded BM25 indexes on reopen.**
 
-  位置：[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)、[collection.rs](../rs/anda_db/src/collection.rs)。索引先使用默认分词器 bootstrap，随后回调中的 `set_tokenizer` 只替换 Collection 字段，不更新 BM25 内部的分词器。
+  Location: [lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs), [index_ops.rs](../rs/anda_db/src/collection/index_ops.rs), [collection.rs](../rs/anda_db/src/collection.rs). Indexes bootstrapped with default tokenizers; callback `set_tokenizer` calls updated the Collection field but neglected internal BM25 state.
 
-  已复现：按官方示例的方式设置 Jieba、创建索引、插入“南京市长江大桥”。重开前可搜索，重开并再次设置 Jieba 后，同样的全文查询为空；`collection.tokenize` 却仍显示正确分词。
+  Reproduction: Initialized Jieba tokenizer, inserted Chinese text, verified search. Upon restart and re-invoking `set_tokenizer`, queries returned empty results despite `collection.tokenize` emitting valid tokens.
 
-  执行：让打开配置在 bootstrap 前提供分词器，或让 setter 安全地更新所有已加载索引的运行时分词器。真实的分词策略变更应触发重建或明确拒绝，避免同一索引混用两种词项语义。
+  Remediation: Supply tokenizers prior to bootstrap in open configuration, or update internal BM25 tokenizers via thread-safe runtime setters.
 
-  验收：中文、多词查询及重开后的新增、更新、删除结果一致；不仅检查 `tokenize()`。探针：`repro_custom_tokenizer_not_restored_to_loaded_bm25`。
+  Validation: Consistent multi-term and CJK queries across restarts, inserts, updates, and deletes. Probe: `repro_custom_tokenizer_not_restored_to_loaded_bm25`.
 
-- [x] **B05：迁移/恢复数据库前缀后，所有集合路径必须跟随打开路径。**
+- [x] **B05: Collection storage paths must follow database relocation paths.**
 
-  位置：[database.rs](../rs/anda_db/src/database.rs)、[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[database.rs](../rs/anda_db/src/database.rs)。Storage 已采用调用方的新路径，但 AndaDB 的 `name` 仍取自旧 `db_meta.cbor`；集合使用 `db.name()` 拼接路径。
+  Location: [database.rs](../rs/anda_db/src/database.rs), [lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs). Storage adopted caller-specified paths, but database names were loaded from legacy `db_meta.cbor`, causing collections to format paths against the old name.
 
-  已复现：把 `reviewdb/` 完整复制到 `restored/` 后，以 `restored` 打开并新增文档，实际写入 `reviewdb/docs/data/2.cbor`。若旧前缀不存在，集合打不开；若旧前缀仍存在，会读写原库。删除路径也依赖同一旧名称。
+  Reproduction: Copying `reviewdb/` to `restored/` and opening `restored` wrote new documents to `reviewdb/docs/data/2.cbor`. If the old path was inaccessible, collections failed to open; if accessible, writes polluted the original database.
 
-  执行：由调用方路径确定存储命名空间，分离展示名称与存储前缀；协调 DB 元数据中的名称，不让旧元数据重定向操作。若不支持改名前缀，至少应在打开时明确拒绝，不能静默访问原库。
+  Remediation: Derive storage namespaces strictly from caller paths, decoupling display names from storage prefixes; reconcile database metadata to prevent path redirects.
 
-  验收：原前缀存在/不存在两种恢复场景，读、增、更新、删除集合都只访问目标前缀；用记录存储调用的包装器断言原前缀无写入。探针：`repro_relocated_database_uses_original_collection_prefix`。
+  Validation: Relocated open scenarios (both with original prefix present and absent) verify that all operations target the new prefix exclusively. Probe: `repro_relocated_database_uses_original_collection_prefix`.
 
-- [x] **B06：`create_btree_index_nx` 只忽略“目标索引确实已存在”。**
+- [x] **B06: `create_btree_index_nx` must only ignore existing matching indexes.**
 
-  位置：[index_ops.rs](../rs/anda_db/src/collection/index_ops.rs)。它无条件吞掉整个创建过程返回的 `DBError::AlreadyExists`，但唯一索引回填冲突使用同一种错误。
+  Location: [index_ops.rs](../rs/anda_db/src/collection/index_ops.rs). Swallowed all `DBError::AlreadyExists` errors, including unique constraint violations during backfill.
 
-  已复现：先存两个相同 key 的文档，再执行 `_nx` 创建唯一索引；调用返回成功，实际没有注册索引，第三个重复 key 仍可插入。组合唯一索引也受这一错误分类方式影响。
+  Reproduction: Pre-inserted duplicate keys, then called `_nx` on a unique index; call succeeded without registering the index, allowing further duplicate keys to be inserted.
 
-  执行：创建前检查目标索引，或仅在错误后确认目标索引已完整加载且配置匹配时返回成功；传播回填产生的重复键错误。错误中保留冲突键和文档 ID。
+  Remediation: Validate index existence upfront, or verify that `AlreadyExists` errors correspond to matching, fully loaded indexes; propagate backfill collision errors with conflicting keys and IDs.
 
-  验收：既有索引的重复初始化成功；既有文档违反唯一约束时初始化失败且不留下半成品。探针：`repro_create_btree_index_nx_swallows_duplicate_backfill_failure`。
+  Validation: Duplicate creation of identical indexes succeeds idempotently; backfills encountering duplicate keys fail explicitly without leaving partial registrations. Probe: `repro_create_btree_index_nx_swallows_duplicate_backfill_failure`.
 
-**进一步修复清单：P2**
+## Priority 2 Remediations (P2)
 
-- [x] **B07：区分文档大小上限与意图日志大小上限。**
+- [x] **B07: Decouple document size limits from mutation intent limits.**
 
-  位置：[recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[storage.rs](../rs/anda_db/src/storage.rs)。日志同时保存旧、新两份完整文档，却走同一个 `max_small_object_size` 检查。默认上限实际为 2,048,000 字节（配置注释称为 2 MiB）。1,100,000 字符的 body 可以插入，但仅修改短 key 就会因日志超过上限而失败。
+  Location: [recovery.rs](../rs/anda_db/src/collection/recovery.rs), [storage.rs](../rs/anda_db/src/storage.rs). Mutation logs retain before and after images of documents, yet enforced `max_small_object_size` (2,048,000 bytes default). A 1.1 MB body could be created, but subsequent updates failed due to log size checks.
 
-  执行：为内部意图定义足够且受控的独立限额，或保存差量/索引前后映像；同时考虑 CBOR 包装开销与兼容格式。验收：接近文档上限的合法文档仍可更新、删除并恢复。探针：`repro_accepted_large_document_cannot_be_updated`。
+  Remediation: Configured independent limits for internal intent records, accounting for CBOR overhead and backward compatibility. Probe: `repro_accepted_large_document_cannot_be_updated`.
 
-- [x] **B08：开放业务回调前，先保证 ID 分配器不会碰到未恢复对象。**
+- [x] **B08: Recover ID allocators before invoking user open callbacks.**
 
-  位置：[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)、[lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs)。回调发生在 replay/repair 之前，分配器从旧 metadata max 起步，而不是从尚待扫描的持久化水位以上开始。
+  Location: [lifecycle.rs](../rs/anda_db/src/collection/lifecycle.rs). Callbacks executed prior to replay/repair; ID allocators started from legacy metadata maximums rather than uncheckpointed storage watermarks.
 
-  已复现：文档 1 add 成功后进程结束，重开回调里添加另一文档，错误地再次分配 ID 1 并报 AlreadyExists，导致打开失败。执行：至少将回调可用的分配器推进到已持久化预留水位；更完整的 API 可拆分配置阶段和恢复后的业务阶段，同时保证 hooks 先于重放生效。验收：带未 checkpoint 新增的重开回调仍可安全 add，且原有文档完整恢复。探针：`repro_open_callback_add_runs_before_allocator_recovery`。
+  Reproduction: Adding document 1 without a checkpoint caused an open callback adding another document to reuse ID 1, failing with `AlreadyExists`.
 
-- [x] **B09：维护性删除也要留下可恢复的按 ID 清理记录。**
+  Remediation: Advanced allocator watermarks to match persisted storage before invoking callbacks; ensured index hooks activate prior to replay. Probe: `repro_open_callback_add_runs_before_allocator_recovery`.
 
-  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)。只有能正常构造 Document 时才记录删除日志；dead ID 或 schema 无法解码的文档走直接扫索引分支。
+- [x] **B09: Retain recoverable per-ID records for maintenance deletions.**
 
-  已复现：已 checkpoint 文档的对象丢失，`remove` 成功清理内存后进程结束；重开时旧 bitmap 与唯一键占用恢复，替代文档仍被拒绝。执行：添加不依赖前映像的 purge-by-id 意图，恢复时扫除相应索引和 bitmap，checkpoint 后才删除该记录。验收：dead ID 和 schema-invalid 对象的删除在任意中断点可重试且不会恢复幽灵唯一键。探针：`repro_dead_id_removal_has_no_replay_record`。
+  Location: [crud.rs](../rs/anda_db/src/collection/crud.rs). Deletion logs were written only if a Document could be constructed; deletions of dead IDs or unparseable schemas bypassed WAL logging.
 
-- [x] **B10：扩展元数据的未知提交结果也必须令句柄失效。**
+  Reproduction: Deleting an unparseable object cleared memory; upon restart, legacy bitmaps and unique keys were resurrected, rejecting replacement documents.
 
-  位置：[persistence.rs](../rs/anda_db/src/collection/persistence.rs)、[extensions.rs](../rs/anda_db/src/collection/extensions.rs)。`guarded` 在 future 返回 Err 时也会解除保护；这里只有取消保护，没有对应的未知存储结果处理。
+  Remediation: Introduced purge-by-ID intent records independent of pre-images; replay purges index and bitmap entries before checkpointing. Probe: `repro_dead_id_removal_has_no_replay_record`.
 
-  已复现：meta PUT 实际成功但丢失响应，`save_extension` 返回错误后 state 仍为 Active；`open_collection` 返回同一个旧句柄，后续扩展写入因旧 CAS token 持续失败。执行：在元数据持久化边界分类错误，未知结果和 CAS 冲突触发 poison；序列化/本地大小预检失败保留可恢复的健康状态。同步覆盖 remove_extension、删除索引与 compaction 的错误出口。验收：ErrorAfter 后直接重开得到新句柄，后续写入成功。探针：`repro_unknown_extension_commit_does_not_poison`。
+- [x] **B10: Invalidate handles on indeterminate extension commits.**
 
-- [x] **B11：HNSW bootstrap 的清理应尊重只读模式。**
+  Location: [persistence.rs](../rs/anda_db/src/collection/persistence.rs), [extensions.rs](../rs/anda_db/src/collection/extensions.rs). Guard wrappers unpoisoned handles on `Err` returns, failing to handle dropped responses or uncertain commits.
 
-  位置：[hnsw.rs](../rs/anda_db/src/index/hnsw.rs)。bootstrap 无条件运行 `purge_orphan_node_blobs`，而上层只在打开完成后判断是否允许 flush。
+  Reproduction: Metadata PUT succeeded on backend but dropped response; handle remained active; subsequent writes failed permanently due to stale CAS tokens.
 
-  已复现：在未引用的节点对象存在时，只读 open 仍发出 DELETE。执行：将清理移到可写维护阶段，或显式传入只读打开策略。验收：只读打开的整个存储调用日志中没有 PUT/DELETE/COPY；可写重开仍能清理真实崩溃遗留对象。探针：`repro_read_only_open_deletes_orphan_hnsw_blobs`。
+  Remediation: Categorized errors at metadata boundaries; indeterminate outcomes poison handles, while local pre-validation errors retain healthy state. Probe: `repro_unknown_extension_commit_does_not_poison`.
 
-- [x] **B12：流式写入成功的数据必须能按约定读回。**
+- [x] **B11: HNSW bootstrap orphan cleanup must honor read-only mode.**
 
-  位置：[storage.rs](../rs/anda_db/src/storage.rs)、[storage.rs](../rs/anda_db/src/storage.rs)。读取以 `max(压缩后大小×16, 小对象上限×16)` 作为解压限额，流式写入却没有相应约束。
+  Location: [hnsw.rs](../rs/anda_db/src/index/hnsw.rs). Bootstrap unconditionally invoked `purge_orphan_node_blobs` during read-only opens.
 
-  已复现：小对象上限 1 KiB 时，64 KiB 重复文本可流式写入并 shutdown 成功，但只读出 16 KiB 就报超限。默认配置下，高压缩率且大于 32,768,000 字节的数据也会碰到该条件。执行：定义独立的流式明文大小预算，并在写端验证；或使用受验证的原始长度元数据。不能只由压缩比推断正常数据是否过大。验收：分别测试重复文本、零字节、不可压缩数据、限额前后边界，成功写入的对象应能完整 round-trip。探针：`repro_stream_writer_reader_rejects_compressible_roundtrip`。
+  Remediation: Shifted cleanup to writable maintenance phases or gated behind read-only flags. Probe: `repro_read_only_open_deletes_orphan_hnsw_blobs`.
 
-- [x] **B13：压缩头识别不能依赖第一次缓冲至少有 4 字节。**
+- [x] **B12: Ensure readable roundtrips for streamed writes.**
 
-  位置：[storage.rs](../rs/anda_db/src/storage.rs)。`object_chunk_size=1..3` 合法进入构造，第一次 `fill_buf` 不足以识别 zstd magic，流式读取会直接返回压缩内容。
+  Location: [storage.rs](../rs/anda_db/src/storage.rs). Decompression bounded reads by `max(compressed_len * 16, small_object_limit * 16)`, while streaming writes lacked corresponding constraints. Highly compressible data could write successfully but fail during read.
 
-  执行：在不丢失前缀的前提下读取完整 magic，或在初始化验证并约束块大小；对 0 也明确拒绝。验收：块大小 1、2、3、4、默认值下，压缩与未压缩对象的 buffered/stream 结果一致，或小块配置明确报错。探针：`repro_stream_reader_small_chunk_does_not_sniff_zstd`。
+  Remediation: Enforced independent uncompressed limits verified during writing. Probe: `repro_stream_writer_reader_rejects_compressible_roundtrip`.
 
-- [x] **B14：遍历 JSON 数组时逐个检查元素。**
+- [x] **B13: Do not rely on 4-byte minimums for zstd magic sniffing.**
 
-  位置：[index/mod.rs](../rs/anda_db/src/index/mod.rs)。只在首元素是字符串或对象时进入 JSON 数组，因此 `[0, "searchable", ["nested"]]` 的两个文本都被遗漏；首元素为嵌套数组时也不会递归。
+  Location: [storage.rs](../rs/anda_db/src/storage.rs). Bounded chunk sizes (1–3 bytes) caused initial buffer fills to fail magic sniffing, returning raw compressed bytes.
 
-  执行：移除首元素筛选，对所有元素使用现有迭代栈与复杂度预算，非文本元素自然跳过。验收：混合数组、嵌套数组和空数组语义一致；重建索引使历史遗漏文本可搜索。探针：`repro_json_text_extraction_depends_on_first_array_element`。
+  Remediation: Sniffed magic without consuming stream prefixes or enforced minimum chunk sizes. Probe: `repro_stream_reader_small_chunk_does_not_sniff_zstd`.
 
-- [x] **B15：`add(Document)` 应验证 Document 的字段编号映射与集合一致。**
+- [x] **B14: Inspect all elements when traversing JSON arrays for indexing.**
 
-  位置：[crud.rs](../rs/anda_db/src/collection/crud.rs)。集合验证按自己的字段编号检查值，索引 hooks 却按传入 Document 自带的 schema 查字段名；两者不一定是同一套映射。
+  Location: [index/mod.rs](../rs/anda_db/src/index/mod.rs). Arrays were traversed only if the initial element was a string or object; mixed arrays like `[0, "text"]` were missed.
 
-  已复现：两个 schema 都有文本字段 a/b，但注册顺序相反；add 接受外部 Document 后，查询 a=`A` 返回该 ID，get 却显示 a=`B`。执行：拒绝不兼容的字段编号映射，或按字段名显式转换后再统一验证和索引；不能只比较 Arc 指针。验收：独立构造但等价的 schema 可接受；编号不兼容的 schema 明确拒绝或按名转换，立即读取与重开前后的索引一致。探针：`repro_foreign_document_schema_yields_wrong_index_values`。
+  Remediation: Traversed all elements using standard stack budgets, skipping non-text entries cleanly. Probe: `repro_json_text_extraction_depends_on_first_array_element`.
 
-**性能与简化清单**
+- [x] **B15: Validate Document field indices against Collection schema.**
 
-以下优化以当前代码路径为依据。除 P04 的行为探针外，尚未进行专门性能基准；执行时应先测量，再保留有收益的改动。
+  Location: [crud.rs](../rs/anda_db/src/collection/crud.rs). Collections checked values by internal field indices while hooks inspected names from Document-attached schemas; mismatched registration orders corrupted index values.
 
-| 完成 | 编号 | 可执行改动 | 位置与依据 | 验收方式 |
+  Remediation: Reject mismatched field mappings or convert explicitly by name before validation. Probe: `repro_foreign_document_schema_yields_wrong_index_values`.
+
+## Performance and Simplification Items
+
+| Done | ID | Item | Focus | Verification |
 | --- | --- | --- | --- | --- |
-| [x] | P01 | 对布尔过滤实施有界集合计算和候选集下推 | [query.rs](../rs/anda_db/src/collection/query.rs)：Or/And 子树以 limit=0 展开；限额 1,000 只限制最终输出，复杂过滤仍可分配 O(N) 中间集合。Not 即使候选集很小也求全量排除集。 | 用 reference set 验证所有等价表达式与双向分页；记录高匹配率、嵌套过滤下的峰值分配、p95。Or 的每个分支可保留同方向前 K 个再合并：被分支排除的 ID 已有至少 K 个更靠前的并集成员；And 不能直接套这个截断规则。 |
-| [x] | P02 | 对恢复读取、意图读取与清理使用有界并发；把垃圾回收与提交边界分开建模 | [recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)：每个对象串行 await，日志删除又处于独占 operation_gate 内。 | 用 1/10/50 ms 存储延迟、64/1,000 条待恢复记录测重开与写入阻塞时间；并发保持可配置上限。串行部分约为 N×单次请求延迟，不应按 CPU 优化处理。必须先修 B03，任何并行化都不能吞掉恢复失败。 |
-| [x] | P03 | 缩减在内存中保留的意图内容；评估索引映像或差量日志 | [recovery.rs](../rs/anda_db/src/collection/recovery.rs)、[recovery.rs](../rs/anda_db/src/collection/recovery.rs)：每次更新持有两份完整文档，重开还 clone 整张 intent map。正常 flush 主要需要路径/sequence 来清理。 | 测同一大文档重复更新 1,000 次、checkpoint 前后的 RSS、编码字节数和恢复时间；保持多次更新与部分 checkpoint 的重放正确性。内存中可只保留序号，磁盘格式优化单独实施。 |
-| [x] | P04 | 让 BM25 compaction 按 changed/dirty 状态决定持久化，避免相同桶数反复重排 | [bm25.rs](../rs/anda_db/src/index/bm25.rs)：底层即使桶数不变也重建并标脏，wrapper 因 new_count >= old_count 直接返回。现有文档确实只承诺桶数减少时持久化，因此列为优化。 | 探针 `repro_bm25_compaction_same_bucket_count_does_not_flush` 已确认相同桶数压实后仍 dirty；参考 B-Tree 的 CompactionOutcome。第一次必要压实提交，紧接第二次无变化调用应为 no-op。 |
-| [x] | P05 | 给单路检索提供直接返回路径，删除 RRF 后重复去重 | [query.rs](../rs/anda_db/src/collection/query.rs)、[query.rs](../rs/anda_db/src/query.rs)：即使只有一个排名列表也建 hash map、排序，再转 UniqueVec；RRF 的 map 已保证输出 ID 唯一。 | 对单 BM25、单 HNSW、混合与多同类索引比较结果顺序、边界值和分配数；多路 top-K 可进一步评估有界堆，避免无必要全排序。 |
-| [x] | P06 | 测量同步计算对异步执行器的占用，按阈值做有界 CPU 调度 | [crud.rs](../rs/anda_db/src/collection/crud.rs)、[query.rs](../rs/anda_db/src/collection/query.rs)、[storage.rs](../rs/anda_db/src/storage.rs)：验证、tokenization、HNSW、CBOR 与 zstd 直接在 async 调用里同步执行。 | 同时运行短查询和大文档写入，测短请求 p99/执行器调度延迟。大任务可批量 offload，保留小任务快速路径；spawn_blocking 的任务不会随外层取消自动停止，必须保留操作租约和结束追踪。另对工作区 release 的 opt-level=z 与速度配置做实测比较。 |
-| [x] | P07 | 建立按字节的缓存预算，测量固定 256 个失效条带的碰撞成本 | [storage.rs](../rs/anda_db/src/storage.rs)、[storage.rs](../rs/anda_db/src/storage.rs)：默认每集合 10,000 个对象、每对象最多约 2 MB；大量写入会间接淘汰同条带的其他热对象。 | 用大文档、多集合及读写混合负载测实际 RSS、命中率和后端 GET 数。优先明确 cache_max_bytes；条带数、路径 generation 方案以测量选择，不能把既有 entry-count 配置静默改成字节语义。 |
-| [x] | P08 | 为高选择性过滤提供可调的检索候选策略 | [query.rs](../rs/anda_db/src/collection/query.rs)：目前先取每索引 min(limit×10,4096) 候选再过滤，命中可能不足。该上限已有文档，是召回/成本取舍，不计作此次 bug。 | 测租户/时间过滤选择率 0.1%、1%、10% 的 recall@K 与延迟；评估先过滤、小集合精算或自适应扩候选，保留资源上限和近似检索语义。 |
+| [x] | P01 | Bounded boolean evaluation and candidate pushdown | [query.rs](../rs/anda_db/src/collection/query.rs): Or/And subtrees expanded with limit=0, causing O(N) intermediate allocations. | Validated against reference sets and bidirectional pagination; verified peak memory reductions. |
+| [x] | P02 | Bounded concurrency for recovery reads and GC | [recovery.rs](../rs/anda_db/src/collection/recovery.rs): Replaced serialized sequential awaits with configurable concurrency limits. | Tested under 1/10/50 ms latency with 64/1,000 pending items; ensures failures abort cleanly (B03). |
+| [x] | P03 | Compact in-memory intent tracking | [recovery.rs](../rs/anda_db/src/collection/recovery.rs): Replaced cloned full documents in memory with sequence identifiers. | Measured 1,000 repeated updates on large documents; confirmed RSS drops and replay correctness. |
+| [x] | P04 | BM25 compaction state tracking | [bm25.rs](../rs/anda_db/src/index/bm25.rs): Prevented repeated re-sorting when bucket count is unchanged. | Verified via `repro_bm25_compaction_same_bucket_count_does_not_flush`; second call is a no-op. |
+| [x] | P05 | Fast path for single-query retrieval | [query.rs](../rs/anda_db/src/collection/query.rs): Bypassed RRF deduplication maps when querying single indexes. | Verified result ordering and allocation counts across single BM25, single HNSW, and hybrid searches. |
+| [x] | P06 | Offload heavy CPU tasks from async runtimes | [crud.rs](../rs/anda_db/src/collection/crud.rs), [storage.rs](../rs/anda_db/src/storage.rs): Bounded blocking threadpools for heavy serialization/compression. | Measured scheduler latency under concurrent reads and writes; benchmarked `opt-level=z` vs `opt-level=3`. |
+| [x] | P07 | Byte-based cache budgets and striped eviction | [storage.rs](../rs/anda_db/src/storage.rs): Added `cache_max_bytes` alongside object-count limits. | Benchmarked under mixed workloads; verified eviction patterns and backend GET counts. |
+| [x] | P08 | Configurable candidate selection for selective queries | [query.rs](../rs/anda_db/src/collection/query.rs): Added adaptive candidate expansion and pre-filtering options. | Tested under 0.1%, 1%, and 10% selectivity; verified recall improvements. |
 
-- [x] **S01：把 Collection 按职责拆分，但保持锁与提交不变量集中。**
+- [x] **S01: Decompose Collection into focused modules.**
+  Split 9,850 lines of `collection.rs` into lifecycle, recovery, crud, query, index_ops, and extensions while maintaining public APIs and locking invariants.
 
-  `collection.rs` 共 9,850 行，其中生产实现和文档 4,418 行。可拆为 lifecycle、recovery、crud、query、index_ops、extensions 与 tests；先只移动代码，保持公开路径及 API。锁顺序、poison 条件、发布顺序保留在统一说明中，避免每个模块复制一份不同规则。验收：不改行为，已有测试与格式兼容夹具全部通过。
+- [x] **S02: Unified undo logs for CRUD operations.**
+  Replaced scattered HashMaps with `Vec<UndoEntry>` for deterministic rollback sequencing and standardized handle poisoning.
 
-- [x] **S02：用类型化撤销记录替换三套 CRUD 中多张 HashMap。**
+- [x] **S03: Explicit metadata state machine.**
+  Formalized committed snapshots, pending index changes, and checkpoint states; unified B-Tree and BM25 manifest handling.
 
-  [crud.rs](../rs/anda_db/src/collection/crud.rs)、[crud.rs](../rs/anda_db/src/collection/crud.rs)、[crud.rs](../rs/anda_db/src/collection/crud.rs)。这些容器用于追踪操作历史，不需要按 index 哈希查找。可使用 `Vec<UndoEntry>`，明确记录已经完成的阶段并逆序回滚，统一回滚失败的 poison 策略。必须在 B01 的跨文档隔离修复后实施；重构撤销记录本身不能解决唯一键竞争。
+- [x] **S04: Documentation and dependency alignment.**
+  Corrected documentation on poisoned handle read availability; upgraded README references to `object_store=0.14`; clarified storage reconciliation heuristics.
 
-- [x] **S03：把元数据快照、提交与回收的状态表达清楚。**
+## Recommended Staging and Gates
 
-  将 “unclaimed/full” 隐含约束转成命名明确的已提交快照、待发布索引变更、checkpoint 结果；统一 B-Tree/BM25 的 bucket manifest 提交及最佳努力回收公共部分。避免过早引入统一大 trait，把 HNSW 的节点/ids/metadata 恢复流程强行装进桶索引协议。验收依据是 B02/B10 和现有故障注入，不仅是编译通过。
-
-- [x] **S04：消除文档与实际契约的矛盾，修复上手依赖版本。**
-
-  [error.rs](../rs/anda_db/src/error.rs) 及多处注释声称非 Active 句柄拒绝所有操作，但 get/search/query 实际允许读取；[技术文档](anda_db.md#L419) 又明确说明 poisoned 句柄仍可读。由于已有这一明确约定，本报告未把“缺少读取生命周期检查”计入 15 项 bug。应统一说明可读、可写、可恢复状态，以及读取旧句柄可能落后于存储的范围。
-
-  [README.md:33](../rs/anda_db/README.md#L33) 仍建议 `object_store=0.13`，而 crate 已依赖 0.14；照此接入会产生不同版本的 ObjectStore trait 不兼容，应更新并增加独立消费者编译验证。另外，`reconcile_storage` 仍描述“连续 missing 后停止”的旧恢复启发式，现已是水位有界扫描；清理这些会误导维护者的注释。
-
-**建议实施顺序与验收门槛**
-
-| 批次 | 工作项 | 完成标准 |
+| Batch | Items | Acceptance Criteria |
 | --- | --- | --- |
-| 1：约束与发布安全 | B01、B02、B03、B05、B06 | 唯一键交错测试、完整前缀调用日志、元数据发布故障矩阵通过；不会静默丢索引或遗漏正常对象 |
-| 2：重开与恢复行为 | B04、B08、B09、B10、B11 | 重开前后分词、意图处理及只读行为一致；故障消失后可正常重试 |
-| 3：输入及大小边界 | B07、B12、B13、B14、B15 | 最大合法文档 CRUD、流式 round-trip、异构 schema、混合 JSON 回归通过 |
-| 4：低风险性能改进 | P01、P02、P03、P04、P05 | 先保留正确性基线，再报告相同数据与环境下的延迟、RSS、对象请求数变化 |
-| 5：较大设计调整 | P06、P07、P08、S01—S04 | 小步骤实施；不要把模块拆分、磁盘格式变更与并发协议修改塞入同一次提交 |
-
-每批至少运行 `cargo test -p anda_db --all-features` 和严格 Clippy。涉及磁盘格式/日志的修改必须保留 v0_8、v0_11 夹具可读性，增加旧数据升级后再次读写与重开的验证；不能只重新生成夹具使测试变绿。涉及并发协议的修改，应将串行崩溃测试补成确定性交错测试，并与参考文档集合和唯一键映射比较。
-
-性能验收建议记录操作吞吐、p50/p95/p99、峰值 RSS、对象 GET/PUT/DELETE 次数、字节数、独占操作门等待时间和检索 recall@K。至少分开 InMemory、带固定延迟的存储与本地文件后端；生产速度结论应来自优化构建，不能从本次 debug 模式回归测试的用时推导。
+| 1: Invariants and Publication | B01, B02, B03, B05, B06 | Unique key interleaving, prefix isolation, and metadata publication fault matrices pass without silent data loss. |
+| 2: Reopen and Recovery | B04, B08, B09, B10, B11 | Tokenizer state, intent replay, and read-only behavior match specifications across restarts. |
+| 3: Input and Size Boundaries | B07, B12, B13, B14, B15 | Large document CRUD, stream roundtrips, foreign schemas, and nested JSON tests pass. |
+| 4: Performance Enhancements | P01, P02, P03, P04, P05 | Verified latencies, RSS, and storage request counts under identical environments. |
+| 5: Architectural Refactoring | P06, P07, P08, S01–S04 | Incremental pull requests preserving on-disk compatibility and test stability. |

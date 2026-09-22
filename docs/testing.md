@@ -1,5 +1,7 @@
 # Testing Standards
 
+[中文版](testing.zh.md)
+
 AndaDB promises durability and consistency, so its test suite must cover two
 dimensions ordinary software tests ignore: **the machine can lose power at any
 moment**, and **any operation sequence must behave like the spec**. The suite

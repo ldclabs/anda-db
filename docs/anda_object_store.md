@@ -1,5 +1,7 @@
 # anda_object_store
 
+[中文版](anda_object_store.zh.md)
+
 `MetaStore` adds logical metadata and conditional updates to an `ObjectStore`.
 `EncryptedStore` adds chunked AES-256-GCM encryption and uses the same commit
 protocol. Choose one wrapper; nesting both usually adds redundant metadata I/O.

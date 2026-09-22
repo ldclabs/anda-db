@@ -1,5 +1,7 @@
 # anda_db_tfs - Full-Text Search Engine for AndaDB
 
+[中文版](anda_db_tfs.zh.md)
+
 `anda_db_tfs` is the embedded full-text search component of [AndaDB](../README.md). It implements the classic **Okapi BM25** ranking algorithm and is designed for long-term textual memory in AI agents. It is written in pure Rust, thread-safe, and has very few dependencies. It can be used on its own or reused directly by the upper-layer database as the `anda_db::BM25` index.
 
 ---

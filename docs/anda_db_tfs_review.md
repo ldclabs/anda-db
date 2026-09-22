@@ -1,5 +1,7 @@
 # anda_db_tfs review follow-up (2026-09-06)
 
+[中文版](anda_db_tfs_review.zh.md)
+
 The correctness checklist F01–F10 is implemented. The existing CBOR metadata and bucket formats are retained. Baseline source: `63973ca276465f7d480a7fc2176d609f22a96fa7`.
 
 ## Completed correctness work

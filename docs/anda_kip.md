@@ -1,5 +1,7 @@
 # `anda_kip` — Technical Reference
 
+[中文版](anda_kip.zh.md)
+
 Tracks KIP at `dcde1de`, including the 2.1.0 memory vocabulary and the strict
 UTC millisecond timestamp contract (§6.5). See the
 [Cognitive Nexus documentation](anda_cognitive_nexus.md) for implemented contracts and capability boundaries.

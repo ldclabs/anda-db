@@ -1,5 +1,7 @@
 # anda_db_hnsw — HNSW vector index
 
+[中文版](anda_db_hnsw.zh.md)
+
 `anda_db_hnsw` is the embeddable vector index used by AndaDB. It stores vectors
 as bf16, computes distances in floating point, and supports incremental
 persistence through caller-supplied callbacks.

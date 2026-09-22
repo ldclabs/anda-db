@@ -1,5 +1,7 @@
 # `anda_cognitive_nexus` — Technical Reference
 
+[中文版](anda_cognitive_nexus.zh.md)
+
 For the 0.13.1 protected Watch/wake host APIs, atomicity guarantees, real-time
 lease bounds and remaining host responsibilities, see
 [Durable Watch handoff](../rs/anda_cognitive_nexus/README.md#durable-watch-handoff-0131).

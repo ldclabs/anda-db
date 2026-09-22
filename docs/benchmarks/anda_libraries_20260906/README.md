@@ -1,18 +1,20 @@
-# Anda libraries: local before/after measurements
+# Anda Libraries: Local Before/After Benchmark Measurements (2026-09-06)
 
-测量日期：2026-09-06。平台 arm64 macOS，rustc 1.97.1。旧实现来自本任务开始前保存的两个子库源码；新实现对应 `source_hashes.json` 记录的 `e21d9d2` 快照。该提交复审后的 multipart 正确性修复不在这组性能数字中。使用**不同的全新构建目录**，从 Cargo JSON 读取各自生成的可执行文件。两边共用同一份基准源码，依赖版本与工作区 Cargo.lock 一致。
+[中文版](README.zh.md)
 
-配置：CARGO_PROFILE_BENCH_OPT_LEVEL=3、CARGO_PROFILE_BENCH_LTO=false；每项先预热 2 次，再测 15 次。延迟包含同一计数分配器的开销；p95 使用 15 个样本的 nearest-rank。这里只是本地微基准，未隔离 CPU、未模拟真实云网络，不代表生产端到端加速。
+Measurement date: 2026-09-06. Platform: arm64 macOS, rustc 1.97.1. The legacy implementation is sourced from the pre-task snapshot; the new implementation reflects commit `e21d9d2` in `source_hashes.json` (post-review multipart correctness fixes are not part of these performance numbers). Built into **distinct, clean target directories**, reading binary paths directly from Cargo JSON output. Both runs share the identical benchmark harness and Cargo.lock dependency tree.
 
-allocations 是分配/重分配次数；allocated_bytes 是累计申请字节（含 realloc 的新请求大小），不是净存活内存；largest_allocation 是最大单次分配。进程峰值 RSS 用 Python resource.getrusage(RUSAGE_CHILDREN) 读取，单位为 macOS 返回的字节。每个二进制由独立测量进程运行。
+Configuration: `CARGO_PROFILE_BENCH_OPT_LEVEL=3`, `CARGO_PROFILE_BENCH_LTO=false`. Each case undergoes 2 warmups and 15 measured iterations. Reported latencies include allocation-tracking overhead; p95 uses nearest-rank across 15 samples. These local microbenchmarks do not isolate CPU cores or simulate production cloud network topologies and should not be interpreted as end-to-end production speedups.
 
-普通 MetaStore 在 InMemory 上可直接共享 Bytes，所以取消全量 payload 哈希会出现很大的相对加速；不能把这一倍数外推到网络或磁盘写入。首段解密现在最多聚合 64 KiB 的小加密块，旧实现每次输出一个小块；首段延迟对应的输出大小不同，主要用其最大分配量评估内存改善。
+`allocations` represents allocation/reallocation count; `allocated_bytes` represents cumulative requested bytes (including realloc size deltas), not net surviving heap; `largest_allocation` is the single largest allocation request. Peak process RSS was captured via Python `resource.getrusage(RUSAGE_CHILDREN)` in macOS bytes. Each binary was executed in an isolated child process.
 
-工作负载：UniqueVec 使用 100,000 个值，分别为全唯一、50% 重复和 99.9% 重复；元数据压力读取使用 4 MiB 对象、1 KiB 分块（4,096 个 tags），明显小于默认 256 KiB 分块。
+MetaStore on InMemory shares underlying `Bytes` directly, making the elimination of full-payload hashing appear disproportionately fast; this factor cannot be extrapolated to network or disk writes. Initial stream decryption now coalesces small cipher chunks up to 64 KiB (legacy emitted one chunk at a time); output sizes differ slightly, with maximum allocation serving as the primary metric for memory improvement.
 
-关键结果：加密热 head 和单字节范围读取不再反复认证全部 tags；16 MiB 加密 put 与不对齐 multipart 省掉全量 SHA3；交错范围读取减少重复下载/解密。GC 在有网络延迟时的收益应看请求计数：单 key 的 10 个垃圾 generation，元数据 GET 从 11 次减为 2 次；该请求数量已经由回归测试验证。
+Workload: `UniqueVec` evaluated 100,000 values across fully unique, 50% duplicate, and 99.9% duplicate distributions. Metadata stress read used 4 MiB objects with 1 KiB chunks (4,096 tags), substantially smaller than the 256 KiB default.
 
-取舍：新输入校验增加冷元数据读取成本；碰撞保护对小文件写入有成本；列表保持更强的结构检查。UniqueVec 流式构建显著降低重复输入的累计分配，但全唯一 String、部分 From<Vec> 场景会变慢，且整个 utils 基准进程的峰值 RSS 上升。保留了这些原始结果，没有把所有路径描述为加速。构建器的抽样预留每个容器最多按 1 MiB 元素量计算，优先避免受原始输入长度控制的大量预分配。
+Key findings: Authenticated hot `head` and single-byte range reads eliminate redundant GMAC tag re-authentication; 16 MiB encrypted `put` and unaligned multipart operations eliminate full SHA-3 passes; interleaved range reads reduce redundant downloads and decryptions. GC benefits under network latency should be evaluated by request count: for 10 orphaned generations of a single key, metadata GETs dropped from 11 to 2 (verified via regression tests).
+
+Tradeoffs: Strict input validation introduces cold metadata read overhead; collision guards add latency to small file writes; listing operations perform stricter structural checks. Streaming `UniqueVec` construction reduces cumulative allocations on duplicate inputs, but fully unique strings and select `From<Vec>` paths show regressions, increasing overall utils benchmark process RSS. All raw numbers are retained without selective filtering. Builder sampling caps pre-allocation reservations at 1 MiB element equivalents to avoid uncontrolled allocations based on raw input length.
 
 ## UniqueVec
 
@@ -31,9 +33,9 @@ allocations 是分配/重分配次数；allocated_bytes 是累计申请字节（
 | string/duplicate | 6432.792 | 3718.625 | 1.73× | 12,476,808 / 3,415,796 |
 | serde/duplicate | 8335.083 | 5819.125 | 1.43× | 16,368,168 / 3,415,796 |
 
-整个 utils 基准进程峰值 RSS：38,617,088 → 45,350,912 字节。该峰值覆盖整个基准矩阵，不能等同于单个对象或单次操作的内存。
+Peak process RSS across utils benchmark: 38,617,088 → 45,350,912 bytes. This covers the entire benchmark suite and does not reflect single-object memory footprint.
 
-## Object stores
+## Object Stores
 
 | Case | Before median µs | After median µs | Before/after | Before/after allocated bytes |
 | --- | ---: | ---: | ---: | ---: |
@@ -55,13 +57,13 @@ allocations 是分配/重分配次数；allocated_bytes 是累计申请字节（
 | gc/100_keys_1000_orphans | 1711.166 | 1676.125 | 1.02× | 1,289,654 / 1,318,375 |
 | list/warm/100_keys | 46.208 | 68.459 | 0.67× | 182,097 / 178,736 |
 
-整个 store 基准进程峰值 RSS：137,691,136 → 132,481,024 字节。该峰值覆盖整个基准矩阵，不能等同于单个对象或单次操作的内存。
+Peak process RSS across store benchmark: 137,691,136 → 132,481,024 bytes. This covers the entire benchmark suite and does not reflect single-object memory footprint.
 
-## Reproduce
+## Reproduction
 
 ```bash
 CARGO_PROFILE_BENCH_LTO=false CARGO_PROFILE_BENCH_OPT_LEVEL=3 cargo bench -p anda_db_utils --bench unique_vec
 CARGO_PROFILE_BENCH_LTO=false CARGO_PROFILE_BENCH_OPT_LEVEL=3 cargo bench -p anda_object_store --bench storage
 ```
 
-做前后对照时，必须为两个源码版本指定不同的 target-dir，并选择 Cargo 实际报告的可执行文件；不要复用旧文件名。CSV 包含全部 p95、分配计数及最大分配，resources 文件保存进程资源数据。
+Comparative runs must target separate `--target-dir` folders and execute the specific binary path emitted by Cargo JSON. Full p95 distributions, allocation counts, and largest allocations are captured in CSV files; process RSS is recorded in accompanying resources files.

@@ -1,82 +1,84 @@
-**HNSW 修复后的基准记录**
+# HNSW Post-Fix Benchmark Measurements
 
-2026-09-06。使用同一机器、Rust 1.97.1、opt-level=3；基线为修改前的 HNSW 源码快照。比较用例采用单层图、固定数据种子 42，避免旧版本没有可注入图层 RNG 的差异。1,000 节点比较取 3 次运行的中位数；其余用例为单次规模/功能测量。
+[中文版](anda_db_hnsw_benchmarks.zh.md)
 
-基准使用计数分配器，会对两边增加测量开销；机器未进行性能隔离。因此这些是可复现的工程测量，不能直接当作生产容量承诺。
+Dated 2026-09-06. Evaluated on the same machine, Rust 1.97.1, `opt-level=3`; baseline reflects the pre-modification HNSW source snapshot. Comparative scenarios used single-layer graphs with a fixed random seed (42) to eliminate variances from legacy builds lacking injectable layer RNG. The 1,000-node comparison reports the median of 3 runs; remaining cases represent single-run scale/functional measurements.
 
-[完整 CSV](../rs/anda_db_hnsw/benches/results/review-20260906.csv) · [环境与比较说明](../rs/anda_db_hnsw/benches/results/review-20260906.json) · [运行方法](../rs/anda_db_hnsw/benches/README.md)
+Benchmarks utilize an allocation-counting allocator, introducing measurement overhead to both baselines; the host machine was not isolated for exclusive execution. Consequently, these metrics represent reproducible engineering benchmarks rather than production capacity guarantees.
 
-**默认连接数下的比较**
+[Full CSV](../rs/anda_db_hnsw/benches/results/review-20260906.csv) · [Environment and Notes](../rs/anda_db_hnsw/benches/results/review-20260906.json) · [Reproduction Instructions](../rs/anda_db_hnsw/benches/README.md)
 
-N=1,000，D=128，M=32，efConstruction=200，efSearch=50，均匀合成数据；查询耗时为 100 次查询的总时间，召回由其中 20 个查询的独立 f64 oracle 计算。保存为内存后端、单路上传，无模拟 I/O 延迟。
+## Comparison Under Default Connectivity
 
-| 项目 | Euclidean 旧 → 新 | Cosine 旧 → 新 |
+N=1,000, D=128, M=32, efConstruction=200, efSearch=50, uniform synthetic data. Query duration reports total wall-clock time across 100 queries; recall is computed against an independent f64 brute-force oracle across 20 sample queries. Storage backend is in-memory with single-stream upload and zero injected I/O latency.
+
+| Metric | Euclidean: Old → New | Cosine: Old → New |
 | --- | --- | --- |
-| 构建 1,000 节点 | 454.247 → 512.234 ms | 667.705 → 580.309 ms |
-| 查询 100 次 | 12.549 → 11.044 ms | 16.306 → 11.728 ms |
-| 查询分配次数 | 1,761 → 100 | 1,800 → 100 |
+| Build 1,000 nodes | 454.247 → 512.234 ms | 667.705 → 580.309 ms |
+| Execute 100 queries | 12.549 → 11.044 ms | 16.306 → 11.728 ms |
+| Query allocation count | 1,761 → 100 | 1,800 → 100 |
 | recall@10 | 1.000 → 0.995 | 1.000 → 1.000 |
-| 保存 | 1.511 → 1.444 ms | 1.433 → 1.427 ms |
-| 保存阶段峰值请求堆字节 | 9,158,392 → 4,858,884 | 9,189,539 → 4,648,798 |
-| 加载 | 4.369 → 7.993 ms | 4.473 → 7.887 ms |
-| 删除 199 个节点 | 5.790 → 11.076 ms | 6.628 → 11.243 ms |
+| Save duration | 1.511 → 1.444 ms | 1.433 → 1.427 ms |
+| Peak requested heap bytes during save | 9,158,392 → 4,858,884 | 9,189,539 → 4,648,798 |
+| Load duration | 4.369 → 7.993 ms | 4.473 → 7.887 ms |
+| Delete 199 nodes | 5.790 → 11.076 ms | 6.628 → 11.243 ms |
 
-可以确认的收益：该 Cosine 用例召回相同，查询总耗时下降约 28%，查询分配下降约 94%，保存阶段峰值请求堆内存下降约 49%。
+Verified improvements: The Cosine workload achieved identical recall while total query latency decreased by ~28%, query allocations dropped by ~94%, and peak requested heap during save dropped by ~49%.
 
-同样需要保留的代价：Euclidean 构建约增加 13%；完整清理入边使此稠密图删除变重；加载新增代际、结构和反向引用处理，耗时增加。Euclidean 的同参数召回从 200/200 命中变为 199/200，不能把其时间变化表述为严格同召回的无损提升。
+Documented tradeoffs: Euclidean build latency increased by ~13%; comprehensive inbound edge cleanup adds overhead to deletions on dense graphs; loading incurs extra latency to handle generational tags, structural checks, and reverse reference tracking. Euclidean recall with identical parameters shifted from 200/200 hits to 199/200; this timing change cannot be framed as a strictly lossless performance increase at identical recall.
 
-公开 DistanceMetric::compute_mixed 增加完整输入检查，10,000 次 Euclidean 计算由 0.801 ms 变为 2.166 ms，Cosine 由 1.065 ms 变为 2.597 ms。索引热路径使用已验证向量和预备查询，避免重复执行公开边界检查。
+The public `DistanceMetric::compute_mixed` function added comprehensive input validation: 10,000 Euclidean calculations increased from 0.801 ms to 2.166 ms, and Cosine increased from 1.065 ms to 2.597 ms. Hot index search paths operate on pre-validated vectors and pre-processed queries to avoid redundant public boundary checks.
 
-**删除扫描的规模验证**
+## Scale Verification for Deletion Scans
 
-N=10,000，D=128，M=2，efConstruction=16，efSearch=16，单层图；删除 1,999 个非入口节点：
+N=10,000, D=128, M=2, efConstruction=16, efSearch=16, single-layer graph; deleting 1,999 non-entry nodes:
 
-| 项目 | 旧 | 新 |
+| Metric | Prior | New |
 | --- | --- | --- |
-| 删除 | 94.052 ms | 7.017 ms |
-| 保存 | 19.082 ms | 7.613 ms |
-| 加载 | 26.349 ms | 26.424 ms |
-| 保存阶段峰值请求堆字节 | 66,120,932 | 16,881,599 |
+| Delete duration | 94.052 ms | 7.017 ms |
+| Save duration | 19.082 ms | 7.613 ms |
+| Load duration | 26.349 ms | 26.424 ms |
+| Peak requested heap bytes during save | 66,120,932 | 16,881,599 |
 
-非入口删除不再进行全表扫描，在此稀疏配置上约快 13.4 倍。该配置召回很低（0.070 / 0.055），仅用于观察扫描和容量成本，不作为检索参数推荐。
+Deleting non-entry nodes no longer triggers a full graph scan, running ~13.4x faster under this sparse configuration. Note that recall is intentionally low here (0.070 / 0.055) as this configuration is designed solely to isolate scan and capacity overhead, not as a recommended retrieval configuration.
 
-**有延迟的节点上传**
+## Node Uploads Under Simulated Latency
 
-新实现，N=1,000、D=128，每个节点模拟 1 ms I/O 等待：
+New implementation, N=1,000, D=128, with 1 ms simulated I/O latency per node:
 
-| 上传并发 | 保存总耗时 |
+| Upload Concurrency | Total Save Duration |
 | --- | --- |
 | 1 | 2,273.961 ms |
 | 8 | 287.556 ms |
 
-此用例约快 7.9 倍；实际收益取决于后端并发能力、限流和延迟。测试另行验证所有节点完成后才提交 IDs/metadata，以及并发数和字节预算上限。
+This scenario runs ~7.9x faster; real-world benefits depend on backend concurrency limits, rate limiting, and network latency. Regression tests independently verify that IDs and metadata are committed only after all node uploads succeed, subject to configured concurrency and byte budget bounds.
 
-**100,000 节点运行**
+## 100,000-Node Scale Test
 
-新实现，N=100,000、D=128、M=32、efConstruction=200、efSearch=100、16 层上限、均匀合成数据。查询 50 次，精确召回仅采样 5 次：
+New implementation, N=100,000, D=128, M=32, efConstruction=200, efSearch=100, 16 max layers, uniform synthetic data. 50 queries executed, exact recall sampled across 5 queries:
 
-| 项目 | 结果 |
+| Metric | Result |
 | --- | --- |
-| 构建 | 516.208 s，约 194 节点/s |
-| 查询 P50 / P95 / P99 | 2.904 / 3.483 / 3.708 ms |
-| 初始 recall@10 | 0.740 |
-| 保存 | 188.240 ms，序列化 94,080,629 字节 |
-| 加载 | 1,106.599 ms |
-| 重开后 recall@10 | 0.740 |
-| 删除 19,999 节点 | 2,472.523 ms |
-| 删除后 recall@10 | 0.680 |
-| 重插已改变向量 | 144.496 s |
-| 重插后 recall@10 | 0.640 |
-| 加载阶段峰值请求堆字节 | 756,758,941 |
+| Graph build | 516.208 s (~194 nodes/s) |
+| Query latency P50 / P95 / P99 | 2.904 / 3.483 / 3.708 ms |
+| Initial recall@10 | 0.740 |
+| Save duration | 188.240 ms (94,080,629 serialized bytes) |
+| Load duration | 1,106.599 ms |
+| Post-reopen recall@10 | 0.740 |
+| Delete 19,999 nodes | 2,472.523 ms |
+| Post-delete recall@10 | 0.680 |
+| Re-insert modified vectors | 144.496 s |
+| Post-reinsert recall@10 | 0.640 |
+| Peak requested heap bytes during load | 756,758,941 |
 
-这次运行验证了规模、持久化及查询路径，**没有证明这组参数满足高召回业务要求**。高维均匀随机数据较难；默认不重连的删除模式也会影响召回。精确评估只有 5 个查询，不足以形成生产质量结论，应按业务向量分布扩大查询样本、调高 ef、评估重连或重建策略。
+This test validates scale, persistence, and search paths, **without claiming this parameter set satisfies high-recall production requirements**. High-dimensional uniform synthetic data is challenging; default deletion without edge reconnection also degrades graph connectivity and recall. A 5-query sample is insufficient for production quality conclusions; production deployments should sample domain-specific vector distributions, increase `efSearch`, and evaluate edge reconnection or periodic re-indexing.
 
-另外完成了 1,000×384 聚簇数据的 InnerProduct/Manhattan、重连删除模式运行；具体各阶段结果保留在 CSV。重复向量、两种选邻策略及删除模式也由回归测试覆盖。基准框架支持完整参数矩阵和实际 embedding CSV，但本轮没有穷举所有组合，也没有将合成向量当作真实业务语料。
+Additional runs covering 1,000x384 clustered vectors under InnerProduct/Manhattan and reconnect-on-delete modes are recorded in the CSV. Duplicate vectors, dual neighbor selection heuristics, and deletion modes are validated in regression tests.
 
-**计量口径**
+## Measurement Methodologies
 
-- peak_live_bytes / live_byte_delta 是计数分配器观察到的请求堆容量，包含该阶段仍存活的其他对象，不等于单个索引的最小驻留内存。
-- maxrss_raw 是每个独立子进程的 getrusage 原始峰值 RSS，保留平台标识，未与堆字节混用。
-- load 的计量同时存在原索引、序列化图和重开的索引，因此峰值高于只启动一个索引的场景。
-- 旧实现删除的反向引用不完整；修复后完成更多必要工作。删除时间变化必须结合工作语义看待。
-- 保留发布配置的 opt-level='z'，本次速度比较通过环境变量覆盖 bench profile，不改变全工作区发布策略。
+- `peak_live_bytes` and `live_byte_delta` reflect heap volume observed by the counting allocator, inclusive of other objects surviving in the process, and do not equal the minimal resident memory of a single index.
+- `maxrss_raw` records raw peak RSS via `getrusage` per child process, preserving OS-specific units without conflating process RSS with heap bytes.
+- Load measurements concurrently retain the source index, serialized graph bytes, and reopened index, resulting in higher peak memory than starting a single standalone index.
+- Legacy deletions left dangling inbound references; the repaired implementation performs full cleanup. Changes in deletion latency must be evaluated against the corrected semantics.
+- The release profile retains `opt-level='z'`; speed benchmarks override this via environment variables without altering the workspace-wide release profile.
