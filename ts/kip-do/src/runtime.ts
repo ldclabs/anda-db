@@ -148,6 +148,17 @@ export function validateErasurePlan(
 }
 
 export function validateDurable(tx: Transaction): void {
+  for (const [id, s] of tx.staged) {
+    if (
+      s.isNew &&
+      s.element.kind === 'Activity' &&
+      s.element.row.client_key.startsWith('watch_fire:') &&
+      !tx.authorizedWatchFires.has(id)
+    )
+      throw errors.notAuthorized(
+        'watch_fire client keys are reserved for protected Watch advancement',
+      )
+  }
   const roots = new Set(
     [...tx.staged]
       .filter(([, s]) => s.verb === 'purge' || s.verb === 'purge_payload')
@@ -263,6 +274,18 @@ export function validateDurable(tx: Transaction): void {
       if (!watch && (old || e.row.attributes.status === 'armed'))
         fail('armed Watch requires persisted WatchState')
       if (watch) {
+        if (
+          s.baseRow &&
+          !tx.authorizedWatchUpdates.has(id) &&
+          ['watch_class', 'due_at'].some(
+            (k) =>
+              canonicalJson(obj(s.baseRow?.attributes)[k] ?? null) !==
+              canonicalJson(e.row.attributes[k] ?? null),
+          )
+        )
+          throw errors.notAuthorized(
+            'changing an armed Watch deadline/class requires a protected new generation',
+          )
         if (watch.condition_digest !== digest(e.row.attributes.condition!))
           fail('Watch condition digest mismatch')
         if (
@@ -282,6 +305,7 @@ export function changePage(
   after: number,
   limit: number,
   space: string,
+  target = session.nexus.store.currentSeq(space),
 ): JsonMap {
   const store = session.nexus.store,
     authority = session.effectiveAuthority(space),
@@ -292,7 +316,9 @@ export function changePage(
   if (
     !Number.isSafeInteger(after) ||
     after < 0 ||
-    after > head ||
+    after > target ||
+    !Number.isSafeInteger(target) ||
+    target > head ||
     !Number.isInteger(limit) ||
     limit < 1 ||
     limit > 10000
@@ -307,14 +333,19 @@ export function changePage(
   )
   const rows = store.all<TransactionRow>(
     'transactions',
-    'SELECT * FROM transactions WHERE space = ? AND seq > ? ORDER BY seq LIMIT ?',
+    "SELECT * FROM transactions WHERE space = ? AND seq > ? AND seq <= ? AND status = 'committed' ORDER BY seq LIMIT ?",
     space,
     after,
+    target,
     limit + 1,
   )
-  const complete = rows.length <= limit
+  const floor = Number(
+    obj(store.controlAt(space, 'internal/governance')?.value).coverage_floor ??
+      0,
+  )
+  const complete = rows.length <= limit && after >= floor
   rows.length = Math.min(rows.length, limit)
-  const through = complete ? head : (rows.at(-1)?.seq ?? after)
+  const through = complete ? target : (rows.at(-1)?.seq ?? after)
   const coverage = {
     through_seq: through,
     complete,
@@ -371,15 +402,32 @@ export function changePage(
     coverage,
     through_time: nowTime(),
     next_cursor: String(through),
+    resync_required: after < floor,
   }
 }
 
-function structuredCondition(condition: Json): boolean {
+export function structuredCondition(condition: Json): boolean {
   return ['element', 'slot', 'type'].some((k) => k in obj(condition))
 }
 
-function bindWatchCondition(cx: Context, condition: Json): Json {
-  if (!structuredCondition(condition)) return condition
+export function bindWatchCondition(cx: Context, condition: Json): Json {
+  if (new TextEncoder().encode(JSON.stringify(condition)).length > 65536)
+    throw errors.resourceExhausted('Watch condition exceeds 64 KiB')
+  if (typeof condition === 'string') {
+    if (!condition.trim())
+      throw errors.typeMismatch('Watch text cannot be empty')
+    return condition
+  }
+  if (
+    !isJsonMap(condition) ||
+    (!structuredCondition(condition) && condition.text === undefined)
+  )
+    throw errors.typeMismatch('Watch condition requires selectors or text')
+  if (
+    condition.text !== undefined &&
+    (typeof condition.text !== 'string' || !condition.text.trim())
+  )
+    throw errors.typeMismatch('Watch text must be a nonempty string')
   const c = structuredClone(obj(condition))
   for (const key of Object.keys(c))
     if (!['element', 'slot', 'type', 'ops', 'touched', 'text'].includes(key))
@@ -516,164 +564,6 @@ export function leaseTask(
   })
 }
 
-export function armWatch(
-  session: Session,
-  space: string,
-  ref: string,
-  expected: number,
-): JsonMap {
-  return session.nexus.transact(() => {
-    const tx = transaction(session, space, ref, expected),
-      e = tx.load(parseElementId(ref))
-    if (e.kind !== 'Concept' || e.row.schema_ref !== PROFILE + 'Watch')
-      fail('watch must be Watch Concept')
-    const row = (e as Extract<Element, { kind: 'Concept' }>).row,
-      cx = new Context(tx.store, tx.env, space, tx.authority, tx.auth)
-    row.attributes.condition = bindWatchCondition(cx, row.attributes.condition!)
-    const watch = {
-      arm_generation: Number(facet(e, 'WatchState')?.arm_generation ?? 0) + 1,
-      armed_seq: tx.snapshotSeq,
-      condition_digest: digest(row.attributes.condition!),
-      authorization_view: projectionBasis(cx, cx.projectionPolicy, cx.validAt)
-        .authorization_view!,
-      consumed_seq: tx.snapshotSeq,
-      matched: false,
-    }
-    row.attributes.status = 'armed'
-    row.facets[PROFILE + 'WatchState'] = watch
-    tx.authorizedWatchUpdates.add(ref)
-    tx.markChanged(parseElementId(ref), 'update')
-    return { watch, receipt: tx.commit('') as unknown as Json }
-  })
-}
-
-export function advanceWatch(
-  session: Session,
-  space: string,
-  ref: string,
-  expected: number,
-  generation: number,
-  limit: number,
-  evaluate?: (condition: Json, change: Json) => boolean,
-): JsonMap {
-  return session.nexus.transact(() => {
-    const tx = transaction(session, space, ref, expected),
-      e = tx.load(parseElementId(ref))
-    if (e.kind !== 'Concept') fail('watch must be Concept')
-    const row = (e as Extract<Element, { kind: 'Concept' }>).row,
-      watch = structuredClone(facet(e, 'WatchState'))
-    if (
-      !watch ||
-      watch.arm_generation !== generation ||
-      row.attributes.status !== 'armed'
-    )
-      throw errors.versionConflict('Watch generation no longer armed')
-    const page = changePage(session, Number(watch.consumed_seq), limit, space),
-      coverage = obj(page.coverage)
-    if (watch.authorization_view !== coverage.authorization_view)
-      throw errors.versionConflict(
-        'authorization changed; re-arm Watch with new coverage basis',
-      )
-    const condition = row.attributes.condition!,
-      c = obj(condition),
-      silence = row.attributes.watch_class === 'silence',
-      due =
-        typeof row.attributes.due_at === 'string'
-          ? normalizeTime(row.attributes.due_at, 'Watch deadline')
-          : null
-    if (!structuredCondition(condition) && !evaluate)
-      throw errors.unsupportedCapability(
-        'text-only Watch requires explicit Brain evaluator',
-      )
-    let matched = watch.matched === true
-    for (const envelope of page.changes as JsonMap[]) {
-      if (silence && due && String(envelope.committed_at) > due) continue
-      if (
-        ((envelope.control_changes as JsonMap[]) ?? []).some((c) =>
-          ['schema', 'identity', 'policy', 'trust'].includes(String(c.kind)),
-        )
-      )
-        throw errors.versionConflict(
-          'Watch control basis changed; re-arm after resynchronization',
-        )
-      if (!structuredCondition(condition)) {
-        matched ||= evaluate!(condition, envelope)
-        continue
-      }
-      for (const change of envelope.changes as JsonMap[]) {
-        let yes = true
-        if (
-          !isJsonMap(condition) ||
-          !['element', 'slot', 'type'].some((k) => k in c)
-        ) {
-          if (!evaluate)
-            throw errors.unsupportedCapability(
-              'text-only Watch needs explicit Brain evaluator',
-            )
-          yes = evaluate(condition, change)
-        } else {
-          if (c.element !== undefined) yes &&= c.element === change.id
-          if (Array.isArray(c.ops)) yes &&= c.ops.includes(change.op!)
-          if (Array.isArray(c.touched))
-            yes &&=
-              Array.isArray(change.touched) &&
-              change.touched.some((p) => (c.touched as Json[]).includes(p))
-          if (c.type !== undefined || c.slot !== undefined) {
-            const retained = tx.store.elementAt(
-              space,
-              parseElementId(String(change.id)),
-              Number(envelope.space_seq),
-            )
-            if (!retained)
-              throw errors.versionConflict(
-                'Watch history erased; resynchronize coverage',
-              )
-            let value = render(retained)
-            if (c.type !== undefined) yes &&= value.schema_ref === c.type
-            if (c.slot !== undefined) {
-              if (retained.kind === 'Assertion') {
-                const p = tx.store.elementAt(
-                  space,
-                  parseElementId(retained.row.proposition_id),
-                  Number(envelope.space_seq),
-                )
-                if (!p)
-                  throw errors.versionConflict('Watch slot history unavailable')
-                value = render(p)
-              }
-              yes &&=
-                (typeof value.subject === 'string'
-                  ? value.subject
-                  : obj(value.subject).id) === obj(c.slot).subject &&
-                value.predicate_ref === obj(c.slot).predicate
-            }
-          }
-        }
-        matched ||= yes
-      }
-    }
-    watch.matched = matched
-    watch.consumed_seq = coverage.through_seq!
-    const deadline = !!due && due <= nowTime() && coverage.complete === true
-    const status =
-      (!silence && matched) || (silence && deadline && !matched)
-        ? 'fired'
-        : deadline
-          ? 'expired'
-          : 'armed'
-    row.attributes.status = status
-    row.facets[PROFILE + 'WatchState'] = watch
-    tx.authorizedWatchUpdates.add(ref)
-    tx.markChanged(parseElementId(ref), 'update')
-    return {
-      watch,
-      status,
-      coverage,
-      receipt: tx.commit('') as unknown as Json,
-    }
-  })
-}
-
 function checkDispatch(
   session: Session,
   space: string,
@@ -698,7 +588,17 @@ function checkDispatch(
   requirePermitted(
     authority.authorize('update', resourceOfElement(task), session.auth),
   )
-  const activity = store.load(parseElementId(request.attempt_ref)),
+  return checkAttentionAttempt(session, space, request.attempt_ref)
+}
+
+export function checkAttentionAttempt(
+  session: Session,
+  space: string,
+  attemptRef: string,
+): JsonMap {
+  const store = session.nexus.store,
+    authority = session.effectiveAuthority(space)
+  const activity = store.load(parseElementId(attemptRef)),
     attempt = activity && facet(activity, 'AttemptRecord')
   if (
     !activity ||

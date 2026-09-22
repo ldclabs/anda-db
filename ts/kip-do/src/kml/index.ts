@@ -93,19 +93,7 @@ export function executeKml(
   const request =
     ingested === null ? cx.request : { ...(cx.request ?? {}), ...ingested }
 
-  for (const clause of statement.clauses) {
-    declareHandles(tx, clause)
-  }
-  for (const clause of statement.clauses) declareConceptType(tx,clause,request,cx.operation)
-  // Clause order carries no mutation semantics (§24), so this is a planning
-  // order rather than an execution order. See `clauses.planPass`.
-  for (let pass = 0; pass < PLAN_PASSES; pass++) {
-    if (pass === 3) tx.freezeHandleViews()
-    for (const clause of statement.clauses) {
-      if (planPass(clause) !== pass) continue
-      apply(tx, clause, request, cx.operation)
-    }
-  }
+  planKml(tx, statement, request, cx.operation)
 
   return tx.commit(cx.idempotencyKey ?? '', cx.requestDigest ?? '')
 }
@@ -168,3 +156,26 @@ export {
   type VersionGuard,
   type WriteContext,
 } from '../tx.js'
+
+/** Plan bounded host output inside an existing transaction. */
+export function planKml(
+  tx: Transaction,
+  statement: KmlStatement,
+  request?: JsonMap,
+  operation?: JsonMap,
+): void {
+  for (const clause of statement.clauses) {
+    declareHandles(tx, clause)
+  }
+  for (const clause of statement.clauses)
+    declareConceptType(tx, clause, request, operation)
+  // Clause order carries no mutation semantics (§24), so this is a planning
+  // order rather than an execution order. See `clauses.planPass`.
+  for (let pass = 0; pass < PLAN_PASSES; pass++) {
+    if (pass === 3) tx.freezeHandleViews()
+    for (const clause of statement.clauses) {
+      if (planPass(clause) !== pass) continue
+      apply(tx, clause, request, operation)
+    }
+  }
+}

@@ -344,3 +344,85 @@ identity repair, immutable replay material, validated learning records, fenced
 tasks, persistent Watches and dispatch recovery. See the [integration guide](../../docs/anda-brain-nexus-contracts.zh.md)
 for Rust/TypeScript signatures and record ordering. Deterministic host evaluators
 are registered by exact rule-artifact digest; uploaded data never executes code.
+
+### Durable Watch handoff
+
+`armWatch` pins the condition, generation, deadline, observation basis and host
+configuration. `rearmWatch(ref, expected, condition, dueAt, space?)` replaces a
+condition/deadline in a new generation. A firing atomically commits the Watch,
+one `watch_fire` Activity, one protected wake and its replayable result. Silence
+Watches use a fixed inclusive deadline sequence, so later traffic cannot keep
+extending the observation interval. Ordinary KML cannot forge fire identities.
+
+Configure `setAttentionConfig(expected, config, space?)` before arming when the
+host supplies an evaluator or dispatch binding. Scope identity is immutable;
+changing pins invalidates previously observed work until it is rearmed.
+Structured selectors use AND. Text and mixed conditions need a pinned evaluator;
+the optional synchronous `advanceWatch` evaluator must return a boolean and
+must not write to the Nexus. For asynchronous evaluation, use:
+
+```ts
+const prepared = session.prepareWatchPage(watchRef, version, generation, 100, 'page-1')
+const page = session.readPreparedWatchPage(String(prepared.ticket_ref))
+// The host evaluates each authorized before/after candidate outside a transaction.
+const judgments = await evaluateCandidates(page.candidates)
+const result = session.commitWatchPage(page.ticket_ref, {
+  evaluation_key: 'evaluation-1',
+  evaluator: page.evaluator,
+  judgments,
+})
+```
+
+Every candidate needs a unique judgment and bounded rationale. `unknown` retains
+an evaluation receipt without advancing coverage. Tickets retain their source
+snapshot, deadline, basis and evaluator. Material lives in governed artifacts,
+so source erasure also revokes prepared pages and evaluation rationale.
+
+`readWake` and `listWakes(cursor?, scanLimit?, space?)` require `maintain` and
+full visibility of the originating Watch and fire Activity. Pagination is a
+bounded snapshot scan; follow `next_cursor` even when an intermediate page is
+empty. `readControl` enforces these same protections.
+
+`claimWake`, `renewWake`, `blockWake`, `resumeWake`, `cancelWake` and `finishWake`
+require the expected wake version and fence. Claims/takeovers increase the
+fence; leases expire within five real-time minutes. `finishWake` commits one
+bounded KML block, up to 16 continuations and the terminal receipt together.
+Replay returns the retained result; changing a request under the same operation
+identity is rejected. Unresolved dispatches prevent completion. Cancellation
+retains their reconciliation obligations.
+
+Timed retries carry `not_before_ms`. For `on_change`, register executable host
+code with `nexus.registerWakeResumeVerifier(condition, pin, verifier)` after each
+restart. `resumeWake` returns a Promise, awaits the verifier outside the SQLite
+transaction, then rechecks current versions, authority and observation basis.
+
+`beginWakeDispatch(ref, expected, fence, attemptRef, supportsIdempotency,
+supportsOutcomeLookup, space?)` rechecks the native AttemptRecord, DecisionRecord,
+revision authority, dependency pins and registered binding before persisting
+intent. A repeated non-idempotent send becomes `lookup` or `outcome_unknown`.
+Outcome lookup requires a pre-registered `setDispatchLookupObserver` whose
+principal authenticates directly. `reconcileWakeLookup` can make a proven
+`not_started` dispatch ready again; `finished` is not a successful Outcome.
+`reconcileWakeDispatch` closes the intent using a committed terminal Outcome,
+including after cancellation. The host owns scheduling and external delivery.
+
+### Contextual trust
+
+`setContextualTrust(expected, configuration, space?)` replaces global weights and
+explicit actor/predicate/context rules. More specific matches win; conflicting
+rules of equal specificity fail. `setTrust` preserves existing contextual rules.
+Both current and historical BELIEF projections use the applicable trust version
+without changing stored assertion confidence.
+
+`applyTrustCalibration(expected, proposalPin, operationKey, space?)` requires
+`manage_trust`, a pinned method, eligible Evidence inherited in the proposal's
+material sources, and explicit uncertainty. It atomically commits the exact
+configuration, provenance, Governance audit and replay receipt. Calibration
+algorithms and automatic application policy remain host responsibilities.
+
+Retries of committed calibration and wake reconciliation calls recheck current
+authority and material visibility without requiring or consuming another
+approval. New operations still require approval when the active policy says so.
+
+The [Nexus parity audit](../../docs/kip-do-nexus-parity.md) records the commit scope
+and regression coverage for these host APIs.

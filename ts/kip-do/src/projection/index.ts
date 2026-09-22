@@ -1,3 +1,5 @@
+import { parseElementId } from '../id.js'
+import { trustWeight } from '../trust.js'
 import { errors } from '../errors.js'
 import { dependencyValidity } from './dependency.js'
 import { sha256Text } from '../digest.js'
@@ -317,6 +319,28 @@ function admit(
     return null
   }
 
+  const actor =
+    typeof row.asserted_by === 'string'
+      ? row.asserted_by
+      : (((row.asserted_by as JsonMap)?.id as string) ?? '')
+  let trust = policy.trust_weights[actor] ?? policy.default_trust_weight
+  if (policy.contextual_trust_rules?.length) {
+    const proposition = cx.load(parseElementId(row.proposition_id))
+    if (!proposition || proposition.kind !== 'Proposition') {
+      ledger.excluded.push({
+        assertion_id: id,
+        reason: 'proposition_unavailable',
+      })
+      return null
+    }
+    trust = trustWeight(
+      policy.contextual_trust_rules,
+      trust,
+      actor,
+      proposition.row.predicate_ref,
+      policy.context_refs,
+    )
+  }
   const side = opposesTarget ? ledger.opposing : row.stance === 'reject' ? ledger.opposing : ledger.supporting
   side.push(id)
 
@@ -331,7 +355,9 @@ function admit(
     actorRef: (row.asserted_by ?? null) as Json,
     evidence: row.evidence_refs.map((ref) => ref.id),
     stance: row.stance,
-    confidence: (row.confidence < 0 ? policy.unstated_confidence : row.confidence) * (policy.trust_weights[(row.asserted_by as JsonMap)?.id as string] ?? policy.default_trust_weight),
+    confidence:
+      (row.confidence < 0 ? policy.unstated_confidence : row.confidence) *
+      trust,
     opposesTarget,
   }
 }

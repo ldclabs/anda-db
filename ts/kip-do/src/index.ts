@@ -303,3 +303,34 @@ export * from "./cognitive.js"
 export type { ControlRecord } from "./control.js"
 
 export { digest as contentDigest } from "./schema/contracts.js"
+
+export type {
+  RuntimeScope,
+  RuntimePin,
+  RuntimePins,
+  AttentionConfig,
+  WatchTrigger,
+  WatchFire,
+  WakeLease,
+  WakeResume,
+  WakeRetry,
+  WakeState,
+  WakeRecord,
+  WakeContinuation,
+  WakePage,
+  WakeResumeInput,
+  WakeResumeVerifier,
+  WatchCandidate,
+  PreparedWatchPage,
+  WatchMatch,
+  WatchJudgment,
+  WatchEvaluation,
+  DispatchLookupObserver,
+  DispatchLookupStatus,
+  DispatchLookup,
+} from './attention/types.js'
+export type {
+  ContextualTrustRule,
+  TrustConfiguration,
+  TrustCalibrationProposal,
+} from './trust.js'

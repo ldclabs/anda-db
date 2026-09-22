@@ -2,6 +2,20 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [@ldclabs/kip-do 0.13.2] — 2026-09-22
+
+- Bring kip-do host APIs into parity with Nexus changes from `de2433b` through
+  `d9cdeb3`: atomic Watch fire/wake handoff, bounded fenced leases, continuations,
+  snapshot discovery, revocable semantic evaluation pages, authenticated dispatch
+  lookup and terminal reconciliation, contextual trust and audited calibration.
+- Enforce full source visibility on protected attention reads, fixed silence
+  deadlines, reserved fire identities and dispatch binding/observer prerequisites.
+  Add SQLite rollback, restart, replay, authorization and cross-engine behavior
+  regressions; retain host ownership of scheduling and external effects.
+- Replay committed trust calibration and wake reconciliation results without
+  requiring or consuming another approval. Recheck current authority and material
+  visibility on retries; new writes still require their own approval.
+
 ## [anda_cognitive_nexus 0.13.4] — 2026-09-21
 
 - Map legacy Commitment `completed` to native `fulfilled`. On migrated stores,

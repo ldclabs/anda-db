@@ -138,6 +138,9 @@ export class Store extends RowStore {
     applySchema(sql)
     this.governance = new GovernanceStore(sql)
     this.governance.onMutation = (entry) => {
+      // Native trust calibration already journals its control and audit in one
+      // transaction. It changes trust, not the authorization configuration.
+      if (entry.operation === 'apply_trust_calibration') return
       for (const space of this.spaces()) {
         if (
           entry.space_id &&

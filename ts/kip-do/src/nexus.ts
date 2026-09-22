@@ -1,3 +1,23 @@
+import * as attentionWatch from './attention/watch.js'
+import * as attentionWork from './attention/work.js'
+import * as attentionEvaluation from './attention/evaluation.js'
+import * as attentionDispatch from './attention/dispatch.js'
+import * as attentionCatalog from './attention/catalog.js'
+import * as contextualTrust from './trust.js'
+import type {
+  AttentionConfig,
+  RuntimePin,
+  WakeRecord,
+  WakeRetry,
+  WakeContinuation,
+  WakePage,
+  WakeResumeVerifier,
+  PreparedWatchPage,
+  WatchEvaluation,
+  DispatchLookup,
+  DispatchLookupObserver,
+} from './attention/types.js'
+import type { TrustConfiguration } from './trust.js'
 import * as runtime from './runtime.js'
 import { Transaction } from './tx.js'
 import { artifactValue } from './control.js'
@@ -150,6 +170,14 @@ export interface NexusOptions {
 }
 
 export class CognitiveNexus {
+  registerWakeResumeVerifier(
+    condition: Json,
+    pin: RuntimePin,
+    verifier: WakeResumeVerifier,
+  ): string {
+    return attentionWork.registerResumeVerifier(this, condition, pin, verifier)
+  }
+
   /** Restore trusted bindings on startup. A digest cannot be rebound live. */
   registerEvaluationRule(artifact: Json, evaluator: EvaluationRule): string {
     return this.store.evaluationRules.register(artifact, evaluator)
@@ -1246,7 +1274,7 @@ export class Session {
     return runtime.leaseTask(this, space, ref, expected, expiresAt)
   }
   armWatch(ref: string, expected: number, space = this.nexus.space): JsonMap {
-    return runtime.armWatch(this, space, ref, expected)
+    return attentionWatch.armWatch(this, space, ref, expected)
   }
   advanceWatch(
     ref: string,
@@ -1256,7 +1284,7 @@ export class Session {
     space = this.nexus.space,
     evaluate?: (condition: Json, change: Json) => boolean,
   ): JsonMap {
-    return runtime.advanceWatch(
+    return attentionWatch.advanceWatch(
       this,
       space,
       ref,
@@ -1265,6 +1293,264 @@ export class Session {
       limit,
       evaluate,
     )
+  }
+
+  rearmWatch(
+    ref: string,
+    expected: number,
+    condition: Json,
+    dueAt: string | null,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWatch.armWatch(this, space, ref, expected, [
+      condition,
+      dueAt,
+    ])
+  }
+  setAttentionConfig(
+    expected: number,
+    config: AttentionConfig,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionGoverned(space, 'manage_policy', () =>
+      attentionCatalog.setAttentionConfig(this, space, expected, config),
+    )
+  }
+  readWake(ref: string, space = this.nexus.space): WakeRecord {
+    return attentionWork.loadWake(this, space, ref)
+  }
+  listWakes(
+    cursor: string | null = null,
+    scanLimit = 100,
+    space = this.nexus.space,
+  ): WakePage {
+    return attentionCatalog.listWakes(this, space, cursor, scanLimit)
+  }
+  claimWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    expiresAt: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWork.updateWake(this, space, ref, expected, fence, {
+      kind: 'claim',
+      expiresAt,
+    })
+  }
+  renewWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    expiresAt: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWork.updateWake(this, space, ref, expected, fence, {
+      kind: 'renew',
+      expiresAt,
+    })
+  }
+  blockWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    retry: WakeRetry,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWork.updateWake(this, space, ref, expected, fence, {
+      kind: 'block',
+      retry,
+    })
+  }
+  resumeWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    space = this.nexus.space,
+  ): Promise<JsonMap> {
+    return attentionWork.resumeWake(this, space, ref, expected, fence)
+  }
+  cancelWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    reason: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWork.updateWake(this, space, ref, expected, fence, {
+      kind: 'cancel',
+      reason,
+    })
+  }
+  finishWake(
+    ref: string,
+    expected: number,
+    fence: number,
+    command = '',
+    parameters: JsonMap = {},
+    continuations: WakeContinuation[] = [],
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionWork.updateWake(this, space, ref, expected, fence, {
+      kind: 'finish',
+      command,
+      parameters,
+      continuations,
+    })
+  }
+  prepareWatchPage(
+    ref: string,
+    expected: number,
+    generation: number,
+    limit: number,
+    preparationKey: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionEvaluation.prepareWatchPage(
+      this,
+      space,
+      ref,
+      expected,
+      generation,
+      limit,
+      preparationKey,
+    )
+  }
+  readPreparedWatchPage(
+    ref: string,
+    space = this.nexus.space,
+  ): PreparedWatchPage {
+    return attentionEvaluation.readPreparedWatchPage(this, space, ref)
+  }
+  commitWatchPage(
+    ref: string,
+    evaluation: WatchEvaluation,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionEvaluation.commitWatchPage(this, space, ref, evaluation)
+  }
+  beginWakeDispatch(
+    ref: string,
+    expected: number,
+    fence: number,
+    attemptRef: string,
+    supportsIdempotency: boolean,
+    supportsOutcomeLookup: boolean,
+    space = this.nexus.space,
+  ): JsonMap {
+    return attentionDispatch.beginWakeDispatch(
+      this,
+      space,
+      ref,
+      expected,
+      fence,
+      attemptRef,
+      supportsIdempotency,
+      supportsOutcomeLookup,
+    )
+  }
+  reconcileWakeDispatch(
+    ref: string,
+    expected: number,
+    outcomeRef: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionReplayable(space, 'record_outcome', (authorizeWrite) =>
+      attentionDispatch.reconcileWakeDispatch(
+        this,
+        space,
+        ref,
+        expected,
+        outcomeRef,
+        authorizeWrite,
+      ),
+    )
+  }
+  setDispatchLookupObserver(
+    expected: number,
+    observer: DispatchLookupObserver,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionGoverned(space, 'manage_policy', () =>
+      attentionDispatch.setLookupObserver(this, space, expected, observer),
+    )
+  }
+  reconcileWakeLookup(
+    ref: string,
+    expected: number,
+    observation: DispatchLookup,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionReplayable(space, 'record_outcome', (authorizeWrite) =>
+      attentionDispatch.reconcileWakeLookup(
+        this,
+        space,
+        ref,
+        expected,
+        observation,
+        authorizeWrite,
+      ),
+    )
+  }
+  setContextualTrust(
+    expected: number,
+    config: TrustConfiguration,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionGoverned(space, 'manage_trust', () =>
+      contextualTrust.setContextualTrust(this, space, expected, config),
+    )
+  }
+  applyTrustCalibration(
+    expected: number,
+    proposal: ArtifactPin,
+    operationKey: string,
+    space = this.nexus.space,
+  ): JsonMap {
+    return this.attentionReplayable(space, 'manage_trust', (authorizeWrite) =>
+      contextualTrust.applyTrustCalibration(
+        this,
+        space,
+        expected,
+        proposal,
+        operationKey,
+        authorizeWrite,
+      ),
+    )
+  }
+  private attentionGoverned<T>(
+    space: string,
+    permission: Permission,
+    body: () => T,
+  ): T {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), [permission])
+      const result = body()
+      this.consume(approvals)
+      return result
+    })
+  }
+
+  /** Replay checks current authority; only a new write spends an approval. */
+  private attentionReplayable<T>(
+    space: string,
+    permission: Permission,
+    body: (authorizeWrite: () => void) => T,
+  ): T {
+    return this.nexus.transact(() => {
+      const authority = this.effectiveAuthority(space)
+      requirePermittedForReplay(
+        authority.authorize(permission, spaceResource(), this.auth),
+      )
+      let approvals: Approved[] = []
+      // Each operation validates its retained result and material visibility
+      // before replaying, and calls this gate before its first new write.
+      const result = body(() => {
+        approvals = this.gate(authority, [permission])
+      })
+      this.consume(approvals)
+      return result
+    })
   }
 
   putArtifact(
@@ -1568,7 +1854,18 @@ export class Session {
         'trust',
         'trust',
         expected,
-        { weights, default_weight: defaultWeight },
+        {
+          weights,
+          default_weight: defaultWeight,
+          ...((this.nexus.store.controlAt(space, 'trust')?.value as JsonMap)
+            ?.rules
+            ? {
+                rules: (
+                  this.nexus.store.controlAt(space, 'trust')!.value as JsonMap
+                ).rules!,
+              }
+            : {}),
+        },
         { principal_id: this.auth.principal_id },
       )
       this.consume(approvals)
@@ -1592,7 +1889,9 @@ export class Session {
         this.auth,
       ),
     )
-    return this.nexus.store.controlAt(space, key, seq)
+    const row = this.nexus.store.controlAt(space, key, seq)
+    if (row) attentionCatalog.authorizeControlRead(this, space, row)
+    return row
   }
 
   /** Creates or replaces a Principal group (§29, `manage_membership`). */

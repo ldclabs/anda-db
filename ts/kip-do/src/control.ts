@@ -125,6 +125,7 @@ export function projectionPolicyAt(
     risk: requested.risk,
     trust_weights: (trust.value as JsonMap).weights,
     default_trust_weight: (trust.value as JsonMap).default_weight,
+    contextual_trust_rules: (trust.value as JsonMap).rules ?? [],
     trust_version: digest(trust.value),
   })
   return policy

@@ -1,3 +1,4 @@
+import { validateCommitLeases } from './attention/common.js'
 import { validateDurable } from './runtime.js'
 import type { ControlRecord } from './control.js'
 import { validateLearning } from './learning.js'
@@ -256,6 +257,13 @@ export class Transaction {
   private readonly handleViews = new Map<string, Element>()
   readonly staged = new Map<string, Staged>()
   readonly controlEffects: Omit<ControlRecord, 'id'>[] = []
+  runtimeResult: JsonMap | null = null
+  readonly attentionLeases: {
+    reference: string
+    version: number
+    fence: number
+  }[] = []
+  readonly authorizedWatchFires = new Set<string>()
   identityChanged = false
   readonly authorizedWatchUpdates = new Set<string>()
   readonly guarded = new Map<string, Set<string>>()
@@ -525,7 +533,8 @@ export class Transaction {
     for (const id of this.handleMap.values()) {
       const key = formatElementId(id)
       const staged = this.staged.get(key)
-      if (staged !== undefined) this.handleViews.set(key, structuredClone(staged.element))
+      if (staged !== undefined)
+        this.handleViews.set(key, structuredClone(staged.element))
     }
   }
 
@@ -781,7 +790,7 @@ export class Transaction {
       return this.outcome('no_effect', null, null, previewed)
     }
 
-    if (pending.length === 0) {
+    if (pending.length === 0 && this.controlEffects.length === 0) {
       // No sequence is taken, because nothing happened: a Space clock that
       // ticks for a no-op makes every `CHANGES SINCE` cursor report a change
       // that is not there.
@@ -793,6 +802,7 @@ export class Transaction {
 
     this.propagateGovernance(pending)
 
+    validateCommitLeases(this)
     const seq = this.store.nextSeq(this.cx.space)
     if (this.identityChanged || pending.some(([, s]) => s.verb === 'merge')) {
       const space = this.store.space(this.cx.space)!
@@ -1174,17 +1184,36 @@ export class Transaction {
       snapshot_seq: this.snapshotSeq,
       committed_at: committedAt ?? this.cx.at,
       status: seq === null ? 'no_effect' : 'committed',
-      transaction_class: 'cognitive',
+      transaction_class: changes.length
+        ? 'cognitive'
+        : this.controlEffects.some((c) =>
+              [
+                'schema',
+                'identity',
+                'policy',
+                'trust',
+                'authorization',
+              ].includes(c.kind),
+            )
+          ? 'governance'
+          : this.controlEffects.length
+            ? 'service'
+            : 'cognitive',
       idempotency_key: idempotencyKey,
       request_digest: requestDigest,
       semantic_plan_digest: '',
       result_digest: '',
       schema_environment_version: this.env.version,
       result: {
+        ...(this.runtimeResult ? { runtime: this.runtimeResult } : {}),
         handles: this.handles(),
         actor_binding_id: this.actorBinding,
         control_changes: this.controlEffects
-          .filter((c) => c.kind !== 'erasure')
+          .filter((c) =>
+            ['schema', 'identity', 'policy', 'trust', 'authorization'].includes(
+              c.kind,
+            ),
+          )
           .map((c) => ({ kind: c.kind, version: String(seq) })),
       } as Json,
       changes,

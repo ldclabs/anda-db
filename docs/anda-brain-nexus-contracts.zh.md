@@ -43,6 +43,26 @@ Rust 的 `anda_kip::cognitive` 和 TypeScript 包根导出 `ArtifactPin`、
 | 验证清除报告 | `validate_erasure_plan(space, plan)` | `validateErasurePlan(plan, space?)` |
 | 用观察结果完成对账 | `reconcile_dispatch(space, attempt_id, expected, outcome_ref)` | `reconcileDispatch(attemptId, expected, outcomeRef, space?)` |
 
+以下 attention/trust 宿主 API 在 Rust 与 kip-do 均已实现。表中的 TypeScript 方法
+最后均可传 `space?`；Rust 对应方法以 `space` 为第一个参数，使用 snake_case。
+
+| 操作 | TypeScript Session |
+| --- | --- |
+| 配置作用域及策略、评估器、执行绑定摘要 | `setAttentionConfig(expected, config, space?)` |
+| 在新 generation 中替换条件及截止时间 | `rearmWatch(ref, expected, condition, dueAt, space?)` |
+| 准备语义评估页 | `prepareWatchPage(ref, expected, generation, limit, preparationKey, space?)` |
+| 读取、提交评估页 | `readPreparedWatchPage(ref, space?)` / `commitWatchPage(ref, evaluation, space?)` |
+| 读取及分页发现 wake | `readWake(ref, space?)` / `listWakes(cursor?, scanLimit?, space?)` |
+| 领取、接管或续租 wake | `claimWake(ref, expected, fence, expiresAt, space?)` / `renewWake(...)` |
+| 阻塞及恢复 wake | `blockWake(ref, expected, fence, retry, space?)` / `resumeWake(ref, expected, fence, space?)` |
+| 取消 wake | `cancelWake(ref, expected, fence, reason, space?)` |
+| 原子提交输出及续接 | `finishWake(ref, expected, fence, command?, parameters?, continuations?, space?)` |
+| wake 派发前检查 | `beginWakeDispatch(ref, expected, fence, attemptRef, supportsIdempotency, supportsOutcomeLookup, space?)` |
+| 注册直接认证的查询观察者 | `setDispatchLookupObserver(expected, observer, space?)` |
+| 查询与终态观察对账 | `reconcileWakeLookup(ref, expected, observation, space?)` / `reconcileWakeDispatch(ref, expected, outcomeRef, space?)` |
+| 配置上下文信任 | `setContextualTrust(expected, configuration, space?)` |
+| 应用带来源的校准提案 | `applyTrustCalibration(expected, proposalPin, operationKey, space?)` |
+
 自定义评估器注册在 Nexus 上：Rust `register_evaluation_rule(artifact, evaluator)`，
 TypeScript `registerEvaluationRule(artifact, evaluator)`。按规范化规则内容的 SHA-256
 摘要绑定；同一实例中不能重绑已有摘要。重启时恢复注册，历史材料本身不会自动加载代码。
@@ -157,7 +177,7 @@ expires_at 和 attempt_count。完成任务时，在同一个 `MUTATE` 中写入
 
 先创建 `disarmed` Watch，再 arm。每次 arm 都增加 generation。推进时提交所读版本
 和 generation，持久化 consumed_seq、matched 与状态。结构化 selectors 使用 AND，
-ops/touched 数组内部使用 OR；文本条件须提供 Brain evaluator。Rust 使用
+ops/touched 数组内部使用 OR；文本与混合条件须在 AttentionConfig 固定 evaluator 摘要，并提供 Brain evaluator。Rust 使用
 `advance_watch_with`，TypeScript 使用 `advanceWatch` 的 evaluator 参数。
 
 `change_page` 在空页上也返回 coverage。仅在 `complete` 且 authorization_view 一致、
@@ -165,7 +185,30 @@ ops/touched 数组内部使用 OR；文本条件须提供 Brain evaluator。Rust
 要求重新同步与布置 Watch。Rust 的控制检查点可识别中断的控制写入；旧库迁移之前的
 控制历史不会被补造成完整历史。
 
-派发顺序是：提交 AttemptRecord → enqueue_dispatch → begin_dispatch → 工具调用。
+Watch 触发、唯一 `watch_fire` Activity、wake 与重放结果在同一事务提交。silence 的
+截止序号固定为截止时间之前（含边界）的最后提交；后续流量不会扩大扫描目标。异步
+评估使用 prepare/read/commit 三步，必须逐一判断所有候选；`unknown` 不推进覆盖水位。
+页面及判断依据保存在可撤销的治理材料中，清除来源后不能继续读取或应用。
+
+wake 租约最长五分钟，使用真实时间与递增 fence；完成输出、continuation 与终态回执
+原子提交。`readWake`、`listWakes` 和通用 `readControl` 都检查 `maintain` 以及来源的
+完整可见性。分页允许空的中间页，应继续读取 `next_cursor`。恢复 `on_change` 需要每次
+启动后调用 Nexus 的 `register_wake_resume_verifier` / `registerWakeResumeVerifier`
+注册代码；TS `resumeWake` 返回 Promise，await 期间不持有事务，返回后重新校验状态。
+
+wake 派发使用 `beginWakeDispatch`，需要注册执行绑定；声明结果查询能力时还必须
+提前注册直接认证的观察者。查询 `not_started` 可以开放重试；查询 `finished` 不会
+伪造成功 Outcome。完成 wake 前必须解决所有派发结果，取消后仍保留对账记录。
+
+上下文信任规则按 actor、精确 predicate schema ref 和 context ref 匹配，较具体的
+规则优先，同等具体度的权重冲突拒绝投影。`setTrust` 保留上下文规则。校准提案必须
+绑定方法、有效 Evidence、继承材料来源与显式不确定性；应用需要 `manage_trust`，
+配置、来源、审计与回执原子提交，不要求仅为原生审计授予 `create`。
+
+校准与 wake 对账的已提交请求可以在一次性审批消耗后重放；重放仍检查当前权限与
+材料可见性，但不会要求或消耗新的审批。新操作继续遵循当前策略的审批要求。
+
+SleepTask 的派发顺序是：提交 AttemptRecord → enqueue_dispatch → begin_dispatch → 工具调用。
 工具适配器的幂等/查询能力标志必须来自宿主配置，不能取自模型生成内容。每次实际派发
 使用返回的 attempt_id 作为外部幂等键，并携带当前租约 token。返回动作只有
 `dispatch`、`lookup`、`outcome_unknown`、`done`；不支持幂等或查询时，丢失结果后禁止

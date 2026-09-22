@@ -1,3 +1,4 @@
+import type { ContextualTrustRule } from '../trust.js'
 /**
  * The Epistemic Policy a projection runs under.
  *
@@ -27,6 +28,7 @@ export const BASELINE_VERSION = 2
 export interface Policy {
   trust_weights: Record<string, number>
   default_trust_weight: number
+  contextual_trust_rules?: ContextualTrustRule[]
   trust_version: string
   context_refs: string[]
   purpose: string
