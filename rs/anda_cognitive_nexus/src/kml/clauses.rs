@@ -2477,6 +2477,9 @@ async fn find_client_key(
     if client_key.is_empty() {
         return Ok(None);
     }
+    if let Some(id) = tx.staged_client_key(kind, client_key) {
+        return Ok(Some(id));
+    }
     store
         .find_by_client_key(&tx.cx.space, kind, client_key)
         .await
@@ -2504,6 +2507,7 @@ async fn client_key_retry(
     let Some(existing_id) = existing else {
         return Ok(false);
     };
+    let staged_creation = tx.is_new_element(existing_id);
     let differing = {
         let stored = tx.load(existing_id).await?;
         // Whether the stored element still is what its creation made it. Once
@@ -2511,7 +2515,7 @@ async fn client_key_retry(
         // evidence about the creation, and comparing it would turn an ordinary
         // rename into a permanent failure for the bootstrap that re-runs the
         // same `CLIENT KEY`.
-        let pristine = stored.version() == 1;
+        let pristine = staged_creation || stored.version() == 1;
         creation_differs(element, stored, pristine)
     };
     if let Some(member) = differing {
@@ -2912,15 +2916,9 @@ pub(crate) async fn check_structural(
             let facts = facts_for(store, tx, &endpoint).await?;
             targets.push((endpoint.key(), facts));
         }
-        // A field this environment cannot resolve declares nothing to hold the
-        // write to, the same stance a Proposition takes on an unresolvable
-        // predicate.
-        let Ok((_, validation)) =
-            tx.env
-                .prepare_structural(field, &source, &targets, Intent::Write)
-        else {
-            continue;
-        };
+        let (_, validation) = tx
+            .env
+            .prepare_structural(field, &source, &targets, Intent::Write)?;
         validation.into_result()?;
     }
     Ok(())

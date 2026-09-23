@@ -84,7 +84,7 @@ impl Context<'_> {
                 offset: consumed,
                 traversal: self.traversal.clone(),
             }
-            .to_token(&self.space)
+            .issue(self.store, &self.space, &self.auth.principal_id)
         });
 
         let mut rows = Vec::with_capacity(window.len());
@@ -321,7 +321,7 @@ impl Context<'_> {
                 offset: consumed,
                 traversal: self.traversal.clone(),
             }
-            .to_token(&self.space)
+            .issue(self.store, &self.space, &self.auth.principal_id)
         });
 
         let mut rows = Vec::with_capacity(window.len());

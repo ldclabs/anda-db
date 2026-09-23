@@ -170,8 +170,31 @@ impl Transaction {
         }) {
             return Ok(());
         }
-        let activities = self.learning_universe(ElementKind::Activity).await?;
-        let evidence = self.learning_universe(ElementKind::Evidence).await?;
+        // Creating or selecting a Skill revision needs only the current plan.
+        // Historical uniqueness/sample scans are relevant to new audit records,
+        // not to every unrelated Skill edit in a growing memory Space.
+        let has_record = |names: &[&str]| {
+            pending
+                .iter()
+                .any(|(_, staged)| names.iter().any(|name| record(&staged.row, name).is_ok()))
+        };
+        let staged_kind = |kind| {
+            self.staged
+                .values()
+                .filter(|s| s.row.kind() == kind)
+                .map(|s| s.row.clone())
+                .collect::<Vec<_>>()
+        };
+        let activities = if has_record(&["AttemptRecord", "OutcomeRecord", "EvaluationRecord"]) {
+            self.learning_universe(ElementKind::Activity).await?
+        } else {
+            staged_kind(ElementKind::Activity)
+        };
+        let evidence = if has_record(&["OutcomeRecord", "EvaluationRecord"]) {
+            self.learning_universe(ElementKind::Evidence).await?
+        } else {
+            staged_kind(ElementKind::Evidence)
+        };
         let mut attempts = BTreeSet::new();
         let mut observations = BTreeSet::new();
         for row in &activities {

@@ -49,6 +49,8 @@ If you are building higher-level AI memory or KIP-powered systems:
 3. [anda_db.md](./anda_db.md)
 4. [anda_object_store.md](./anda_object_store.md)
 
+Runtime fixes and measurements: [Cognitive Nexus review (中文)](./anda_cognitive_nexus_review.zh.md).
+
 ### Storage and deployment implementers
 
 If your main concern is persistence, durability, encryption, or portability

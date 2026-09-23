@@ -642,6 +642,9 @@ impl EffectiveAuthority {
         element: &crate::store::Element,
         auth: &AuthContext,
     ) -> Option<Visibility> {
+        if element.space() != self.space.space_id {
+            return None;
+        }
         let resource = ResourceContext::of_element(element);
         // §29.1 and §29.2 are two questions, and collapsing them loses the one
         // §30.4 cares about. `discover` decides whether the element exists as
@@ -681,9 +684,6 @@ impl EffectiveAuthority {
     /// outside it (§88.6). Answered from the authority rather than by scanning,
     /// because the point is to avoid producing the number at all.
     pub fn reads_whole_space(&self, auth: &AuthContext) -> bool {
-        if self.is_owner {
-            return true;
-        }
         let decision = self.authorize(Permission::Read, &ResourceContext::default(), auth);
         decision.is_permitted() && decision.unrestricted
     }

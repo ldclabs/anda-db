@@ -580,6 +580,19 @@ impl GovernanceStore {
         Ok(row)
     }
 
+    pub(crate) async fn binding(&self, id: u64) -> Result<ActorBindingRow, KipError> {
+        self.bindings
+            .get()
+            .get_as(id)
+            .await
+            .map_err(|error| match error {
+                DBError::NotFound { .. } => {
+                    KipError::not_found_or_not_visible("control record unavailable")
+                }
+                other => db_error(other),
+            })
+    }
+
     /// Revokes an ActorBinding.
     pub async fn revoke_binding(&self, id: u64, actor: &str) -> Result<(), KipError> {
         let mut row: ActorBindingRow = self

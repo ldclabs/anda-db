@@ -603,7 +603,7 @@ async fn a_transaction_is_recoverable_by_id_and_by_idempotency_key() {
     .await;
     assert_eq!(by_key["tx_id"], tx_id);
 
-    // A key nobody used tells the caller it is safe to send again.
+    // Unknown and hidden transactions have the same non-disclosing answer.
     let unknown = run(
         &nexus,
         r#"DESCRIBE TRANSACTION BY IDEMPOTENCY KEY "never-used""#,
@@ -611,7 +611,9 @@ async fn a_transaction_is_recoverable_by_id_and_by_idempotency_key() {
     .await;
     let error = unknown.error.as_ref().unwrap();
     assert_eq!(error.code.as_str(), "TransactionUnknown");
-    assert!(error.message.contains("safe to send again"));
+    // An unavailable lookup must not distinguish hidden history from absence
+    // or promise that a fresh mutation is safe after the caller lost visibility.
+    assert_eq!(error.message, "transaction unavailable");
 }
 
 #[tokio::test]

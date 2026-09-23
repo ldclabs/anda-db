@@ -868,10 +868,8 @@ impl Session {
 
     /// The same gate and spend, for a caller that handles the guard itself.
     ///
-    /// Separate rather than a flag on [`Self::governed`], because taking the
-    /// guard twice deadlocks rather than fails: three callers reach a
-    /// [`CognitiveNexus`] method that guards its own write, and one holds the
-    /// guard across a body that needs the resolved authority.
+    /// Called only after acquiring the execution guard. Resolving authority,
+    /// performing the operation and settling its approvals share that guard.
     async fn gated<T>(
         &self,
         space_id: &str,
@@ -915,6 +913,18 @@ impl Session {
         operation(authority).await
     }
 
+    fn require_host_identity(&self) -> Result<(), KipError> {
+        if self.auth.principal_id != SYSTEM_PRINCIPAL
+            || self.auth.auth_method != "engine"
+            || !self.auth.delegation_chain.is_empty()
+        {
+            return Err(KipError::not_authorized(
+                "global identity administration requires a direct engine system session",
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates a Grant in this Space (§29, `manage_grants`).
     ///
     /// The actions are checked against the registry before the record is
@@ -947,6 +957,11 @@ impl Session {
     /// Revokes a Grant (§29, `manage_grants`). Revoked, never deleted.
     pub async fn revoke_grant(&self, space_id: &str, id: u64) -> Result<(), KipError> {
         self.governed(space_id, Permission::ManageGrants, async || {
+            let row =
+                self.nexus.governance().grant(id).await?.ok_or_else(|| {
+                    KipError::not_found_or_not_visible("control record unavailable")
+                })?;
+            require_control_space(space_id, &row.space_id)?;
             self.nexus
                 .governance()
                 .revoke_grant(id, &self.auth.principal_id)
@@ -999,6 +1014,13 @@ impl Session {
     /// withdraw at all.
     pub async fn revoke_delegation(&self, space_id: &str, id: u64) -> Result<(), KipError> {
         self.governed(space_id, Permission::ManageDelegation, async || {
+            let row = self
+                .nexus
+                .governance()
+                .delegation(id)
+                .await?
+                .ok_or_else(|| KipError::not_found_or_not_visible("control record unavailable"))?;
+            require_control_space(space_id, &row.space_id)?;
             self.nexus
                 .governance()
                 .revoke_delegation(id, &self.auth.principal_id)
@@ -1007,12 +1029,14 @@ impl Session {
         .await
     }
 
-    /// Creates or replaces a Principal group (§29, `manage_membership`).
+    /// Creates or replaces a global Principal group. Requires a direct system
+    /// session as well as `manage_membership`; Space grants are not global authority.
     pub async fn put_group(
         &self,
         space_id: &str,
         draft: GroupDraft,
     ) -> Result<PrincipalGroupRow, KipError> {
+        self.require_host_identity()?;
         self.governed(space_id, Permission::ManageMembership, async || {
             self.nexus
                 .governance()
@@ -1022,13 +1046,15 @@ impl Session {
         .await
     }
 
-    /// Suspends or restores a Principal (§29, `manage_membership`).
+    /// Suspends or restores a global Principal. Requires a direct system session
+    /// as well as `manage_membership`.
     pub async fn set_principal_status(
         &self,
         space_id: &str,
         principal_id: &str,
         status: &str,
     ) -> Result<PrincipalRow, KipError> {
+        self.require_host_identity()?;
         self.governed(space_id, Permission::ManageMembership, async || {
             self.nexus
                 .governance()
@@ -1050,6 +1076,11 @@ impl Session {
         draft: ActorBindingDraft,
     ) -> Result<ActorBindingRow, KipError> {
         self.governed(space_id, Permission::ManageActorBinding, async || {
+            if draft.scope == crate::governance::store::ANY_SPACE {
+                self.require_host_identity()?;
+            } else {
+                require_control_space(space_id, &draft.scope)?;
+            }
             self.nexus
                 .governance()
                 .create_binding(draft, &self.auth.principal_id)
@@ -1061,6 +1092,12 @@ impl Session {
     /// Revokes an ActorBinding (§17, `manage_actor_binding`).
     pub async fn revoke_binding(&self, space_id: &str, id: u64) -> Result<(), KipError> {
         self.governed(space_id, Permission::ManageActorBinding, async || {
+            let row = self.nexus.governance().binding(id).await?;
+            if row.scope == crate::governance::store::ANY_SPACE {
+                self.require_host_identity()?;
+            } else {
+                require_control_space(space_id, &row.scope)?;
+            }
             self.nexus
                 .governance()
                 .revoke_binding(id, &self.auth.principal_id)
@@ -1076,6 +1113,15 @@ impl Session {
         draft: PolicyDraft,
     ) -> Result<GovernancePolicyRow, KipError> {
         self.governed(space_id, Permission::ManagePolicy, async || {
+            require_control_space(space_id, &draft.space_id)?;
+            if let Some(previous) = self
+                .nexus
+                .governance()
+                .active_policy(&draft.policy_id)
+                .await?
+            {
+                require_control_space(space_id, &previous.space_id)?;
+            }
             self.nexus
                 .governance()
                 .publish_policy(draft, &self.auth.principal_id)
@@ -1097,6 +1143,13 @@ impl Session {
         note: &str,
     ) -> Result<ApprovalRow, KipError> {
         self.governed(space_id, Permission::ApproveHighRisk, async || {
+            let row = self
+                .nexus
+                .governance()
+                .find_approval(id)
+                .await?
+                .ok_or_else(|| KipError::not_found_or_not_visible("control record unavailable"))?;
+            require_control_space(space_id, &row.space_id)?;
             self.nexus
                 .governance()
                 .approve(id, &self.auth.principal_id, note)
@@ -1116,8 +1169,8 @@ impl Session {
         artifact: &SchemaPackage,
         source: &str,
     ) -> Result<crate::schema::PackageRef, KipError> {
-        self.gated(space_id, Permission::ManageSchema, async || {
-            self.nexus.install_package(artifact, source).await
+        self.governed(space_id, Permission::ManageSchema, async || {
+            self.nexus.store.install_package(artifact, source).await
         })
         .await
     }
@@ -1134,8 +1187,8 @@ impl Session {
         space_id: &str,
         lock: crate::schema::SchemaLock,
     ) -> Result<SchemaEnvironment, KipError> {
-        self.gated(space_id, Permission::ManageSchema, async || {
-            self.nexus.activate_schema(space_id, lock).await
+        self.governed(space_id, Permission::ManageSchema, async || {
+            self.nexus.store.activate_schema(space_id, lock).await
         })
         .await
     }
@@ -1154,9 +1207,7 @@ impl Session {
         capsule: &anda_kip::Capsule,
         isolate: bool,
     ) -> Result<crate::capsule::ImportReport, KipError> {
-        self.gated(space_id, Permission::Import, async || {
-            let _guard = self.nexus.lock.write().await;
-            self.nexus.store.reopen_if_poisoned().await?;
+        self.governed(space_id, Permission::Import, async || {
             crate::capsule::import(
                 &self.nexus,
                 capsule,
@@ -1218,7 +1269,7 @@ impl Executor for Session {
             Ok(space) => space,
             Err(err) => return Response::from(err),
         };
-        if let Err(err) = self.check_envelope(&space, request).await {
+        if let Err(err) = self.check_envelope(request) {
             return Response::from(err);
         }
         let auth = self.auth.merged_with_request(request);
@@ -1254,6 +1305,9 @@ impl Session {
             Ok(None) => {}
             Err(err) => return Response::from(err),
         }
+        if let Err(err) = self.check_preconditions(call.space, call.request).await {
+            return Response::from(err);
+        }
         let base = base_authorizations(&authority, call.auth, permissions);
         let decisions = match self.gate(&authority, call.auth, base).await {
             Ok(decisions) => decisions,
@@ -1274,7 +1328,11 @@ impl Session {
             evaluation_time,
         )
         .await;
-        let response = self.settle(response, decisions).await;
+        let response = if call.request.is_dry_run() {
+            response
+        } else {
+            self.settle(response, decisions).await
+        };
         if self.nexus.store.has_poisoned_handle() {
             let _ = self.nexus.store.reopen().await;
         }
@@ -1282,22 +1340,56 @@ impl Session {
     }
 
     /// The read lane, which KQL and META share: a shared lock, the gate, and
-    /// an approval a read may satisfy but never spends (§63.2).
+    /// approval settlement; previews do not consume approvals (§63.2).
     async fn run_read(&self, call: &Call<'_>, read: Read<'_>) -> Response {
-        let _guard = match self.nexus.read_guard().await {
-            Ok(g) => g,
-            Err(e) => return Response::from(e),
+        // KML previews reserve and discard transaction shells. Serialize them
+        // with writers even though they do not commit cognitive changes.
+        let _write_guard = if matches!(
+            read,
+            Read::Meta(anda_kip::MetaCommand::Preview(
+                anda_kip::PreviewCommand::Kml(_)
+            ))
+        ) {
+            let guard = self.nexus.lock.write().await;
+            if let Err(error) = self.nexus.store.reopen_if_poisoned().await {
+                return Response::from(error);
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let _read_guard = if _write_guard.is_none() {
+            match self.nexus.read_guard().await {
+                Ok(guard) => Some(guard),
+                Err(error) => return Response::from(error),
+            }
+        } else {
+            None
         };
         let authority = match self.authority(call.space, call.auth).await {
             Ok(authority) => authority,
             Err(err) => return Response::from(err),
         };
-        let base = base_authorizations(&authority, call.auth, read.permissions());
+        if let Err(err) = self.check_preconditions(call.space, call.request).await {
+            return Response::from(err);
+        }
+        let mut permissions = read.permissions();
+        if call
+            .request
+            .read
+            .as_ref()
+            .is_some_and(|r| r.snapshot_token.is_some())
+            && !permissions.contains(&Permission::ReadHistory)
+        {
+            permissions.push(Permission::ReadHistory);
+        }
+        let base = base_authorizations(&authority, call.auth, permissions);
         let _approval_guard = self.approval_guard(&base).await;
         let decisions = match self.gate(&authority, call.auth, base).await {
             Ok(decisions) => decisions,
             Err(err) => return Response::from(err),
         };
+        let preview = matches!(read, Read::Meta(anda_kip::MetaCommand::Preview(_)));
         let response = match read {
             Read::Kql(query) => {
                 crate::kql::execute(
@@ -1324,7 +1416,11 @@ impl Session {
                 .await
             }
         };
-        self.settle(response, decisions).await
+        if preview {
+            response
+        } else {
+            self.settle(response, decisions).await
+        }
     }
 }
 
@@ -1457,8 +1553,8 @@ impl Session {
         Ok(Some(crate::kml::replay(&row)))
     }
 
-    /// Every envelope invariant this engine can check before anything runs.
-    async fn check_envelope(&self, space: &str, request: &Request) -> Result<(), KipError> {
+    /// State preconditions are checked under the execution lock, after replay.
+    async fn check_preconditions(&self, space: &str, request: &Request) -> Result<(), KipError> {
         if let Some(preconditions) = &request.preconditions {
             let row = self.nexus.store.get_space(space).await?;
             if let Some(expected) = preconditions.space_seq
@@ -1480,6 +1576,11 @@ impl Session {
             }
         }
 
+        Ok(())
+    }
+
+    /// Stateless envelope validation cannot race with an execution.
+    fn check_envelope(&self, request: &Request) -> Result<(), KipError> {
         // A `critical` extension is a precondition, not a hint (request schema,
         // `extensions`): this engine implements no request extensions, so one
         // it is told it must honor fails the request rather than being ignored.
@@ -1693,4 +1794,14 @@ impl Executor for CognitiveNexus {
 /// discovering the gap through an error.
 pub fn supported_command_types() -> &'static [CommandType] {
     &[CommandType::Kml, CommandType::Kql, CommandType::Meta]
+}
+
+/// A Session's Space authority never administers another Space's records.
+fn require_control_space(expected: &str, actual: &str) -> Result<(), KipError> {
+    if actual != expected {
+        return Err(KipError::not_found_or_not_visible(
+            "control record unavailable",
+        ));
+    }
+    Ok(())
 }

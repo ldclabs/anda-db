@@ -113,40 +113,53 @@ pub async fn merge(
     let authority = EffectiveAuthority::resolve(store, space_id, &auth).await?;
     let mut tx = Transaction::begin(store, space_id, origin, false, authority, auth).await?;
 
-    // Phase 2: mint the ids the new records will wear, so a reference to a
-    // record that appears later in the artifact still resolves.
-    for record in &fresh {
-        let id = tx.mint(record.kind).await?;
-        mapping.insert(record.source_id.clone(), id);
-    }
+    let planned: Result<_, KipError> = async {
+        // Phase 2: mint the ids the new records will wear, so a reference to a
+        // record that appears later in the artifact still resolves.
+        for record in &fresh {
+            let id = tx.mint(record.kind).await?;
+            mapping.insert(record.source_id.clone(), id);
+        }
 
-    // Phase 3: rewrite and stage. A Proposition resolves against the tuple it
-    // becomes *after* rewriting, because one Space keeps one Proposition per
-    // semantic tuple (§12.4) — importing a tuple the destination already has
-    // must bind it, not collide with its unique index.
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for record in &fresh {
-        let id = mapping[&record.source_id];
-        if record.kind == ElementKind::Proposition
-            && let Some(existing) = resolve_tuple(store, space_id, &record.view, &mapping).await?
-        {
-            // The minted shell is left unstaged; commit discards it.
-            let _ = id;
-            mapping.insert(record.source_id.clone(), existing);
-            reused += 1;
-            continue;
+        // Phase 3: rewrite and stage. A Proposition resolves against the tuple it
+        // becomes *after* rewriting, because one Space keeps one Proposition per
+        // semantic tuple (§12.4) — importing a tuple the destination already has
+        // must bind it, not collide with its unique index.
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for record in &fresh {
+            let id = mapping[&record.source_id];
+            if record.kind == ElementKind::Proposition
+                && let Some(existing) =
+                    resolve_tuple(store, space_id, &record.view, &mapping).await?
+            {
+                // The minted shell is left unstaged; commit discards it.
+                let _ = id;
+                mapping.insert(record.source_id.clone(), existing);
+                reused += 1;
+                continue;
+            }
+            let mut element = build(record, id, space_id, digest, &mapping)?;
+            if isolate {
+                // §48.5: an isolate import lands in quarantine rather than in
+                // ordinary recall. The records are durable and auditable and a
+                // reviewer can read them; nothing recalls, projects or acts on them
+                // until somebody releases them.
+                *element.state_mut() = crate::store::rows::state::QUARANTINED.to_string();
+            }
+            tx.stage_new(id, element, anda_kip::ChangeOp::Create);
+            *counts.entry(record.kind.to_string()).or_default() += 1;
         }
-        let mut element = build(record, id, space_id, digest, &mapping)?;
-        if isolate {
-            // §48.5: an isolate import lands in quarantine rather than in
-            // ordinary recall. The records are durable and auditable and a
-            // reviewer can read them; nothing recalls, projects or acts on them
-            // until somebody releases them.
-            *element.state_mut() = crate::store::rows::state::QUARANTINED.to_string();
-        }
-        tx.stage_new(id, element, anda_kip::ChangeOp::Create);
-        *counts.entry(record.kind.to_string()).or_default() += 1;
+
+        Ok(counts)
     }
+    .await;
+    let counts = match planned {
+        Ok(counts) => counts,
+        Err(error) => {
+            tx.abort().await;
+            return Err(error);
+        }
+    };
 
     let entry = crate::store::space::JournalEntry {
         idempotency_key: format!("kip:import:{digest}"),

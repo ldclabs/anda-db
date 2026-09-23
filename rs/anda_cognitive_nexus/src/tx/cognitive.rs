@@ -23,6 +23,118 @@ fn premises(contract: &Json) -> Json {
 }
 
 impl Transaction {
+    /// KML and Capsule rows share the same final Core schema checks. This is
+    /// independent of the host-only learning standing granted to native records.
+    pub(crate) async fn validate_core_schema(&mut self) -> Result<(), KipError> {
+        use crate::schema::{EndpointFacts, Intent, PackageState, SymbolRef};
+        let importing = self.cx.origin.get("import").is_some();
+        let intent = if importing {
+            Intent::Read
+        } else {
+            Intent::Write
+        };
+        // Existing KML edits validate the fields they change in their clause.
+        // Do not rebind untouched historical types to the current Schema Lock.
+        let rows: Vec<_> = self
+            .staged
+            .values()
+            .filter(|s| s.is_new && s.changed && s.op != ChangeOp::Purge)
+            .map(|s| s.row.clone())
+            .collect();
+        for element in rows {
+            if importing {
+                let symbols = std::iter::once(element.schema_ref())
+                    .chain(element.facets().keys().map(String::as_str))
+                    .chain(element.structural().keys().map(String::as_str));
+                for name in symbols.filter(|name| name.starts_with("kip://")) {
+                    let symbol: SymbolRef = name.parse()?;
+                    let state = self.env.state(&symbol.package.package_id);
+                    if !state.allows_write() && state != PackageState::ValidationOnly {
+                        return Err(KipError::new(
+                            KipErrorCode::ProtectedSchemaState,
+                            "package does not admit imported records",
+                        ));
+                    }
+                }
+            }
+            let carrier = EndpointFacts::Element {
+                kind: element.kind(),
+                schema_ref: match &element {
+                    Element::Concept(row) => Some(row.schema_ref.clone()).filter(|s| !s.is_empty()),
+                    _ => None,
+                },
+            };
+            match &element {
+                Element::Concept(row) => {
+                    self.env
+                        .prepare_concept(&row.schema_ref, &row.attributes, &row.facets, intent)?
+                        .1
+                        .into_result()?;
+                }
+                Element::Proposition(row) => {
+                    let subject = self.schema_endpoint(&row.subject).await?;
+                    let object = self.schema_endpoint(&row.object).await?;
+                    self.env
+                        .prepare_proposition(&row.predicate_ref, &subject, &object, intent)?
+                        .1
+                        .into_result()?;
+                    self.env
+                        .validate_facets(element.facets(), &carrier, intent)?
+                        .into_result()?;
+                }
+                _ => {
+                    self.env
+                        .validate_facets(element.facets(), &carrier, intent)?
+                        .into_result()?;
+                }
+            }
+            for (field, values) in element.structural() {
+                let values = values.as_array().ok_or_else(|| {
+                    KipError::type_mismatch("structural references must be an array")
+                })?;
+                let mut targets = Vec::with_capacity(values.len());
+                for value in values {
+                    let endpoint = crate::term::Endpoint::from_json(value)?;
+                    targets.push((endpoint.key(), self.schema_endpoint(value).await?));
+                }
+                self.env
+                    .prepare_structural(field, &carrier, &targets, intent)?
+                    .1
+                    .into_result()?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn schema_endpoint(
+        &self,
+        value: &Json,
+    ) -> Result<crate::schema::EndpointFacts, KipError> {
+        use crate::{schema::EndpointFacts, term::Endpoint};
+        Ok(match Endpoint::from_json(value)? {
+            Endpoint::Literal(literal) => EndpointFacts::Literal {
+                datatype: literal.datatype,
+                value: literal.value,
+            },
+            Endpoint::Local(id) => {
+                let row = match self.staged.get(&id) {
+                    Some(staged) => staged.row.clone(),
+                    None => self.store.get_element(id).await?,
+                };
+                EndpointFacts::Element {
+                    kind: id.kind,
+                    schema_ref: match row {
+                        Element::Concept(row) => {
+                            Some(row.schema_ref.clone()).filter(|s| !s.is_empty())
+                        }
+                        _ => None,
+                    },
+                }
+            }
+            _ => EndpointFacts::Unresolved,
+        })
+    }
+
     pub(crate) async fn final_element(&self, id: ElementId) -> Result<Element, KipError> {
         let row = if let Some(s) = self.staged.get(&id) {
             if s.is_new {
@@ -98,15 +210,6 @@ impl Transaction {
                 "revalidation must complete and name its exact outputs",
             ));
         }
-        let candidates = self
-            .store
-            .activities()
-            .query_all_ids(crate::store::eq_field(
-                "space",
-                Fv::Text(self.cx.space.clone()),
-            ))
-            .await
-            .map_err(db_error)?;
         for output in &activity.outputs {
             let id = reference_id(output).ok_or_else(|| {
                 KipError::constraint_violation("revalidation needs local output references")
@@ -127,6 +230,18 @@ impl Transaction {
             if !matches!(target, Element::Assertion(_)) {
                 continue;
             }
+            let candidates = self
+                .store
+                .activities()
+                .query_all_ids(crate::store::eq_fields(&[
+                    ("space", Fv::Text(self.cx.space.clone())),
+                    (
+                        "output_keys",
+                        Fv::Text(crate::term::Endpoint::Local(id).key()),
+                    ),
+                ]))
+                .await
+                .map_err(db_error)?;
             let mut original = None;
             for aid in &candidates {
                 let row: ActivityRow = self

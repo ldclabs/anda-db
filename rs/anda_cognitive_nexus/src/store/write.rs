@@ -158,6 +158,25 @@ pub trait Row: sealed::Sealed + serde::Serialize + Send + Sync {
 
     /// The row id, readable without a mutable borrow.
     fn id(&self) -> u64;
+
+    /// Recompute denormalized reference columns before storage/index updates.
+    fn refresh_index_keys(&mut self);
+}
+
+macro_rules! refresh_keys {
+    ($row:ident, Activity) => {
+        $row.input_keys = $row
+            .inputs
+            .iter()
+            .map(crate::kml::clauses::endpoint_key)
+            .collect();
+        $row.output_keys = $row
+            .outputs
+            .iter()
+            .map(crate::kml::clauses::endpoint_key)
+            .collect();
+    };
+    ($row:ident, $kind:ident) => {};
 }
 
 macro_rules! impl_row {
@@ -171,6 +190,8 @@ macro_rules! impl_row {
 
         impl Row for $ty {
             const KIND: ElementKind = ElementKind::$kind;
+
+            fn refresh_index_keys(&mut self) { refresh_keys!(self, $kind); }
 
             #[inline]
             fn id(&self) -> u64 {
@@ -276,6 +297,7 @@ impl Store {
         cx: &WriteContext,
         row: &mut R,
     ) -> Result<ElementId, KipError> {
+        row.refresh_index_keys();
         cx.stamp_new(row);
         let collection = self.elements(R::KIND);
         let seq = collection.add_from(row).await.map_err(db_error)?;
@@ -290,6 +312,7 @@ impl Store {
     /// columns is enumerated, and a column missing from that list would
     /// silently stop being persisted.
     pub async fn update<R: Row>(&self, cx: &WriteContext, row: &mut R) -> Result<u64, KipError> {
+        row.refresh_index_keys();
         cx.stamp_update(row);
         let id = *row.envelope_mut().id;
         let collection = self.elements(R::KIND);

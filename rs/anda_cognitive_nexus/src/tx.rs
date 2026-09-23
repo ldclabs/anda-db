@@ -441,6 +441,19 @@ impl Transaction {
             })
     }
 
+    pub(crate) fn staged_client_key(&self, kind: ElementKind, key: &str) -> Option<ElementId> {
+        self.staged.iter().find_map(|(id, staged)| {
+            let client_key = match &staged.row {
+                Element::Concept(row) => &row.client_key,
+                Element::Assertion(row) => &row.client_key,
+                Element::Evidence(row) => &row.client_key,
+                Element::Activity(row) => &row.client_key,
+                Element::Proposition(_) => return None,
+            };
+            (id.kind == kind && client_key == key).then_some(*id)
+        })
+    }
+
     /// Stages a newly created element's final row.
     pub fn stage_new(&mut self, id: ElementId, row: Element, op: ChangeOp) {
         self.staged.insert(
@@ -941,8 +954,29 @@ impl Transaction {
     ///
     /// A dry run never establishes a durable cognitive commit (§69.3), so it
     /// removes its own shells and journals nothing.
-    pub async fn commit(mut self, entry: JournalEntry) -> Result<Outcome, KipError> {
+    pub async fn commit(self, entry: JournalEntry) -> Result<Outcome, KipError> {
+        let store = self.store.clone();
+        let shells = self.shells.clone();
+        let mut redo_owned = false;
+        let result = Box::pin(self.commit_inner(entry, &mut redo_owned)).await;
+        if result.is_err() && !redo_owned {
+            for id in shells {
+                let _ = store.elements(id.kind).remove(id.seq).await;
+            }
+        }
+        result
+    }
+
+    async fn commit_inner(
+        mut self,
+        entry: JournalEntry,
+        redo_owned: &mut bool,
+    ) -> Result<Outcome, KipError> {
         if let Err(error) = async {
+            Box::pin(self.validate_core_schema()).await?;
+            self.propagate_governance().await?;
+            self.check_reference_closure().await?;
+            self.check_concept_key_identity().await?;
             self.capture_cognitive_contracts().await?;
             self.validate_learning().await?;
             self.validate_durable()?;
@@ -987,10 +1021,6 @@ impl Transaction {
                 warnings: self.warnings,
             });
         }
-
-        self.propagate_governance().await?;
-        self.check_reference_closure().await?;
-        self.check_concept_key_identity().await?;
 
         // Nothing this transaction touched keeps its shell state, and the
         // version rule is applied here so that a clause touching one element
@@ -1115,6 +1145,9 @@ impl Transaction {
             self.discard_shells().await;
             return Err(error);
         }
+        let control_replacements = self.artifact_erasure_replacements().await?;
+        // From this point a durable intent may exist, so recovery owns the IDs.
+        *redo_owned = true;
         let journalled = self
             .store
             .commit_plan(crate::store::control::CommitPlan {
@@ -1128,7 +1161,7 @@ impl Transaction {
                     origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
                     ..entry
                 },
-                control_replacements: self.artifact_erasure_replacements().await?,
+                control_replacements,
                 writes,
                 controls: std::mem::take(&mut self.control_effects),
                 space: space_effect,
@@ -1231,7 +1264,16 @@ impl Transaction {
             }
             let view = crate::view::render(&element);
             let old_view = before.as_ref().map(crate::view::render);
-            crate::schema::contracts::validate_record(&self.env, &view, old_view.as_ref())?;
+            crate::schema::contracts::validate_record_with_intent(
+                &self.env,
+                &view,
+                old_view.as_ref(),
+                if self.cx.origin.get("import").is_some() {
+                    crate::schema::Intent::Read
+                } else {
+                    crate::schema::Intent::Write
+                },
+            )?;
             self.validate_revalidation(&element).await?;
             let Element::Activity(activity) = element else {
                 continue;
@@ -1410,6 +1452,7 @@ impl Transaction {
         macro_rules! put {
             ($row:expr, $variant:ident) => {{
                 let mut row = *$row;
+                row.refresh_index_keys();
                 row._id = id.seq;
                 row.space = self.cx.space.clone();
                 row.version = version;

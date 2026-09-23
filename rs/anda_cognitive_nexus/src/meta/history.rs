@@ -10,7 +10,7 @@
 //! holds. The difference matters for a follower: a stream that restarted from
 //! the beginning would replay work the caller already did.
 
-use anda_db::query::{Filter, RangeQuery};
+use anda_db::query::Filter;
 use anda_db_schema::Fv;
 use anda_kip::{
     AsOf, ChangeEntry, ChangesCommand, HistoryCommand, Json, KipError, KipErrorCode, Scalar,
@@ -117,7 +117,7 @@ pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<A
     }
 
     let from = bound(cx, from_seq, 0)?;
-    let to = bound(cx, to_seq, u64::MAX)?;
+    let to = bound(cx, to_seq, cx.pinned_seq)?.min(cx.pinned_seq);
     let limit = match limit {
         Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?,
         None => usize::MAX,
@@ -180,18 +180,10 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
         None => 100,
     };
 
-    let mut rows = journal(
-        cx,
-        Filter::And(vec![
-            Box::new(crate::store::eq_field("space", Fv::Text(cx.space.clone()))),
-            Box::new(Filter::Field((
-                "seq".to_string(),
-                RangeQuery::Gt(Fv::U64(after)),
-            ))),
-        ]),
-    )
-    .await?;
-    rows.sort_by_key(|row| row.seq);
+    let mut rows = cx
+        .store
+        .journal_page(&cx.space, after, cx.pinned_seq, limit.saturating_add(1))
+        .await?;
     let floor = cx
         .store
         .control_at(&cx.space, "internal/governance", u64::MAX)
@@ -253,29 +245,38 @@ fn change_cursor(cx: &Context<'_>, scalar: &Scalar) -> Result<u64, KipError> {
 
 /// `DESCRIBE TRANSACTION`.
 pub async fn transaction(cx: &mut Context<'_>, tx_id: &str) -> Result<Json, KipError> {
-    let row = cx.store.find_transaction(tx_id).await?.ok_or_else(|| {
-        KipError::new(
-            KipErrorCode::TransactionUnknown,
-            format!("this Nexus has no transaction {tx_id:?}"),
-        )
-    })?;
-    Ok(described(&row))
+    let row = cx
+        .store
+        .find_transaction(tx_id)
+        .await?
+        .ok_or_else(transaction_unavailable)?;
+    describe_visible(cx, row).await
 }
 
 /// `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` — the lost-response lookup (§80.4).
 pub async fn transaction_by_key(cx: &mut Context<'_>, key: &str) -> Result<Json, KipError> {
     let row = crate::kml::find_transaction_for_key(cx.store, &cx.space, cx.auth, key)
         .await?
-        .ok_or_else(|| {
-            KipError::new(
-                KipErrorCode::TransactionUnknown,
-                format!(
-                    "no transaction in this Space committed under the idempotency key {key:?}; \
-                     the original request never committed, so it is safe to send again"
-                ),
-            )
-        })?;
-    Ok(described(&row))
+        .ok_or_else(transaction_unavailable)?;
+    describe_visible(cx, row).await
+}
+
+fn transaction_unavailable() -> KipError {
+    KipError::new(KipErrorCode::TransactionUnknown, "transaction unavailable")
+}
+
+async fn describe_visible(cx: &mut Context<'_>, row: TransactionRow) -> Result<Json, KipError> {
+    if row.space != cx.space || row.seq > cx.pinned_seq {
+        return Err(transaction_unavailable());
+    }
+    if row.changes.is_empty() {
+        return Ok(described(&row));
+    }
+    let mut rows = vec![row];
+    visible_changes(cx, &mut rows).await?;
+    rows.first()
+        .map(described)
+        .ok_or_else(transaction_unavailable)
 }
 
 /// One transaction, as `DESCRIBE TRANSACTION` answers it.
@@ -409,22 +410,10 @@ pub(crate) async fn change_page_through(
     if limit == 0 || limit > 10000 || after > target || target > cx.pinned_seq {
         return Err(KipError::constraint_violation("invalid change page bounds"));
     }
-    let mut rows = journal(
-        cx,
-        Filter::And(vec![
-            Box::new(crate::store::eq_field("space", Fv::Text(cx.space.clone()))),
-            Box::new(Filter::Field((
-                "seq".into(),
-                RangeQuery::Gt(Fv::U64(after)),
-            ))),
-            Box::new(Filter::Field((
-                "seq".into(),
-                RangeQuery::Le(Fv::U64(target)),
-            ))),
-        ]),
-    )
-    .await?;
-    rows.sort_by_key(|r| r.seq);
+    let mut rows = cx
+        .store
+        .journal_page(&cx.space, after, target, limit + 1)
+        .await?;
     let floor = cx
         .store
         .control_at(&cx.space, "internal/governance", u64::MAX)

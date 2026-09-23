@@ -537,19 +537,17 @@ impl Context<'_> {
         known: &Solutions,
     ) -> Result<Solutions, KipError> {
         let (subject, left, left_var) = self.expand_endpoint(&triple.subject, known).await?;
-        let scope = known.clone().join(left.clone());
+        let scope = self.join(known.clone(), left.clone())?;
         let (object, right, right_var) = self.expand_endpoint(&triple.object, &scope).await?;
-        let expanded = left.join(right);
-        let scoped = known.clone().join(expanded.clone());
+        let expanded = self.join(left, right)?;
+        let scoped = self.join(known.clone(), expanded.clone())?;
         let triple = PropositionTriple {
             subject,
             predicate: triple.predicate.clone(),
             object,
         };
-        let mut result = self
-            .match_tuple_simple(variable, &triple, &scoped)
-            .await?
-            .join(expanded);
+        let matched = self.match_tuple_simple(variable, &triple, &scoped).await?;
+        let mut result = self.join(matched, expanded)?;
         remove_internal(&mut result, left_var.iter().chain(right_var.iter()));
         Ok(result)
     }
@@ -637,6 +635,9 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if !self.readable_tuple(id) {
+                continue;
+            }
             // The predicate index was ranged over a lineage, so the symbol is
             // checked here; at a past coordinate no filter could be pushed
             // down at all, so the whole tuple is.
@@ -709,10 +710,11 @@ impl Context<'_> {
     ) -> Result<Solutions, KipError> {
         let (subject, left, left_var) = self.expand_endpoint(subject, &Solutions::unit()).await?;
         let (object, right, right_var) = self.expand_endpoint(object, &left).await?;
-        let mut result = self
+        let matched = self
             .match_structural_simple(edge, &subject, field, &object)
-            .await?
-            .join(left.join(right));
+            .await?;
+        let expanded = self.join(left, right)?;
+        let mut result = self.join(matched, expanded)?;
         remove_internal(&mut result, left_var.iter().chain(right_var.iter()));
         Ok(result)
     }
@@ -1313,6 +1315,9 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if !self.readable_tuple(id) {
+                continue;
+            }
             if !predicate_matches(&row.predicate_ref, symbols) {
                 continue;
             }
@@ -1360,6 +1365,9 @@ impl Context<'_> {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
+            if !self.readable_tuple(id) {
+                continue;
+            }
             if !predicate_matches(&row.predicate_ref, symbols)
                 || (historical && row.state != "active")
             {

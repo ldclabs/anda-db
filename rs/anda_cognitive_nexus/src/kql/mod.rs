@@ -7,10 +7,8 @@
 //! The raw Core view (Spec §53.1). `?p PROPOSITION (...)` reports that a tuple
 //! exists; `?a ASSERTION {...}` reports that somebody claimed something. What
 //! is *currently believed* is a different question, answered by `BELIEF`, which
-//! projects rather than reads — and which this engine does not implement yet.
-//! It says so rather than answering the raw question instead, because "Alice
-//! asserted X" and "X is believed" are exactly the two things KIP 2.0 exists to
-//! keep apart.
+//! projects the eligible Assertions under the selected policy. "Alice asserted
+//! X" and "X is believed" remain separate answers.
 //!
 //! ## Bounded by construction
 //!
@@ -48,6 +46,8 @@ use project::Projected;
 /// depending on machine load, which is a worse contract than a limit a caller
 /// can reason about.
 pub const MAX_CANDIDATES: usize = 100_000;
+/// Total intermediate rows/candidate join pairs per query, including nested blocks.
+pub const MAX_SOLUTIONS: usize = 100_000;
 
 /// The state one query execution carries.
 pub struct Context<'a> {
@@ -99,6 +99,9 @@ pub struct Context<'a> {
     pub read_origin: bool,
     governed_limit: Option<usize>,
     budget: usize,
+    solution_budget: usize,
+    historical_ids: BTreeMap<(String, u64), Vec<ElementId>>,
+    pub(crate) dependency_cache: BTreeMap<String, Json>,
     /// Explicit mutation output handles are ambient values, unlike query
     /// variables introduced by a WHERE branch. Standalone KQL has none.
     ambient: Solutions,
@@ -146,6 +149,9 @@ impl<'a> Context<'a> {
                 .max_results
                 .map(|limit| limit as usize),
             budget: MAX_CANDIDATES,
+            solution_budget: MAX_SOLUTIONS,
+            historical_ids: BTreeMap::new(),
+            dependency_cache: BTreeMap::new(),
             ambient: Solutions::unit(),
             next_internal_variable: 0,
         })
@@ -218,6 +224,17 @@ impl<'a> Context<'a> {
                     object_view.insert("canonical_object".to_string(), object);
                 }
                 self.views.insert(id, Arc::new(view));
+            }
+        }
+        if let Some(element) = &element
+            && let Some(visibility) = self.authority.may_read(element, self.auth)
+            && let Some(view) = self.views.get_mut(&id)
+        {
+            let view = Arc::make_mut(view);
+            if visibility.content {
+                crate::governance::redact::apply(view, &visibility.constraints, self.read_origin);
+            } else {
+                crate::governance::redact::to_identity_only(view);
             }
         }
         self.filter_reference_audit(id).await?;
@@ -321,12 +338,23 @@ impl<'a> Context<'a> {
                 return Ok(cursor);
             }
             let next = match self.load_unattached(cursor).await? {
-                Some(Element::Concept(row)) if !row.merged_into.is_empty() => {
-                    row.merged_into.parse::<ElementId>()?
+                Some(Element::Concept(_)) => {
+                    let view = self.view_of(cursor);
+                    let Some(next) = view
+                        .get("merged_into")
+                        .and_then(Json::as_str)
+                        .filter(|v| !v.is_empty())
+                    else {
+                        return Ok(cursor);
+                    };
+                    next.parse::<ElementId>()?
                 }
                 _ => return Ok(cursor),
             };
             if next == cursor {
+                return Ok(cursor);
+            }
+            if self.load_unattached(next).await?.is_none() {
                 return Ok(cursor);
             }
             cursor = next;
@@ -430,6 +458,9 @@ impl<'a> Context<'a> {
     /// can still be cited; what it says stays closed.
     pub(crate) fn admit(&mut self, element: Option<Element>) -> Option<Element> {
         let element = element?;
+        if element.space() != self.space {
+            return None;
+        }
         let visibility = self.authority.may_read(&element, self.auth)?;
         if let Some(limit) = visibility
             .constraints
@@ -460,6 +491,13 @@ impl<'a> Context<'a> {
         }
         self.views.insert(element.id(), Arc::new(view));
         Some(element)
+    }
+
+    pub(crate) fn readable_tuple(&self, id: ElementId) -> bool {
+        let view = self.view_of(id);
+        ["subject", "predicate_ref", "object"]
+            .iter()
+            .all(|field| view.get(*field).is_some())
     }
 
     /// The rendered view of an already-loaded element.
@@ -565,8 +603,15 @@ impl<'a> Context<'a> {
         filters: Option<anda_db::query::Filter>,
     ) -> Result<Vec<ElementId>, KipError> {
         if let Some(seq) = self.as_of {
-            let elements = self.store.elements_at(&self.space, kind, seq).await?;
-            self.charge(elements.len())?;
+            let key = (kind.to_string(), seq);
+            if let Some(ids) = self.historical_ids.get(&key) {
+                return Ok(ids.clone());
+            }
+            let (elements, scanned) = self
+                .store
+                .elements_at_bounded(&self.space, kind, seq, self.budget)
+                .await?;
+            self.charge(scanned)?;
             let mut ids = Vec::with_capacity(elements.len());
             for element in elements {
                 let id = element.id();
@@ -581,6 +626,7 @@ impl<'a> Context<'a> {
                     ids.push(id);
                 }
             }
+            self.historical_ids.insert(key, ids.clone());
             return Ok(ids);
         }
         let ids = match filters {
@@ -644,6 +690,17 @@ impl<'a> Context<'a> {
                 )));
             }
             _ => {}
+        }
+        if from_token
+            .into_iter()
+            .chain(from_command)
+            .chain(cursor.as_ref().map(|c| c.snapshot_seq))
+            .any(|seq| seq > self.pinned_seq)
+        {
+            return Err(KipError::new(
+                anda_kip::KipErrorCode::HistoricalSnapshotUnavailable,
+                "read coordinate is ahead of the Space",
+            ));
         }
         // A continuation is pinned to the coordinate its own first page read
         // at (§44.8). It does not ask for `read_history`: the caller is
@@ -720,6 +777,13 @@ impl<'a> Context<'a> {
         }
     }
 
+    fn join(&mut self, left: Solutions, right: Solutions) -> Result<Solutions, KipError> {
+        left.join_bounded(right, &mut self.solution_budget)
+    }
+    fn union(&mut self, left: Solutions, right: Solutions) -> Result<Solutions, KipError> {
+        left.union_bounded(right, &mut self.solution_budget)
+    }
+
     /// Evaluates a `WHERE` block into one set of solutions.
     ///
     /// Boxed because `NOT`, `OPTIONAL` and `UNION` nest blocks inside blocks,
@@ -744,7 +808,10 @@ impl<'a> Context<'a> {
                 let vars = validation::validate_block(self, clauses, &scope)?;
                 let mut solutions = self.solve_with(clauses, incoming).await?;
                 // Keep sites even when an empty input skipped a nested block.
-                solutions = solutions.union(Solutions::table(vars.into_iter().collect(), vec![]));
+                solutions = self.union(
+                    solutions,
+                    Solutions::table(vars.into_iter().collect(), vec![]),
+                )?;
                 solutions.deduplicate();
                 Ok(solutions)
             }
@@ -785,25 +852,25 @@ impl<'a> Context<'a> {
                 let table = self
                     .match_element(ElementKind::Concept, variable, matcher)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Assertion { variable, matcher } => {
                 let table = self
                     .match_element(ElementKind::Assertion, variable, matcher)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Evidence { variable, matcher } => {
                 let table = self
                     .match_element(ElementKind::Evidence, variable, matcher)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Activity { variable, matcher } => {
                 let table = self
                     .match_element(ElementKind::Activity, variable, matcher)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Proposition { variable, matcher } => {
                 // The solutions so far are passed in so a traversal can start
@@ -814,7 +881,7 @@ impl<'a> Context<'a> {
                 let table = self
                     .match_proposition(variable.as_deref(), matcher, &solutions)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Structural {
                 variable,
@@ -825,7 +892,7 @@ impl<'a> Context<'a> {
                 let table = self
                     .match_structural(variable.as_deref(), subject, field, object)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::Filter { expression } => {
                 let mut solutions = solutions;
@@ -840,8 +907,8 @@ impl<'a> Context<'a> {
                 for row in &solutions.rows {
                     let incoming = solutions.with_rows(vec![row.clone()]);
                     let table = self.solve_with(inner, incoming.clone()).await?;
-                    if incoming.clone().join(table).is_empty() {
-                        out = out.union(incoming);
+                    if self.join(incoming.clone(), table)?.is_empty() {
+                        out = self.union(out, incoming)?;
                     }
                 }
                 out
@@ -851,7 +918,8 @@ impl<'a> Context<'a> {
                 for row in &solutions.rows {
                     let incoming = solutions.with_rows(vec![row.clone()]);
                     let table = self.solve_with(inner, incoming.clone()).await?;
-                    out = out.union(incoming.left_join(table));
+                    let joined = incoming.left_join_bounded(table, &mut self.solution_budget)?;
+                    out = self.union(out, joined)?;
                 }
                 out
             }
@@ -861,11 +929,11 @@ impl<'a> Context<'a> {
                 // so a branch binding different variables widens the result
                 // instead of filtering the other side away.
                 let branch = self.solve_with(inner, self.ambient.clone()).await?;
-                solutions.union(branch)
+                self.union(solutions, branch)?
             }
             WhereClause::Belief { variable, target } => {
                 let table = self.match_belief(variable, target, &solutions).await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
             WhereClause::BeliefSlot {
                 variable,
@@ -875,7 +943,7 @@ impl<'a> Context<'a> {
                 let table = self
                     .match_belief_slot(variable, subject, predicate, &solutions)
                     .await?;
-                solutions.join(table)
+                self.join(solutions, table)?
             }
         })
     }
@@ -972,12 +1040,14 @@ fn page_cursor(
             format!("CURSOR takes the opaque token this engine issued, got {token}"),
         ));
     };
-    crate::store::history::PageCursor::from_token(
+    let cursor = crate::store::history::PageCursor::from_token(
         &token,
         space,
         crate::store::history::CursorFamily::Query,
         &cx.traversal,
-    )
+    )?;
+    cursor.require_issued(cx.store, &token, &cx.auth.principal_id)?;
+    Ok(cursor)
 }
 
 async fn run(

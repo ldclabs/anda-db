@@ -1586,6 +1586,11 @@ function findClientKey(
   clientKey: string,
 ): Element | null {
   if (clientKey === '') return null
+  for (const staged of tx.staged.values()) {
+    const element = staged.element
+    if (element.kind === kind && 'client_key' in element.row && element.row.client_key === clientKey)
+      return element
+  }
   return tx.store.byClientKey(kind, tx.cx.space, clientKey)
 }
 
@@ -1616,7 +1621,8 @@ function clientKeyRetry(
   // evidence about the creation, and comparing it would turn an ordinary
   // rename into a permanent failure for the bootstrap that re-runs the same
   // `CLIENT KEY`.
-  const pristine = (existing.row as { version: number }).version === 1
+  const pristine = (existing.row as { version: number }).version === 1 ||
+    tx.isNewElement({kind: existing.kind, seq: existing.row.id})
   const member = creationDiffers(element, existing, pristine)
   const existingId = {
     kind: existing.kind,

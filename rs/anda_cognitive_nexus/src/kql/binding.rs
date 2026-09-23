@@ -17,7 +17,8 @@
 //! the *element* `C-1` and the *string* `"C-1"`, which is exactly the
 //! distinction a filter like `IS_ELEMENT(?x)` exists to ask about.
 
-use anda_kip::{ElementKind, Json};
+use anda_kip::{ElementKind, Json, KipError};
+use std::collections::{HashMap, HashSet};
 
 use crate::id::ElementId;
 
@@ -211,15 +212,13 @@ impl Solutions {
         let Some(index) = self.index_of(var) else {
             return vec![];
         };
-        let mut seen: Vec<Binding> = Vec::new();
-        for row in &self.rows {
-            if let Some(value) = row.get(index)
-                && !seen.contains(value)
-            {
-                seen.push(value.clone());
-            }
-        }
-        seen
+        let mut seen = HashSet::new();
+        self.rows
+            .iter()
+            .filter_map(|row| row.get(index))
+            .filter(|value| seen.insert(value.identity_key()))
+            .cloned()
+            .collect()
     }
 
     /// The distinct elements one variable takes.
@@ -236,48 +235,82 @@ impl Solutions {
     /// reading of two independent patterns in one `WHERE` block — and also why
     /// the caller caps result size rather than trusting the query to be small.
     pub fn join(self, other: Solutions) -> Solutions {
+        let mut budget = usize::MAX;
+        self.join_bounded(other, &mut budget)
+            .expect("unbounded join")
+    }
+
+    /// The query engine supplies one shared work budget for every nested join.
+    pub(crate) fn join_bounded(
+        self,
+        other: Solutions,
+        budget: &mut usize,
+    ) -> Result<Solutions, KipError> {
         if self.vars.is_empty() && self.rows.len() == 1 {
-            return other;
+            spend(budget, other.rows.len())?;
+            return Ok(other);
         }
         if other.vars.is_empty() && other.rows.len() == 1 {
-            return self;
+            spend(budget, self.rows.len())?;
+            return Ok(self);
         }
-        if self.is_empty() || other.is_empty() {
-            // One unsatisfiable conjunct makes the conjunction unsatisfiable,
-            // but the variable set still has to grow: a later `OPTIONAL` needs
-            // to know which columns exist.
-            return Solutions {
-                vars: union_vars(&self.vars, &other.vars),
-                rows: vec![],
-            };
-        }
-
         let shared: Vec<(usize, usize)> = self
             .vars
             .iter()
             .enumerate()
-            .filter_map(|(left, name)| {
-                other
-                    .vars
-                    .iter()
-                    .position(|other_name| other_name == name)
-                    .map(|right| (left, right))
-            })
+            .filter_map(|(l, name)| other.index_of(name).map(|r| (l, r)))
             .collect();
-        let carried: Vec<usize> = other
-            .vars
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !shared.iter().any(|(_, right)| right == index))
-            .map(|(index, _)| index)
+        let carried: Vec<usize> = (0..other.vars.len())
+            .filter(|r| !shared.iter().any(|(_, right)| right == r))
             .collect();
-
         let mut vars = self.vars.clone();
-        vars.extend(carried.iter().map(|index| other.vars[*index].clone()));
-
+        vars.extend(carried.iter().map(|r| other.vars[*r].clone()));
+        if self.is_empty() || other.is_empty() {
+            return Ok(Solutions { vars, rows: vec![] });
+        }
+        if shared.is_empty()
+            && self
+                .rows
+                .len()
+                .checked_mul(other.rows.len())
+                .is_none_or(|n| n > *budget)
+        {
+            return Err(exhausted());
+        }
+        // Fully bound keys use a hash join. OPTIONAL's missing values remain
+        // wildcards and are checked separately, preserving their compatibility.
+        let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+        let mut wildcard = Vec::new();
+        for (i, row) in other.rows.iter().enumerate() {
+            if shared.iter().any(|(_, r)| matches!(row[*r], Binding::Null)) {
+                wildcard.push(i);
+            } else {
+                index
+                    .entry(shared.iter().map(|(_, r)| row[*r].identity_key()).collect())
+                    .or_default()
+                    .push(i);
+            }
+        }
         let mut rows = Vec::new();
         for left in &self.rows {
-            for right in &other.rows {
+            let candidates = if shared
+                .iter()
+                .any(|(l, _)| matches!(left[*l], Binding::Null))
+            {
+                (0..other.rows.len()).collect::<Vec<_>>()
+            } else {
+                let key: Vec<_> = shared
+                    .iter()
+                    .map(|(l, _)| left[*l].identity_key())
+                    .collect();
+                let mut candidates = index.get(&key).cloned().unwrap_or_default();
+                candidates.extend(&wildcard);
+                candidates.sort_unstable();
+                candidates
+            };
+            spend(budget, candidates.len())?;
+            for i in candidates {
+                let right = &other.rows[i];
                 if !shared
                     .iter()
                     .all(|(l, r)| compatible(&left[*l], &right[*r]))
@@ -285,18 +318,16 @@ impl Solutions {
                     continue;
                 }
                 let mut row = left.clone();
-                for (left_index, right_index) in &shared {
-                    if matches!(row[*left_index], Binding::Null) {
-                        row[*left_index] = right[*right_index].clone();
+                for (l, r) in &shared {
+                    if matches!(row[*l], Binding::Null) {
+                        row[*l] = right[*r].clone();
                     }
                 }
-                for index in &carried {
-                    row.push(right[*index].clone());
-                }
+                row.extend(carried.iter().map(|r| right[*r].clone()));
                 rows.push(row);
             }
         }
-        Solutions { vars, rows }
+        Ok(Solutions { vars, rows })
     }
 
     /// Left join: every left row survives, padded when nothing matched.
@@ -305,17 +336,30 @@ impl Solutions {
     /// turn "we have no birth date for Bob" into "Bob does not exist", which
     /// is the open-world mistake in miniature.
     pub fn left_join(self, other: Solutions) -> Solutions {
+        let mut budget = usize::MAX;
+        self.left_join_bounded(other, &mut budget)
+            .expect("unbounded left join")
+    }
+
+    pub(crate) fn left_join_bounded(
+        self,
+        other: Solutions,
+        budget: &mut usize,
+    ) -> Result<Solutions, KipError> {
         let mut out = self.header().union(other.header());
         for left in &self.rows {
             let incoming = self.with_rows(vec![left.clone()]);
-            let matches = incoming.clone().join(other.clone());
-            out = out.union(if matches.is_empty() {
-                incoming
-            } else {
-                matches
-            });
+            let matches = incoming.clone().join_bounded(other.clone(), budget)?;
+            out = out.union_bounded(
+                if matches.is_empty() {
+                    incoming
+                } else {
+                    matches
+                },
+                budget,
+            )?;
         }
-        out
+        Ok(out)
     }
 
     /// Anti-join: keep the left rows that the right side cannot extend.
@@ -351,7 +395,20 @@ impl Solutions {
     /// A branch that does not bind a column pads it with `Null`, so a `UNION`
     /// of differently-shaped branches stays one table rather than silently
     /// dropping the narrower side.
-    pub fn union(self, other: Solutions) -> Solutions {
+    pub(crate) fn union_bounded(
+        self,
+        other: Solutions,
+        budget: &mut usize,
+    ) -> Result<Solutions, KipError> {
+        spend(budget, other.rows.len())?;
+        Ok(self.union(other))
+    }
+
+    pub fn union(mut self, other: Solutions) -> Solutions {
+        if self.vars == other.vars {
+            self.rows.extend(other.rows);
+            return self;
+        }
         let vars = union_vars(&self.vars, &other.vars);
         let mut rows = Vec::with_capacity(self.rows.len() + other.rows.len());
         for source in [&self, &other] {
@@ -365,6 +422,17 @@ impl Solutions {
         }
         Solutions { vars, rows }
     }
+}
+
+fn exhausted() -> KipError {
+    KipError::resource_exhausted(
+        "query intermediate-solution budget exhausted; narrow the patterns",
+    )
+}
+
+fn spend(budget: &mut usize, count: usize) -> Result<(), KipError> {
+    *budget = budget.checked_sub(count).ok_or_else(exhausted)?;
+    Ok(())
 }
 
 /// Whether two bindings of the same variable agree.

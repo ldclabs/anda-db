@@ -79,10 +79,9 @@
 //! Agent can read what is missing instead of discovering it by triggering an
 //! error — or, worse, reading an absent feature as an absent fact.
 //!
-//! The projection is partial and says so in its own output: there is no trust
-//! model and no evidence-quality evaluation in this engine, so every eligible
-//! corroboration group counts equally, and every answer carries that warning
-//! rather than reading as a judgement it did not make.
+//! Projection applies protected actor and contextual trust weights. Evidence
+//! quality is not automatically graded, and each answer states that boundary.
+//! `DESCRIBE TRUST` reports the protected configuration.
 //!
 //! Not implemented yet, and reported as `UnsupportedCapability` rather than
 //! answered wrongly:
@@ -92,7 +91,6 @@
 //! SEARCH ... AS OF SEQ           the index reflects the present only
 //! Capsule signatures               nothing is signed
 //! the "restore" import mode        identity continuity is not modelled
-//! DESCRIBE TRUST                   no trust evaluation to report
 //! Space-level retention defaults   retention is set per element
 //! ```
 //!

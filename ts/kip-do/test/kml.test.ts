@@ -945,3 +945,13 @@ describe('KML', () => {
     })
   })
 })
+
+
+it('dry-run validates logical keys before producing its preview', async () => {
+  await withNexus('preview-key-conflict', (nexus) => {
+    const parsed = parseKip('MUTATE { CREATE CONCEPT ?a {TYPE "Person" NAME "A" SET FIELDS {key:"same"}} CREATE CONCEPT ?b {TYPE "Person" NAME "B" SET FIELDS {key:"same"}} }')
+    if (!('Kml' in parsed)) throw new Error('expected KML')
+    expect(() => nexus.mutate(parsed.Kml, {}, {dryRun: true})).toThrow(/logical Concept key/)
+    expect(nexus.query('FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }')).toEqual([0])
+  })
+})

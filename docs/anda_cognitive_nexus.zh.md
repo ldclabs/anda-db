@@ -4,6 +4,14 @@
 
 有关 0.13.1 受保护的 Watch/wake 宿主 API、原子性保证、实时租约边界以及其余宿主职责，请参阅[持久化 Watch 移交文档](../rs/anda_cognitive_nexus/README.md#durable-watch-handoff-0131)。
 
+本次运行时修复收紧了 Session 管理接口与事务详情的 Space 边界。全局 Principal/Group 管理需要直接的 system session；可信宿主仍可使用 `nexus.governance()`。显式 `AS OF` 与 `read.snapshot_token` 均要求 `read_history`。
+
+KQL/HISTORY 分页保留首个快照；cursor 按 Principal 记录在当前 Store 内，最多保留 1024 项。重连、淘汰或无效来源返回 `CursorExpired`，调用者应从第一页重新开始。有效的 KQL 续页仍可在没有 `read_history` 的情况下继续原快照。LIST/SEARCH 在相应状态变化后要求重新分页；其余不支持 snapshot_token 的 META 命令显式拒绝该选项。
+
+事务最终身份校验同时作用于 dry-run 与真实提交；提交前拒绝会清理 pending 行。Capsule 新记录经过类型、属性、Facet 与端点检查；ValidationOnly 包仍可用于验证导入数据，不授予本地创建权限。新输出索引首次打开时补齐旧 Activity 的派生键，不改变认知内容、版本或持久化格式。
+
+查询另有 100,000 次中间结果/候选配对工作预算；LIMIT 不豁免 JOIN 预算。历史重建对扫描版本收费，并在同一查询内按 kind 复用结果。性能测量见[审查基准](benchmarks/anda_nexus_2026-09-23/README.md)。
+
 追踪 KIP v2 提交 `dcde1de`，包含 2.1.0 记忆词汇表。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
 
 > 参考实现 **KIP 2.0** Cognitive Nexus —— 构建在 Anda DB 之上的嵌入式 AI Agent 记忆大脑。
@@ -78,7 +86,7 @@ src/
 ├── time.rs        统一规范的 UTC 格式；字典序 == 时间先后顺序
 ├── view.rs        原始核心视图（Spec §53.1）—— KQL 点路径的底层读取对象
 ├── profiles.rs    内置的认知记忆 Profile，同步自规范
-├── store/         管理 10 个 anda_db 集合：数据行、写入路径、Spaces、
+├── store/         管理 12 个 anda_db 集合：数据行、写入路径、Spaces、
 │   ├── history.rs   流水账日志，以及供 AS OF 读取的元素版本日志
 │   └── planes.rs    基于数据行差异比对推导出的分平面版本计数器
 ├── schema/        符号标识、Package 工件、每个 Space 的独立环境
@@ -96,13 +104,14 @@ src/
 
 ## 3. 存储架构
 
-10 个集合用于认知状态，另有 8 个集合用于治理控制平面（第 10 节）。每个核心实体类别独立分配集合，因为它们拥有截然不同的字段结构与高频访问路径：例如投影计算需要首先拉取针对某一命题的所有 Assertion，而对齐阶段的 `SEARCH` 仅检索 Concept 的名称。
+12 个集合用于认知状态，另有 8 个集合用于治理控制平面（第 10 节）。每个核心实体类别独立分配集合，因为它们拥有截然不同的字段结构与高频访问路径：例如投影计算需要首先拉取针对某一命题的所有 Assertion，而对齐阶段的 `SEARCH` 仅检索 Concept 的名称。
 
 | 集合名称                          | 存储内容                                      |
 | :-------------------------------- | :-------------------------------------------- |
 | `concepts` `propositions` `assertions` `evidence` `activities` | 核心认知元素                                 |
 | `spaces`                          | MemorySpace 注册表及其序列号                  |
 | `transactions`                    | 事务提交日志（Commit journal）                |
+| `kip_control_records` `kip_commit_log` | 受保护控制状态与持久化 redo 计划 |
 | `schema_packages` `schema_envs`   | 已安装的 Package 工件及各 Space 的激活状态    |
 | `element_versions`                | 记录元素历史版本的行 —— 供 `AS OF` 读取使用   |
 

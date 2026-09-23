@@ -69,6 +69,9 @@ pub async fn execute(
         request.parameters.as_ref(),
         operation.parameters.as_ref(),
     );
+    if let Err(error) = bind_meta_read(&mut cx, command, request).await {
+        return Response::from(error);
+    }
     let environment_version = cx.env.version;
 
     match run(&mut cx, command).await {
@@ -100,6 +103,61 @@ pub async fn execute(
     }
 }
 
+/// META histories preserve their first page's coordinate. Catalogs and the
+/// live search index expire instead of silently continuing over changed state.
+async fn bind_meta_read(
+    cx: &mut crate::kql::Context<'_>,
+    command: &MetaCommand,
+    request: &Request,
+) -> Result<(), KipError> {
+    use crate::store::history::CursorFamily;
+    use anda_kip::HistoryCommand;
+    match command {
+        MetaCommand::History(history) => {
+            let scalar = match history {
+                HistoryCommand::Element { cursor, .. } | HistoryCommand::Space { cursor, .. } => {
+                    cursor.as_ref()
+                }
+            };
+            let cursor = scalar
+                .map(|s| read_cursor(cx, s, CursorFamily::History))
+                .transpose()?;
+            cx.bind_read(None, request, cursor).await
+        }
+        MetaCommand::List(list) => {
+            if let Some(scalar) = &list.cursor {
+                let cursor = read_cursor(cx, scalar, CursorFamily::List)?;
+                if cursor.snapshot_seq != cx.pinned_seq {
+                    return Err(KipError::cursor_expired(
+                        "list",
+                        "catalog changed; start a new traversal",
+                    ));
+                }
+            }
+            if request
+                .read
+                .as_ref()
+                .is_some_and(|r| r.snapshot_token.is_some())
+            {
+                return Err(KipError::unsupported_capability(
+                    "LIST does not support snapshot_token reads",
+                ));
+            }
+            Ok(())
+        }
+        _ if request
+            .read
+            .as_ref()
+            .is_some_and(|r| r.snapshot_token.is_some()) =>
+        {
+            Err(KipError::unsupported_capability(
+                "this META command does not support snapshot_token reads",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Reads a `CURSOR` slot as the opaque token this engine issues.
 ///
 /// §88.4: a cursor is opaque or authenticated, never a number a caller can
@@ -111,7 +169,10 @@ pub(crate) fn read_cursor(
     family: crate::store::history::CursorFamily,
 ) -> Result<crate::store::history::PageCursor, KipError> {
     let token = describe::scalar_str(cx, scalar, "CURSOR")?;
-    crate::store::history::PageCursor::from_token(&token, &cx.space, family, &cx.traversal)
+    let cursor =
+        crate::store::history::PageCursor::from_token(&token, &cx.space, family, &cx.traversal)?;
+    cursor.require_issued(cx.store, &token, &cx.auth.principal_id)?;
+    Ok(cursor)
 }
 
 /// Issues the cursor for the next page, when one remains.
@@ -128,7 +189,7 @@ pub(crate) fn next_cursor(
             offset: consumed,
             traversal: cx.traversal.clone(),
         }
-        .to_token(&cx.space)
+        .issue(cx.store, &cx.space, &cx.auth.principal_id)
     })
 }
 
@@ -326,6 +387,8 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
                 "cursor": "the last space_seq consumed, opaque to nobody"
             },
             "paging": {
+                "continuations": "principal-bound server mapping; expires after reconnect or eviction",
+                "retained_continuations": 1024,
                 // §44.8 and §88.4: a cursor is opaque, carries the coordinate the
                 // traversal began at, and belongs to the family that issued it.
                 "cursor": "opaque token, snapshot-pinned, per operation family",
@@ -557,6 +620,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
             // a timeout makes the same query succeed or fail depending on
             // machine load, which is not a property a caller can plan around.
             "kql_elements_examined": crate::kql::MAX_CANDIDATES,
+            "kql_intermediate_work": crate::kql::MAX_SOLUTIONS,
             "search_results_per_page": 100,
             "meta_page_default": 100,
         })),

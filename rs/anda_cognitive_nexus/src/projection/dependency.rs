@@ -41,17 +41,29 @@ impl Context<'_> {
                 serde_json::json!({"status":"unverifiable","action_eligible":false,"reasons":["historical projection control state unavailable"],"basis":self.projection_basis(policy,at,None)}),
             );
         }
+        let cache_key = crate::schema::contracts::digest(&serde_json::json!([
+            element.id().to_string(),
+            element.version(),
+            self.pinned_seq,
+            policy,
+            at,
+        ]))?;
+        if let Some(value) = self.dependency_cache.get(&cache_key) {
+            return Ok(value.clone());
+        }
         let mut result = self
             .check_dependencies(element, policy, at, &mut Vec::new())
             .await?;
         result.reasons.sort();
         result.reasons.dedup();
-        Ok(serde_json::json!({
+        let value = serde_json::json!({
             "status": (["current", "needs_review", "unverifiable"][result.state as usize]),
             "action_eligible": result.state == 0,
             "reasons": result.reasons,
             "basis": self.projection_basis(policy, at, result.next),
-        }))
+        });
+        self.dependency_cache.insert(cache_key, value.clone());
+        Ok(value)
     }
 
     async fn check_dependencies(
@@ -119,7 +131,18 @@ impl Context<'_> {
             return Ok(result);
         }
         let mut producer = None;
-        let ids = self.candidates(ElementKind::Activity, None).await?;
+        let ids = self
+            .candidates(
+                ElementKind::Activity,
+                Some(crate::store::eq_fields(&[
+                    ("space", anda_db_schema::Fv::Text(self.space.clone())),
+                    (
+                        "output_keys",
+                        anda_db_schema::Fv::Text(crate::term::Endpoint::Local(id).key()),
+                    ),
+                ])),
+            )
+            .await?;
         self.charge(ids.len())?;
         for aid in ids {
             let Some(Element::Activity(row)) = self.load_unattached(aid).await? else {

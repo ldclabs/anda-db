@@ -4279,6 +4279,55 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "transaction-final-validation",
+    "description": "Final identity validation agrees between preview and commit; client keys also resolve inside one mutation.",
+    "setup": [],
+    "cases": [
+      {
+        "name": "commit refuses the same duplicate logical keys",
+        "command": "MUTATE { CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Duplicate\" SET FIELDS {key: \"same-key\"} } CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Duplicate\" SET FIELDS {key: \"same-key\"} } }",
+        "expect": {
+          "error": "IdentityConflict"
+        }
+      },
+      {
+        "name": "rejected creations leave no visible rows",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {name:\"Duplicate\"} }",
+        "expect": {
+          "result": [
+            0
+          ]
+        }
+      },
+      {
+        "name": "one client key resolves to one creation inside a MUTATE",
+        "command": "MUTATE { CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Batch Alice\" CLIENT KEY \"batch-identity\" } CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Batch Alice\" CLIENT KEY \"batch-identity\" } }",
+        "expect": {}
+      },
+      {
+        "name": "the batch contains one logical creation",
+        "command": "FIND(COUNT(?c)) WHERE { ?c CONCEPT {name:\"Batch Alice\"} }",
+        "expect": {
+          "result": [
+            1
+          ]
+        }
+      },
+      {
+        "name": "the same creation can still retry after commit",
+        "command": "CREATE CONCEPT ?c {TYPE \"Person\" NAME \"Batch Alice\" CLIENT KEY \"batch-identity\"}",
+        "expect": {}
+      },
+      {
+        "name": "a conflicting use of that client key is rejected",
+        "command": "CREATE CONCEPT ?c {TYPE \"Person\" NAME \"Other\" CLIENT KEY \"batch-identity\"}",
+        "expect": {
+          "error": "ClientKeyConflict"
+        }
+      }
+    ]
+  },
+  {
     "name": "transactions",
     "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it. EXPECT VERSION is the one guard, and it is always the trailing clause (Spec §52.8); there is no EXPECT STATE — TRANSITION validates the target's current lifecycle state itself and fails InvalidLifecycleTransition from the wrong one (§35.3, §52.5), while a move to the state already held is a no_effect rather than an error.",
     "setup": [
@@ -4546,4 +4595,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 356
+export const CASE_COUNT = 362

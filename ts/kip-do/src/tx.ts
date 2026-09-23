@@ -781,6 +781,20 @@ export class Transaction {
       ([, staged]) => staged.changed,
     )
 
+    // Logical identities are checked before either preview or persistence.
+    const keys = new Set<string>()
+    for (const [, staged] of pending) {
+      const element = staged.element
+      if (element.kind !== 'Concept' || element.row.key === '') continue
+      const row = element.row
+      const key = canonicalJson([row.lineage, row.key])
+      const existing = this.store.conceptByKey(this.cx.space, row.lineage, row.key)
+      if (keys.has(key) || (existing !== null && existing.id !== row.id))
+        throw errors.identityConflict('a logical Concept key already identifies another element')
+      keys.add(key)
+    }
+    this.propagateGovernance(pending)
+
     if (this.dryRun) {
       // A dry run leaves nothing behind. The caller usually wraps this in a
       // transaction it rolls back, but PREVIEW does not — and a shell that
@@ -799,8 +813,6 @@ export class Transaction {
         this.journal(null, null, idempotencyKey, [], requestDigest)
       return this.outcome('no_effect', null, null, [])
     }
-
-    this.propagateGovernance(pending)
 
     validateCommitLeases(this)
     const seq = this.store.nextSeq(this.cx.space)

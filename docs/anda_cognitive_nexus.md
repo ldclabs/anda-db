@@ -6,6 +6,28 @@ For the 0.13.1 protected Watch/wake host APIs, atomicity guarantees, real-time
 lease bounds and remaining host responsibilities, see
 [Durable Watch handoff](../rs/anda_cognitive_nexus/README.md#durable-watch-handoff-0131).
 
+Session control mutations and transaction descriptions enforce the selected
+Space. Global Principal/Group administration requires a direct system session;
+the trusted host retains `nexus.governance()`. Both explicit `AS OF` and
+`read.snapshot_token` require `read_history`.
+
+KQL/HISTORY pages retain their first snapshot. Continuations are bound to the
+Principal in a bounded Store-local registry (1024 entries); reconnect, eviction
+or an unissued token produces `CursorExpired`, requiring a new traversal.
+Legitimate KQL continuations retain their original snapshot without an extra
+`read_history` grant. LIST/SEARCH expire after relevant state changes; other
+META commands explicitly refuse unsupported snapshot-token reads.
+
+Dry runs and commits share final identity checks, and pre-commit rejection
+cleans pending rows. Capsule creations validate types, attributes, Facets and
+endpoints. ValidationOnly packages can still validate imported data without
+allowing local creation. The new output index backfills old Activity reference
+keys on first open without changing cognitive content, versions or file formats.
+
+Queries also have a 100,000 intermediate-row/candidate-pair work budget; LIMIT
+does not bypass it. Historical reconstruction charges scanned versions and is
+reused per kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
+
 Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
@@ -112,7 +134,7 @@ src/
 
 ## 3. Storage
 
-Ten collections for cognitive state, plus eight for Governance (§10). One per
+Twelve collections for cognitive state, plus eight for Governance (§10). One per
 Core element kind, because they have genuinely different columns and genuinely
 different hot paths: a projection starts by fetching every Assertion about one
 Proposition, while a grounding `SEARCH` looks only at Concept names.
@@ -122,6 +144,7 @@ Proposition, while a grounding `SEARCH` looks only at Concept names.
 | `concepts` `propositions` `assertions` `evidence` `activities` | the Core elements   |
 | `spaces`                          | the MemorySpace registry and its sequence     |
 | `transactions`                    | the commit journal                            |
+| `kip_control_records` `kip_commit_log` | protected controls and durable redo plans |
 | `schema_packages` `schema_envs`   | installed artifacts, and per-Space activation |
 | `element_versions`                | one row per element version — what `AS OF` reads |
 

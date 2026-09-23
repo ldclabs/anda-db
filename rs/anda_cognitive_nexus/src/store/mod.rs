@@ -1,8 +1,9 @@
 //! # The storage layer
 //!
-//! Ten `anda_db` collections: one per Core element kind (Spec §6.1), plus the
+//! Twelve `anda_db` collections: one per Core element kind (Spec §6.1), plus the
 //! MemorySpace registry, the transaction journal, the Schema Package and Schema
-//! Environment registries, and the element version log. The Governance Control
+//! Environment registries, the element version log, protected controls and the
+//! durable commit log. The Governance Control
 //! Plane's eight collections live beside them under
 //! [`governance`](crate::governance::store), in the same database and behind
 //! the same flush — but semantically a different plane, and reachable from no
@@ -134,6 +135,7 @@ macro_rules! collections {
             /// which is what keeps an ordinary cognitive write off the control plane.
             pub governance: crate::governance::store::GovernanceStore,
             pub evaluation_rules: crate::evaluation::EvaluationRules,
+            issued_cursors: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String)>>>,
             $($field: Slot,)*
             /// Resolved Schema Environments, keyed by Space and version.
             ///
@@ -165,6 +167,7 @@ macro_rules! collections {
                     db,
                     governance,
                     evaluation_rules: crate::evaluation::EvaluationRules::default(),
+                    issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
                     $($field,)*
                     environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
                 };
@@ -198,7 +201,7 @@ macro_rules! collections {
     };
 }
 
-// The engine's ten collections, declared once.
+// The engine's collections, declared once.
 //
 // Each row names the accessor, the row type whose schema it is opened with,
 // the collection name, the index setup, and the description. Opening,
@@ -376,6 +379,32 @@ async fn init_activities(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["status"]).await?;
     // The provenance DAG is walked backward from outputs to inputs (§62).
     c.create_btree_index_nx(&["input_keys"]).await?;
+    // Older Capsule imports did not fill this derived column. Repair it once
+    // before building the index; this changes no cognitive content or version.
+    if c.get_btree_index(&["output_keys"]).is_err() {
+        for id in c.ids() {
+            let mut row: ActivityRow = c.get_as(id).await?;
+            let old = (row.input_keys.clone(), row.output_keys.clone());
+            row.refresh_index_keys();
+            if old != (row.input_keys.clone(), row.output_keys.clone()) {
+                c.update(
+                    id,
+                    BTreeMap::from([
+                        (
+                            "input_keys".into(),
+                            Fv::Array(row.input_keys.into_iter().map(Fv::Text).collect()),
+                        ),
+                        (
+                            "output_keys".into(),
+                            Fv::Array(row.output_keys.into_iter().map(Fv::Text).collect()),
+                        ),
+                    ]),
+                )
+                .await?;
+            }
+        }
+    }
+    c.create_btree_index_nx(&["output_keys"]).await?;
     Ok(())
 }
 

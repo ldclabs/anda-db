@@ -500,7 +500,7 @@ async fn optional_element_indexes_stay_sparse_through_crud_and_recovery() {
                 .await
                 .unwrap(),
             &["expires_at", "client_key"],
-            &["seq", "output_keys"],
+            &["seq"],
         ),
     ];
 

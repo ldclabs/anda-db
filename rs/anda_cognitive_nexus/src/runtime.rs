@@ -174,6 +174,23 @@ fn facet<'a>(element: &'a Element, name: &str) -> Result<&'a Json, KipError> {
         .ok_or_else(|| KipError::constraint_violation(format!("missing {name}")))
 }
 
+/// Required lease fields are decoded once at the protected host boundary.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TaskLease {
+    owner: String,
+    fencing_token: u64,
+    expires_at: String,
+    #[serde(default)]
+    attempt_count: u64,
+}
+
+impl TaskLease {
+    fn read(value: &Json) -> Result<Self, KipError> {
+        serde_json::from_value(value.clone())
+            .map_err(|e| KipError::constraint_violation(format!("invalid LeaseState: {e}")))
+    }
+}
+
 impl Session {
     async fn check_dispatch(
         &self,
@@ -184,15 +201,12 @@ impl Session {
         let authority = self.effective_authority(space).await?;
         let task = store.get_element(request.task_ref.parse()?).await?;
         let task_view = crate::view::render(&task);
-        let lease = facet(&task, "LeaseState")?;
-        let lease_expiry = crate::time::normalize(
-            lease["expires_at"].as_str().unwrap_or(""),
-            "lease expires_at",
-        )?;
+        let lease = TaskLease::read(facet(&task, "LeaseState")?)?;
+        let lease_expiry = crate::time::normalize(&lease.expires_at, "lease expires_at")?;
         if task.space() != space
             || task_view["attributes"]["status"] != "running"
-            || lease["owner"] != self.auth.principal_id
-            || lease["fencing_token"] != request.fencing_token
+            || lease.owner != self.auth.principal_id
+            || lease.fencing_token != request.fencing_token
             || lease_expiry <= crate::time::now()
         {
             return Err(KipError::version_conflict(
@@ -570,23 +584,62 @@ impl Session {
         expires_at: &str,
     ) -> Result<Json, KipError> {
         let expires_at = crate::time::normalize(expires_at, "lease expires_at")?;
-        self.with_authority(space,async |authority| {
-            let id=task_ref.parse()?;
-            let mut tx=Transaction::begin(&self.nexus.store,space,json!({"principal_id":self.auth.principal_id}),false,authority,(*self.auth).clone()).await?;
-            tx.authorize_element(id,Permission::Update).await?;
-            tx.expect_versions(id,&[Guard{version:expected,plane:PlaneKey::Element}]).await?;
-            let now=tx.cx.at.clone();
-            let Element::Concept(row)=tx.load(id).await? else {return Err(KipError::constraint_violation("task must be a SleepTask"));};
-            if row.schema_ref!=format!("{PROFILE}SleepTask") {return Err(KipError::constraint_violation("task must be a SleepTask"));}
-            let previous=row.facets.get(&format!("{PROFILE}LeaseState")).cloned();
-            let previous_expiry=previous.as_ref().and_then(|p|p["expires_at"].as_str()).map(|value|crate::time::normalize(value,"lease expires_at")).transpose()?;
-            let takeover=row.attributes.get("status")!=Some(&json!("running")) || previous_expiry.as_ref().is_some_and(|expiry|expiry<=&now);
-            let fence=previous.as_ref().and_then(|p|p["fencing_token"].as_u64()).unwrap_or(0)+u64::from(takeover||previous.is_none());
-            let attempts=previous.as_ref().and_then(|p|p["attempt_count"].as_u64()).unwrap_or(0)+u64::from(takeover||previous.is_none());
-            let lease=json!({"owner":self.auth.principal_id,"fencing_token":fence,"expires_at":expires_at,"attempt_count":attempts});
-            row.attributes.insert("status".into(),json!("running"));row.facets.insert(format!("{PROFILE}LeaseState"),lease.clone());
-            tx.mark_changed(id,anda_kip::ChangeOp::Update);let outcome=tx.commit(JournalEntry::default()).await?;
+        self.with_authority(space, async |authority| {
+            let id = task_ref.parse()?;
+            let mut tx = Transaction::begin(
+                &self.nexus.store,
+                space,
+                json!({"principal_id":self.auth.principal_id}),
+                false,
+                authority,
+                (*self.auth).clone(),
+            )
+            .await?;
+            tx.authorize_element(id, Permission::Update).await?;
+            tx.expect_versions(
+                id,
+                &[Guard {
+                    version: expected,
+                    plane: PlaneKey::Element,
+                }],
+            )
+            .await?;
+            let now = tx.cx.at.clone();
+            let Element::Concept(row) = tx.load(id).await? else {
+                return Err(KipError::constraint_violation("task must be a SleepTask"));
+            };
+            if row.schema_ref != format!("{PROFILE}SleepTask") {
+                return Err(KipError::constraint_violation("task must be a SleepTask"));
+            }
+            let previous = row
+                .facets
+                .get(&format!("{PROFILE}LeaseState"))
+                .map(TaskLease::read)
+                .transpose()?;
+            let previous_expiry = previous
+                .as_ref()
+                .map(|p| crate::time::normalize(&p.expires_at, "lease expires_at"))
+                .transpose()?;
+            let takeover = row.attributes.get("status") != Some(&json!("running"))
+                || previous_expiry
+                    .as_ref()
+                    .is_some_and(|expiry| expiry <= &now);
+            let increment = u64::from(takeover || previous.is_none());
+            let lease = TaskLease {
+                owner: self.auth.principal_id.clone(),
+                fencing_token: previous.as_ref().map_or(0, |p| p.fencing_token) + increment,
+                attempt_count: previous.as_ref().map_or(0, |p| p.attempt_count) + increment,
+                expires_at,
+            };
+            let lease =
+                serde_json::to_value(lease).map_err(|e| KipError::internal_error(e.to_string()))?;
+            row.attributes.insert("status".into(), json!("running"));
+            row.facets
+                .insert(format!("{PROFILE}LeaseState"), lease.clone());
+            tx.mark_changed(id, anda_kip::ChangeOp::Update);
+            let outcome = tx.commit(JournalEntry::default()).await?;
             Ok(json!({"lease":lease,"receipt":outcome.receipt}))
-        }).await
+        })
+        .await
     }
 }

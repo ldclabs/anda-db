@@ -165,7 +165,34 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             None,
         );
         let mut views = std::collections::BTreeMap::new();
-        let ids = cx.active_of(kind).await?;
+        let mut filters = vec![
+            crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
+            crate::store::eq_field("state", anda_db_schema::Fv::Text("active".into())),
+        ];
+        let selector = match kind {
+            ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
+            ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
+            _ => None,
+        };
+        if let Some((field, symbol)) = selector
+            && let Some((low, high)) = crate::schema::lineage_range(symbol)
+        {
+            filters.push(anda_db::query::Filter::Field((
+                field.into(),
+                anda_db::query::RangeQuery::Between(
+                    anda_db_schema::Fv::Text(low),
+                    anda_db_schema::Fv::Text(high),
+                ),
+            )));
+        }
+        let ids = cx
+            .candidates(
+                kind,
+                Some(anda_db::query::Filter::And(
+                    filters.into_iter().map(Box::new).collect(),
+                )),
+            )
+            .await?;
         cx.charge(ids.len())?;
         for id in ids {
             let Some(element) = cx.load(id).await? else {

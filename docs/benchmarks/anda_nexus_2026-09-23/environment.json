@@ -1,0 +1,23 @@
+{
+  "baseline": "b77dd10",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "profile": "standalone Cargo release, opt-level=3, default features",
+  "backend": "object_store InMemory, default DBConfig storage",
+  "sizes": [
+    1000,
+    10000
+  ],
+  "warmup": 1,
+  "iterations": 5,
+  "process_pairs": 3,
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after"
+  ],
+  "notes": "Identical driver. Setup excluded; one warm-up followed by five measurements per workload. No other build or test started by this task runs during the paired measurements. This is local microbenchmark latency, not production throughput."
+}

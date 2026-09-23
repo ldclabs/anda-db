@@ -265,6 +265,15 @@ pub fn validate_record(
     view: &Json,
     before: Option<&Json>,
 ) -> Result<(), KipError> {
+    validate_record_with_intent(env, view, before, super::Intent::Write)
+}
+
+pub(crate) fn validate_record_with_intent(
+    env: &super::SchemaEnvironment,
+    view: &Json,
+    before: Option<&Json>,
+    intent: super::Intent,
+) -> Result<(), KipError> {
     anda_kip::validate_json(view)?;
     let terminal = |v: &Json| {
         matches!(
@@ -286,8 +295,7 @@ pub fn validate_record(
                     "an attached OutcomeRecord is immutable, including previously absent optional members",
                 ));
             }
-            let symbol =
-                env.resolve_symbol(super::SymbolKind::Facet, name, super::Intent::Write)?;
+            let symbol = env.resolve_symbol(super::SymbolKind::Facet, name, intent)?;
             let def = env.facet_def(&symbol)?;
             if let Some(schema) = def.extra.get("value_schema") {
                 validate_value(schema, value)?;

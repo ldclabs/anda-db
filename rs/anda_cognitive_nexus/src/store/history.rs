@@ -42,7 +42,16 @@ impl Store {
         row: &R,
     ) -> Result<(), KipError> {
         // A retained redo intent may replay after the version was flushed.
-        for row_id in self.version_ids(&cx.space, id).await? {
+        for row_id in self
+            .element_versions()
+            .query_all_ids(eq_fields(&[
+                ("space", Fv::Text(cx.space.clone())),
+                ("element", Fv::Text(id.to_string())),
+                ("tx_id", Fv::Text(cx.tx_id.clone())),
+            ]))
+            .await
+            .map_err(db_error)?
+        {
             let old: ElementVersionRow = self
                 .element_versions()
                 .get_as(row_id)
@@ -209,19 +218,61 @@ impl Store {
         kind: ElementKind,
         seq: u64,
     ) -> Result<Vec<Element>, KipError> {
-        let ids = self
-            .element_versions()
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
-                Box::new(eq_field("kind", Fv::Text(kind.to_string()))),
-                Box::new(Filter::Field((
-                    "seq".to_string(),
-                    RangeQuery::Le(Fv::U64(seq)),
-                ))),
-            ]))
-            .await
-            .map_err(db_error)?;
+        Ok(self
+            .elements_at_bounded(space_id, kind, seq, usize::MAX)
+            .await?
+            .0)
+    }
 
+    /// Bound version-log work before decoding full historical rows.
+    pub(crate) async fn elements_at_bounded(
+        &self,
+        space_id: &str,
+        kind: ElementKind,
+        seq: u64,
+        budget: usize,
+    ) -> Result<(Vec<Element>, usize), KipError> {
+        let table = self.element_versions();
+        let filter = Filter::And(vec![
+            Box::new(eq_field("space", Fv::Text(space_id.into()))),
+            Box::new(eq_field("kind", Fv::Text(kind.to_string()))),
+            Box::new(Filter::Field(("seq".into(), RangeQuery::Le(Fv::U64(seq))))),
+        ]);
+        let mut ids = Vec::new();
+        let mut after = 0;
+        loop {
+            let limit = budget
+                .saturating_sub(ids.len())
+                .saturating_add(1)
+                .min(anda_db::collection::Collection::MAX_SEARCH_LIMIT);
+            let page = table
+                .query_ids(
+                    Filter::And(vec![
+                        Box::new(filter.clone()),
+                        Box::new(Filter::Field((
+                            "_id".into(),
+                            RangeQuery::Gt(Fv::U64(after)),
+                        ))),
+                    ]),
+                    Some(limit),
+                )
+                .await
+                .map_err(db_error)?;
+            if let Some(id) = page.last() {
+                after = *id;
+            }
+            let done = page.len() < limit;
+            ids.extend(page);
+            if ids.len() > budget {
+                return Err(KipError::resource_exhausted(
+                    "historical version scan exceeds query budget",
+                ));
+            }
+            if done {
+                break;
+            }
+        }
+        let scanned = ids.len();
         let mut latest: BTreeMap<String, ElementVersionRow> = BTreeMap::new();
         for row_id in ids {
             let row: ElementVersionRow = self
@@ -236,7 +287,54 @@ impl Store {
                 }
             }
         }
-        latest.into_values().map(decode).collect()
+        Ok((
+            latest.into_values().map(decode).collect::<Result<_, _>>()?,
+            scanned,
+        ))
+    }
+
+    /// Ordered by logical sequence, independent of journal insertion order.
+    /// Caller holds the Nexus guard; only the selected page is materialized.
+    pub(crate) async fn journal_page(
+        &self,
+        space: &str,
+        after: u64,
+        through: u64,
+        limit: usize,
+    ) -> Result<Vec<TransactionRow>, KipError> {
+        if after >= through || limit == 0 {
+            return Ok(vec![]);
+        }
+        let table = self.transactions();
+        let mut ids = Vec::new();
+        {
+            let spaces = table.get_btree_index(&["space"]).map_err(db_error)?;
+            let sequences = table.get_btree_index(&["seq"]).map_err(db_error)?;
+            if let Some(result) = spaces.query_with(&Fv::Text(space.into()), |members| {
+                Some(sequences.try_range_query_ids(
+                    RangeQuery::Between(Fv::U64(after + 1), Fv::U64(through)),
+                    false,
+                    |posting| {
+                        for id in posting {
+                            if members.binary_search(id).is_ok() {
+                                ids.push(*id);
+                                if ids.len() == limit {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    },
+                ))
+            }) {
+                result.map_err(db_error)?;
+            }
+        }
+        let mut rows = Vec::with_capacity(ids.len());
+        for id in ids {
+            rows.push(table.get_as(id).await.map_err(db_error)?);
+        }
+        Ok(rows)
     }
 
     /// The transaction that produced one Space sequence, when the journal
@@ -519,6 +617,40 @@ impl CursorFamily {
 }
 
 impl PageCursor {
+    /// Server-mapped continuations preserve ordinary paging without granting
+    /// arbitrary historical reads. Eviction or reconnect requires a new page 1.
+    pub(crate) fn issue(&self, store: &Store, space: &str, principal: &str) -> String {
+        let token = self.to_token(space);
+        let mut issued = store.issued_cursors.lock();
+        if !issued.iter().any(|(p, t)| p == principal && t == &token) {
+            if issued.len() == 1024 {
+                issued.pop_front();
+            }
+            issued.push_back((principal.into(), token.clone()));
+        }
+        token
+    }
+
+    pub(crate) fn require_issued(
+        &self,
+        store: &Store,
+        token: &str,
+        principal: &str,
+    ) -> Result<(), KipError> {
+        if !store
+            .issued_cursors
+            .lock()
+            .iter()
+            .any(|(p, t)| p == principal && t == token)
+        {
+            return Err(KipError::cursor_expired(
+                self.family.tag(),
+                "continuation unavailable; start a new traversal",
+            ));
+        }
+        Ok(())
+    }
+
     /// The opaque token a client passes back to continue.
     ///
     /// Opaque by contract rather than by encryption, like a snapshot token: a
