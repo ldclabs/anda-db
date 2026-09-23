@@ -76,3 +76,43 @@ Record hardware, Rust version, profile, workload and seeds with results. Report
 recall together with throughput/latency and heap/RSS: a faster graph with worse
 recall is a different tradeoff, not an unconditional optimization. Large matrix
 coverage is a runnable capability, not a claim that every case was executed.
+
+## September 23, 2026 comparison
+
+[Raw phase measurements](results/review-20260923.csv) and
+[environment / parameters](results/review-20260923.json) compare the HNSW source
+at `975b16a7` with duplicate-aware selection, fresh f32 pruning scores, cached
+cosine norms, reusable writer scratch and streamlined loading. Both binaries use
+opt-level 3, LTO, the same dependencies and the counting allocator. The table
+shows medians of three trials, each with 1,000 uniform vectors, M=32,
+efConstruction=200, efSearch=50, 16 maximum layers and seed 42. There are 100
+queries per phase and 40 exact recall queries. Only the 768-dimensional case
+enables deletion reconnection. Deletion removes 199 nodes.
+
+| Case | Build ms, before → after | Load ms, before → after | Delete ms, before → after | Build allocations, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Cosine, D=384 | 1563.256 → 994.543 | 11.330 → 9.098 | 12.542 → 10.775 | 398,657 → 279,224 |
+| Cosine, D=768, reconnect | 2727.119 → 1763.915 | 15.790 → 13.716 | 7687.198 → 4473.675 | 398,345 → 278,826 |
+| Euclidean, D=128 | 539.761 → 507.508 | 7.671 → 6.375 | 10.827 → 11.317 | 397,903 → 278,368 |
+
+Load allocations fell by about 29% in all three cases. Cosine D=768 deletion
+allocations fell from 292,007 to 55,456 with scratch reuse. Cosine recall@10
+was unchanged: 1.0 at D=384 and 0.9975 at D=768, both initially and after
+reinsertion. Euclidean initial recall increased from 0.9975 to 1.0; after
+reinsertion it remained 0.9975. Euclidean query elapsed time increased from
+12.532 to 13.190 ms initially and from 12.944 to 13.925 ms after reinsertion
+(5–8%). Fresh pruning scores change graph topology, so this is a measured
+quality/performance tradeoff, not an across-the-board query speedup.
+
+Scratch reuse retains memory between mutations: the build phase's net live
+requested heap grew by about 0.5 MB relative to the baseline in these cases.
+For D=768 with reconnection, the deletion phase's live-byte delta changed from
+−0.79 MB to +2.12 MB as its pair-distance cache grew. This is allocation reuse,
+not a reduction in retained heap. Search and pair-distance caches release
+capacities above 131,072 entries after an operation.
+
+These are synthetic, non-isolated machine measurements with allocator
+instrumentation. The original and loaded graphs coexist during the load phase;
+its process-wide peak includes both graphs and serialized data. The table is
+not a standalone index RSS estimate. Wider datasets and production hardware
+need separate measurements.

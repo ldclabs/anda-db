@@ -229,6 +229,8 @@ pub enum SelectNeighborsStrategy {
     /// Algorithm 4 from the HNSW paper with `keepPrunedConnections`: keeps a
     /// candidate only if it is closer to the query than to every neighbor
     /// already selected, then backfills with the closest pruned candidates.
+    /// Identical candidate vectors are deferred to backfill so distinct
+    /// directions can survive pruning even in duplicate-heavy data.
     /// Better recall than [`SelectNeighborsStrategy::Simple`], especially on
     /// clustered data.
     Heuristic,

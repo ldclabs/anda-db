@@ -148,35 +148,41 @@ impl HnswIndex {
         let mixed = loaded
             .values()
             .any(|(_, generation)| *generation > saved_version);
-        let rebuild_safe = loaded.values().all(|(node, _)| {
-            self.config
-                .distance_metric
-                .validate_stored(&node.vector, &self.name)
-                .is_ok()
-        });
+        let rebuild_safe = mixed
+            && loaded.values().all(|(node, _)| {
+                self.config
+                    .distance_metric
+                    .validate_stored(&node.vector, &self.name)
+                    .is_ok()
+            });
         let layers: FxHashMap<_, _> = loaded.iter().map(|(&id, (n, _))| (id, n.layer)).collect();
-        let vectors: FxHashMap<_, _> = loaded
-            .iter()
-            .map(|(&id, (node, _))| (id, node.vector.clone()))
-            .collect();
+        let repair_distances = mixed && !rebuild_safe;
+        let vectors: FxHashMap<_, _> = if repair_distances || loaded.values().any(|(_, g)| *g == 0)
+        {
+            loaded
+                .iter()
+                .map(|(&id, (node, _))| (id, node.vector.clone()))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
         let mut repaired = BTreeSet::new();
         for (&id, (node, generation)) in &mut loaded {
             let node = Arc::make_mut(node);
             let mut changed = false;
             for (layer, edges) in node.neighbors.iter_mut().enumerate() {
-                let mut seen = FxHashSet::default();
+                let old_len = edges.len();
                 edges.retain(|&(target, _)| {
-                    let keep = target != id
-                        && layers.get(&target).is_some_and(|&l| l as usize >= layer)
-                        && seen.insert(target);
-                    changed |= !keep;
-                    keep
+                    target != id && layers.get(&target).is_some_and(|&l| l as usize >= layer)
                 });
+                edges.sort_unstable_by_key(|edge| edge.0);
+                edges.dedup_by_key(|edge| edge.0);
+                changed |= edges.len() != old_len;
             }
             // Old snapshots may contain stale distances after ID reuse. A
             // mixed image containing a legacy-range vector cannot safely use
             // normal insertion to rebuild, so repair all of its edges here.
-            if *generation == 0 || (mixed && !rebuild_safe) {
+            if *generation == 0 || repair_distances {
                 for edges in &mut node.neighbors {
                     edges.retain_mut(|(target, distance)| {
                         let Ok(fresh) = self
@@ -193,9 +199,6 @@ impl HnswIndex {
                         true
                     });
                 }
-            }
-            for edges in &mut node.neighbors {
-                edges.sort_unstable_by_key(|edge| edge.0);
             }
             if changed {
                 node.version = node.version.saturating_add(1);
@@ -550,6 +553,7 @@ impl HnswIndex {
     /// budget. Errors, cancellation and Stopped leave the entire snapshot
     /// retryable. Before an error or Stopped result is returned, every node
     /// callback already created by this method is awaited to completion.
+    /// All payload sizes are checked before the first callback is invoked.
     pub async fn flush_with_options<N, NF, I, IF, M, MF>(
         &self,
         now_ms: u64,
@@ -584,6 +588,24 @@ impl HnswIndex {
             .any(|&size| size > options.max_in_flight_bytes)
         {
             return Err(self.operation_error("A node exceeds the configured flush byte budget"));
+        }
+        // Reject deterministic size/encoding failures before external I/O.
+        let ids = self.encode_ids(snapshot.ids.clone())?;
+        if ids.len() > options.max_in_flight_bytes {
+            return Err(
+                self.operation_error("The IDs image exceeds the configured flush byte budget")
+            );
+        }
+
+        let metadata = self.encode_metadata(
+            &snapshot.metadata,
+            snapshot.entry_point,
+            snapshot.removed.keys().copied().collect(),
+        )?;
+        if metadata.len() > options.max_in_flight_bytes {
+            return Err(
+                self.operation_error("The metadata image exceeds the configured flush byte budget")
+            );
         }
         let mut pending = FuturesUnordered::new();
         let mut offset = 0;
@@ -636,24 +658,7 @@ impl HnswIndex {
             return Ok(FlushOutcome::Stopped);
         }
 
-        let ids = self.encode_ids(snapshot.ids.clone())?;
-        if ids.len() > options.max_in_flight_bytes {
-            return Err(
-                self.operation_error("The IDs image exceeds the configured flush byte budget")
-            );
-        }
         ids_f(ids).await.map_err(|e| self.operation_error(e))?;
-
-        let metadata = self.encode_metadata(
-            &snapshot.metadata,
-            snapshot.entry_point,
-            snapshot.removed.keys().copied().collect(),
-        )?;
-        if metadata.len() > options.max_in_flight_bytes {
-            return Err(
-                self.operation_error("The metadata image exceeds the configured flush byte budget")
-            );
-        }
         metadata_f(metadata)
             .await
             .map_err(|e| self.operation_error(e))?;

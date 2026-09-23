@@ -1429,7 +1429,6 @@ fn test_select_neighbors_invalid_bf16_and_pending_metadata_flush() {
             u64::MAX,
             0,
             0,
-            0,
             &mut layer_cache
         ),
         Err(HnswError::NotFound { id: u64::MAX, .. })

@@ -82,13 +82,24 @@ impl DistanceMetric {
     /// migration when their vectors predate those bounds.
     pub(crate) fn stored(&self, a: &[bf16], b: &[bf16]) -> Result<f32, HnswError> {
         let value = self.validated(a, b)?;
-        if bf16::from_f32(value).is_finite() {
-            Ok(value)
+        stored_distance(value)
+    }
+
+    /// Internal graph operands have already been validated and their norms are
+    /// immutable. Reuse them during selection, pruning and deletion repair.
+    pub(crate) fn stored_with_norms(
+        &self,
+        a: &[bf16],
+        norm_a: f64,
+        b: &[bf16],
+        norm_b: f64,
+    ) -> Result<f32, HnswError> {
+        let value = if *self == Self::Cosine {
+            cosine_with_norms(a, norm_a, b, norm_b)?
         } else {
-            Err(numeric_error(
-                "distance cannot be represented by the stored edge format",
-            ))
-        }
+            self.validated(a, b)?
+        };
+        stored_distance(value)
     }
 
     fn wide<A: AsF32, B: AsF32>(&self, a: &[A], b: &[B]) -> f64 {
@@ -420,17 +431,36 @@ impl<'a> PreparedQuery<'a> {
         if self.metric != DistanceMetric::Cosine {
             return self.metric.validated(self.values, vector);
         }
-        if self.norm < f32::EPSILON as f64 || node_norm < f32::EPSILON as f64 {
-            return Ok(1.0);
-        }
-        let dot = -inner_product(self.values, vector);
-        let dot = if dot.is_finite() {
-            dot as f64
-        } else {
-            dot_wide(self.values, vector)
-        };
-        finite_distance(1.0 - (dot / (self.norm * node_norm)).clamp(-1.0, 1.0))
+        cosine_with_norms(self.values, self.norm, vector, node_norm)
     }
+}
+
+fn stored_distance(value: f32) -> Result<f32, HnswError> {
+    if bf16::from_f32(value).is_finite() {
+        Ok(value)
+    } else {
+        Err(numeric_error(
+            "distance cannot be represented by the stored edge format",
+        ))
+    }
+}
+
+fn cosine_with_norms<A: AsF32, B: AsF32>(
+    a: &[A],
+    norm_a: f64,
+    b: &[B],
+    norm_b: f64,
+) -> Result<f32, HnswError> {
+    if norm_a < f32::EPSILON as f64 || norm_b < f32::EPSILON as f64 {
+        return Ok(1.0);
+    }
+    let dot = -inner_product(a, b);
+    let dot = if dot.is_finite() {
+        dot as f64
+    } else {
+        dot_wide(a, b)
+    };
+    finite_distance(1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0))
 }
 
 #[inline]

@@ -22,14 +22,26 @@ thread_local! {
     static WORKSPACE: RefCell<SearchWorkspace> = RefCell::new(SearchWorkspace::default());
 }
 
+fn with_workspace<R>(f: impl FnOnce(&mut SearchWorkspace) -> R) -> R {
+    WORKSPACE.with(|cell| {
+        if let Ok(mut workspace) = cell.try_borrow_mut() {
+            let result = f(&mut workspace);
+            workspace.trim();
+            result
+        } else {
+            f(&mut SearchWorkspace::default())
+        }
+    })
+}
+
 impl SearchWorkspace {
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.distances.clear();
         self.visited.clear();
         self.candidates.clear();
         self.results.clear();
     }
-    fn trim(&mut self) {
+    pub(super) fn trim(&mut self) {
         // A single unusually expensive traversal must not permanently retain
         // an unbounded allocation on every worker thread.
         if self.distances.capacity() > 131_072
@@ -50,14 +62,14 @@ impl HnswIndex {
         if top_k == 0 {
             return Ok(Vec::new());
         }
-        self.validate_query(
+        let ef = self.validate_query(
             query.len(),
             query.iter().all(|v| v.is_finite()),
             top_k,
             SearchOptions::default(),
         )?;
         let query: Vec<f32> = query.iter().map(|v| v.to_f32()).collect();
-        self.search_f32(&query, top_k)
+        with_workspace(|workspace| self.search_validated(&query, top_k, ef, workspace))
     }
 
     /// Searches without quantizing the f32 query. See Self::search for limits.
@@ -72,20 +84,7 @@ impl HnswIndex {
         top_k: usize,
         options: SearchOptions,
     ) -> Result<Vec<(u64, f32)>, HnswError> {
-        WORKSPACE.with(|cell| {
-            if let Ok(mut workspace) = cell.try_borrow_mut() {
-                let result = self.search_f32_with_workspace(query, top_k, options, &mut workspace);
-                workspace.trim();
-                result
-            } else {
-                self.search_f32_with_workspace(
-                    query,
-                    top_k,
-                    options,
-                    &mut SearchWorkspace::default(),
-                )
-            }
-        })
+        with_workspace(|workspace| self.search_f32_with_workspace(query, top_k, options, workspace))
     }
 
     /// Searches using caller-owned scratch allocations.
@@ -105,6 +104,16 @@ impl HnswIndex {
             top_k,
             options,
         )?;
+        self.search_validated(query, top_k, ef, workspace)
+    }
+
+    fn search_validated(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+    ) -> Result<Vec<(u64, f32)>, HnswError> {
         let query = PreparedQuery::new(self.config.distance_metric, query);
         for attempt in 0..Self::SEARCH_MAX_ATTEMPTS {
             workspace.reset();
@@ -155,13 +164,12 @@ impl HnswIndex {
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> Result<Vec<(u64, f32)>, HnswError> {
-        let (mut id, mut level) = *self.entry_point.read();
+        let (mut id, level) = *self.entry_point.read();
         for layer in (1..=level).rev() {
             let candidate = self.greedy_search(query, id, layer, workspace)?;
             id = candidate.0;
-            level = candidate.2;
         }
-        let mut results = self.search_layer(query, id, level, 0, ef, workspace)?;
+        let mut results = self.search_layer(query, id, 0, ef, workspace)?;
         results.truncate(top_k);
         Ok(results
             .into_iter()
@@ -212,15 +220,28 @@ impl HnswIndex {
         &self,
         query: &PreparedQuery<'_>,
         entry: u64,
-        _entry_layer: u8,
         layer: u8,
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
+        let mut output = Vec::new();
+        self.search_layer_into(query, entry, layer, ef, workspace, &mut output)?;
+        Ok(output)
+    }
+
+    pub(super) fn search_layer_into(
+        &self,
+        query: &PreparedQuery<'_>,
+        entry: u64,
+        layer: u8,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+        output: &mut Vec<Neighbor>,
+    ) -> Result<(), HnswError> {
+        output.clear();
         if ef <= 1 {
-            return self
-                .greedy_search(query, entry, layer, workspace)
-                .map(|node| vec![node]);
+            output.push(self.greedy_search(query, entry, layer, workspace)?);
+            return Ok(());
         }
         workspace.visited.clear();
         workspace.candidates.clear();
@@ -270,12 +291,12 @@ impl HnswIndex {
                 }
             }
         }
-        let mut output = Vec::with_capacity(workspace.results.len());
+        output.reserve(workspace.results.len());
         while let Some((distance, id, layer)) = workspace.results.pop() {
             output.push((id, distance.0, layer));
         }
         output.reverse();
-        Ok(output)
+        Ok(())
     }
 
     fn search_distance(

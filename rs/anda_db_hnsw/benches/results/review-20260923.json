@@ -1,0 +1,46 @@
+{
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "baseline_commit": "975b16a7f82669da00ad5a5c80910cbd124bab21",
+  "opt_level": 3,
+  "lto": true,
+  "codegen_units": 1,
+  "counting_allocator": true,
+  "common_arguments": [
+    "--run",
+    "--n",
+    "1000",
+    "--queries",
+    "100",
+    "--recall-queries",
+    "40",
+    "--seed",
+    "42"
+  ],
+  "cases": {
+    "cosine-384": [
+      "--dim",
+      "384",
+      "--metric",
+      "cosine"
+    ],
+    "cosine-768-reconnect": [
+      "--dim",
+      "768",
+      "--metric",
+      "cosine",
+      "--reconnect",
+      "true"
+    ],
+    "euclidean-128": [
+      "--dim",
+      "128",
+      "--metric",
+      "euclidean"
+    ]
+  },
+  "trials": 3,
+  "comparison": "Same benchmark executable source, dependencies, parameters and seeds. Baseline binary saved before HNSW changes; current binary includes duplicate-aware selection, f32 pruning scores, cached norms and reusable writer scratch.",
+  "scope": "Synthetic uniform vectors; macOS arm64; machine not isolated. Runs performed without concurrent Cargo builds/tests. Report medians, not universal speedups. No RSS measurement. Euclidean query time increased 5-8%; initial recall rose from 0.9975 to 1.0, post-reinsert recall stayed 0.9975."
+}

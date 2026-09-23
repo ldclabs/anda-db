@@ -89,7 +89,7 @@ fn recall_at_k(
     k: usize,
 ) -> f64 {
     let (truth, kth) = ground_truth(metric, data, query, k);
-    let threshold = kth * 1.001 + 1e-6;
+    let threshold = kth + kth.abs() * 0.001 + 1e-6;
     let hits = results
         .iter()
         .take(k)
@@ -185,6 +185,99 @@ fn cosine_recall_at_10_meets_floor() {
     println!("cosine: avg recall@10 = {avg:.4}, min = {min:.4}");
     assert!(avg >= 0.95, "average recall@10 too low: {avg:.4}");
     assert!(min >= 0.60, "worst-case recall@10 too low: {min:.4}");
+}
+
+#[test]
+fn inner_product_and_manhattan_recall_at_10_meet_floor() {
+    for metric in [DistanceMetric::InnerProduct, DistanceMetric::Manhattan] {
+        let bench = Bench::build(metric, 1000, 32, 50, 42);
+        let (avg, min) = bench.measure(&bench.index);
+        println!("{metric:?}: avg recall@10 = {avg:.4}, min = {min:.4}");
+        assert!(
+            avg >= 0.95,
+            "{metric:?} average recall@10 too low: {avg:.4}"
+        );
+        assert!(
+            min >= 0.60,
+            "{metric:?} worst-case recall@10 too low: {min:.4}"
+        );
+    }
+}
+
+#[test]
+fn negative_distance_boundary_ties_count_as_hits() {
+    let data = BTreeMap::from([(1, vec![10.0]), (2, vec![10.0])]);
+    assert_eq!(
+        recall_at_k(
+            DistanceMetric::InnerProduct,
+            &data,
+            &[1.0],
+            &[(2, -10.0)],
+            1
+        ),
+        1.0
+    );
+}
+
+#[test]
+fn clustered_signed_vectors_retain_recall_after_deletion() {
+    for metric in [
+        DistanceMetric::Euclidean,
+        DistanceMetric::Cosine,
+        DistanceMetric::InnerProduct,
+        DistanceMetric::Manhattan,
+    ] {
+        let mut rng = SplitMix64(2026);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..32).map(|_| rng.next_f32() * 2.0 - 1.0).collect())
+            .collect();
+        let index = HnswIndex::try_new_seeded(
+            "clustered".into(),
+            Some(HnswConfig {
+                dimension: 32,
+                distance_metric: metric,
+                reconnect_on_delete: true,
+                ..Default::default()
+            }),
+            42,
+        )
+        .unwrap();
+        let mut data = BTreeMap::new();
+        for id in 0..512 {
+            let vector: Vec<_> = centers[id as usize % centers.len()]
+                .iter()
+                .map(|v| bf16::from_f32(v + (rng.next_f32() - 0.5) * 0.1).to_f32())
+                .collect();
+            index.insert_f32(id, vector.clone(), 0).unwrap();
+            data.insert(id, vector);
+        }
+        let queries = (0..32)
+            .map(|i| {
+                centers[i % centers.len()]
+                    .iter()
+                    .map(|v| v + (rng.next_f32() - 0.5) * 0.1)
+                    .collect()
+            })
+            .collect();
+        let mut bench = Bench {
+            index,
+            data,
+            queries,
+            metric,
+            k: 10,
+        };
+        for deleted in [false, true] {
+            if deleted {
+                for id in (0..512).step_by(5) {
+                    assert!(bench.index.remove(id, 1));
+                    bench.data.remove(&id);
+                }
+            }
+            let (avg, min) = bench.measure(&bench.index);
+            assert!(avg >= 0.95, "{metric:?}, deleted={deleted}: avg={avg}");
+            assert!(min >= 0.60, "{metric:?}, deleted={deleted}: min={min}");
+        }
+    }
 }
 
 /// Deleting a fifth of the corpus must not poison the survivors' graph, and

@@ -147,6 +147,56 @@ use std::{
     },
 };
 
+#[tokio::test]
+async fn duplicate_vectors_do_not_isolate_a_distinct_insert() {
+    for metric in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+        for count in [77, 90] {
+            let index = HnswIndex::try_new_seeded(
+                "duplicate_neighbors".into(),
+                Some(HnswConfig {
+                    dimension: 128,
+                    distance_metric: metric,
+                    ..Default::default()
+                }),
+                42,
+            )
+            .unwrap();
+            for id in 0..count {
+                index.insert_f32(id, vec![1.0; 128], 0).unwrap();
+            }
+            let mut query = vec![1.0; 128];
+            query[0] = 2.0;
+            index.insert_f32(count, query.clone(), 1).unwrap();
+            assert_eq!(index.get_node_with(count, |n| n.layer).unwrap(), 0);
+            let incoming = index.node_ids().into_iter().any(|id| {
+                index
+                    .get_node_with(id, |n| n.neighbors[0].iter().any(|e| e.0 == count))
+                    .unwrap()
+            });
+            assert!(incoming, "{metric:?}: distinct node has no incoming edge");
+            let disk = Disk::default();
+            disk.flush(&index).await;
+            let loaded = disk.load().await;
+            for index in [&index, &loaded] {
+                for ef in [50, 4096] {
+                    let hits = index
+                        .search_f32_with_options(
+                            &query,
+                            10,
+                            SearchOptions {
+                                ef_search: Some(ef),
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(hits[0].0, count, "{metric:?}, ef={ef}");
+                    assert!(hits[0].1.abs() < 1e-6);
+                }
+                assert_graph(index);
+            }
+        }
+    }
+}
+
 struct NoEofReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -483,7 +533,6 @@ async fn byte_budget_covers_ids_and_metadata_payloads() {
         many.insert_f32(id * (u32::MAX as u64 + 1), vec![id as f32, 0.0], 0)
             .unwrap();
     }
-    many.store_dirty_nodes(async |_, _| Ok(true)).await.unwrap();
     let mut ids = Vec::new();
     many.store_ids(&mut ids).unwrap();
     let nodes_called = AtomicBool::new(false);
@@ -545,7 +594,7 @@ async fn byte_budget_covers_ids_and_metadata_payloads() {
         .await;
     assert!(result.is_err());
     assert!(!nodes_called.load(Ordering::SeqCst));
-    assert!(ids_called.load(Ordering::SeqCst));
+    assert!(!ids_called.load(Ordering::SeqCst));
     assert!(!metadata_called.load(Ordering::SeqCst));
 }
 

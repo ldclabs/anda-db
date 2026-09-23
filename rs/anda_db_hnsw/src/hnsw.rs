@@ -73,7 +73,7 @@ pub struct HnswIndex {
     /// Search does not acquire this mutex, but insert/remove both clone
     /// and rewrite adjacency lists. Without this mutex, concurrent writers can
     /// overwrite each other's neighbor-list updates.
-    structural_lock: Mutex<()>,
+    structural_lock: Mutex<ConstructionWorkspace>,
 
     /// Lock-free id → node map backing the graph.
     ///
@@ -193,6 +193,46 @@ struct HnswIndexRef<'a> {
     removed_nodes: Vec<u64>,
 }
 
+type Neighbor = (u64, f32, u8);
+type PairDistanceCache = FxHashMap<(u64, u64), f32>;
+type NeighborUpdates = FxHashMap<u64, SmallVec<[(u8, (u64, bf16)); 8]>>;
+
+#[derive(Default)]
+struct NeighborScratch {
+    seen: FxHashSet<u64>,
+    selected: Vec<Neighbor>,
+    discarded: Vec<Neighbor>,
+}
+
+/// Shared by serialized writers, so batch construction retains its allocations
+/// without one scratch set per index per worker thread.
+#[derive(Default)]
+struct ConstructionWorkspace {
+    search: SearchWorkspace,
+    vector: Vec<f32>,
+    candidates: Vec<Neighbor>,
+    distances: PairDistanceCache,
+    selection: NeighborScratch,
+    updates: NeighborUpdates,
+}
+
+impl ConstructionWorkspace {
+    fn reset(&mut self) {
+        self.search.reset();
+        self.vector.clear();
+        self.candidates.clear();
+        self.distances.clear();
+        self.updates.clear();
+    }
+
+    fn trim(&mut self) {
+        self.search.trim();
+        if self.distances.capacity() > 131_072 {
+            self.distances = PairDistanceCache::default();
+        }
+    }
+}
+
 impl HnswIndex {
     /// Maximum number of in-flight node loads used by [`Self::load_nodes`].
     pub const LOAD_NODES_CONCURRENCY: usize = 32;
@@ -239,7 +279,7 @@ impl HnswIndex {
             name: name.clone(),
             config: config.clone(),
             layer_gen,
-            structural_lock: Mutex::new(()),
+            structural_lock: Mutex::new(ConstructionWorkspace::default()),
             nodes: CoHashMap::new(),
             incoming: Mutex::new(FxHashMap::default()),
             layer_rng: Mutex::new(None),
@@ -386,7 +426,21 @@ impl HnswIndex {
             .distance_metric
             .validate_stored(&vector, &self.name)?;
 
-        let _structural_guard = self.structural_lock.lock();
+        let mut workspace = self.structural_lock.lock();
+        workspace.reset();
+        let result = self.insert_locked(id, vector, now_ms, &mut workspace);
+        workspace.trim();
+        result
+    }
+
+    /// Called only while holding the structural lock and its reusable scratch.
+    fn insert_locked(
+        &self,
+        id: u64,
+        vector: Vec<bf16>,
+        now_ms: u64,
+        workspace: &mut ConstructionWorkspace,
+    ) -> Result<(), HnswError> {
         let nodes = self.nodes.pin();
         // Check if ID already exists.
         if nodes.contains_key(&id) {
@@ -441,99 +495,65 @@ impl HnswIndex {
         // The new vector is exactly representable in f32, so searching with the
         // f32 copy yields bit-identical distances while skipping the per-element
         // bf16 promotion of the query inside every distance computation.
-        let vector_f32: Vec<f32> = vector.iter().map(|v| v.to_f32()).collect();
-        let mut workspace = SearchWorkspace::default();
-        let query = crate::distance::PreparedQuery::new(self.config.distance_metric, &vector_f32);
+        let ConstructionWorkspace {
+            search,
+            vector: vector_f32,
+            candidates,
+            distances,
+            selection,
+            updates,
+        } = workspace;
+        vector_f32.extend(vector.iter().map(|v| v.to_f32()));
+        let query = crate::distance::PreparedQuery::new(self.config.distance_metric, vector_f32);
         let mut entry_point_node = initial_entry_point_node;
-        let mut entry_point_layer = current_max_layer;
         let mut entry_point_dist = f32::MAX;
 
-        // Search from top layer down to find the best entry point
-        for current_layer_search in (layer + 1..=current_max_layer).rev() {
-            let nearest = self.search_layer(
-                &query,
-                entry_point_node,
-                entry_point_layer,
-                current_layer_search,
-                1, // Only need the closest one for entry point search
-                &mut workspace,
-            )?;
-            if let Some(&(nearest_id, nearest_dist, nearest_layer)) = nearest.first()
-                && nearest_dist < entry_point_dist
-            {
-                entry_point_node = nearest_id;
-                entry_point_layer = nearest_layer;
-                entry_point_dist = nearest_dist;
-            }
+        for current_layer in (layer + 1..=current_max_layer).rev() {
+            let nearest = self.greedy_search(&query, entry_point_node, current_layer, search)?;
+            entry_point_node = nearest.0;
+            entry_point_dist = nearest.1;
         }
 
-        // Inter-node distance cache shared across calls to `select_neighbors`.
-        #[allow(clippy::type_complexity)]
-        let mut multi_distance_cache: FxHashMap<(u64, u64), f32> = FxHashMap::default();
-
-        // Pending reverse-edge updates: `neighbor_id -> [(layer, (new_id, dist))]`.
-        //
-        // Edges at layer L require both endpoints to exist at layer L.
-        #[allow(clippy::type_complexity)]
-        let mut neighbor_updates_required: FxHashMap<
-            u64,
-            SmallVec<[(u8, (u64, bf16)); 8]>,
-        > = FxHashMap::default();
-
         // Build connections
-        for current_layer_build in (0..=layer).rev() {
+        for current_layer_build in (0..=layer.min(current_max_layer)).rev() {
             let max_connections = self.config.layer_capacity(current_layer_build);
 
-            let nearest = self.search_layer(
+            self.search_layer_into(
                 &query,
-                entry_point_node, // Use the best entry point found so far
-                entry_point_layer,
+                entry_point_node,
                 current_layer_build,
                 self.config.ef_construction,
-                &mut workspace,
+                search,
+                candidates,
             )?;
-
-            let selected_neighbors = self.select_neighbors(
-                nearest,
+            self.select_neighbors_in_place(
+                candidates,
                 max_connections,
                 self.config.select_neighbors_strategy,
-                &mut multi_distance_cache,
+                distances,
+                selection,
+                true,
             )?;
 
             // Use the best candidate on this layer as the entry point for the next
             // iteration if it improves on the running minimum distance.
-            if let Some(closest_in_layer) = selected_neighbors
+            if let Some(closest_in_layer) = candidates
                 .iter()
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal))
                 && closest_in_layer.1 < entry_point_dist
             {
                 entry_point_node = closest_in_layer.0;
                 entry_point_dist = closest_in_layer.1;
-                // Keep the layer metadata in sync with the new entry node;
-                // `search_layer` propagates it into its results, and the
-                // reverse-edge guard below relies on it being accurate.
-                entry_point_layer = closest_in_layer.2;
             }
 
             // Record forward edges on the new node and queue reverse edges.
-            for (neighbor_id, dist, neighbor_layer) in selected_neighbors {
+            for (neighbor_id, dist, neighbor_layer) in candidates.drain(..) {
                 if neighbor_id == id {
                     // Skip self-loops.
                     continue;
                 }
 
-                if neighbor_layer < current_layer_build {
-                    // The candidate does not exist at this layer, so this
-                    // layer's graph must not link to it. This happens whenever
-                    // the new node raises the max layer: `search_layer` returns
-                    // the entry point unexpanded at a layer it does not belong
-                    // to and `select_neighbors` passes it through. Recording
-                    // the forward edge anyway would leave a permanently
-                    // asymmetric dead end — the reverse edge is (correctly)
-                    // refused below, and the descent would then follow an edge
-                    // to a node that is not on the layer it is descending.
-                    continue;
-                }
+                debug_assert!(neighbor_layer >= current_layer_build);
 
                 let dist_bf16 = bf16::from_f32(dist);
                 // (1) Forward edge on the new node.
@@ -541,7 +561,7 @@ impl HnswIndex {
 
                 // (2) Reverse edge on the existing node; guaranteed valid here
                 //     because the target exists at this layer.
-                neighbor_updates_required
+                updates
                     .entry(neighbor_id)
                     .or_default()
                     .push((current_layer_build, (id, dist_bf16)));
@@ -581,12 +601,12 @@ impl HnswIndex {
         // Each affected neighbor is cloned exactly once: reverse-edge inserts and
         // (if needed) pruning via `select_neighbors` both mutate the local copy
         // before a single `nodes.insert` writes it back.
-        for (neighbor_id, updates) in neighbor_updates_required {
+        for (neighbor_id, updates) in updates.drain() {
             // Clone only adjacency; immutable vector storage remains shared.
-            let mut neighbor_node = match nodes.get(&neighbor_id) {
-                Some(n) => (**n).clone(),
-                None => continue,
+            let Some(neighbor) = nodes.get(&neighbor_id) else {
+                continue;
             };
+            let mut neighbor_node = (**neighbor).clone();
 
             for (update_layer, connection) in updates {
                 let Some(n_layer_list) = neighbor_node.neighbors.get_mut(update_layer as usize)
@@ -604,20 +624,31 @@ impl HnswIndex {
                 if n_layer_list.len() > should_truncate {
                     // Prune in place: re-run the neighbor-selection strategy over
                     // the current connection list and keep only the best `max_conns`.
-                    let candidates: Vec<(u64, f32, u8)> = n_layer_list
-                        .iter()
-                        .map(|&(cid, dist)| (cid, dist.to_f32(), 0)) // layer unused here
-                        .collect();
-                    if let Ok(selected) = self.select_neighbors(
-                        candidates,
-                        max_conns,
-                        self.config.select_neighbors_strategy,
-                        &mut multi_distance_cache,
-                    ) {
+                    candidates.clear();
+                    for &(cid, _) in n_layer_list.iter() {
+                        if let Some(target) = nodes.get(&cid) {
+                            // Select using fresh f32 distances, not bf16-rounded
+                            // edge weights. Legacy unrepresentable edges are dropped.
+                            if let Ok(distance) = self.node_distance(neighbor, target, distances) {
+                                candidates.push((cid, distance, target.layer));
+                            }
+                        }
+                    }
+                    if self
+                        .select_neighbors_in_place(
+                            candidates,
+                            max_conns,
+                            self.config.select_neighbors_strategy,
+                            distances,
+                            selection,
+                            false,
+                        )
+                        .is_ok()
+                    {
                         n_layer_list.clear();
                         n_layer_list.extend(
-                            selected
-                                .into_iter()
+                            candidates
+                                .drain(..)
                                 .map(|(id, dist, _)| (id, bf16::from_f32(dist))),
                         );
                     }
@@ -681,7 +712,8 @@ impl HnswIndex {
     /// * `true` if a node with `id` existed and was removed.
     /// * `false` otherwise.
     pub fn remove(&self, id: u64, now_ms: u64) -> bool {
-        let _structural_guard = self.structural_lock.lock();
+        let mut workspace = self.structural_lock.lock();
+        workspace.reset();
         let nodes = self.nodes.pin();
         let Some(node) = nodes.get(&id).cloned() else {
             return false;
@@ -770,7 +802,12 @@ impl HnswIndex {
         };
 
         // Distance cache shared by the re-link candidates and `select_neighbors`.
-        let mut pair_distance_cache: FxHashMap<(u64, u64), f32> = FxHashMap::default();
+        let ConstructionWorkspace {
+            distances: pair_distance_cache,
+            selection,
+            candidates,
+            ..
+        } = &mut *workspace;
         let mut dirty_nodes = BTreeSet::new();
         for &neighbor_id in &neighbor_ids {
             if let Some(n) = nodes.get(&neighbor_id) {
@@ -799,15 +836,21 @@ impl HnswIndex {
                         continue;
                     };
                     let current_list = &o.neighbors[layer];
-                    let mut candidate_ids: FxHashSet<u64> =
-                        current_list.iter().map(|&(cid, _)| cid).collect();
-                    let mut candidates: Vec<(u64, f32, u8)> = current_list
-                        .iter()
-                        .map(|&(cid, dist)| (cid, dist.to_f32(), 0)) // layer unused here
-                        .collect();
+                    selection.seen.clear();
+                    selection
+                        .seen
+                        .extend(current_list.iter().map(|&(cid, _)| cid));
+                    candidates.clear();
+                    for &(cid, _) in current_list {
+                        if let Some(target) = nodes.get(&cid)
+                            && let Ok(distance) = self.node_distance(n, target, pair_distance_cache)
+                        {
+                            candidates.push((cid, distance, target.layer));
+                        }
+                    }
                     let existing_len = candidates.len();
                     for &(peer, _) in peers {
-                        if peer == neighbor_id || peer == id || !candidate_ids.insert(peer) {
+                        if peer == neighbor_id || peer == id || !selection.seen.insert(peer) {
                             continue;
                         }
                         let Some(peer_node) = nodes.get(&peer) else {
@@ -817,45 +860,30 @@ impl HnswIndex {
                             // The peer does not exist at this layer.
                             continue;
                         }
-                        let cache_key = if neighbor_id < peer {
-                            (neighbor_id, peer)
-                        } else {
-                            (peer, neighbor_id)
-                        };
-                        let dist = match pair_distance_cache.entry(cache_key) {
-                            Entry::Occupied(entry) => *entry.get(),
-                            Entry::Vacant(entry) => {
-                                match self
-                                    .config
-                                    .distance_metric
-                                    .compute(&n.vector, &peer_node.vector)
-                                {
-                                    Ok(dist) => {
-                                        entry.insert(dist);
-                                        dist
-                                    }
-                                    // Defensive: vectors are validated on
-                                    // insert/load, so this is unreachable.
-                                    Err(_) => continue,
-                                }
-                            }
+                        let Ok(dist) = self.node_distance(n, peer_node, pair_distance_cache) else {
+                            continue;
                         };
                         candidates.push((peer, dist, 0));
                     }
 
                     if candidates.len() > existing_len {
                         let max_conns = self.config.layer_capacity(layer as u8);
-                        if let Ok(selected) = self.select_neighbors(
-                            candidates,
-                            max_conns,
-                            self.config.select_neighbors_strategy,
-                            &mut pair_distance_cache,
-                        ) {
+                        if self
+                            .select_neighbors_in_place(
+                                candidates,
+                                max_conns,
+                                self.config.select_neighbors_strategy,
+                                pair_distance_cache,
+                                selection,
+                                false,
+                            )
+                            .is_ok()
+                        {
                             let layer_list = &mut o.neighbors[layer];
                             layer_list.clear();
                             layer_list.extend(
-                                selected
-                                    .into_iter()
+                                candidates
+                                    .drain(..)
                                     .map(|(cid, dist, _)| (cid, bf16::from_f32(dist))),
                             );
                         }
@@ -873,135 +901,120 @@ impl HnswIndex {
             self.dirty_nodes.write().extend(dirty_nodes);
         }
 
+        workspace.trim();
         true
     }
 
-    /// Selects the best neighbors for a node based on the configured strategy
-    ///
-    /// # Arguments
-    ///
-    /// * `candidates` - List of candidate nodes with their distances
-    /// * `m` - Maximum number of neighbors to select
-    /// * `strategy` - Strategy to use for selection (Simple or Heuristic)
-    /// * `distance_cache` - Cache of previously computed distances between nodes
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Vec<(u64, f32, u8)>, HnswError>` - Selected neighbors with their distances
-    fn select_neighbors(
+    fn node_distance(
         &self,
-        mut candidates: Vec<(u64, f32, u8)>,
+        a: &GraphNode,
+        b: &GraphNode,
+        cache: &mut PairDistanceCache,
+    ) -> Result<f32, HnswError> {
+        let key = if a.id < b.id {
+            (a.id, b.id)
+        } else {
+            (b.id, a.id)
+        };
+        match cache.entry(key) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let distance = self
+                    .config
+                    .distance_metric
+                    .stored_with_norms(&a.vector, a.norm, &b.vector, b.norm)?;
+                entry.insert(distance);
+                Ok(distance)
+            }
+        }
+    }
+
+    /// Selects in reusable buffers. Callers hold the structural lock; sorted
+    /// layer-search output can bypass sorting, while pruning sorts fresh scores.
+    fn select_neighbors_in_place(
+        &self,
+        candidates: &mut Vec<Neighbor>,
         m: usize,
         strategy: SelectNeighborsStrategy,
-        distance_cache: &mut FxHashMap<(u64, u64), f32>,
-    ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
+        distance_cache: &mut PairDistanceCache,
+        scratch: &mut NeighborScratch,
+        sorted: bool,
+    ) -> Result<(), HnswError> {
         if m == 0 {
-            return Ok(Vec::new());
+            candidates.clear();
+            return Ok(());
         }
         let nodes = self.nodes.pin();
-        let mut seen = FxHashSet::default();
+        scratch.seen.clear();
         candidates.retain(|(id, distance, _)| {
-            distance.is_finite() && nodes.contains_key(id) && seen.insert(*id)
+            distance.is_finite() && nodes.contains_key(id) && scratch.seen.insert(*id)
         });
         if candidates.len() <= m {
-            return Ok(candidates);
+            return Ok(());
+        }
+        if !sorted {
+            candidates.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        }
+        if strategy == SelectNeighborsStrategy::Simple {
+            candidates.truncate(m);
+            return Ok(());
         }
 
-        match strategy {
-            SelectNeighborsStrategy::Simple => {
-                // Simple strategy: select m closest neighbors
-                let mut selected = candidates;
-                selected
-                    .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
-                selected.truncate(m);
-                Ok(selected)
+        scratch.selected.clear();
+        scratch.discarded.clear();
+        for candidate in candidates.drain(..) {
+            if scratch.selected.len() >= m {
+                break;
             }
-            SelectNeighborsStrategy::Heuristic => {
-                // Algorithm 4 from the HNSW paper: scan candidates from nearest
-                // to farthest and keep one only if it is closer to the query
-                // point than to every neighbor selected so far. This favors
-                // edges that span different directions ("diversity") over
-                // tightly clustered ones, and needs at most `c * m` pairwise
-                // distances with an early exit on the first conflict.
-                let mut remaining = candidates;
-                remaining
-                    .sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
-
-                let mut selected: Vec<(u64, f32, u8)> = Vec::with_capacity(m);
-                // Candidates pruned by the diversity rule, kept in ascending
-                // distance order as backfill (`keepPrunedConnections`) so the
-                // node still ends up with exactly `m` edges.
-                let mut discarded: Vec<(u64, f32, u8)> = Vec::new();
-
-                for candidate in remaining {
-                    if selected.len() >= m {
-                        break;
-                    }
-
-                    let (cand_id, cand_dist, _) = candidate;
-                    if !nodes.contains_key(&cand_id) {
-                        // The node is gone (removed concurrently or left over
-                        // as a stale neighbor id). It can never be a useful
-                        // edge, so drop it instead of letting it occupy — or
-                        // backfill — a slot ahead of live candidates.
-                        continue;
-                    }
-
-                    let mut keep = true;
-                    for &(sel_id, _, _) in &selected {
-                        let cache_key = if cand_id < sel_id {
-                            (cand_id, sel_id)
-                        } else {
-                            (sel_id, cand_id)
-                        };
-
-                        let dist = match distance_cache.entry(cache_key) {
-                            Entry::Occupied(entry) => *entry.get(),
-                            Entry::Vacant(entry) => {
-                                if let (Some(cand_node), Some(sel_node)) =
-                                    (nodes.get(&cand_id), nodes.get(&sel_id))
-                                {
-                                    let dist = self
-                                        .config
-                                        .distance_metric
-                                        .stored(&cand_node.vector, &sel_node.vector)?;
-                                    entry.insert(dist);
-                                    dist
-                                } else {
-                                    // The candidate was checked above, so only
-                                    // a concurrently removed `sel_id` reaches
-                                    // here (defensive): skip this pair and keep
-                                    // testing the candidate against the rest.
-                                    continue;
-                                }
-                            }
-                        };
-
-                        if dist < cand_dist {
-                            keep = false;
-                            break;
-                        }
-                    }
-
-                    if keep {
-                        selected.push(candidate);
-                    } else {
-                        discarded.push(candidate);
-                    }
+            let Some(node) = nodes.get(&candidate.0) else {
+                continue;
+            };
+            let mut keep = true;
+            for &(selected_id, _, _) in &scratch.selected {
+                let Some(selected) = nodes.get(&selected_id) else {
+                    continue;
+                };
+                // Duplicate vectors add no direction. Defer them to backfill
+                // so they cannot fill every slot before a distinct candidate
+                // is considered. This also covers zero vectors and inner product.
+                if node.vector == selected.vector
+                    || self.node_distance(node, selected, distance_cache)? < candidate.1
+                {
+                    keep = false;
+                    break;
                 }
-
-                // Backfill with the closest pruned candidates.
-                let mut discarded = discarded.into_iter();
-                while selected.len() < m {
-                    match discarded.next() {
-                        Some(candidate) => selected.push(candidate),
-                        None => break,
-                    }
-                }
-
-                Ok(selected)
+            }
+            if keep {
+                scratch.selected.push(candidate);
+            } else {
+                scratch.discarded.push(candidate);
             }
         }
+        let remaining = m - scratch.selected.len();
+        scratch
+            .selected
+            .extend(scratch.discarded.drain(..).take(remaining));
+        std::mem::swap(candidates, &mut scratch.selected);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn select_neighbors(
+        &self,
+        mut candidates: Vec<Neighbor>,
+        m: usize,
+        strategy: SelectNeighborsStrategy,
+        cache: &mut PairDistanceCache,
+    ) -> Result<Vec<Neighbor>, HnswError> {
+        self.select_neighbors_in_place(
+            &mut candidates,
+            m,
+            strategy,
+            cache,
+            &mut NeighborScratch::default(),
+            false,
+        )?;
+        Ok(candidates)
     }
 
     /// Repairs the entry point by selecting the live node with the highest layer.

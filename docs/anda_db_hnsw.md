@@ -96,7 +96,8 @@ overflows during bf16 conversion is rejected too. Query distance overflow
 returns an error rather than inserting NaN/Inf into ranking heaps.
 Rejected vector input leaves the graph and public operation counters unchanged.
 
-Cosine query norms are prepared once; immutable node norms are cached.
+Cosine query norms are prepared once; immutable node norms are cached and
+reused during neighbor selection, pruning and deletion repair as well as search.
 The API still returns Euclidean distance, not squared L2.
 
 ## Graph storage and mutation
@@ -119,6 +120,19 @@ its bf16 vector is shared by Arc, and each adjacency layer uses a Vec.
 Updating edges copies adjacency without copying the vector. Adjacency lists are
 ordered by target ID and contain no duplicates. Exact reverse references are
 maintained per target and layer, including asymmetric edges created by pruning.
+
+Heuristic selection defers identical candidate vectors to the final backfill,
+leaving room for distinct directions before filling the remaining slots. Pruning
+and deletion repair score candidates in f32 rather than comparing rounded bf16
+edge weights with full-precision pair distances. This prevents a repeated-vector
+cluster from pruning every incoming edge of a newly inserted distinct vector.
+It does not guarantee global connectivity for arbitrary data or deletion orders.
+The serialized node and edge formats are unchanged.
+
+Serialized writers reuse bounded construction scratch for searches, candidate
+selection and pair-distance caches. Ordinary modern snapshots load without
+building the legacy distance-repair lookup table or allocating a deduplication
+set for each adjacency layer.
 
 `get_node_with` materializes the public owned representation for compatibility;
 it is intended for inspection/export, not the search hot path. Individual
@@ -202,9 +216,12 @@ fsync durability where the platform supports it.
 
 Upload concurrency is 1–64. The aggregate node callback buffers in flight and
 each later IDs/metadata callback buffer stay within the configured byte budget.
-A single payload larger than the budget is an error. Exact node sizes use
-cbor2::serialized_size. IDs are written only after all node callbacks succeed;
-metadata is written last. A node callback returning false stops without
+A single payload larger than the budget is an error. All node, IDs and metadata
+payload sizes are checked before invoking any write callback. IDs and metadata
+are encoded during this preflight and retained until their callbacks; the byte
+budget bounds callback payloads, not the entire snapshot and staging memory.
+Exact node sizes use cbor2::serialized_size. IDs are written only after all node
+callbacks succeed; metadata is written last. A node callback returning false stops without
 committing. On an error or stop, every node callback already started by the
 flush is awaited before the method returns. Cancellation can still leave an
 individual backend write durable, so dirty evidence is retained for recovery.
@@ -314,7 +331,10 @@ cargo run -p anda_db_hnsw --example hnsw_demo
 The regression suite covers numeric overflow, ID reuse, buffered-writer failure,
 stop/cancellation contracts, tombstone generations, mixed-image recovery,
 transactional load retries, query bounds and bounded parallel uploads.
-Recall tests use deterministic data and graph seeds.
+Recall tests use deterministic data and graph seeds, cover all four metrics
+on uniform and signed clustered data, and count negative-distance boundary ties
+with an absolute-value tolerance. Duplicate-vector regressions also check a
+distinct insert's incoming edges and self-query before and after persistence.
 
 Memory estimates must include alignment, capacities, Arc/hash-table overhead,
 reverse references and temporary snapshots. On the measured 64-bit build,
@@ -323,3 +343,11 @@ bytes, but this does not describe the whole index footprint.
 
 See the [benchmark guide](../rs/anda_db_hnsw/benches/README.md) for the configurable
 data matrix, allocation/latency/recall measurements and release-profile controls.
+
+The [September 2026 comparison](../rs/anda_db_hnsw/benches/README.md#september-23-2026-comparison)
+records three-trial medians for 1,000-vector workloads: construction time fell
+6–36%, load allocations fell about 29%, and 768-dimensional cosine deletion
+with reconnection became about 42% faster. Euclidean queries took 5–8% longer;
+recall stayed equal or improved. Reused scratch increased retained heap; the
+benchmark guide records that tradeoff too. See the raw measurements and environment
+before applying these synthetic results to application sizing.
