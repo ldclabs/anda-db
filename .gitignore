@@ -26,6 +26,8 @@ target/
 Cargo.lock
 # Standalone deployed binary: its Docker build uses `cargo --locked`.
 !rs/cf-tokenizer/Cargo.lock
+# Workspace lock snapshot used by the Nexus server Docker build.
+!rs/anda_cognitive_nexus_server/Cargo.lock
 
 # JavaScript workspaces (ts/kip-do). Tool caches such as vitest's also land in
 # a root-level node_modules, so this is not scoped to js/.

@@ -13,16 +13,16 @@ use axum::BoxError;
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fs::File, io, net::SocketAddr, sync::Arc, time::Duration};
 use structured_logger::{Builder, async_json::new_writer, get_env_level};
-use tokio::{
-    signal,
-    sync::{Mutex, Semaphore},
-};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio::{signal, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 mod handler;
 mod nexus;
+mod runtime;
+
+use runtime::{ExecutionManager, abort_task, finish_task};
 
 use handler::*;
 
@@ -31,17 +31,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Bounded cleanup window after the graceful deadline has already forced an
-/// abort. This is not an extension of the graceful drain contract.
-const FORCED_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// The hard execution deadline is this multiple of the per-request response
-/// deadline. It is derived instead of separately configurable so the two can
-/// never be set inconsistently: the response deadline must always fire first,
-/// and the hard deadline exists only to reclaim a bounded mutation permit
-/// from an execution that is never going to finish.
-const EXECUTION_TIMEOUT_FACTOR: u32 = 4;
-
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -85,7 +74,8 @@ struct Cli {
     #[clap(long, env = "MAX_LOGGED_REQUEST_BYTES", default_value = "8192")]
     max_logged_request_bytes: usize,
 
-    /// Maximum number of concurrently executing KIP mutations
+    /// Maximum admitted KIP requests, including reads and request-body reception.
+    /// The legacy option name is retained for deployment compatibility.
     #[clap(long, env = "MAX_CONCURRENT_MUTATIONS", default_value = "64")]
     max_concurrent_mutations: usize,
 
@@ -93,12 +83,16 @@ struct Cli {
     #[clap(long, env = "SHUTDOWN_DRAIN_TIMEOUT_SECS", default_value = "300")]
     shutdown_drain_timeout_secs: u64,
 
-    /// Retention window for the `kip_logs` collection in days. Every `/kip`
-    /// request appends a durable audit document, so unbounded retention
+    /// Retention window for `execute_kip` audit documents in days. Unbounded retention
     /// (`0`) grows storage and index memory forever and must be chosen
     /// explicitly.
     #[clap(long, env = "LOG_RETENTION_DAYS", default_value = "30")]
     log_retention_days: u64,
+
+    /// Object cache budget for a new database, in bytes (0 disables caching).
+    /// Existing databases retain their persisted storage configuration.
+    #[clap(long, env = "CACHE_MAX_BYTES", default_value = "67108864")]
+    cache_max_bytes: u64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -107,6 +101,8 @@ struct Cli {
 #[derive(Subcommand)]
 /// Storage backend selection for the server.
 pub enum Commands {
+    /// Use ephemeral in-memory storage (the default); all data is lost on exit.
+    Memory,
     /// Use a local filesystem-backed database.
     Local {
         /// Local database directory.
@@ -135,16 +131,17 @@ async fn main() -> Result<(), BoxError> {
         .with_target_writer("*", new_writer(tokio::io::stdout()))
         .init();
 
-    let object_store = match cli.command {
-        Some(Commands::Local { db }) => build_object_store(db)?,
-        None => build_object_store("memory".to_string())?,
-    };
+    // Fail before opening storage when another process already serves this port.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let packages = read_schema_packages(&cli.schema_package)?;
+    // Keep the local writer lock alive until every database task has stopped.
+    let backend = build_object_store(cli.command)?;
 
     let db_config = DBConfig {
         name: "anda_db".to_string(),
         description: "Anda DB".to_string(),
         storage: StorageConfig {
-            cache_max_capacity: 100000,
+            cache_max_bytes: Some(cli.cache_max_bytes),
             compress_level: 3,
             object_chunk_size: 256 * 1024,
             bucket_overload_size: 1024 * 1024,
@@ -154,64 +151,46 @@ async fn main() -> Result<(), BoxError> {
         lock: None,
     };
 
-    let packages = read_schema_packages(&cli.schema_package)?;
-    let db = Arc::new(AndaDB::connect(object_store.clone(), db_config).await?);
+    let db = Arc::new(AndaDB::connect(backend.store.clone(), db_config).await?);
     let nexus = nexus::Nexus::connect(db.clone(), &packages, cli.max_logged_request_bytes).await?;
 
-    let admission = CancellationToken::new();
-    let mutation_tasks = TaskTracker::new();
-    let mutation_aborts = Arc::new(Mutex::new(Vec::new()));
-    let request_timeout = Duration::from_secs(cli.request_timeout_secs.max(1));
+    let executions = ExecutionManager::new(cli.max_concurrent_mutations);
     let state = AppState {
         nexus: nexus.clone(),
         name: APP_NAME.to_string(),
         version: APP_VERSION.to_string(),
-        request_timeout,
-        execution_timeout: request_timeout.saturating_mul(EXECUTION_TIMEOUT_FACTOR),
-        admission: admission.clone(),
-        mutation_tasks: mutation_tasks.clone(),
-        mutation_permits: Arc::new(Semaphore::new(cli.max_concurrent_mutations.max(1))),
-        mutation_aborts: mutation_aborts.clone(),
+        request_timeout: Duration::from_secs(cli.request_timeout_secs.max(1)),
+        executions: executions.clone(),
     };
     let app = build_router(state, cli.api_key, cli.max_body_size);
-    let auto_flush_cancel = CancellationToken::new();
-    let retention_cancel = CancellationToken::new();
-
-    // Periodic flush of database/collection metadata; when the token is
-    // cancelled the task flushes and closes the database before exiting.
-    let mut flush_task = tokio::spawn({
-        let db = db.clone();
-        let cancel = auto_flush_cancel.child_token();
-        let interval = Duration::from_secs(cli.flush_interval_secs.max(1));
-        async move { db.auto_flush(cancel, interval).await }
-    });
-
-    // Optional retention cleanup for the `kip_logs` collection, driven by
-    // the indexed `period` field (hours since the Unix epoch).
-    let retention_task = if let Some(retention_hours) = retention_hours {
-        let nexus = nexus.clone();
-        let cancel = retention_cancel.child_token();
-        Some(tokio::spawn(async move {
+    let background_cancel = CancellationToken::new();
+    let flush_task = tokio::spawn(periodic_flush(
+        db.clone(),
+        background_cancel.clone(),
+        Duration::from_secs(cli.flush_interval_secs.max(1)),
+    ));
+    let retention_task = retention_hours.map(|hours| {
+        let cancel = background_cancel.clone();
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
                 }
-                let before_period = (unix_ms() / 3_600_000).saturating_sub(retention_hours);
-                match nexus.prune_logs(before_period).await {
+                let before = (unix_ms() / 3_600_000).saturating_sub(hours);
+                match nexus.prune_logs(before, &cancel).await {
                     Ok(0) => {}
                     Ok(n) => log::info!("pruned {n} expired KIP logs"),
                     Err(err) => log::error!("failed to prune KIP logs: {err:?}"),
                 }
             }
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
-    let listener = create_reuse_port_listener(addr).await?;
-    log::warn!("{}@{} listening on {:?}", APP_NAME, APP_VERSION, addr);
-
+    log::warn!(
+        "{APP_NAME}@{APP_VERSION} listening on {:?}",
+        listener.local_addr()?
+    );
     let stop_accepting = CancellationToken::new();
     let mut server_task = tokio::spawn({
         let stop_accepting = stop_accepting.clone();
@@ -221,150 +200,87 @@ async fn main() -> Result<(), BoxError> {
                 .await
         }
     });
-    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout_secs.max(1));
     let (server_event, fatal_shutdown) = tokio::select! {
         joined = &mut server_task => (Some(joined), false),
         _ = shutdown_signal() => (None, false),
-        _ = admission.cancelled() => {
-            log::error!(
-                "a KIP mutation exceeded its hard execution deadline; starting process shutdown"
-            );
-            (None, true)
-        }
+        _ = executions.admission.cancelled() => (None, true),
     };
-    let shutdown_deadline = tokio::time::Instant::now() + drain_timeout;
-    let (server_forced_abort, mut result) = match server_event {
-        Some(joined) => {
-            admission.cancel();
-            retention_cancel.cancel();
-            match joined {
-                Ok(result) => (false, result),
-                Err(err) => (
-                    true,
-                    Err(io::Error::other(format!("HTTP server task failed: {err}"))),
-                ),
-            }
-        }
-        None => {
-            admission.cancel();
-            retention_cancel.cancel();
-            stop_accepting.cancel();
-            match tokio::time::timeout_at(shutdown_deadline, &mut server_task).await {
-                Ok(joined) => match joined {
-                    Ok(result) => (false, result),
-                    Err(err) => (
-                        true,
-                        Err(io::Error::other(format!("HTTP server task failed: {err}"))),
-                    ),
-                },
-                Err(_) => {
-                    log::error!(
-                        "HTTP handler drain deadline exceeded; aborting remaining handlers"
-                    );
-                    server_task.abort();
-                    if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut server_task)
-                        .await
-                        .is_err()
-                    {
-                        log::error!(
-                            "aborted HTTP server task did not terminate before cleanup deadline"
-                        );
-                    }
-                    (true, Ok(()))
-                }
-            }
-        }
+    executions.admission.cancel();
+    stop_accepting.cancel();
+    background_cancel.cancel();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(cli.shutdown_drain_timeout_secs.max(1));
+    let server_result = match server_event {
+        Some(joined) => joined
+            .map_err(|err| io::Error::other(format!("HTTP server task failed: {err}")))
+            .and_then(|result| result),
+        None => finish_task(&mut server_task, deadline, "HTTP server")
+            .await
+            .and_then(|result| result),
     };
-    if fatal_shutdown && result.is_ok() {
-        // Exit non-zero so supervisors configured with an on-failure restart
-        // policy replace the crash-recoverable process.
-        result = Err(io::Error::other(
-            "KIP mutation exceeded the hard execution deadline",
-        ));
+    shutdown_database(
+        db,
+        executions,
+        flush_task,
+        retention_task,
+        deadline,
+        server_result,
+    )
+    .await?;
+    if fatal_shutdown {
+        return Err(io::Error::other("KIP execution exceeded its hard deadline").into());
     }
-
-    // No new handler can spawn a mutation after the HTTP server has drained.
-    // Stop retention, then drain every detached non-cancel-safe mutation
-    // before allowing auto_flush to close the database.
-    let mut forced_crash = server_forced_abort;
-    if let Some(mut task) = retention_task {
-        match tokio::time::timeout_at(shutdown_deadline, &mut task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                log::error!("retention task failed during shutdown: {err:?}");
-                forced_crash = true;
-            }
-            Err(_) => {
-                log::error!("retention drain deadline exceeded; aborting retention task");
-                forced_crash = true;
-                task.abort();
-                if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut task)
-                    .await
-                    .is_err()
-                {
-                    log::error!("aborted retention task did not terminate before cleanup deadline");
-                }
-            }
-        }
-    }
-    // Serialize TaskTracker::close with the handler's final admission check,
-    // spawn, and abort-handle registration. TaskTracker::close alone does not
-    // reject later spawns.
-    {
-        let _registration = mutation_aborts.lock().await;
-        mutation_tasks.close();
-    }
-    if tokio::time::timeout_at(shutdown_deadline, mutation_tasks.wait())
-        .await
-        .is_err()
-    {
-        log::error!("KIP mutation drain deadline exceeded; aborting remaining mutations");
-        forced_crash = true;
-        let handles = mutation_aborts.lock().await;
-        for handle in handles.iter().filter(|handle| !handle.is_finished()) {
-            handle.abort();
-        }
-        drop(handles);
-        if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, mutation_tasks.wait())
-            .await
-            .is_err()
-        {
-            log::error!("aborted KIP mutations did not terminate before cleanup deadline");
-        }
-    }
-
-    if forced_crash {
-        // Never publish an arbitrary cancellation point through a graceful
-        // close. Abort auto-flush and leave the database for crash recovery.
-        flush_task.abort();
-        if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut flush_task)
-            .await
-            .is_err()
-        {
-            log::error!("aborted auto-flush task did not terminate before cleanup deadline");
-        }
-    } else {
-        // Every task that can mutate the database drained normally. Give the
-        // final flush/close only the time remaining in the same total
-        // shutdown budget; if it overruns, stop at a crash-recoverable point.
-        auto_flush_cancel.cancel();
-        match tokio::time::timeout_at(shutdown_deadline, &mut flush_task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => log::error!("flush task failed: {err:?}"),
-            Err(_) => {
-                log::error!("database close exceeded the total shutdown deadline; aborting");
-                flush_task.abort();
-                if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, &mut flush_task)
-                    .await
-                    .is_err()
-                {
-                    log::error!("aborted database close did not terminate before cleanup deadline");
-                }
-            }
-        }
-    }
-    result?;
+    drop(backend);
     Ok(())
+}
+
+/// Stop between flushes; final close is owned by shutdown so its error reaches
+/// the process exit status. Never cancel an in-progress flush during normal drain.
+async fn periodic_flush(db: Arc<AndaDB>, cancel: CancellationToken, interval: Duration) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        if let Err(err) = db.flush().await {
+            log::error!("database flush failed: {err}");
+        }
+    }
+}
+
+async fn shutdown_database(
+    db: Arc<AndaDB>,
+    executions: ExecutionManager,
+    mut flush_task: JoinHandle<()>,
+    retention_task: Option<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    server_result: io::Result<()>,
+) -> io::Result<()> {
+    let mut failure = server_result.err();
+    if let Some(mut task) = retention_task
+        && let Err(err) = finish_task(&mut task, deadline, "retention").await
+    {
+        log::error!("{err}");
+        failure.get_or_insert(err);
+    }
+    if let Err(err) = executions.drain(deadline).await {
+        log::error!("{err}");
+        failure.get_or_insert(err);
+    }
+    if failure.is_some() {
+        // A task may have been cancelled mid-write. Leave persisted state for
+        // reopen/recovery rather than publishing an arbitrary cancellation point.
+        abort_task(&mut flush_task).await;
+    } else if let Err(err) = finish_task(&mut flush_task, deadline, "periodic flush").await {
+        failure = Some(err);
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    let mut close = tokio::spawn(async move { db.close().await });
+    finish_task(&mut close, deadline, "database close")
+        .await?
+        .map_err(io::Error::other)
 }
 
 /// Reads the operator-supplied Schema Package artifacts.
@@ -390,7 +306,7 @@ fn read_schema_packages(paths: &[String]) -> Result<Vec<nexus::SchemaPackageSour
 /// Converts the configured retention window from days to hours.
 ///
 /// `None` means "keep every audit log forever" — an explicit operator
-/// choice, since every `/kip` request appends a durable document. An
+/// choice, since each executed KIP envelope appends a durable document. An
 /// out-of-range value is refused at startup instead of wrapping: an
 /// unchecked `days * 24` turns `768614336404564651` into `8`, which would
 /// silently prune essentially the whole audit log (and panic in a debug
@@ -459,28 +375,39 @@ pub async fn shutdown_signal() {
     log::warn!("received termination signal, starting graceful shutdown");
 }
 
-/// Creates a TCP listener with `SO_REUSEPORT` enabled.
-pub async fn create_reuse_port_listener(
-    addr: SocketAddr,
-) -> Result<tokio::net::TcpListener, BoxError> {
-    let socket = match &addr {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-
-    socket.set_reuseport(true)?;
-    socket.bind(addr)?;
-    let listener = socket.listen(1024)?;
-    Ok(listener)
+/// The lock file remains present after exit. Unlinking it would let another
+/// process lock a new inode while a live writer still holds the old one.
+struct StorageBackend {
+    store: Arc<dyn ObjectStore>,
+    _writer_lock: Option<File>,
 }
 
-fn build_object_store(ty: String) -> Result<Arc<dyn ObjectStore>, BoxError> {
-    match ty.as_str() {
-        "" | "memory" | "in_memory" => Ok(Arc::new(InMemory::new())),
-        path => {
-            let os = LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
-            let os = MetaStoreBuilder::new(os, 100000).build();
-            Ok(Arc::new(os))
+fn build_object_store(command: Option<Commands>) -> Result<StorageBackend, BoxError> {
+    match command {
+        None | Some(Commands::Memory) => Ok(StorageBackend {
+            store: Arc::new(InMemory::new()),
+            _writer_lock: None,
+        }),
+        Some(Commands::Local { db }) => {
+            std::fs::create_dir_all(&db)?;
+            let path = std::fs::canonicalize(&db)?;
+            let lock = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path.join(".anda-nexus-writer.lock"))?;
+            lock.try_lock().map_err(|err| {
+                io::Error::other(format!(
+                    "cannot acquire the database writer lock for {}: {err}",
+                    path.display(),
+                ))
+            })?;
+            let local = LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
+            Ok(StorageBackend {
+                store: Arc::new(MetaStoreBuilder::new(local, 100_000).build()),
+                _writer_lock: Some(lock),
+            })
         }
     }
 }
@@ -542,5 +469,112 @@ mod tests {
                 .to_string();
             assert!(err.contains("out of range"), "unexpected error: {err}");
         }
+    }
+
+    #[tokio::test]
+    async fn local_directories_are_created_locked_and_persistent() {
+        use object_store::{ObjectStoreExt, path::Path};
+        let root = tempfile::tempdir().unwrap();
+        for name in ["memory", "in_memory", "nested/new"] {
+            let path = root.path().join(name);
+            let command = || {
+                Some(Commands::Local {
+                    db: path.to_str().unwrap().into(),
+                })
+            };
+            let backend = build_object_store(command()).unwrap();
+            assert!(path.is_dir());
+            assert!(
+                build_object_store(command()).is_err(),
+                "duplicate local writer must fail"
+            );
+            let key = Path::from("round-trip");
+            backend.store.put(&key, "persisted".into()).await.unwrap();
+            drop(backend);
+            let reopened = build_object_store(command()).unwrap();
+            let bytes = reopened
+                .store
+                .get(&key)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], b"persisted");
+        }
+        assert_eq!(
+            build_object_store(None).unwrap().store.to_string(),
+            "InMemory"
+        );
+        assert_eq!(
+            build_object_store(Some(Commands::Memory))
+                .unwrap()
+                .store
+                .to_string(),
+            "InMemory"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_final_close_failure() {
+        use anda_object_store::{FaultOp, FaultRule, FaultStore};
+        let (store, fault) = FaultStore::wrap(InMemory::new());
+        let db = Arc::new(
+            AndaDB::connect(
+                Arc::new(store),
+                DBConfig {
+                    name: "close_failure".into(),
+                    description: String::new(),
+                    storage: StorageConfig::default(),
+                    lock: None,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let _nexus = nexus::Nexus::connect(db.clone(), &[], 8192).await.unwrap();
+        fault.push_rule(FaultRule::fail_once(FaultOp::Put, ""));
+        let result = shutdown_database(
+            db,
+            ExecutionManager::new(1),
+            tokio::spawn(async {}),
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Ok(()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "final persistence failure must reach the process result"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_skips_close_and_reports_failure() {
+        let db = Arc::new(
+            AndaDB::connect(
+                Arc::new(InMemory::new()),
+                DBConfig {
+                    name: "forced_shutdown".into(),
+                    description: String::new(),
+                    storage: StorageConfig::default(),
+                    lock: None,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let result = shutdown_database(
+            db.clone(),
+            ExecutionManager::new(1),
+            tokio::spawn(async {}),
+            Some(tokio::spawn(std::future::pending())),
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            Ok(()),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // Close sets read-only. The forced path must leave recovery to reopen.
+        assert!(!db.is_read_only());
     }
 }

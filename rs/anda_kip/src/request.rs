@@ -174,6 +174,14 @@ impl Request {
 
     /// Decode an envelope while preserving protocol timestamp error classes.
     pub fn from_value(value: Json) -> Result<Self, KipError> {
+        let request = Self::decode_value(value)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    // Shared decoding for the ordinary and prepared execution paths. Validation
+    // belongs to the caller so ingest commands need only be parsed once.
+    pub(crate) fn decode_value(value: Json) -> Result<Self, KipError> {
         if let Some(entries) = value.pointer("/ingest/evidence").and_then(Json::as_array) {
             for entry in entries {
                 if let Some(at) = entry.get("observed_at") {
@@ -181,10 +189,7 @@ impl Request {
                 }
             }
         }
-        let request: Self = serde_json::from_value(value)
-            .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?;
-        request.validate()?;
-        Ok(request)
+        serde_json::from_value(value).map_err(|e| KipError::invalid_request_envelope(e.to_string()))
     }
 
     /// Checks every envelope invariant that does not need an engine.

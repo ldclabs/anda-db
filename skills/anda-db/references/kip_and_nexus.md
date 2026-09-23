@@ -13,7 +13,7 @@ rather than inferring support from a package version.
 | `anda_db` | Embedded document storage and B-Tree/BM25/HNSW retrieval; no model-generated embeddings or Brain scheduler |
 | `anda_kip` | Protocol SDK: `parse_kip`, executable `Command` AST, request/response envelopes, semantics, errors, `Executor` seam |
 | `anda_cognitive_nexus` | Stateful Rust executor over AndaDB: transactions, Schema resolution, Governance, belief projection |
-| `anda_cognitive_nexus_server` | HTTP/JSON-RPC transport and authenticated sessions for Nexus |
+| `anda_cognitive_nexus_server` | HTTP/JSON-RPC transport with a shared system-Principal administrator endpoint |
 | `anda_db_server` / `anda_db_shard_proxy` | Core database HTTP APIs / multi-tenant shard routing |
 | `ts/kip-do` | Independent SQLite-backed Cloudflare Durable Object KIP engine, not a Rust binding |
 | `rs/anda_kip_wasm` | Rust parser compiled to WASM for the TypeScript differential oracle |
@@ -74,6 +74,12 @@ Use `Request::from_json` for raw JSON to retain strict duplicate-key and numeric
 source checks. The batch helpers preserve independent/sequence receipts under
 `results[].receipt`; the top-level receipt is for atomic execution. Explicit
 null ingest payloads and result values are present values, not missing fields.
+
+For transports that classify commands before executing them, use
+`PreparedRequest::from_value` after strict raw JSON decoding. Its read-only
+`request()` and `operations()` views share the validated envelope and parsed
+commands; consuming `execute()` keeps ordinary batch/receipt semantics without
+another parse. It does not add atomic execution or authenticated authority.
 
 `CapsuleRecords(Vec<Json>)` preserves array order; `by_kind` borrows a filtered
 view. Do not regroup records before computing or verifying a Capsule digest.

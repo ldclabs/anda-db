@@ -8,10 +8,11 @@ use anda_db::{
     unix_ms,
 };
 use anda_db_schema::{AndaDBSchema, BoxError, Fv, Json};
-use anda_kip::{CommandType, Operation, Request, Response, execute_request};
+use anda_kip::{CommandType, Operation, PreparedRequest, Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
 /// Smallest accepted value for the stored-request size cap. The truncated
 /// stand-in itself needs room for its marker.
@@ -80,26 +81,18 @@ pub struct Nexus {
     max_logged_request_bytes: usize,
 }
 
-/// What a request will actually run, classified from the parsed commands.
-///
-/// Classifying costs a parse that execution then repeats, and the cheap
-/// alternative — the caller's `operation.language` — is exactly the field
-/// §73.1 says must never be trusted: it is advisory. An audit record that
-/// called a mutation a read because the client labelled it one would be worse
-/// than no audit record, and the HTTP layer decides how to describe a lost
-/// response from the same answer, where the cost of believing a label is a
-/// duplicated write.
+/// Command families from the same prepared ASTs that execution consumes.
 #[derive(Clone, Debug)]
 pub struct RequestLanguages(Vec<CommandType>);
 
 impl RequestLanguages {
     /// Classifies every operation, in first-seen order.
-    pub fn of(request: &Request) -> Self {
+    pub fn of(request: &PreparedRequest) -> Self {
         let mut seen: Vec<CommandType> = Vec::new();
-        for operation in &request.operations {
+        for operation in request.operations() {
             let language = operation
-                .parse()
-                .map_or(CommandType::Unknown, |command| CommandType::from(&command));
+                .as_ref()
+                .map_or(CommandType::Unknown, CommandType::from);
             if !seen.contains(&language) {
                 seen.push(language);
             }
@@ -128,11 +121,27 @@ impl std::fmt::Display for RequestLanguages {
     }
 }
 
+fn json_size(value: &impl Serialize) -> serde_json::Result<usize> {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 /// Returns the request to persist in the audit log.
 ///
-/// Every `/kip` request appends a durable document containing the client's
+/// Each executed KIP envelope appends a durable document containing the client's
 /// request envelope, so a client sending bodies near the configured limit would
-/// add megabytes of permanent storage (and B-Tree/BM25 memory) per call. Once
+/// add megabytes of permanent storage (and cache/index memory) per call. Once
 /// the serialized request exceeds `max_bytes` it is replaced by a bounded
 /// stand-in that still deserializes as a [`Request`], so `list_logs` keeps
 /// working; the audit record then states what was dropped instead of storing
@@ -145,53 +154,44 @@ impl std::fmt::Display for RequestLanguages {
 /// execution metadata plus a prefix of the first command.
 fn truncate_request(request: &Request, max_bytes: usize) -> Cow<'_, Request> {
     let max_bytes = max_bytes.max(MIN_LOGGED_REQUEST_BYTES);
-    // A request that cannot be serialized at all is stored truncated as well:
-    // it certainly cannot be stored verbatim.
-    let size = serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len());
+    let size = json_size(request).unwrap_or(usize::MAX);
     if size <= max_bytes {
         return Cow::Borrowed(request);
     }
-
-    // Keep a prefix of the first command for forensics. Half the budget leaves
-    // room for the marker regardless of how the rest serializes.
-    let keep = max_bytes / 2;
     let first = request
         .operations
         .first()
         .and_then(|operation| operation.command.as_deref())
         .unwrap_or_default();
-    let end = first
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|i| *i <= keep)
-        .last()
-        .unwrap_or(0);
-    let marker = format!(
-        "{}… [truncated: the {size}-byte request carried {} operation(s) and exceeded the \
-         {max_bytes}-byte audit log limit]",
-        &first[..end],
-        request.operations.len(),
-    );
-
-    let logged = Request {
+    let mut end = first.floor_char_boundary((max_bytes / 2).min(first.len()));
+    let marker = |end| {
+        format!(
+            "{}… [truncated: the {size}-byte request carried {} operation(s) and exceeded the {max_bytes}-byte audit log limit]",
+            &first[..end],
+            request.operations.len(),
+        )
+    };
+    let mut logged = Request {
         kip: request.kip.clone(),
         request_id: request.request_id.clone(),
         space: request.space.clone(),
         execution: request.execution.clone(),
-        operations: vec![Operation::new(marker.clone())],
+        operations: vec![Operation::new(marker(end))],
         options: request.options.clone(),
         ..Default::default()
     };
-    // Correlation metadata is client-supplied too, so keeping it is not by
-    // itself a bound. If the stand-in is still over budget, drop everything
-    // that is not the marker rather than let the cap be advisory.
-    let logged = match serde_json::to_vec(&logged) {
-        Ok(bytes) if bytes.len() <= max_bytes => logged,
-        _ => Request {
-            operations: vec![Operation::new(marker)],
+    if json_size(&logged).unwrap_or(usize::MAX) > max_bytes {
+        logged = Request {
+            operations: logged.operations,
             ..Default::default()
-        },
-    };
+        };
+    }
+    // JSON escaping can expand a prefix. The marker without a prefix fits the
+    // minimum cap, so shrinking terminates while preserving UTF-8 boundaries.
+    while json_size(&logged).unwrap_or(usize::MAX) > max_bytes {
+        end = first.floor_char_boundary(end / 2);
+        logged.operations[0].command = Some(marker(end));
+    }
     Cow::Owned(logged)
 }
 
@@ -209,7 +209,7 @@ impl Nexus {
     /// There is no `$self` genesis here. KIP 1.x seeded a `$self` Person node
     /// carrying the server's principal id; in 2.0 a Person is explicitly *not*
     /// a Principal (`Person != PrincipalRecord != ActorBinding`), Principals
-    /// are Governance state, and this engine has no Governance plane. Writing
+    /// are Governance state, and belong to a separate Governance plane. Writing
     /// an identity into cognitive content to stand in for one would encode
     /// exactly the confusion the profile forbids.
     ///
@@ -263,21 +263,19 @@ impl Nexus {
 
     /// Runs a whole KIP request envelope and appends an audit record.
     ///
-    /// Execution goes through [`execute_request`], which runs `independent` and
-    /// `sequence` batches and refuses `atomic` rather than emulating it: one
-    /// transaction across several operations is an engine property, and this
-    /// engine does not have it yet.
-    ///
-    /// `languages` is passed in rather than derived here because the caller
-    /// needs the same classification before this future is spawned — see
-    /// [`RequestLanguages`] — and classifying twice would mean parsing every
-    /// command three times.
-    pub async fn execute_kip(&self, request: Request, languages: &RequestLanguages) -> Response {
+    /// The prepared SDK path preserves batch semantics without parsing again.
+    /// Audit persistence remains best-effort and is awaited to completion.
+    pub async fn execute_kip(
+        &self,
+        request: PreparedRequest,
+        languages: &RequestLanguages,
+    ) -> Response {
         let timestamp = unix_ms();
-
         let languages = languages.to_string();
-        let response = execute_request(self.nexus.as_ref(), &request).await;
-        let logged_request = truncate_request(&request, self.max_logged_request_bytes);
+        // Only the bounded log envelope is copied, never a large ingest body.
+        let logged_request =
+            truncate_request(request.request(), self.max_logged_request_bytes).into_owned();
+        let response = request.execute(self.nexus.as_ref()).await;
         // Errors live at the operation level for an ordinary failure and at the
         // request level only for an envelope failure or an unknown outcome, so
         // an audit record that read one of them would be blank for half of the
@@ -301,14 +299,19 @@ impl Nexus {
                     .or_else(|| response.results.iter().find_map(|r| r.receipt.as_ref()))
                     .and_then(|r| r.tx_id.as_deref()),
                 "errors": errors,
+                "operations": response.results.iter().map(|result| json!({
+                    "op_id": result.op_id,
+                    "status": result.status,
+                    "tx_id": result.receipt.as_ref().and_then(|receipt| receipt.tx_id.as_deref()),
+                    "error": result.error,
+                })).collect::<Vec<_>>(),
             }),
             period: timestamp / 3600 / 1000,
             timestamp,
         };
 
-        // Log persistence is best-effort but must not be silent; durability
-        // is handled by the periodic `AndaDB::auto_flush` task instead of a
-        // per-request flush.
+        // The document write is durable; the periodic flush checkpoints indexes.
+        // A logging failure must not replace an already committed KIP outcome.
         if let Err(err) = self.logs.add_from(&log).await {
             log::error!(
                 action = "Nexus::execute_kip";
@@ -368,9 +371,13 @@ impl Nexus {
     /// `query_ids` keep returning the same undeletable ids), the loop exits
     /// instead of spinning without backoff; the next scheduled prune run
     /// retries.
-    pub async fn prune_logs(&self, before_period: u64) -> Result<usize, BoxError> {
+    pub async fn prune_logs(
+        &self,
+        before_period: u64,
+        cancel: &CancellationToken,
+    ) -> Result<usize, BoxError> {
         let mut total = 0usize;
-        loop {
+        while !cancel.is_cancelled() {
             let ids = self
                 .logs
                 .query_ids(
@@ -383,6 +390,10 @@ impl Nexus {
             }
             let mut deleted_this_batch = 0usize;
             for id in ids {
+                // Observe shutdown only between completed, non-cancel-safe deletes.
+                if cancel.is_cancelled() {
+                    return Ok(total + deleted_this_batch);
+                }
                 if self.logs.remove(id).await?.is_some() {
                     deleted_this_batch += 1;
                 }
@@ -396,6 +407,7 @@ impl Nexus {
             }
             total += deleted_this_batch;
         }
+        Ok(total)
     }
 }
 
@@ -427,7 +439,7 @@ mod tests {
     /// Runs one command the way the handler does: classify once, then
     /// execute with that classification.
     async fn run(nexus: &Nexus, command: &str) -> Response {
-        let request = Request::single(command);
+        let request = PreparedRequest::new(Request::single(command)).unwrap();
         let languages = RequestLanguages::of(&request);
         nexus.execute_kip(request, &languages).await
     }
@@ -521,7 +533,10 @@ mod tests {
             add_log(&nexus, period).await;
         }
 
-        let pruned = nexus.prune_logs(10).await.unwrap();
+        let pruned = nexus
+            .prune_logs(10, &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(pruned, 2);
 
         let (logs, _) = nexus
@@ -535,7 +550,13 @@ mod tests {
         assert!(logs.iter().all(|log| log.period >= 10));
 
         // Idempotent when nothing is expired.
-        assert_eq!(nexus.prune_logs(10).await.unwrap(), 0);
+        assert_eq!(
+            nexus
+                .prune_logs(10, &CancellationToken::new())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// The bundled profile is in force on a fresh database, and a restart
@@ -676,11 +697,17 @@ mod tests {
     #[test]
     fn languages_are_classified_from_the_parsed_commands() {
         assert_eq!(
-            RequestLanguages::of(&Request::single("DESCRIBE PRIMER")).to_string(),
+            RequestLanguages::of(
+                &PreparedRequest::new(Request::single("DESCRIBE PRIMER")).unwrap()
+            )
+            .to_string(),
             "META"
         );
         assert_eq!(
-            RequestLanguages::of(&Request::single("this is not a KIP command")).to_string(),
+            RequestLanguages::of(
+                &PreparedRequest::new(Request::single("this is not a KIP command")).unwrap()
+            )
+            .to_string(),
             "UNKNOWN"
         );
 
@@ -693,10 +720,15 @@ mod tests {
             execution: Some(Execution::new(ExecutionMode::Sequence)),
             ..Default::default()
         };
-        let mixed = RequestLanguages::of(&mixed);
+        let mixed = RequestLanguages::of(&PreparedRequest::new(mixed).unwrap());
         assert_eq!(mixed.to_string(), "KML,KQL");
         assert!(mixed.has_mutation());
-        assert!(!RequestLanguages::of(&Request::single("DESCRIBE PRIMER")).has_mutation());
+        assert!(
+            !RequestLanguages::of(
+                &PreparedRequest::new(Request::single("DESCRIBE PRIMER")).unwrap()
+            )
+            .has_mutation()
+        );
     }
 
     /// The cap is enforced end to end: an oversized request is readable
@@ -723,5 +755,109 @@ mod tests {
         assert!(logged.len() < command.len());
         assert!(logged.contains("truncated"));
         assert_eq!(log.languages, "KQL");
+    }
+
+    #[test]
+    fn truncated_requests_obey_encoded_caps_and_utf8_boundaries() {
+        for cap in [0, 256, 1024, 8192] {
+            for text in ["x", "\\\"", "中文", "\n\t"] {
+                let request = Request::single(text.repeat(20_000));
+                let logged = truncate_request(&request, cap);
+                let bytes = serde_json::to_vec(&*logged).unwrap();
+                assert!(
+                    bytes.len() <= cap.max(MIN_LOGGED_REQUEST_BYTES),
+                    "cap={cap}, size={}",
+                    bytes.len()
+                );
+                assert!(serde_json::from_slice::<Request>(&bytes).is_ok());
+                assert_eq!(json_size(&*logged).unwrap(), bytes.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_correlates_every_batch_result() {
+        let nexus = test_nexus().await;
+        let request = PreparedRequest::new(Request {
+            operations: vec![
+                Operation::new(r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Alice" }"#)
+                    .with_op_id("first"),
+                Operation::new(r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Bob" }"#)
+                    .with_op_id("second"),
+                Operation::new("not KIP").with_op_id("failed"),
+                Operation::new("DESCRIBE PRIMER").with_op_id("skipped"),
+            ],
+            execution: Some(Execution::new(ExecutionMode::Sequence)),
+            ..Default::default()
+        })
+        .unwrap();
+        let languages = RequestLanguages::of(&request);
+        let response = nexus.execute_kip(request, &languages).await;
+        assert_eq!(response.status, TopLevelStatus::Partial);
+        let (logs, _) = nexus.list_logs(ListLogParams::default()).await.unwrap();
+        let operations = logs[0].response["operations"].as_array().unwrap();
+        assert_eq!(operations.len(), 4);
+        for (logged, result) in operations.iter().zip(&response.results) {
+            assert_eq!(logged["op_id"], json!(result.op_id));
+            assert_eq!(logged["status"], json!(result.status));
+            assert_eq!(
+                logged["tx_id"],
+                json!(result.receipt.as_ref().and_then(|r| r.tx_id.as_ref()))
+            );
+            assert_eq!(logged["error"], json!(result.error));
+        }
+        assert_ne!(operations[0]["tx_id"], operations[1]["tx_id"]);
+    }
+
+    #[tokio::test]
+    async fn retention_observes_cancellation_between_completed_deletes() {
+        use anda_object_store::{FaultGate, FaultKind, FaultOp, FaultRule, FaultStore};
+        let (store, fault) = FaultStore::wrap(InMemory::new());
+        let db = Arc::new(
+            AndaDB::connect(
+                Arc::new(store),
+                DBConfig {
+                    name: "retention_cancel".into(),
+                    description: String::new(),
+                    storage: StorageConfig::default(),
+                    lock: None,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let nexus = Nexus::connect(db.clone(), &[], 8192).await.unwrap();
+        for _ in 0..3 {
+            add_log(&nexus, 1).await;
+        }
+        let cancel = CancellationToken::new();
+        let gate = FaultGate::new();
+        fault.push_rule(FaultRule {
+            op: FaultOp::Put,
+            path_contains: Some("kip_logs".into()),
+            skip: 0,
+            times: 1,
+            kind: FaultKind::PauseBefore(gate.clone()),
+        });
+        let task = tokio::spawn({
+            let nexus = nexus.clone();
+            let cancel = cancel.clone();
+            async move { nexus.prune_logs(10, &cancel).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_entered())
+            .await
+            .unwrap();
+        cancel.cancel();
+        assert!(
+            !task.is_finished(),
+            "a pending deletion must not be cancelled"
+        );
+        gate.release();
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        assert!(!nexus.logs.is_poisoned());
+        assert_eq!(nexus.prune_logs(10, &cancel).await.unwrap(), 0);
+        let (logs, _) = nexus.list_logs(ListLogParams::default()).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        db.close().await.unwrap();
     }
 }

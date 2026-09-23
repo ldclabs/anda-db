@@ -8,7 +8,8 @@ WORKDIR /build
 COPY rs ./rs
 COPY py ./py
 COPY Cargo.toml ./
-RUN cargo build --release -p anda_cognitive_nexus_server
+COPY rs/anda_cognitive_nexus_server/Cargo.lock ./Cargo.lock
+RUN cargo build --locked --release -p anda_cognitive_nexus_server
 
 FROM debian:bookworm-slim AS runtime
 

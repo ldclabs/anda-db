@@ -201,6 +201,47 @@ pub async fn execute_request(executor: &impl Executor, request: &Request) -> Res
     run_request(executor, request, |_| Ok(())).await
 }
 
+/// A validated envelope with its operations parsed once, ready for execution.
+///
+/// Hosts may inspect the parsed commands for admission, timeout reporting and
+/// logging. The envelope and commands cannot be changed independently. Syntax
+/// errors remain per-operation results, preserving batch execution semantics.
+#[derive(Debug)]
+pub struct PreparedRequest {
+    request: Request,
+    parsed: Vec<Result<Command, KipError>>,
+}
+
+impl PreparedRequest {
+    /// Validates an envelope and prepares all operations, including ingest.
+    pub fn new(request: Request) -> Result<Self, KipError> {
+        let parsed = request.prepare_operations()?;
+        Ok(Self { request, parsed })
+    }
+
+    /// Decodes and prepares an envelope without parsing ingest commands twice.
+    /// For raw JSON, call [`crate::parse_canonical_json`] first to preserve
+    /// duplicate-key and numeric-source checks.
+    pub fn from_value(value: crate::Json) -> Result<Self, KipError> {
+        Self::new(Request::decode_value(value)?)
+    }
+
+    /// The validated envelope, available for correlation and bounded logging.
+    pub fn request(&self) -> &Request {
+        &self.request
+    }
+
+    /// Each prepared operation, in request order, including syntax failures.
+    pub fn operations(&self) -> &[Result<Command, KipError>] {
+        &self.parsed
+    }
+
+    /// Executes the prepared commands with the ordinary batch semantics.
+    pub async fn execute(self, executor: &impl Executor) -> Response {
+        run_prepared_request(executor, &self.request, self.parsed, |_| Ok(())).await
+    }
+}
+
 /// Runs a whole request envelope on a read-only path (§76).
 ///
 /// The envelope counterpart of [`execute_readonly`]: accepts KQL and META —
@@ -230,6 +271,15 @@ async fn run_request(
         Err(err) => return Response::from(err).with_request_id(request.request_id.clone()),
     };
 
+    run_prepared_request(executor, request, parsed, admits).await
+}
+
+async fn run_prepared_request(
+    executor: &impl Executor,
+    request: &Request,
+    parsed: Vec<Result<Command, KipError>>,
+    admits: impl Fn(&Command) -> Result<(), KipError>,
+) -> Response {
     let mode = request.execution_mode();
     if mode == ExecutionMode::Atomic {
         return Response::from(KipError::unsupported_capability(
@@ -748,5 +798,69 @@ mod tests {
         let response = execute_request(&CommitThenUnknown, &request).await;
         assert_eq!(response.status, TopLevelStatus::OutcomeUnknown);
         assert_eq!(response.receipt, None);
+    }
+
+    #[tokio::test]
+    async fn prepared_execution_matches_ordinary_batch_semantics() {
+        for mode in [
+            ExecutionMode::Independent,
+            ExecutionMode::Sequence,
+            ExecutionMode::Atomic,
+        ] {
+            for on_error in [OnError::Stop, OnError::Continue] {
+                if mode == ExecutionMode::Atomic && on_error == OnError::Continue {
+                    continue;
+                }
+                let request = Request {
+                    request_id: Some("prepared".into()),
+                    execution: Some(Execution {
+                        on_error: Some(on_error),
+                        idempotency_key: Some("same-key".into()),
+                        ..Execution::new(mode)
+                    }),
+                    operations: vec![
+                        Operation::new("DESCRIBE PRIMER").with_op_id("read"),
+                        Operation::new("not a command").with_op_id("bad"),
+                        Operation::new(r#"TRANSITION :a TO "archived""#).with_op_id("write"),
+                    ],
+                    ..Default::default()
+                };
+                let expected = execute_request(&EchoNexus, &request).await;
+                let prepared =
+                    PreparedRequest::from_value(serde_json::to_value(request).unwrap()).unwrap();
+                assert_eq!(prepared.operations().len(), 3);
+                assert!(prepared.operations()[1].is_err());
+                assert!(prepared.operations()[2].as_ref().unwrap().is_mutation());
+                let actual = prepared.execute(&EchoNexus).await;
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_decode_preserves_ingest_and_timestamp_validation() {
+        let mut value = serde_json::json!({
+            "kip":"2.0", "operations":[{"command":"DESCRIBE PRIMER"}],
+            "ingest":{"evidence":[{"key":"e", "evidence_class":"user_statement", "payload":null}]}
+        });
+        assert_eq!(
+            PreparedRequest::from_value(value.clone()).unwrap_err().code,
+            Request::from_value(value.clone()).unwrap_err().code
+        );
+        value["operations"][0]["command"] = serde_json::json!(r#"TRANSITION :a TO "archived""#);
+        assert!(PreparedRequest::from_value(value.clone()).is_ok());
+        for at in [
+            serde_json::json!(42),
+            serde_json::json!("2026-09-23T00:00:00Z"),
+        ] {
+            value["ingest"]["evidence"][0]["observed_at"] = at;
+            assert_eq!(
+                PreparedRequest::from_value(value.clone()).unwrap_err().code,
+                Request::from_value(value.clone()).unwrap_err().code
+            );
+        }
     }
 }

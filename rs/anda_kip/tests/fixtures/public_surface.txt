@@ -109,6 +109,7 @@ executor.rs: fn execute_kip
 executor.rs: fn execute_readonly
 executor.rs: fn execute_request
 executor.rs: fn execute_request_readonly
+executor.rs: struct PreparedRequest
 executor.rs: trait Executor
 json.rs: const MAX_SAFE_INTEGER
 json.rs: fn parse_canonical_json

@@ -613,6 +613,18 @@ the vendored schemas remain the portable artifact validation contract.
 
 ---
 
+### 9.1 Prepared execution for transports
+
+`PreparedRequest::from_value` decodes and validates an envelope, including
+ingest timestamps and command constraints, and retains each parsed operation.
+For raw JSON, call `parse_canonical_json` first to preserve duplicate-key and
+numeric-source checks. Hosts inspect `request()` and `operations()` for timeout
+classification and bounded logging, then consume `execute()` to run the same
+commands. Preparation failures are envelope errors; command syntax failures
+remain individual batch results. Independent/sequence receipts, request
+correlation, skipped results and atomic refusal match `execute_request`.
+
+
 ## 10. Core data model
 
 `anda_kip::types` models the element envelope and the Core kinds:

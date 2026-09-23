@@ -1,7 +1,10 @@
-use anda_kip::{ErrorObject, KipError, KipErrorCode, Request, Response, TopLevelStatus};
+use anda_kip::{
+    ErrorObject, KipError, KipErrorCode, PreparedRequest, Response, ResponseExecution, RetryClass,
+    RetryInfo, TopLevelStatus,
+};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request as HttpRequest, State},
+    extract::{DefaultBodyLimit, FromRequest, Request as HttpRequest, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::IntoResponse,
@@ -10,8 +13,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
+
+use crate::runtime::{DetachedError, EXECUTION_TIMEOUT_FACTOR, ExecutionManager};
 
 use crate::nexus::{ListLogParams, ListLogsError, Nexus, RequestLanguages};
 
@@ -22,37 +26,10 @@ pub struct AppState {
     pub nexus: Nexus,
     /// Per-request **response** deadline for `/kip`. A KIP execution that
     /// exceeds it gets a 408 response, but the already-started execution
-    /// finishes in the background (see [`run_detached_with_timeout`]).
+    /// finishes in the background (see [`ExecutionManager::run`]).
     pub request_timeout: Duration,
-    /// Hard upper bound on a detached KIP execution. It exists only so a
-    /// stuck or pathologically slow execution eventually initiates process
-    /// shutdown; see [`run_detached_with_timeout`].
-    pub execution_timeout: Duration,
-    /// Stops new KIP work as soon as graceful shutdown begins.
-    pub admission: CancellationToken,
-    /// Tracks non-cancel-safe KIP mutations that may outlive their HTTP
-    /// response deadline.
-    pub mutation_tasks: TaskTracker,
-    /// Bounds detached mutation concurrency.
-    pub mutation_permits: Arc<Semaphore>,
-    /// Serializes the final admission check and task registration with
-    /// shutdown's tracker close. The handles are retained only for the hard
-    /// shutdown deadline.
-    pub mutation_aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
-}
-
-/// How a detached execution failed to produce a value before the deadline.
-#[derive(Debug)]
-pub enum DetachedError {
-    /// The response deadline elapsed; the detached task keeps running. Its
-    /// hard deadline initiates process shutdown without cancelling it.
-    Timeout,
-    /// The detached task itself failed (panicked or was aborted).
-    Join(tokio::task::JoinError),
-    /// Shutdown has closed request admission.
-    ShuttingDown,
-    /// The bounded mutation executor has no free capacity.
-    Busy,
+    /// All admitted requests share one bounded execution registry.
+    pub executions: ExecutionManager,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,82 +55,6 @@ where
         result = tokio::time::timeout(deadline, fut) => {
             result.map_err(|_| CancelSafeError::Timeout)
         }
-    }
-}
-
-/// Runs `fut` on a detached task with a response deadline and a hard
-/// execution deadline.
-///
-/// KML execution mutates the graph in multiple steps and has no rollback
-/// log: cancelling it mid-flight — which is exactly what dropping the
-/// future inside `tokio::time::timeout` does — can leave half-written
-/// graph state (e.g. an `UPSERT` with only a prefix of its blocks
-/// applied). Spawning first means `deadline` only abandons the *response*;
-/// the execution itself keeps running in the background.
-///
-/// `hard_deadline` bounds how long the process may keep serving after a
-/// runaway execution. The execution itself is never cancelled here: doing so
-/// would poison the affected AndaDB collection while the process continued to
-/// serve stale state. Instead the deadline closes admission through
-/// `admission`; `main` observes that token, drains the server, and lets the
-/// existing shutdown path either finish the mutation or terminate at a
-/// crash-recoverable point. It must be set well above the response deadline
-/// so a normal slow request never initiates shutdown.
-pub(crate) async fn run_detached_with_timeout<T, F>(
-    admission: &CancellationToken,
-    tracker: &TaskTracker,
-    permits: Arc<Semaphore>,
-    aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
-    deadline: Duration,
-    hard_deadline: Duration,
-    fut: F,
-) -> Result<T, DetachedError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    if admission.is_cancelled() {
-        return Err(DetachedError::ShuttingDown);
-    }
-    let hard_shutdown = admission.clone();
-    let permit = permits
-        .try_acquire_owned()
-        .map_err(|_| DetachedError::Busy)?;
-    // Shutdown takes this same lock before closing the TaskTracker. This
-    // closes the otherwise-real race where a handler passes its final token
-    // check, is preempted, and registers a mutation after `wait()` returned.
-    let mut handles = aborts.lock().await;
-    if admission.is_cancelled() {
-        return Err(DetachedError::ShuttingDown);
-    }
-    let task = tracker.spawn(async move {
-        // The permit is released when this task ends, never when the response
-        // waiter gives up.
-        let _permit = permit;
-        tokio::pin!(fut);
-        tokio::select! {
-            value = &mut fut => value,
-            _ = tokio::time::sleep(hard_deadline) => {
-                log::error!(
-                    action = "run_detached_with_timeout",
-                    hard_deadline_secs = hard_deadline.as_secs();
-                    "detached execution exceeded its hard deadline; closing admission \
-                     and initiating process shutdown without cancelling the mutation",
-                );
-                hard_shutdown.cancel();
-                fut.await
-            }
-        }
-    });
-    handles.retain(|handle| !handle.is_finished());
-    handles.push(task.abort_handle());
-    drop(handles);
-    match tokio::time::timeout(deadline, task).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(join_error)) => Err(DetachedError::Join(join_error)),
-        // Dropping the JoinHandle detaches the task: it keeps running. The
-        // hard deadline closes admission but does not drop the future.
-        Err(_) => Err(DetachedError::Timeout),
     }
 }
 
@@ -300,17 +201,22 @@ fn error_response(code: KipErrorCode, message: impl Into<String>) -> Json<Box<Re
 /// POST /kip
 ///
 /// Authentication runs in the router layer ([`build_router`]), before this
-/// handler and before the `Json` extractor parses the body.
+/// handler and before the body is read or parsed.
 pub async fn post_kip(
     State(app): State<AppState>,
-    headers: header::HeaderMap,
-    body: axum::body::Bytes,
+    request: HttpRequest,
 ) -> Result<(StatusCode, Json<Response>), KipHttpError> {
-    if app.admission.is_cancelled() {
+    if app.executions.admission.is_cancelled() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, shutting_down()));
     }
 
-    let content_type = headers
+    // Capacity bounds body buffering and parsing as well as execution.
+    let permit = app
+        .executions
+        .reserve()
+        .map_err(|err| detached_error(err, false))?;
+    let content_type = request
+        .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -333,6 +239,31 @@ pub async fn post_kip(
             error_response(KipErrorCode::InvalidRequestEnvelope, message),
         )
     };
+    let body = run_cancel_safe_with_timeout(
+        &app.executions.admission,
+        app.request_timeout.saturating_mul(2),
+        axum::body::Bytes::from_request(request, &app),
+    )
+    .await
+    .map_err(|err| match err {
+        CancelSafeError::Timeout => {
+            timeout_error("request body reception exceeded the configured timeout")
+        }
+        CancelSafeError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, shutting_down()),
+    })?
+    .map_err(|err| {
+        (
+            err.status(),
+            error_response(
+                if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    KipErrorCode::ResourceExhausted
+                } else {
+                    KipErrorCode::InvalidRequestEnvelope
+                },
+                err.body_text(),
+            ),
+        )
+    })?;
     let source = std::str::from_utf8(&body).map_err(|e| decode_error(e.to_string()))?;
     let value = anda_kip::parse_canonical_json(source).map_err(|e| decode_error(e.message))?;
     let req: JsonRpcRequest =
@@ -340,66 +271,54 @@ pub async fn post_kip(
 
     match req.method.as_str() {
         "execute_kip" => {
-            let params = Request::from_value(req.params).map_err(|e| {
+            let params = PreparedRequest::from_value(req.params).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
                     error_response(e.code, format!("invalid parameters: {e}")),
                 )
             })?;
 
-            // Detached execution: on timeout the client gets a 408, but the
-            // started KIP execution (possibly a mid-write KML mutation)
-            // continues to completion instead of being cancelled halfway.
             let nexus = app.nexus.clone();
             let languages = RequestLanguages::of(&params);
-            let has_mutation = languages.has_mutation();
-            let response = run_detached_with_timeout(
-                &app.admission,
-                &app.mutation_tasks,
-                app.mutation_permits.clone(),
-                app.mutation_aborts.clone(),
-                app.request_timeout,
-                app.execution_timeout,
-                async move { nexus.execute_kip(params, &languages).await },
-            )
-            .await
-            .map_err(|err| match err {
-                DetachedError::Timeout => {
-                    log::warn!(
-                        action = "post_kip",
-                        method = "execute_kip",
-                        timeout_secs = app.request_timeout.as_secs();
-                        "response deadline exceeded; KIP execution continues in the background",
-                    );
-                    abandoned_response(has_mutation)
-                }
-                DetachedError::Join(join_error) => {
-                    log::error!(
-                        action = "post_kip",
-                        method = "execute_kip";
-                        "KIP execution task failed: {join_error:?}",
-                    );
-                    // The task was spawned, so a KML mutation may have run to
-                    // an arbitrary point before it died: §80.3 says the client
-                    // must look the outcome up, not re-issue the write.
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(Box::new(Response::outcome_unknown(
-                            KipError::outcome_unknown(
-                                "the KIP execution task failed before reporting its outcome",
-                            ),
-                        ))),
-                    )
-                }
-                DetachedError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, shutting_down()),
-                DetachedError::Busy => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    error_response(
-                        KipErrorCode::ResourceExhausted,
-                        "server mutation capacity is exhausted",
-                    ),
+            let has_mutation = languages.has_mutation() && !params.request().is_dry_run();
+            let request_id = params.request().request_id.clone();
+            let execution = ResponseExecution {
+                mode: params.request().execution_mode(),
+                on_error: Some(
+                    params
+                        .request()
+                        .execution
+                        .as_ref()
+                        .and_then(|e| e.on_error)
+                        .unwrap_or(anda_kip::OnError::Stop),
                 ),
-            })?;
+                isolation: params
+                    .request()
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.isolation.clone()),
+                idempotency_key: params
+                    .request()
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.idempotency_key.clone()),
+                extensions: None,
+            };
+            let response = app
+                .executions
+                .run(
+                    permit,
+                    app.request_timeout,
+                    app.request_timeout.saturating_mul(EXECUTION_TIMEOUT_FACTOR),
+                    async move { nexus.execute_kip(params, &languages).await },
+                )
+                .await
+                .map_err(|err| {
+                    let mut error = detached_error(err, has_mutation);
+                    error.1.0.request_id = request_id;
+                    error.1.0.execution = Some(execution);
+                    error
+                })?;
             match kip_status(&response) {
                 status if status.is_success() => Ok((status, Json(response))),
                 status => Err((status, Json(Box::new(response)))),
@@ -422,7 +341,7 @@ pub async fn post_kip(
             // abort connection tasks that it already spawned. Dropping this
             // read future on shutdown prevents it from crossing DB close.
             let (logs, next_cursor) = run_cancel_safe_with_timeout(
-                &app.admission,
+                &app.executions.admission,
                 app.request_timeout,
                 app.nexus.list_logs(params),
             )
@@ -471,43 +390,63 @@ pub async fn post_kip(
     }
 }
 
-/// Bounds the complete HTTP route, including buffering the request body and
-/// running extractors. Handler-local deadlines only start after `Json` has
-/// consumed the body, so without this outer layer a slow client can occupy a
-/// connection indefinitely.
-///
-/// As in `anda_db_server`, the transport deadline is twice the processing
-/// timeout. This lets a request whose body arrived normally receive the more
-/// precise handler-local timeout first, while still placing a finite bound on
-/// a stalled body. A mutation already admitted by [`post_kip`] remains owned
-/// by the mutation tracker when the response future is dropped.
-pub async fn total_timeout(
-    State(request_timeout): State<Duration>,
-    req: HttpRequest,
-    next: Next,
-) -> axum::response::Response {
-    let deadline = request_timeout.saturating_mul(2);
-    match tokio::time::timeout(deadline, next.run(req)).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            timeout_error("request processing exceeded the configured timeout").into_response()
+/// Failures before execution are known refusals; a started write can have an
+/// unknown outcome. Keep HTTP status, protocol code and retry advice aligned.
+fn detached_error(err: DetachedError, has_mutation: bool) -> KipHttpError {
+    match err {
+        DetachedError::Timeout => abandoned_response(has_mutation),
+        DetachedError::Join(err) => {
+            log::error!("KIP execution task failed: {err:?}");
+            if has_mutation {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(Box::new(Response::outcome_unknown(
+                        KipError::outcome_unknown(
+                            "the KIP execution task failed before reporting its outcome",
+                        ),
+                    ))),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    safe_error(KipErrorCode::InternalError, "KIP read task failed"),
+                )
+            }
         }
+        DetachedError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, shutting_down()),
+        DetachedError::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            error_response(
+                KipErrorCode::RateLimited,
+                "server execution capacity is exhausted; back off and retry",
+            ),
+        ),
     }
+}
+
+/// Override conservative registry defaults only where no cognitive write can
+/// have occurred (body reception, a refused request, or a read-only request).
+fn safe_error(code: KipErrorCode, message: impl Into<String>) -> Json<Box<Response>> {
+    let mut error = ErrorObject::new(code, message);
+    error.retry = Some(RetryInfo::new(RetryClass::SafeSameRequest));
+    error.hint = Some(
+        "Back off and retry the identical request; no cognitive mutation was executed.".into(),
+    );
+    Json(Box::new(Response::failed(error)))
 }
 
 fn timeout_error(message: impl Into<String>) -> KipHttpError {
     (
         StatusCode::REQUEST_TIMEOUT,
-        error_response(KipErrorCode::ExecutionTimeout, message),
+        safe_error(KipErrorCode::ExecutionTimeout, message),
     )
 }
 
 /// The response for an execution whose *response* deadline elapsed while the
 /// execution itself kept running.
 ///
-/// For a read that is a plain timeout: nothing was written, and re-sending the
-/// identical request is safe, which is what `ExecutionTimeout`'s registered
-/// retry class says. For a mutation it is §80.3's unknown outcome — the write
+/// A read has no cognitive write to reconcile, so this transport can explicitly
+/// report safe retry instead of the registry's conservative timeout default. For a mutation it is §80.3's unknown outcome — the write
 /// may still commit — and answering with a `safe_same_request` class would be
 /// an invitation to commit the same cognition twice.
 fn abandoned_response(has_mutation: bool) -> KipHttpError {
@@ -529,39 +468,9 @@ fn abandoned_response(has_mutation: bool) -> KipHttpError {
     }
 }
 
-/// The body for a request refused because the process is draining.
-///
-/// `InternalError` rather than a bespoke code: its registered retry class is
-/// `safe_same_request`, which is exactly right here — nothing was executed, so
-/// re-sending the identical envelope to another instance is safe.
+/// A shutdown refusal is known not to have executed.
 fn shutting_down() -> Json<Box<Response>> {
-    error_response(KipErrorCode::InternalError, "server is shutting down")
-}
-
-/// Rewrites extractor-level rejections (e.g. the body-limit 413, which axum
-/// emits as plain text) into the JSON-RPC error format.
-pub async fn normalize_rejections(
-    req: axum::extract::Request,
-    next: Next,
-) -> axum::response::Response {
-    let resp = next.run(req).await;
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE
-        && resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|ct| !ct.starts_with("application/json"))
-    {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            error_response(
-                KipErrorCode::ResourceExhausted,
-                "request body exceeds the configured size limit",
-            ),
-        )
-            .into_response();
-    }
-    resp
+    safe_error(KipErrorCode::InternalError, "server is shutting down")
 }
 
 /// Rejects an unauthenticated `/kip` request before any extractor runs.
@@ -590,7 +499,6 @@ async fn require_api_key(
 /// `/kip` runs [`require_api_key`] as a route layer, i.e. before the body is
 /// read or parsed.
 pub fn build_router(state: AppState, api_key: Option<String>, max_body_size: usize) -> Router {
-    let request_timeout = state.request_timeout;
     Router::new()
         .route("/", routing::get(get_information))
         .route(
@@ -601,11 +509,6 @@ pub fn build_router(state: AppState, api_key: Option<String>, max_body_size: usi
             )),
         )
         .layer(DefaultBodyLimit::max(max_body_size.max(1024)))
-        .layer(middleware::from_fn(normalize_rejections))
-        .layer(middleware::from_fn_with_state(
-            request_timeout,
-            total_timeout,
-        ))
         .with_state(state)
 }
 
@@ -653,9 +556,13 @@ mod tests {
     use object_store::memory::InMemory;
     use tower::ServiceExt;
 
-    async fn test_app(api_key: Option<String>) -> Router {
+    async fn test_state() -> AppState {
+        test_state_with_store(Arc::new(InMemory::new())).await
+    }
+
+    async fn test_state_with_store(store: Arc<dyn object_store::ObjectStore>) -> AppState {
         let db = AndaDB::connect(
-            Arc::new(InMemory::new()),
+            store,
             DBConfig {
                 name: "kip_handler_test".to_string(),
                 description: String::new(),
@@ -666,18 +573,17 @@ mod tests {
         .await
         .unwrap();
         let nexus = Nexus::connect(Arc::new(db), &[], 8 * 1024).await.unwrap();
-        let state = AppState {
+        AppState {
             name: "test".to_string(),
             version: "0.0.0".to_string(),
             nexus,
             request_timeout: Duration::from_secs(30),
-            execution_timeout: Duration::from_secs(120),
-            admission: CancellationToken::new(),
-            mutation_tasks: TaskTracker::new(),
-            mutation_permits: Arc::new(Semaphore::new(4)),
-            mutation_aborts: Arc::new(Mutex::new(Vec::new())),
-        };
-        build_router(state, api_key, 2 * 1024 * 1024)
+            executions: ExecutionManager::new(4),
+        }
+    }
+
+    async fn test_app(api_key: Option<String>) -> Router {
+        build_router(test_state().await, api_key, 2 * 1024 * 1024)
     }
 
     async fn post_json(app: &Router, body: &str, api_key: Option<&str>) -> (StatusCode, Value) {
@@ -717,13 +623,9 @@ mod tests {
 
     #[tokio::test]
     async fn route_timeout_covers_a_stalled_json_body() {
-        async fn extract(Json(_): Json<JsonRpcRequest>) -> StatusCode {
-            StatusCode::OK
-        }
-
-        let app = Router::new().route("/kip", routing::post(extract)).layer(
-            middleware::from_fn_with_state(Duration::from_millis(20), total_timeout),
-        );
+        let mut state = test_state().await;
+        state.request_timeout = Duration::from_millis(20);
+        let app = build_router(state, None, 2 * 1024 * 1024);
 
         let (mut tx, channel_body) = http_body_util::channel::Channel::<Bytes>::new(4);
         tx.send_data(Bytes::from_static(b"{\"method\":"))
@@ -749,182 +651,12 @@ mod tests {
         assert_eq!(body["error"]["code"], "ExecutionTimeout");
         assert_eq!(
             body["error"]["message"],
-            "request processing exceeded the configured timeout"
+            "request body reception exceeded the configured timeout"
         );
 
         // Keep the producer alive until after the timeout response so the
         // route was ended by the deadline rather than end-of-stream.
         drop(tx);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn detached_timeout_returns_early_but_lets_execution_finish() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        let completed = Arc::new(AtomicBool::new(false));
-        let flag = completed.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-
-        let result = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            Arc::new(Semaphore::new(1)),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_millis(20),
-            Duration::from_secs(30),
-            async move {
-                started_tx.send(()).unwrap();
-                // Held open well past the deadline until the test releases it.
-                let _ = release_rx.await;
-                flag.store(true, Ordering::SeqCst);
-                42u32
-            },
-        )
-        .await;
-
-        // The caller observes the timeout, not the value.
-        assert!(matches!(result, Err(DetachedError::Timeout)));
-        // The detached execution was started and, once unblocked, still
-        // runs to completion instead of being cancelled by the timeout.
-        started_rx.await.unwrap();
-        assert!(!completed.load(Ordering::SeqCst));
-        release_tx.send(()).unwrap();
-        tracker.close();
-        tokio::time::timeout(Duration::from_secs(5), tracker.wait())
-            .await
-            .expect("tracked execution must drain");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !completed.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("detached execution must finish after the timeout response");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn detached_timeout_returns_value_and_maps_panics() {
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-        let permits = Arc::new(Semaphore::new(1));
-        let ok = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            async { 7u32 },
-        )
-        .await;
-        assert!(matches!(ok, Ok(7)));
-
-        let panicked = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits,
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            async {
-                panic!("boom");
-                #[allow(unreachable_code)]
-                0u32
-            },
-        )
-        .await;
-        match panicked {
-            Err(DetachedError::Join(err)) => assert!(err.is_panic()),
-            other => panic!("expected a join error, got {other:?}"),
-        }
-        tracker.close();
-        tracker.wait().await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_closes_admission_and_capacity_is_bounded() {
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-        let permits = Arc::new(Semaphore::new(1));
-        let permit = permits.clone().acquire_owned().await.unwrap();
-        let busy = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-            async { 1u8 },
-        )
-        .await;
-        assert!(matches!(busy, Err(DetachedError::Busy)));
-        drop(permit);
-
-        admission.cancel();
-        let shutting_down = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits,
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(1),
-            Duration::from_secs(30),
-            async { 2u8 },
-        )
-        .await;
-        assert!(matches!(shutting_down, Err(DetachedError::ShuttingDown)));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn tracker_close_cannot_race_a_late_mutation_registration() {
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-        let permits = Arc::new(Semaphore::new(1));
-        let registry = Arc::new(Mutex::new(Vec::new()));
-        let registration = registry.lock().await;
-
-        let attempt = tokio::spawn({
-            let admission = admission.clone();
-            let tracker = tracker.clone();
-            let permits = permits.clone();
-            let registry = registry.clone();
-            async move {
-                run_detached_with_timeout(
-                    &admission,
-                    &tracker,
-                    permits,
-                    registry,
-                    Duration::from_secs(1),
-                    Duration::from_secs(30),
-                    async { 1u8 },
-                )
-                .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while permits.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("mutation did not reach the final registration gate");
-
-        // This is the shutdown side of the shared critical section. The
-        // waiting handler passed its first check, but cannot register after
-        // cancellation and tracker close once this guard is released.
-        admission.cancel();
-        tracker.close();
-        drop(registration);
-
-        let result = attempt.await.expect("registration task panicked");
-        assert!(matches!(result, Err(DetachedError::ShuttingDown)));
-        tracker.wait().await;
-        assert_eq!(tracker.len(), 0);
     }
 
     #[tokio::test]
@@ -949,109 +681,6 @@ mod tests {
             .expect("cancel-safe read must observe shutdown promptly")
             .expect("cancel-safe read task panicked");
         assert_eq!(result, Err(CancelSafeError::ShuttingDown));
-    }
-
-    /// A hard deadline must stop the process from admitting more mutations,
-    /// but it must not cancel the in-flight database write and poison a live
-    /// collection. The normal shutdown drain owns the eventual completion or
-    /// crash-style abort.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_hard_deadline_closes_admission_without_cancelling_the_execution() {
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-        let permits = Arc::new(Semaphore::new(1));
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completed_in_task = completed.clone();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let result = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_millis(20),
-            Duration::from_millis(100),
-            async move {
-                let _ = release_rx.await;
-                completed_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                1u8
-            },
-        )
-        .await;
-
-        // The client sees the response deadline, and the execution is still
-        // running (and still holding the only permit).
-        assert!(matches!(result, Err(DetachedError::Timeout)));
-        assert_eq!(permits.available_permits(), 0);
-
-        tokio::time::timeout(Duration::from_secs(5), admission.cancelled())
-            .await
-            .expect("the hard deadline must close admission");
-        assert_eq!(
-            permits.available_permits(),
-            0,
-            "the hard deadline must not cancel the execution or release its permit"
-        );
-        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
-
-        let rejected = run_detached_with_timeout(
-            &admission,
-            &tracker,
-            permits.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            async { 2u8 },
-        )
-        .await;
-        assert!(matches!(rejected, Err(DetachedError::ShuttingDown)));
-
-        release_tx.send(()).unwrap();
-        tracker.close();
-        tokio::time::timeout(Duration::from_secs(5), tracker.wait())
-            .await
-            .expect("shutdown drain must observe the execution finish");
-        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(permits.available_permits(), 1);
-    }
-
-    /// Even when the hard deadline precedes the response deadline, the helper
-    /// keeps polling the mutation after closing admission.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_hard_deadline_waits_for_the_mutation_to_finish() {
-        let admission = CancellationToken::new();
-        let tracker = TaskTracker::new();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn({
-            let admission = admission.clone();
-            let tracker = tracker.clone();
-            async move {
-                run_detached_with_timeout(
-                    &admission,
-                    &tracker,
-                    Arc::new(Semaphore::new(1)),
-                    Arc::new(Mutex::new(Vec::new())),
-                    Duration::from_secs(5),
-                    Duration::from_millis(20),
-                    async move {
-                        let _ = release_rx.await;
-                        7u8
-                    },
-                )
-                .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(5), admission.cancelled())
-            .await
-            .expect("the hard deadline must close admission");
-        assert!(
-            !task.is_finished(),
-            "closing admission must not cancel the mutation"
-        );
-        release_tx.send(()).unwrap();
-        assert!(matches!(task.await.unwrap(), Ok(7)));
-        tracker.close();
-        tracker.wait().await;
     }
 
     /// Every KIP error class maps to a status a load balancer, retry policy,
@@ -1291,5 +920,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admission_rejections_are_retryable_before_body_parsing() {
+        let state = test_state().await;
+        let manager = state.executions.clone();
+        let permits: Vec<_> = (0..4).map(|_| manager.reserve().unwrap()).collect();
+        let app = build_router(state, None, 1024);
+        let (status, body) = post_json(&app, "not JSON", None).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "RateLimited");
+        assert_eq!(body["error"]["retry"]["class"], "safe_same_request");
+        drop(permits);
+        manager.admission.cancel();
+        let (status, body) = post_json(&app, "not JSON", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["retry"]["class"], "safe_same_request");
+    }
+
+    #[tokio::test]
+    async fn body_limit_and_strict_json_survive_manual_body_reception() {
+        let app = build_router(test_state().await, None, 1024);
+        let (status, body) = post_json(&app, &"x".repeat(2048), None).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "ResourceExhausted");
+        let (status, _) = post_json(
+            &app,
+            r#"{"method":"list_logs","method":"execute_kip","params":{}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delayed_body_does_not_override_a_started_writes_outcome() {
+        use anda_object_store::{FaultGate, FaultKind, FaultOp, FaultRule, FaultStore};
+        let (store, fault) = FaultStore::wrap(InMemory::new());
+        let mut state = test_state_with_store(Arc::new(store)).await;
+        state.request_timeout = Duration::from_millis(500);
+        let manager = state.executions.clone();
+        let nexus = state.nexus.clone();
+        let app = build_router(state, None, 2 * 1024 * 1024);
+        let gate = FaultGate::new();
+        // Pause the audit append after the graph transaction committed. A
+        // timeout still cannot claim a failed write or lose its recovery key.
+        fault.push_rule(FaultRule {
+            op: FaultOp::Put,
+            path_contains: Some("kip_logs".into()),
+            skip: 0,
+            times: 1,
+            kind: FaultKind::PauseBefore(gate.clone()),
+        });
+        let (mut tx, channel) = http_body_util::channel::Channel::<Bytes>::new(1);
+        let request = tokio::spawn(
+            app.oneshot(
+                AxumRequest::post("/kip")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::new(channel))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        tx.send_data(Bytes::from_static(br#"{"method":"execute_kip","params":{"kip":"2.0","request_id":"slow-write","execution":{"mode":"independent","idempotency_key":"write-key"},"operations":[{"command":"CREATE CONCEPT ?p { TYPE \"Person\" NAME \"Alice\" }"}]}}"#)).await.unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered())
+            .await
+            .unwrap();
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "outcome_unknown", "{body}");
+        assert_eq!(body["error"]["retry"]["class"], "outcome_lookup_required");
+        assert_eq!(body["request_id"], "slow-write");
+        assert_eq!(body["execution"]["idempotency_key"], "write-key");
+        assert_eq!(body["execution"]["mode"], "independent");
+        gate.release();
+        manager
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        let (logs, _) = nexus.list_logs(ListLogParams::default()).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].response["status"], "succeeded");
+        assert!(logs[0].response["operations"][0]["tx_id"].is_string());
     }
 }
