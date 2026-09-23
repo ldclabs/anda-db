@@ -45,6 +45,11 @@ Options: `--addr` (default `127.0.0.1:8080`), `--api-key`, `--primary-db`
 (default `64`), and `--shutdown-timeout-secs` (default `30`). All options can
 also be set through their uppercase environment variables.
 
+Local storage directories are created automatically. The server binds its
+listener before opening storage and does not enable `SO_REUSEPORT`. Run only
+one writer process per database namespace, even when using different ports;
+stop the old process before starting its replacement on the same storage.
+
 `--max-databases` bounds the registry of non-primary databases. Each
 registered database keeps a permanent background flush task and a name in the
 primary database's registry extension, so registration past the limit is
@@ -52,13 +57,18 @@ refused with `409 limit_exceeded`. The bound is not applied when reopening
 databases at startup, so lowering it never blocks a restart.
 
 On shutdown, new RPC admission closes immediately, active reads are
-cancelled, and admitted mutations drain before databases close. If the
-shutdown timeout (measured from admission close, including HTTP drain time)
+cancelled, and admitted mutations and cold collection opens drain before
+databases close. If the shutdown timeout (measured from admission close, including HTTP drain time)
 expires, the server explicitly aborts remaining work and skips the final
 database flush, treating the exit as a crash so the normal recovery path can
 repair durable state on the next open. The timeout bounds RPC drain; after a
 successful drain, the final durable database close is allowed to finish rather
-than being cancelled halfway through its flush.
+than being cancelled halfway through its flush. Final close failures are
+returned by `db.close` and `AppState::shutdown`; the executable exits with an
+error when shutdown cannot complete cleanly. `AppState::shutdown()` now returns
+`Result<(), ApiError>`, including an error for crash-style deadline aborts.
+Cold opens use a separate concurrency pool of `--max-concurrent-mutations`
+slots, so a write awaiting its collection does not wait for its own permit.
 
 ## Wire Protocol
 
@@ -151,7 +161,7 @@ All three methods are root-scope, hence admin-only:
 
 ```bash
 # Create a database with its own key
-curl -H 'Authorization: Bearer $ADMIN_KEY' -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $ADMIN_KEY" -H 'Content-Type: application/json' \
   -d '{"method":"db.create","params":{"name":"tenant_a","api_key":"<tenant key>"}}' \
   http://127.0.0.1:8080/
 
@@ -169,7 +179,7 @@ curl -H 'Authorization: Bearer $ADMIN_KEY' -H 'Content-Type: application/json' \
 A caller-supplied key is never echoed back, and a generated key is
 unrecoverable afterwards — rotate again if it is lost. `db.close` keeps a
 binding so that reopening a database cannot silently weaken it; use
-`db.remove_api_key` to revoke.
+`db.remove_api_key` to revoke, including while the database is closed.
 
 Two bindings are refused: the **primary database** cannot be delegated (its
 extension metadata *is* the server's registry and key map), and no
@@ -214,12 +224,18 @@ Admin key only — a per-database key is rejected on `POST /` with `401`.
 | `db.connect` | `{name, description?}` | Database metadata; creates if missing |
 | `db.close` | `{name}` | Flushes, closes, and unregisters the database |
 | `db.set_api_key` | `{name, api_key?}` | `{name, api_key}`; `api_key` is set only when generated |
-| `db.remove_api_key` | `{name}` | `true` if a key was bound |
+| `db.remove_api_key` | `{name}` | `true` if a key was bound; also works for closed databases |
 
 Databases created or opened at runtime are recorded in the primary
 database's extensions and reopened automatically on the next start;
 `db.close` removes a database from that registry. The primary database
-cannot be closed.
+cannot be closed. `db.open` and `db.connect` reject unsupported parameters such
+as `api_key`; use `db.create` or `db.set_api_key` to provision a key.
+
+Key changes become visible to authorization after persistence succeeds. On a
+failed key or registry write, the server restores the prior staged metadata
+and attempts to persist that restoration. If storage remains unavailable,
+the error is logged and the restored state remains pending for the next flush.
 
 ### Database scope (`POST /{db_name}`)
 
@@ -295,13 +311,13 @@ document schema, and optional index definitions:
 ```
 
 The engine only allows index changes while it has exclusive access to a
-collection, so indexes are defined at creation time. `collection.ensure` is
-idempotent: it opens the collection when it already exists and only applies
-the index definitions when it actually creates (or first loads) it. An HNSW
-configuration that has drifted from the persisted one is never silently
-kept: when the first load detects the difference, `collection.ensure`
-answers `409 conflict` naming the field and both configurations — remove
-and recreate the index (or the collection) to change it.
+collection. `collection.ensure` applies index definitions when it creates or
+cold-opens a collection. On an already-open handle it verifies the definitions:
+a missing index or changed HNSW configuration returns `409 conflict`, never a
+successful response that silently ignores the request. To add an index, an
+admin can close and reopen the database, then call `collection.ensure` before
+other collection requests. Changing an existing HNSW configuration requires
+recreating that index through the embedded API (or recreating the collection).
 
 ### Queries
 
@@ -328,11 +344,14 @@ indexed fields.
 
 ### Vector fields
 
-`Vector` fields store `bf16` values. On input the server accepts arrays of
+`Vector` fields store `bf16` values. HNSW also accepts `Option<Vector>` fields;
+missing or null optional vectors are not indexed. On input the server accepts arrays of
 floats (converted to `bf16`) as well as arrays of integers (interpreted as
 raw `bf16` bit patterns — the engine's native wire format). Responses always
 return vectors as `bf16` bit patterns, so a document read from the server
-can be written back unchanged.
+can be written back unchanged. Non-finite vectors and vectors whose dimension
+differs from their HNSW index are rejected with `400 invalid_input` before
+mutation. `doc.add_many` validates all documents before inserting the first.
 
 ### Durability
 

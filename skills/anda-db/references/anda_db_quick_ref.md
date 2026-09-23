@@ -17,6 +17,8 @@ function. Source: [database](../../../rs/anda_db/src/database.rs),
 | `db.open_or_create_collection(schema, config, callback)` | Open/create; apply a higher schema version on a fresh open |
 | `db.create_collection(schema, config, callback)` | Require a new collection |
 | `db.open_collection(name: String, callback)` | Open the persisted schema |
+| `db.contains_collection(name: &str)` | Check logical existence without cloning metadata |
+| `db.get_open_collection(name: &str)` | Get an active cached handle without I/O; use `open_collection` on a miss |
 | `db.close_collection(name: &str)` | Flush and retire the registered handle |
 | `db.delete_collection(name: &str)` | Remove the collection and its storage |
 
@@ -97,6 +99,11 @@ let removed: Option<Document> = collection.remove(id).await?;
   and call `add` without setting `_id` yourself.
 - `#[unique]` declares a constraint; the corresponding B-Tree index must
   exist for inserts and updates to enforce it.
+
+`DBError::unique_index_conflict()` identifies a typed B-Tree duplicate-key
+error and returns its logical index name. Use it at a document-write boundary
+instead of classifying every `AlreadyExists` as a uniqueness conflict: storage
+collisions also use that outer variant.
 
 ## B-Tree indexes and filters
 

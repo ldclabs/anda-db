@@ -207,6 +207,20 @@ pub enum DBError {
 }
 
 impl DBError {
+    /// Returns the B-tree index that rejected a duplicate key.
+    ///
+    /// Unlike matching `AlreadyExists` alone, this excludes storage-level
+    /// collisions. Only the logical index name is returned, not its source.
+    pub fn unique_index_conflict(&self) -> Option<&str> {
+        if let Self::AlreadyExists { source, .. } = self
+            && let Some(BTreeError::AlreadyExists { name, .. }) =
+                source.downcast_ref::<BTreeError>()
+        {
+            return Some(name);
+        }
+        None
+    }
+
     /// Returns the collection lifecycle state that rejected the operation, if
     /// this error came from a handle that was closing, closed, being deleted,
     /// deleted, or poisoned.

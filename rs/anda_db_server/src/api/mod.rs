@@ -73,7 +73,8 @@ pub async fn rpc_root(State(state): State<AppState>, headers: HeaderMap, body: B
         &body,
         RootMethod::parse,
         |state, enc, method, params, _principal| async move {
-            dispatch_root(&state, enc, method, params).await
+            // Keep the large dispatch future out of the composed HTTP stack.
+            Box::pin(dispatch_root(&state, enc, method, params)).await
         },
     )
     .await;
@@ -100,7 +101,10 @@ pub async fn rpc_db(
         &body,
         DbMethod::parse,
         move |state, enc, method, params, principal| async move {
-            dispatch_db(&state, &db_name, principal, enc, method, params).await
+            Box::pin(dispatch_db(
+                &state, &db_name, principal, enc, method, params,
+            ))
+            .await
         },
     )
     .await;
@@ -493,38 +497,46 @@ async fn dispatch_db(
         DbMethod::CollectionCreate => enc.reply(&collection::create(&db, params.decode()?).await?),
         DbMethod::CollectionEnsure => enc.reply(&collection::ensure(&db, params.decode()?).await?),
         DbMethod::CollectionMetadata => {
-            enc.reply(&collection::metadata(&db, params.decode()?).await?)
+            enc.reply(&collection::metadata(state, &db, params.decode()?).await?)
         }
-        DbMethod::CollectionStats => enc.reply(&collection::stats(&db, params.decode()?).await?),
+        DbMethod::CollectionStats => {
+            enc.reply(&collection::stats(state, &db, params.decode()?).await?)
+        }
         DbMethod::CollectionDelete => enc.reply(&collection::delete(&db, params.decode()?).await?),
-        DbMethod::CollectionFlush => enc.reply(&collection::flush(&db, params.decode()?).await?),
+        DbMethod::CollectionFlush => {
+            enc.reply(&collection::flush(state, &db, params.decode()?).await?)
+        }
         DbMethod::CollectionSetReadOnly => {
-            enc.reply(&collection::set_read_only(&db, params.decode()?).await?)
+            enc.reply(&collection::set_read_only(state, &db, params.decode()?).await?)
         }
         DbMethod::CollectionGetExtension => {
-            enc.reply(&collection::get_extension(&db, params.decode()?).await?)
+            enc.reply(&collection::get_extension(state, &db, params.decode()?).await?)
         }
         DbMethod::CollectionSaveExtension => {
-            enc.reply(&collection::save_extension(&db, params.decode()?).await?)
+            enc.reply(&collection::save_extension(state, &db, params.decode()?).await?)
         }
         DbMethod::CollectionRemoveExtension => {
-            enc.reply(&collection::remove_extension(&db, params.decode()?).await?)
+            enc.reply(&collection::remove_extension(state, &db, params.decode()?).await?)
         }
 
         // ─── documents ───────────────────────────────────────────────
-        DbMethod::DocAdd => enc.reply(&document::add(&db, params.decode()?).await?),
-        DbMethod::DocAddMany => enc.reply(&document::add_many(&db, params.decode()?).await?),
-        DbMethod::DocGet => enc.reply(&document::get(&db, params.decode()?).await?),
-        DbMethod::DocGetMany => enc.reply(&document::get_many(&db, params.decode()?).await?),
-        DbMethod::DocUpdate => enc.reply(&document::update(&db, params.decode()?).await?),
-        DbMethod::DocRemove => enc.reply(&document::remove(&db, params.decode()?).await?),
-        DbMethod::DocExists => enc.reply(&document::exists(&db, params.decode()?).await?),
-        DbMethod::DocCount => enc.reply(&document::count(&db, params.decode()?).await?),
-        DbMethod::DocSearch => enc.reply(&document::search(&db, params.decode()?).await?),
-        DbMethod::DocSearchIds => enc.reply(&document::search_ids(&db, params.decode()?).await?),
-        DbMethod::DocQueryIds => enc.reply(&document::query_ids(&db, params.decode()?).await?),
+        DbMethod::DocAdd => enc.reply(&document::add(state, &db, params.decode()?).await?),
+        DbMethod::DocAddMany => enc.reply(&document::add_many(state, &db, params.decode()?).await?),
+        DbMethod::DocGet => enc.reply(&document::get(state, &db, params.decode()?).await?),
+        DbMethod::DocGetMany => enc.reply(&document::get_many(state, &db, params.decode()?).await?),
+        DbMethod::DocUpdate => enc.reply(&document::update(state, &db, params.decode()?).await?),
+        DbMethod::DocRemove => enc.reply(&document::remove(state, &db, params.decode()?).await?),
+        DbMethod::DocExists => enc.reply(&document::exists(state, &db, params.decode()?).await?),
+        DbMethod::DocCount => enc.reply(&document::count(state, &db, params.decode()?).await?),
+        DbMethod::DocSearch => enc.reply(&document::search(state, &db, params.decode()?).await?),
+        DbMethod::DocSearchIds => {
+            enc.reply(&document::search_ids(state, &db, params.decode()?).await?)
+        }
+        DbMethod::DocQueryIds => {
+            enc.reply(&document::query_ids(state, &db, params.decode()?).await?)
+        }
         DbMethod::DocQueryLastIds => {
-            enc.reply(&document::query_last_ids(&db, params.decode()?).await?)
+            enc.reply(&document::query_last_ids(state, &db, params.decode()?).await?)
         }
     };
     Ok(resp)
@@ -601,7 +613,7 @@ mod tests {
         let err = request.await.unwrap().unwrap_err();
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(dropped.load(Ordering::Acquire));
-        state.shutdown().await;
+        state.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -669,6 +681,6 @@ mod tests {
 
         first_release.add_permits(1);
         assert!(first.await.unwrap().is_ok());
-        state.shutdown().await;
+        state.shutdown().await.unwrap();
     }
 }

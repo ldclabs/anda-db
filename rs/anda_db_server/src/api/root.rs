@@ -16,6 +16,7 @@ use crate::{
 /// Parameters identifying a database, with an optional description used
 /// when the database is created.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseParams {
     /// Database name (lowercase ASCII letters, digits, and underscores).
     pub name: String,
@@ -46,7 +47,7 @@ pub struct CreateDatabaseParams {
 /// Parameters of `db.set_api_key` / `db.remove_api_key`.
 #[derive(Debug, Deserialize)]
 pub struct ApiKeyParams {
-    /// Name of an open or registered database.
+    /// Database name. Removal also accepts retained bindings for closed databases.
     pub name: String,
     /// The key to bind. When omitted, the server generates one with a CSPRNG
     /// and returns it in [`ApiKeyResult::api_key`].

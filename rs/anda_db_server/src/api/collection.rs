@@ -3,10 +3,8 @@
 //! Index definitions are part of collection creation: the engine only
 //! allows index changes while it holds exclusive access to the collection
 //! (at creation or on the first open after a restart). `collection.ensure`
-//! therefore guarantees the listed indexes only when it actually creates or
-//! first opens the collection; a requested HNSW configuration that differs
-//! from the persisted one is answered as a `409` at that point (see
-//! [`ensure`]).
+//! applies new indexes on creation or cold open, and verifies the requested
+//! indexes even on a cached handle. Unsatisfied requests return `409`.
 
 use anda_db::{
     collection::{Collection, CollectionConfig, CollectionMetadata, CollectionStats},
@@ -22,7 +20,7 @@ use super::db::{
     ExtensionKeyParams, SaveExtensionParams, SetReadOnlyParams,
     ensure_writable as ensure_db_writable,
 };
-use crate::error::ApiError;
+use crate::{error::ApiError, state::AppState};
 
 /// Parameters identifying a collection.
 #[derive(Debug, Deserialize)]
@@ -89,53 +87,33 @@ pub struct CollectionSetReadOnlyParams {
     pub params: SetReadOnlyParams,
 }
 
-/// Opens a collection, loading it from storage on first access.
-///
-/// The engine call runs on its own task, never inline. Read RPCs are
-/// dispatched on the cancellable path (their future is dropped on client
-/// disconnect, request timeout, or shutdown), but `AndaDB::open_collection`
-/// finishes a cold open with `Collection::flush`, which arms a cancel guard
-/// that **poisons the handle** if its future is dropped mid-write. Without
-/// this hop, the first `doc.get` on a cold collection that hit the request
-/// timeout poisoned a perfectly healthy collection for every concurrent and
-/// subsequent operation. Dropping the caller now only detaches the join
-/// handle; the open itself runs to completion.
-pub async fn open(db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> {
-    // Prove the client-facing 404 from logical metadata before entering the
-    // engine. A later NotFound can mean missing/corrupt persisted collection
-    // state and must be handled by the conservative DBError fallback.
-    if !db.metadata().collections.contains(name) {
+/// Returns a cached handle directly; cold opens run in the server's bounded
+/// task tracker because recovery/checkpoint writes must outlive HTTP timeouts.
+pub async fn open(state: &AppState, db: &AndaDB, name: &str) -> Result<Arc<Collection>, ApiError> {
+    if let Some(collection) = db.get_open_collection(name) {
+        return Ok(collection);
+    }
+    if !db.contains_collection(name) {
         return Err(ApiError::not_found(format!(
             "collection {name:?} not found"
         )));
     }
-    let opening = tokio::spawn({
+    let opening = state.spawn_collection_open({
         let db = db.clone();
         let name = name.to_string();
         async move {
             let result = db.open_collection(name.clone(), async |_| Ok(())).await;
             if let Err(err) = &result {
-                // The engine open paths log nothing on failure, and a caller
-                // that was cancelled has already dropped the JoinHandle —
-                // without this line a failed cold open would be observed by
-                // nobody at all.
-                log::warn!(
-                    action = "collection::open",
-                    collection = name;
-                    "collection open failed: {err:?}",
-                );
+                log::warn!(action = "collection::open", collection = name; "collection open failed: {err:?}");
             }
             result
         }
-    });
+    }).await?;
     match opening.await {
         Ok(result) => Ok(result?),
+        Err(err) if err.is_cancelled() && state.is_shutting_down() => Err(ApiError::unavailable()),
         Err(err) => {
-            log::error!(
-                action = "collection::open",
-                collection = name;
-                "collection open task failed: {err:?}",
-            );
+            log::error!(action = "collection::open", collection = name; "collection open task failed: {err:?}");
             Err(ApiError::internal("internal server error"))
         }
     }
@@ -224,9 +202,13 @@ fn validate_definition(params: &CreateCollectionParams) -> Result<(), ApiError> 
                 index.field
             ))
         })?;
-        if field.r#type() != &FieldType::Vector {
+        let value_type = match field.r#type() {
+            FieldType::Option(inner) => inner.as_ref(),
+            value_type => value_type,
+        };
+        if value_type != &FieldType::Vector {
             return Err(ApiError::invalid_input(format!(
-                "HNSW index field {:?} must have type Vector",
+                "HNSW index field {:?} must have type Vector or Option<Vector>",
                 index.field
             )));
         }
@@ -268,7 +250,7 @@ pub async fn create(
 ) -> Result<CollectionMetadata, ApiError> {
     validate_definition(&params)?;
     ensure_db_writable(db)?;
-    if db.metadata().collections.contains(&params.config.name) {
+    if db.contains_collection(&params.config.name) {
         return Err(ApiError::already_exists(format!(
             "collection {:?} already exists",
             params.config.name
@@ -289,9 +271,7 @@ pub async fn create(
         .await
     {
         Ok(collection) => collection,
-        Err(err @ DBError::AlreadyExists { .. })
-            if db.metadata().collections.contains(&collection_name) =>
-        {
+        Err(err @ DBError::AlreadyExists { .. }) if db.contains_collection(&collection_name) => {
             // The pre-check above was clear, and the name is now registered:
             // another request won the per-name creation race. This proves a
             // logical conflict without trusting the engine variant or exposing
@@ -313,12 +293,9 @@ pub async fn create(
 /// `collection.ensure` — opens the collection or creates it if missing.
 ///
 /// The engine refuses to silently keep an existing HNSW index whose persisted
-/// configuration differs from the request (`create_hnsw_index_nx`), but its
-/// `DBError::Index` would be sanitized into an opaque 500 that only fires on
-/// the first load after a restart. The conflict is proven here instead,
-/// inside the exclusive-access callback where the persisted configuration is
-/// loaded, and answered as an actionable `409 conflict`: the caller owns this
-/// configuration, so echoing it back leaks nothing.
+/// configuration differs from the request (`create_hnsw_index_nx`). Check
+/// before changing indexes on a cold open and also on cached handles, where
+/// the callback is skipped. Unsatisfied definitions return `409 conflict`.
 pub async fn ensure(
     db: &AndaDB,
     params: CreateCollectionParams,
@@ -353,7 +330,29 @@ pub async fn ensure(
         })
         .await;
     match result {
-        Ok(collection) => Ok(collection.metadata()),
+        Ok(collection) => {
+            if let Some(conflict) = hnsw_config_conflict(&collection, &hnsw_indexes) {
+                return Err(ApiError::conflict(conflict));
+            }
+            for fields in &btree_indexes {
+                let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+                if collection.get_btree_index(&fields).is_err() {
+                    return Err(missing_index(&fields.join("-")));
+                }
+            }
+            if !bm25_indexes.is_empty() {
+                let fields: Vec<&str> = bm25_indexes.iter().map(String::as_str).collect();
+                if collection.get_bm25_index(&fields).is_err() {
+                    return Err(missing_index(&fields.join("-")));
+                }
+            }
+            for index in &hnsw_indexes {
+                if collection.get_hnsw_index(&index.field).is_err() {
+                    return Err(missing_index(&index.field));
+                }
+            }
+            Ok(collection.metadata())
+        }
         Err(err) => {
             // The callback proved the conflict against the persisted
             // configuration before returning `err`, so the client-safe
@@ -374,14 +373,19 @@ pub async fn ensure(
     }
 }
 
+fn missing_index(name: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "index {name:?} is missing on the open collection; close and reopen the database, then call collection.ensure before accessing the collection"
+    ))
+}
+
 /// Returns an actionable client-safe message when `collection` already
 /// carries an HNSW index whose persisted configuration differs from a
 /// requested one, or `None` when every requested index is absent or
 /// identical.
 ///
-/// Must run inside the create/open callback: that is the only point where
-/// the server holds the collection exclusively with its persisted indexes
-/// loaded, so the comparison cannot race another request.
+/// Index definitions are immutable on a shared handle. Check in the callback
+/// before creating indexes and again on return for cached handles.
 fn hnsw_config_conflict(
     collection: &Collection,
     hnsw_indexes: &[HnswIndexParams],
@@ -426,21 +430,26 @@ async fn ensure_indexes(
 
 /// `collection.metadata`
 pub async fn metadata(
+    state: &AppState,
     db: &AndaDB,
     params: CollectionParams,
 ) -> Result<CollectionMetadata, ApiError> {
-    Ok(open(db, &params.collection).await?.metadata())
+    Ok(open(state, db, &params.collection).await?.metadata())
 }
 
 /// `collection.stats`
-pub async fn stats(db: &AndaDB, params: CollectionParams) -> Result<CollectionStats, ApiError> {
-    Ok(open(db, &params.collection).await?.stats())
+pub async fn stats(
+    state: &AppState,
+    db: &AndaDB,
+    params: CollectionParams,
+) -> Result<CollectionStats, ApiError> {
+    Ok(open(state, db, &params.collection).await?.stats())
 }
 
 /// `collection.delete` — removes the collection and all of its data.
 pub async fn delete(db: &AndaDB, params: CollectionParams) -> Result<(), ApiError> {
     ensure_db_writable(db)?;
-    if !db.metadata().collections.contains(&params.collection) {
+    if !db.contains_collection(&params.collection) {
         return Err(ApiError::not_found(format!(
             "collection {:?} not found",
             params.collection
@@ -451,14 +460,19 @@ pub async fn delete(db: &AndaDB, params: CollectionParams) -> Result<(), ApiErro
 }
 
 /// `collection.flush` — returns `true` if pending changes were written.
-pub async fn flush(db: &AndaDB, params: CollectionParams) -> Result<bool, ApiError> {
-    let collection = open(db, &params.collection).await?;
+pub async fn flush(
+    state: &AppState,
+    db: &AndaDB,
+    params: CollectionParams,
+) -> Result<bool, ApiError> {
+    let collection = open(state, db, &params.collection).await?;
     ensure_writable(&collection)?;
     Ok(collection.flush(anda_db::unix_ms()).await?)
 }
 
 /// `collection.set_read_only`
 pub async fn set_read_only(
+    state: &AppState,
     db: &AndaDB,
     params: CollectionSetReadOnlyParams,
 ) -> Result<(), ApiError> {
@@ -468,26 +482,28 @@ pub async fn set_read_only(
             db.name()
         )));
     }
-    let collection = open(db, &params.collection).await?;
+    let collection = open(state, db, &params.collection).await?;
     collection.set_read_only(params.params.read_only);
     Ok(())
 }
 
 /// `collection.get_extension`
 pub async fn get_extension(
+    state: &AppState,
     db: &AndaDB,
     params: CollectionExtensionParams,
 ) -> Result<Option<Fv>, ApiError> {
-    let collection = open(db, &params.collection).await?;
+    let collection = open(state, db, &params.collection).await?;
     Ok(collection.get_extension(&params.params.key))
 }
 
 /// `collection.save_extension` — sets the value and persists collection metadata.
 pub async fn save_extension(
+    state: &AppState,
     db: &AndaDB,
     params: CollectionSaveExtensionParams,
 ) -> Result<(), ApiError> {
-    let collection = open(db, &params.collection).await?;
+    let collection = open(state, db, &params.collection).await?;
     ensure_writable(&collection)?;
     params
         .params
@@ -502,10 +518,11 @@ pub async fn save_extension(
 
 /// `collection.remove_extension` — returns the previous value, if any.
 pub async fn remove_extension(
+    state: &AppState,
     db: &AndaDB,
     params: CollectionExtensionParams,
 ) -> Result<Option<Fv>, ApiError> {
-    let collection = open(db, &params.collection).await?;
+    let collection = open(state, db, &params.collection).await?;
     ensure_writable(&collection)?;
     Ok(collection.remove_extension(&params.params.key).await?)
 }
@@ -513,7 +530,6 @@ pub async fn remove_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anda_db::{database::DBConfig, storage::StorageConfig};
     use axum::http::StatusCode;
     use object_store::memory::InMemory;
 
@@ -530,23 +546,23 @@ mod tests {
         }
     }
 
-    async fn test_db(name: &str) -> AndaDB {
-        AndaDB::connect(
+    async fn test_db(name: &str) -> (AppState, AndaDB) {
+        let state = AppState::connect(
             Arc::new(InMemory::new()),
-            DBConfig {
-                name: name.to_string(),
-                description: String::new(),
-                storage: StorageConfig::default(),
-                lock: None,
+            crate::ServerOptions {
+                primary_db: name.into(),
+                ..Default::default()
             },
         )
         .await
-        .unwrap()
+        .unwrap();
+        let db = state.get_db(name).await.unwrap();
+        (state, db)
     }
 
     #[tokio::test]
     async fn database_read_only_is_a_conflict_for_collection_mutations() {
-        let db = test_db("read_only_collections").await;
+        let (state, db) = test_db("read_only_collections").await;
         db.set_read_only(true);
 
         let error = create(&db, params("items")).await.unwrap_err();
@@ -572,6 +588,7 @@ mod tests {
             .await
             .unwrap_err(),
             flush(
+                &state,
                 &db,
                 CollectionParams {
                     collection: "items".to_string(),
@@ -585,12 +602,12 @@ mod tests {
         }
 
         db.set_read_only(false);
-        db.close().await.unwrap();
+        state.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn concurrent_collection_create_is_a_sanitized_conflict() {
-        let db = test_db("concurrent_collection_create").await;
+        let (state, db) = test_db("concurrent_collection_create").await;
         let (left, right) =
             tokio::join!(create(&db, params("items")), create(&db, params("items")));
 
@@ -607,6 +624,6 @@ mod tests {
         assert_eq!(error.message, "collection \"items\" already exists");
         assert!(!error.message.contains("meta.cbor"));
 
-        db.close().await.unwrap();
+        state.shutdown().await.unwrap();
     }
 }

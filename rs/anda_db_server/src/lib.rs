@@ -105,7 +105,8 @@ pub use state::{AppState, OpenMode, ServerInfo, ServerOptions};
 /// slow-transmitting client cannot hold a connection open indefinitely;
 /// the per-request timeout applied to the dispatched operation itself
 /// lives in the RPC handlers. Read-only RPCs are cancellation-safe; mutating
-/// RPCs run under bounded concurrency and remain tracked through shutdown.
+/// RPCs run under bounded concurrency and remain tracked through shutdown. Cold collection opens share that tracking; cached
+/// handles are returned directly.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", routing::get(api::get_info).post(api::rpc_root))

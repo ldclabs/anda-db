@@ -316,6 +316,27 @@ impl AndaDB {
         self.inner.metadata.read().clone()
     }
 
+    /// Checks the collection registry without cloning database metadata.
+    pub fn contains_collection(&self, name: &str) -> bool {
+        self.inner.metadata.read().collections.contains(name)
+    }
+
+    /// Returns an active cached handle without loading or recovering it.
+    ///
+    /// A miss must go through [`Self::open_collection`]. Like an ordinary
+    /// open, the returned handle can subsequently be retired by another task.
+    pub fn get_open_collection(&self, name: &str) -> Option<Arc<Collection>> {
+        if self.inner.dropping_collections.read().contains(name) {
+            return None;
+        }
+        self.inner
+            .collections
+            .read()
+            .get(name)
+            .filter(|collection| collection.is_active_handle())
+            .cloned()
+    }
+
     /// Applies `f` to the in-memory metadata and marks it as changed, so the
     /// next [`AndaDB::flush_metadata`] persists it. The version is bumped
     /// while the write lock is held: a flush that reads the version and
@@ -1701,7 +1722,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(collection.name(), "test_collection");
-        assert!(db.metadata().collections.contains("test_collection"));
+        assert!(db.contains_collection("test_collection"));
+        assert!(Arc::ptr_eq(
+            &collection,
+            &db.get_open_collection("test_collection").unwrap()
+        ));
+        db.close_collection("test_collection").await.unwrap();
+        assert!(db.contains_collection("test_collection"));
+        assert!(db.get_open_collection("test_collection").is_none());
+        assert!(!db.contains_collection("missing"));
+        db.close().await.unwrap();
     }
 
     #[tokio::test]

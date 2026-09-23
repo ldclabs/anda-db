@@ -450,7 +450,7 @@ async fn test_database_registry_survives_restart() {
     rpc_ok(&app, "/", "db.create", json!({"name": "tenant_a"})).await;
     rpc_ok(&app, "/", "db.create", json!({"name": "tenant_b"})).await;
     rpc_ok(&app, "/", "db.close", json!({"name": "tenant_b"})).await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // A new server over the same object store reopens registered databases;
     // tenant_b was closed and must stay closed.
@@ -1493,7 +1493,7 @@ async fn test_timeout_returns_408_but_mutation_still_completes() {
     // usable and can be closed cleanly (flush task present and cancellable).
     rpc_ok(&app, "/slowdb", "db.metadata", Value::Null).await;
     rpc_ok(&app, "/", "db.close", json!({"name": "slowdb"})).await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1523,7 +1523,7 @@ async fn test_slow_create_cannot_register_after_shutdown_closes_admission() {
     assert_eq!(resp["error"]["code"], "unavailable");
     assert_eq!(state.db_names().await, vec![PRIMARY_DB.to_string()]);
 
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1583,7 +1583,8 @@ async fn test_shutdown_drains_slow_mutation_before_database_close() {
     tokio::time::timeout(Duration::from_secs(5), shutdown)
         .await
         .expect("shutdown did not finish after mutation drained")
-        .expect("shutdown task panicked");
+        .expect("shutdown task panicked")
+        .unwrap();
     assert!(collection.metadata().stats.read_only);
 }
 
@@ -1621,7 +1622,8 @@ async fn test_shutdown_deadline_uses_crash_style_abort_without_database_close() 
 
     tokio::time::timeout(Duration::from_secs(5), state.shutdown())
         .await
-        .expect("hard-deadline shutdown did not finish");
+        .expect("hard-deadline shutdown did not finish")
+        .unwrap_err();
     let (status, resp) = tokio::time::timeout(Duration::from_secs(5), mutation)
         .await
         .expect("aborted mutation response did not finish")
@@ -1670,7 +1672,7 @@ async fn test_database_registry_is_capped() {
     // Closing one frees a slot.
     rpc_ok(&app, "/", "db.close", json!({"name": "tenant_a"})).await;
     rpc_ok(&app, "/", "db.create", json!({"name": "tenant_c"})).await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // Lowering the cap below the number of registered databases must not
     // break a restart: the bound applies to registration, not to reopening.
@@ -1684,7 +1686,7 @@ async fn test_database_registry_is_capped() {
     let names: Vec<String> = serde_json::from_value(names).unwrap();
     assert!(names.contains(&"tenant_b".to_string()), "names: {names:?}");
     assert!(names.contains(&"tenant_c".to_string()), "names: {names:?}");
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 }
 
 /// A *read* RPC must never be able to poison a collection.
@@ -1731,7 +1733,8 @@ async fn test_a_timed_out_read_does_not_poison_a_cold_collection() {
     gate.wait_until_blocked().await;
     tokio::time::timeout(Duration::from_secs(5), state.shutdown())
         .await
-        .expect("crash-style shutdown did not finish");
+        .expect("crash-style shutdown did not finish")
+        .unwrap_err();
     let _ = tokio::time::timeout(Duration::from_secs(5), stuck).await;
     // The blocked put was aborted with the mutation, so the gate is idle
     // again and must not be released: a stray permit would let the next
@@ -1803,7 +1806,7 @@ async fn test_a_timed_out_read_does_not_poison_a_cold_collection() {
         .open_collection("articles".to_string(), async |_| Ok(()))
         .await
         .expect("the collection must still open");
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
     assert!(collection.metadata().stats.read_only);
 }
 
@@ -1854,7 +1857,8 @@ async fn test_a_poisoned_collection_answers_with_a_retryable_status() {
     gate.wait_until_blocked().await;
     tokio::time::timeout(Duration::from_secs(5), state.shutdown())
         .await
-        .expect("crash-style shutdown did not finish");
+        .expect("crash-style shutdown did not finish")
+        .unwrap_err();
     let _ = tokio::time::timeout(Duration::from_secs(5), stuck).await;
     assert!(
         collection.is_poisoned(),
@@ -1890,7 +1894,7 @@ async fn test_a_poisoned_collection_answers_with_a_retryable_status() {
 async fn test_shutdown_rejects_new_requests_with_503() {
     let state = test_state(Arc::new(InMemory::new()), None).await;
     let app = build_router(state.clone());
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // Root and database-scoped RPC endpoints refuse new work while (or
     // after) shutting down, so late requests cannot race the database close.
@@ -1981,7 +1985,7 @@ async fn test_corrupt_registry_refuses_start() {
         json!({"key": "server:databases", "value": "not a set"}),
     )
     .await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     let err = match AppState::connect(store, test_options(None)).await {
         Ok(_) => panic!("startup must fail instead of overwriting a corrupt registry"),
@@ -2007,7 +2011,7 @@ async fn test_failed_reopen_keeps_database_registered() {
         .expect("failed to connect AppState");
     let app = build_router(state.clone());
     rpc_ok(&app, "/", "db.create", json!({"name": "auxdb"})).await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // Every read of auxdb fails: the reopen on startup fails, but the
     // registry entry must survive later registry rewrites.
@@ -2034,7 +2038,7 @@ async fn test_failed_reopen_keeps_database_registered() {
     // being rejected as though it were a new registration.
     handle.reset();
     rpc_ok(&app, "/", "db.open", json!({"name": "auxdb"})).await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // Both registered databases are reopened automatically on the next start.
     let state = AppState::connect(store, options)
@@ -2045,7 +2049,7 @@ async fn test_failed_reopen_keeps_database_registered() {
     let names: Vec<String> = serde_json::from_value(names).unwrap();
     assert!(names.contains(&"auxdb".to_string()), "names: {names:?}");
     assert!(names.contains(&"otherdb".to_string()), "names: {names:?}");
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 }
 
 // ─── authorization ───────────────────────────────────────────────────────
@@ -2449,9 +2453,20 @@ async fn test_api_key_provisioning_guards() {
 #[tokio::test]
 async fn test_api_keys_survive_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let app = tenants_app(store.clone()).await;
+    let state = test_state(store.clone(), Some(ADMIN_KEY.to_string())).await;
+    let app = build_router(state.clone());
+    for (name, key) in [("tenant_a", "key-a"), ("tenant_b", "key-b")] {
+        rpc_auth_ok(
+            &app,
+            Some(ADMIN_KEY),
+            "/",
+            "db.create",
+            json!({"name": name, "api_key": key}),
+        )
+        .await;
+    }
     rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
-    drop(app);
+    state.shutdown().await.unwrap();
 
     // Only the hash is persisted, yet the binding is still enforced after a
     // restart — including for a database that was closed and reopened.
@@ -2478,7 +2493,7 @@ async fn test_api_keys_survive_restart() {
     .await;
     rpc_auth_ok(&app, Some("key-a"), "/tenant_a", "db.metadata", Value::Null).await;
     assert_unauthorized(&app, Some("key-b"), "/tenant_a", "db.metadata").await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     // Restarting without the admin key would silently downgrade every bound
     // database to "no key at all", so the server refuses to start instead.
@@ -2591,7 +2606,7 @@ async fn test_corrupt_api_key_map_refuses_start() {
         json!({"key": "server:api_keys", "value": "not a map"}),
     )
     .await;
-    state.shutdown().await;
+    state.shutdown().await.unwrap();
 
     let err = match AppState::connect(store, test_options(Some(ADMIN_KEY.to_string()))).await {
         Ok(_) => panic!("startup must fail instead of overwriting a corrupt key map"),
@@ -2602,4 +2617,399 @@ async fn test_corrupt_api_key_map_refuses_start() {
         "unexpected error: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn failed_key_rotation_restores_authorization_and_durable_extension() {
+    use anda_db_server::{OpenMode, Scope};
+    for kind in [FaultKind::Error, FaultKind::ErrorAfter] {
+        let (fault_store, faults) = FaultStore::wrap(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(fault_store);
+        let state = test_state(store.clone(), Some(ADMIN_KEY.into())).await;
+        state
+            .register_db(OpenMode::Create, "tenant", None, Some("old-key".into()))
+            .await
+            .unwrap();
+        faults.push_rule(FaultRule {
+            op: FaultOp::Put,
+            path_contains: Some(PRIMARY_DB.into()),
+            skip: 0,
+            times: 1,
+            kind,
+        });
+        assert!(
+            state
+                .set_db_api_key("tenant", Some("new-key".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .authorize(Scope::Database("tenant"), Some("old-key"))
+                .is_ok()
+        );
+        assert!(
+            state
+                .authorize(Scope::Database("tenant"), Some("new-key"))
+                .is_err()
+        );
+        faults.reset();
+        state
+            .get_db(PRIMARY_DB)
+            .await
+            .unwrap()
+            .flush()
+            .await
+            .unwrap();
+        state.shutdown().await.unwrap();
+        let restarted = test_state(store, Some(ADMIN_KEY.into())).await;
+        assert!(
+            restarted
+                .authorize(Scope::Database("tenant"), Some("old-key"))
+                .is_ok()
+        );
+        assert!(
+            restarted
+                .authorize(Scope::Database("tenant"), Some("new-key"))
+                .is_err()
+        );
+        restarted.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_registry_changes_do_not_leak_into_later_flushes() {
+    use anda_db_server::OpenMode;
+    for close in [false, true] {
+        let (fault_store, faults) = FaultStore::wrap(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(fault_store);
+        let state = test_state(store.clone(), None).await;
+        if close {
+            state
+                .register_db(OpenMode::Create, "tenant", None, None)
+                .await
+                .unwrap();
+        }
+        faults.push_rule(FaultRule::fail_once(FaultOp::Put, PRIMARY_DB));
+        if close {
+            assert!(state.close_db("tenant").await.is_err());
+        } else {
+            assert!(
+                state
+                    .register_db(OpenMode::Create, "tenant", None, None)
+                    .await
+                    .is_err()
+            );
+        }
+        faults.reset();
+        state.shutdown().await.unwrap();
+        let restarted = test_state(store, None).await;
+        assert_eq!(restarted.get_db("tenant").await.is_ok(), close);
+        restarted.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn database_close_and_shutdown_surface_collection_flush_errors() {
+    for shutdown in [false, true] {
+        let (fault_store, faults) = FaultStore::wrap(InMemory::new());
+        let state = test_state(Arc::new(fault_store), None).await;
+        let app = build_router(state.clone());
+        rpc_ok(&app, "/", "db.create", json!({"name":"tenant"})).await;
+        setup_articles(&app, "tenant").await;
+        add_article(&app, "tenant", "dirty", "text", 1).await;
+        faults.push_rule(FaultRule::fail_once(FaultOp::Put, "tenant/articles"));
+        if shutdown {
+            assert!(state.shutdown().await.is_err());
+            assert!(state.db_names().await.is_empty());
+        } else {
+            let (status, _) = rpc_cbor(&app, "/", "db.close", json!({"name":"tenant"})).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            faults.reset();
+            state.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn warm_ensure_rejects_missing_indexes_and_cold_open_can_install_them() {
+    let state = test_state(Arc::new(InMemory::new()), None).await;
+    let app = build_router(state.clone());
+    let path = format!("/{PRIMARY_DB}");
+    let mut params = create_articles_params();
+    params["btree_indexes"] = json!([]);
+    rpc_ok(&app, &path, "collection.create", params).await;
+    let error = rpc_err(
+        &app,
+        &path,
+        "collection.ensure",
+        create_articles_params(),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(error["message"].as_str().unwrap().contains("score"));
+    state
+        .get_db(PRIMARY_DB)
+        .await
+        .unwrap()
+        .close_collection("articles")
+        .await
+        .unwrap();
+    let metadata = rpc_ok(&app, &path, "collection.ensure", create_articles_params()).await;
+    assert!(metadata["btree_indexes"].get("score").is_some());
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn vector_write_validation_is_consistent_for_add_update_and_batch() {
+    for optional in [false, true] {
+        let state = test_state(Arc::new(InMemory::new()), None).await;
+        let app = build_router(state.clone());
+        let path = format!("/{PRIMARY_DB}");
+        let mut params = json!({
+            "config":{"name":"vectors","description":""},
+            "schema":{"fields":[
+                {"name":"_id","description":"","type":"U64","unique":true,"index":0},
+                {"name":"v","description":"","type":"Vector","unique":false,"index":1}
+            ]},
+            "hnsw_indexes":[{"field":"v","config":{
+                "dimension":4,"max_layers":4,"max_connections":8,"ef_construction":50,
+                "ef_search":20,"distance_metric":"Cosine","select_neighbors_strategy":"Heuristic"
+            }}]
+        });
+        if optional {
+            params["schema"]["fields"][1]["type"] = json!({"Option":"Vector"});
+        }
+        rpc_ok(&app, &path, "collection.create", params.clone()).await;
+        let mut drifted = params;
+        drifted["hnsw_indexes"][0]["config"]["ef_search"] = json!(21);
+        rpc_err(
+            &app,
+            &path,
+            "collection.ensure",
+            drifted,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        let valid = json!({"v":[0.1,0.2,0.3,0.4]});
+        let id = rpc_ok(
+            &app,
+            &path,
+            "doc.add",
+            json!({"collection":"vectors","doc":valid}),
+        )
+        .await["_id"]
+            .as_u64()
+            .unwrap();
+        // Raw bf16 bits for infinity and NaN must be rejected just like bad dimensions.
+        for invalid in [
+            json!([0.1, 0.2]),
+            json!([32640, 0, 0, 0]),
+            json!([32704, 0, 0, 0]),
+        ] {
+            for (method, params) in [
+                (
+                    "doc.add",
+                    json!({"collection":"vectors","doc":{"v":invalid}}),
+                ),
+                (
+                    "doc.update",
+                    json!({"collection":"vectors","_id":id,"fields":{"v":invalid}}),
+                ),
+                (
+                    "doc.add_many",
+                    json!({"collection":"vectors","docs":[valid,{"v":invalid}]}),
+                ),
+            ] {
+                let error = rpc_err(&app, &path, method, params, StatusCode::BAD_REQUEST).await;
+                assert_eq!(error["code"], "invalid_input");
+            }
+        }
+        assert_eq!(
+            rpc_ok(&app, &path, "doc.count", json!({"collection":"vectors"})).await,
+            json!(1)
+        );
+        let ids = rpc_ok(
+            &app,
+            &path,
+            "doc.search_ids",
+            json!({"collection":"vectors","query":{"search":{"vector":[0.1,0.2,0.3,0.4]}}}),
+        )
+        .await;
+        assert_eq!(ids, json!([id]));
+        if optional {
+            rpc_ok(
+                &app,
+                &path,
+                "doc.add",
+                json!({"collection":"vectors","doc":{"v":null}}),
+            )
+            .await;
+            let found = rpc_ok(
+                &app,
+                &path,
+                "doc.search_ids",
+                json!({"collection":"vectors","query":{"search":{"vector":[0.1,0.2,0.3,0.4]}}}),
+            )
+            .await;
+            assert_eq!(found, json!([id]));
+        }
+        state.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn closed_database_key_can_be_revoked_without_reopening() {
+    use anda_db_server::{OpenMode, Scope};
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_state(store.clone(), Some(ADMIN_KEY.into())).await;
+    state
+        .register_db(OpenMode::Create, "tenant", None, Some("key".into()))
+        .await
+        .unwrap();
+    state.close_db("tenant").await.unwrap();
+    assert!(state.remove_db_api_key("tenant").await.unwrap());
+    assert!(!state.remove_db_api_key("tenant").await.unwrap());
+    state.shutdown().await.unwrap();
+    let state = test_state(store, Some(ADMIN_KEY.into())).await;
+    state
+        .register_db(OpenMode::Open, "tenant", None, None)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .authorize(Scope::Database("tenant"), Some("key"))
+            .is_err()
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_drains_cold_opens_and_aborts_them_at_the_deadline() {
+    use anda_object_store::FaultGate;
+    for abort in [false, true] {
+        let (fault_store, faults) = FaultStore::wrap(InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(fault_store);
+        let state = test_state(store.clone(), None).await;
+        let app = build_router(state.clone());
+        setup_articles(&app, PRIMARY_DB).await;
+        state.shutdown().await.unwrap();
+        let mut options = test_options(None);
+        options.shutdown_timeout = Duration::from_millis(if abort { 20 } else { 5000 });
+        // A mutation can open a collection even with a single mutation permit.
+        options.max_concurrent_mutations = 1;
+        let state = AppState::connect(store, options).await.unwrap();
+        let app = build_router(state.clone());
+        let gate = FaultGate::new();
+        let continued = FaultGate::new();
+        for gate in [&gate, &continued] {
+            faults.push_rule(FaultRule {
+                op: FaultOp::Get,
+                path_contains: Some("test_db/articles/".into()),
+                skip: 0,
+                times: 1,
+                kind: FaultKind::PauseBefore(gate.clone()),
+            });
+        }
+        let read = tokio::spawn(async move {
+            rpc_cbor(
+                &app,
+                "/test_db",
+                "doc.count",
+                json!({"collection":"articles"}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .unwrap();
+        let shutdown = tokio::spawn({
+            let state = state.clone();
+            async move { state.shutdown().await }
+        });
+        assert_eq!(read.await.unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
+        if abort {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            gate.release();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), continued.wait_entered())
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(!shutdown.is_finished());
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(2), continued.wait_entered())
+                .await
+                .unwrap();
+            assert!(!shutdown.is_finished());
+            continued.release();
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_root_api_key_parameter_is_rejected() {
+    let state = test_state(Arc::new(InMemory::new()), Some(ADMIN_KEY.into())).await;
+    let app = build_router(state.clone());
+    for method in ["db.connect", "db.open"] {
+        let (status, response) = rpc_auth(
+            &app,
+            Some(ADMIN_KEY),
+            "/",
+            method,
+            json!({"name":"tenant","api_key":"requested-key"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"]["code"], "invalid_input");
+    }
+    assert!(state.get_db("tenant").await.is_err());
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_mutation_slot_can_cold_open_and_update_without_an_extra_read() {
+    let mut options = test_options(None);
+    options.max_concurrent_mutations = 1;
+    let state = AppState::connect(Arc::new(InMemory::new()), options)
+        .await
+        .unwrap();
+    let app = build_router(state.clone());
+    setup_articles(&app, PRIMARY_DB).await;
+    let db = state.get_db(PRIMARY_DB).await.unwrap();
+    db.close_collection("articles").await.unwrap();
+    let id = tokio::time::timeout(
+        Duration::from_secs(2),
+        add_article(&app, PRIMARY_DB, "before", "body", 1),
+    )
+    .await
+    .unwrap();
+    let collection = db.get_open_collection("articles").unwrap();
+    let before = collection.stats().get_count;
+    let updated = rpc_ok(
+        &app,
+        &format!("/{PRIMARY_DB}"),
+        "doc.update",
+        json!({"collection":"articles","_id":id,"fields":{"title":"after"}}),
+    )
+    .await;
+    assert_eq!(updated["title"], "after");
+    assert_eq!(
+        collection.stats().get_count,
+        before,
+        "update must not pre-read the document through Collection::get"
+    );
+    state.shutdown().await.unwrap();
 }

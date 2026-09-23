@@ -111,6 +111,10 @@ async fn main() -> Result<(), BoxError> {
     let addr: SocketAddr = cli.addr.parse()?;
     check_startup_api_key(cli.api_key.as_deref(), &addr, cli.insecure_no_api_key)?;
 
+    // Acquire the listener before opening any writer or starting flush tasks.
+    // Each database namespace must have exactly one live writer process.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
     Builder::with_level(&get_env_level().to_string())
         .with_target_writer("*", new_writer(tokio::io::stdout()))
         .init();
@@ -118,6 +122,7 @@ async fn main() -> Result<(), BoxError> {
     let object_store: Arc<dyn ObjectStore> = match cli.command {
         None | Some(Commands::Memory) => Arc::new(InMemory::new()),
         Some(Commands::Local { path }) => {
+            std::fs::create_dir_all(&path)?;
             let store = LocalFileSystem::new_with_prefix(path)?.with_fsync(true);
             // The local filesystem backend needs the metadata wrapper for
             // conditional-put support used by the storage layer.
@@ -146,7 +151,6 @@ async fn main() -> Result<(), BoxError> {
     .map_err(|err| err.message)?;
 
     let app = build_router(state.clone());
-    let listener = create_reuse_port_listener(addr).await?;
     log::warn!("{APP_NAME}@{APP_VERSION} listening on {addr:?}");
 
     // A termination signal cancels the token; graceful shutdown then drains
@@ -186,7 +190,7 @@ async fn main() -> Result<(), BoxError> {
     // when the server loop returned an error. `shutdown` enforces its own
     // mutation-drain deadline. If it expires, shutdown uses an explicit
     // crash-style task abort and skips the final database flush.
-    state.shutdown().await;
+    state.shutdown().await.map_err(|err| err.message)?;
     result?;
     Ok(())
 }
@@ -216,18 +220,4 @@ async fn shutdown_signal() {
     }
 
     log::warn!("received termination signal, starting graceful shutdown");
-}
-
-/// Creates a TCP listener with SO_REUSEPORT enabled so multiple server
-/// processes can share the port for zero-downtime restarts.
-async fn create_reuse_port_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, BoxError> {
-    let socket = match &addr {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-
-    socket.set_reuseport(true)?;
-    socket.bind(addr)?;
-    let listener = socket.listen(1024)?;
-    Ok(listener)
 }

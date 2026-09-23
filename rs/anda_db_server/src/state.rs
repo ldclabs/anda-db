@@ -13,7 +13,7 @@
 
 use anda_db::{
     database::{AndaDB, DBConfig, DBMetadata},
-    schema::validate_field_name,
+    schema::{Fv, validate_field_name},
     storage::StorageConfig,
 };
 use axum::http::StatusCode;
@@ -77,9 +77,10 @@ pub struct ServerOptions {
     /// Per-request processing deadline for the RPC endpoints.
     pub request_timeout: Duration,
     /// Maximum number of non-cancel-safe mutating RPCs that may run at once.
+    /// Cold collection opens have a separate pool of the same size.
     pub max_concurrent_mutations: usize,
-    /// Maximum time, measured from admission close, for admitted mutating
-    /// RPCs to finish before crash-style abort (no database flush/close).
+    /// Maximum time, measured from admission close, for admitted mutations
+    /// and cold opens to finish before crash-style abort (no database flush/close).
     pub shutdown_timeout: Duration,
     /// Maximum accepted request body size in bytes.
     pub max_body_size: usize,
@@ -143,7 +144,19 @@ pub struct ServerInfo {
 struct DbEntry {
     db: AndaDB,
     cancel: CancellationToken,
-    flush_task: JoinHandle<()>,
+    flush_task: JoinHandle<Result<(), ApiError>>,
+}
+
+impl DbEntry {
+    async fn finish(&mut self) -> Result<(), ApiError> {
+        match (&mut self.flush_task).await {
+            Ok(result) => result,
+            Err(err) => {
+                log::error!(action = "database_close", database = self.db.name(); "flush task failed: {err:?}");
+                Err(ApiError::internal("database close task failed"))
+            }
+        }
+    }
 }
 
 impl Drop for DbEntry {
@@ -172,6 +185,60 @@ impl Drop for TrackedTaskRegistration {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+    }
+}
+
+/// Owns background work through completion, including tasks whose HTTP waiter
+/// has gone away. Registration and abort snapshots share the same short lock.
+#[derive(Default)]
+struct TrackedTasks {
+    tracker: TaskTracker,
+    aborts: Arc<StdMutex<BTreeMap<u64, AbortHandle>>>,
+    next_id: AtomicU64,
+}
+
+impl TrackedTasks {
+    fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let mut aborts = self
+            .aborts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let registration = TrackedTaskRegistration {
+            id,
+            aborts: self.aborts.clone(),
+        };
+        let task = self.tracker.spawn(async move {
+            let _registration = registration;
+            future.await
+        });
+        aborts.insert(id, task.abort_handle());
+        task
+    }
+
+    fn abort_all(&self) {
+        for abort in self
+            .aborts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            abort.abort();
+        }
+    }
+
+    fn close(&self) {
+        self.tracker.close();
+    }
+    fn len(&self) -> usize {
+        self.tracker.len()
+    }
+    async fn wait(&self) {
+        self.tracker.wait().await;
     }
 }
 
@@ -209,20 +276,13 @@ struct Inner {
     /// task, not the HTTP handler, so a timeout/disconnect cannot release the
     /// slot while the mutation is still running.
     mutation_slots: Arc<Semaphore>,
-    /// Tracks every admitted non-cancel-safe mutation until its future exits.
-    mutation_tasks: TaskTracker,
-    /// Abort handles retained for the hard-deadline path. Normal shutdown
-    /// never aborts mutations; once the deadline is exceeded, aborting them
-    /// is treated as a process-crash boundary and databases are not flushed.
-    mutation_aborts: Arc<StdMutex<BTreeMap<u64, AbortHandle>>>,
-    next_mutation_id: AtomicU64,
-    /// Tracks every database auto-flush owner independently of `DbEntry`.
-    /// A `db.close` mutation temporarily moves its entry out of `databases`;
-    /// global tracking keeps the task reachable on hard shutdown even if the
-    /// mutation is then aborted and drops its JoinHandle.
-    db_tasks: TaskTracker,
-    db_task_aborts: Arc<StdMutex<BTreeMap<u64, AbortHandle>>>,
-    next_db_task_id: AtomicU64,
+    /// Cold opens share the shutdown tracker but have separate permits: a
+    /// mutation waiting for its collection must not reacquire its own slot.
+    open_slots: Arc<Semaphore>,
+    /// Tracks admitted mutations and cold collection opens until completion.
+    mutation_tasks: TrackedTasks,
+    /// Tracks flush owners even when a close moves an entry out of the map.
+    db_tasks: TrackedTasks,
     databases: RwLock<BTreeMap<String, DbEntry>>,
     /// Names of non-primary databases that should be reopened on the next
     /// start. Kept separate from `databases` so a database that failed to
@@ -318,12 +378,9 @@ impl AppState {
                 shutdown_started: OnceLock::new(),
                 read_cancel: CancellationToken::new(),
                 mutation_slots: Arc::new(Semaphore::new(max_concurrent_mutations)),
-                mutation_tasks: TaskTracker::new(),
-                mutation_aborts: Arc::new(StdMutex::new(BTreeMap::new())),
-                next_mutation_id: AtomicU64::new(0),
-                db_tasks: TaskTracker::new(),
-                db_task_aborts: Arc::new(StdMutex::new(BTreeMap::new())),
-                next_db_task_id: AtomicU64::new(0),
+                open_slots: Arc::new(Semaphore::new(max_concurrent_mutations)),
+                mutation_tasks: TrackedTasks::default(),
+                db_tasks: TrackedTasks::default(),
                 databases: RwLock::new(BTreeMap::new()),
                 registry: RwLock::new(BTreeSet::new()),
                 lifecycle: Mutex::new(()),
@@ -451,14 +508,35 @@ impl AppState {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let permit = self
-            .inner
-            .mutation_slots
-            .clone()
+        self.spawn_operation(self.inner.mutation_slots.clone(), mutation)
+            .await
+    }
+
+    pub(crate) async fn spawn_collection_open<F, T>(
+        &self,
+        opening: F,
+    ) -> Result<JoinHandle<T>, ApiError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn_operation(self.inner.open_slots.clone(), opening)
+            .await
+    }
+
+    async fn spawn_operation<F, T>(
+        &self,
+        slots: Arc<Semaphore>,
+        operation: F,
+    ) -> Result<JoinHandle<T>, ApiError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = slots
             .acquire_owned()
             .await
             .map_err(|_| ApiError::unavailable())?;
-
         let _guard = self
             .inner
             .rpc_admission
@@ -467,30 +545,10 @@ impl AppState {
         if self.is_shutting_down() {
             return Err(ApiError::unavailable());
         }
-
-        // Prevent a very fast task from completing before its abort handle is
-        // inserted: the tracked future does not poll `mutation` until the
-        // synchronous registration below sends the start signal.
-        let id = self.inner.next_mutation_id.fetch_add(1, Ordering::Relaxed);
-        let aborts = self.inner.mutation_aborts.clone();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        let task = self.inner.mutation_tasks.spawn(async move {
+        Ok(self.inner.mutation_tasks.spawn(async move {
             let _permit = permit;
-            let _registration = TrackedTaskRegistration { id, aborts };
-            start_rx
-                .await
-                .expect("mutation task start sender dropped before registration");
-            mutation.await
-        });
-        self.inner
-            .mutation_aborts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, task.abort_handle());
-        start_tx
-            .send(())
-            .expect("mutation task exited before start signal");
-        Ok(task)
+            operation.await
+        }))
     }
 
     /// Closes RPC admission immediately, cancels active read-only RPCs, and
@@ -507,6 +565,7 @@ impl AppState {
         }
         let _ = self.inner.shutdown_started.set(Instant::now());
         self.inner.mutation_slots.close();
+        self.inner.open_slots.close();
         self.inner.mutation_tasks.close();
         self.inner.db_tasks.close();
         self.inner.read_cancel.cancel();
@@ -707,14 +766,12 @@ impl AppState {
             self.undo_api_key_binding(name, api_key.is_some()).await;
             return Err(ApiError::unavailable());
         }
-        {
-            self.inner.registry.write().await.insert(name.to_string());
-        }
+        let newly_registered = self.inner.registry.write().await.insert(name.to_string());
         if let Err(err) = self.persist_registry().await {
             // Success must mean "reopened automatically after a restart".
             // Unwind the registration completely so a client retry repeats
             // the whole open + persist flow.
-            {
+            if newly_registered {
                 self.inner.registry.write().await.remove(name);
             }
             let entry = { self.inner.databases.write().await.remove(name) };
@@ -722,7 +779,7 @@ impl AppState {
                 entry.cancel.cancel();
             }
             if let Some(mut entry) = entry
-                && let Err(close_err) = (&mut entry.flush_task).await
+                && let Err(close_err) = entry.finish().await
             {
                 log::error!(
                     action = "AppState::register_db",
@@ -783,7 +840,6 @@ impl AppState {
     /// fallback. Returns whether a binding existed. Admin-only.
     pub async fn remove_db_api_key(&self, name: &str) -> Result<bool, ApiError> {
         let _guard = self.inner.lifecycle.lock().await;
-        self.require_known_db(name).await?;
         if self.db_api_key(name).is_none() {
             return Ok(false);
         }
@@ -830,67 +886,56 @@ impl AppState {
         Err(ApiError::not_found(format!("database {name:?} not found")))
     }
 
-    /// Applies one change to the key map and persists the result, restoring
-    /// the previous in-memory value if persistence fails so that memory and
-    /// storage never disagree.
+    /// Persists a candidate key map before publishing it to authorization.
+    /// Persistence failures restore the database extension as well.
     ///
     /// Callers must hold the `lifecycle` lock: it is what serializes
     /// concurrent updates against each other and against the registry writes
     /// that share the primary database's metadata.
     async fn store_api_key(&self, name: &str, hash: Option<ApiKeyHash>) -> Result<(), ApiError> {
-        let previous = {
-            let mut keys = self
-                .inner
-                .api_keys
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match hash {
-                Some(hash) => keys.insert(name.to_string(), hash),
-                None => keys.remove(name),
+        let mut keys = self
+            .inner
+            .api_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match hash {
+            Some(hash) => {
+                keys.insert(name.to_string(), hash);
             }
-        };
-        if let Err(err) = self.persist_api_keys().await {
-            let mut keys = self
-                .inner
-                .api_keys
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match previous {
-                Some(previous) => keys.insert(name.to_string(), previous),
-                None => keys.remove(name),
-            };
-            return Err(err);
+            None => {
+                keys.remove(name);
+            }
         }
+        self.persist_server_extension(DB_API_KEYS_KEY, &keys)
+            .await?;
+        *self
+            .inner
+            .api_keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = keys;
         Ok(())
     }
 
-    /// Persists the per-database key hashes into the primary database's
-    /// extensions. Errors must be propagated: a caller that reported a
-    /// successful rotation while the old hash survives on disk would restore
-    /// the revoked key on the next restart.
-    async fn persist_api_keys(&self) -> Result<(), ApiError> {
-        let keys: BTreeMap<String, ApiKeyHash> = {
-            self.inner
-                .api_keys
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+    /// Lifecycle callers serialize these writes. Restore the database's staged
+    /// snapshot too: save_extension changes it before attempting storage I/O.
+    async fn persist_server_extension<T: Serialize + Default>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), ApiError> {
+        let db = self.get_db(&self.inner.options.primary_db).await?;
+        let previous = match db.get_extension(key) {
+            Some(previous) => previous,
+            None => Fv::serialized(&T::default(), None)?,
         };
-        let primary = {
-            let dbs = self.inner.databases.read().await;
-            dbs.get(&self.inner.options.primary_db)
-                .map(|entry| entry.db.clone())
-        };
-        if let Some(db) = primary
-            && let Err(err) = db
-                .save_extension_from(DB_API_KEYS_KEY.to_string(), &keys)
-                .await
-        {
-            log::error!(
-                action = "AppState::persist_api_keys",
-                database = self.inner.options.primary_db;
-                "failed to persist per-database API keys: {err:?}",
-            );
+        if let Err(err) = db.save_extension_from(key.to_string(), value).await {
+            db.set_extension(key.to_string(), previous);
+            // Also repair a write whose acknowledgement was lost. If storage
+            // remains unavailable, the restored snapshot stays dirty for retry.
+            if let Err(rollback) = db.flush_metadata(anda_db::unix_ms()).await {
+                log::error!(action = "persist_server_extension", extension = key; "rollback flush failed: {rollback:?}");
+            }
             return Err(err.into());
         }
         Ok(())
@@ -919,7 +964,7 @@ impl AppState {
         // later await point without the token cancelled, the auto-flush task
         // would keep running forever with an open database, and a client
         // retrying `db.open` would create a second writer on the same
-        // storage. Cancelling the token makes `AndaDB::auto_flush` flush and
+        // storage. Cancelling the token makes the background owner flush and
         // close the database on its own even if we never reach the
         // `flush_task.await` below (the `DbEntry` drop is a further
         // backstop).
@@ -940,17 +985,12 @@ impl AppState {
             self.inner.registry.write().await.insert(name.to_string());
         }
 
-        if let Some(mut entry) = entry {
-            // Wait for `AndaDB::auto_flush` to close the database (flushing
-            // all collections) before reporting success.
-            if let Err(err) = (&mut entry.flush_task).await {
-                log::error!(
-                    action = "AppState::close_db",
-                    database = name;
-                    "flush task failed: {err:?}",
-                );
-            }
-        }
+        let closed = match entry {
+            Some(mut entry) => entry.finish().await,
+            None => Ok(()),
+        };
+        // Both the durable registry change and the database close must succeed.
+        closed?;
         // Success means the close is durable: the database will not be
         // reopened on the next start.
         persisted
@@ -958,14 +998,15 @@ impl AppState {
 
     /// Flushes and closes every open database. Called on server shutdown.
     ///
-    /// Closes admission and drains every tracked mutation before databases
+    /// Closes admission and drains tracked mutations and cold opens before databases
     /// are closed. The drain is bounded by [`ServerOptions::shutdown_timeout`].
     /// If that deadline expires, mutation tasks and auto-flush tasks are
     /// explicitly aborted and joined, and databases are dropped without a
     /// final flush/close. This is intentionally crash-equivalent: flushing a
     /// future that was cancelled at an arbitrary await could publish partial
     /// in-memory state. Durable recovery handles the next open.
-    pub async fn shutdown(&self) {
+    /// Returns an error on a drain timeout or a final database close failure.
+    pub async fn shutdown(&self) -> Result<(), ApiError> {
         self.begin_shutdown();
         let remaining = self
             .inner
@@ -988,7 +1029,9 @@ impl AppState {
                 "mutation drain deadline exceeded; forcing crash-style task abort without database flush",
             );
             self.abort_after_shutdown_deadline().await;
-            return;
+            return Err(ApiError::internal(
+                "shutdown drain timed out; database tasks were aborted without a final flush",
+            ));
         }
 
         self.inner.cancel.cancel();
@@ -996,14 +1039,10 @@ impl AppState {
             let mut dbs = self.inner.databases.write().await;
             std::mem::take(&mut *dbs).into_values().collect()
         };
+        let mut first_error = None;
         for mut entry in entries {
-            let name = entry.db.name().to_string();
-            if let Err(err) = (&mut entry.flush_task).await {
-                log::error!(
-                    action = "AppState::shutdown",
-                    database = name;
-                    "flush task failed: {err:?}",
-                );
+            if let Err(err) = entry.finish().await {
+                first_error.get_or_insert(err);
             }
         }
         // Covers any future lifecycle path that moves an entry out of the map
@@ -1011,6 +1050,7 @@ impl AppState {
         // await their owner before the mutation tracker drains, so this is
         // normally already empty.
         self.inner.db_tasks.wait().await;
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Hard-deadline shutdown path. Abort and join mutations first; only once
@@ -1018,17 +1058,7 @@ impl AppState {
     /// call `AndaDB::close` here because an aborted mutation may have left
     /// recoverable, but not safely flushable, intermediate in-memory state.
     async fn abort_after_shutdown_deadline(&self) {
-        let aborts: Vec<AbortHandle> = self
-            .inner
-            .mutation_aborts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        for abort in aborts {
-            abort.abort();
-        }
+        self.inner.mutation_tasks.abort_all();
 
         if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, self.inner.mutation_tasks.wait())
             .await
@@ -1049,17 +1079,7 @@ impl AppState {
         // `db.close` mutation moves its `DbEntry` out of `databases` while it
         // awaits that task. Aborting the mutation drops/detaches the local
         // JoinHandle, but this registry still reaches the task.
-        let db_aborts: Vec<AbortHandle> = self
-            .inner
-            .db_task_aborts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
-        for abort in db_aborts {
-            abort.abort();
-        }
+        self.inner.db_tasks.abort_all();
         if tokio::time::timeout(FORCED_ABORT_JOIN_TIMEOUT, self.inner.db_tasks.wait())
             .await
             .is_err()
@@ -1081,7 +1101,7 @@ impl AppState {
         // the global tracker above.
         for entry in &mut entries {
             match (&mut entry.flush_task).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(err) if err.is_cancelled() => {}
                 Err(err) => {
                     log::error!(
@@ -1100,29 +1120,23 @@ impl AppState {
     /// Spawns the background flush task for an open database.
     fn new_entry(&self, db: AndaDB) -> DbEntry {
         let cancel = self.inner.cancel.child_token();
-        let id = self.inner.next_db_task_id.fetch_add(1, Ordering::Relaxed);
-        let aborts = self.inner.db_task_aborts.clone();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let flush_task = self.inner.db_tasks.spawn({
             let db = db.clone();
             let cancel = cancel.clone();
             let interval = self.inner.options.flush_interval;
             async move {
-                let _registration = TrackedTaskRegistration { id, aborts };
-                start_rx
-                    .await
-                    .expect("database task start sender dropped before registration");
-                db.auto_flush(cancel, interval).await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return db.close().await.map_err(ApiError::from),
+                        _ = tokio::time::sleep(interval) => {}
+                    }
+                    if let Err(err) = db.flush().await {
+                        log::error!(action = "database_flush", database = db.name(); "periodic flush failed: {err:?}");
+                    }
+                }
             }
         });
-        self.inner
-            .db_task_aborts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, flush_task.abort_handle());
-        start_tx
-            .send(())
-            .expect("database task exited before start signal");
         DbEntry {
             db,
             cancel,
@@ -1137,25 +1151,8 @@ impl AppState {
     /// (`db.create`/`db.open` reopening after restart, `db.close` staying
     /// closed) must propagate this error instead of reporting success.
     async fn persist_registry(&self) -> Result<(), ApiError> {
-        let names: BTreeSet<String> = { self.inner.registry.read().await.clone() };
-        let primary = {
-            let dbs = self.inner.databases.read().await;
-            dbs.get(&self.inner.options.primary_db)
-                .map(|entry| entry.db.clone())
-        };
-        if let Some(db) = primary
-            && let Err(err) = db
-                .save_extension_from(DB_REGISTRY_KEY.to_string(), &names)
-                .await
-        {
-            log::error!(
-                action = "AppState::persist_registry",
-                database = self.inner.options.primary_db;
-                "failed to persist database registry: {err:?}",
-            );
-            return Err(err.into());
-        }
-        Ok(())
+        let names: BTreeSet<String> = self.inner.registry.read().await.clone();
+        self.persist_server_extension(DB_REGISTRY_KEY, &names).await
     }
 }
 
