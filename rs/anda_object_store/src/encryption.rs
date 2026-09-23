@@ -160,11 +160,10 @@ pub struct EncryptedStoreBuilder<T: ObjectStore> {
     chunk_size: u64,
     /// When true, reject legacy sidecar metadata without authentication.
     strict_metadata_auth: bool,
-    /// In-memory metadata cache to avoid round-trips on hot paths.
-    meta_cache: Cache<Path, Arc<Metadata>>,
+    /// Optional custom cache. The built-in cache is constructed at build time.
+    meta_cache: Option<Cache<Path, Arc<Metadata>>>,
     /// Maximum number of metadata entries the built-in cache holds. Retained
-    /// so [`EncryptedStoreBuilder::with_meta_cache_ttl`] can rebuild the
-    /// cache without losing the configured capacity.
+    /// so selecting the built-in cache after a custom one retains capacity.
     meta_cache_capacity: u64,
     meta_cache_ttl: Duration,
     meta_cache_bytes: u64,
@@ -437,11 +436,7 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
             cipher,
             chunk_size: DEFAULT_CHUNK_SIZE,
             strict_metadata_auth: false,
-            meta_cache: build_meta_cache(
-                meta_cache_capacity,
-                DEFAULT_META_CACHE_TTL,
-                DEFAULT_CACHE_BYTES,
-            ),
+            meta_cache: None,
             meta_cache_capacity,
             meta_cache_ttl: DEFAULT_META_CACHE_TTL,
             meta_cache_bytes: DEFAULT_CACHE_BYTES,
@@ -457,7 +452,7 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// The supplied cache replaces the built-in one wholesale, so its own
     /// capacity and eviction policy apply instead of the capacity passed to
     /// [`EncryptedStoreBuilder::new`]. A later
-    /// [`EncryptedStoreBuilder::with_meta_cache_ttl`] rebuilds the built-in
+    /// [`EncryptedStoreBuilder::with_meta_cache_ttl`] selects the built-in
     /// cache and discards the supplied one.
     ///
     /// # Parameters
@@ -467,26 +462,26 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// The builder with the updated metadata cache
     pub fn with_meta_cache(self, cache: Cache<Path, Arc<Metadata>>) -> Self {
         Self {
-            meta_cache: cache,
+            meta_cache: Some(cache),
             ..self
         }
     }
 
     /// Sets the time-to-live (TTL) for the metadata cache.
     ///
-    /// The cache is rebuilt with the capacity passed to
+    /// The built-in cache will use the capacity passed to
     /// [`EncryptedStoreBuilder::new`] and the default time-to-idle.
     pub fn with_meta_cache_ttl(mut self, ttl: Duration) -> Self {
         self.meta_cache_ttl = ttl;
-        self.meta_cache = build_meta_cache(self.meta_cache_capacity, ttl, self.meta_cache_bytes);
+        self.meta_cache = None;
         self
     }
 
-    /// Rebuilds the built-in cache with an estimated byte budget and the original
+    /// Selects the built-in cache with an estimated byte budget and the original
     /// entry limit. Like with_meta_cache_ttl, replaces a supplied custom cache.
     pub fn with_meta_cache_bytes(mut self, bytes: u64) -> Self {
         self.meta_cache_bytes = bytes;
-        self.meta_cache = build_meta_cache(self.meta_cache_capacity, self.meta_cache_ttl, bytes);
+        self.meta_cache = None;
         self
     }
 
@@ -577,6 +572,13 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
     /// # Returns
     /// A new `EncryptedStore` instance
     pub fn build(self) -> EncryptedStore<T> {
+        let cache = self.meta_cache.unwrap_or_else(|| {
+            build_meta_cache(
+                self.meta_cache_capacity,
+                self.meta_cache_ttl,
+                self.meta_cache_bytes,
+            )
+        });
         let validation = Arc::new(ValidationContext {
             cipher: self.cipher.clone(),
             strict: self.strict_metadata_auth,
@@ -588,7 +590,7 @@ impl<T: ObjectStore> EncryptedStoreBuilder<T> {
         let validator = validation.clone();
         EncryptedStore {
             inner: Arc::new(
-                SidecarStore::new(self.store, self.meta_cache)
+                SidecarStore::new(self.store, cache)
                     .with_limits(self.limits)
                     .with_validator(move |path, meta| validator.validate(path, meta)),
             ),
@@ -666,7 +668,7 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
                 if let PutMode::Update(v) = &opts.mode {
                     match meta {
                         Some(m) => {
-                            check_update_version(location, &m.e_tag, &m.generation, v)?;
+                            check_update_version(location, &m.e_tag, v)?;
                         }
                         None => {
                             return Err(Error::Precondition {
@@ -753,12 +755,9 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
             .put_multipart_opts(&self.inner.generation_path(location, &generation), opts)
             .await?;
         Ok(Box::new(EncryptedStoreUploader {
-            buf: Vec::new(),
+            buffer: EncryptionBuffer::new(),
             transport: CiphertextParts::default(),
             size: 0,
-            aes_nonce: rand_bytes(),
-            aes_tags: Vec::new(),
-            chunk_index: 0,
             location: location.clone(),
             generation,
             lifecycle: Lifecycle::new(flight, "EncryptedStore"),
@@ -969,12 +968,12 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
         // copied generation from garbage collection until then.
         let (src, generation, _in_flight) = self
             .inner
-            .copy_payload(from, to, extensions.clone())
+            .copy_payload(from, to, create, extensions.clone())
             .await?;
 
         let mut meta = (*src).clone();
         // A copy is a commit of its own, so it gets its own CAS token
-        // instead of the source's; see `derive_copy_e_tag`.
+        // instead of the source's.
         meta.e_tag = Some(commit_e_tag(&generation));
         meta.chunk_size = Some(self.read_chunk_size(&src));
         meta.generation = Some(generation);
@@ -1032,12 +1031,9 @@ impl<T: ObjectStore> ObjectStore for EncryptedStore<T> {
 /// encryption chunk boundaries. Failed/cancelled parts require a new upload;
 /// metadata publication may be retried after the payload has completed.
 pub struct EncryptedStoreUploader<T: ObjectStore> {
-    buf: Vec<u8>,
+    buffer: EncryptionBuffer,
     transport: CiphertextParts,
     size: u64,
-    aes_tags: Vec<ByteArray<16>>,
-    aes_nonce: [u8; 12],
-    chunk_index: u64,
     location: Path,
     generation: String,
     lifecycle: Lifecycle,
@@ -1056,29 +1052,53 @@ impl<T: ObjectStore> std::fmt::Debug for EncryptedStoreUploader<T> {
         write!(f, "EncryptedStoreUploader({})", self.location)
     }
 }
-impl<T: ObjectStore> EncryptedStoreUploader<T> {
-    fn encrypt_buffer(&mut self, tail: bool) -> Result<()> {
+/// Buffers one plaintext tail and records chunk tags. Keeping this separate
+/// lets regular parts and finalization share encryption while the lifecycle
+/// drop guard remains borrowed throughout finalization.
+struct EncryptionBuffer {
+    plaintext: Vec<u8>,
+    tags: Vec<ByteArray<16>>,
+    nonce: [u8; 12],
+    index: u64,
+}
+
+impl EncryptionBuffer {
+    fn new() -> Self {
+        Self {
+            plaintext: Vec::new(),
+            tags: Vec::new(),
+            nonce: rand_bytes(),
+            index: 0,
+        }
+    }
+
+    fn encrypt(
+        &mut self,
+        cipher: &Aes256Gcm,
+        chunk_size: u64,
+        tail: bool,
+        location: &Path,
+    ) -> Result<Option<Bytes>> {
         let split = if tail {
-            self.buf.len()
+            self.plaintext.len()
         } else {
-            self.buf.len() / self.chunk_size as usize * self.chunk_size as usize
+            self.plaintext.len() / chunk_size as usize * chunk_size as usize
         };
         if split == 0 {
-            return Ok(());
+            return Ok(None);
         }
-        let mut data = std::mem::take(&mut self.buf);
-        self.buf = data.split_off(split);
+        let mut data = std::mem::take(&mut self.plaintext);
+        self.plaintext = data.split_off(split);
         encrypt_chunks(
-            &self.cipher,
-            &self.aes_nonce,
-            self.chunk_size,
-            &mut self.chunk_index,
-            &mut self.aes_tags,
+            cipher,
+            &self.nonce,
+            chunk_size,
+            &mut self.index,
+            &mut self.tags,
             &mut data,
-            &self.location,
+            location,
         )?;
-        self.transport.push(data.into());
-        Ok(())
+        Ok(Some(data.into()))
     }
 }
 #[async_trait]
@@ -1104,11 +1124,18 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
         };
         self.size = size;
         for segment in payload.iter() {
-            self.buf.extend_from_slice(segment);
+            self.buffer.plaintext.extend_from_slice(segment);
         }
-        if let Err(err) = self.encrypt_buffer(false) {
-            self.lifecycle.fail();
-            return Box::pin(async { Err(err) });
+        match self
+            .buffer
+            .encrypt(&self.cipher, self.chunk_size, false, &self.location)
+        {
+            Ok(Some(data)) => self.transport.push(data),
+            Ok(None) => {}
+            Err(err) => {
+                self.lifecycle.fail();
+                return Box::pin(async { Err(err) });
+            }
         }
         let mut parts = Vec::new();
         while self.transport.len() >= self.part_size {
@@ -1134,40 +1161,32 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             // Finalizing's drop guard poisons the upload on error or cancellation.
             // Split field borrows so no mutation can escape that guard.
             let attempt = self.lifecycle.finalizing()?;
-            if !self.buf.is_empty() {
-                let mut data = std::mem::take(&mut self.buf);
-                encrypt_chunks(
-                    &self.cipher,
-                    &self.aes_nonce,
-                    self.chunk_size,
-                    &mut self.chunk_index,
-                    &mut self.aes_tags,
-                    &mut data,
-                    &self.location,
-                )?;
-                self.transport.push(data.into());
+            if let Some(data) =
+                self.buffer
+                    .encrypt(&self.cipher, self.chunk_size, true, &self.location)?
+            {
+                self.transport.push(data);
             }
             while self.transport.len() != 0 {
                 let size = self.transport.len().min(self.part_size);
                 self.inner.put_part(self.transport.take(size)).await?;
             }
             self.inner.complete().await?;
-            let mut meta = Metadata {
+            let meta = Metadata {
                 validation: ValidationCertificate::default(),
                 size: self.size,
                 e_tag: Some(commit_e_tag(&self.generation)),
                 original_tag: None,
                 original_version: None,
-                aes_nonce: self.aes_nonce.into(),
-                aes_tags: std::mem::take(&mut self.aes_tags),
+                aes_nonce: self.buffer.nonce.into(),
+                aes_tags: std::mem::take(&mut self.buffer.tags),
                 chunk_size: Some(self.chunk_size),
                 chunk_aad_version: Some(CHUNK_AAD_BOUND),
                 auth_nonce: None,
                 auth_tag: None,
                 generation: Some(self.generation.clone()),
-                committed_at_ms: Some(new_commit_timestamp_ms()),
+                committed_at_ms: None,
             };
-            seal_metadata(&self.cipher, &self.location, &mut meta)?;
             self.prepared = Some(meta);
             attempt.materialized();
         }
@@ -1184,6 +1203,10 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
                 meta,
                 &mut self.publication_baseline,
                 self.extensions.clone(),
+                |meta| {
+                    meta.committed_at_ms = Some(new_commit_timestamp_ms());
+                    seal_metadata(&self.cipher, &self.location, meta)
+                },
             )
             .await?;
         self.prepared = None;
@@ -1203,7 +1226,8 @@ impl<T: ObjectStore> MultipartUpload for EncryptedStoreUploader<T> {
             self.extensions.clone(),
         )
         .await?;
-        self.buf.clear();
+        self.buffer.plaintext = Vec::new();
+        self.buffer.tags = Vec::new();
         self.transport = CiphertextParts::default();
         self.prepared = None;
         Ok(())
@@ -1253,9 +1277,8 @@ fn encrypt_chunks(
 /// - `size` — total number of plaintext bytes to yield before completing.
 ///
 /// The function expects the upstream stream to deliver every requested
-/// ciphertext chunk in full; partial trailing data is decrypted in the
-/// post-loop fallback so short last chunks (length < `chunk_size`) are
-/// handled correctly.
+/// ciphertext chunk in full. The final batch is bounded by the authenticated
+/// object size, including a short last chunk; truncated batches are rejected.
 #[allow(clippy::too_many_arguments)]
 fn create_decryption_stream(
     res: GetResult,
@@ -1294,10 +1317,20 @@ fn create_decryption_stream(
                     index += 1;
                 }
                 ciphertext_remaining -= chunk.len() as u64;
+                let allocation_size = chunk.capacity();
                 if first { chunk.advance(start_offset); first = false; }
                 if chunk.len() as u64 > remaining { chunk.truncate(remaining as usize); }
                 remaining -= chunk.len() as u64;
-                yield chunk.freeze();
+                // A tiny retained range must not pin its entire crypto batch.
+                // Full streaming batches keep the existing zero-copy handoff.
+                let bytes = if chunk.len() < allocation_size.div_ceil(2) {
+                    let bytes = Bytes::copy_from_slice(&chunk);
+                    drop(chunk);
+                    bytes
+                } else {
+                    chunk.freeze()
+                };
+                yield bytes;
                 if remaining == 0 { return; }
             }
         }

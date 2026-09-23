@@ -66,9 +66,10 @@ conditional write. A backend without conditional metadata puts therefore cannot
 provide cross-instance logical `Create`; use external coordination when that
 operation is required.
 
-- `Create` rejects an existing valid document. Explicit create/overwrite may
-  rebuild a decodable-but-invalid or undecodable document; its untrusted pointer
-  is never followed for cleanup.
+- `Create` never replaces an existing commit point, even if its metadata cannot
+  be decoded or validated. A wrong encryption key or changed resource limits
+  must not turn an existing object into an absent one. Explicit `Overwrite` may
+  rebuild invalid metadata; its untrusted pointer is never followed for cleanup.
 - `Update` requires the current logical ETag, freshly checked against the
   backend inside the per-key section. Invalid or absent metadata cannot satisfy
   it. `UpdateVersion::version` is rejected.
@@ -78,6 +79,10 @@ operation is required.
 - `GetOptions::version` returns `NotSupported`; results expose `version: None`.
 - Rename is copy-then-delete, not a multi-key atomic transaction. Self-rename
   validates existence and mode without deleting the object.
+
+Conditional copy/rename checks the target commit point before copying any payload.
+An existing target therefore fails without allocating a garbage generation. The
+final conditional metadata put still arbitrates a target created after this check.
 
 ### Logical ETags
 
@@ -157,6 +162,9 @@ chunk tag has been verified. A malformed/truncated chunk fails the read.
 plaintext. The decryption stream copies bounded batches (at most 64 KiB or one
 crypto chunk, whichever is larger) out of each upstream buffer; retaining a small output chunk does not pin an entire large
 plaintext allocation. The upstream backend may still retain its own buffer.
+After range trimming, a result smaller than half its plaintext allocation is
+copied into an independent buffer. Retaining a one-byte range therefore does not
+retain a whole crypto chunk; full streaming batches keep their zero-copy handoff.
 HEAD and empty-object reads do not decrypt a body.
 
 `get_ranges` plans all requested ranges together, deduplicates overlapping
@@ -192,6 +200,12 @@ exists with the expected size. This prevents a stale retry from replacing a
 newer acknowledged commit even when cleanup left the older payload in storage.
 A repeated complete after a reported success returns the original result.
 
+The commit timestamp is assigned under the per-key lock immediately before each
+new metadata publication, after any retry checks. Encrypted metadata is sealed
+there as well. A retry after a failed publication gets a fresh timestamp; if the
+generation was already committed but its acknowledgement was lost, the retry
+preserves the committed timestamp and ETag.
+
 Abort performs backend cleanup before marking the handle aborted, so a definite
 abort or delete failure remains retryable. If payload materialization has
 finished, abort re-reads metadata under the per-key writer lock and deletes the
@@ -216,11 +230,14 @@ additional; this is not an exact process-RSS bound.
 
 - Metadata TTL defaults to one hour.
 - Encrypted metadata additionally has a 20-minute idle timeout.
-- `with_meta_cache_bytes(bytes)` rebuilds the built-in weighted cache.
+- `with_meta_cache_bytes(bytes)` selects the built-in weighted cache budget.
 - `with_meta_cache_ttl(ttl)` preserves the original entry and byte budgets.
 - `EncryptedStoreBuilder::with_meta_cache(custom)` replaces the cache wholesale;
   its own capacity/eviction policy applies. A subsequent TTL/byte-budget setter
   replaces that custom cache, so builder order is meaningful.
+
+Builders defer constructing the built-in cache until `build()`, so repeated
+configuration calls do not allocate and discard caches.
 
 Decoded encrypted metadata is certified only after authentication, encoded-size
 checks and layout checks succeed. The private certificate binds the exact
@@ -229,8 +246,11 @@ logical path. Repeated reads of a valid cached value skip scanning and
 reauthenticating all tags. A raw external cache, another key/path, or a strict
 reader cannot inherit unearned trust from an earlier context.
 
-Cold loads run under the same per-key lock as commits. Listings may reuse valid
-cached metadata but never seed the cache from an uncoordinated listing snapshot.
+Cold reads and listings load and validate metadata under the same per-key lock as
+commits, then fill the cache. Repeated listings and subsequent reads can reuse
+those entries without refetching sidecars. A listing cannot insert its older
+snapshot after a newer commit. Missing entries and compatibility-mode CBOR
+failures are skipped without caching; semantic/authentication failures propagate.
 
 `with_metadata_limits(MetadataLimits { ... })` configures these defaults:
 
@@ -354,5 +374,35 @@ The suite includes InMemory/LocalFileSystem trait conformance, legacy formats,
 CAS/ABA and concurrency checks, authenticated cleanup, unknown outcomes and
 cancellation, multipart retries, cache trust boundaries, size budgets, range
 oracles and request/response Extensions. The benchmark harness records latency,
-allocation count, allocated bytes and largest allocation. Cloud integration and
-real power-loss tests remain deployment-specific.
+allocation count, cumulative allocated bytes and largest allocation. Tiny-range
+cases additionally report outstanding allocator bytes while holding the result;
+conditional-copy cases report backend copies and remaining target generations.
+Cloud integration and real power-loss tests remain deployment-specific.
+
+### Review-fix measurements (2026-09-23)
+
+Compared the implementation at `308c5cd` with these changes, using the same
+extended benchmark and resolved dependencies on macOS arm64, Rust 1.98.1.
+Both builds used `CARGO_PROFILE_BENCH_LTO=false CARGO_PROFILE_BENCH_OPT_LEVEL=3`.
+Three alternating before/after runs each used two warmups and 15 samples per
+case. Times below are medians of the three per-run medians. These are local,
+allocator-instrumented microbenchmarks, not cloud-throughput estimates.
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| One-byte range, default 256 KiB chunk, offset 100: retained heap bytes | 262,168 | 1 |
+| Same range: latency (µs) | 119.38 | 119.04 |
+| Conditional copy to existing target: latency (µs) | 4.46 | 0.96 |
+| Conditional copy: backend copies over 17 attempts | 17 | 0 |
+| Encrypted listing, 100 keys, repeated after cold listing (µs) | 180.42 | 61.29 |
+| Encrypted listing, 100 keys, cold cache (µs) | 179.38 | 297.42 |
+| Plain listing, 100 already-cached keys (µs) | 52.92 | 58.04 |
+| Encrypted full read, 4 MiB (µs) | 2,341.92 | 2,371.33 |
+
+The range change removes retained memory without avoiding the required full
+chunk decryption. Listing cache population adds work to the first scan; repeated
+scans save sidecar reads and authentication. Regression request counters verify
+three metadata GETs for two listings plus a head over three cached keys, versus
+seven with caching disabled. Conditional-copy rejection leaves only the original
+target generation. Successful conditional copies pay one extra metadata HEAD to
+avoid unnecessary payload copies when the target already exists.

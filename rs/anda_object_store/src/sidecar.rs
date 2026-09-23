@@ -535,9 +535,23 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         location: &Path,
         extensions: Extensions,
     ) -> Result<Arc<M>> {
+        Ok(self
+            .cached_meta(location, extensions, None)
+            .await?
+            .expect("ordinary lookups do not skip metadata"))
+    }
+
+    /// Listings may skip missing/undecodable documents, but use the same
+    /// per-key load and validation path as reads before filling the cache.
+    async fn cached_meta(
+        &self,
+        location: &Path,
+        extensions: Extensions,
+        listing: Option<ListingMetaPolicy>,
+    ) -> Result<Option<Arc<M>>> {
         if let Some(meta) = self.meta_cache.get(location).await {
             self.validate_meta(location, &meta)?;
-            return Ok(meta);
+            return Ok(Some(meta));
         }
 
         let rt = self
@@ -550,14 +564,30 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                     self.validate_meta(location, entry.value())?;
                     return Ok(Op::Nop);
                 }
-                let bytes = self
+                let bytes = match self
                     .fetch_meta_bytes_with_extensions(location, extensions)
-                    .await?;
-                let meta = self.decode_valid_meta(location, &bytes)?;
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(Error::NotFound { .. }) if listing.is_some() => return Ok(Op::Nop),
+                    Err(err) => return Err(err),
+                };
+                let meta = match self.decode_meta(location, &bytes) {
+                    Ok(meta) => meta,
+                    Err(err) if listing.is_some_and(|policy| !policy.reject_corrupt) => {
+                        log::warn!(
+                            "{}: skipping object with corrupted metadata in listing: {location}: {err}",
+                            M::STORE_NAME
+                        );
+                        return Ok(Op::Nop);
+                    }
+                    Err(err) => return Err(err),
+                };
+                self.validate_meta(location, &meta)?;
                 Ok::<_, Error>(Op::Put(Arc::new(meta)))
             })
             .await?;
-        Ok(rt.unwrap().value().clone())
+        Ok(rt.into_entry().map(|entry| entry.value().clone()))
     }
 
     /// Re-resolves the metadata from the backend **inside the per-key
@@ -611,13 +641,13 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// unreferenced generations are reclaimed by garbage collection.
     ///
     /// With `create`, the commit fails with [`Error::AlreadyExists`] when a
-    /// decodable document already exists; when no document exists at all the
-    /// metadata put is forwarded with [`PutMode::Create`], so a second writer
+    /// document already exists, even if validation would fail. When none exists,
+    /// the metadata put is forwarded with [`PutMode::Create`], so a second writer
     /// racing the same key **across processes** is rejected by the backend's
-    /// conditional write. A document that exists but does not decode (torn by
-    /// external corruption) is treated as absent so an overwriting or
-    /// creating put can rebuild the key; its unreachable payload is left to
-    /// garbage collection.
+    /// conditional write. Only an explicit overwrite may rebuild an invalid
+    /// document; validation failure can also mean a wrong key or changed limits,
+    /// and must not grant a creating put permission to replace existing data.
+    /// An invalid document's untrusted payload pointer is never used for cleanup.
     ///
     /// After a successful commit the replaced payload (previous generation,
     /// or the legacy `data/` object) is deleted best-effort; failures are
@@ -638,7 +668,6 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         };
         let mut replaced: Option<Path> = None;
         let replaced_out = &mut replaced;
-        let mut f = Some(f);
         let mut guard = CommitGuard {
             cache: &self.meta_cache,
             armed: false,
@@ -650,7 +679,6 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             .meta_cache
             .entry(location.clone())
             .and_try_compute_with(|_entry| async move {
-                let f = f.take().expect("update_meta_with closure invoked twice");
                 let mut meta_mode = PutMode::Overwrite;
                 // Resolve the current document from the backend, not from
                 // the (possibly lagging) cache entry: conditional writes
@@ -659,11 +687,9 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                     .fetch_meta_bytes_with_extensions(location, extensions.clone())
                     .await
                 {
+                    Ok(_) if create => return Err(already_exists()),
                     Ok(data) => match self.decode_valid_meta(location, &data) {
                         Ok(cur) => {
-                            if create {
-                                return Err(already_exists());
-                            }
                             *replaced_out = Some(self.payload_path(location, cur.generation()));
                             f(Some(&cur)).await?
                         }
@@ -756,15 +782,17 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         }
     }
 
-    pub(crate) async fn publish_upload(
+    pub(crate) async fn publish_upload<F>(
         &self,
         location: &Path,
-        meta: M,
+        mut meta: M,
         baseline: &mut PublicationBaseline,
         extensions: Extensions,
+        prepare: F,
     ) -> Result<CommitResult<M>>
     where
         M: Clone,
+        F: FnOnce(&mut M) -> Result<()>,
     {
         let retry = baseline.is_some();
         let baseline_out = baseline;
@@ -810,6 +838,10 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
                     ));
                 }
             }
+            // Timestamp/seal only an actual publication, after acquiring the
+            // key lock. A retry of an already committed generation keeps the
+            // original metadata above, including its authenticated timestamp.
+            prepare(&mut meta)?;
             Ok(meta)
         })
         .await
@@ -1017,38 +1049,21 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
     /// deleted while the listing was running, and (in compatibility mode)
     /// documents that no longer decode.
     ///
-    /// Decoded documents seen here are deliberately **not** inserted into the
-    /// metadata cache: an insert could clobber a newer document committed by
-    /// a concurrent writer between our fetch and the insert.
+    /// Cold entries are loaded and cached under the same per-key lock as writes,
+    /// so a listing cannot cache an old document after a newer commit.
     async fn listing_entry(
         &self,
         obj: ObjectMeta,
         policy: &ListingMetaPolicy,
     ) -> Result<Option<ObjectMeta>> {
         let location = self.strip_meta_prefix(obj.location);
-        let meta: Arc<M> = if let Some(meta) = self.meta_cache.get(&location).await {
-            meta
-        } else {
-            match self.fetch_meta_bytes(&location).await {
-                Ok(data) => match self.decode_meta(&location, &data) {
-                    Ok(meta) => Arc::new(meta),
-                    Err(err) => {
-                        if policy.reject_corrupt {
-                            return Err(err);
-                        }
-                        log::warn!(
-                            "{}: skipping object with corrupted metadata in listing: {location}: {err}",
-                            M::STORE_NAME
-                        );
-                        return Ok(None);
-                    }
-                },
-                Err(Error::NotFound { .. }) => return Ok(None),
-                Err(err) => return Err(err),
-            }
+        let Some(meta) = self
+            .cached_meta(&location, Extensions::default(), Some(*policy))
+            .await?
+        else {
+            return Ok(None);
         };
 
-        self.validate_meta(&location, &meta)?;
         Ok(Some(ObjectMeta {
             location,
             last_modified: logical_last_modified(meta.committed_at_ms(), meta.generation())
@@ -1094,6 +1109,34 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         })
     }
 
+    /// Reject an existing copy target before paying for a payload copy. The
+    /// final conditional metadata put still arbitrates a concurrent create.
+    async fn check_copy_target_absent(
+        &self,
+        location: &Path,
+        extensions: Extensions,
+    ) -> Result<()> {
+        match self
+            .store
+            .get_opts(
+                &self.meta_path(location),
+                GetOptions {
+                    head: true,
+                    extensions,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Err(Error::AlreadyExists {
+                path: location.to_string(),
+                source: "object already exists".into(),
+            }),
+            Err(Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Copies the current payload of `from` into a fresh generation of `to`,
     /// re-resolving a stale cached pointer once (see the read paths). The
     /// target's commit point is **not** touched: the caller builds the new
@@ -1111,6 +1154,7 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
         &self,
         from: &Path,
         to: &Path,
+        create: bool,
         extensions: Extensions,
     ) -> Result<(Arc<M>, String, InFlightGuard)> {
         let mut retried = false;
@@ -1119,6 +1163,12 @@ impl<T: ObjectStore, M: SidecarMeta> SidecarStore<T, M> {
             let src = self
                 .get_meta_with_extensions(from, extensions.clone())
                 .await?;
+            // Preserve source-NotFound precedence while rejecting an occupied
+            // target before allocating/copying a generation.
+            if create {
+                self.check_copy_target_absent(to, extensions.clone())
+                    .await?;
+            }
             let src_path = self.payload_path(from, src.generation());
             let generation = new_generation();
             let in_flight = self.track_in_flight(to, &generation);

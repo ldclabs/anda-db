@@ -1,4 +1,4 @@
-use anda_object_store::{EncryptedStoreBuilder, MetaStoreBuilder};
+use anda_object_store::{EncryptedStoreBuilder, FaultOp, FaultStore, MetaStoreBuilder};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{
@@ -176,5 +176,113 @@ fn main() {
                 black_box(collector.list(None).try_collect::<Vec<_>>().await.unwrap());
             });
         },
+    );
+
+    let tiny = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0; 32]).build();
+    runtime
+        .block_on(tiny.put(&path, vec![7; 1024 * 1024].into()))
+        .unwrap();
+    support::measure(
+        "encrypted/range/default_chunk/one_byte",
+        || {},
+        || {
+            black_box(runtime.block_on(tiny.get_range(&path, 100..101)).unwrap());
+        },
+    );
+    for offset in [100, 256 * 1024 - 1] {
+        support::retained(
+            &format!("encrypted/range/default_chunk/offset={offset}"),
+            || {
+                runtime
+                    .block_on(tiny.get_range(&path, offset..offset + 1))
+                    .unwrap()
+            },
+        );
+    }
+
+    let cache = moka::future::Cache::builder().max_capacity(1000).build();
+    let listing_backend = InMemory::new();
+    let writer = EncryptedStoreBuilder::with_secret(listing_backend.clone(), 1000, [0; 32]).build();
+    runtime.block_on(async {
+        for i in 0..100 {
+            writer
+                .put(
+                    &Path::from(format!("listing/{i}")),
+                    Bytes::from_static(b"data").into(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    drop(writer);
+    let reader = EncryptedStoreBuilder::with_secret(listing_backend, 1000, [0; 32])
+        .with_meta_cache(cache.clone())
+        .build();
+    support::measure(
+        "encrypted/list/cold/100_keys",
+        || cache.invalidate_all(),
+        || {
+            black_box(
+                runtime
+                    .block_on(reader.list(None).try_collect::<Vec<_>>())
+                    .unwrap(),
+            );
+        },
+    );
+    support::measure(
+        "encrypted/list/repeated_after_cold/100_keys",
+        || {},
+        || {
+            black_box(
+                runtime
+                    .block_on(reader.list(None).try_collect::<Vec<_>>())
+                    .unwrap(),
+            );
+        },
+    );
+
+    let copy_backend = InMemory::new();
+    let (fault, handle) = FaultStore::wrap(copy_backend.clone());
+    let copy_store = MetaStoreBuilder::new(fault, 100).build();
+    let source = Path::from("copy/source");
+    let target = Path::from("copy/target");
+    runtime.block_on(async {
+        copy_store
+            .put(&source, vec![7; 1024 * 1024].into())
+            .await
+            .unwrap();
+        copy_store
+            .put(&target, Bytes::from_static(b"exists").into())
+            .await
+            .unwrap();
+    });
+    handle.reset();
+    support::measure(
+        "meta/copy_if_not_exists/existing_target",
+        || {},
+        || {
+            assert!(
+                runtime
+                    .block_on(copy_store.copy_if_not_exists(&source, &target))
+                    .is_err()
+            );
+        },
+    );
+    let copies = handle
+        .mutation_log()
+        .iter()
+        .filter(|(op, _)| *op == FaultOp::Copy)
+        .count();
+    let generations = runtime
+        .block_on(
+            copy_backend
+                .list(Some(&Path::from("gen/copy/target")))
+                .try_collect::<Vec<_>>(),
+        )
+        .unwrap();
+    eprintln!(
+        "conditional_copy: attempts=17, backend_copies={copies}, target_generations={}, target_payload_bytes={}",
+        generations.len(),
+        generations.iter().map(|meta| meta.size).sum::<u64>()
     );
 }

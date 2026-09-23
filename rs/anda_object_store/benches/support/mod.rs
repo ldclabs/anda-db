@@ -11,6 +11,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static COUNT: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static LARGEST: AtomicU64 = AtomicU64::new(0);
+static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 fn record(bytes: usize) {
     if ACTIVE.load(Ordering::Relaxed) {
         COUNT.fetch_add(1, Ordering::Relaxed);
@@ -21,19 +22,52 @@ fn record(bytes: usize) {
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        ptr
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         record(size);
-        unsafe { System.realloc(ptr, layout, size) }
+        let ptr = unsafe { System.realloc(ptr, layout, size) };
+        if !ptr.is_null() {
+            if size >= layout.size() {
+                LIVE_BYTES.fetch_add((size - layout.size()) as u64, Ordering::Relaxed);
+            } else {
+                LIVE_BYTES.fetch_sub((layout.size() - size) as u64, Ordering::Relaxed);
+            }
+        }
+        ptr
     }
+}
+
+/// Report outstanding allocator bytes while retaining one result, separately
+/// from measure's cumulative allocation counters. Warm cache/runtime state first.
+pub fn retained(name: &str, mut run: impl FnMut() -> bytes::Bytes) {
+    for _ in 0..2 {
+        drop(run());
+    }
+    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let result = run();
+    let held = LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    eprintln!(
+        "{name}: result_bytes={}, retained_allocation_bytes={held}",
+        result.len()
+    );
+    drop(result);
 }
 pub fn header() {
     println!("case,median_us,p95_us,allocations,allocated_bytes,largest_allocation");

@@ -72,7 +72,6 @@ use base64::{Engine, prelude::BASE64_URL_SAFE};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
-use moka::future::Cache;
 use object_store::{path::Path, *};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -145,8 +144,6 @@ impl<T: ObjectStore> Clone for MetaStore<T> {
 pub struct MetaStoreBuilder<T: ObjectStore> {
     /// The underlying storage implementation
     store: T,
-    /// Cache for metadata to reduce storage operations
-    meta_cache: Cache<Path, Arc<Metadata>>,
     /// Maximum number of metadata entries to cache
     meta_cache_capacity: u64,
     meta_cache_ttl: Duration,
@@ -255,13 +252,6 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     pub fn new(store: T, meta_cache_capacity: u64) -> Self {
         MetaStoreBuilder {
             store,
-            meta_cache: metadata_cache(
-                meta_cache_capacity,
-                DEFAULT_CACHE_BYTES,
-                Duration::from_secs(3600),
-                None,
-                Metadata::cache_weight,
-            ),
             meta_cache_capacity,
             meta_cache_ttl: Duration::from_secs(3600),
             meta_cache_bytes: DEFAULT_CACHE_BYTES,
@@ -272,26 +262,12 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     /// Sets the time-to-live (TTL) for the metadata cache.
     pub fn with_meta_cache_ttl(mut self, ttl: Duration) -> Self {
         self.meta_cache_ttl = ttl;
-        self.meta_cache = metadata_cache(
-            self.meta_cache_capacity,
-            self.meta_cache_bytes,
-            ttl,
-            None,
-            Metadata::cache_weight,
-        );
         self
     }
 
     /// Sets the estimated key/value byte budget while retaining the entry limit.
     pub fn with_meta_cache_bytes(mut self, bytes: u64) -> Self {
         self.meta_cache_bytes = bytes;
-        self.meta_cache = metadata_cache(
-            self.meta_cache_capacity,
-            bytes,
-            self.meta_cache_ttl,
-            None,
-            Metadata::cache_weight,
-        );
         self
     }
 
@@ -306,10 +282,15 @@ impl<T: ObjectStore> MetaStoreBuilder<T> {
     /// # Returns
     /// A new `MetaStore` instance
     pub fn build(self) -> MetaStore<T> {
+        let cache = metadata_cache(
+            self.meta_cache_capacity,
+            self.meta_cache_bytes,
+            self.meta_cache_ttl,
+            None,
+            Metadata::cache_weight,
+        );
         MetaStore {
-            inner: Arc::new(
-                SidecarStore::new(self.store, self.meta_cache).with_limits(self.limits),
-            ),
+            inner: Arc::new(SidecarStore::new(self.store, cache).with_limits(self.limits)),
         }
     }
 }
@@ -363,12 +344,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                             path: location.to_string(),
                             source: "metadata not found".into(),
                         })?;
-                        check_update_version(
-                            location,
-                            &current.e_tag,
-                            &current.generation,
-                            version,
-                        )?;
+                        check_update_version(location, &current.e_tag, version)?;
                     }
                     let (generation, in_flight) = self
                         .inner
@@ -549,7 +525,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         // copied generation from garbage collection until then.
         let (src, generation, _in_flight) = self
             .inner
-            .copy_payload(from, to, extensions.clone())
+            .copy_payload(from, to, create, extensions.clone())
             .await?;
         self.inner
             .update_meta_with(to, create, extensions, async |_| {
@@ -656,7 +632,7 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
                 original_tag: None,
                 original_version: None,
                 generation: Some(self.generation.clone()),
-                committed_at_ms: Some(new_commit_timestamp_ms()),
+                committed_at_ms: None,
             });
             attempt.materialized();
         }
@@ -673,6 +649,10 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
                 metadata,
                 &mut self.publication_baseline,
                 self.extensions.clone(),
+                |meta| {
+                    meta.committed_at_ms = Some(new_commit_timestamp_ms());
+                    Ok(())
+                },
             )
             .await?;
         self.prepared = None;
@@ -717,7 +697,6 @@ pub(crate) fn sha3_256(data: &[u8]) -> [u8; 32] {
 fn check_update_version(
     location: &Path,
     current_e_tag: &Option<String>,
-    _current_generation: &Option<String>,
     update: &UpdateVersion,
 ) -> Result<()> {
     // Mirror `object_store`'s in-memory reference behavior: an e_tag is

@@ -1634,3 +1634,402 @@ async fn gc_rechecks_once_per_key_and_mark_budget_precedes_deletes() {
         2
     );
 }
+
+fn wrapped_store<T: ObjectStore>(
+    backend: T,
+    encrypted: bool,
+    capacity: u64,
+) -> Box<dyn ObjectStore> {
+    if encrypted {
+        Box::new(EncryptedStoreBuilder::with_secret(backend, capacity, [0; 32]).build())
+    } else {
+        Box::new(MetaStoreBuilder::new(backend, capacity).build())
+    }
+}
+
+#[tokio::test]
+async fn create_with_wrong_key_preserves_existing_commit() {
+    let backend = InMemory::new();
+    let path = Path::from("wrong-key");
+    let writer = wrapped_store(backend.clone(), true, 100);
+    writer
+        .put(&path, Bytes::from_static(b"original").into())
+        .await
+        .unwrap();
+    drop(writer);
+    let before = backend
+        .get(&Path::from("meta/wrong-key"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let wrong = EncryptedStoreBuilder::with_secret(backend.clone(), 100, [1; 32])
+        .with_strict_metadata_auth()
+        .build();
+    assert!(wrong.get(&path).await.is_err());
+    let result = wrong
+        .put_opts(
+            &path,
+            Bytes::from_static(b"replacement").into(),
+            PutMode::Create.into(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::AlreadyExists { .. })));
+    assert_eq!(
+        backend
+            .get(&Path::from("meta/wrong-key"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        before
+    );
+    let reopened = wrapped_store(backend, true, 100);
+    assert_eq!(
+        reopened.get(&path).await.unwrap().bytes().await.unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn create_after_lowering_limits_preserves_existing_commit() {
+    use anda_object_store::MetadataLimits;
+    for encrypted in [false, true] {
+        let backend = InMemory::new();
+        let path = Path::from("lowered-limits");
+        let writer = wrapped_store(backend.clone(), encrypted, 100);
+        writer
+            .put(&path, Bytes::from_static(b"original").into())
+            .await
+            .unwrap();
+        drop(writer);
+        let limits = MetadataLimits {
+            max_object_size: 4,
+            ..Default::default()
+        };
+        let smaller: Box<dyn ObjectStore> = if encrypted {
+            Box::new(
+                EncryptedStoreBuilder::with_secret(backend.clone(), 100, [0; 32])
+                    .with_metadata_limits(limits)
+                    .build(),
+            )
+        } else {
+            Box::new(
+                MetaStoreBuilder::new(backend.clone(), 100)
+                    .with_metadata_limits(limits)
+                    .build(),
+            )
+        };
+        assert!(smaller.get(&path).await.is_err());
+        assert!(matches!(
+            smaller
+                .put_opts(
+                    &path,
+                    Bytes::from_static(b"new").into(),
+                    PutMode::Create.into()
+                )
+                .await,
+            Err(Error::AlreadyExists { .. })
+        ));
+        let reopened = wrapped_store(backend, encrypted, 100);
+        assert_eq!(
+            reopened.get(&path).await.unwrap().bytes().await.unwrap(),
+            "original"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_retry_timestamp_tracks_first_successful_publication() {
+    for encrypted in [false, true] {
+        for after in [false, true] {
+            let backend = InMemory::new();
+            let (fault, handle) = FaultStore::wrap(backend.clone());
+            let store = wrapped_store(fault, encrypted, 100);
+            let path = Path::from("retry-timestamp");
+            store
+                .put(&path, Bytes::from_static(b"old").into())
+                .await
+                .unwrap();
+            let mut upload = store.put_multipart(&path).await.unwrap();
+            upload
+                .put_part(Bytes::from_static(b"new").into())
+                .await
+                .unwrap();
+            handle.push_rule(FaultRule {
+                op: FaultOp::Put,
+                path_contains: Some("meta/".into()),
+                skip: 0,
+                times: 1,
+                kind: if after {
+                    FaultKind::ErrorAfter
+                } else {
+                    FaultKind::Error
+                },
+            });
+            assert!(upload.complete().await.is_err());
+            let initial = store.head(&path).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let observed = chrono::Utc::now();
+            let content = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(content, if after { "new" } else { "old" });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let committed = upload.complete().await.unwrap();
+            // Read through a new context to also verify the timestamp's seal.
+            let reopened = wrapped_store(backend, encrypted, 100);
+            let head = reopened.head(&path).await.unwrap();
+            assert_eq!(
+                reopened.get(&path).await.unwrap().bytes().await.unwrap(),
+                "new"
+            );
+            let conditional = reopened
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        if_modified_since: Some(observed),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if after {
+                assert_eq!(head.last_modified, initial.last_modified);
+                assert_eq!(head.e_tag, initial.e_tag);
+                assert!(matches!(conditional, Err(Error::NotModified { .. })));
+            } else {
+                assert!(head.last_modified > observed);
+                assert_eq!(conditional.unwrap().bytes().await.unwrap(), "new");
+            }
+            assert_eq!(upload.complete().await.unwrap().e_tag, committed.e_tag);
+            assert_eq!(
+                store.head(&path).await.unwrap().last_modified,
+                head.last_modified
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tiny_single_ranges_release_crypto_batch_allocation() {
+    for chunk_size in [1024, 256 * 1024] {
+        let store = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0; 32])
+            .with_chunk_size(chunk_size)
+            .build();
+        let path = Path::from("tiny-range");
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        store.put(&path, payload.clone().into()).await.unwrap();
+        for range in [
+            100..101,
+            chunk_size - 1..chunk_size + 1,
+            chunk_size - 1..chunk_size,
+        ] {
+            let bytes = store.get_range(&path, range.clone()).await.unwrap();
+            assert_eq!(
+                bytes.as_ref(),
+                &payload[range.start as usize..range.end as usize]
+            );
+            let capacity = bytes.try_into_mut().unwrap().capacity();
+            assert!(
+                capacity <= 2 * (range.end - range.start) as usize,
+                "retained {capacity} bytes for {range:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn existing_copy_and_rename_targets_do_not_allocate_generations() {
+    use futures::TryStreamExt;
+    for encrypted in [false, true] {
+        let backend = InMemory::new();
+        let (fault, handle) = FaultStore::wrap(backend.clone());
+        let store = wrapped_store(fault, encrypted, 100);
+        let from = Path::from("copy-source");
+        let to = Path::from("copy-target");
+        store.put(&from, vec![0; 1024 * 1024].into()).await.unwrap();
+        store
+            .put(&to, Bytes::from_static(b"exists").into())
+            .await
+            .unwrap();
+        // Existence must also protect a corrupt target without attempting repair.
+        for corrupt in [false, true] {
+            if corrupt {
+                backend
+                    .put(
+                        &Path::from("meta/copy-target"),
+                        Bytes::from_static(b"\xffgarbage").into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            handle.reset();
+            for _ in 0..3 {
+                assert!(matches!(
+                    store.copy_if_not_exists(&from, &to).await,
+                    Err(Error::AlreadyExists { .. })
+                ));
+                assert!(matches!(
+                    store.rename_if_not_exists(&from, &to).await,
+                    Err(Error::AlreadyExists { .. })
+                ));
+            }
+            assert!(handle.mutation_log().is_empty());
+            assert_eq!(
+                backend
+                    .list(Some(&Path::from("gen")))
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                store.get(&from).await.unwrap().bytes().await.unwrap().len(),
+                1024 * 1024
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_copy_still_arbitrates_after_target_preflight() {
+    use anda_object_store::FaultGate;
+    for encrypted in [false, true] {
+        let (fault, handle) = FaultStore::wrap(InMemory::new());
+        let store = wrapped_store(fault, encrypted, 100);
+        let from = Path::from("race-source");
+        let to = Path::from("race-target");
+        store
+            .put(&from, Bytes::from_static(b"source").into())
+            .await
+            .unwrap();
+        let gate = FaultGate::new();
+        handle.push_rule(FaultRule {
+            op: FaultOp::Copy,
+            path_contains: Some("gen/".into()),
+            skip: 0,
+            times: 1,
+            kind: FaultKind::PauseBefore(gate.clone()),
+        });
+        let mut copy = Box::pin(store.copy_if_not_exists(&from, &to));
+        tokio::select! { _ = &mut copy => panic!("copy should wait"), _ = gate.wait_entered() => () }
+        store
+            .put(&to, Bytes::from_static(b"winner").into())
+            .await
+            .unwrap();
+        gate.release();
+        assert!(matches!(copy.await, Err(Error::AlreadyExists { .. })));
+        assert_eq!(
+            store.get(&to).await.unwrap().bytes().await.unwrap(),
+            "winner"
+        );
+    }
+}
+
+async fn listing_variant(store: &dyn ObjectStore, variant: u8) -> Vec<ObjectMeta> {
+    use futures::TryStreamExt;
+    let prefix = Path::from("listing");
+    match variant {
+        0 => store.list(Some(&prefix)).try_collect().await.unwrap(),
+        1 => store
+            .list_with_offset(Some(&prefix), &prefix)
+            .try_collect()
+            .await
+            .unwrap(),
+        _ => {
+            store
+                .list_with_delimiter(Some(&prefix))
+                .await
+                .unwrap()
+                .objects
+        }
+    }
+}
+
+#[tokio::test]
+async fn cold_listing_variants_fill_cache_and_respect_disabled_cache() {
+    for encrypted in [false, true] {
+        let backend = InMemory::new();
+        let writer = wrapped_store(backend.clone(), encrypted, 100);
+        for i in 0..3 {
+            writer
+                .put(
+                    &Path::from(format!("listing/{i}")),
+                    Bytes::from_static(b"data").into(),
+                )
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        for capacity in [0, 100] {
+            for variant in 0..3 {
+                let controls = Arc::new(Controls::default());
+                let store = wrapped_store(
+                    ProbeStore {
+                        inner: backend.clone(),
+                        controls: controls.clone(),
+                    },
+                    encrypted,
+                    capacity,
+                );
+                assert_eq!(listing_variant(store.as_ref(), variant).await.len(), 3);
+                assert_eq!(listing_variant(store.as_ref(), variant).await.len(), 3);
+                store.head(&Path::from("listing/0")).await.unwrap();
+                let metadata_gets = controls
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(op, _)| op.starts_with("get:meta/"))
+                    .count();
+                assert_eq!(metadata_gets, if capacity == 0 { 7 } else { 3 });
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn listing_cannot_cache_a_pointer_after_its_replacement() {
+    use anda_object_store::{FaultGate, FaultOutcome};
+    for encrypted in [false, true] {
+        let backend = InMemory::new();
+        let path = Path::from("listing/race");
+        let seed = wrapped_store(backend.clone(), encrypted, 100);
+        seed.put(&path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        drop(seed);
+        let (fault, handle) = FaultStore::wrap(backend);
+        let store = wrapped_store(fault, encrypted, 100);
+        let gate = FaultGate::new();
+        handle.push_rule(FaultRule {
+            op: FaultOp::Get,
+            path_contains: Some("meta/listing/race".into()),
+            skip: 0,
+            times: 1,
+            kind: FaultKind::PauseAfter(gate.clone()),
+        });
+        // Leave the old generation physically present so a stale cache cannot
+        // be masked by the payload-NotFound refresh path.
+        handle.push_rule(FaultRule::fail_once(FaultOp::Delete, "gen/"));
+        let mut listing = Box::pin(listing_variant(store.as_ref(), 0));
+        tokio::select! { _ = &mut listing => panic!("listing should wait"), _ = gate.wait_entered() => () }
+        let mut write = Box::pin(store.put(&path, Bytes::from_static(b"new value").into()));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(!handle.event_log().iter().any(
+            |event| event.op == FaultOp::Put && event.outcome == FaultOutcome::BackendSucceeded
+        ));
+        gate.release();
+        let (listed, result) = futures::join!(listing, write);
+        assert_eq!(listed.len(), 1);
+        let committed = result.unwrap();
+        assert_eq!(
+            store.get(&path).await.unwrap().bytes().await.unwrap(),
+            "new value"
+        );
+        let latest = listing_variant(store.as_ref(), 0).await;
+        assert_eq!(latest[0].e_tag, committed.e_tag);
+        assert_eq!(latest[0].size, 9);
+    }
+}

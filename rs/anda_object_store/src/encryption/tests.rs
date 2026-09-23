@@ -201,6 +201,34 @@ fn meta_cache_ttl_preserves_the_configured_capacity() {
     assert_eq!(policy.time_to_idle(), Some(DEFAULT_META_CACHE_TTI));
 }
 
+#[test]
+fn builder_cache_setter_order_is_preserved() {
+    let custom = Cache::builder().max_capacity(3).build();
+    let store = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0; 32])
+        .with_meta_cache_ttl(Duration::from_secs(7))
+        .with_meta_cache_bytes(1024)
+        .with_meta_cache(custom.clone())
+        .build();
+    assert_eq!(store.inner.meta_cache.policy().max_capacity(), Some(3));
+    assert_eq!(store.inner.meta_cache.policy().time_to_live(), None);
+
+    let store = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0; 32])
+        .with_meta_cache(custom.clone())
+        .with_meta_cache_ttl(Duration::from_secs(7))
+        .build();
+    assert_eq!(store.inner.meta_cache.policy().max_capacity(), Some(100));
+    assert_eq!(
+        store.inner.meta_cache.policy().time_to_live(),
+        Some(Duration::from_secs(7))
+    );
+
+    let store = EncryptedStoreBuilder::with_secret(InMemory::new(), 100, [0; 32])
+        .with_meta_cache(custom)
+        .with_meta_cache_bytes(0)
+        .build();
+    assert_eq!(store.inner.meta_cache.policy().max_capacity(), Some(0));
+}
+
 #[tokio::test]
 async fn test_with_memory() {
     let storage = EncryptedStoreBuilder::with_secret(InMemory::new(), 10000, [0u8; 32]).build();
@@ -1376,7 +1404,7 @@ async fn test_with_local_file() {
 /// One-byte counter values make bare-ciphertext ETags collide with
 /// probability 1/256 per pair; a collision lets a stale CAS token pass
 /// the precondition and silently rewind the counter. The logical ETag
-/// is therefore seeded with the per-commit nonce (see `put_opts`).
+/// therefore identifies the unique generation of each commit (see `put_opts`).
 #[tokio::test(flavor = "multi_thread")]
 async fn stress_occ_counter_local_file() {
     const NUM_WORKERS: usize = 16;

@@ -47,10 +47,8 @@ async fn put_legacy_object<T: ObjectStore>(inner: &T, location: &Path, payload: 
 /// The logical ETag the currently committed generation of `location` must
 /// carry for `payload`.
 ///
-/// The ETag is unique per commit — it hashes the generation together with
-/// the payload — so a test cannot derive it from the content alone;
-/// asserting against this value still proves that the committed metadata
-/// and the committed payload describe the same write.
+/// The ETag hashes the generation, so a test cannot derive it from content.
+/// Payload equality is checked separately by the callers.
 async fn committed_e_tag<T: ObjectStore>(
     storage: &MetaStore<T>,
     location: &Path,
@@ -1027,7 +1025,7 @@ async fn corrupted_metadata_heals_on_overwrite() {
 }
 
 #[tokio::test]
-async fn create_over_corrupted_metadata_heals() {
+async fn create_preserves_corrupted_metadata_until_explicit_overwrite() {
     let inner = InMemory::new();
     let storage = MetaStoreBuilder::new(inner.clone(), 100).build();
     let location = Path::from("create-heal");
@@ -1044,10 +1042,10 @@ async fn create_over_corrupted_metadata_heals() {
         .await
         .unwrap();
 
-    // The object is unreadable, so `Create` treats it as absent and
-    // rebuilds it.
+    // Unreadable metadata is still an existing commit point. Create cannot
+    // authorize repair; only an explicit overwrite can replace it.
     let reopened = MetaStoreBuilder::new(inner.clone(), 100).build();
-    reopened
+    let err = reopened
         .put_opts(
             &location,
             Bytes::from_static(b"new").into(),
@@ -1056,6 +1054,21 @@ async fn create_over_corrupted_metadata_heals() {
                 ..Default::default()
             },
         )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists { .. }));
+    assert_eq!(
+        inner
+            .get(&Path::from("meta/create-heal"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        Bytes::from_static(b"\xffgarbage")
+    );
+    reopened
+        .put(&location, Bytes::from_static(b"new").into())
         .await
         .unwrap();
     let bytes = reopened
