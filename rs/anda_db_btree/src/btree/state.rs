@@ -29,31 +29,33 @@ impl<FV> BucketState<FV> {
 #[derive(Debug)]
 pub(super) struct Posting<PK> {
     pub(super) bucket_id: u32,
-    pub(super) version: u64,
     pub(super) docs: PostingList<PK>,
 }
 impl<PK: Eq + Hash + Clone> Posting<PK> {
     pub(super) fn new(bucket_id: u32, id: PK) -> Self {
         Self {
             bucket_id,
-            version: 1,
             docs: vec![id].into(),
         }
     }
 }
-impl<PK> From<(u32, u64, PostingList<PK>)> for Posting<PK> {
-    fn from((bucket_id, version, docs): (u32, u64, PostingList<PK>)) -> Self {
-        Self {
-            bucket_id,
-            version,
-            docs,
-        }
+// The persisted triple still carries the per-posting update counter that
+// earlier releases kept but never read. It is ignored on load and written as
+// a constant, so older releases can still decode new buckets.
+impl<PK> From<StoredPosting<PK>> for Posting<PK> {
+    fn from((bucket_id, _, docs): StoredPosting<PK>) -> Self {
+        Self { bucket_id, docs }
     }
 }
 impl<PK: Serialize> Serialize for Posting<PK> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (self.bucket_id, self.version, &self.docs).serialize(serializer)
+        stored_posting(self.bucket_id, &self.docs).serialize(serializer)
     }
+}
+
+/// The persisted `(bucket_id, legacy counter, doc_ids)` triple.
+pub(super) fn stored_posting<D: ?Sized>(bucket_id: u32, docs: &D) -> (u32, u64, &D) {
+    (bucket_id, 0, docs)
 }
 
 pub(super) struct Removal<FV> {

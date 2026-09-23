@@ -569,11 +569,7 @@ impl<FV> RangeQuery<FV> {
     }
 }
 
-impl<PK, FV> BTreeIndex<PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     /// Queries the index for an exact key match
     ///
     /// # Arguments
@@ -593,8 +589,6 @@ where
     where
         F: FnOnce(&Vec<PK>) -> Option<R>,
     {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-
         self.postings
             .get(field_value)
             .and_then(|posting| f(&posting.docs))
@@ -712,12 +706,8 @@ where
     {
         if let Err(source) = query.validate() {
             query.discard();
-            return Err(BTreeError::Generic {
-                name: self.name.clone(),
-                source,
-            });
+            return Err(self.generic_error(source));
         }
-        self.query_count.fetch_add(1, Ordering::Relaxed);
         Ok(match query {
             RangeQuery::Eq(key) => match self.postings.get(&key) {
                 Some(posting) => f(&key, &posting.docs).1,

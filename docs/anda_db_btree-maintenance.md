@@ -2,6 +2,41 @@
 
 [中文版](anda_db_btree-maintenance.zh.md)
 
+## 2026-09-24 Follow-up
+
+Implemented against `5a093df`, without subagents or new dependencies. Bucket
+and metadata payloads keep their CBOR layout.
+
+- [x] Stop counting queries. Every lookup incremented one shared atomic, so
+  concurrent readers contended on a single cache line. `BTreeStats.query_count`
+  remains because older releases require it when decoding metadata; it now
+  keeps the loaded value.
+- [x] Build the ordered key set once after loading, from the surviving
+  postings, instead of inserting each bucket's keys in hash order. The build
+  also runs when loading stops on an error, so loaded postings stay range
+  queryable.
+- [x] Leave buckets without postings out of the manifest. They are no longer
+  rewritten as empty objects and fetched on every open; their previous objects,
+  including empty ones committed by earlier releases, are reported as obsolete.
+- [x] Drop the per-posting update counter, which nothing read (8 bytes per
+  key). The persisted triple writes `0` in its place and ignores it on load.
+- [x] Add the `BTreeKey` bound alias and shared error constructors, and remove
+  the placeholder buckets that `load_metadata` built only for `load_buckets` to
+  discard.
+
+### Measurements
+
+Apple M1 Pro (10 CPUs), rustc 1.98.1, release profile (`opt-level=z`, LTO).
+An ad hoc A/B harness (not committed) was built against both versions and run
+three times, alternating builds; the table shows medians.
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Point lookups, 100k keys, 1 / 2 / 4 / 8 threads (total M ops/s) | 30.2 / 25.5 / 24.9 / 19.7 | 31.6 / 52.3 / 86.5 / 76.6 |
+| Load 1M `u64` keys (best of 5 per run) | 492 ms | 359 ms |
+| Load 1M `String` keys (best of 5 per run) | 1,068 ms | 772 ms |
+| 20,000 keys in 4 KiB buckets, oldest 19,000 removed, then flush: manifest entries / objects written / empty objects | 67 / 64 / 63 | 4 / 1 / 0 |
+
 ## 2026-09-23 Follow-up
 
 Implemented against `eb950fd623796b47ba56f6ba5db5120117d9cf4f`, without

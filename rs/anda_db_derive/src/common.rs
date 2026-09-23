@@ -1870,6 +1870,7 @@ mod tests {
 
         // `macro_rules!` substitution wraps types in invisible groups.
         let grouped = Type::Group(syn::TypeGroup {
+            attrs: Vec::new(),
             group_token: Default::default(),
             elem: Box::new(parse_quote!(Vec<u8>)),
         });

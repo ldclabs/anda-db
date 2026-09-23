@@ -9,7 +9,7 @@
 //! Conceptually the index is an inverted map:
 //!
 //! ```text
-//! field_value (FV)  →  Posting { bucket_id, version, Vec<primary_key (PK)> }
+//! field_value (FV)  →  Posting { bucket_id, Vec<primary_key (PK)> }
 //! ```
 //!
 //! Field values are additionally kept in an in-memory [`std::collections::BTreeSet`]
@@ -46,16 +46,17 @@
 //!
 //! The library never writes to disk itself — callers supply async closures to
 //! [`BTreeIndex::flush`] / [`BTreeIndex::flush_owned_with`]. Every dirty
-//! bucket is written to a **fresh** immutable object keyed by
-//! `(bucket_id, generation)`, then the metadata — whose *manifest* maps every
-//! live bucket id to its current generation — is committed last. The metadata
-//! write is the single atomic commit point:
+//! bucket that still holds postings is written to a **fresh** immutable
+//! object keyed by `(bucket_id, generation)`, then the metadata — whose
+//! *manifest* maps every non-empty bucket id to its current generation — is
+//! committed last. The metadata write is the single atomic commit point:
 //!
 //! - A crash or error before the commit leaves the new objects as
 //!   unreferenced garbage; a loader still sees the previous complete
 //!   snapshot.
-//! - After the commit, the replaced objects are garbage; they are returned
-//!   as [`FlushOutcome::obsolete`] for best-effort deletion.
+//! - After the commit, the replaced objects — and those of buckets that
+//!   became empty — are garbage; they are returned as
+//!   [`FlushOutcome::obsolete`] for best-effort deletion.
 //!
 //! Metadata persisted by pre-manifest releases (no manifest, un-suffixed
 //! bucket objects) is still loadable: the loader falls back to scanning
@@ -96,7 +97,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use state::{BucketState, Posting, Removal};
+use state::{BucketState, Posting, Removal, stored_posting};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -109,21 +110,18 @@ use std::{
 
 use crate::{BTreeError, BoxError};
 
+/// Bounds shared by the primary keys (`PK`) and field values (`FV`) of a
+/// [`BTreeIndex`]. Implemented automatically for every qualifying type.
+pub trait BTreeKey: Ord + Hash + Debug + Clone + Serialize + DeserializeOwned {}
+impl<T: Ord + Hash + Debug + Clone + Serialize + DeserializeOwned> BTreeKey for T {}
+
 /// Serialization-only views. No posting, PK, FV or membership map is cloned.
-struct BucketView<'a, PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+struct BucketView<'a, PK, FV> {
     index: &'a BTreeIndex<PK, FV>,
     id: u32,
     fields: &'a FxHashSet<FV>,
 }
-impl<PK, FV> Serialize for BucketView<'_, PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> Serialize for BucketView<'_, PK, FV> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("Bucket", 1)?;
@@ -131,15 +129,8 @@ where
         state.end()
     }
 }
-struct PostingsView<'a, 'b, PK, FV>(&'a BucketView<'b, PK, FV>)
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned;
-impl<PK, FV> Serialize for PostingsView<'_, '_, PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+struct PostingsView<'a, 'b, PK, FV>(&'a BucketView<'b, PK, FV>);
+impl<PK: BTreeKey, FV: BTreeKey> Serialize for PostingsView<'_, '_, PK, FV> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(None)?;
@@ -221,7 +212,6 @@ where
 fn previous_posting_size_after_append<PK, FV>(
     field_value: &FV,
     bucket_id: u32,
-    version_after_append: u64,
     doc_ids_after_append: &PostingList<PK>,
 ) -> usize
 where
@@ -235,9 +225,8 @@ where
     // size is still a valid one-element-smaller estimate, and any residual
     // drift in bucket accounting is bounded by the saturating arithmetic at
     // the call sites. Do not assert on the popped element here.
-    let previous = (
+    let previous = stored_posting(
         bucket_id,
-        version_after_append.saturating_sub(1),
         &doc_ids_after_append[..doc_ids_after_append.len().saturating_sub(1)],
     );
     posting_entry_size(field_value, &previous)
@@ -255,9 +244,8 @@ where
 ///
 /// # Type parameters
 ///
-/// - `PK`: primary key. Must be `Ord + Eq + Hash + Clone + Serialize +
-///   DeserializeOwned + Debug`.
-/// - `FV`: field value. Same bounds as `PK`.
+/// - `PK`: primary key; `FV`: field value. Both must satisfy [`BTreeKey`]
+///   (`Ord + Hash + Debug + Clone + Serialize + DeserializeOwned`).
 ///
 /// # Invariants
 ///
@@ -271,11 +259,7 @@ where
 ///    renumbers buckets densely from `0` and resets it. Durable objects are
 ///    addressed by `(bucket_id, generation)`, so a reused id never collides
 ///    with a retired object.
-pub struct BTreeIndex<PK, FV>
-where
-    PK: Ord + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+pub struct BTreeIndex<PK, FV> {
     /// Index name
     name: String,
 
@@ -306,9 +290,6 @@ where
 
     /// Highest bucket id currently in use (monotonic).
     max_bucket_id: AtomicU32,
-
-    /// Cumulative number of query operations performed.
-    query_count: AtomicU64,
 
     /// Version of the last successfully persisted metadata.
     /// Prevents re-serializing identical metadata.
@@ -385,11 +366,13 @@ pub struct FlushOutcome {
     pub obsolete: Vec<BucketObject>,
 }
 
-/// Posting list for a single field value: `(bucket_id, update_version, doc_ids)`.
+/// Persisted posting for a single field value: `(bucket_id, counter, doc_ids)`.
 ///
-/// - `bucket_id`      — the bucket currently storing this posting.
-/// - `update_version` — monotonic counter bumped on every doc-id add/remove.
-/// - `doc_ids`        — unique list of primary keys. Appends preserve order,
+/// - `bucket_id` — the bucket that stored this posting; the loader uses the
+///   id of the bucket it actually read instead.
+/// - `counter`   — update counter of earlier releases; ignored on load and
+///   written as `0`.
+/// - `doc_ids`   — unique list of primary keys. Appends preserve order,
 ///   but removals use swap-remove, so the remaining ids may be reordered
 ///   after any deletion. Do not rely on insertion order.
 type StoredPosting<PK> = (u32, u64, PostingList<PK>);
@@ -450,6 +433,7 @@ pub struct BTreeMetadata {
 
     /// Bucket manifest: `bucket_id -> generation` of the durable object that
     /// currently holds the bucket's content (`0` = legacy un-suffixed object).
+    /// Buckets without postings are omitted.
     ///
     /// The manifest is the loader's single source of truth: a posting exists
     /// only in the bucket objects it references. The loader separately tracks
@@ -477,7 +461,10 @@ pub struct BTreeStats {
     /// Number of elements in the index
     pub num_elements: u64,
 
-    /// Number of query operations performed
+    /// No longer maintained: always the value loaded from storage (`0` for
+    /// new indexes). Counting every lookup on one shared atomic made
+    /// concurrent reads slower than a single reader. The field stays because
+    /// older releases require it when decoding metadata.
     pub query_count: u64,
 
     /// Number of insert operations performed
@@ -526,17 +513,11 @@ struct BucketPersistenceSnapshot {
     data: Vec<u8>,
 }
 
-// Helper structure for serialization and deserialization of bucket
+// Owned form of a bucket payload, used when loading. `BTreeKey` already
+// supplies the serde bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "PK: Serialize, FV: Serialize",
-    deserialize = "PK: DeserializeOwned, FV: DeserializeOwned"
-))]
-struct BucketOwned<PK, FV>
-where
-    PK: Eq + Ord + Hash + Clone,
-    FV: Eq + Ord + Hash + Clone,
-{
+#[serde(bound = "")]
+struct BucketOwned<PK: BTreeKey, FV: BTreeKey> {
     #[serde(rename = "p")]
     postings: FxHashMap<FV, StoredPosting<PK>>,
 }
@@ -547,11 +528,7 @@ mod mutation;
 mod persistence;
 mod query;
 
-impl<PK, FV> BTreeIndex<PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     /// Marks a bucket as dirty and bumps its `dirty_version`.
     ///
     /// The `dirty_version` counter is sampled while a flush serializes the
@@ -669,10 +646,7 @@ where
             },
             &mut data,
         )
-        .map_err(|err| BTreeError::Serialization {
-            name: self.name.clone(),
-            source: err.into(),
-        })?;
+        .map_err(|err| self.serialization_error(err))?;
         drop(bucket);
 
         Ok(Some(BucketPersistenceSnapshot {
@@ -760,7 +734,6 @@ where
                 buckets: BTreeMap::new(),
             }),
             max_bucket_id: AtomicU32::new(0),
-            query_count: AtomicU64::new(0),
             last_saved_version: AtomicU64::new(0),
             mutation_gate: RwLock::new(()),
             dirty_hint: AtomicBool::new(false),
@@ -774,16 +747,26 @@ where
         self.load_state
     }
 
+    fn generic_error(&self, source: impl Into<BoxError>) -> BTreeError {
+        BTreeError::Generic {
+            name: self.name.clone(),
+            source: source.into(),
+        }
+    }
+
+    fn serialization_error(&self, source: impl Into<BoxError>) -> BTreeError {
+        BTreeError::Serialization {
+            name: self.name.clone(),
+            source: source.into(),
+        }
+    }
+
     fn ensure_ready(&self) -> Result<(), BTreeError> {
         if self.load_state != LoadState::Ready {
-            return Err(BTreeError::Generic {
-                name: self.name.clone(),
-                source: format!(
-                    "index is read-only ({:?}); load all required buckets first",
-                    self.load_state
-                )
-                .into(),
-            });
+            return Err(self.generic_error(format!(
+                "index is read-only ({:?}); load all required buckets first",
+                self.load_state
+            )));
         }
         Ok(())
     }
@@ -813,7 +796,6 @@ where
     pub fn metadata(&self) -> BTreeMetadata {
         let mut metadata = self.metadata.read().clone();
         metadata.stats.num_elements = self.postings.len() as u64;
-        metadata.stats.query_count = self.query_count.load(Ordering::Relaxed);
         metadata.stats.max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
         metadata
     }
@@ -822,7 +804,6 @@ where
     pub fn stats(&self) -> BTreeStats {
         let mut stats = { self.metadata.read().stats.clone() };
         stats.num_elements = self.postings.len() as u64;
-        stats.query_count = self.query_count.load(Ordering::Relaxed);
         stats.max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
         stats
     }
@@ -841,10 +822,7 @@ where
     }
 }
 
-impl<PK> BTreeIndex<PK, String>
-where
-    PK: Ord + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey> BTreeIndex<PK, String> {
     /// Specialized version of prefix query for String type
     /// Searches the index using a prefix.
     ///
@@ -865,7 +843,6 @@ where
     where
         F: FnMut(&str, &Vec<PK>) -> (bool, Option<R>),
     {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
         let mut results = Vec::new();
 
         // 从 prefix 起正序遍历，遇到第一个不以 prefix 开头的键即终止。

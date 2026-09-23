@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils
+## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree
 
 - **Breaking (anda_db_schema):** remove `FieldType::normalize` and
   `FieldType::prune_undeclared`. Nothing called them any more: reading a
@@ -23,6 +23,20 @@ All notable changes to this workspace are documented in this file.
 - Document that large binary fields should use `serde_bytes::ByteBuf` /
   `ByteBufB64`: a `Vec<u8>` serializes one integer per byte and is several
   hundred times slower to store.
+- anda_db_btree: queries no longer bump a shared counter, which made
+  concurrent point lookups slower than a single reader (8 threads: 19.7 →
+  76.6 M ops/s). `BTreeStats::query_count` now keeps its loaded value; the
+  field stays for older readers.
+- anda_db_btree: loading builds the ordered key set once from the loaded
+  postings (1M keys load about 27% faster).
+- anda_db_btree: flush leaves buckets without postings out of the manifest
+  and reports their objects, including empty ones written by earlier
+  releases, as obsolete, so emptied buckets are no longer fetched on every
+  open.
+- anda_db_btree: postings drop an update counter nothing read (8 bytes per
+  key); the persisted triple writes `0` in its place, so the bucket format
+  and older readers are unaffected. New `BTreeKey` trait names the shared
+  `PK`/`FV` bounds.
 
 ## [@ldclabs/kip-do 0.13.2] — 2026-09-22
 

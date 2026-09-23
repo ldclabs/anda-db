@@ -131,6 +131,11 @@ referenced by an upgraded manifest. `load_buckets_partial` explicitly permits
 missing objects for diagnostics and returns their identities. An incomplete,
 failed or cancelled attempt remains `LoadState::Partial`.
 
+The ordered key set is built once, from the loaded postings, after the bucket
+objects have been read. A sorted bulk build replaces per-bucket insertion in
+hash order. It also runs when loading stops on an error, so every loaded
+posting stays reachable by range queries.
+
 Only Ready accepts mutations:
 
 | Operation on a read-only handle | Result |
@@ -147,16 +152,21 @@ explicitly to discard live state.
 ## Persistence
 
 Metadata preserves the `{"metadata": ...}` wrapper. Each bucket contains a
-p map from FV to `(bucket_id, posting_version, [PK...])`. Named runtime types
-do not alter the tuple/array wire representation; CBOR maps may have definite
-or indefinite lengths.
+p map from FV to `(bucket_id, counter, [PK...])`. The loader takes the bucket
+ID from the object it read. The counter is a per-posting update count kept by
+earlier releases; it is written as 0 and ignored on load, so older releases
+still decode new buckets. Named runtime types do not alter the tuple/array wire
+representation; CBOR maps may have definite or indefinite lengths.
 
 Generation 0 addresses legacy unsuffixed objects. The metadata buckets map
 is the authoritative mapping from bucket IDs to object generations.
 
 `flush_owned_with(now_ms, metadata_writer, bucket_writer)`:
 
-1. Captures dirty bucket identities and prepares the manifest.
+1. Captures dirty bucket identities and prepares the manifest. Buckets without
+   postings are left out of the manifest and never written; their previous
+   objects are reported as obsolete. This includes empty objects committed by
+   earlier releases, which drop out at the next flush.
 2. Encodes and writes one bucket at a time without cloning postings or their
    auxiliary membership maps.
 3. Invokes metadata_writer after all required bucket writes succeed.

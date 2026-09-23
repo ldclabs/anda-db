@@ -1,10 +1,6 @@
 use super::*;
 
-impl<PK, FV> BTreeIndex<PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     /// Compacts fragmented buckets by re-binning all field values into fewer, properly-sized
     /// buckets using a best-fit-decreasing bin-packing strategy.
     ///
@@ -87,7 +83,7 @@ where
             .map(|entry| {
                 let posting = entry.value();
                 let size =
-                    posting_entry_size(entry.key(), &(u32::MAX, posting.version, &posting.docs));
+                    posting_entry_size(entry.key(), &stored_posting(u32::MAX, &posting.docs));
                 (entry.key().clone(), size)
             })
             .collect();

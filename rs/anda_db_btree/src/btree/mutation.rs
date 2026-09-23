@@ -1,10 +1,6 @@
 use super::*;
 
-impl<PK, FV> BTreeIndex<PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     // Shared posting primitives: callers keep their own batching/packing
     // strategy, but uniqueness, versions and remove-last semantics agree.
     pub(super) fn append_posting(
@@ -22,7 +18,6 @@ where
             });
         }
         if posting.docs.push(doc_id.clone()) {
-            posting.version += 1;
             Ok(doc_size)
         } else {
             Ok(0)
@@ -37,15 +32,14 @@ where
         let entry_removed = self
             .postings
             .remove_if_mut(&field_value, |_, posting| {
-                let full_size = if posting.docs.len() == 1 {
-                    posting_entry_size(&field_value, &*posting)
-                } else {
-                    0
+                // Size the whole entry only when this removal will empty it.
+                let full_size = match posting.docs.as_slice() {
+                    [only] if only == doc_id => posting_entry_size(&field_value, &*posting),
+                    _ => 0,
                 };
                 if posting.docs.remove(doc_id).is_none() {
                     return false;
                 }
-                posting.version += 1;
                 let empty = posting.docs.is_empty();
                 let size_decrease = if empty {
                     full_size
@@ -99,10 +93,7 @@ where
         // mutated, so a failing `Serialize` impl surfaces as an error instead
         // of a panic (and never leaves a half-applied insert behind).
         let doc_id_size =
-            try_cbor_serialized_size(&doc_id).map_err(|err| BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err,
-            })? + 2;
+            try_cbor_serialized_size(&doc_id).map_err(|err| self.serialization_error(err))? + 2;
 
         // Inserting between load_metadata() and load_buckets() is NOT supported:
         // the load overwrites postings by design (see `load_buckets`).
@@ -126,12 +117,8 @@ where
                 let posting = Posting::new(bucket, doc_id.clone());
                 // Reject an unserializable field value before inserting it:
                 // nothing has been mutated yet, so returning here is clean.
-                size_increase = try_posting_entry_size(&field_value, &posting).map_err(|err| {
-                    BTreeError::Serialization {
-                        name: self.name.clone(),
-                        source: err,
-                    }
-                })?;
+                size_increase = try_posting_entry_size(&field_value, &posting)
+                    .map_err(|err| self.serialization_error(err))?;
                 entry.insert(posting);
                 is_new = true;
             }
@@ -202,7 +189,6 @@ where
                             previous_posting_size_after_append(
                                 &field_value,
                                 target_bucket,
-                                posting.version,
                                 &posting.docs,
                             )
                         } else {
@@ -344,10 +330,7 @@ where
         // Validate `doc_id` serialization up-front, before any state is
         // mutated (see `insert`).
         let doc_id_size =
-            try_cbor_serialized_size(&doc_id).map_err(|err| BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err,
-            })? + 2;
+            try_cbor_serialized_size(&doc_id).map_err(|err| self.serialization_error(err))? + 2;
 
         // Track which values were successfully inserted
         let mut inserted_count = 0;
@@ -410,10 +393,7 @@ where
                     match try_posting_entry_size(&field_value, &posting) {
                         Ok(size) => size_increase = size,
                         Err(err) => {
-                            deferred_error = Some(BTreeError::Serialization {
-                                name: self.name.clone(),
-                                source: err,
-                            });
+                            deferred_error = Some(self.serialization_error(err));
                             break;
                         }
                     }

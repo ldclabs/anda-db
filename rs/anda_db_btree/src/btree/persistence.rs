@@ -1,10 +1,6 @@
 use super::*;
 
-impl<PK, FV> BTreeIndex<PK, FV>
-where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-{
+impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     /// Loads an index from metadata reader and a closure for loading buckets.
     ///
     /// # Arguments
@@ -54,7 +50,6 @@ where
 
         // Extract configuration values
         let max_bucket_id = AtomicU32::new(metadata.stats.max_bucket_id);
-        let query_count = AtomicU64::new(metadata.stats.query_count);
         let last_saved_version = AtomicU64::new(metadata.stats.version);
 
         // `num_elements` comes from untrusted storage; cap the pre-allocation
@@ -63,25 +58,15 @@ where
         const MAX_PREALLOCATED_CAPACITY: u64 = 1 << 16;
         let capacity = metadata.stats.num_elements.min(MAX_PREALLOCATED_CAPACITY) as usize;
 
-        // Register every bucket the manifest references up front, as an
-        // empty placeholder that `load_buckets` fills in. A flush rebuilds
-        // the manifest from this map, so a committed object whose bucket was
-        // skipped while loading is carried forward instead of being retired.
-        let buckets: DashMap<u32, BucketState<FV>> = metadata
-            .buckets
-            .keys()
-            .map(|bucket_id| (*bucket_id, BucketState::default()))
-            .collect();
-        buckets.entry(0).or_default();
-
+        // Buckets are registered by `load_buckets`; until then the index
+        // refuses mutations, flushes and compaction.
         Ok(BTreeIndex {
             name: metadata.name.clone(),
             config: metadata.config.clone(),
             postings: DashMap::with_capacity(capacity),
-            buckets,
+            buckets: DashMap::from_iter([(0, BucketState::default())]),
             btree: RwLock::new(BTreeSet::new()),
             metadata: RwLock::new(metadata),
-            query_count,
             max_bucket_id,
             last_saved_version,
             mutation_gate: RwLock::new(()),
@@ -124,10 +109,9 @@ where
         F: AsyncFnMut(BucketObject) -> Result<Option<Vec<u8>>, BoxError>,
     {
         if self.load_state == LoadState::Ready {
-            return Err(BTreeError::Generic {
-                name: self.name.clone(),
-                source: "buckets are already loaded; reopen to discard live state".into(),
-            });
+            return Err(
+                self.generic_error("buckets are already loaded; reopen to discard live state")
+            );
         }
         self.load_state = LoadState::Partial;
         self.postings.clear();
@@ -143,14 +127,10 @@ where
         let objects: Vec<BucketObject> = if legacy {
             let max_bucket_id = self.max_bucket_id.load(Ordering::Relaxed);
             if max_bucket_id > MAX_LEGACY_BUCKET_ID {
-                return Err(BTreeError::Generic {
-                    name: self.name.clone(),
-                    source: format!(
-                        "legacy metadata max_bucket_id {max_bucket_id} exceeds the supported \
+                return Err(self.generic_error(format!(
+                    "legacy metadata max_bucket_id {max_bucket_id} exceeds the supported \
                          scan range {MAX_LEGACY_BUCKET_ID}; the metadata is corrupted"
-                    )
-                    .into(),
-                });
+                )));
             }
             (0..=max_bucket_id)
                 .map(|bucket_id| BucketObject {
@@ -169,97 +149,95 @@ where
         };
 
         let mut loaded_bucket_ids: Vec<u32> = Vec::new();
-        for object in objects {
-            let i = object.bucket_id;
-            let data = f(object).await.map_err(|err| BTreeError::Generic {
-                name: self.name.clone(),
-                source: err,
-            })?;
-            let Some(data) = data else {
-                if !legacy {
-                    if !allow_partial {
-                        return Err(BTreeError::Generic {
-                            name: self.name.clone(),
-                            source: format!(
-                                "bucket object ({}, {}) referenced by the manifest is missing",
-                                i, object.generation
-                            )
-                            .into(),
-                        });
-                    }
-                    log::warn!(
-                        "BTreeIndex '{}': bucket object ({}, {}) referenced by the manifest is missing; index is read-only",
-                        self.name,
-                        i,
-                        object.generation
-                    );
-                    missing.push(object);
-                }
-                continue;
-            };
-
-            loaded_bucket_ids.push(i);
-            let bucket: BucketOwned<PK, FV> =
-                cbor2::from_reader(&data[..]).map_err(|err| BTreeError::Serialization {
-                    name: self.name.clone(),
-                    source: err.into(),
-                })?;
-            let mut bks =
-                FxHashSet::with_capacity_and_hasher(bucket.postings.len(), Default::default());
-            let mut loaded_keys = Vec::with_capacity(bucket.postings.len());
-            // Set when this bucket file contains stale entries (an empty
-            // posting persisted by a pre-manifest release); the bucket is
-            // loaded as dirty so the next flush rewrites the file without
-            // them.
-            let mut needs_repair = false;
-
-            // Higher bucket ids are the newer state when a migrated posting
-            // appears in more than one bucket. Reconcile the old in-memory
-            // bucket ownership and mark it dirty so the stale lower bucket
-            // is repaired on the next flush.
-            for (field_value, stored) in bucket.postings {
-                let mut posting = Posting::from(stored);
-                // Only pre-manifest flushes could persist an empty posting
-                // (they sampled a bucket between "posting emptied by
-                // remove()" and "posting entry removed"); the manifest flush
-                // filters empty postings out. Registering one would create a
-                // "ghost" key visible to `keys()`, range queries and `len()`
-                // with no backing documents. Treat it as a tombstone instead:
-                // skip it, drop any stale copy already loaded from an older
-                // bucket, and mark the affected buckets dirty to self-heal on
-                // the next flush.
-                if posting.docs.is_empty() {
-                    needs_repair = true;
-                    if let Some((_, previous)) = self.postings.remove(&field_value) {
-                        self.detach_superseded_posting(&field_value, &previous, i);
-                        self.btree.write().remove(&field_value);
+        let loaded = async {
+            for object in objects {
+                let i = object.bucket_id;
+                let data = f(object).await.map_err(|err| self.generic_error(err))?;
+                let Some(data) = data else {
+                    if !legacy {
+                        if !allow_partial {
+                            return Err(self.generic_error(format!(
+                                "bucket object ({i}, {}) referenced by the manifest is missing",
+                                object.generation
+                            )));
+                        }
+                        log::warn!(
+                            "BTreeIndex '{}': bucket object ({}, {}) referenced by the manifest is missing; index is read-only",
+                            self.name,
+                            i,
+                            object.generation
+                        );
+                        missing.push(object);
                     }
                     continue;
+                };
+
+                loaded_bucket_ids.push(i);
+                let bucket: BucketOwned<PK, FV> =
+                    cbor2::from_reader(&data[..]).map_err(|err| self.serialization_error(err))?;
+                let mut bks =
+                    FxHashSet::with_capacity_and_hasher(bucket.postings.len(), Default::default());
+                // Set when this bucket file contains stale entries (an empty
+                // posting persisted by a pre-manifest release); the bucket is
+                // loaded as dirty so the next flush rewrites the file without
+                // them.
+                let mut needs_repair = false;
+
+                // Higher bucket ids are the newer state when a migrated posting
+                // appears in more than one bucket. Reconcile the old in-memory
+                // bucket ownership and mark it dirty so the stale lower bucket
+                // is repaired on the next flush.
+                for (field_value, stored) in bucket.postings {
+                    let mut posting = Posting::from(stored);
+                    // Only pre-manifest flushes could persist an empty posting
+                    // (they sampled a bucket between "posting emptied by
+                    // remove()" and "posting entry removed"); the manifest flush
+                    // filters empty postings out. Registering one would create a
+                    // "ghost" key visible to `keys()`, range queries and `len()`
+                    // with no backing documents. Treat it as a tombstone instead:
+                    // skip it, drop any stale copy already loaded from an older
+                    // bucket, and mark the affected buckets dirty to self-heal on
+                    // the next flush.
+                    if posting.docs.is_empty() {
+                        needs_repair = true;
+                        if let Some((_, previous)) = self.postings.remove(&field_value) {
+                            self.detach_superseded_posting(&field_value, &previous, i);
+                        }
+                        continue;
+                    }
+
+                    posting.bucket_id = i;
+                    if let Some(previous) = self.postings.insert(field_value.clone(), posting) {
+                        self.detach_superseded_posting(&field_value, &previous, i);
+                    }
+
+                    bks.insert(field_value);
                 }
 
-                posting.bucket_id = i;
-                if let Some(previous) = self.postings.insert(field_value.clone(), posting) {
-                    self.detach_superseded_posting(&field_value, &previous, i);
+                if needs_repair {
+                    self.dirty_hint.store(true, Ordering::Release);
                 }
-
-                bks.insert(field_value.clone());
-                loaded_keys.push(field_value);
+                // `data.len()` (the on-disk payload length) seeds the bucket
+                // size here, while runtime mutations apply estimated deltas
+                // (`posting_entry_size` + fudge). The two baselines can drift
+                // slightly; the size is only used for packing decisions and
+                // is always combined with saturating arithmetic.
+                self.buckets.insert(
+                    i,
+                    BucketState::new(data.len(), needs_repair, bks, u64::from(needs_repair)),
+                );
             }
-
-            self.btree.write().extend(loaded_keys);
-            if needs_repair {
-                self.dirty_hint.store(true, Ordering::Release);
-            }
-            // `data.len()` (the on-disk payload length) seeds the bucket
-            // size here, while runtime mutations apply estimated deltas
-            // (`posting_entry_size` + fudge). The two baselines can drift
-            // slightly; the size is only used for packing decisions and
-            // is always combined with saturating arithmetic.
-            self.buckets.insert(
-                i,
-                BucketState::new(data.len(), needs_repair, bks, u64::from(needs_repair)),
-            );
+            Ok::<(), BTreeError>(())
         }
+        .await;
+        // Build the ordered key set once from the surviving postings: a sorted
+        // bulk build is far cheaper than inserting each bucket's keys in hash
+        // order, and superseded or tombstoned keys are already gone. It also
+        // runs when loading stopped early, so a failed load still keeps every
+        // posting reachable by range queries.
+        *self.btree.get_mut() = self.postings.iter().map(|e| e.key().clone()).collect();
+        loaded?;
+
         if missing.is_empty() {
             self.load_state = LoadState::Ready;
         }
@@ -344,17 +322,19 @@ where
     /// Every dirty bucket is serialized and written to a **fresh** object
     /// keyed by `(bucket_id, generation)` — the generation is this flush's
     /// metadata version, so a bucket object is never mutated in place once a
-    /// committed manifest references it. The metadata (carrying the manifest
-    /// `bucket_id -> generation`) is written last; that single write is the
-    /// atomic commit point:
+    /// committed manifest references it. Buckets without postings are not
+    /// written and drop out of the manifest. The metadata (carrying the
+    /// manifest `bucket_id -> generation`) is written last; that single
+    /// write is the atomic commit point:
     ///
     /// * A crash or error **before** the metadata commit leaves the new
     ///   bucket objects as unreferenced garbage. A loader still sees the
     ///   previous manifest — a complete snapshot. A retry without another
     ///   mutation can reuse the same generation and bucket content.
     /// * **After** the commit, the objects replaced by this flush are
-    ///   garbage. They are returned as [`FlushOutcome::obsolete`] for the
-    ///   caller to delete best-effort; a failed deletion only leaks space.
+    ///   garbage, and so are the objects of buckets that became empty. They
+    ///   are returned as [`FlushOutcome::obsolete`] for the caller to delete
+    ///   best-effort; a failed deletion only leaks space.
     ///
     /// [`compact_buckets`](Self::compact_buckets) needs no special write
     /// ordering under this protocol: the repacked layout becomes visible
@@ -446,12 +426,18 @@ where
         let generation = meta.stats.version;
 
         // Build the new manifest: dirty buckets move to this generation,
-        // clean buckets keep their committed object. In-memory buckets that
-        // were never persisted (e.g. the empty initial bucket) stay out.
+        // clean buckets keep their committed object. Buckets holding no
+        // posting stay out — the never-persisted initial bucket as well as
+        // buckets emptied by removals — so their previous objects are retired
+        // instead of being rewritten as empty payloads and fetched on every
+        // open until an explicit compaction.
         let committed = std::mem::take(&mut meta.buckets);
         let dirty_ids: FxHashSet<u32> = dirty.iter().copied().collect();
         for entry in self.buckets.iter() {
             let id = *entry.key();
+            if entry.fields.is_empty() {
+                continue;
+            }
             if dirty_ids.contains(&id) {
                 meta.buckets.insert(id, generation);
             } else if let Some(committed_generation) = committed.get(&id) {
@@ -460,12 +446,8 @@ where
         }
 
         let mut meta_buf = Vec::with_capacity(256);
-        cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut meta_buf).map_err(|err| {
-            BTreeError::Serialization {
-                name: self.name.clone(),
-                source: err.into(),
-            }
-        })?;
+        cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut meta_buf)
+            .map_err(|err| self.serialization_error(err))?;
 
         // Objects the previous manifest referenced that the new one replaces
         // or drops (bucket rewrites, compaction leftovers, legacy objects).
@@ -483,12 +465,16 @@ where
         // previous durable snapshot fully intact.
         let mut saved_marks = Vec::with_capacity(dirty.len());
         for bucket_id in dirty {
-            let snapshot =
-                self.serialize_bucket_snapshot(bucket_id)?
-                    .ok_or_else(|| BTreeError::Generic {
-                        name: self.name.clone(),
-                        source: "bucket changed during flush; exclude concurrent mutations".into(),
-                    })?;
+            if !meta.buckets.contains_key(&bucket_id) {
+                // Emptied bucket: nothing to write, only the dirty mark to clear.
+                if let Some(bucket) = self.buckets.get(&bucket_id) {
+                    saved_marks.push((bucket_id, bucket.dirty_version));
+                }
+                continue;
+            }
+            let snapshot = self.serialize_bucket_snapshot(bucket_id)?.ok_or_else(|| {
+                self.generic_error("bucket changed during flush; exclude concurrent mutations")
+            })?;
             saved_marks.push((snapshot.bucket_id, snapshot.dirty_version));
             bucket_writer(
                 BucketObject {
@@ -498,19 +484,13 @@ where
                 snapshot.data,
             )
             .await
-            .map_err(|source| BTreeError::Generic {
-                name: self.name.clone(),
-                source,
-            })?;
+            .map_err(|source| self.generic_error(source))?;
         }
 
         // Phase 2: the manifest commit — the single atomic point.
         metadata_writer(meta_buf)
             .await
-            .map_err(|source| BTreeError::Generic {
-                name: self.name.clone(),
-                source,
-            })?;
+            .map_err(|source| self.generic_error(source))?;
 
         // Publish the committed state in memory.
         self.last_saved_version

@@ -48,8 +48,8 @@ async fn flush_to<PK, FV>(
     now_ms: u64,
 ) -> FlushOutcome
 where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
+    PK: BTreeKey,
+    FV: BTreeKey,
 {
     let mut meta_buf: Vec<u8> = Vec::new();
     let buckets = &mut store.buckets;
@@ -79,8 +79,8 @@ where
 /// Loads a complete index from `store`.
 async fn load_from<PK, FV>(store: &MemStore) -> BTreeIndex<PK, FV>
 where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
+    PK: BTreeKey,
+    FV: BTreeKey,
 {
     BTreeIndex::load_all(&store.metadata[..], async |object| {
         Ok(store.buckets.get(&object).cloned())
@@ -205,8 +205,8 @@ fn install_capture_logger() {
 /// (stale listings of removed postings are tolerated drift).
 fn assert_bucket_ownership<PK, FV>(index: &BTreeIndex<PK, FV>)
 where
-    PK: Ord + Eq + Hash + Debug + Clone + Serialize + DeserializeOwned,
-    FV: Eq + Ord + Hash + Debug + Clone + Serialize + DeserializeOwned,
+    PK: BTreeKey,
+    FV: BTreeKey,
 {
     for entry in index.postings.iter() {
         let bucket_id = entry.value().bucket_id;
@@ -2448,9 +2448,9 @@ fn test_stats() {
     let _ = index.query_with(&"apple".to_string(), |_| Some(()));
     let _: Vec<()> = index.range_query_with(RangeQuery::Ge("a".to_string()), |_, _| (true, vec![]));
 
-    // 检查搜索后的统计信息
+    // 查询不再计数：共享原子计数器会让并发读互相争抢缓存行
     let stats = index.stats();
-    assert_eq!(stats.query_count, 2);
+    assert_eq!(stats.query_count, 0);
 
     // 删除一些数据
     let _ = index.remove(1, "apple".to_string(), now_ms());
@@ -3283,7 +3283,6 @@ async fn test_flush_filters_transiently_empty_posting() {
     {
         let mut posting = index.postings.get_mut(&"a".to_string()).unwrap();
         posting.docs.swap_remove_if(|id| *id == 1);
-        posting.version += 1;
     }
 
     let mut written: HashMap<u32, Vec<u8>> = Default::default();
@@ -3912,4 +3911,164 @@ fn explicit_null_manifest_is_not_legacy_metadata() {
     let mut bytes = Vec::new();
     cbor2::to_writer(&serde_json::json!({"metadata":metadata}), &mut bytes).unwrap();
     assert!(BTreeIndex::<u64, String>::load_metadata(&bytes[..]).is_err());
+}
+
+fn small_u64_index(name: &str) -> BTreeIndex<u64, u64> {
+    let config = BTreeConfig {
+        bucket_overload_size: 256,
+        allow_duplicates: true,
+    };
+    BTreeIndex::new(name.to_string(), Some(config))
+}
+
+#[tokio::test]
+async fn flush_drops_emptied_buckets_from_the_manifest() {
+    let index = small_u64_index("retention");
+    for i in 0..200u64 {
+        index.insert(i, i, 1).unwrap();
+    }
+    let mut store = MemStore::default();
+    flush_to(&index, &mut store, 1).await;
+    let before = index.metadata().buckets.len();
+    assert!(before > 4, "fixture needs several buckets, got {before}");
+
+    // Retire the oldest keys: the buckets that held them empty out entirely.
+    for i in 0..190u64 {
+        assert!(index.remove(i, i, 2));
+    }
+    let outcome = flush_to(&index, &mut store, 2).await;
+    let manifest = index.metadata().buckets;
+    assert!(manifest.len() < before);
+    assert_eq!(
+        outcome.obsolete.len(),
+        before,
+        "every old object was replaced or retired"
+    );
+    assert_eq!(
+        store.buckets.len(),
+        manifest.len(),
+        "no empty object was written"
+    );
+    for (bucket_id, generation) in &manifest {
+        let object = BucketObject {
+            bucket_id: *bucket_id,
+            generation: *generation,
+        };
+        let bucket: BucketOwned<u64, u64> =
+            cbor2::from_reader(&store.buckets[&object][..]).unwrap();
+        assert!(!bucket.postings.is_empty(), "{object:?} is empty");
+    }
+    let reloaded: BTreeIndex<u64, u64> = load_from(&store).await;
+    assert_eq!(reloaded.keys(None, None), (190..200).collect::<Vec<_>>());
+
+    // Emptying the index leaves a modern empty manifest that reloads cleanly.
+    for i in 190..200u64 {
+        assert!(index.remove(i, i, 3));
+    }
+    assert!(flush_to(&index, &mut store, 3).await.saved);
+    assert!(index.metadata().buckets.is_empty());
+    assert!(store.buckets.is_empty());
+    let reloaded: BTreeIndex<u64, u64> = load_from(&store).await;
+    assert!(reloaded.is_empty());
+    assert_eq!(reloaded.load_state(), LoadState::Ready);
+    assert!(reloaded.insert(1, 1, 4).unwrap());
+    assert!(flush_to(&reloaded, &mut store, 4).await.saved);
+    let reloaded: BTreeIndex<u64, u64> = load_from(&store).await;
+    assert_eq!(reloaded.keys(None, None), vec![1]);
+}
+
+#[tokio::test]
+async fn empty_bucket_objects_left_by_older_releases_are_retired() {
+    let index = small_u64_index("stale_empty");
+    for i in 0..100u64 {
+        index.insert(i, i, 1).unwrap();
+    }
+    let mut store = MemStore::default();
+    flush_to(&index, &mut store, 1).await;
+    assert!(index.metadata().buckets.len() > 1);
+
+    // Older releases rewrote an emptied bucket as an empty payload and kept
+    // referencing it from the manifest.
+    let object = *store.buckets.keys().find(|o| o.bucket_id == 0).unwrap();
+    let emptied = index.buckets.get(&0).unwrap().fields.len();
+    let mut empty = Vec::new();
+    cbor2::to_writer(
+        &BucketOwned::<u64, u64> {
+            postings: FxHashMap::default(),
+        },
+        &mut empty,
+    )
+    .unwrap();
+    store.buckets.insert(object, empty);
+
+    let loaded: BTreeIndex<u64, u64> = load_from(&store).await;
+    assert_eq!(loaded.len(), 100 - emptied);
+    assert!(loaded.metadata().buckets.contains_key(&0));
+
+    assert!(loaded.insert(1_000, 1_000, 2).unwrap());
+    let outcome = flush_to(&loaded, &mut store, 2).await;
+    assert!(outcome.obsolete.contains(&object));
+    assert!(!loaded.metadata().buckets.contains_key(&0));
+    assert!(!store.buckets.contains_key(&object));
+    let reloaded: BTreeIndex<u64, u64> = load_from(&store).await;
+    assert_eq!(reloaded.keys(None, None), loaded.keys(None, None));
+}
+
+#[tokio::test]
+async fn failed_bucket_load_keeps_loaded_postings_range_queryable() {
+    let index = small_u64_index("interrupted");
+    for i in 0..100u64 {
+        index.insert(i, i, 1).unwrap();
+    }
+    let mut store = MemStore::default();
+    flush_to(&index, &mut store, 1).await;
+    let manifest = index.metadata().buckets;
+    assert!(manifest.len() > 2);
+    let (&bucket_id, &generation) = manifest.iter().nth(1).unwrap();
+    let unavailable = BucketObject {
+        bucket_id,
+        generation,
+    };
+
+    let mut loaded = BTreeIndex::<u64, u64>::load_metadata(&store.metadata[..]).unwrap();
+    let result = loaded
+        .load_buckets(async |object| {
+            if object == unavailable {
+                Err::<Option<Vec<u8>>, _>("bucket store unavailable".into())
+            } else {
+                Ok(store.buckets.get(&object).cloned())
+            }
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(loaded.load_state(), LoadState::Partial);
+    assert!(!loaded.is_empty());
+    assert_eq!(
+        loaded.keys(None, None).len(),
+        loaded.len(),
+        "every loaded posting keeps its ordered key"
+    );
+
+    loaded
+        .load_buckets(async |object| Ok(store.buckets.get(&object).cloned()))
+        .await
+        .unwrap();
+    assert_eq!(loaded.keys(None, None), (0..100).collect::<Vec<_>>());
+}
+
+#[test]
+fn postings_do_not_keep_the_legacy_update_counter() {
+    // Bucket id plus alignment padding, then the id list: no counter field.
+    assert_eq!(
+        std::mem::size_of::<Posting<u64>>(),
+        8 + std::mem::size_of::<PostingList<u64>>()
+    );
+    // Older releases persisted a real counter; it is ignored on load and
+    // written back as a constant, keeping the triple decodable by them.
+    let stored: StoredPosting<u64> = (7, 42, PostingList::from(vec![1, 2]));
+    let posting = Posting::from(stored);
+    let mut bytes = Vec::new();
+    cbor2::to_writer(&posting, &mut bytes).unwrap();
+    let decoded: (u32, u64, Vec<u64>) = cbor2::from_reader(&bytes[..]).unwrap();
+    assert_eq!(decoded, (7, 0, vec![1, 2]));
 }
