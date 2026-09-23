@@ -45,7 +45,7 @@ pub struct Capsule {
     pub version: String,
     /// Everything the Capsule carries.
     pub payload: CapsulePayload,
-    /// The digest and proofs over [`Capsule::payload`].
+    /// The digest and proofs over format, format_version and payload.
     pub integrity: CapsuleIntegrity,
 }
 
@@ -121,6 +121,9 @@ pub struct CapsulePayload {
     /// The cognitive records themselves.
     #[serde(default)]
     pub records: CapsuleRecords,
+    /// Ordered delta Change Envelopes; absence and an empty delta stay distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<Json>>,
     /// Dependencies deliberately left out, named rather than dangling (§40.1).
     #[serde(default)]
     pub external_refs: Vec<ExternalRef>,
@@ -217,40 +220,32 @@ pub struct SchemaDependency {
     pub digest: Option<String>,
 }
 
-/// The cognitive records a Capsule carries, grouped by Core kind.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-#[serde(try_from = "Vec<Json>", into = "Vec<Json>")]
-pub struct CapsuleRecords {
-    /// Concept records.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub concepts: Vec<Json>,
-    /// Proposition records.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub propositions: Vec<Json>,
-    /// Assertion records.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assertions: Vec<Json>,
-    /// Evidence records.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<Json>,
-    /// Activity records.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activities: Vec<Json>,
-}
+/// Cognitive records in their original wire order. Array order participates
+/// in the content digest; kind-specific access must not rearrange the payload.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct CapsuleRecords(pub Vec<Json>);
 
 impl CapsuleRecords {
-    /// The total number of records carried.
     pub fn len(&self) -> usize {
-        self.concepts.len()
-            + self.propositions.len()
-            + self.assertions.len()
-            + self.evidence.len()
-            + self.activities.len()
+        self.0.len()
     }
 
-    /// Whether the Capsule carries no records at all.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
+    }
+
+    /// Borrow records of one kind without changing their stored order.
+    pub fn by_kind(&self, kind: crate::ElementKind) -> impl Iterator<Item = &Json> {
+        self.0
+            .iter()
+            .filter(move |record| record["kind"] == kind.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CapsuleRecords {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        Self::try_from(Vec::<Json>::deserialize(decoder)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -319,15 +314,10 @@ pub struct BlobRef {
 /// A request, not an enforcement mechanism: the destination applies its own
 /// trust, classification, authority, Schema and Governance policy (§39.5).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(transparent)]
 pub struct CapsuleHandling {
-    #[serde(flatten)]
+    /// Source-defined handling data, including explicit nulls and empty lists.
     pub extra: Map<String, Json>,
-    /// How the source classified this content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_classification: Option<String>,
-    /// Handling requirements the source asks for.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requirements: Vec<Json>,
 }
 
 /// The digest and proofs over a Capsule payload (Spec §37.6).
@@ -337,27 +327,16 @@ pub struct CapsuleIntegrity {
     pub digest_profile: String,
     /// The canonical content digest, e.g. `sha256:...`.
     pub content_digest: String,
+    /// The declared signature scope, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers: Option<String>,
     /// Signatures and other proofs over that digest.
     #[serde(default, rename = "signatures")]
     pub proofs: Vec<CapsuleProof>,
 }
 
-/// One proof over a Capsule's content digest (Spec §37.8).
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct CapsuleProof {
-    /// The proof kind, e.g. `signature`.
-    #[serde(rename = "type")]
-    pub proof_type: String,
-    /// The cryptographic suite used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suite: Option<String>,
-    /// How to obtain the verification key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_method: Option<String>,
-    /// The proof value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-}
+/// A proof object whose members are defined by its cryptographic suite.
+pub type CapsuleProof = Map<String, Json>;
 
 /// How a Capsule is brought into a destination Space (Spec §39).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -517,7 +496,7 @@ fn utf16_units(text: &str) -> Vec<u16> {
 impl Capsule {
     /// The canonical bytes this Capsule's `integrity.content_digest` covers.
     ///
-    /// The digest is taken over the **payload**, not over the whole artifact:
+    /// The digest covers format, format_version and payload, excluding integrity:
     /// a signature must not cover itself, and adding a countersignature must
     /// not invalidate the digest the first signer attested to (§37.8).
     ///
@@ -579,31 +558,21 @@ impl TryFrom<Json> for SchemaDependency {
 }
 impl From<CapsuleRecords> for Vec<Json> {
     fn from(value: CapsuleRecords) -> Self {
-        value
-            .concepts
-            .into_iter()
-            .chain(value.propositions)
-            .chain(value.assertions)
-            .chain(value.evidence)
-            .chain(value.activities)
-            .collect()
+        value.0
     }
 }
 impl TryFrom<Vec<Json>> for CapsuleRecords {
     type Error = String;
     fn try_from(values: Vec<Json>) -> Result<Self, Self::Error> {
-        let mut out = Self::default();
-        for value in values {
-            match value["kind"].as_str() {
-                Some("concept") => out.concepts.push(value),
-                Some("proposition") => out.propositions.push(value),
-                Some("assertion") => out.assertions.push(value),
-                Some("evidence") => out.evidence.push(value),
-                Some("activity") => out.activities.push(value),
-                _ => return Err("Capsule record needs a Core kind".into()),
-            }
+        if values.iter().any(|value| {
+            value["kind"]
+                .as_str()
+                .and_then(crate::ElementKind::from_wire)
+                .is_none()
+        }) {
+            return Err("Capsule record needs a Core kind".into());
         }
-        Ok(out)
+        Ok(Self(values))
     }
 }
 
@@ -632,18 +601,16 @@ mod tests {
                     version: "2.0.0".into(),
                     digest: Some("sha256:abc".into()),
                 }],
-                records: CapsuleRecords {
-                    concepts: vec![
-                        serde_json::json!({"id": "c:1", "kind": "concept", "name": "Alice"}),
-                    ],
-                    ..Default::default()
-                },
+                records: CapsuleRecords(vec![
+                    serde_json::json!({"id": "c:1", "kind": "concept", "name": "Alice"}),
+                ]),
                 ..Default::default()
             },
             CapsuleIntegrity {
                 digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: "sha256:abc".into(),
                 proofs: vec![],
+                covers: None,
             },
         )
     }
@@ -704,16 +671,16 @@ mod tests {
         // invalidate what the first signer attested to.
         let mut capsule = snapshot();
         let before = capsule.canonical_payload();
-        capsule.integrity.proofs.push(CapsuleProof {
-            proof_type: "signature".into(),
-            suite: None,
-            verification_method: None,
-            signature: Some("sig".into()),
-        });
+        capsule.integrity.proofs.push(
+            serde_json::json!({"type":"signature","signature":"sig"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
         assert_eq!(capsule.canonical_payload(), before);
 
         // But changing what it carries does change it.
-        capsule.payload.records.concepts.push(serde_json::json!({}));
+        capsule.payload.records.0.push(serde_json::json!({}));
         assert_ne!(capsule.canonical_payload(), before);
     }
 

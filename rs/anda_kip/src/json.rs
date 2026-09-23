@@ -8,6 +8,26 @@ use std::fmt;
 
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// Unlike serde's default `Option`, a present JSON null remains `Some(Null)`.
+pub(crate) fn deserialize_present_json<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Json>, D::Error> {
+    Json::deserialize(decoder).map(Some)
+}
+
+pub(crate) fn validate_number(number: &Number) -> Result<(), KipError> {
+    let valid = number.as_f64().is_some_and(|value| {
+        value.is_finite() && (value.fract() != 0.0 || value.abs() <= MAX_SAFE_INTEGER as f64)
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(KipError::invalid_request_envelope(
+            "KIP numbers must be finite binary64 with safe integral values",
+        ))
+    }
+}
+
 /// Validate the source token before serde or an adapter discards its digits.
 pub fn portable_number(source: &str) -> Result<Number, String> {
     serde_json::from_str::<Number>(source).map_err(|_| "invalid JSON number syntax".to_string())?;
@@ -43,7 +63,7 @@ pub fn validate_json(value: &Json) -> Result<(), KipError> {
         }
         match value {
             Json::Number(n) => {
-                portable_number(&n.to_string()).map_err(KipError::invalid_request_envelope)?;
+                validate_number(n)?;
             }
             Json::Array(items) => {
                 for item in items {

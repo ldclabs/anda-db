@@ -28,6 +28,7 @@ mod json;
 mod kml;
 mod kql;
 mod meta;
+mod validation;
 
 /// Maximum accepted length (in bytes) of a single KIP command string.
 ///
@@ -84,7 +85,7 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
             )),
         ),
     )?;
-    validate_command(&command)?;
+    validate_shape(&command)?;
     Ok(command)
 }
 
@@ -125,6 +126,10 @@ pub(crate) fn validate_command(command: &Command) -> Result<(), KipError> {
     crate::validate_json(
         &serde_json::to_value(command).map_err(|e| KipError::invalid_syntax(e.to_string()))?,
     )?;
+    validate_shape(command)
+}
+
+fn validate_shape(command: &Command) -> Result<(), KipError> {
     match command {
         Command::Kql(query) => validate_query(query),
         Command::Kml(statement) => validate_statement(statement),
@@ -138,12 +143,7 @@ pub(crate) fn validate_command(command: &Command) -> Result<(), KipError> {
 /// empty projection list — and a query with no column to name is not a
 /// narrower query, it is a query with no answer shape at all.
 fn validate_query(query: &KqlQuery) -> Result<(), KipError> {
-    if query.find_clause.expressions.is_empty() {
-        return Err(KipError::invalid_syntax(
-            "FIND needs at least one projection: a query with no projected column has no result \
-             shape",
-        ));
-    }
+    validation::query(query)?;
     crate::semantics::check_kql(query)
 }
 
@@ -155,15 +155,7 @@ fn validate_statement(statement: &KmlStatement) -> Result<(), KipError> {
 
 /// Every schema-independent rule a META command must satisfy.
 fn validate_meta_command(meta: &MetaCommand) -> Result<(), KipError> {
-    if let MetaCommand::ExportCapsule(export) = meta {
-        if export.where_clauses.is_empty() {
-            return Err(KipError::invalid_syntax(
-                "EXPORT CAPSULE needs at least one selection pattern: an unbounded EXPORT is \
-                 not a Capsule",
-            ));
-        }
-        kml::validate_exact_patterns(&export.where_clauses)?;
-    }
+    validation::meta(meta)?;
     crate::semantics::check_meta(meta)
 }
 

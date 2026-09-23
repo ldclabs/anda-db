@@ -60,3 +60,12 @@ it('shares the tuple created by repeated ASSERT clauses in the same transaction'
     expect(nexus.query('FIND(COUNT(?a)) WHERE { ?a ASSERTION {} }')).toEqual([2])
   })
 })
+
+it('preserves explicit null and empty payload values through ingestion and reads', async () => {
+  for (const [index, payload] of [null, {}, [], ''].entries()) {
+    await withNexus(`empty-payload-${index}`, nexus => {
+      mint(nexus, [{...original, payload}])
+      expect(nexus.query('FIND(?e.payload) WHERE { ?e EVIDENCE {} }')).toEqual([{mode:'inline', inline:payload}])
+    })
+  }
+})

@@ -536,8 +536,7 @@ async fn an_imported_tuple_binds_the_proposition_the_destination_already_has() {
     let canonical = capsule
         .payload
         .records
-        .concepts
-        .iter()
+        .by_kind(anda_kip::ElementKind::Concept)
         .find(|c| c["name"] == "Alice")
         .cloned()
         .unwrap();

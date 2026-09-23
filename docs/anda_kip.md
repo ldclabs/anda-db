@@ -587,6 +587,32 @@ Helpers:
 
 ---
 
+### SDK admission and wire values
+
+Text and transported ASTs share shape checks for query subjects, predicate
+paths, META operands, exact mutation/export patterns, and duplicate bound
+object keys. Mutation handles must resolve to an output of the same plan or
+the clause's own WHERE; variables introduced inside NOT remain local. Assertion
+registries do not constrain fields inside package-defined attributes or Facets.
+
+Use `Request::from_json` at raw transport boundaries to reject duplicate keys
+and lossy numeric tokens. `Request::parse_operations` and `execute_request`
+reuse one set of parsed operations, including requests with ingestion. Explicit
+`payload: null` and `result: null` remain present values. Extensions must be
+objects with a boolean `critical` member when supplied.
+
+The batch helpers return each independent/sequence transaction's receipt in
+`results[i].receipt`. The top-level receipt is reserved for atomic execution,
+which these helpers do not implement. Clients recovering an unknown outcome
+must inspect the correlated operation, not the most recent unrelated commit.
+
+Core element types preserve Concept structural/merge fields and purged Evidence
+payloads. Lifecycle reference arrays use `Vec<Json>` to retain both portable
+`{id}` objects and existing native-view id strings. This is a decoding model;
+the vendored schemas remain the portable artifact validation contract.
+
+---
+
 ## 10. Core data model
 
 `anda_kip::types` models the element envelope and the Core kinds:
@@ -648,6 +674,21 @@ has is the active Schema Packages' decision, validated by the destination.
 `Capsule::validate_frame` is the cheap structural gate: format, a content
 digest, and `base_seq`/`target_seq` on a delta Capsule. It is not
 `VALIDATE CAPSULE`, which needs an engine and a destination Space.
+
+`CapsuleRecords` stores one ordered `Vec<Json>` (`.0`). Use
+`records.by_kind(ElementKind::Concept)` to borrow records of one kind; grouping
+must not reorder the signed array. Delta `payload.changes` is preserved as
+`Option<Vec<Json>>`, including an explicitly empty array. `CapsuleHandling.extra`
+is the complete handling object, and `CapsuleProof` is a JSON member map, so
+suite-specific proof fields and explicit handling nulls are retained.
+`canonical_payload()` covers `format`, `format_version`, and `payload`; it
+excludes `integrity` as required by §37.7.
+
+SDK migration from the earlier grouped types: replace `records.concepts` (and
+the other kind vectors) with `by_kind` for reads or `.0` for ordered edits;
+construct records with `CapsuleRecords(vec![...])`. Put handling members in
+`CapsuleHandling.extra` and proof members in `CapsuleProof`'s map. When building
+`CapsuleIntegrity` directly, supply its optional `covers` field.
 
 `ImportMode` is `preview` / `isolate` / `merge` / `restore`, and
 `ImportMode::may_map_self()` is true only for `restore`: source `$self` must

@@ -265,39 +265,13 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
       analyzeAssertionShape(record.set_fields, record.set_structural, out)
     }
     analyzeStructural(record.set_structural, out)
-    for (const facet of record.set_facets) analyzeAssignments(facet.values, out)
-    return
-  }
-  if ('CreateEvidence' in clause || 'CreateActivity' in clause) {
-    const record =
-      'CreateEvidence' in clause ? clause.CreateEvidence : clause.CreateActivity
-    if (record.set_fields) analyzeAssignments(record.set_fields, out)
-    analyzeStructural(record.set_structural, out)
-    for (const facet of record.set_facets) analyzeAssignments(facet.values, out)
-    return
-  }
-  if ('CreateConcept' in clause || 'UpsertConcept' in clause) {
-    const concept =
-      'CreateConcept' in clause ? clause.CreateConcept : clause.UpsertConcept
-    if (concept.set_fields) analyzeAssignments(concept.set_fields, out)
-    if (concept.set_attributes) analyzeAssignments(concept.set_attributes, out)
-    analyzeStructural(concept.set_structural, out)
-    for (const facet of concept.set_facets) {
-      analyzeAssignments(facet.values, out)
-    }
     return
   }
   if ('Update' in clause) {
     const update = clause.Update
     for (const action of update.actions) {
       if ('SetFields' in action) analyzeAssignments(action.SetFields, out)
-      else if ('SetAttributes' in action) {
-        analyzeAssignments(action.SetAttributes, out)
-      } else if ('SetFacet' in action) {
-        analyzeAssignments(action.SetFacet.values, out)
-      } else if ('SetStructural' in action) {
-        analyzeStructural(action.SetStructural, out)
-      }
+
     }
     warnUnbounded('UPDATE', !!update.where_clauses, !!update.limit, out)
     return
@@ -315,8 +289,6 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
       'TRANSITION ... TO',
       out,
     )
-    if (transition.set_fields) analyzeAssignments(transition.set_fields, out)
-    analyzeStructural(transition.set_structural, out)
     warnUnbounded(
       'TRANSITION',
       !!transition.where_clauses,
@@ -327,7 +299,6 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
   }
   if ('SetRetention' in clause) {
     const retention = clause.SetRetention
-    analyzeAssignments(retention.values, out)
     warnUnbounded(
       'SET RETENTION',
       !!retention.where_clauses,
@@ -358,8 +329,7 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
 }
 
 /**
- * Core-typed fields mean the same thing wherever they are written, so an
- * `UPDATE` that sets one gets the same check a `CREATE ASSERTION` gets.
+ * Core fields only; attribute and Facet members belong to their Schema.
  */
 function analyzeAssignments(
   assignments: Assignments,

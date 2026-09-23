@@ -1,4 +1,4 @@
-import { canonicalJson } from './json.js'
+import { canonicalJson, isJsonMap } from './json.js'
 /**
  * The request envelope (§71), and every invariant of it this engine checks
  * before anything runs.
@@ -60,6 +60,8 @@ export interface KipRequestEnvelope {
     command?: string
     parameters?: JsonMap
     idempotency_key?: string
+    extensions?: JsonMap
+    options?: { extensions?: JsonMap }
   }[]
   parameters?: JsonMap
   context?: RequestContext
@@ -83,20 +85,23 @@ function criticalExtensions(envelope: KipRequestEnvelope): string[] {
     envelope.options,
     envelope.ingest,
     ...(envelope.operations ?? []),
+    ...(envelope.operations ?? []).map(operation => operation.options),
+    ...(envelope.ingest?.evidence ?? []),
   ]
   const names = new Set<string>()
   for (const block of blocks) {
     if (block === null || typeof block !== 'object') continue
     const extensions = (block as { extensions?: unknown }).extensions
-    if (extensions === null || typeof extensions !== 'object') continue
+    if (extensions === undefined) continue
+    if (!isJsonMap(extensions)) throw new KipError('InvalidRequestEnvelope', 'extensions must be an object')
     for (const [name, value] of Object.entries(extensions as Record<string, unknown>)) {
-      if (
-        value !== null &&
-        typeof value === 'object' &&
-        (value as { critical?: unknown }).critical === true
-      ) {
-        names.add(name)
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(name)) {
+        throw new KipError('InvalidIdentifier', `extension ${name} must be namespaced`)
       }
+      if (!isJsonMap(value) || ('critical' in value && typeof value.critical !== 'boolean')) {
+        throw new KipError('InvalidRequestEnvelope', `extension ${name} must be an object with a boolean critical flag when present`)
+      }
+      if (value.critical === true) names.add(name)
     }
   }
   return [...names].sort()

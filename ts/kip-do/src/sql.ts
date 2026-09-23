@@ -91,7 +91,7 @@ export function checkValueSize(value: string, what: string): string {
 
 /** Serializes a value for storage, size-checked and canonically ordered. */
 export function encodeJson(value: unknown, what: string): string {
-  return checkValueSize(canonicalJson(value ?? {}), what)
+  return checkValueSize(canonicalJson(value === undefined ? {} : value), what)
 }
 
 /**

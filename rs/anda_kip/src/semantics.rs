@@ -339,52 +339,17 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
                 analyze_assertion_shape(fields, record.set_structural.as_deref(), out);
             }
             analyze_structural(record.set_structural.as_deref(), out);
-            for facet in &record.set_facets {
-                analyze_assignments(&facet.values, out);
-            }
         }
-        MutationClause::CreateEvidence(record) | MutationClause::CreateActivity(record) => {
-            if let Some(fields) = &record.set_fields {
-                analyze_assignments(fields, out);
-            }
-            analyze_structural(record.set_structural.as_deref(), out);
-            for facet in &record.set_facets {
-                analyze_assignments(&facet.values, out);
-            }
-        }
-        MutationClause::CreateConcept(concept) => {
-            for fields in [&concept.set_fields, &concept.set_attributes]
-                .into_iter()
-                .flatten()
-            {
-                analyze_assignments(fields, out);
-            }
-            analyze_structural(concept.set_structural.as_deref(), out);
-            for facet in &concept.set_facets {
-                analyze_assignments(&facet.values, out);
-            }
-        }
-        MutationClause::UpsertConcept(concept) => {
-            for fields in [&concept.set_fields, &concept.set_attributes]
-                .into_iter()
-                .flatten()
-            {
-                analyze_assignments(fields, out);
-            }
-            analyze_structural(concept.set_structural.as_deref(), out);
-            for facet in &concept.set_facets {
-                analyze_assignments(&facet.values, out);
-            }
-        }
+        // Attributes and Facets are package-defined; their member names do
+        // not acquire Assertion semantics by coinciding with Core field names.
+        MutationClause::CreateEvidence(_)
+        | MutationClause::CreateActivity(_)
+        | MutationClause::CreateConcept(_)
+        | MutationClause::UpsertConcept(_) => {}
         MutationClause::Update(update) => {
             for action in &update.actions {
-                match action {
-                    UpdateAction::SetFields(a) | UpdateAction::SetAttributes(a) => {
-                        analyze_assignments(a, out)
-                    }
-                    UpdateAction::SetFacet(facet) => analyze_assignments(&facet.values, out),
-                    UpdateAction::SetStructural(edges) => analyze_structural(Some(edges), out),
-                    _ => {}
+                if let UpdateAction::SetFields(a) = action {
+                    analyze_assignments(a, out);
                 }
             }
             warn_unbounded(
@@ -404,10 +369,6 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
                 "TRANSITION ... TO",
                 out,
             );
-            if let Some(fields) = &transition.set_fields {
-                analyze_assignments(fields, out);
-            }
-            analyze_structural(transition.set_structural.as_deref(), out);
             warn_unbounded(
                 "TRANSITION",
                 transition.where_clauses.is_some(),
@@ -416,7 +377,6 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
             );
         }
         MutationClause::SetRetention(retention) => {
-            analyze_assignments(&retention.values, out);
             warn_unbounded(
                 "SET RETENTION",
                 retention.where_clauses.is_some(),
@@ -440,8 +400,7 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Core-typed fields mean the same thing wherever they are written, so an
-/// `UPDATE` that sets one gets the same check a `CREATE ASSERTION` gets.
+/// Check Core fields only, never members of attributes or Facets.
 fn analyze_assignments(assignments: &crate::ast::Assignments, out: &mut Vec<Diagnostic>) {
     for (field, value) in assignments {
         match field.as_str() {

@@ -192,10 +192,24 @@ impl Request {
     /// This is the structural gate: Governance, Schema resolution, snapshot
     /// alignment and commit-time revalidation all remain runtime invariants.
     pub fn validate(&self) -> Result<(), KipError> {
-        crate::validate_json(
-            &serde_json::to_value(self)
-                .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?,
-        )?;
+        self.validate_shape()?;
+        if self.ingest.is_some() {
+            check_ingest_commands(self.operations.iter().map(Operation::parse))?;
+        }
+        Ok(())
+    }
+
+    /// Prepare one execution without parsing ingest operations a second time.
+    pub(crate) fn prepare_operations(&self) -> Result<Vec<Result<Command, KipError>>, KipError> {
+        self.validate_shape()?;
+        let parsed: Vec<_> = self.operations.iter().map(Operation::parse).collect();
+        if self.ingest.is_some() {
+            check_ingest_commands(parsed.iter().map(|result| result.as_ref()))?;
+        }
+        Ok(parsed)
+    }
+
+    fn validate_shape(&self) -> Result<(), KipError> {
         if self.kip != KIP_VERSION {
             return Err(KipError::unsupported_protocol_version(format!(
                 "this runtime speaks KIP {KIP_VERSION}, the request declares {:?}",
@@ -255,51 +269,19 @@ impl Request {
         }
 
         if let Some(parameters) = &self.parameters {
-            for name in parameters.keys() {
+            for (name, value) in parameters {
                 validate_binding_name(name, "parameter")?;
+                crate::validate_json(value)?;
             }
         }
         if let Some(requires) = &self.requires {
-            for name in requires.keys() {
+            for (name, value) in requires {
                 validate_capability_name(name)?;
+                crate::validate_json(value)?;
             }
         }
         if let Some(ingest) = &self.ingest {
             ingest.validate()?;
-            // §71.1 mints each entry "inside the request's transaction scope"
-            // and makes ingestion transactional. A request whose operations are
-            // all reads opens no such scope, so the Evidence would be minted
-            // nowhere while the request still answered `succeeded` — and the
-            // caller would go on believing the observation was recorded, which
-            // is precisely the fidelity failure §88.12 has ingestion exist to
-            // prevent.
-            //
-            // Only refused once every operation parsed. A command that does not
-            // parse should still report its own syntax error rather than being
-            // recast as an envelope fault.
-            //
-            // The scan stops at the first mutation and keeps no command: the
-            // question is whether *some* operation opens a transaction, and
-            // the executor parses them all again anyway.
-            let mut every_operation_parsed = true;
-            let mut opens_a_transaction = false;
-            for operation in &self.operations {
-                match operation.parse() {
-                    Ok(command) if command.is_mutation() => {
-                        opens_a_transaction = true;
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(_) => every_operation_parsed = false,
-                }
-            }
-            if every_operation_parsed && !opens_a_transaction {
-                return Err(KipError::invalid_request_envelope(
-                    "an `ingest` block mints Evidence inside the request's transaction, so the \
-                     request must carry at least one KML operation; a read-only request would \
-                     drop the observation while reporting success",
-                ));
-            }
         }
 
         Ok(())
@@ -379,12 +361,29 @@ impl Request {
     /// rejected rather than trusted: that label is exactly the lever an
     /// injection would pull to get a write past a read-only path (§73.1, §88.3).
     pub fn parse_operations(&self) -> Result<Vec<Command>, KipError> {
-        self.validate()?;
-        self.operations
-            .iter()
-            .map(|operation| operation.parse())
-            .collect()
+        self.prepare_operations()?.into_iter().collect()
     }
+}
+
+// Syntax failures stay operation-level errors; only an entirely readable
+// request can be classified as dropping its ingest observations.
+fn check_ingest_commands<C: std::borrow::Borrow<Command>, E>(
+    commands: impl IntoIterator<Item = Result<C, E>>,
+) -> Result<(), KipError> {
+    let mut all_parsed = true;
+    for command in commands {
+        match command {
+            Ok(command) if command.borrow().is_mutation() => return Ok(()),
+            Ok(_) => {}
+            Err(_) => all_parsed = false,
+        }
+    }
+    if all_parsed {
+        return Err(KipError::invalid_request_envelope(
+            "an ingest block requires at least one KML operation to mint Evidence transactionally",
+        ));
+    }
+    Ok(())
 }
 
 /// Which MemorySpace a request runs against (Spec §5).
@@ -544,6 +543,12 @@ pub struct Preconditions {
 
 impl EnvelopeBlock for Preconditions {
     fn validate(&self) -> Result<(), KipError> {
+        for value in [self.space_seq, self.schema_environment_version]
+            .into_iter()
+            .flatten()
+        {
+            crate::json::validate_number(&value.into())?;
+        }
         validate_extensions(&self.extensions, "preconditions.extensions")
     }
 }
@@ -624,7 +629,10 @@ impl Operation {
                     "an operation's command must not be empty",
                 ));
             }
-            (None, Some(_)) => {}
+            (None, Some(ast)) => crate::validate_json(
+                &serde_json::to_value(ast)
+                    .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?,
+            )?,
             (Some(_), Some(_)) => {
                 return Err(KipError::invalid_request_envelope(
                     "an operation carries either `command` text or a pre-parsed `ast`, never both",
@@ -649,8 +657,9 @@ impl Operation {
         }
 
         if let Some(parameters) = &self.parameters {
-            for name in parameters.keys() {
+            for (name, value) in parameters {
                 validate_binding_name(name, "parameter")?;
+                crate::validate_json(value)?;
             }
         }
         Ok(())
@@ -736,6 +745,9 @@ pub struct RequestOptions {
 impl EnvelopeBlock for RequestOptions {
     fn validate(&self) -> Result<(), KipError> {
         validate_extensions(&self.extensions, "options.extensions")?;
+        if let Some(value) = self.deadline_ms {
+            crate::json::validate_number(&value.into())?;
+        }
         if self.deadline_ms == Some(0) {
             return Err(KipError::invalid_request_envelope(
                 "options.deadline_ms must be greater than zero",
@@ -845,7 +857,11 @@ pub struct IngestEvidence {
     /// What kind of observation this is (§15.2).
     pub evidence_class: String,
     /// The inline payload, preserved without model rewriting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub payload: Option<Json>,
     /// A runtime artifact handle carrying the payload bytes instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -902,8 +918,14 @@ impl IngestEvidence {
             source_actor.validate("ingest source_actor")?;
         }
         validate_optional_non_empty(&self.client_key, "ingest client_key", limits::CLIENT_KEY)?;
-        for facet in self.facets.keys() {
+        if let Some(payload) = &self.payload {
+            crate::validate_json(payload)?;
+        }
+        for (facet, fields) in &self.facets {
             validate_bounded(facet, "ingest facets name", limits::FACET_NAME)?;
+            for value in fields.values() {
+                crate::validate_json(value)?;
+            }
         }
         validate_extensions(&self.extensions, "ingest evidence extensions")?;
         match (&self.payload, &self.payload_artifact) {
@@ -973,12 +995,24 @@ fn validate_extensions(extensions: &Option<Map<String, Json>>, what: &str) -> Re
     let Some(extensions) = extensions else {
         return Ok(());
     };
-    for name in extensions.keys() {
+    for (name, value) in extensions {
         if !is_namespaced_extension(name) {
             return Err(KipError::invalid_identifier(format!(
                 "{what} key {name:?} must be namespaced as <vendor>/<feature>"
             )));
         }
+        let object = value.as_object().ok_or_else(|| {
+            KipError::invalid_request_envelope(format!("{what}[{name:?}] must be an object"))
+        })?;
+        if object
+            .get("critical")
+            .is_some_and(|critical| !critical.is_boolean())
+        {
+            return Err(KipError::invalid_request_envelope(format!(
+                "{what}[{name:?}].critical must be a boolean"
+            )));
+        }
+        crate::validate_json(value)?;
     }
     Ok(())
 }
@@ -1249,7 +1283,11 @@ pub struct OperationResult {
     /// What happened.
     pub status: OperationStatus,
     /// The result value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub result: Option<Json>,
     /// The coordinates and policies this result was produced under.
     #[serde(default, skip_serializing_if = "Option::is_none")]

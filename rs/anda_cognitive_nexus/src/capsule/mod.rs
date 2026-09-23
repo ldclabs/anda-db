@@ -173,13 +173,7 @@ pub async fn export(
             continue;
         }
         included.insert(*id);
-        match id.kind {
-            ElementKind::Concept => records.concepts.push(rendered),
-            ElementKind::Proposition => records.propositions.push(rendered),
-            ElementKind::Assertion => records.assertions.push(rendered),
-            ElementKind::Evidence => records.evidence.push(rendered),
-            ElementKind::Activity => records.activities.push(rendered),
-        }
+        records.0.push(rendered);
     }
 
     // §40.1: what the records reference but do not carry is *declared*, not
@@ -254,6 +248,7 @@ pub async fn export(
             vec![]
         },
         records,
+        changes: None,
         external_refs,
         blobs: BTreeMap::new(),
         handling: anda_kip::CapsuleHandling {
@@ -262,7 +257,6 @@ pub async fn export(
             } else {
                 Map::from_iter([("anda/source_control".into(), Json::Object(source_control))])
             },
-            ..Default::default()
         },
         extensions: Map::new(),
     };
@@ -276,6 +270,7 @@ pub async fn export(
             // No proofs: this engine signs nothing, and an empty proof list is
             // an honest "unsigned" rather than a claim of provenance.
             proofs: vec![],
+            covers: None,
         },
     ))
 }
@@ -605,11 +600,11 @@ pub fn describe(source: &str) -> Result<Json, KipError> {
         "source": payload.source,
         "schema": payload.schema,
         "counts": {
-            "concept": payload.records.concepts.len(),
-            "proposition": payload.records.propositions.len(),
-            "assertion": payload.records.assertions.len(),
-            "evidence": payload.records.evidence.len(),
-            "activity": payload.records.activities.len(),
+            "concept": payload.records.by_kind(ElementKind::Concept).count(),
+            "proposition": payload.records.by_kind(ElementKind::Proposition).count(),
+            "assertion": payload.records.by_kind(ElementKind::Assertion).count(),
+            "evidence": payload.records.by_kind(ElementKind::Evidence).count(),
+            "activity": payload.records.by_kind(ElementKind::Activity).count(),
         },
         "external_refs": payload.external_refs.len(),
         "blobs": payload.blobs.len(),
@@ -648,10 +643,9 @@ mod tests {
                 closure: "selective".into(),
                 ..Default::default()
             },
-            records: CapsuleRecords {
-                concepts: vec![serde_json::json!({"id": "C-1", "name": "Alice"})],
-                ..Default::default()
-            },
+            records: CapsuleRecords(vec![
+                serde_json::json!({"id": "C-1", "kind":"concept", "name": "Alice"}),
+            ]),
             ..Default::default()
         };
         let digest = payload_digest(&payload).unwrap();
@@ -661,6 +655,7 @@ mod tests {
                 digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: digest,
                 proofs: vec![],
+                covers: None,
             },
         );
         let report = verify(&capsule).unwrap();
@@ -675,7 +670,7 @@ mod tests {
         );
 
         let mut tampered = capsule.clone();
-        tampered.payload.records.concepts[0]["name"] = Json::from("Mallory");
+        tampered.payload.records.0[0]["name"] = Json::from("Mallory");
         let err = verify(&tampered).unwrap_err();
         assert_eq!(err.name(), "DigestMismatch");
     }
@@ -722,14 +717,15 @@ mod tests {
                 digest_profile: "kip-jcs-safe-v1".into(),
                 content_digest: digest.clone(),
                 proofs: vec![],
+                covers: None,
             },
         );
-        capsule.integrity.proofs.push(anda_kip::CapsuleProof {
-            proof_type: "signature".into(),
-            suite: None,
-            verification_method: None,
-            signature: Some("...".into()),
-        });
+        capsule.integrity.proofs.push(
+            serde_json::json!({"type":"signature","signature":"..."})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
         assert_eq!(payload_digest(&capsule.payload).unwrap(), digest);
     }
 }

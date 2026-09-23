@@ -497,6 +497,26 @@ impl Executor for MyNexus {
 
 ---
 
+### SDK 校验与 wire 值
+
+文本与外部 AST 共用查询主语、路径、META 操作数、精确匹配和重复对象键校验。
+mutation handle 必须由同一计划输出或当前子句的 WHERE 绑定；NOT 内的新变量不向外导出。
+Assertion 的枚举、区间规则不用于自定义属性和 Facet 成员。
+
+原始传输输入使用 `Request::from_json`，保留重复键和数字精度检查。
+`Request::parse_operations` 与 `execute_request` 在一次准备过程中复用解析结果，
+包含 ingest 的请求也不再重复解析。显式 `payload: null`、`result: null` 保留为存在的值。
+extension 值必须是对象，其中 `critical` 若存在则必须是布尔值。
+
+批处理 helper 将 independent/sequence 中每次事务的回执放在 `results[i].receipt`；
+顶层回执留给 atomic 执行，该 helper 不实现 atomic。恢复未知结果时应读取对应操作的回执。
+
+Core 类型保留 Concept 的结构关系、合并引用及 Evidence 的 payload 清除标记。
+生命周期引用数组使用 `Vec<Json>`，兼容 portable `{id}` 对象和已有 native view 的 ID 字符串；
+portable artifact 的合法性仍由 vendored schema 判断。
+
+---
+
 ## 10. 核心数据模型
 
 `anda_kip::types` 建模了实体信封及各类核心实体：`Concept`、`Proposition`、`Assertion`、`Evidence`、`Activity`，每个实体均携带包含 `governance`、`retention`、`facets` 与 `_system` 的 `ElementEnvelope`。
@@ -540,6 +560,18 @@ Evidence    evidence_class  payload  content_digest  media_type
 `anda_kip::capsule` 建模了胶囊工件帧结构——清单（manifest）、来源、Schema 依赖、数据记录、外部引用、二进制块（blobs）、处理策略、完整性校验——以及导入相关的词汇体系。记录载荷保持为 JSON 格式，因为记录包含哪些具体字段由活跃的 Schema Packages 决定，并在导入时由目标环境进行校验。
 
 `Capsule::validate_frame` 是低开销的结构门禁：校验格式、内容摘要，以及增量胶囊中的 `base_seq`/`target_seq`。它不是 `VALIDATE CAPSULE`，后者需要具体引擎和目标 Space 参与。
+
+`CapsuleRecords` 以一个有序 `Vec<Json>`（`.0`）保存记录；使用
+`records.by_kind(ElementKind::Concept)` 按种类借用，不能为分组而改变参与摘要的数组顺序。
+增量 `payload.changes` 使用 `Option<Vec<Json>>`，区分缺失与显式空数组。
+`CapsuleHandling.extra` 保存完整 handling 对象，`CapsuleProof` 是 JSON 成员映射，
+保留套件自定义字段及显式 null。`canonical_payload()` 覆盖 `format`、
+`format_version` 和 `payload`，排除 `integrity`。
+
+旧 SDK 调用点应将 `records.concepts` 等分组字段读取改成 `by_kind`，有序修改改成 `.0`，
+用 `CapsuleRecords(vec![...])` 构造；handling 和 proof 成员放入对应映射。
+直接构造 `CapsuleIntegrity` 时需要提供新增的可选 `covers` 字段。
+
 
 `ImportMode` 包括 `preview` / `isolate` / `merge` / `restore`，且 `ImportMode::may_map_self()` 仅在 `restore` 模式下为 true：源端 `$self` 严禁静默映射为目标端 `$self`。`IdentityResolution::ORDER` 规定了保守的冲突解决序列，最终落脚于“新建实体”。`ExternalRefKind` 明确区分 `redacted`（源端刻意隐匿）与 `unavailable`（源端本身缺失）。
 

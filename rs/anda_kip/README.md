@@ -101,6 +101,19 @@ assert!(write.is_mutation());
 # Ok::<(), anda_kip::KipError>(())
 ```
 
+## SDK compatibility notes
+
+Capsule records retain wire order in `CapsuleRecords(Vec<Json>)`; use `by_kind`
+for filtered access. Delta changes, handling values, and proof members survive
+round trips. Core lifecycle reference lists accept portable reference objects
+as well as native-view IDs. Explicit null payloads/results remain present.
+Independent/sequence batch receipts are attached to `results[].receipt`.
+See [SDK migration details](../../docs/anda_kip.md#11-cognitive-capsules).
+
+Parser and ingest benchmarks run with
+`cargo bench -p anda_kip --bench protocol --profile release-speed`.
+See the [paired measurements](../../docs/benchmarks/anda_kip_2026-09-23/README.md).
+
 ## Command-line syntax check
 
 ```bash

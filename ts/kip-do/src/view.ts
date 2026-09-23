@@ -150,11 +150,9 @@ function evidence(id: ElementId, row: EvidenceRow): JsonMap {
     ...envelope(id, row),
     ...present({
       evidence_class: row.evidence_class,
-      payload: present({
-        mode: row.payload_mode,
-        inline: row.payload_inline,
-        content_ref: row.content_ref,
-      }),
+      payload: row.payload_mode === 'inline'
+        ? { mode: 'inline', inline: row.payload_inline }
+        : present({ mode: row.payload_mode, content_ref: row.content_ref }),
       content_digest: row.content_digest,
       media_type: row.media_type,
       observed_at: row.observed_at,

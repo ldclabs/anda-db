@@ -135,3 +135,23 @@ async fn assertions_share_a_tuple_created_in_their_own_transaction() {
     assert_eq!(nexus.store.propositions().len(), 1);
     assert_eq!(nexus.store.assertions().len(), 2);
 }
+
+#[tokio::test]
+async fn explicit_null_payload_survives_ingestion_and_readback() {
+    let nexus = fresh().await;
+    let mut evidence = observation();
+    evidence.payload = Some(Value::Null);
+    let request =
+        Request::from_value(serde_json::to_value(request(vec![evidence])).unwrap()).unwrap();
+    let result = execute_request(&nexus, &request).await;
+    assert_eq!(result.status, TopLevelStatus::Succeeded, "{result:?}");
+    let result = execute_request(
+        &nexus,
+        &Request::single("FIND(?e.payload) WHERE { ?e EVIDENCE {} }"),
+    )
+    .await;
+    assert_eq!(
+        result.first_result(),
+        Some(&json!([{"mode":"inline","inline":null}]))
+    );
+}

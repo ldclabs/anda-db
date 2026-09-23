@@ -73,23 +73,11 @@ const EVIDENCE_IMMUTABLE: &[&str] = &[
 /// A Proposition tuple is immutable after creation (Spec §12.5).
 const PROPOSITION_IMMUTABLE: &[&str] = &["subject", "predicate", "object"];
 
-/// The ASSERT members §55.1 defines.
-const ASSERT_MEMBERS: &[&str] = &[
-    "by",
-    "mode",
-    "stance",
-    "confidence",
-    "at",
-    "valid",
-    "evidence",
-    "key",
-];
-
 /// Parses a KML statement: a `MUTATE` block, or a single mutation that is still
 /// a one-clause transaction.
 pub(crate) fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
     if let Ok((rest, _)) = ws(word("MUTATE")).parse(input) {
-        let (rest, groups) = cut(braced(many0(ws(spanned(mutation_clause))))).parse(rest)?;
+        let (rest, groups) = cut(braced(many0(ws(mutation_clause)))).parse(rest)?;
         if groups.is_empty() {
             return fail(input, "at least one mutation inside MUTATE { ... }");
         }
@@ -103,35 +91,72 @@ pub(crate) fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
         ));
     }
 
-    let (rest, (position, group)) = ws(spanned(mutation_clause)).parse(input)?;
+    let (rest, group) = ws(mutation_clause).parse(input)?;
     Ok((
         rest,
         KmlStatement {
             explicit_transaction: false,
-            clauses: flatten(vec![(position, group)]),
+            clauses: flatten(vec![group]),
         },
     ))
 }
 
-/// One source statement may lower to several clauses; `ASSERT` is the case.
-///
-/// The clause's position in its plan keeps synthetic handles distinct between
-/// two handle-less `ASSERT`s in the same transaction, and the position is only
-/// known once the whole block has parsed — hence a thunk rather than the
-/// clauses themselves. `FnOnce` because it is called exactly once, which lets
-/// the expansion move what it parsed instead of cloning every field of it.
-type ClauseGroup = Box<dyn FnOnce(usize) -> Vec<MutationClause>>;
+/// Only ASSERT needs deferred lowering to assign its synthetic handle.
+enum ClauseGroup {
+    Single(MutationClause),
+    Assert {
+        written_handle: Option<String>,
+        triple: (Term, PredAtom, Term),
+        members: Box<AssertMembers>,
+        superseding: Option<ElementRef>,
+    },
+}
 
-fn flatten(groups: Vec<(&str, ClauseGroup)>) -> Vec<MutationClause> {
-    groups
-        .into_iter()
-        .enumerate()
-        .flat_map(|(seq, (_, build))| build(seq))
-        .collect()
+fn flatten(groups: Vec<ClauseGroup>) -> Vec<MutationClause> {
+    let mut clauses = Vec::with_capacity(groups.len());
+    for (seq, group) in groups.into_iter().enumerate() {
+        match group {
+            ClauseGroup::Single(clause) => clauses.push(clause),
+            ClauseGroup::Assert {
+                written_handle,
+                triple,
+                members,
+                superseding,
+            } => {
+                // `#` cannot occur in a source identifier; seq separates the
+                // generated handles of otherwise anonymous ASSERT clauses.
+                let assertion_handle = written_handle.unwrap_or_else(|| format!("#assert{seq}"));
+                let proposition_handle = format!("{assertion_handle}#proposition");
+                clauses.push(MutationClause::EnsureProposition(EnsureProposition {
+                    handle: Some(proposition_handle.clone()),
+                    subject: triple.0,
+                    predicate: triple.1,
+                    object: triple.2,
+                    expect_versions: Vec::new(),
+                }));
+                clauses.push(MutationClause::CreateAssertion(
+                    members.into_record(assertion_handle.clone(), proposition_handle),
+                ));
+                if let Some(target) = superseding {
+                    clauses.push(MutationClause::Transition(Transition {
+                        target,
+                        to: Scalar::Literal(KipValue::String(transition_state::SUPERSEDED.into())),
+                        by: Some(ElementRef::Handle(assertion_handle)),
+                        set_fields: None,
+                        set_structural: None,
+                        where_clauses: None,
+                        limit: None,
+                        expect_versions: Vec::new(),
+                    }));
+                }
+            }
+        }
+    }
+    clauses
 }
 
 fn single(clause: MutationClause) -> ClauseGroup {
-    Box::new(move |_| vec![clause])
+    ClauseGroup::Single(clause)
 }
 
 fn mutation_clause(input: &str) -> VResult<'_, ClauseGroup> {
@@ -330,6 +355,7 @@ fn expect_version_clauses(input: &str) -> VResult<'_, Vec<ExpectVersion>> {
 fn check_guards(guards: &[ExpectVersion]) -> Result<(), KipError> {
     let mut seen = BTreeSet::new();
     for guard in guards {
+        super::validation::scalar(&guard.version)?;
         if !seen.insert(guard.plane_key()) {
             return Err(KipError::invalid_syntax(format!(
                 "EXPECT VERSION guards the {} plane twice; one guard per plane",
@@ -622,47 +648,12 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
     let (rest, superseding) = opt_after(&["SUPERSEDING"], ws(element_ref)).parse(rest)?;
     Ok((
         rest,
-        Box::new(move |seq: usize| {
-            // The Proposition handle is synthesized, so it must collide with
-            // neither a user handle nor another ASSERT in the same plan. `#`
-            // cannot occur in a KIP identifier, which rules out the first; the
-            // clause position rules out the second.
-            let assertion_handle = written_handle.unwrap_or_else(|| format!("#assert{seq}"));
-            let proposition_handle = format!("{assertion_handle}#proposition");
-            let edges = members.evidence_edges();
-            let mut clauses = vec![
-                MutationClause::EnsureProposition(EnsureProposition {
-                    handle: Some(proposition_handle.clone()),
-                    subject: triple.0,
-                    predicate: triple.1,
-                    object: triple.2,
-                    expect_versions: Vec::new(),
-                }),
-                MutationClause::CreateAssertion(RecordCreate {
-                    handle: assertion_handle.clone(),
-                    client_key: members.client_key.clone(),
-                    set_fields: Some(members.set_fields(proposition_handle)),
-                    set_facets: Vec::new(),
-                    set_structural: (!edges.is_empty()).then_some(edges),
-                }),
-            ];
-            // `SUPERSEDING :old` is revision (§14.2): the old claim was wrong.
-            // It desugars to the one lifecycle statement, `BY` the new
-            // Assertion (§55.1).
-            if let Some(target) = superseding {
-                clauses.push(MutationClause::Transition(Transition {
-                    target,
-                    to: Scalar::Literal(KipValue::String(transition_state::SUPERSEDED.into())),
-                    by: Some(ElementRef::Handle(assertion_handle)),
-                    set_fields: None,
-                    set_structural: None,
-                    where_clauses: None,
-                    limit: None,
-                    expect_versions: Vec::new(),
-                }));
-            }
-            clauses
-        }),
+        ClauseGroup::Assert {
+            written_handle,
+            triple,
+            members: Box::new(members),
+            superseding,
+        },
     ))
 }
 
@@ -679,32 +670,28 @@ struct AssertMembers {
 }
 
 impl AssertMembers {
-    /// Reads the block, or says what was expected where it was not.
     fn read(members: Assignments) -> Result<Self, &'static str> {
-        for (key, _) in &members {
-            if !ASSERT_MEMBERS.contains(&key.as_str()) {
-                return Err(
-                    "an ASSERT member: by, mode, stance, confidence, at, valid, evidence or key",
-                );
-            }
+        let (mut by, mut mode, mut stance, mut confidence) = (None, None, None, None);
+        let (mut asserted_at, mut valid_time, mut evidence, mut key) = (None, None, None, None);
+        for (name, value) in members {
+            let slot = match name.as_str() {
+                "by" => &mut by,
+                "mode" => &mut mode,
+                "stance" => &mut stance,
+                "confidence" => &mut confidence,
+                "at" => &mut asserted_at,
+                "valid" => &mut valid_time,
+                "evidence" => &mut evidence,
+                "key" => &mut key,
+                _ => {
+                    return Err(
+                        "an ASSERT member: by, mode, stance, confidence, at, valid, evidence or key",
+                    );
+                }
+            };
+            *slot = Some(value);
         }
-        let take = |name: &str| {
-            members
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
-        };
-        // `by` names whose stance this is, and `mode` says how it was arrived
-        // at. Neither has a safe default: guessing the actor would forge
-        // attribution, and guessing the mode would turn hearsay into
-        // observation.
-        let by = take("by").ok_or(
-            "by: <semantic actor> — an Assertion without an assertor has no epistemic owner",
-        )?;
-        let mode = take("mode").ok_or(
-            "mode: one of observed, stated, inferred, predicted, hypothetical or imported",
-        )?;
-        let client_key = match take("key") {
+        let client_key = match key {
             None => None,
             Some(MutationValue::Param(name)) => Some(Scalar::Param(name)),
             Some(MutationValue::Value(
@@ -716,65 +703,62 @@ impl AssertMembers {
             Some(_) => return Err("a literal or :parameter for the ASSERT key member"),
         };
         Ok(Self {
-            by,
-            mode,
-            stance: take("stance")
-                .unwrap_or(MutationValue::Value(KipValue::String("support".into()))),
-            confidence: take("confidence"),
-            asserted_at: take("at"),
-            valid_time: take("valid"),
-            evidence: take("evidence"),
+            by: by.ok_or("by: <semantic actor> — an Assertion needs an assertor")?,
+            mode: mode
+                .ok_or("mode: observed, stated, inferred, predicted, hypothetical or imported")?,
+            stance: stance.unwrap_or(MutationValue::Value(KipValue::String("support".into()))),
+            confidence,
+            asserted_at,
+            valid_time,
+            evidence,
             client_key,
         })
     }
 
-    /// The `SET FIELDS` of the desugared `CREATE ASSERTION`. The normative
-    /// expansion carries a stance even when the source omitted one, so the
-    /// default is materialized here rather than left for the engine.
-    fn set_fields(&self, proposition_handle: String) -> Assignments {
-        let mut fields: Assignments = vec![
+    fn into_record(self, handle: String, proposition_handle: String) -> RecordCreate {
+        let mut fields = vec![
             (
                 "proposition".into(),
                 MutationValue::Handle(proposition_handle),
             ),
-            ("asserted_by".into(), self.by.clone()),
-            ("mode".into(), self.mode.clone()),
-            ("stance".into(), self.stance.clone()),
+            ("asserted_by".into(), self.by),
+            ("mode".into(), self.mode),
+            ("stance".into(), self.stance),
         ];
         for (name, value) in [
-            ("confidence", &self.confidence),
-            ("asserted_at", &self.asserted_at),
-            ("valid_time", &self.valid_time),
+            ("confidence", self.confidence),
+            ("asserted_at", self.asserted_at),
+            ("valid_time", self.valid_time),
         ] {
             if let Some(value) = value {
-                fields.push((name.into(), value.clone()));
+                fields.push((name.into(), value));
             }
         }
-        fields
-    }
-
-    /// `evidence` is a reserved Core *structural* field, not a plain one: the
-    /// normative desugaring emits `("evidence", ref) {role: "support"}`, one
-    /// role-qualified edge per cited artifact.
-    fn evidence_edges(&self) -> Vec<StructuralEdge> {
-        let Some(value) = self.evidence.clone() else {
-            return Vec::new();
-        };
-        evidence_refs(value)
+        // Every sugar citation is a role-qualified Core structural edge.
+        let edges: Vec<_> = self
+            .evidence
             .into_iter()
+            .flat_map(evidence_refs)
             .map(|value| StructuralEdge {
                 field: SymbolRef::Name("evidence".into()),
                 value,
                 options: Some(
                     [(
-                        "role".to_string(),
+                        "role".into(),
                         BoundValue::Value(KipValue::String("support".into())),
                     )]
                     .into_iter()
                     .collect(),
                 ),
             })
-            .collect()
+            .collect();
+        RecordCreate {
+            handle,
+            client_key: self.client_key,
+            set_fields: Some(fields),
+            set_facets: Vec::new(),
+            set_structural: (!edges.is_empty()).then_some(edges),
+        }
     }
 }
 
@@ -1203,15 +1187,20 @@ fn validate_update_expr(expr: &UpdateExpr) -> Result<(), KipError> {
 }
 
 fn validate_mutation_value(value: &MutationValue) -> Result<(), KipError> {
-    if let MutationValue::Expr(expr) = value {
-        validate_update_expr(expr)?;
+    match value {
+        MutationValue::Expr(expr) => validate_update_expr(expr),
+        MutationValue::Array(items) => items.iter().try_for_each(super::validation::bound),
+        MutationValue::Object(entries) => super::validation::entries_unique(entries),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn validate_structural_edges(edges: &[StructuralEdge]) -> Result<(), KipError> {
     for edge in edges {
         validate_mutation_value(&edge.value)?;
+        if let Some(options) = &edge.options {
+            super::validation::bound_object(options)?;
+        }
     }
     Ok(())
 }
@@ -1267,11 +1256,14 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
     };
 
     if let Some(where_clauses) = clause_where(clause) {
-        validate_exact_patterns(where_clauses)?;
+        super::validation::patterns(where_clauses, Flavor::Exact)?;
     }
 
     match clause {
         MutationClause::CreateConcept(c) => {
+            for value in [&c.client_key, &c.name].into_iter().flatten() {
+                super::validation::scalar(value)?;
+            }
             c.set_fields.as_ref().map_or(Ok(()), &check_assignments)?;
             c.set_attributes
                 .as_ref()
@@ -1305,7 +1297,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                      {id: <literal-or-parameter>} or {key: <literal-or-parameter>}");
             }
             if let Some(matcher) = &c.r#match {
-                validate_exact_object_matcher(matcher)?;
+                super::validation::object_matcher(matcher, Flavor::Exact)?;
             }
             if c.unset_structural.as_ref().is_some_and(Vec::is_empty) {
                 return bad("UNSET STRUCTURAL removes named references; list at least one");
@@ -1314,6 +1306,9 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
         MutationClause::CreateEvidence(c)
         | MutationClause::CreateAssertion(c)
         | MutationClause::CreateActivity(c) => {
+            if let Some(value) = &c.client_key {
+                super::validation::scalar(value)?;
+            }
             c.set_fields.as_ref().map_or(Ok(()), &check_assignments)?;
             check_facets(&c.set_facets)?;
             c.set_structural
@@ -1328,10 +1323,13 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                     ?variables are KQL read-pattern syntax",
                 );
             }
-            validate_proposition_subject(&c.subject)?;
-            validate_exact_term(&c.object)?;
+            super::validation::proposition_subject(&c.subject, Flavor::Exact)?;
+            super::validation::term(&c.object, Flavor::Exact)?;
         }
         MutationClause::Update(c) => {
+            if let Some(value) = &c.limit {
+                super::validation::scalar(value)?;
+            }
             check_guards(&c.expect_versions)?;
             for action in &c.actions {
                 match action {
@@ -1360,6 +1358,10 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
             }
         }
         MutationClause::Transition(c) => {
+            super::validation::scalar(&c.to)?;
+            if let Some(value) = &c.limit {
+                super::validation::scalar(value)?;
+            }
             check_guards(&c.expect_versions)?;
             if let Err(ctx) = check_transition_shape(c) {
                 return Err(KipError::invalid_syntax(format!(
@@ -1372,18 +1374,30 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
                 .map_or(Ok(()), validate_structural_edges)?;
         }
         MutationClause::SetRetention(c) => {
+            if let Some(value) = &c.limit {
+                super::validation::scalar(value)?;
+            }
             check_guards(&c.expect_versions)?;
             check_assignments(&c.values)?
         }
         // The grammar freezes the spelling so a purge is never the result of a
         // near-miss confirmation.
         MutationClause::Purge(c) => {
+            if let Some(value) = &c.reference_policy {
+                super::validation::scalar(value)?;
+            }
+            if let Some(value) = &c.limit {
+                super::validation::scalar(value)?;
+            }
             check_guards(&c.expect_versions)?;
             if c.confirm != "PURGE" {
                 return bad("PURGE must be confirmed with the exact literal \"PURGE\"");
             }
         }
         MutationClause::PurgePayload(c) => {
+            if let Some(value) = &c.limit {
+                super::validation::scalar(value)?;
+            }
             check_guards(&c.expect_versions)?;
             if c.confirm != "PURGE" {
                 return bad("PURGE PAYLOAD must be confirmed with the exact literal \"PURGE\"");
@@ -1397,89 +1411,6 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
 /// KML and META selection blocks parse in the exact flavor: no `BELIEF`, and no
 /// raw predicate paths. A virtual Projection is never a mutation target or an
 /// export selector, and a path never resolves to one Proposition to write.
-pub(crate) fn validate_exact_patterns(clauses: &[WhereClause]) -> Result<(), KipError> {
-    for clause in clauses {
-        match clause {
-            WhereClause::Belief { .. } | WhereClause::BeliefSlot { .. } => {
-                return Err(KipError::invalid_syntax(
-                    "BELIEF is a read-only Projection and can never be a mutation target or an \
-                     export selector",
-                ));
-            }
-            WhereClause::Concept { matcher, .. }
-            | WhereClause::Assertion { matcher, .. }
-            | WhereClause::Evidence { matcher, .. }
-            | WhereClause::Activity { matcher, .. } => validate_exact_object_matcher(matcher)?,
-            WhereClause::Proposition { matcher, .. } => validate_exact_proposition(matcher)?,
-            WhereClause::Structural {
-                subject, object, ..
-            } => {
-                validate_exact_term(subject)?;
-                validate_exact_term(object)?;
-            }
-            WhereClause::Not(inner) | WhereClause::Optional(inner) | WhereClause::Union(inner) => {
-                validate_exact_patterns(inner)?
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn validate_proposition_subject(subject: &Term) -> Result<(), KipError> {
-    if matches!(subject, Term::Literal(_)) {
-        return Err(KipError::invalid_syntax(
-            "a Proposition subject must be an Element reference, never a Literal",
-        ));
-    }
-    validate_exact_term(subject)
-}
-
-fn validate_exact_proposition(matcher: &PropositionMatcher) -> Result<(), KipError> {
-    let PropositionMatcher::Tuple(triple) = matcher else {
-        return Ok(());
-    };
-    if matches!(triple.predicate, crate::ast::PredTerm::Path(_)) {
-        return Err(KipError::invalid_syntax(
-            "alternation and hop quantifiers are KQL traversal forms and are not selection \
-             syntax here",
-        ));
-    }
-    validate_proposition_subject(&triple.subject)?;
-    validate_exact_term(&triple.object)
-}
-
-fn validate_exact_term(term: &Term) -> Result<(), KipError> {
-    match term {
-        Term::Match(matcher) => validate_exact_object_matcher(matcher),
-        Term::Proposition(matcher) => validate_exact_proposition(matcher),
-        Term::Variable(_) | Term::Param(_) | Term::Literal(_) => Ok(()),
-    }
-}
-
-fn validate_exact_object_matcher(matcher: &crate::ast::ObjectMatcher) -> Result<(), KipError> {
-    for value in matcher.values() {
-        validate_exact_match_value(value)?;
-    }
-    Ok(())
-}
-
-fn validate_exact_match_value(value: &crate::ast::MatchValue) -> Result<(), KipError> {
-    match value {
-        crate::ast::MatchValue::Array(items) => {
-            for item in items {
-                validate_exact_match_value(item)?;
-            }
-            Ok(())
-        }
-        crate::ast::MatchValue::Match(matcher) => validate_exact_object_matcher(matcher),
-        crate::ast::MatchValue::Proposition(matcher) => validate_exact_proposition(matcher),
-        crate::ast::MatchValue::Variable(_)
-        | crate::ast::MatchValue::Param(_)
-        | crate::ast::MatchValue::Literal(_) => Ok(()),
-    }
-}
-
 /// Checks the invariants that only the whole mutation plan can decide.
 pub(crate) fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
     if statement.clauses.is_empty() {
@@ -1494,10 +1425,10 @@ pub(crate) fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
     // Handles are block-local names. Two clauses claiming the same handle make
     // every forward reference to it ambiguous, so the whole plan is rejected
     // rather than resolved by position.
-    let mut plan_handles: BTreeSet<String> = BTreeSet::new();
+    let mut plan_handles: BTreeSet<&str> = BTreeSet::new();
     for clause in &statement.clauses {
         if let Some(name) = clause.handle()
-            && !plan_handles.insert(name.to_string())
+            && !plan_handles.insert(name)
         {
             return Err(KipError::duplicate_local_handle(format!(
                 "?{name} is claimed by two clauses in one mutation plan"
@@ -1508,14 +1439,14 @@ pub(crate) fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
     // Every executable handle must be created by this plan or bound by that
     // clause's own WHERE. Parameters remain runtime bindings and are unaffected.
     for clause in &statement.clauses {
-        let mut allowed = plan_handles.clone();
+        let mut allowed = BTreeSet::new();
         if let Some(where_clauses) = clause_where(clause) {
             collect_where_variables(where_clauses, &mut allowed);
         }
         let mut referenced = BTreeSet::new();
         collect_clause_handles(clause, &mut referenced);
         for name in referenced {
-            if !allowed.contains(&name) {
+            if !plan_handles.contains(name.as_str()) && !allowed.contains(&name) {
                 return Err(KipError::reference_error(format!(
                     "?{name} is not bound by this command's mutation outputs or WHERE clause"
                 )));
@@ -1570,7 +1501,10 @@ fn collect_clause_handles(clause: &MutationClause, out: &mut BTreeSet<String>) {
             collect_facets_handles(&c.set_facets, out);
             collect_edges_handles(c.set_structural.as_ref(), out);
         }
-        MutationClause::EnsureProposition(_) => {}
+        MutationClause::EnsureProposition(c) => {
+            super::common::collect_term_variables(&c.subject, out);
+            super::common::collect_term_variables(&c.object, out);
+        }
         MutationClause::Update(c) => {
             element(&c.target);
             for action in &c.actions {

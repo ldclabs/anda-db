@@ -225,9 +225,10 @@ async fn run_request(
     request: &Request,
     admits: impl Fn(&Command) -> Result<(), KipError>,
 ) -> Response {
-    if let Err(err) = request.validate() {
-        return Response::from(err).with_request_id(request.request_id.clone());
-    }
+    let parsed = match request.prepare_operations() {
+        Ok(parsed) => parsed,
+        Err(err) => return Response::from(err).with_request_id(request.request_id.clone()),
+    };
 
     let mode = request.execution_mode();
     if mode == ExecutionMode::Atomic {
@@ -243,8 +244,6 @@ async fn run_request(
     // classification the gate used drift from the one the executor sees (§73.1).
     // An operation that does not parse cannot be a mutation; it fails as its
     // own result below, which is where a caller can correlate it by `op_id`.
-    let parsed: Vec<Result<Command, KipError>> =
-        request.operations.iter().map(Operation::parse).collect();
     for command in parsed.iter().filter_map(|parsed| parsed.as_ref().ok()) {
         if let Err(err) = admits(command) {
             return Response::from(err).with_request_id(request.request_id.clone());
@@ -259,13 +258,6 @@ async fn run_request(
 
     let mut results = Vec::with_capacity(request.operations.len());
     let mut stopped = false;
-    // This helper runs each operation as its own transaction, so a batch can
-    // produce several receipts while the envelope has one slot for them. The
-    // latest commit is the one a caller normally needs to inspect. If an
-    // operation reports `outcome_unknown`, however, only that operation's
-    // receipt is safe recovery data: returning an earlier known receipt would
-    // point lookup at the wrong transaction (§80.3).
-    let mut receipt = None;
     let mut snapshot = None;
     let mut outcome_unknown_error = None;
 
@@ -284,18 +276,15 @@ async fn run_request(
         let result = match parsed {
             Ok(command) => {
                 let response = executor.execute(command, request, operation).await;
-                if response.status == TopLevelStatus::OutcomeUnknown {
-                    if outcome_unknown_error.is_none() {
-                        receipt = response.receipt.clone();
-                        outcome_unknown_error = Some(response.error.clone().unwrap_or_else(|| {
-                            KipError::outcome_unknown(
-                                "the executor could not establish whether the operation committed",
-                            )
-                            .into()
-                        }));
-                    }
-                } else if outcome_unknown_error.is_none() && response.receipt.is_some() {
-                    receipt = response.receipt.clone();
+                if response.status == TopLevelStatus::OutcomeUnknown
+                    && outcome_unknown_error.is_none()
+                {
+                    outcome_unknown_error = Some(response.error.clone().unwrap_or_else(|| {
+                        KipError::outcome_unknown(
+                            "the executor could not establish whether the operation committed",
+                        )
+                        .into()
+                    }));
                 }
                 if response.snapshot.is_some() {
                     snapshot = response.snapshot.clone();
@@ -336,7 +325,6 @@ async fn run_request(
             extensions: None,
         }),
         results,
-        receipt,
         snapshot,
         error: outcome_unknown_error,
         ..Default::default()
@@ -355,12 +343,14 @@ fn operation_result_from(response: Response) -> OperationResult {
         warnings,
         next_cursor,
         error,
+        receipt,
         ..
     } = response;
 
     if let Some(mut result) = results.into_iter().next() {
         result.warnings.extend(warnings);
         result.next_cursor = result.next_cursor.or(next_cursor);
+        result.receipt = result.receipt.or(receipt);
         return result;
     }
     match error {
@@ -369,11 +359,13 @@ fn operation_result_from(response: Response) -> OperationResult {
             error: Some(error),
             warnings,
             next_cursor,
+            receipt,
             ..Default::default()
         },
         None => OperationResult {
             warnings,
             next_cursor,
+            receipt,
             ..OperationResult::no_effect()
         },
     }
@@ -537,9 +529,13 @@ mod tests {
         )
         .await;
         assert_eq!(
-            response.receipt.as_ref().and_then(|r| r.tx_id.as_deref()),
+            response.results[0]
+                .receipt
+                .as_ref()
+                .and_then(|r| r.tx_id.as_deref()),
             Some("tx-9")
         );
+        assert!(response.receipt.is_none());
         // A single-command response states its caveats at the request level;
         // here that is the operation level.
         assert_eq!(response.results[0].warnings.len(), 1);

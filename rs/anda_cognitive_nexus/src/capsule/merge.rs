@@ -233,14 +233,14 @@ fn collect(capsule: &Capsule) -> Result<Vec<Record>, KipError> {
     let payload = &capsule.payload;
     let mut records = Vec::new();
     let mut ids = std::collections::BTreeSet::new();
-    for (kind, views) in [
-        (ElementKind::Concept, &payload.records.concepts),
-        (ElementKind::Proposition, &payload.records.propositions),
-        (ElementKind::Evidence, &payload.records.evidence),
-        (ElementKind::Activity, &payload.records.activities),
-        (ElementKind::Assertion, &payload.records.assertions),
+    for kind in [
+        ElementKind::Concept,
+        ElementKind::Proposition,
+        ElementKind::Evidence,
+        ElementKind::Activity,
+        ElementKind::Assertion,
     ] {
-        for view in views {
+        for view in payload.records.by_kind(kind) {
             let Some(source_id) = view.get("id").and_then(Json::as_str) else {
                 return Err(KipError::new(
                     KipErrorCode::CapsuleValidationFailed,

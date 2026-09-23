@@ -154,7 +154,7 @@ function checkEntry(entry: IngestEvidence): void {
   // Exactly one, because the two answer the same question differently: an
   // entry carrying both leaves the runtime choosing which observation the
   // record is of.
-  const inline = entry.payload !== undefined && entry.payload !== null
+  const inline = entry.payload !== undefined
   const handle = entry.payload_artifact !== undefined
   if (inline === handle) {
     throw errors.invalidRequestEnvelope(

@@ -37,6 +37,7 @@ import type { Program } from '@ldclabs/kip-lang'
 import { KipError, errors, type KipErrorCode } from '../errors.js'
 import type { Command, KqlQuery } from './ast.js'
 import { checkSemantics } from './semantics.js'
+import { checkMutationHandles } from './handles.js'
 
 /**
  * The parse-time codes kip-lang reports, in this engine's registry.
@@ -103,6 +104,7 @@ export function parseKip(source: string): Command {
     const command = lower(program)
     preserveDistinctOrdering(program, [command])
     checkPortableAst(command)
+    checkMutationHandles(command)
     checkSemantics(command)
     return command
   } catch (err) {
@@ -148,7 +150,7 @@ export function parseKipAll(source: string): Command[] {
     const program = parseProgram(source)
     const commands = lowerAll(program)
     preserveDistinctOrdering(program, commands)
-    for (const command of commands) { checkPortableAst(command); checkSemantics(command) }
+    for (const command of commands) { checkPortableAst(command); checkMutationHandles(command); checkSemantics(command) }
     return commands
   } catch (err) {
     throw toKipError(err)

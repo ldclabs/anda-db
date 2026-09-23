@@ -1261,7 +1261,8 @@ pub(crate) fn collect_where_variables(clauses: &[WhereClause], out: &mut BTreeSe
                 collect_pred_atom_variable(predicate, out);
             }
             WhereClause::Filter { .. } => {}
-            WhereClause::Not(inner) | WhereClause::Optional(inner) | WhereClause::Union(inner) => {
+            WhereClause::Not(_) => {}
+            WhereClause::Optional(inner) | WhereClause::Union(inner) => {
                 collect_where_variables(inner, out)
             }
         }
@@ -1310,7 +1311,7 @@ fn collect_triple_variables(triple: &PropositionTriple, out: &mut BTreeSet<Strin
     }
 }
 
-fn collect_term_variables(term: &Term, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_term_variables(term: &Term, out: &mut BTreeSet<String>) {
     match term {
         Term::Variable(name) => {
             out.insert(name.clone());

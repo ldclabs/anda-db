@@ -68,6 +68,18 @@ KIP 1.x data needs the explicit
 not sufficient to migrate the old graph model; collection replacement is
 one-way and should be rehearsed on a backup.
 
+## SDK wire handling
+
+Use `Request::from_json` for raw JSON to retain strict duplicate-key and numeric
+source checks. The batch helpers preserve independent/sequence receipts under
+`results[].receipt`; the top-level receipt is for atomic execution. Explicit
+null ingest payloads and result values are present values, not missing fields.
+
+`CapsuleRecords(Vec<Json>)` preserves array order; `by_kind` borrows a filtered
+view. Do not regroup records before computing or verifying a Capsule digest.
+The SDK retains delta `changes`, arbitrary handling values and proof members.
+See the [SDK migration notes](../../../docs/anda_kip.md#11-cognitive-capsules).
+
 ## Cross-engine validation
 
 The two engines share [conformance fixtures](../../../fixtures/kip-conformance-2.0/).

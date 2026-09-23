@@ -84,11 +84,11 @@ capsule.rs: struct CapsuleHandling
 capsule.rs: struct CapsuleIntegrity
 capsule.rs: struct CapsuleManifest
 capsule.rs: struct CapsulePayload
-capsule.rs: struct CapsuleProof
 capsule.rs: struct CapsuleRecords
 capsule.rs: struct CapsuleSource
 capsule.rs: struct ExternalRef
 capsule.rs: struct SchemaDependency
+capsule.rs: type CapsuleProof
 capsule.rs: type CapsuleRefMap
 cognitive.rs: fn evaluate_binary_rule
 cognitive.rs: fn validate_lease_transition

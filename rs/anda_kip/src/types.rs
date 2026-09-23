@@ -257,6 +257,17 @@ pub struct Concept {
     /// Proposition plus an Assertion instead (§10.5).
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub attributes: Map<String, Json>,
+    /// Profile-defined structural references, outside the attribute plane.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub structural: Map<String, Json>,
+    /// Canonical forwarding reference. Native views may use a bare id;
+    /// portable element artifacts carry `{id}`.
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merged_into: Option<Json>,
 }
 
 /// A Proposition — a truth-neutral tuple (Spec §12.2).
@@ -418,10 +429,10 @@ pub struct AssertionLifecycle {
     pub status: Option<AssertionStatus>,
     /// Assertions this one replaces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub supersedes: Vec<String>,
+    pub supersedes: Vec<Json>,
     /// Assertions that replaced this one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub superseded_by: Vec<String>,
+    pub superseded_by: Vec<Json>,
     /// When the assertor withdrew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retracted_at: Option<String>,
@@ -430,11 +441,19 @@ pub struct AssertionLifecycle {
 /// How an Evidence payload is carried.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct EvidencePayload {
+    /// Portable payload destruction marker (`"purged"`). Native views may
+    /// instead expose the marker in `mode`; both forms retain their spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// `inline` or `external`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// The payload itself, when carried inline.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inline: Option<Json>,
     /// A content-addressed reference, when carried externally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,10 +504,10 @@ pub struct EvidenceLifecycle {
     pub status: Option<String>,
     /// Evidence this record corrects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub corrects: Vec<String>,
+    pub corrects: Vec<Json>,
     /// Evidence that corrected this record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub corrected_by: Vec<String>,
+    pub corrected_by: Vec<Json>,
 }
 
 /// An Activity — a provenance record (Spec §16.3).

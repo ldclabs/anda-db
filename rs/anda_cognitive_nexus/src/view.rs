@@ -237,17 +237,10 @@ fn concept(row: &ConceptRow) -> Json {
         canonical_id: some_text(&row.canonical_id),
         aliases: row.aliases.clone(),
         attributes: row.attributes.clone(),
+        structural: row.structural.clone(),
+        merged_into: some_text(&row.merged_into).map(Json::String),
     };
-    finish(
-        &value,
-        &row.structural,
-        &[(
-            "merged_into",
-            some_text(&row.merged_into)
-                .map(Json::String)
-                .unwrap_or(Json::Null),
-        )],
-    )
+    serde_json::to_value(value).expect("Concept view serializes")
 }
 
 fn proposition(row: &PropositionRow) -> Json {
@@ -337,8 +330,13 @@ fn assertion(row: &AssertionRow) -> Json {
                 "expired" => Some(AssertionStatus::Expired),
                 _ => None,
             },
-            supersedes: row.supersedes.clone(),
-            superseded_by: row.superseded_by.clone(),
+            supersedes: row.supersedes.iter().cloned().map(Json::String).collect(),
+            superseded_by: row
+                .superseded_by
+                .iter()
+                .cloned()
+                .map(Json::String)
+                .collect(),
             retracted_at: some_text(&row.retracted_at),
         }),
     };
@@ -350,8 +348,9 @@ fn evidence(row: &EvidenceRow) -> Json {
         envelope: envelope(row),
         evidence_class: row.evidence_class.clone(),
         payload: Some(EvidencePayload {
+            status: None,
             mode: some_text(&row.payload_mode),
-            inline: (!row.payload_inline.is_null()).then(|| row.payload_inline.clone()),
+            inline: (row.payload_mode == "inline").then(|| row.payload_inline.clone()),
             content_ref: some_text(&row.content_ref),
         }),
         content_digest: some_text(&row.content_digest),
@@ -361,8 +360,8 @@ fn evidence(row: &EvidenceRow) -> Json {
         generated_by: some_text(&row.generated_by).map(|id| serde_json::json!({"id": id})),
         lifecycle: Some(EvidenceLifecycle {
             status: some_text(&row.status),
-            corrects: row.corrects.clone(),
-            corrected_by: row.corrected_by.clone(),
+            corrects: row.corrects.iter().cloned().map(Json::String).collect(),
+            corrected_by: row.corrected_by.iter().cloned().map(Json::String).collect(),
         }),
     };
     finish(&value, &row.structural, &[])

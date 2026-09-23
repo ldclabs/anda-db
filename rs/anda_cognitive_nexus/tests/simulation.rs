@@ -216,7 +216,7 @@ async fn simulation_is_not_a_request_option_or_an_ordinary_principal_capability(
     seed(&nexus).await;
     let request: Request = serde_json::from_value(
         json!({"kip": "2.0", "operations": [{"command": "DESCRIBE PRIMER"}],
-        "extensions": {"test/simulated_lifecycle_time": AFTER}}),
+        "extensions": {"test/simulated_lifecycle_time": {"at": AFTER}}}),
     )
     .unwrap();
     assert_eq!(

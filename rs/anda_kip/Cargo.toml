@@ -27,6 +27,9 @@ path = "src/bin/kip_cli.rs"
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 proptest = { workspace = true }
-# Only the `pattern` keyword of the vendored wire schemas needs a regex engine;
-# `tests/support/json_schema.rs` implements the rest of the keyword set itself.
-regex = { workspace = true, features = ["std"] }
+jsonschema = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "protocol"
+harness = false
