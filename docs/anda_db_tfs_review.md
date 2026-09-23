@@ -127,3 +127,108 @@ cargo bench -p anda_db_tfs --features full --bench tfs_index --no-run
 - `cargo test --workspace --all-features`: 1530 tests passed; 1 ignored at this revision. Includes the production missing-bucket bootstrap and stored-format compatibility tests.
 
 The ignored workspace test is the intentional on-disk fixture generator (`generate_fixture_for_current_version`); it is not a skipped correctness test. Existing stored-format compatibility tests passed.
+
+## Follow-up review — 2026-09-23
+
+This follow-up uses `cdc5880` as its implementation baseline. It preserves the
+CBOR format and addresses the following ordinary query and maintenance cases:
+
+- Normalize all associative OR operands, including mixed AND/NOT expressions.
+  Direct token operands are deduplicated after tokenization, so
+  `run OR run OR (beta AND gamma)` and `(run OR run) OR (beta AND gamma)` have
+  identical scores and ranking. Complex branches still contribute their scores.
+- Make compaction weights independent of previous bucket IDs by reserving a
+  fixed maximum u32 CBOR width. Repeated compaction of an unchanged index,
+  including after reload and across the 24/256 bucket-ID boundaries, does not
+  advance the version or upload objects.
+- Short-circuit empty candidate sets before posting access or selectivity
+  estimation, while retaining parser errors and successful-query counters.
+- Allocate result maps from actual matches. Missing and rare queries no longer
+  reserve a thousand entries; common queries avoid repeated result-map growth.
+  The existing shared scorer still preserves global DF and last-entry-wins
+  handling of historical duplicate postings.
+- Tokenize removals before taking mutation/document locks. Share posting pruning
+  and size accounting between removal, purge and loading, and share atomic empty
+  posting removal/ownership rechecks. This removes nested bookkeeping maps and
+  temporary sets without changing lock order or recovery behavior.
+- Reclaim oversized posting capacity during compaction, including single-bucket
+  indexes. Lists above 64 entries of capacity and below one quarter occupancy
+  shrink with room for twice the surviving length. Capacity-only changes do not
+  dirty the index.
+- Correct the English/Chinese flush concurrency contract and stripe-lock order.
+
+Regression coverage includes mixed OR ranking and stemming, compaction followed
+by flush/reload/no-op compaction, a posting-lock test for empty candidate sets,
+removal paused inside its actual mutation critical section, and allocation
+budgets. The operation model now includes purge and compaction. A separate
+recursive boolean model covers truth sets and globally scored candidate subsets.
+Benchmarks add missing terms, 0/1/100 candidates, mixed OR, unchanged compaction,
+and maintenance after deleting 90% of the corpus.
+
+### Allocation measurements
+
+On Apple ARM64 macOS with rustc 1.98.1, a standalone allocator probe using the
+same `default_tokenizer` corpus measured the following cumulative allocation
+requests per query. These are allocator request bytes, not RSS or retained heap.
+
+| Case | Before (bytes) | After (bytes) |
+| --- | ---: | ---: |
+| Missing term, 10,000 documents | 35,271 | 447 |
+| One-hit term, 10,000 documents | 35,572 | 824 |
+| Common term with an empty candidate set, 10,000 documents | 148,060 | 450 |
+
+The committed allocation test uses `SimpleTokenizer` to isolate index costs:
+missing/one-hit queries request 251/622 bytes, and an empty candidate query
+requests 250 bytes (448 with boolean parsing), both at 1,000 and 20,000 documents.
+A single-bucket corpus reduced from 20,000 to 1,000 documents releases a net
+492,288 requested bytes during maintenance, without dirtying the clean index.
+The test also verifies insertion after shrinking.
+
+```sh
+cargo test -p anda_db_tfs --all-features --test allocations -- --nocapture
+```
+
+### Paired timing measurements
+
+The preserved baseline executable and final executable ran consecutively after
+all builds/tests completed, with no concurrent compilation. Both use the updated
+fixed-corpus benchmark, the workspace size-oriented release profile (`opt-level=z`,
+LTO, one codegen unit), 20 samples, 300 ms warmup and one-second target measurement.
+This second paired run rechecked small regressions observed in the first pass;
+values below are Criterion mean estimates, not production latency guarantees.
+
+| Case | Before (µs) | After (µs) | Change |
+| --- | ---: | ---: | ---: |
+| Missing term / 10,000 | 1.255 | 1.065 | -15.1% |
+| Rare term / 10,000 | 1.643 | 1.417 | -13.8% |
+| Common term / 10,000 | 771.887 | 587.376 | -23.9% |
+| Empty candidate set / 10,000 | 310.437 | 1.005 | -99.7% |
+| One candidate / 10,000 | 330.333 | 326.424 | -1.2% |
+| AND / 10,000 | 333.659 | 329.689 | -1.2% |
+| Mixed OR / 10,000 | 362.907 | 369.305 | +1.8% |
+| Remove 100 | 3187.045 | 3175.205 | -0.4% |
+| Purge 100 | 189.755 | 187.503 | -1.2% |
+| Load 1,000 | 2158.747 | 2202.623 | +2.0% |
+| Unchanged compaction + flush / 20,000 | 63041.229 | 10442.895 | -83.4% |
+| Maintenance after 90% deletion / 1,000 | 109.255 | 120.719 | +10.5% |
+
+The repeat run did not establish a substantial AND, mixed-OR, load, or deletion
+speed change; it retained those small differences instead of claiming universal
+speedups. Maintenance after bulk deletion costs about 11 µs more in this corpus,
+including the new capacity-reclamation pass. Unchanged compaction still scans and
+packs the index, but avoids rebuilding and uploading the entire layout. A future
+single-term scorer was not added: actual-match reservation improves the existing
+shared path without duplicating global-DF or historical-posting handling.
+
+To compare revisions, copy the current benchmark file into the baseline checkout,
+compile and retain its executable, then run the baseline with `--bench --save-baseline tfs_review_paired` and the final executable with `--bench --baseline tfs_review_paired`.
+The allocation-budget command above is independent of Criterion.
+
+### Validation
+
+- `cargo check --workspace --all-features`
+- `cargo test --workspace --all-features`: 1,744 passed; one existing fixture
+  generator intentionally ignored. Crash-recovery and persisted-format tests pass.
+- TFS default, no-default and all-feature tests; `tfs_demo` example tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo fmt --all -- --check`, `make check-agents-doc`, and `git diff --check`.

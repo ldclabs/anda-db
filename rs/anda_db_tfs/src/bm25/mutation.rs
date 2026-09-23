@@ -144,6 +144,21 @@ impl<T: Tokenizer> BM25Index<T> {
         }
     }
 
+    /// Rechecks emptiness under the posting lock, releases it, then rechecks
+    /// ownership under the bucket lock. A concurrent insert may append to or
+    /// recreate a list between either check and must keep its registration.
+    fn remove_empty_postings(&self, tokens: Vec<(u32, String)>) {
+        for (owner, token) in tokens {
+            if self
+                .postings
+                .remove_if(&token, |_, posting| posting.1.is_empty())
+                .is_some()
+            {
+                self.unlist_if_unowned(owner, &token);
+            }
+        }
+    }
+
     /// Removes a document from the index.
     ///
     /// The caller must provide the *original text* that was used on
@@ -171,6 +186,8 @@ impl<T: Tokenizer> BM25Index<T> {
         if !self.is_fully_loaded() {
             return false;
         }
+        // Like insert, tokenize before entering the mutation critical section.
+        let token_freqs = collect_tokens(&mut self.tokenizer.clone(), text, None);
         let _mutation_guard = self.mutation_gate.read();
         let _doc_guard = self.doc_locks[Self::doc_stripe(id)].lock();
 
@@ -193,73 +210,28 @@ impl<T: Tokenizer> BM25Index<T> {
         // difference are within the estimate's tolerance.
         let doc_entry = doc_entry_size(id, removed_tokens.unwrap_or(0));
 
-        // Tokenize the document
-        let token_freqs = {
-            let mut tokenizer = self.tokenizer.clone();
-            collect_tokens(&mut tokenizer, text, None)
-        };
-
-        // buckets_to_update: FxHashMap<bucketid, FxHashMap<token, size_decrease>>
-        let mut buckets_to_update: FxHashMap<u32, FxHashMap<String, usize>> = FxHashMap::default();
-        // Remove from inverted index
-        let mut maybe_empty_tokens: Vec<String> = Vec::new();
+        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut emptied_tokens = Vec::new();
         for (token, _) in token_freqs {
             if let Some(mut posting) = self.postings.get_mut(&token) {
-                // Remove every entry for this document in one pass. Duplicates
-                // can exist when a previous remove() was given non-original
-                // text and the document was re-inserted afterwards.
-                let mut removed_vals: Vec<(u64, usize)> = Vec::new();
-                posting.1.retain(|entry| {
-                    if entry.0 == id {
-                        removed_vals.push(*entry);
-                        false
-                    } else {
-                        true
+                let size = retain_posting(&token, &mut posting, |doc_id| doc_id != id);
+                if size > 0 {
+                    *bucket_size_decrease.entry(posting.0).or_default() += size;
+                    if posting.1.is_empty() {
+                        emptied_tokens.push((posting.0, token));
                     }
-                });
-                if removed_vals.is_empty() {
-                    continue;
                 }
-
-                let size_decrease = if posting.1.is_empty() {
-                    maybe_empty_tokens.push(token.clone());
-                    cbor_serialized_size(&(&token, (posting.0, &removed_vals))) + 2
-                } else {
-                    removed_vals
-                        .iter()
-                        .map(|val| cbor_serialized_size(val) + 2)
-                        .sum()
-                };
-                let b = buckets_to_update.entry(posting.0).or_default();
-                b.insert(token, size_decrease);
             }
         }
 
-        // Drop empty postings atomically: a concurrent insert may have appended
-        // a new entry after the guard above was released, in which case the
-        // posting must survive. `remove_if` re-checks under the shard lock.
-        let mut removed_postings: FxHashSet<String> =
-            FxHashSet::with_capacity_and_hasher(maybe_empty_tokens.len(), FxBuildHasher);
-        for token in maybe_empty_tokens {
-            if self
-                .postings
-                .remove_if(&token, |_, posting| posting.1.is_empty())
-                .is_some()
-            {
-                removed_postings.insert(token);
-            }
-        }
-
-        for (bucket_id, val) in buckets_to_update {
+        self.remove_empty_postings(emptied_tokens);
+        for (bucket_id, size) in bucket_size_decrease {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
                 bucket.mark_dirty();
-                bucket.size = bucket.size.saturating_sub(val.values().sum());
+                bucket.size = bucket.size.saturating_sub(size);
                 if bucket.doc_ids.remove(&id) {
                     bucket.size = bucket.size.saturating_sub(doc_entry);
                 }
-            }
-            for token in val.keys().filter(|token| removed_postings.contains(*token)) {
-                self.unlist_if_unowned(bucket_id, token);
             }
         }
 
@@ -383,53 +355,21 @@ impl<T: Tokenizer> BM25Index<T> {
         // the `buckets` map is touched.
         let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
         let mut emptied_tokens: Vec<(u32, String)> = Vec::new();
-        for mut posting in self.postings.iter_mut() {
-            let bucket_id = posting.0;
-            let mut removed_entries: Vec<(u64, usize)> = Vec::new();
-            posting.1.retain(|entry| {
-                if dead.contains(&entry.0) {
-                    removed_entries.push(*entry);
-                    false
-                } else {
-                    true
+        for mut entry in self.postings.iter_mut() {
+            let (token, posting) = entry.pair_mut();
+            let size = retain_posting(token, posting, |id| !dead.contains(&id));
+            if size > 0 {
+                *bucket_size_decrease.entry(posting.0).or_default() += size;
+                if posting.1.is_empty() {
+                    emptied_tokens.push((posting.0, token.clone()));
                 }
-            });
-            if removed_entries.is_empty() {
-                continue;
-            }
-
-            // Mirror of `remove`: the whole `(token, (bucket, entries))` tuple
-            // when the posting disappears — that is what `insert` charged for
-            // a brand-new token — and the per-entry cost otherwise.
-            let size_decrease = if posting.1.is_empty() {
-                emptied_tokens.push((bucket_id, posting.key().clone()));
-                cbor_serialized_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
-            } else {
-                removed_entries
-                    .iter()
-                    .map(|entry| cbor_serialized_size(entry) + 2)
-                    .sum()
-            };
-            *bucket_size_decrease.entry(bucket_id).or_default() += size_decrease;
-        }
-
-        // Phase 3: drop the emptied posting lists atomically. A concurrent
-        // insert may have appended an entry after the sweep released the shard
-        // guard, in which case the posting must survive; `remove_if` re-checks
-        // under the shard lock.
-        let mut removed_postings: FxHashSet<String> =
-            FxHashSet::with_capacity_and_hasher(emptied_tokens.len(), FxBuildHasher);
-        for (_, token) in emptied_tokens.iter() {
-            if self
-                .postings
-                .remove_if(token, |_, posting| posting.1.is_empty())
-                .is_some()
-            {
-                removed_postings.insert(token.clone());
             }
         }
 
-        // Phase 4: resize and dirty every bucket that owned an affected token.
+        // Recheck emptiness and ownership before applying deferred accounting.
+        self.remove_empty_postings(emptied_tokens);
+
+        // Phase 3: resize and dirty every bucket that owned an affected token.
         let mut purged_postings = !bucket_size_decrease.is_empty();
         for (bucket_id, size_decrease) in bucket_size_decrease {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
@@ -438,19 +378,7 @@ impl<T: Tokenizer> BM25Index<T> {
             }
         }
 
-        // Phase 5: unlist the tokens whose posting is genuinely gone.
-        // `removed_postings` is a snapshot: a concurrent insert may have
-        // re-created the posting, possibly in another bucket. Only drop the
-        // token when no bucket claims it or a different one does, otherwise no
-        // bucket would list it and `serialize_bucket` would lose the term.
-        for (bucket_id, token) in emptied_tokens {
-            if !removed_postings.contains(&token) {
-                continue;
-            }
-            self.unlist_if_unowned(bucket_id, &token);
-        }
-
-        // Phase 6: drop the purged ids from every bucket's doc-id set. A
+        // Phase 4: drop the purged ids from every bucket's doc-id set. A
         // bucket can still list one without owning a posting for it, and its
         // serialized `doc_tokens` would resurrect the id on reload. Read-scan
         // first so a purge that touches nothing does not write-lock every

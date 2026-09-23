@@ -32,6 +32,8 @@ enum Op {
     RemoveMissing(u64),
     /// Re-insert a live document id; must fail with `AlreadyExists`.
     ReinsertLive(usize),
+    Purge(Vec<usize>),
+    Compact,
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -40,6 +42,8 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => (0usize..64).prop_map(Op::RemoveLive),
         1 => (1_000_000u64..1_000_010).prop_map(Op::RemoveMissing),
         1 => (0usize..64).prop_map(Op::ReinsertLive),
+        1 => prop::collection::vec(0usize..64, 0..8).prop_map(Op::Purge),
+        1 => Just(Op::Compact),
     ]
 }
 
@@ -211,6 +215,17 @@ proptest! {
                         "expected AlreadyExists, got {:?}", err
                     );
                 }
+                Op::Purge(selectors) => {
+                    let live: Vec<_> = model.docs.keys().copied().collect();
+                    let ids: BTreeSet<_> = if live.is_empty() {
+                        BTreeSet::new()
+                    } else {
+                        selectors.iter().map(|n| live[n % live.len()]).collect()
+                    };
+                    prop_assert_eq!(index.purge_ids(&ids, now_ms), ids.len());
+                    for id in ids { model.docs.remove(&id); }
+                }
+                Op::Compact => { index.compact_buckets(); }
             }
         }
 
@@ -218,5 +233,82 @@ proptest! {
 
         let reloaded = flush_and_reload(&index);
         assert_search_matches_model(&reloaded, &model, "after flush/load round-trip");
+    }
+}
+
+#[derive(Clone, Debug)]
+enum BooleanExpr {
+    Term(usize),
+    Not(Box<Self>),
+    And(Vec<Self>),
+    Or(Vec<Self>),
+}
+
+impl BooleanExpr {
+    fn render(&self) -> String {
+        match self {
+            Self::Term(i) => WORDS[*i].into(),
+            Self::Not(inner) => format!("NOT ({})", inner.render()),
+            Self::And(children) | Self::Or(children) => {
+                let operator = if matches!(self, Self::And(_)) {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                children
+                    .iter()
+                    .map(|q| format!("({})", q.render()))
+                    .collect::<Vec<_>>()
+                    .join(operator)
+            }
+        }
+    }
+
+    fn matches(&self, id: u64) -> bool {
+        match self {
+            Self::Term(i) => id & (1 << i) != 0,
+            Self::Not(inner) => !inner.matches(id),
+            Self::And(children) => children.iter().all(|q| q.matches(id)),
+            Self::Or(children) => children.iter().any(|q| q.matches(id)),
+        }
+    }
+}
+
+fn boolean_expr() -> impl Strategy<Value = BooleanExpr> {
+    (0usize..5)
+        .prop_map(BooleanExpr::Term)
+        .prop_recursive(4, 32, 3, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(|q| BooleanExpr::Not(Box::new(q))),
+                prop::collection::vec(inner.clone(), 2..4).prop_map(BooleanExpr::And),
+                prop::collection::vec(inner, 2..4).prop_map(BooleanExpr::Or),
+            ]
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    #[test]
+    fn nested_boolean_queries_match_truth_model(
+        expr in boolean_expr(),
+        scope in prop::collection::vec(0u64..40, 0..32),
+    ) {
+        let index = BM25Index::new("boolean-model".into(), default_tokenizer(), None);
+        // All combinations of five words, including a document matching none.
+        for id in 0..32 {
+            let mut text = String::from("anchor");
+            for (i, word) in WORDS.iter().take(5).enumerate() {
+                if id & (1 << i) != 0 { text.push(' '); text.push_str(word); }
+            }
+            index.insert(id, &text, 0).unwrap();
+        }
+        let query = expr.render();
+        let full = index.try_search_advanced(&query, 100, None).unwrap();
+        let expected: BTreeSet<_> = (0..32).filter(|id| expr.matches(*id)).collect();
+        prop_assert_eq!(full.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>(), expected);
+        let scoped = index.try_search_in_ids(&query, 100, None, &scope, true).unwrap();
+        let expected_scoped: Vec<_> = full.into_iter().filter(|(id, _)| scope.contains(id)).collect();
+        prop_assert_eq!(scoped, expected_scoped);
     }
 }

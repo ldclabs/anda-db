@@ -59,6 +59,89 @@ fn boolean_operands_preserve_tokenizer_semantics() {
 }
 
 #[test]
+fn mixed_or_grouping_preserves_scores_and_ranking() {
+    use tantivy::tokenizer::{SimpleTokenizer, Stemmer};
+    let tokenizer = anda_db_tfs::TokenizerChain::builder(SimpleTokenizer::default())
+        .filter(Stemmer::default())
+        .build();
+    let index = BM25Index::new("or-grouping".into(), tokenizer, None);
+    for (id, text) in [(1, "run"), (2, "beta gamma"), (3, "run beta gamma")] {
+        index.insert(id, text, 0).unwrap();
+    }
+    let expected = index.search_advanced("run OR (beta AND gamma)", 10, None);
+    for query in [
+        "run OR run OR (beta AND gamma)",
+        "(run OR run) OR (beta AND gamma)",
+        "run OR (run OR (beta AND gamma))",
+        "(beta AND gamma) OR (run OR run)",
+        "running OR runs OR (beta AND gamma)",
+    ] {
+        assert_eq!(index.search_advanced(query, 10, None), expected, "{query}");
+        assert_eq!(
+            index
+                .try_search_in_ids(query, 10, None, &[1, 2], true)
+                .unwrap(),
+            expected
+                .iter()
+                .copied()
+                .filter(|(id, _)| *id != 3)
+                .collect::<Vec<_>>(),
+            "{query}",
+        );
+    }
+}
+
+#[test]
+fn compaction_is_stable_across_bucket_id_widths_and_reload() {
+    use tantivy::tokenizer::SimpleTokenizer;
+    for (count, limit) in [(1000, 64), (1000, 512), (20_000, 8192)] {
+        let index = BM25Index::new(
+            "stable-compaction".into(),
+            SimpleTokenizer::default(),
+            Some(BM25Config {
+                bucket_overload_size: limit,
+                ..Default::default()
+            }),
+        );
+        for id in 0..count {
+            index
+                .insert(id, &format!("term{id:06} common group{:03}", id % 100), 0)
+                .unwrap();
+        }
+        assert!(index.stats().max_bucket_id >= if limit == 64 { 256 } else { 24 });
+        let hits = index.search("common term000099", 10, None);
+        let mut store = Store::default();
+        save(&index, &mut store);
+        index.compact_buckets();
+        save(&index, &mut store);
+        let committed = store.metadata.clone();
+        let version = index.stats().version;
+        for _ in 0..3 {
+            let (before, after) = index.compact_buckets();
+            assert_eq!(before, after);
+            assert_eq!(index.stats().version, version);
+            assert!(!index.has_dirty_buckets());
+            let outcome = block_on(index.flush_with(
+                2,
+                |_| async { panic!("unchanged compaction committed metadata") },
+                |_, _| async { panic!("unchanged compaction uploaded a bucket") },
+            ));
+            assert!(!outcome.unwrap().saved);
+        }
+        let loaded = block_on(BM25Index::load_all_strict(
+            SimpleTokenizer::default(),
+            committed.as_slice(),
+            async |key| Ok(store.buckets.get(&key).cloned()),
+        ))
+        .unwrap();
+        assert_eq!(loaded.search("common term000099", 10, None), hits);
+        loaded.compact_buckets();
+        assert!(!loaded.has_dirty_buckets());
+        assert_eq!(loaded.stats().version, version);
+    }
+}
+
+#[test]
 fn guarded_parser_never_silently_changes_negation() {
     for parentheses in 0..=64 {
         for negations in 0..=65 {

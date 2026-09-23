@@ -255,7 +255,8 @@ impl<T: Tokenizer> BM25Index<T> {
         let mut empty_tokens: Vec<(u32, String)> = Vec::new();
         let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
 
-        for mut posting in self.postings.iter_mut() {
+        for mut entry in self.postings.iter_mut() {
+            let (token, posting) = entry.pair_mut();
             let bucket_id = posting.0;
             let doc_ids = doc_ids_by_bucket.entry(bucket_id).or_default();
             // Prune entries whose document has no token length anywhere.
@@ -265,29 +266,20 @@ impl<T: Tokenizer> BM25Index<T> {
             // remove() that was given non-original text. Dropping it here makes
             // the index self-healing on reload. Documents from buckets that
             // were intentionally skipped (partial load) are not affected.
-            let mut removed_entries: Vec<(u64, usize)> = Vec::new();
-            posting.1.retain(|entry| {
-                if let Some(token_count) = doc_token_lengths.get(&entry.0) {
-                    loaded_doc_tokens.insert(entry.0, *token_count);
-                    doc_ids.insert(entry.0);
+            let size = retain_posting(token, posting, |id| {
+                if let Some(token_count) = doc_token_lengths.get(&id) {
+                    loaded_doc_tokens.insert(id, *token_count);
+                    doc_ids.insert(id);
                     true
                 } else {
-                    removed_entries.push(*entry);
                     false
                 }
             });
-
-            if !removed_entries.is_empty() {
-                let size_decrease = if posting.1.is_empty() {
-                    empty_tokens.push((bucket_id, posting.key().clone()));
-                    cbor_serialized_size(&(posting.key(), (bucket_id, &removed_entries))) + 2
-                } else {
-                    removed_entries
-                        .iter()
-                        .map(|entry| cbor_serialized_size(entry) + 2)
-                        .sum()
-                };
-                *bucket_size_decrease.entry(bucket_id).or_default() += size_decrease;
+            if size > 0 {
+                *bucket_size_decrease.entry(bucket_id).or_default() += size;
+                if posting.1.is_empty() {
+                    empty_tokens.push((bucket_id, token.clone()));
+                }
             }
         }
 

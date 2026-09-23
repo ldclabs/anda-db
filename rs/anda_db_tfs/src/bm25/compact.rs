@@ -13,7 +13,10 @@ impl<T: Tokenizer> BM25Index<T> {
     ///
     /// * bucket ids are reassigned to a contiguous `0..new_count` range;
     /// * every resulting bucket is marked dirty so the next
-    ///   [`flush`](Self::flush) will rewrite the full on-disk layout.
+    ///   [`flush`](Self::flush) will rewrite the full on-disk layout, unless
+    ///   it already has the canonical layout;
+    /// * posting lists with substantial unused capacity release it. This is
+    ///   in-memory maintenance and does not itself dirty any bucket.
     ///
     /// This is a heuristic, not a guarantee of the optimal bucket count. Its
     /// cost is `O(P + U log U)` for P posting entries and U distinct tokens,
@@ -41,7 +44,20 @@ impl<T: Tokenizer> BM25Index<T> {
         // The postings are still on disk; the bucket map is placeholders, so
         // there is nothing to repack and rebuilding it would drop every
         // committed bucket from the manifest.
-        if !self.is_fully_loaded() || old_count <= 1 {
+        if !self.is_fully_loaded() {
+            return (old_count, old_count);
+        }
+
+        // Bulk deletion retains Vec capacity on the mutation hot path. Reclaim
+        // it only during maintenance, including a one-bucket index. Leave some
+        // headroom for subsequent inserts and avoid resizing small lists.
+        for mut posting in self.postings.iter_mut() {
+            let entries = &mut posting.1;
+            if entries.capacity() > 64 && entries.capacity() / 4 > entries.len() {
+                entries.shrink_to(entries.len().saturating_mul(2));
+            }
+        }
+        if old_count <= 1 {
             return (old_count, old_count);
         }
 
@@ -50,7 +66,10 @@ impl<T: Tokenizer> BM25Index<T> {
             .postings
             .iter()
             .map(|entry| {
-                let size = cbor_serialized_size(&(entry.key(), entry.value())) + 2;
+                // Old owner IDs must not affect packing: their variable CBOR
+                // width changes after reassignment and can make every repeated
+                // compaction rewrite the index. Reserve the maximum u32 width.
+                let size = cbor_serialized_size(&(entry.key(), (u32::MAX, &entry.1))) + 2;
                 (entry.key().clone(), size)
             })
             .collect();

@@ -85,6 +85,7 @@ fn benchmark(c: &mut Criterion) {
         let docs = corpus(n, false);
         let index = build(&docs, 8192, false);
         for (name, query, advanced) in [
+            ("missing", "absent", false),
             ("rare", "term000099", false),
             ("common", "common", false),
             ("and", "common AND term000099", true),
@@ -101,6 +102,27 @@ fn benchmark(c: &mut Criterion) {
                 })
             });
         }
+        for count in [0, 1, 100] {
+            let ids: Vec<_> = (0..count).collect();
+            search.bench_function(BenchmarkId::new(format!("candidates_{count}"), n), |b| {
+                b.iter(|| {
+                    black_box(
+                        index
+                            .try_search_in_ids("common", 10, None, black_box(&ids), false)
+                            .unwrap(),
+                    )
+                })
+            });
+        }
+        search.bench_function(BenchmarkId::new("mixed_or", n), |b| {
+            b.iter(|| {
+                black_box(index.search_advanced(
+                    "group01 OR group01 OR (group02 AND common)",
+                    10,
+                    None,
+                ))
+            })
+        });
         let many_absent_negatives = format!(
             "common{}",
             (0..64)
@@ -218,6 +240,28 @@ fn benchmark(c: &mut Criterion) {
     persistence.bench_function("compact_1000", |b| {
         b.iter_batched(
             || build(&docs, 512, false),
+            |index| black_box(index.compact_buckets()),
+            BatchSize::SmallInput,
+        )
+    });
+    let compacted = build(&corpus(20_000, false), 8192, false);
+    compacted.compact_buckets();
+    let mut compacted_store = Store::default();
+    save(&compacted, &mut compacted_store);
+    persistence.bench_function("compact_unchanged_20000", |b| {
+        b.iter(|| {
+            compacted.compact_buckets();
+            black_box(save(&compacted, &mut compacted_store))
+        })
+    });
+    let deleted = (100..1000).collect::<BTreeSet<_>>();
+    persistence.bench_function("compact_after_purge_90_percent", |b| {
+        b.iter_batched(
+            || {
+                let index = build(&docs, 8192, false);
+                index.purge_ids(&deleted, 1);
+                index
+            },
             |index| black_box(index.compact_buckets()),
             BatchSize::SmallInput,
         )

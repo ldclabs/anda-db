@@ -58,7 +58,7 @@ BM25Index
   | `tokens`        | The list of terms owned by this bucket            |
   | `doc_ids`       | The set of document IDs seen in this bucket       |
 
-`is_dirty()` is true if and only if `dirty_version > saved_version`, which gives `flush` an **idempotent and linearly incremental** behavior: a successfully written bucket only records the `dirty_version` observed at write time. If it is modified again concurrently, it remains dirty and will be written again on the next flush.
+`is_dirty()` is true if and only if `dirty_version > saved_version`. A flush records the captured dirty versions as saved only after the manifest commit succeeds; failures leave the buckets retryable. The caller must exclude mutations, compaction, and other flushes for the entire flush. Version tracking does not make concurrent mutation during flush safe.
 
 ---
 
@@ -84,11 +84,18 @@ For fragmented indexes left over from earlier versions, or buckets hollowed out 
 
 The return value `(old_count, new_count)` is useful for monitoring. Concurrent `insert` / `remove` calls are safe: `compact_buckets` takes the index's internal mutation gate exclusively, so no mutation can observe — or add to — the half-rebuilt bucket map. It must still not overlap a `flush` (see [§5](#5-concurrency-model)).
 
+Packing uses a fixed conservative CBOR width for the bucket owner, so the old
+bucket IDs cannot influence the new layout. Repeating compaction without data
+changes, including after reload, leaves the version and dirty state unchanged.
+Maintenance also shrinks posting lists whose capacity exceeds four times their
+length (and 64 entries), retaining space for twice the live length. This applies
+to single-bucket indexes too and does not itself require a disk write.
+
 ---
 
 ## 5. Concurrency Model
 
-- Insert, remove, purge and search support concurrent calls. Mutations of the same document id are serialized with internal striped locks, spanning document membership, postings and bucket accounting. Batch purge acquires stripes in ascending order.
+- Insert, remove, purge and search support concurrent calls. Mutations of the same document id are serialized with internal striped locks, spanning document membership, postings and bucket accounting. Batch purge deduplicates stripe indices and acquires them in ascending order.
 - The lock order is mutation gate → document stripes → maps. Posting creation and bucket registration share a bucket lock. Removal rechecks posting ownership while holding that same bucket lock before unlisting a token.
 - Compaction holds the mutation gate exclusively. The caller must exclude flush from mutations, compaction and other flushes for the entire async call; Collection's exclusive operation lease provides this. One writer per durable index remains the deployment contract.
 - Searches are best-effort concurrent reads, not transactional snapshots. A query samples corpus statistics once; counters converge after completed mutations. No average-length cache is maintained.
@@ -206,6 +213,12 @@ let hits = index.search_advanced(
     None,
 );
 ```
+
+OR normalization flattens nested ORs and merges their direct token operands even
+when AND/NOT branches are present. Duplicate normalized tokens contribute once
+within that OR; redundant OR parentheses do not change scores. Complex branches
+still contribute their own scores. Empty candidate sets stop before reading
+postings; other candidate searches continue to use global DF/IDF.
 
 ---
 

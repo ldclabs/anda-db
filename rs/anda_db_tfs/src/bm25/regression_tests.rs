@@ -22,14 +22,18 @@ impl Tokenizer for PausingTokenizer {
 }
 
 #[test]
-fn same_id_reinsert_waits_for_the_entire_remove() {
+fn remove_tokenizes_before_acquiring_mutation_locks() {
     let tokenizer = PausingTokenizer {
         inner: RawTokenizer::default(),
         armed: Arc::new(AtomicBool::new(false)),
         entered: Arc::new(Barrier::new(2)),
         resume: Arc::new(Barrier::new(2)),
     };
-    let index = Arc::new(BM25Index::new("same-id".into(), tokenizer.clone(), None));
+    let index = Arc::new(BM25Index::new(
+        "tokenize-first".into(),
+        tokenizer.clone(),
+        None,
+    ));
     index.insert(1, "alpha", 0).unwrap();
     tokenizer.armed.store(true, Ordering::SeqCst);
     let removing = {
@@ -37,8 +41,45 @@ fn same_id_reinsert_waits_for_the_entire_remove() {
         std::thread::spawn(move || index.remove(1, "alpha", 1))
     };
     tokenizer.entered.wait();
+    let unlocked = index.doc_locks[BM25Index::<PausingTokenizer>::doc_stripe(1)]
+        .try_lock()
+        .is_some();
+    let present = index.get_doc_tokens(1);
+    tokenizer.resume.wait();
+    assert!(removing.join().unwrap());
+    assert!(unlocked, "tokenization must not hold a document stripe");
+    assert_eq!(
+        present,
+        Some(1),
+        "tokenization must precede membership removal"
+    );
+}
+
+#[test]
+fn same_id_reinsert_waits_for_the_entire_remove() {
+    use std::time::{Duration, Instant};
+    let index = Arc::new(BM25Index::new(
+        "same-id".into(),
+        RawTokenizer::default(),
+        None,
+    ));
+    index.insert(1, "alpha", 0).unwrap();
+    // Park removal after membership removal but before posting cleanup.
+    let posting = index.postings.get_mut("alpha").unwrap();
+    let removing = {
+        let index = index.clone();
+        std::thread::spawn(move || index.remove(1, "alpha", 1))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while index.doc_tokens.contains_key(&1) {
+        assert!(
+            Instant::now() < deadline,
+            "remove never entered its critical section"
+        );
+        std::thread::yield_now();
+    }
     assert!(
-        index.doc_locks[BM25Index::<PausingTokenizer>::doc_stripe(1)]
+        index.doc_locks[BM25Index::<RawTokenizer>::doc_stripe(1)]
             .try_lock()
             .is_none()
     );
@@ -46,13 +87,56 @@ fn same_id_reinsert_waits_for_the_entire_remove() {
         let index = index.clone();
         std::thread::spawn(move || index.insert(1, "alpha", 2))
     };
-    tokenizer.resume.wait();
+    drop(posting);
     assert!(removing.join().unwrap());
     inserting.join().unwrap().unwrap();
     assert_eq!(index.len(), 1);
     assert_eq!(index.search("alpha", 10, None)[0].0, 1);
     assert_eq!(index.total_tokens.load(Ordering::Relaxed), 1);
     assert_roundtrip(&index, 1);
+}
+
+#[test]
+fn empty_candidates_do_not_read_postings() {
+    use std::{sync::mpsc, time::Duration};
+    let index = Arc::new(BM25Index::new(
+        "empty-scope".into(),
+        RawTokenizer::default(),
+        None,
+    ));
+    index.insert(1, "common", 0).unwrap();
+    for (query, logical) in [
+        ("common", false),
+        ("common", true),
+        ("common AND present", true),
+        ("common OR NOT absent", true),
+    ] {
+        let posting = index.postings.get_mut("common").unwrap();
+        let (send, receive) = mpsc::channel();
+        let searching = {
+            let index = index.clone();
+            std::thread::spawn(move || {
+                send.send(index.try_search_in_ids(query, 10, None, &[], logical))
+                    .unwrap();
+            })
+        };
+        let result = receive.recv_timeout(Duration::from_secs(5));
+        drop(posting);
+        searching.join().unwrap();
+        assert!(
+            result
+                .expect("empty scope tried to lock postings")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(index.stats().search_count, 4);
+    assert!(
+        index
+            .try_search_in_ids(&"x".repeat(9000), 10, None, &[], true)
+            .is_err()
+    );
+    assert_eq!(index.stats().search_count, 4);
 }
 
 #[test]

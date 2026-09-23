@@ -6,7 +6,7 @@
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -53,6 +53,34 @@ fn cbor_serialized_size<T: ?Sized + Serialize>(value: &T) -> usize {
 /// first time a document lands in it and refunded when the document leaves.
 fn doc_entry_size(doc_id: u64, token_count: usize) -> usize {
     cbor_serialized_size(&(doc_id, token_count))
+}
+
+/// Removes posting entries and returns the same size estimate charged on insert.
+/// Shared by text deletion, bulk purge and load-time stale-entry cleanup.
+fn retain_posting(
+    token: &str,
+    posting: &mut PostingValue,
+    mut keep: impl FnMut(u64) -> bool,
+) -> usize {
+    let mut removed = Vec::new();
+    posting.1.retain(|entry| {
+        if keep(entry.0) {
+            true
+        } else {
+            removed.push(*entry);
+            false
+        }
+    });
+    if removed.is_empty() {
+        0
+    } else if posting.1.is_empty() {
+        cbor_serialized_size(&(token, (posting.0, &removed))) + 2
+    } else {
+        removed
+            .iter()
+            .map(|entry| cbor_serialized_size(entry) + 2)
+            .sum()
+    }
 }
 
 /// Copies at most [`MAX_ERROR_TEXT_BYTES`] of `text` into an error value,

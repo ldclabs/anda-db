@@ -178,6 +178,11 @@ impl<T: Tokenizer> BM25Index<T> {
         context: &mut QueryContext,
         candidates: Option<&Scores>,
     ) -> Result<Scores, BM25Error> {
+        // Parsing already succeeded; even selectivity estimates would take
+        // unnecessary posting locks when the external filter matched nothing.
+        if candidates.is_some_and(Scores::is_empty) {
+            return Ok(Scores::default());
+        }
         match query {
             QueryPlan::Terms(tokens) => Ok(self.score_tokens(tokens, context, candidates)),
             QueryPlan::Or(queries) => {
@@ -202,13 +207,10 @@ impl<T: Tokenizer> BM25Index<T> {
         context: &mut QueryContext,
         candidates: Option<&Scores>,
     ) -> Scores {
-        if context.doc_count == 0 || tokens.is_empty() {
+        if context.doc_count == 0 || tokens.is_empty() || candidates.is_some_and(Scores::is_empty) {
             return Scores::default();
         }
-        let mut scores = Scores::with_capacity_and_hasher(
-            candidates.map_or(1000, Scores::len).min(context.doc_count),
-            FxBuildHasher,
-        );
+        let mut scores = Scores::default();
         let mut valid: FxHashMap<u64, (f32, f32)> = FxHashMap::default();
         let mut live_ids = FxHashSet::default();
         // Factor the document-length normalization once. In particular, do
@@ -296,6 +298,11 @@ impl<T: Tokenizer> BM25Index<T> {
                 idf
             });
             let weight = idf * tf_gain;
+            // Allocate from actual matches, not a fixed minimum: missing and
+            // rare terms should not reserve room for a thousand documents.
+            if scores.is_empty() {
+                scores.reserve(valid.len());
+            }
             for (id, (tf, length)) in valid.drain() {
                 *scores.entry(id).or_default() +=
                     tf * weight / (tf + norm_base + norm_length * length);
@@ -724,26 +731,36 @@ impl QueryPlan {
                     .collect(),
             ),
             QueryType::Or(queries) => {
-                let queries: Vec<_> = queries
-                    .iter()
-                    .map(|q| Self::prepare(q, tokenizer))
-                    .collect();
-                if queries.iter().all(|q| matches!(q, Self::Terms(_))) {
-                    // Merge token sets, never the raw operand text: tokenizers
-                    // may be case-sensitive or depend on whitespace/context.
-                    let mut tokens = Vec::new();
-                    for query in queries {
-                        if let Self::Terms(mut terms) = query {
-                            tokens.append(&mut terms);
-                        }
-                    }
-                    tokens.sort_unstable();
-                    tokens.dedup();
-                    Self::Terms(tokens)
-                } else {
-                    Self::Or(queries)
+                let mut tokens = Vec::new();
+                let mut branches = Vec::new();
+                for query in queries {
+                    Self::prepare(query, tokenizer).collect_or(&mut tokens, &mut branches);
+                }
+                // Normalize the entire associative OR, including when it has
+                // AND/NOT branches. Parentheses must not change term weights.
+                // Tokenize operands independently to preserve custom tokenizers.
+                tokens.sort_unstable();
+                tokens.dedup();
+                if branches.is_empty() {
+                    return Self::Terms(tokens);
+                }
+                if !tokens.is_empty() {
+                    branches.insert(0, Self::Terms(tokens));
+                }
+                Self::Or(branches)
+            }
+        }
+    }
+
+    fn collect_or(self, tokens: &mut Vec<String>, branches: &mut Vec<Self>) {
+        match self {
+            Self::Terms(mut terms) => tokens.append(&mut terms),
+            Self::Or(queries) => {
+                for query in queries {
+                    query.collect_or(tokens, branches);
                 }
             }
+            query => branches.push(query),
         }
     }
 }
