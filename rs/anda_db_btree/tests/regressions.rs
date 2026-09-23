@@ -96,7 +96,7 @@ fn missing_manifest_object_is_an_error_and_partial_load_is_read_only() {
     assert!(partial.insert(99, 99, 3).unwrap());
 }
 #[test]
-fn cancelled_load_can_be_retried_without_mutating_partial_state() {
+fn cancelled_load_keeps_queries_consistent_and_can_be_retried() {
     let index = BTreeIndex::new(
         "cancel_load".into(),
         Some(BTreeConfig {
@@ -122,6 +122,18 @@ fn cancelled_load_can_be_retried_without_mutating_partial_state() {
         assert!(matches!(futures::poll!(future), std::task::Poll::Pending));
     });
     assert_eq!(loaded.load_state(), LoadState::Partial);
+    // Dropping the load future must leave every loaded posting reachable by
+    // ordered queries, even before the caller retries the incomplete load.
+    let loaded_keys: Vec<_> = (0..40)
+        .filter(|key| loaded.query_with(key, |_| Some(())).is_some())
+        .collect();
+    assert!(!loaded_keys.is_empty());
+    assert_eq!(loaded.len(), loaded_keys.len());
+    assert_eq!(loaded.keys(None, None), loaded_keys);
+    assert_eq!(
+        loaded.range_query_with(RangeQuery::Ge(0), |key, _| (true, vec![*key])),
+        loaded_keys
+    );
     assert!(loaded.insert(99, 99, 2).is_err());
     block_on(loaded.load_buckets(async |obj| Ok(store.buckets.get(&obj).cloned()))).unwrap();
     assert_eq!(loaded.keys(None, None), (0..40).collect::<Vec<_>>());

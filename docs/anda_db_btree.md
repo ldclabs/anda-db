@@ -133,8 +133,9 @@ failed or cancelled attempt remains `LoadState::Partial`.
 
 The ordered key set is built once, from the loaded postings, after the bucket
 objects have been read. A sorted bulk build replaces per-bucket insertion in
-hash order. It also runs when loading stops on an error, so every loaded
-posting stays reachable by range queries.
+hash order. It also runs when loading stops on an error or its future is
+cancelled, so every loaded posting stays reachable by range queries before
+a retry.
 
 Only Ready accepts mutations:
 

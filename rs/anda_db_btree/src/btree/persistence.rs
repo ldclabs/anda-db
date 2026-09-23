@@ -1,5 +1,15 @@
 use super::*;
 
+// Rebuild once from surviving postings on every exit, including cancellation
+// while awaiting a bucket. No lock is held across an await.
+struct RebuildKeysOnDrop<'a, PK: BTreeKey, FV: BTreeKey>(&'a mut BTreeIndex<PK, FV>);
+
+impl<PK: BTreeKey, FV: BTreeKey> Drop for RebuildKeysOnDrop<'_, PK, FV> {
+    fn drop(&mut self) {
+        *self.0.btree.get_mut() = self.0.postings.iter().map(|e| e.key().clone()).collect();
+    }
+}
+
 impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     /// Loads an index from metadata reader and a closure for loading buckets.
     ///
@@ -150,20 +160,22 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
 
         let mut loaded_bucket_ids: Vec<u32> = Vec::new();
         let loaded = async {
+            let guard = RebuildKeysOnDrop(self);
+            let index = &mut *guard.0;
             for object in objects {
                 let i = object.bucket_id;
-                let data = f(object).await.map_err(|err| self.generic_error(err))?;
+                let data = f(object).await.map_err(|err| index.generic_error(err))?;
                 let Some(data) = data else {
                     if !legacy {
                         if !allow_partial {
-                            return Err(self.generic_error(format!(
+                            return Err(index.generic_error(format!(
                                 "bucket object ({i}, {}) referenced by the manifest is missing",
                                 object.generation
                             )));
                         }
                         log::warn!(
                             "BTreeIndex '{}': bucket object ({}, {}) referenced by the manifest is missing; index is read-only",
-                            self.name,
+                            index.name,
                             i,
                             object.generation
                         );
@@ -174,7 +186,7 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
 
                 loaded_bucket_ids.push(i);
                 let bucket: BucketOwned<PK, FV> =
-                    cbor2::from_reader(&data[..]).map_err(|err| self.serialization_error(err))?;
+                    cbor2::from_reader(&data[..]).map_err(|err| index.serialization_error(err))?;
                 let mut bks =
                     FxHashSet::with_capacity_and_hasher(bucket.postings.len(), Default::default());
                 // Set when this bucket file contains stale entries (an empty
@@ -200,29 +212,29 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
                     // the next flush.
                     if posting.docs.is_empty() {
                         needs_repair = true;
-                        if let Some((_, previous)) = self.postings.remove(&field_value) {
-                            self.detach_superseded_posting(&field_value, &previous, i);
+                        if let Some((_, previous)) = index.postings.remove(&field_value) {
+                            index.detach_superseded_posting(&field_value, &previous, i);
                         }
                         continue;
                     }
 
                     posting.bucket_id = i;
-                    if let Some(previous) = self.postings.insert(field_value.clone(), posting) {
-                        self.detach_superseded_posting(&field_value, &previous, i);
+                    if let Some(previous) = index.postings.insert(field_value.clone(), posting) {
+                        index.detach_superseded_posting(&field_value, &previous, i);
                     }
 
                     bks.insert(field_value);
                 }
 
                 if needs_repair {
-                    self.dirty_hint.store(true, Ordering::Release);
+                    index.dirty_hint.store(true, Ordering::Release);
                 }
                 // `data.len()` (the on-disk payload length) seeds the bucket
                 // size here, while runtime mutations apply estimated deltas
                 // (`posting_entry_size` + fudge). The two baselines can drift
                 // slightly; the size is only used for packing decisions and
                 // is always combined with saturating arithmetic.
-                self.buckets.insert(
+                index.buckets.insert(
                     i,
                     BucketState::new(data.len(), needs_repair, bks, u64::from(needs_repair)),
                 );
@@ -230,12 +242,6 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
             Ok::<(), BTreeError>(())
         }
         .await;
-        // Build the ordered key set once from the surviving postings: a sorted
-        // bulk build is far cheaper than inserting each bucket's keys in hash
-        // order, and superseded or tombstoned keys are already gone. It also
-        // runs when loading stopped early, so a failed load still keeps every
-        // posting reachable by range queries.
-        *self.btree.get_mut() = self.postings.iter().map(|e| e.key().clone()).collect();
         loaded?;
 
         if missing.is_empty() {

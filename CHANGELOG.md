@@ -29,6 +29,9 @@ All notable changes to this workspace are documented in this file.
   field stays for older readers.
 - anda_db_btree: loading builds the ordered key set once from the loaded
   postings (1M keys load about 27% faster).
+- anda_db_btree: cancelled bucket loads also rebuild the ordered key set,
+  keeping range queries consistent with point queries on the read-only
+  partial index before retrying.
 - anda_db_btree: flush leaves buckets without postings out of the manifest
   and reports their objects, including empty ones written by earlier
   releases, as obsolete, so emptied buckets are no longer fetched on every
