@@ -2,6 +2,51 @@
 
 [中文版](anda_db_review.zh.md)
 
+## Follow-up completed — 2026-09-23
+
+The follow-up review addressed five correctness/API cases, four performance
+items and two internal simplifications. Persistent object layouts and public
+method signatures are unchanged. Collection schema upgrades now enforce the
+existing requirement to remove indexes before retiring their top-level fields.
+
+| Item | Implemented behavior / evidence |
+| --- | --- |
+| Internal object capacity | Index objects and collection ID bitmaps use a symmetric `max(256 MiB, max_small_object_size)` budget. A default-config BM25 index with 100,000 common texts flushes/reopens; compressed and uncompressed small-limit collection cases cover B-Tree and BM25. |
+| Indexed field retirement | Reject before storing the new schema; cover B-Tree, compound B-Tree, multi-field BM25 and HNSW. Removing indexes under the old schema allows the upgrade. |
+| Oversized updates | Encode and check document bytes before intents/index changes, then reuse the payload for the conditional PUT. Rejected updates leave the handle active. |
+| Optional embeddings | `Option<Vector>` can be indexed, backfilled, populated later and cleared; it survives reopen. |
+| Raw document construction | `Collection::new_document()` initializes the `_id` placeholder. Missing business fields still fail validation. |
+| Unchanged updates | Compare normalized fields and derived BM25/HNSW values; skip unchanged indexes and all persistence for a document no-op. |
+| Dense cursor pages | One indexed equality plus ID predicates uses one posting scan with bounded page memory, preserving ascending result order and both page ends after posting reordering. |
+| ID persistence | Track membership dirtiness separately from collection metadata; ordinary updates/extensions do not rewrite `ids.cbor`. |
+| Recovery I/O | Prefetch current bodies for distinct intent IDs within the configured concurrency, applying repairs in ID order. A gated test verifies both parallel reads and the concurrency ceiling. |
+| ID state | Encapsulate the ordered set, bitmap and dirty flag behind one lock; mutation methods update all three together. |
+| Initialization | Creation and reopen share runtime-state construction from their durable inputs. |
+
+Evidence: [collection regressions](../rs/anda_db/tests/core_review.rs), the
+storage budget regression in [storage.rs](../rs/anda_db/src/storage.rs), and
+[three paired benchmark trials](benchmarks/anda_db_core_2026-09-23/README.md).
+The new cases supplement the existing crash-recovery, cancellation and format
+fixtures; the old fixtures were not regenerated.
+
+Validation: workspace all-feature check and tests passed (**1,765 passed,
+0 failed, 1 existing fixture generator ignored**); workspace all-target,
+all-feature Clippy passed with `-D warnings`. Core coverage includes 12 new
+regression tests. Formatting, agent-document consistency and local documentation
+links were checked. The bundled `db_demo` ran twice against a temporary real
+filesystem with MetaStore, covering first creation and reopening with Jieba.
+
+Three-trial median dense-page time fell from 9.939 ms to 3.658 ms, with peak
+additional heap from 2,762,184 to 1,176 bytes. Thirty unchanged update/flush
+operations went from about 272 PUTs to zero. Distinct-document recovery under
+the injected latency model fell from 1,147.834 to 383.431 ms. Ordinary changed
+updates save one bitmap PUT per checkpoint, but their p95 did not improve.
+Whole postings still have finite capacity and rewrite cost; general composite
+filters retain their existing memory behavior.
+
+The September 6 report below is retained as historical validation and design
+context, with its original test counts and benchmark results.
+
 **Completion Status (2026-09-06)**
 
 All checklist items — **15 bug fixes, 8 performance enhancements, and 4 architectural simplifications — are resolved**. Executed without subagents.

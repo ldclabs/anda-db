@@ -810,7 +810,7 @@ where
         // exist, so overwrite any leftover files from a crashed creation or a
         // previously removed index instead of failing with AlreadyExists.
         let ver = storage
-            .put_bytes(
+            .put_internal_bytes(
                 &BTree::metadata_path(&name),
                 data.into(),
                 PutMode::Overwrite,
@@ -834,12 +834,12 @@ where
     async fn bootstrap(name: String, storage: Storage) -> Result<Self, DBError> {
         let fields: Vec<String> = from_virtual_field_name(&name);
         let path = BTree::metadata_path(&name);
-        let (metadata, ver) = storage.fetch_bytes(&path).await?;
+        let (metadata, ver) = storage.fetch_internal_bytes(&path).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
         let index = BTreeIndex::<DocumentId, FV>::load_all(&metadata[..], async move |object| {
             let path = BTree::bucket_path(n.clone().as_str(), object);
-            match s.clone().fetch_bytes(&path).await {
+            match s.clone().fetch_internal_bytes(&path).await {
                 Ok((data, _)) => Ok(Some(data.into())),
                 Err(DBError::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.into()),
@@ -897,7 +897,7 @@ where
                     async move {
                         let path = BTree::bucket_path(&name, object);
                         let _ = storage
-                            .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
+                            .put_internal_bytes(&path, Bytes::from(data), PutMode::Overwrite)
                             .await?;
                         Ok(())
                     }

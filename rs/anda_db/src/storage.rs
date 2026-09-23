@@ -39,6 +39,11 @@ const CACHE_WRITE_SEQ_STRIPES: usize = 4096;
 /// Call the `*_with_limit` variants to use a different explicit budget.
 pub const DEFAULT_STREAM_LIMIT: u64 = 256 * 1024 * 1024;
 
+/// Index buckets/manifests and the collection id bitmap grow with the corpus,
+/// independently of the admission limit for one document. Keep their encoded
+/// bytes and decoded reads under the same budget without changing the format.
+const INTERNAL_OBJECT_LIMIT: usize = 256 * 1024 * 1024;
+
 /// Cached object bytes bound to the write generation observed by their fetch.
 struct CachedObject {
     bytes: Bytes,
@@ -142,6 +147,8 @@ pub struct StorageConfig {
     /// Cannot changed after initialization.
     pub object_chunk_size: usize,
     /// Maximum size (in bytes) for objects considered "small" enough for single `put` operations and caching.
+    /// Document admission uses this pre-compression limit. Internal index objects
+    /// and collection ID bitmaps have a separate budget of at least 256 MiB.
     pub max_small_object_size: usize,
     /// Maximum size of a index bucket before creating a new one
     /// When a bucket's stored data exceeds this size,
@@ -595,8 +602,43 @@ impl Storage {
         self.inner_fetch(&path).await
     }
 
+    fn internal_object_limit(&self) -> usize {
+        INTERNAL_OBJECT_LIMIT.max(self.inner.metadata.config.max_small_object_size)
+    }
+
+    pub(crate) async fn fetch_internal_bytes(
+        &self,
+        doc_path: &str,
+    ) -> Result<(Bytes, ObjectVersion), DBError> {
+        self.inner_fetch_with_budget(
+            &self.full_path(doc_path),
+            Some(self.internal_object_limit()),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_internal<T: DeserializeOwned>(
+        &self,
+        doc_path: &str,
+    ) -> Result<(T, ObjectVersion), DBError> {
+        let (bytes, version) = self.fetch_internal_bytes(doc_path).await?;
+        let value = from_reader(&bytes[..]).map_err(|source| DBError::Serialization {
+            name: self.full_path(doc_path).to_string(),
+            source: source.into(),
+        })?;
+        Ok((value, version))
+    }
+
     /// Internal helper to fetch raw bytes and handle decompression and stats updates.
     async fn inner_fetch(&self, path: &Path) -> Result<(Bytes, ObjectVersion), DBError> {
+        self.inner_fetch_with_budget(path, None).await
+    }
+
+    async fn inner_fetch_with_budget(
+        &self,
+        path: &Path,
+        internal_budget: Option<usize>,
+    ) -> Result<(Bytes, ObjectVersion), DBError> {
         // Try to get the document
         let result = self
             .inner
@@ -606,14 +648,25 @@ impl Storage {
             .map_err(DBError::from)?;
 
         let size = result.meta.size;
+        if let Some(limit) = internal_budget
+            && size > limit as u64
+        {
+            return Err(DBError::PayloadTooLarge {
+                path: path.to_string(),
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+                limit,
+            });
+        }
         let version: ObjectVersion = (&result.meta).into();
         let bytes = result.bytes().await.map_err(DBError::from)?;
 
         // Use a generous multiple of max_small_object_size as the decompression
         // bomb guard. The put path checks pre-compression size against
         // max_small_object_size, so normal data always fits within this limit.
-        let max_decompress_size =
-            (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16);
+        let max_decompress_size = internal_budget.map_or_else(
+            || (self.inner.metadata.config.max_small_object_size as u64).saturating_mul(16),
+            |limit| limit as u64,
+        );
         let large = zstd_compressed(&bytes)
             && (bytes.len() >= CODEC_OFFLOAD_THRESHOLD
                 || zstd_safe::find_decompressed_size(&bytes)
@@ -814,15 +867,32 @@ impl Storage {
     where
         T: Serialize,
     {
-        let path = self.full_path(doc_path);
-        let mut buf: Vec<u8> = Vec::new();
+        let data = self.encode_document(doc_path, doc)?;
+        self.put_bytes(doc_path, data, PutMode::Create).await
+    }
 
-        to_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
+    /// Preflight a document before changing its indexes or writing its intent.
+    /// The returned bytes are also the final PUT payload, avoiding a second
+    /// serialization pass after the mutation has begun.
+    pub(crate) fn encode_document<T: Serialize>(
+        &self,
+        doc_path: &str,
+        doc: &T,
+    ) -> Result<Bytes, DBError> {
+        let mut data = Vec::new();
+        to_writer(doc, &mut data).map_err(|source| DBError::Serialization {
             name: self.inner.base_path.to_string(),
-            source: err.into(),
+            source: source.into(),
         })?;
-
-        self.inner.put(path, buf.into(), PutMode::Create).await
+        let limit = self.inner.metadata.config.max_small_object_size;
+        if data.len() > limit {
+            return Err(DBError::PayloadTooLarge {
+                path: self.full_path(doc_path).to_string(),
+                size: data.len(),
+                limit,
+            });
+        }
+        Ok(data.into())
     }
 
     /// An intent may contain two individually valid documents plus its
@@ -873,20 +943,13 @@ impl Storage {
     where
         T: Serialize,
     {
-        let path = self.full_path(doc_path);
-        let mut buf: Vec<u8> = Vec::new();
-
-        to_writer(doc, &mut buf).map_err(|err| DBError::Serialization {
-            name: self.inner.base_path.to_string(),
-            source: err.into(),
-        })?;
-
+        let data = self.encode_document(doc_path, doc)?;
         let mode = if let Some(version) = version {
             PutMode::Update(version.into())
         } else {
             PutMode::Overwrite
         };
-        self.inner.put(path, buf.into(), mode).await
+        self.put_bytes(doc_path, data, mode).await
     }
 
     /// Puts raw bytes into the object store.
@@ -922,6 +985,22 @@ impl Storage {
     ) -> Result<ObjectVersion, DBError> {
         let path = self.full_path(doc_path);
         self.inner.put(path, data, mode).await
+    }
+
+    pub(crate) async fn put_internal_bytes(
+        &self,
+        doc_path: &str,
+        data: Bytes,
+        mode: PutMode,
+    ) -> Result<ObjectVersion, DBError> {
+        self.inner
+            .put_with_limit(
+                self.full_path(doc_path),
+                data,
+                mode,
+                self.internal_object_limit(),
+            )
+            .await
     }
 
     /// Creates an asynchronous writer (`AsyncWrite`) for writing small objects (< `max_small_object_size`).
@@ -1679,6 +1758,49 @@ fn zstd_compressed(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn internal_objects_have_symmetric_budgets_independent_of_document_size() {
+        use object_store::memory::InMemory;
+        for compression in [0, 3] {
+            let storage = super::Storage::connect(
+                "internal_budget".into(),
+                std::sync::Arc::new(InMemory::new()),
+                super::StorageConfig {
+                    max_small_object_size: 4096,
+                    compress_level: compression,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let data = bytes::Bytes::from(vec![b'x'; 100_000]);
+            assert!(matches!(
+                storage
+                    .put_bytes("public", data.clone(), super::PutMode::Create)
+                    .await,
+                Err(crate::error::DBError::PayloadTooLarge { .. })
+            ));
+            storage
+                .put_internal_bytes("index", data.clone(), super::PutMode::Create)
+                .await
+                .unwrap();
+            assert_eq!(storage.fetch_internal_bytes("index").await.unwrap().0, data);
+            let path = storage.full_path("index");
+            assert!(
+                storage
+                    .inner_fetch_with_budget(&path, Some(100_000))
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                storage
+                    .inner_fetch_with_budget(&path, Some(99_999))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
     use super::*;
     use crate::unix_ms;
     use async_trait::async_trait;

@@ -395,10 +395,15 @@ impl Collection {
         // A missing field is a `Schema` error, as for the B-tree and BM25
         // constructors, so callers can classify all three the same way.
         let field = self.schema.get_field_or_err(field)?;
-        if field.r#type() != &FieldType::Vector {
+        let value_type = match field.r#type() {
+            FieldType::Option(inner) => inner.as_ref(),
+            value_type => value_type,
+        };
+        if value_type != &FieldType::Vector {
             return Err(DBError::Schema {
                 name: self.name.clone(),
-                source: "The type of field for HNSW index should be FieldType::Vector".into(),
+                source: "The type of field for HNSW index should be Vector or Option<Vector>"
+                    .into(),
             });
         }
 

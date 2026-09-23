@@ -135,8 +135,10 @@ A fresh open merges the new schema with persisted field indexes:
   allocation history.
 - The upgraded schema is stored before the open callback can write documents.
   A subsequent callback error does **not** roll back a completed upgrade.
-  Schema upgrades do not rebuild or remove indexes. Remove affected indexes
-  before retiring indexed fields, and plan any required rebuild explicitly.
+  Schema upgrades do not rebuild or remove indexes. An upgrade that retires a
+  top-level field referenced by a B-Tree, BM25 or HNSW index is rejected before
+  the new schema is stored. Open under the old schema, remove affected indexes,
+  close, then upgrade. Plan any required rebuild explicitly.
 
 Use `collection.schema()` for raw documents after opening. The storage format
 uses stable numeric field indexes; deriving a new schema does not reconstruct

@@ -85,6 +85,15 @@ uses persisted `storage_meta.cbor` settings and ignores supplied differences
 namespace's cache or change its compression. `compress_level: 0` disables
 compression for a newly configured namespace.
 
+`max_small_object_size` is the pre-compression document/public buffered-write
+limit. Internal index objects and the collection ID bitmap use a separate
+`max(256 MiB, max_small_object_size)` budget for both writing and reading,
+because high-frequency postings grow with the corpus. This does not split
+postings or make their incremental rewrites constant-cost. CBOR formats and
+conditional writes are unchanged; this budget is not a persisted config field.
+An oversized document update is rejected before its intent or indexes change,
+and the collection remains usable.
+
 Wrapper metadata caches have a separate byte budget:
 `with_meta_cache_bytes` on either store builder retains the entry cap and
 defaults to 64 MiB. `with_metadata_limits(MetadataLimits { ... })` controls
@@ -124,6 +133,10 @@ again; reconcile its identity before retrying an insert.
 mutations already write their document objects; recovery reconciles an
 uncheckpointed generation. Use `db.close().await?` for explicit shutdown when
 the caller needs to handle the close result.
+
+The ID bitmap is written only when membership changes; document updates and
+extension changes alone do not rewrite it. Recovery prefetches current document
+objects with `set_io_concurrency` while applying index repairs in ID order.
 
 For background flushes, `auto_flush` returns `()` and closes on cancellation:
 

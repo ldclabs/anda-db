@@ -1,0 +1,18 @@
+{
+  "baseline_commit": "a9d102cae9d5f68714900c506e5759f7c2ea380c",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "cpu_model": "Unavailable to the sandbox",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "command": "ANDA_BENCH_REVIEW=1 cargo bench -p anda_db --bench core_workloads",
+  "profile": "release (opt-level=z, lto=true, codegen-units=1)",
+  "documents": 100000,
+  "iterations": 30,
+  "recovery_documents": 128,
+  "injected_latency_ms": 5,
+  "trials": 3,
+  "order": "before-1, after-1, before-2, after-2, before-3, after-3",
+  "backend": "InMemory; recovery uses InstrumentedStore with per-operation delay",
+  "compression": 0,
+  "cache_max_capacity": 0,
+  "notes": "Identical benchmark source compiled against baseline and changed libraries. Paired executions ran after compilation had finished; no compiler/test command ran alongside them. Timings include tracking allocator overhead."
+}

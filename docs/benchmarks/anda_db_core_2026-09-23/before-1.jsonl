@@ -1,0 +1,6 @@
+{"iterations":30,"p50_ms":9.973875,"p95_ms":10.455957999999999,"p99_ms":10.65775,"peak_additional_heap_bytes":2762184,"total_ms":301.27216300000003,"workload":"dense_and_page"}
+{"iterations":30,"p50_ms":0.052791000000000005,"p95_ms":0.104125,"p99_ms":0.383416,"peak_additional_heap_bytes":55353,"total_ms":1.9679960000000003,"workload":"unchanged_update_flush"}
+{"puts":272,"workload":"unchanged_update_io"}
+{"iterations":30,"p50_ms":0.018417,"p95_ms":0.021417,"p99_ms":0.036334,"peak_additional_heap_bytes":4951,"total_ms":0.5808309999999999,"workload":"changed_update_flush"}
+{"puts":122,"workload":"changed_update_io"}
+{"documents":128,"elapsed_ms":1147.8335829999999,"get_put_delete_list":[264,3,128,1],"latency_ms":5,"workload":"distinct_document_recovery"}

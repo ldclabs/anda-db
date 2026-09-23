@@ -71,43 +71,19 @@ impl Collection {
             return Err(err);
         }
 
-        Ok(Self {
-            name: config.name.clone(),
-            schema: Arc::new(schema),
+        Ok(Self::from_snapshot(
+            &db,
+            config.name,
             storage,
-            btree_indexes: Vec::new(),
-            bm25_indexes: Vec::new(),
-            hnsw_indexes: Vec::new(),
-            max_document_id: AtomicU64::new(0),
-            search_count: AtomicU64::new(0),
-            get_count: AtomicU64::new(0),
-            tokenizer: default_tokenizer(),
-            doc_ids: RwLock::new(BTreeSet::new()),
-            doc_ids_bitmap: RwLock::new(Treemap::new()),
-            committed_indexes: RwLock::new(IndexRegistry::from_metadata(&metadata)),
-            metadata: RwLock::new(metadata),
-            read_only: AtomicBool::new(false),
-            database_read_only: db.read_only_flag(),
-            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
-            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
-            unique_commit_gate: Arc::new(tokio::sync::RwLock::new(())),
-            unique_key_locks: std::sync::OnceLock::new(),
-            recovery_pending: AtomicBool::new(false),
-            recovery_gate: tokio::sync::Mutex::new(()),
-            io_concurrency: AtomicUsize::new(8),
-            recovery_issues: RwLock::new(BTreeMap::new()),
-            last_saved_version: AtomicU64::new(0),
-            metadata_version: RwLock::new(metadata_version),
-            ids_version: RwLock::new(ids_version),
-            index_hooks: Arc::new(DefaultIndexHooks),
-            doc_locks: Self::new_doc_locks(),
-            pending_mutations: parking_lot::Mutex::new(BTreeSet::new()),
-            stale_mutation_intents: parking_lot::Mutex::new(BTreeSet::new()),
-            extension_write_gate: tokio::sync::Mutex::new(()),
-            next_mutation_sequence: AtomicU64::new(unix_ms()),
-            durable_alloc_watermark: AtomicU64::new(0),
-            watermark_gate: tokio::sync::Mutex::new(()),
-        })
+            CollectionSnapshot {
+                metadata,
+                metadata_version,
+                ids: Treemap::new(),
+                ids_version,
+                alloc_watermark: 0,
+            },
+            false,
+        ))
     }
 
     /// Opens an existing collection.
@@ -142,7 +118,7 @@ impl Collection {
             .fetch::<CollectionMetadata>(Self::METADATA_PATH)
             .await?;
 
-        let (ids, ids_version) = storage.fetch::<Vec<u8>>(Self::IDS_PATH).await?;
+        let (ids, ids_version) = storage.fetch_internal::<Vec<u8>>(Self::IDS_PATH).await?;
         // The stored bitmap is kept as the collection's own: it already
         // describes exactly the set materialized below.
         let stored_ids =
@@ -150,7 +126,6 @@ impl Collection {
                 name: name.clone(),
                 source: "Failed to deserialize ids".into(),
             })?;
-        let doc_ids: BTreeSet<DocumentId> = stored_ids.iter().collect();
 
         // The durable allocation watermark bounds the id window the repair
         // scan below must probe. Collections created before the watermark
@@ -160,45 +135,19 @@ impl Collection {
             Err(DBError::NotFound { .. }) => 0,
             Err(err) => return Err(err),
         };
-        let metadata_max_document_id = metadata.stats.max_document_id;
-
-        let mut collection = Self {
+        let mut collection = Self::from_snapshot(
+            &db,
             name,
-            schema: Arc::new(metadata.schema.clone()),
             storage,
-            btree_indexes: Vec::new(),
-            bm25_indexes: Vec::new(),
-            hnsw_indexes: Vec::new(),
-            max_document_id: AtomicU64::new(metadata.stats.max_document_id),
-            search_count: AtomicU64::new(metadata.stats.search_count),
-            get_count: AtomicU64::new(metadata.stats.get_count),
-            last_saved_version: AtomicU64::new(metadata.stats.version),
-            tokenizer: default_tokenizer(),
-            doc_ids: RwLock::new(doc_ids),
-            doc_ids_bitmap: RwLock::new(stored_ids),
-            committed_indexes: RwLock::new(IndexRegistry::from_metadata(&metadata)),
-            metadata: RwLock::new(metadata),
-            read_only: AtomicBool::new(false),
-            database_read_only: db.read_only_flag(),
-            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
-            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
-            unique_commit_gate: Arc::new(tokio::sync::RwLock::new(())),
-            unique_key_locks: std::sync::OnceLock::new(),
-            recovery_pending: AtomicBool::new(true),
-            recovery_gate: tokio::sync::Mutex::new(()),
-            io_concurrency: AtomicUsize::new(8),
-            recovery_issues: RwLock::new(BTreeMap::new()),
-            metadata_version: RwLock::new(metadata_version),
-            ids_version: RwLock::new(ids_version),
-            index_hooks: Arc::new(DefaultIndexHooks),
-            doc_locks: Self::new_doc_locks(),
-            pending_mutations: parking_lot::Mutex::new(BTreeSet::new()),
-            stale_mutation_intents: parking_lot::Mutex::new(BTreeSet::new()),
-            extension_write_gate: tokio::sync::Mutex::new(()),
-            next_mutation_sequence: AtomicU64::new(unix_ms()),
-            durable_alloc_watermark: AtomicU64::new(alloc_watermark.max(metadata_max_document_id)),
-            watermark_gate: tokio::sync::Mutex::new(()),
-        };
+            CollectionSnapshot {
+                metadata,
+                metadata_version,
+                ids: stored_ids,
+                ids_version,
+                alloc_watermark,
+            },
+            true,
+        );
         collection.load_indexes().await?;
 
         if let Some(schema) = schema
@@ -479,5 +428,70 @@ impl Collection {
         );
 
         Ok(())
+    }
+}
+
+/// Durable inputs shared by creation and reopen. No runtime lock/state is
+/// duplicated across the two lifecycle paths.
+struct CollectionSnapshot {
+    metadata: CollectionMetadata,
+    metadata_version: ObjectVersion,
+    ids: Treemap,
+    ids_version: ObjectVersion,
+    alloc_watermark: u64,
+}
+
+impl Collection {
+    fn from_snapshot(
+        db: &AndaDB,
+        name: String,
+        storage: Storage,
+        snapshot: CollectionSnapshot,
+        recovery_pending: bool,
+    ) -> Self {
+        let CollectionSnapshot {
+            metadata,
+            metadata_version,
+            ids,
+            ids_version,
+            alloc_watermark,
+        } = snapshot;
+        let stats = &metadata.stats;
+        Self {
+            name,
+            schema: Arc::new(metadata.schema.clone()),
+            storage,
+            btree_indexes: Vec::new(),
+            bm25_indexes: Vec::new(),
+            hnsw_indexes: Vec::new(),
+            max_document_id: AtomicU64::new(stats.max_document_id),
+            search_count: AtomicU64::new(stats.search_count),
+            get_count: AtomicU64::new(stats.get_count),
+            last_saved_version: AtomicU64::new(if recovery_pending { stats.version } else { 0 }),
+            durable_alloc_watermark: AtomicU64::new(alloc_watermark.max(stats.max_document_id)),
+            tokenizer: default_tokenizer(),
+            doc_ids: RwLock::new(DocumentIds::from_bitmap(ids)),
+            committed_indexes: RwLock::new(IndexRegistry::from_metadata(&metadata)),
+            metadata: RwLock::new(metadata),
+            read_only: AtomicBool::new(false),
+            database_read_only: db.read_only_flag(),
+            lifecycle: AtomicU8::new(LIFECYCLE_ACTIVE),
+            operation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            unique_commit_gate: Arc::new(tokio::sync::RwLock::new(())),
+            unique_key_locks: std::sync::OnceLock::new(),
+            recovery_pending: AtomicBool::new(recovery_pending),
+            recovery_gate: tokio::sync::Mutex::new(()),
+            io_concurrency: AtomicUsize::new(8),
+            recovery_issues: RwLock::new(BTreeMap::new()),
+            metadata_version: RwLock::new(metadata_version),
+            ids_version: RwLock::new(ids_version),
+            index_hooks: Arc::new(DefaultIndexHooks),
+            doc_locks: Self::new_doc_locks(),
+            pending_mutations: parking_lot::Mutex::new(BTreeSet::new()),
+            stale_mutation_intents: parking_lot::Mutex::new(BTreeSet::new()),
+            extension_write_gate: tokio::sync::Mutex::new(()),
+            next_mutation_sequence: AtomicU64::new(unix_ms()),
+            watermark_gate: tokio::sync::Mutex::new(()),
+        }
     }
 }

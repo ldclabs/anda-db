@@ -80,6 +80,8 @@ impl Collection {
         // retires the id.
         let id = self.max_document_id.fetch_add(1, Ordering::Acquire) + 1;
         doc.set_id(id);
+        let path = Self::doc_path(id);
+        let data = self.storage.encode_document(&path, &doc)?;
 
         // Adds write no per-mutation intent. The durable allocation watermark
         // guarantees the reopen repair scan enumerates every id that may have
@@ -129,8 +131,11 @@ impl Collection {
             return Err(err);
         }
 
-        let path = Self::doc_path(id);
-        if let Err(err) = self.storage.create(&path, &doc).await {
+        if let Err(err) = self
+            .storage
+            .put_bytes(&path, data, crate::storage::PutMode::Create)
+            .await
+        {
             self.rollback_indexes(id, undo, now_ms);
             // `AlreadyExists` is the one *known* outcome of `PutMode::Create`:
             // this add wrote nothing, the object at `path` is someone else's
@@ -193,6 +198,10 @@ impl Collection {
     }
 
     /// Updates an existing document with new field values.
+    ///
+    /// Values are normalized before comparison. If every supplied field is
+    /// unchanged, returns the current document without writes or mutation-stat
+    /// increments. Encoded-size errors are rejected before any mutation.
     ///
     /// Concurrent `update` / `remove` calls for the same document id are
     /// serialized internally (striped per-id locks), so index state and the
@@ -282,8 +291,16 @@ impl Collection {
         let mut fields_keys = FxHashSet::default();
         for (field_name, fv) in fields {
             doc.set_field(&field_name, fv)?;
-            fields_keys.insert(field_name);
+            if doc.get_field(&field_name) != old_doc.get_field(&field_name) {
+                fields_keys.insert(field_name);
+            }
         }
+
+        if fields_keys.is_empty() {
+            return Ok(doc);
+        }
+        let path = Self::doc_path(id);
+        let data = self.storage.encode_document(&path, &doc)?;
 
         // The stored document was structurally validated above, and set_field
         // validates every replacement against the write budget. Revalidating
@@ -325,12 +342,17 @@ impl Collection {
             for index in &self.bm25_indexes {
                 let fields = index.virtual_field();
                 if fields_keys.iter().any(|v| fields.contains(v)) {
-                    if let Some(text) = self.index_hooks.bm25_index_value(index, &old_doc) {
+                    let old = self.index_hooks.bm25_index_value(index, &old_doc);
+                    let new = self.index_hooks.bm25_index_value(index, &doc);
+                    if old == new {
+                        continue;
+                    }
+                    if let Some(text) = old {
                         index.remove(id, &text, now_ms);
                         undo.push(IndexUndo::BM25Removed(index, text));
                     }
 
-                    if let Some(text) = self.index_hooks.bm25_index_value(index, &doc) {
+                    if let Some(text) = new {
                         index.insert(id, &text, now_ms)?;
                         undo.push(IndexUndo::BM25Added(index, text));
                     }
@@ -340,12 +362,17 @@ impl Collection {
             for index in &self.hnsw_indexes {
                 let field_name = index.field_name();
                 if fields_keys.contains(field_name) {
-                    if let Some(vector) = self.index_hooks.hnsw_index_value(index, &old_doc) {
+                    let old = self.index_hooks.hnsw_index_value(index, &old_doc);
+                    let new = self.index_hooks.hnsw_index_value(index, &doc);
+                    if old == new {
+                        continue;
+                    }
+                    if let Some(vector) = old {
                         index.remove(id, now_ms);
                         undo.push(IndexUndo::HnswRemoved(index, vector));
                     }
 
-                    if let Some(vector) = self.index_hooks.hnsw_index_value(index, &doc) {
+                    if let Some(vector) = new {
                         undo.push(IndexUndo::HnswAdded(index));
                         index.insert(id, vector.into_owned(), now_ms)?;
                     }
@@ -367,8 +394,11 @@ impl Collection {
         }
 
         // persist the updated document with update version
-        let path = Self::doc_path(id);
-        if let Err(err) = self.storage.put(&path, &doc, Some(ver)).await {
+        if let Err(err) = self
+            .storage
+            .put_bytes(&path, data, crate::storage::PutMode::Update(ver.into()))
+            .await
+        {
             self.rollback_indexes(id, undo, now_ms);
             // The PUT outcome is unknown: the new document may be durable
             // while memory was just rolled back. The retained intent plus a

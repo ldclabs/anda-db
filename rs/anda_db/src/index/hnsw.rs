@@ -131,10 +131,10 @@ impl Hnsw {
         // Publish the id set before the metadata commit record, matching the
         // steady-state crash contract used by `flush` below.
         let ids_version = storage
-            .put_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Create)
+            .put_internal_bytes(&Hnsw::ids_path(&name), ids.into(), PutMode::Create)
             .await?;
         let metadata_version = storage
-            .put_bytes(
+            .put_internal_bytes(
                 &Hnsw::metadata_path(&name),
                 metadata.into(),
                 PutMode::Create,
@@ -172,15 +172,17 @@ impl Hnsw {
         storage: Storage,
         cleanup: bool,
     ) -> Result<Self, DBError> {
-        let (metadata, metadata_version) = storage.fetch_bytes(&Hnsw::metadata_path(&name)).await?;
-        let (ids, ids_version) = storage.fetch_bytes(&Hnsw::ids_path(&name)).await?;
+        let (metadata, metadata_version) = storage
+            .fetch_internal_bytes(&Hnsw::metadata_path(&name))
+            .await?;
+        let (ids, ids_version) = storage.fetch_internal_bytes(&Hnsw::ids_path(&name)).await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
         let node_versions = Arc::new(RwLock::new(FxHashMap::default()));
         let loaded_node_versions = node_versions.clone();
         let index = HnswIndex::load_all(&metadata[..], &ids[..], async move |id: u64| {
             let path = Hnsw::node_path(n.clone().as_str(), id);
-            match s.clone().fetch_bytes(&path).await {
+            match s.clone().fetch_internal_bytes(&path).await {
                 Ok((data, version)) => {
                     loaded_node_versions.write().insert(id, version);
                     Ok(Some(data.into()))
@@ -226,7 +228,7 @@ impl Hnsw {
                 let versions = versions.clone();
                 async move {
                     let path = Hnsw::node_path(name.as_str(), id);
-                    match storage.fetch_bytes(&path).await {
+                    match storage.fetch_internal_bytes(&path).await {
                         Ok((_, version)) => {
                             versions.write().insert(id, version);
                             Ok(())
@@ -325,7 +327,7 @@ impl Hnsw {
     ) -> Result<(), BoxError> {
         let expected = { object_version.read().clone() };
         let version = storage
-            .put_bytes(&path, Bytes::from(data), PutMode::Update(expected.into()))
+            .put_internal_bytes(&path, Bytes::from(data), PutMode::Update(expected.into()))
             .await
             .map_err(BoxError::from)?;
         *object_version.write() = version;
@@ -351,7 +353,7 @@ impl Hnsw {
             .unwrap_or(PutMode::Create);
         let path = Hnsw::node_path(name.as_str(), id);
         let version = storage
-            .put_bytes(&path, Bytes::from(data), mode)
+            .put_internal_bytes(&path, Bytes::from(data), mode)
             .await
             .map_err(BoxError::from)?;
         versions.write().insert(id, version);

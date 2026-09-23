@@ -17,7 +17,7 @@ pub(super) async fn commit_metadata(
 ) -> Result<(), BoxError> {
     let expected = version.read().clone();
     let published = storage
-        .put_bytes(path, data.into(), PutMode::Update(expected.into()))
+        .put_internal_bytes(path, data.into(), PutMode::Update(expected.into()))
         .await?;
     *version.write() = published;
     Ok(())

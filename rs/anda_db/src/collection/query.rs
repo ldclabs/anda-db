@@ -88,13 +88,11 @@ impl Collection {
 
         self.purge_dead_ids_from_indexes(ids, now_ms);
 
-        // Same lock order as `unregister_doc_id`, taken once for the batch.
+        // Update both id representations under one lock for the batch.
         let removed: Vec<DocumentId> = {
             let mut doc_ids = self.doc_ids.write();
-            let mut bitmap = self.doc_ids_bitmap.write();
             let mut removed = Vec::new();
             for id in ids {
-                bitmap.remove(*id);
                 if doc_ids.remove(id) {
                     removed.push(*id);
                 }
@@ -677,13 +675,7 @@ impl Collection {
                             .iter()
                             .filter(|id| candidates.is_none_or(|s| s.contains(id)))
                         {
-                            rt.insert(*id);
-                            if limit > 0 && rt.len() > limit {
-                                match order {
-                                    ScanOrder::Ascending => rt.pop_last(),
-                                    ScanOrder::Descending => rt.pop_first(),
-                                };
-                            }
+                            order.retain_id(&mut rt, *id, limit);
                         }
                         true
                     })?;
@@ -701,19 +693,17 @@ impl Collection {
                 let mut result = BTreeSet::new();
                 for query in queries {
                     for id in self.filter_by_field_with(*query, candidates, limit, order)? {
-                        result.insert(id);
-                        if limit > 0 && result.len() > limit {
-                            if order.is_descending() {
-                                result.pop_first();
-                            } else {
-                                result.pop_last();
-                            }
-                        }
+                        order.retain_id(&mut result, id, limit);
                     }
                 }
                 Ok(result.into_iter().collect())
             }
             Filter::And(mut queries) => {
+                if limit > 0
+                    && let Some(result) = self.indexed_id_page(&queries, candidates, limit, order)
+                {
+                    return result;
+                }
                 queries.sort_by_cached_key(|filter| self.filter_cardinality_hint(filter));
                 let mut iter = queries.into_iter();
                 let Some(query) = iter.next() else {
@@ -749,6 +739,65 @@ impl Collection {
                 Ok(self.walk_complement(&exclude, candidates, limit, order))
             }
         }
+    }
+
+    /// Common owner/status equality plus id pagination. A posting is not in
+    /// id order after deletes, so visit it once and retain only the first/last
+    /// page. Other AND shapes continue through the general intersection path.
+    fn indexed_id_page(
+        &self,
+        queries: &[Box<Filter>],
+        candidates: Option<&FxHashSet<DocumentId>>,
+        limit: usize,
+        order: ScanOrder,
+    ) -> Option<Result<Vec<DocumentId>, DBError>> {
+        let mut indexed = None;
+        let mut id_queries = Vec::new();
+        for query in queries {
+            if only_id_fields(query) {
+                id_queries.push(Box::new(id_filter_range((**query).clone())));
+            } else if let Filter::Field((name, RangeQuery::Eq(value))) = query.as_ref()
+                && indexed.is_none()
+            {
+                indexed = Some((name, value));
+            } else {
+                return None;
+            }
+        }
+        let (name, value) = indexed?;
+        if id_queries.is_empty() {
+            return None;
+        }
+        Some((|| {
+            let mut id_query = RangeQuery::<u64>::try_convert_from(RangeQuery::And(id_queries))
+                .map_err(|source| DBError::Generic {
+                    name: self.name.clone(),
+                    source,
+                })?;
+            normalize_id_query(&mut id_query);
+            let index = self
+                .btree_indexes
+                .iter()
+                .find(|i| i.name() == name)
+                .ok_or_else(|| DBError::Index {
+                    name: self.name.clone(),
+                    source: format!("BTree index {name:?} not found").into(),
+                })?;
+            let live = self.doc_ids.read();
+            let mut result = BTreeSet::new();
+            index.try_range_query_ids(RangeQuery::Eq(value.clone()), false, |ids| {
+                for &id in ids {
+                    if candidates.is_none_or(|c| c.contains(&id))
+                        && live.contains(&id)
+                        && matches_id_query(&id_query, id)
+                    {
+                        order.retain_id(&mut result, id, limit);
+                    }
+                }
+                true
+            })?;
+            Ok(result.into_iter().collect())
+        })())
     }
 
     pub(super) fn filter_by_id(

@@ -86,6 +86,10 @@ where
 }
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    if std::env::var_os("ANDA_BENCH_REVIEW").is_some() {
+        review_bench().await;
+        return;
+    }
     if std::env::var_os("ANDA_BENCH_IO").is_some() {
         io_bench().await;
         return;
@@ -291,6 +295,201 @@ async fn main() {
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
+}
+
+/// Local comparison of dense pages, unchanged/changed writes, and recovery of
+/// many different documents. Uses the same public API before and after fixes.
+async fn review_bench() {
+    use anda_db::{
+        index::HnswConfig,
+        schema::{Vector, vector_from_f32},
+    };
+    let n = count("ANDA_BENCH_DOCS", 100_000).max(100);
+    let iterations = count("ANDA_BENCH_ITERATIONS", 30).max(1);
+    let cfg = DBConfig {
+        name: "review_bench".into(),
+        storage: StorageConfig {
+            compress_level: 0,
+            cache_max_capacity: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let db = AndaDB::connect(Arc::new(InMemory::new()), cfg.clone())
+        .await
+        .unwrap();
+    let dense = db
+        .create_collection(
+            Row::schema().unwrap(),
+            CollectionConfig {
+                name: "dense".into(),
+                ..Default::default()
+            },
+            async |c| c.create_btree_index(&["owner"]).await,
+        )
+        .await
+        .unwrap();
+    for _ in 0..n {
+        dense
+            .add_from(&Row {
+                _id: 0,
+                owner: 1,
+                body: "memory".into(),
+            })
+            .await
+            .unwrap();
+    }
+    dense.flush(unix_ms()).await.unwrap();
+    measure("dense_and_page", iterations, || async {
+        let f = Filter::And(vec![
+            Box::new(Filter::Field(("owner".into(), RangeQuery::Eq(Fv::U64(1))))),
+            Box::new(id(RangeQuery::Lt(Fv::U64((n / 2) as u64)))),
+        ]);
+        let result = dense.query_last_ids(f, Some(20)).await.unwrap();
+        assert_eq!(
+            result,
+            ((n / 2 - 20) as u64..(n / 2) as u64).collect::<Vec<_>>()
+        );
+    })
+    .await;
+
+    #[derive(Serialize, AndaDBSchema)]
+    struct IndexedRow {
+        _id: u64,
+        body: String,
+        embedding: Vector,
+    }
+    let indexed = db
+        .create_collection(
+            IndexedRow::schema().unwrap(),
+            CollectionConfig {
+                name: "indexed".into(),
+                ..Default::default()
+            },
+            async |c| {
+                c.create_bm25_index(&["body"]).await?;
+                c.create_hnsw_index(
+                    "embedding",
+                    HnswConfig {
+                        dimension: 2,
+                        ..Default::default()
+                    },
+                )
+                .await
+            },
+        )
+        .await
+        .unwrap();
+    indexed
+        .add_from(&IndexedRow {
+            _id: 0,
+            body: "memory".into(),
+            embedding: vector_from_f32(vec![1., 2.]),
+        })
+        .await
+        .unwrap();
+    indexed.flush(unix_ms()).await.unwrap();
+    let before = indexed.storage_stats();
+    measure("unchanged_update_flush", iterations, || async {
+        indexed
+            .update(
+                1,
+                BTreeMap::from([
+                    ("body".into(), Fv::Text("memory".into())),
+                    (
+                        "embedding".into(),
+                        Fv::Vector(vector_from_f32(vec![1., 2.])),
+                    ),
+                ]),
+            )
+            .await
+            .unwrap();
+        indexed.flush(unix_ms()).await.unwrap();
+    })
+    .await;
+    println!(
+        "{}",
+        serde_json::json!({"workload":"unchanged_update_io", "puts":indexed.storage_stats().total_put_count-before.total_put_count})
+    );
+
+    let before = dense.storage_stats();
+    let serial = AtomicUsize::new(0);
+    measure("changed_update_flush", iterations, || async {
+        dense
+            .update(
+                1,
+                BTreeMap::from([(
+                    "body".into(),
+                    Fv::Text(format!(
+                        "updated {}",
+                        serial.fetch_add(1, Ordering::Relaxed)
+                    )),
+                )]),
+            )
+            .await
+            .unwrap();
+        dense.flush(unix_ms()).await.unwrap();
+    })
+    .await;
+    println!(
+        "{}",
+        serde_json::json!({"workload":"changed_update_io", "puts":dense.storage_stats().total_put_count-before.total_put_count})
+    );
+    db.close().await.unwrap();
+
+    let recovery_docs = count("ANDA_BENCH_RECOVERY_DOCS", 128).max(1);
+    let backend = Arc::new(support::InstrumentedStore::default());
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(support::Store(backend.clone()));
+    {
+        let db = AndaDB::connect(store.clone(), cfg.clone()).await.unwrap();
+        let c = db
+            .create_collection(
+                Row::schema().unwrap(),
+                CollectionConfig {
+                    name: "docs".into(),
+                    ..Default::default()
+                },
+                async |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        for _ in 0..recovery_docs {
+            c.add_from(&Row {
+                _id: 0,
+                owner: 1,
+                body: "before".into(),
+            })
+            .await
+            .unwrap();
+        }
+        c.flush(unix_ms()).await.unwrap();
+        for id in 1..=recovery_docs as u64 {
+            c.update(
+                id,
+                BTreeMap::from([("body".into(), Fv::Text("after".into()))]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    backend.reset(5);
+    let start = Instant::now();
+    let db = AndaDB::connect(store, cfg).await.unwrap();
+    let c = db
+        .open_collection("docs".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.;
+    let calls = backend.counts();
+    assert_eq!(c.len(), recovery_docs);
+    assert_eq!(
+        c.get(recovery_docs as u64).await.unwrap().get_field("body"),
+        Some(&Fv::Text("after".into()))
+    );
+    println!(
+        "{}",
+        serde_json::json!({"workload":"distinct_document_recovery", "documents":recovery_docs, "latency_ms":5, "elapsed_ms":elapsed, "get_put_delete_list":calls})
+    );
 }
 
 async fn io_bench() {

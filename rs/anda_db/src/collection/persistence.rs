@@ -109,44 +109,26 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if storing fails
     pub(super) async fn store_ids(&self) -> Result<(), DBError> {
-        let data = {
-            // Lock order matches the mutation helpers: `doc_ids`, then the
-            // bitmap.
-            let doc_ids = self.doc_ids.read();
-            let mut bitmap = self.doc_ids_bitmap.write();
-
-            // A cheap probe, not a proof: cardinality is O(containers) while
-            // a full comparison would be O(documents). It catches an id-set
-            // mutation that bypassed the helpers — the failure mode that
-            // would otherwise persist a wrong id set and drop live documents
-            // on the next open — and repairs it instead of shipping it.
-            if bitmap.cardinality() != doc_ids.len() as u64 {
-                log::error!(
-                    action = "Collection::store_ids",
-                    collection = self.name,
-                    bitmap = bitmap.cardinality(),
-                    live = doc_ids.len();
-                    "Document id bitmap diverged from the id set; rebuilding it",
-                );
-                *bitmap = doc_ids.iter().copied().collect();
-            }
-
-            // `run_optimize` on a copy: it rewrites containers into run form,
-            // which is what makes the stored object small but not what makes
-            // the next incremental `add` cheap.
-            let mut ids = bitmap.clone();
-            ids.run_optimize();
-            ids.serialize::<Portable>()
+        let Some(data) = self.doc_ids.read().snapshot_if_dirty() else {
+            return Ok(());
         };
+        // Preserve the historical CBOR Vec<u8> representation of ids.cbor.
+        let mut payload = Vec::new();
+        cbor2::to_writer(&data, &mut payload).map_err(|source| DBError::Serialization {
+            name: self.name.clone(),
+            source: source.into(),
+        })?;
         let ver = { self.ids_version.read().clone() };
-        let ver = match self.storage.put(Self::IDS_PATH, &data, Some(ver)).await {
-            Ok(ver) => ver,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-
+        let ver = self
+            .storage
+            .put_internal_bytes(
+                Self::IDS_PATH,
+                payload.into(),
+                crate::storage::PutMode::Update(ver.into()),
+            )
+            .await?;
         *self.ids_version.write() = ver;
+        self.doc_ids.write().mark_saved();
         Ok(())
     }
 

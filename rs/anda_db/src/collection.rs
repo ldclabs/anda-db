@@ -56,20 +56,9 @@ pub struct Collection {
     get_count: AtomicU64,
     /// Text tokenization chain for text analysis
     tokenizer: TokenizerChain,
-    /// The live document ids, kept sorted so `_id` filters and complement
-    /// walks can scan from either end. Every read and every query path
-    /// answers from this set: it is the single source of truth.
-    doc_ids: RwLock<BTreeSet<DocumentId>>,
-    /// The same ids in the roaring form `ids.cbor` stores, maintained
-    /// alongside the set so a checkpoint serializes what it already has
-    /// instead of rebuilding it (~17ns per document, ~170ms per flush on a
-    /// 10M-document collection, under the exclusive operation gate).
-    ///
-    /// Nothing reads it except [`Collection::store_ids`]. It is written only
-    /// by [`Collection::register_doc_id`] /
-    /// [`Collection::unregister_doc_id`], which update both structures
-    /// together, so the two cannot be observed disagreeing.
-    doc_ids_bitmap: RwLock<Treemap>,
+    /// Live ids in query order and bitmap form, with one membership dirty flag.
+    /// A single lock keeps both representations coherent.
+    doc_ids: RwLock<DocumentIds>,
     /// Whether the collection is in read-only mode
     read_only: AtomicBool,
     /// Database-level read-only state shared with every collection handle.
@@ -258,6 +247,26 @@ impl ScanOrder {
     /// Whether scans should walk the key space from the largest key down.
     fn is_descending(self) -> bool {
         matches!(self, ScanOrder::Descending)
+    }
+
+    /// Keep the requested end without allocating space for every match.
+    fn retain_id(self, ids: &mut BTreeSet<DocumentId>, id: DocumentId, limit: usize) {
+        if limit > 0 && ids.len() == limit {
+            let outside = match self {
+                Self::Ascending => ids.last().is_some_and(|last| id >= *last),
+                Self::Descending => ids.first().is_some_and(|first| id <= *first),
+            };
+            if outside {
+                return;
+            }
+        }
+        ids.insert(id);
+        if limit > 0 && ids.len() > limit {
+            match self {
+                Self::Ascending => ids.pop_last(),
+                Self::Descending => ids.pop_first(),
+            };
+        }
     }
 
     /// Trims an ascending `result` down to `limit`, keeping the requested end.
@@ -590,26 +599,15 @@ impl Collection {
         }
     }
 
-    /// Adds `id` to the id set and its persisted bitmap form. Returns
-    /// whether the set changed.
-    ///
-    /// Both structures are updated here, while both locks are held, so no
-    /// reader can catch them disagreeing. The locks are always taken in this
-    /// order — `doc_ids`, then the bitmap — here, in
-    /// [`Self::unregister_doc_id`] and in [`Self::store_ids`], so they
-    /// cannot deadlock against each other.
+    /// Adds `id` to both id representations. Returns whether membership changed.
     fn register_doc_id(&self, id: DocumentId) -> bool {
-        let mut doc_ids = self.doc_ids.write();
-        self.doc_ids_bitmap.write().add(id);
-        doc_ids.insert(id)
+        self.doc_ids.write().insert(id)
     }
 
     /// Drops `id` from the id set and its persisted bitmap form. Returns
     /// whether the set changed.
     fn unregister_doc_id(&self, id: DocumentId) -> bool {
-        let mut doc_ids = self.doc_ids.write();
-        self.doc_ids_bitmap.write().remove(id);
-        doc_ids.remove(&id)
+        self.doc_ids.write().remove(&id)
     }
 
     /// Whether this handle or its database is in read-only mode.
@@ -949,9 +947,12 @@ impl Collection {
         self.doc_ids.read().is_empty()
     }
 
-    /// Creates a new empty document with the collection's schema.
+    /// Creates a document with the collection's schema and `_id: 0` placeholder.
+    /// Fill the business fields and pass it to [`Self::add`] to allocate its id.
     pub fn new_document(&self) -> Document {
-        Document::new(self.schema.clone())
+        let mut doc = Document::new(self.schema.clone());
+        doc.set_id(0);
+        doc
     }
 
     /// Updates the collection metadata with the provided function.
@@ -969,6 +970,8 @@ impl Collection {
 
 mod crud;
 mod extensions;
+mod ids;
+use ids::DocumentIds;
 mod index_ops;
 mod lifecycle;
 mod persistence;

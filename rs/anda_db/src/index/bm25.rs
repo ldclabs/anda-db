@@ -130,7 +130,7 @@ impl BM25 {
         // exist, so overwrite any leftover files from a crashed creation or a
         // previously removed index instead of failing with AlreadyExists.
         let ver = storage
-            .put_bytes(&BM25::metadata_path(&name), data.into(), PutMode::Overwrite)
+            .put_internal_bytes(&BM25::metadata_path(&name), data.into(), PutMode::Overwrite)
             .await?;
         Ok(Self {
             name,
@@ -160,12 +160,14 @@ impl BM25 {
         storage: Storage,
     ) -> Result<Self, DBError> {
         let fields = from_virtual_field_name(&name);
-        let (metadata, ver) = storage.fetch_bytes(&BM25::metadata_path(&name)).await?;
+        let (metadata, ver) = storage
+            .fetch_internal_bytes(&BM25::metadata_path(&name))
+            .await?;
         let n = Arc::new(name.clone());
         let s = Arc::new(storage.clone());
         let index = BM25Index::load_all_strict(tokenizer, &metadata[..], async move |object| {
             let path = BM25::bucket_path(n.clone().as_str(), object);
-            match s.clone().fetch_bytes(&path).await {
+            match s.clone().fetch_internal_bytes(&path).await {
                 Ok((data, _)) => Ok(Some(data.into())),
                 Err(DBError::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.into()),
@@ -226,7 +228,7 @@ impl BM25 {
                     let path = BM25::bucket_path(&self.name, object);
                     let _ = self
                         .storage
-                        .put_bytes(&path, Bytes::from(data), PutMode::Overwrite)
+                        .put_internal_bytes(&path, Bytes::from(data), PutMode::Overwrite)
                         .await?;
                     Ok(())
                 },

@@ -246,12 +246,20 @@ impl Collection {
             self.purge_dead_ids_from_indexes(&unindexable_image_ids, now_ms);
         }
 
-        for id in affected_ids {
-            match self
-                .storage
-                .fetch::<DocumentOwned>(&Self::doc_path(id))
-                .await
-            {
+        // Prefetch reads only. Apply recovered documents in id order, after
+        // all historical postings have been removed, just as the serial path.
+        let mut current_documents = futures::stream::iter(affected_ids)
+            .map(|id| async move {
+                (
+                    id,
+                    self.storage
+                        .fetch::<DocumentOwned>(&Self::doc_path(id))
+                        .await,
+                )
+            })
+            .buffered(self.io_concurrency());
+        while let Some((id, current)) = current_documents.next().await {
+            match current {
                 Ok((current, _)) => {
                     // Same tolerance as `repair_document`: a stored document
                     // that does not match the schema is skipped (leaving the
@@ -551,6 +559,31 @@ impl Collection {
             return Ok(false);
         }
 
+        // Once a retired value is pruned while materializing a document, it
+        // cannot drive value-keyed index removal. Reject before persisting the
+        // new schema; callers can reopen under the old schema to drop indexes.
+        for (index, fields) in self
+            .btree_indexes
+            .iter()
+            .map(|i| (i.name(), i.virtual_field()))
+            .chain(
+                self.bm25_indexes
+                    .iter()
+                    .map(|i| (i.name(), i.virtual_field())),
+            )
+        {
+            for field in fields {
+                if new_schema.get_field(field).is_none() {
+                    return Err(self.retired_index_field_error(index, field));
+                }
+            }
+        }
+        for index in &self.hnsw_indexes {
+            if new_schema.get_field(index.field_name()).is_none() {
+                return Err(self.retired_index_field_error(index.name(), index.field_name()));
+            }
+        }
+
         let mut old_schema = self.schema.clone();
         if !old_schema.has_upgrade_history() {
             // Recover before changing the schema, and before replay/pruning
@@ -588,5 +621,12 @@ impl Collection {
             self.schema.version()
         );
         Ok(true)
+    }
+
+    fn retired_index_field_error(&self, index: &str, field: &str) -> DBError {
+        DBError::Schema {
+            name: self.name.clone(),
+            source: format!("cannot retire field {field:?} while index {index:?} references it; remove the index under the current schema before upgrading").into(),
+        }
     }
 }

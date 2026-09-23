@@ -84,12 +84,17 @@ let removed: Option<Document> = collection.remove(id).await?;
 - `update` is a partial update by field **name**. An empty update or an `_id`
   update is an error. `Fv::Null` clears an optional value; it is not a
   general field-deletion operation. Missing documents produce `NotFound`.
+  After normalization, an unchanged update returns the current document without
+  writing an intent/document, rebuilding indexes, or incrementing mutation stats.
+  Encoded-size rejection happens before any index or durable mutation.
 - `remove` returns `None` for an absent id. It can also purge an indexed id
   whose stored object is missing/corrupt, returning `None` after cleanup.
 - `add(document)` needs a schema-compatible `Document`. Build raw documents
   with `collection.new_document()` or
   `Document::try_from(collection.schema(), &value)?`, especially after upgrades;
   field indexes from a freshly derived schema may differ from persisted ones.
+  `new_document()` initializes the internal ID placeholder; fill business fields
+  and call `add` without setting `_id` yourself.
 - `#[unique]` declares a constraint; the corresponding B-Tree index must
   exist for inserts and updates to enforce it.
 
@@ -235,8 +240,9 @@ directly to untrusted requests. `ids()` materializes all ids as well.
 `create_*_index` backfills existing documents before registering an index.
 Unique conflicts can fail backfill. `_nx` avoids duplicate creation, but
 `create_hnsw_index_nx` **errors on any persisted configuration mismatch**;
-remove/recreate the index to change its settings. HNSW fields must be exactly
-`FieldType::Vector`; `Option<Vector>` is not accepted by the collection API.
+remove/recreate the index to change its settings. HNSW fields accept
+`FieldType::Vector` or `Option<Vector>`. Missing/null optional vectors are
+skipped; update the field later to add or clear its indexed vector.
 
 | HNSW setting | Default |
 | --- | --- |

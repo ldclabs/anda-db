@@ -141,6 +141,18 @@ order, so it is evaluated in full and trimmed to the requested end.
 
 Collections also expose their own `extensions` map for storing small application-specific metadata.
 
+`new_document()` supplies the internal ID placeholder: callers fill business
+fields and pass the document to `add`. Updates compare normalized values; a
+same-value update returns the document without changing mutation statistics or
+writing data. Changed documents are encoded and size-checked before their
+intent or indexes are modified. A `PayloadTooLarge` rejection at this stage
+leaves the collection active.
+
+Bounded conjunctions of one indexed equality and ID predicates scan the matching
+posting once, retaining only the requested page. This bounds additional result
+memory by the page size even for a common owner/status key. Posting scans still
+visit all candidate IDs; general intersections keep their existing strategy.
+
 ### Schema
 
 The schema system comes from `anda_db_schema` and is re-exported through `anda_db::schema`.
@@ -160,6 +172,11 @@ Typical field categories include:
 - optional values
 
 The collection validates documents against its schema before they are accepted.
+
+Before a schema upgrade can retire a top-level field, every index referencing
+that field must be removed. An invalid upgrade fails before storing the new
+schema. Reopen under the old schema to remove the indexes, close, then upgrade.
+This includes compound B-Tree and multi-field BM25 indexes.
 
 ### Document Identity
 
@@ -220,7 +237,8 @@ HNSW indexes support approximate nearest-neighbor retrieval over vector fields.
 
 Important properties:
 
-- The indexed field must be a vector field
+- The indexed field must be `Vector` or `Option<Vector>`; missing/null optional
+  values are skipped, and later updates can add or clear the vector
 - Index construction is parameterized by `HnswConfig`
 - Query vectors are supplied as `Vec<f32>`
 - Search returns ranked document ids which can be fused with BM25 results
@@ -355,6 +373,13 @@ The storage layer distinguishes between:
 - streamed objects written by `stream_writer`
 
 `StorageConfig.max_small_object_size` protects the small-object path from oversized payloads.
+
+Internal index buckets/manifests, HNSW objects and the collection ID bitmap use
+an independent `max(256 MiB, max_small_object_size)` encoded/plaintext budget,
+shared by their read and write paths. A common term or repeated B-Tree key can
+therefore grow beyond one document's admission limit. This keeps the existing
+CBOR and conditional-write protocols; postings are still stored whole, so their
+rewrite cost grows with the corpus and the internal budget remains finite.
 
 ### Compression
 
@@ -493,6 +518,11 @@ configurable per handle with `set_io_concurrency(1..=64)`). A transient read
 failure aborts recovery without advancing the checkpoint. `recovery_issues()`
 reports corrupt or schema-invalid document objects skipped by that handle.
 Maintenance `reconcile_storage` performs a full scan under an exclusive lease.
+
+Intent replay prefetches the current bodies of different documents concurrently
+and applies their repairs in ID order. The ordered ID set and roaring bitmap
+share one lock and a membership dirty flag: update/extension-only checkpoints
+do not rewrite `ids.cbor`. The flag clears only after a successful bitmap PUT.
 
 Metadata-only extension writes may publish removal of an index reference, but
 never publish a newly staged index. Full checkpointing persists index data
