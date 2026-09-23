@@ -2,6 +2,28 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils
+
+- **Breaking (anda_db_schema):** remove `FieldType::normalize` and
+  `FieldType::prune_undeclared`. Nothing called them any more: reading a
+  document (`Document::try_from_doc` / `set_doc`) already folds read-back
+  shapes and drops removed nested keys in one pass.
+- Type-mismatch errors embed at most 128 bytes of the offending value; a
+  64 KiB `Bytes` value sent to a `Text` field used to produce a 131 KB
+  message. Wrapped field errors no longer repeat `Invalid field value:`.
+- Typed CBOR array extraction preallocates its output, roughly halving the
+  cost of large `Array` fields in `Document::try_from`.
+- **Breaking (anda_db_utils):** remove the unused `Pipe` trait and
+  `CountingWriter`; use `cbor2::serialized_size` for encoded sizes.
+  `UniqueVec`'s `From<Vec>`, `FromIterator` and `Deserialize` now share one
+  construction path (`From<Vec>` is 15–44% faster in the crate benchmark).
+- anda_db_derive: `FieldTyped` and `AndaDBSchema` share their per-field
+  attribute handling; diagnostics are unchanged. Proc-macro dependencies
+  are declared at the workspace level.
+- Document that large binary fields should use `serde_bytes::ByteBuf` /
+  `ByteBufB64`: a `Vec<u8>` serializes one integer per byte and is several
+  hundred times slower to store.
+
 ## [@ldclabs/kip-do 0.13.2] — 2026-09-22
 
 - Bring kip-do host APIs into parity with Nexus changes from `de2433b` through

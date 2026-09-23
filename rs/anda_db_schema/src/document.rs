@@ -4,7 +4,7 @@ use cbor2::Value;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
-use super::{Fv, IndexedFieldValues, Schema, SchemaError};
+use super::{Fv, IndexedFieldValues, Schema, SchemaError, error::Brief};
 
 /// The unique identifier for a document within a collection.
 ///
@@ -94,16 +94,15 @@ impl Document {
     /// removal and never reuses removed indexes, so such values can only be
     /// stale data written under an older schema. They disappear from storage
     /// the next time the document is rewritten. Entries of removed keys of a
-    /// *nested* struct are dropped the same way (see
-    /// [`FieldType::prune_undeclared`](crate::FieldType::prune_undeclared)).
+    /// *nested* (non-wildcard) map are dropped the same way.
     ///
     /// Generic (schema-less) deserialization cannot restore the declared
     /// variant of every value: a non-negative `I64` reads back as `U64` and
-    /// an `F32` reads back as `F64`, and a `Vector` reads back as an array of
-    /// U64 bf16 bit patterns. Such read-back shapes are normalized into the
-    /// canonical variant here (see
-    /// [`FieldType::normalize`](crate::FieldType::normalize)) so that index
-    /// maintenance and field accessors always observe the declared variant.
+    /// an `F32` reads back as `F64`, a `Vector` reads back as an array of
+    /// U64 bf16 bit patterns and a `Json` payload as its plain map, array or
+    /// primitive shape. Such read-back shapes are normalized into the
+    /// canonical variant here, so that index maintenance and field accessors
+    /// always observe the declared variant.
     ///
     /// # Arguments
     /// * `schema` - The schema to validate against
@@ -155,10 +154,9 @@ impl Document {
 
     /// Prepares freshly deserialized values for validation: entries of
     /// removed *nested* struct fields are dropped — the one-level-down
-    /// analogue of [`Document::drop_retired_fields`], see
-    /// [`FieldType::prune_undeclared`](crate::FieldType::prune_undeclared) —
-    /// and read-back value shapes are folded into the schema's canonical
-    /// variants. See [`Document::try_from_doc`].
+    /// analogue of [`Document::drop_retired_fields`] — and read-back value
+    /// shapes are folded into the schema's canonical variants. See
+    /// [`Document::try_from_doc`].
     fn normalize_fields(
         schema: &Schema,
         fields: &mut IndexedFieldValues,
@@ -169,8 +167,9 @@ impl Document {
                     .prepare_read(std::mem::replace(value, Fv::Null))
                     .map_err(|err| {
                         SchemaError::FieldValue(format!(
-                            "field {:?} is invalid, error: {err}",
-                            field.name()
+                            "field {:?} is invalid, error: {}",
+                            field.name(),
+                            err.detail()
                         ))
                     })?;
             } else if field.required() {
@@ -203,7 +202,8 @@ impl Document {
         })?;
         let doc = doc.into_map().map_err(|err| {
             SchemaError::Validation(format!(
-                "invalid document, expected CBOR map value, got {err:?}"
+                "invalid document, expected CBOR map value, got {}",
+                Brief(&err)
             ))
         })?;
 
@@ -211,7 +211,8 @@ impl Document {
         for (k, v) in doc {
             let k = k.into_text().map_err(|err| {
                 SchemaError::Validation(format!(
-                    "invalid document field key, expected CBOR text value, got {err:?}"
+                    "invalid document field key, expected CBOR text value, got {}",
+                    Brief(&err)
                 ))
             })?;
 
@@ -220,7 +221,7 @@ impl Document {
             // Typed extraction also enforces the write-admission budget for
             // newly supplied values.
             value.validate_complexity().map_err(|err| {
-                SchemaError::FieldValue(format!("field {k:?} is invalid, error: {err}"))
+                SchemaError::FieldValue(format!("field {k:?} is invalid, error: {}", err.detail()))
             })?;
             if fields.insert(field.idx(), value).is_some() {
                 return Err(SchemaError::Validation(format!(
@@ -468,7 +469,10 @@ impl Document {
         let value = Fv::serialized(value, Some(field.r#type()))?;
         // Typed extraction already checked the shape, as in try_from.
         value.validate_complexity().map_err(|err| {
-            SchemaError::FieldValue(format!("field {name:?} is invalid, error: {err}"))
+            SchemaError::FieldValue(format!(
+                "field {name:?} is invalid, error: {}",
+                err.detail()
+            ))
         })?;
         self.fields.insert(field.idx(), value);
         Ok(self)

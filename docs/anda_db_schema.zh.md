@@ -209,8 +209,6 @@ pub static BYTES_WILDCARD_KEY: LazyLock<FieldKey>; // b"*"
 | `FieldType::validate_declaration` | 检查 `self` 是否为合法的类型声明：杜绝 `Option<Option<T>>`，杜绝通配符键与其他普通键混用，校验嵌套深度预算。由 `FieldEntry::new`、`SchemaBuilder::add_field` 与 `Schema` 反序列化自动调用。 |
 | `FieldType::extract` | CBOR → `FieldValue`，要求传入的 CBOR 数据严格匹配 `self`。 |
 | `FieldType::validate` | 检查现有的 `FieldValue` 是否符合 `self`，放行第 3.3 节列出的兼容读回形态。 |
-| `FieldType::normalize` | 将读回的兼容形态归一化为规范变体。 |
-| `FieldType::prune_undeclared` | 修剪剔除类型声明中未包含的嵌套 Map 项（已删除的嵌套字段）。 |
 | `FieldType::is_compatible_upgrade_of` | 判定已存储字段是否能合法重新声明为 `self`（第 5.4 节）。 |
 
 `extract` 是由类型驱动的（用于解析结构化输入），而 `FieldValue::try_from` 是由数据形状驱动的（用于读取无类型 CBOR）。
@@ -276,7 +274,7 @@ let fv = Fv::serialized(&my_struct, Some(&Ft::Array(vec![Ft::Vector])))?;
 | `Vec<T>`                               | `Array`（当 `T: TryFrom<FieldValue>`）  |
 | `BTreeMap<FieldKey, T>`                | `Map`                                   |
 
-在通用反序列化无法精确还原声明变体的场景下，系统接受兼容的读回形态：`i64` 接受非负 `U64`；`f32` 接受已存 `f32` 读回时表现出的 `F64`；`Vec<bf16>` 接受 bf16 位模式构成的整数数组；`f64` / `f32` 接受 `I64` / `U64` —— 由于 JSON 只有单一数字类型，`1.0` 在传输中常以 `1` 呈现。`f64` 接受任意整数（通过 `as f64` 转换：在 $2^{53}$ 内精确，超出则舍入）；`f32` 仅接受能够被 `f32` 精确表示的整数，因此诸如 `16777217` 的值无论以整数还是浮点形式传入都会被直接拒绝，防止发生单方隐式舍入。`FieldType::validate` 执行相同的规则，`FieldType::normalize` 则将上述形态归一化为规范变体。
+在通用反序列化无法精确还原声明变体的场景下，系统接受兼容的读回形态：`i64` 接受非负 `U64`；`f32` 接受已存 `f32` 读回时表现出的 `F64`；`Vec<bf16>` 接受 bf16 位模式构成的整数数组；`f64` / `f32` 接受 `I64` / `U64` —— 由于 JSON 只有单一数字类型，`1.0` 在传输中常以 `1` 呈现。`f64` 接受任意整数（通过 `as f64` 转换：在 $2^{53}$ 内精确，超出则舍入）；`f32` 仅接受能够被 `f32` 精确表示的整数，因此诸如 `16777217` 的值无论以整数还是浮点形式传入都会被直接拒绝，防止发生单方隐式舍入。`FieldType::validate` 执行相同的规则，读取文档（`Document::try_from_doc`）时则将上述形态归一化为规范变体。
 
 对于任意 `DeserializeOwned` 类型，使用：
 

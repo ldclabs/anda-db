@@ -1,12 +1,7 @@
 //! Standalone utility types maintained alongside the AndaDB workspace.
 //!
-//! The crate intentionally stays small and dependency-light. It currently
-//! provides:
-//!
-//! - [`UniqueVec`], an insertion-ordered vector that rejects duplicates.
-//! - [`CountingWriter`], a writer that counts serialized bytes without storing
-//!   the payload.
-//! - [`Pipe`], a small functional-style chaining trait.
+//! The crate intentionally stays small and dependency-light. It provides
+//! [`UniqueVec`], an insertion-ordered vector that rejects duplicates.
 //!
 //! # Hashing
 //!
@@ -22,35 +17,6 @@ use serde::{
     ser::{Serialize, Serializer},
 };
 use std::{borrow::Borrow, hash::Hash};
-
-/// A trait for functional-style method chaining.
-///
-/// Allows any value to be passed through a function, enabling
-/// fluent interfaces and functional programming patterns.
-pub trait Pipe<T> {
-    /// Passes the value through a function.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - Function to apply to the value
-    ///
-    /// # Returns
-    ///
-    /// The result of applying the function to the value
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-        Self: Sized;
-}
-
-impl<T> Pipe<T> for T {
-    fn pipe<F, R>(self, f: F) -> R
-    where
-        F: FnOnce(Self) -> R,
-    {
-        f(self)
-    }
-}
 
 /// A helper utility to efficiently push or extend a `Vec` with unique items.
 ///
@@ -142,30 +108,10 @@ impl<T> From<Vec<T>> for UniqueVec<T>
 where
     T: Eq + Hash + Clone,
 {
-    /// Creates a `UniqueVec` from a `Vec`.
-    ///
-    /// The extender is initialized with all the unique items from the vector.
-    fn from(mut vec: Vec<T>) -> Self {
-        // The input length says nothing about the number of distinct values.
-        // Grow the set with the unique population and avoid cloning duplicates.
-        let input_len = vec.len();
-        let mut seen = 0usize;
-        let mut check_duplicates = std::mem::needs_drop::<T>();
-        let mut set = FxHashSet::default();
-        vec.retain(|item| {
-            seen += 1;
-            // Cheap, non-dropping values can use a single hash probe; cloning
-            // owned payloads is avoided for duplicates.
-            let inserted = (!check_duplicates || !set.contains(item)) && set.insert(item.clone());
-            check_duplicates |= !inserted;
-            if seen == CONSTRUCTION_SAMPLE_LEN && set.len() == CONSTRUCTION_SAMPLE_LEN {
-                set.reserve(construction_reserve::<T>(input_len - seen));
-            }
-            inserted
-        });
-        let mut result = Self { set, vec };
-        result.compact_sparse();
-        result
+    /// Creates a `UniqueVec` from a `Vec`, keeping the first occurrence of
+    /// each item.
+    fn from(vec: Vec<T>) -> Self {
+        vec.into_iter().collect()
     }
 }
 
@@ -173,14 +119,31 @@ impl<T> FromIterator<T> for UniqueVec<T>
 where
     T: Eq + Hash + Clone,
 {
-    /// Creates a `UniqueVec` from an iterator.
+    /// Creates a `UniqueVec` from an iterator, keeping the first occurrence
+    /// of each item.
+    ///
+    /// This is the single construction path (`From<Vec>` and `Deserialize`
+    /// collect through it). The input length says nothing about the number of
+    /// distinct values: capacity is reserved only once a sample turns out
+    /// all-unique, bounded by `CONSTRUCTION_RESERVE_BYTES`, and trimmed again
+    /// at the end.
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut result = Self::default();
         let mut iter = iter.into_iter();
-        let mut seen = 0;
+        let mut seen = 0usize;
+        // Cheap, non-dropping values use a single hash probe until the first
+        // duplicate; owned payloads probe first so duplicates are not cloned.
         let mut check_duplicates = std::mem::needs_drop::<T>();
         while let Some(item) = iter.next() {
-            check_duplicates |= !result.push_constructing(item, check_duplicates);
+            // The value is unpublished: if clone/hash or allocation panics,
+            // the whole local result is dropped (public mutations use
+            // `push`'s rollback guard instead).
+            if !(check_duplicates && result.set.contains(&item)) && result.set.insert(item.clone())
+            {
+                result.vec.push(item);
+            } else {
+                check_duplicates = true;
+            }
             seen += 1;
             if seen == CONSTRUCTION_SAMPLE_LEN && result.len() == CONSTRUCTION_SAMPLE_LEN {
                 let reserve = construction_reserve::<T>(iter.size_hint().0);
@@ -220,21 +183,6 @@ impl<T> UniqueVec<T>
 where
     T: Eq + Hash + Clone,
 {
-    // Only used while constructing an unpublished value. If clone/hash or
-    // allocation panics, the entire local result is dropped; public mutations
-    // continue to use push's rollback guard.
-    fn push_constructing(&mut self, item: T, check_duplicates: bool) -> bool {
-        if check_duplicates && self.set.contains(&item) {
-            return false;
-        }
-        if self.set.insert(item.clone()) {
-            self.vec.push(item);
-            true
-        } else {
-            false
-        }
-    }
-
     fn compact_sparse(&mut self) {
         let threshold = self
             .vec
@@ -500,65 +448,21 @@ where
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut values = UniqueVec::new();
-                let mut check_duplicates = std::mem::needs_drop::<T>();
-                while let Some(item) = seq.next_element()? {
-                    check_duplicates |= !values.push_constructing(item, check_duplicates);
+                let mut error = None;
+                let values = std::iter::from_fn(|| {
+                    seq.next_element().unwrap_or_else(|err| {
+                        error = Some(err);
+                        None
+                    })
+                })
+                .collect();
+                match error {
+                    Some(err) => Err(err),
+                    None => Ok(values),
                 }
-                Ok(values)
             }
         }
         deserializer.deserialize_seq(Visitor(std::marker::PhantomData))
-    }
-}
-
-/// Utility for counting the size of serialized CBOR data.
-///
-/// Note: for computing the encoded size of a CBOR value, prefer
-/// `cbor2::serialized_size` (the workspace convention); it avoids driving a
-/// full serializer through the `Write` trait. This type is kept as a
-/// general-purpose byte-counting `Write` sink for other serialization
-/// formats and for backwards compatibility.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CountingWriter {
-    count: usize,
-}
-
-impl Default for CountingWriter {
-    /// Creates a new `CountingWriter` with a count of 0.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CountingWriter {
-    /// Creates a new `CountingWriter`.
-    pub const fn new() -> Self {
-        CountingWriter { count: 0 }
-    }
-
-    /// Returns the current count of bytes written.
-    pub const fn size(&self) -> usize {
-        self.count
-    }
-}
-
-impl std::io::Write for CountingWriter {
-    /// Implements the write method for the Write trait.
-    /// This simply counts the bytes without actually writing them.
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let len = buf.len();
-        self.count = self
-            .count
-            .checked_add(len)
-            .ok_or_else(|| std::io::Error::other("byte count overflow"))?;
-        Ok(len)
-    }
-
-    /// Implements the flush method for the Write trait.
-    /// This is a no-op since we're not actually writing data.
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 

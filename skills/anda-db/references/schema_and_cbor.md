@@ -177,5 +177,8 @@ untyped decode.
 
 Schema-aware conversion recognizes byte arrays, but Serde does not serialize
 every arbitrary nested `Vec<u8>` as a CBOR byte string. Use explicit
-`Fv::Bytes` or a byte serializer where the wire format requires one. No new
+`Fv::Bytes` or a byte serializer where the wire format requires one. For large
+binary fields prefer `serde_bytes::ByteBuf` / `ByteBufB64`: a `Vec<u8>`
+serializes one integer per byte, making `Document::try_from` several hundred
+times slower for a 64 KiB payload. No new
 direct `ciborium` usage; the former `cbor_size` helper is gone.

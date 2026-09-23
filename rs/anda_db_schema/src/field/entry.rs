@@ -182,10 +182,7 @@ impl FieldEntry {
                 }
                 Ok(v)
             }
-            Err(e) => Err(SchemaError::FieldValue(format!(
-                "field {} is invalid, error: {}",
-                self.name, e
-            ))),
+            Err(err) => Err(self.invalid(err)),
         }
     }
 
@@ -221,14 +218,12 @@ impl FieldEntry {
         let value = self
             .r#type
             .prepare(value, 0, ValueMode::Write)
-            .map_err(|err| {
-                SchemaError::FieldValue(format!("field {} is invalid, error: {err}", self.name))
-            })?;
+            .map_err(|err| self.invalid(err))?;
         // Mirrors `Document::try_from`: typed coercion also enforces the
         // write-admission budget for newly supplied values.
-        value.validate_complexity().map_err(|err| {
-            SchemaError::FieldValue(format!("field {} is invalid, error: {err}", self.name))
-        })?;
+        value
+            .validate_complexity()
+            .map_err(|err| self.invalid(err))?;
         Ok(value)
     }
 
@@ -267,8 +262,14 @@ impl FieldEntry {
             )));
         }
 
-        self.r#type.validate(value).map_err(|err| {
-            SchemaError::FieldValue(format!("field {} is invalid, error: {}", self.name, err))
-        })
+        self.r#type.validate(value).map_err(|err| self.invalid(err))
+    }
+
+    fn invalid(&self, err: SchemaError) -> SchemaError {
+        SchemaError::FieldValue(format!(
+            "field {} is invalid, error: {}",
+            self.name,
+            err.detail()
+        ))
     }
 }

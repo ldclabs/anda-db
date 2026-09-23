@@ -4,9 +4,8 @@ use quote::quote;
 use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    TypeParams, effective_field_name, is_u64_type, named_fields, parse_container_attrs,
-    parse_field_cbor_attrs, parse_field_serde_attrs, reject_direct_recursion, resolve_field_type,
-    schema_crate_path, validate_schema_field_name, validate_unique_attrs,
+    TypeParams, is_u64_type, named_fields, parse_container_attrs, resolve_field_type,
+    schema_crate_path, serialized_field, validate_schema_field_name,
 };
 
 /// Implementation of `#[derive(AndaDBSchema)]`.
@@ -68,49 +67,29 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
     // `SchemaBuilder` injects `_id` as a *required* entry and
     // `Document::try_from` reads it back out of the serialized value, so a
     // struct whose serialized form has no `"_id"` key can be built but never
-    // stored. Track the declaration to report that at compile time.
-    let mut has_serialized_id = false;
+    // stored. A malformed `_id` is reported on its own below; only a missing
+    // declaration gets the "requires `_id`" diagnostic.
+    let mut has_id = false;
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
-        let rust_name = field_ident.unraw().to_string();
-        has_serialized_id |= rust_name == "_id";
-        let serde_attrs = parse_field_serde_attrs(&field.attrs);
-        if let Err(err) = validate_unique_attrs(&field.attrs) {
-            field_entries.push(err.to_compile_error());
-            continue;
-        }
-
-        // Validate shape-changing attributes before the special `_id` path
-        // can return. Skipped ordinary fields have no serialized shape.
-        if !serde_attrs.skip_serializing {
-            match parse_field_cbor_attrs(&field.attrs) {
-                Ok(attrs) if attrs.key.is_some() => {
-                    field_entries.push(syn::Error::new_spanned(field_ident,
-                        "#[cbor(key = ...)] is not supported on top-level document fields: AndaDB documents are stored with text field names. Integer CBOR keys are only supported in nested structs deriving FieldTyped").to_compile_error());
-                    if rust_name == "_id" {
-                        has_serialized_id = true;
-                    }
-                    continue;
-                }
-                Err(err) => {
-                    field_entries.push(err.to_compile_error());
-                    continue;
-                }
-                _ => {}
-            }
-            if serde_attrs.flatten {
-                field_entries.push(syn::Error::new_spanned(field_ident,
-                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field").to_compile_error());
-                if rust_name == "_id" {
-                    has_serialized_id = true;
-                }
+        let is_id = field_ident.unraw() == "_id";
+        has_id |= is_id;
+        let serialized = match serialized_field(field, &container) {
+            Ok(serialized) => serialized,
+            Err(err) => {
+                field_entries.push(err.to_compile_error());
                 continue;
             }
+        };
+        if serialized.as_ref().is_some_and(|f| f.cbor_key.is_some()) {
+            field_entries.push(syn::Error::new_spanned(field_ident,
+                "#[cbor(key = ...)] is not supported on top-level document fields: AndaDB documents are stored with text field names. Integer CBOR keys are only supported in nested structs deriving FieldTyped").to_compile_error());
+            continue;
         }
 
         // The `_id` column is provided automatically by `SchemaBuilder`; the
         // user-declared field is validated and then skipped.
-        if rust_name == "_id" {
+        if is_id {
             // `_id` is always `FieldType::U64`; a `#[field_type]` override
             // would be silently ignored, so reject it.
             if let Some(attr) = field
@@ -126,16 +105,27 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
                     .to_compile_error(),
                 );
             }
-            // A malformed `_id` is reported below on its own; treat it as
-            // declared either way so the "missing `_id`" diagnostic does not
-            // pile a second, misleading error on top of it.
-            has_serialized_id = true;
             if !is_u64_type(&field.ty) {
                 field_entries.push(
                     syn::Error::new_spanned(&field.ty, "The '_id' field must be of type u64")
                         .to_compile_error(),
                 );
-            } else if serde_attrs.skip_serializing {
+            } else if let Some(serialized) = serialized {
+                // serde must keep serializing the primary key as "_id",
+                // otherwise stored documents would not match the schema.
+                if serialized.name != "_id" {
+                    field_entries.push(
+                        syn::Error::new_spanned(
+                            field_ident,
+                            format!(
+                                "serde renames `_id` to {:?}, but the primary key must serialize as \"_id\"; add #[serde(rename = \"_id\")]",
+                                serialized.name
+                            ),
+                        )
+                        .to_compile_error(),
+                    );
+                }
+            } else {
                 // A skipped `_id` never reaches the serialized document, so
                 // `Document::try_from` would fail at runtime with
                 // `field "_id" is required`.
@@ -148,33 +138,17 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
                     )
                     .to_compile_error(),
                 );
-            } else {
-                // serde must keep serializing the primary key as "_id",
-                // otherwise stored documents would not match the schema.
-                let schema_name =
-                    effective_field_name(&rust_name, &serde_attrs, container.rename_all);
-                if schema_name != "_id" {
-                    field_entries.push(
-                        syn::Error::new_spanned(
-                            field_ident,
-                            format!(
-                                "serde renames `_id` to {schema_name:?}, but the primary key must serialize as \"_id\"; add #[serde(rename = \"_id\")]"
-                            ),
-                        )
-                        .to_compile_error(),
-                    );
-                }
             }
             continue;
         }
 
         // Fields serde never serializes must not appear in the schema.
-        if serde_attrs.skip_serializing {
+        let Some(serialized) = serialized else {
             continue;
-        }
+        };
         // Schema field names follow the serialized names: serde renames and
         // container-level rename_all rules are honoured.
-        let schema_name = effective_field_name(&rust_name, &serde_attrs, container.rename_all);
+        let schema_name = serialized.name;
 
         // Reject names AndaDB would refuse at runtime (`FieldEntry::new`
         // accepts only `[a-z0-9_]{1,64}`): a document serialized with such a
@@ -198,7 +172,8 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
                 syn::Error::new_spanned(
                     field_ident,
                     format!(
-                        "field {rust_name:?} serializes as \"_id\", which collides with the auto-generated primary key"
+                        "field {:?} serializes as \"_id\", which collides with the auto-generated primary key",
+                        serialized.rust_name
                     ),
                 )
                 .to_compile_error(),
@@ -217,11 +192,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         }
 
         // `#[field_type = "..."]` wins over auto-inference.
-        if let Err(err) = reject_direct_recursion(field, name) {
-            field_entries.push(err.to_compile_error());
-            continue;
-        }
-        let field_type = match resolve_field_type(field, &root, &type_params) {
+        let field_type = match resolve_field_type(field, name, &root, &type_params) {
             Ok(field_type) => field_type,
             Err(err) => {
                 field_entries.push(err.to_compile_error());
@@ -253,7 +224,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         quote! { let mut builder = #root::Schema::builder(); }
     };
 
-    if !has_serialized_id {
+    if !has_id {
         field_entries.push(
             syn::Error::new_spanned(
                 &input.ident,

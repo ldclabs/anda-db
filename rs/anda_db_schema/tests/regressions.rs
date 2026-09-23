@@ -25,6 +25,7 @@ fn map(fields: &[(&str, Ft)]) -> Ft {
 
 #[test]
 fn finite_f32_json_roundtrip_preserves_bits() {
+    let s = Arc::new(schema(Ft::F32, 0));
     let mut state = 0x12345678u32;
     for bits in [0, 0x80000000, 1, 0x470e2fd0, 0xfcbe64a0]
         .into_iter()
@@ -40,11 +41,14 @@ fn finite_f32_json_roundtrip_preserves_bits() {
             continue;
         }
         let wire = serde_json::to_string(&Fv::F32(f)).unwrap();
-        let mut value: Fv = serde_json::from_str(&wire).unwrap();
-        Ft::F32.normalize(&mut value);
-        Ft::F32
-            .validate(&value)
+        let value: Fv = serde_json::from_str(&wire).unwrap();
+        let raw = DocumentOwned {
+            fields: BTreeMap::from([(0, Fv::U64(1)), (1, value)]),
+        };
+        let doc = Document::try_from_doc(s.clone(), raw)
             .unwrap_or_else(|err| panic!("{bits:08x}: {wire}: {err}"));
+        let value = doc.get_field("payload").unwrap();
+        assert_eq!(value, &Fv::F32(f), "{wire}");
         assert_eq!(f32::try_from(value).unwrap().to_bits(), bits, "{wire}");
     }
 }
@@ -545,5 +549,36 @@ fn json_conversion_rejects_cbor_tags_instead_of_discarding_them() {
     assert_eq!(
         Ft::Json.extract(Cbor::Text("2026-09-06".into())).unwrap(),
         Fv::Json(Json::String("2026-09-06".into()))
+    );
+}
+
+#[test]
+fn mistyped_large_values_produce_bounded_errors() {
+    let text = Fe::new("title".into(), Ft::Text).unwrap();
+    let err = text
+        .coerce(Fv::Bytes(vec![7; 65_536]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.len() < 512, "{} bytes: {err}", err.len());
+    assert!(err.ends_with('…'), "{err}");
+    assert_eq!(err.matches("Invalid field value").count(), 1, "{err}");
+
+    let flag = Fe::new("flag".into(), Ft::Bool).unwrap();
+    let err = flag
+        .coerce(Fv::Vector(vec![anda_db_schema::bf16::from_f32(0.5); 1536]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.len() < 512, "{} bytes: {err}", err.len());
+
+    let err = Document::try_from(Arc::new(schema(Ft::Text, 0)), &vec![0u64; 65_536])
+        .unwrap_err()
+        .to_string();
+    assert!(err.len() < 512, "{} bytes: {err}", err.len());
+
+    // Small values keep their full detail.
+    let err = text.coerce(Fv::U64(5)).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "Invalid field value: field title is invalid, error: expected Text, got 5"
     );
 }

@@ -15,14 +15,14 @@ proc-macro = true
 doctest = true
 
 [dependencies]
-syn = "2.0"
-quote = "1.0"
-proc-macro2 = "1.0"
-proc-macro-crate = "3"
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+proc-macro-crate = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }
 # Cyclic dev-dependency (allowed by cargo, stripped on publish): used by the
 # trybuild UI tests to compile the generated code for real.
 anda_db_schema = { path = "../anda_db_schema" }
-trybuild = "1"
+trybuild = { workspace = true }

@@ -87,6 +87,8 @@ struct ReadmeExamples;
 /// - `String` / `&str` -> `Text`
 /// - integers / floats / `bool` -> their numeric `FieldType`
 /// - `Vec<u8>`, `[u8; N]`, `Bytes`, `ByteBuf`, `ByteArray`, `*B64` -> `Bytes`
+///   (for large payloads prefer `ByteBuf` / `ByteBufB64`: serde writes a
+///   `Vec<u8>` as one integer per byte, which is far slower to store)
 /// - `Vec<bf16>`, `[bf16; N]` -> `Vector`
 /// - `Vec<T>` / `VecDeque<T>` / `LinkedList<T>` / `BinaryHeap<T>` /
 ///   `HashSet<T>` / `BTreeSet<T>` -> `Array(T)`

@@ -185,7 +185,7 @@ impl FieldType {
             _ => {}
         }
         if mode == ValueMode::Read {
-            self.normalize_at(&mut value, depth);
+            self.normalize_read_back(&mut value);
             self.validate_inner(&value)?;
             return Ok(value);
         }
@@ -363,8 +363,8 @@ impl FieldType {
     ///   holds exactly: JSON has a single number type, so `1.0` reaches a
     ///   float field as `1`.
     ///
-    /// Use [`FieldType::normalize`] to fold accepted read-back shapes into
-    /// the canonical variant.
+    /// Reading a document ([`Document::try_from_doc`](crate::Document::try_from_doc))
+    /// folds accepted read-back shapes into the canonical variant.
     ///
     /// `Json` accepts its canonical variant and JSON-compatible read-back
     /// shapes. Bytes and maps with non-text keys are rejected.
@@ -438,7 +438,8 @@ impl FieldType {
                     return Ok(());
                 }
                 Err(SchemaError::FieldValue(format!(
-                    "expected Vector, got {values:?}"
+                    "expected Vector, got {}",
+                    Brief(values)
                 )))
             }
             (FieldType::Array(types), FieldValue::Array(values)) => match types.len() {
@@ -473,44 +474,18 @@ impl FieldType {
                 ft.validate_inner(val)
             }
             _ => Err(SchemaError::FieldValue(format!(
-                "expected type {self:?}, got value {value:?}"
+                "expected type {self:?}, got value {}",
+                Brief(value)
             ))),
         }
     }
 
-    /// Normalizes generic *read-back* shapes into this type's canonical
-    /// variant, recursing into `Array` / `Map` / `Option` composites:
-    ///
-    /// - an `I64` field observed as a non-negative [`FieldValue::U64`] within
-    ///   `i64` range becomes [`FieldValue::I64`],
-    /// - an `F32` field observed as an [`FieldValue::F64`] read-back shape
-    ///   (see `is_f32_read_back`) becomes [`FieldValue::F32`],
-    /// - an `F64` field observed as any integer ([`FieldValue::I64`] /
-    ///   [`FieldValue::U64`]), and an `F32` field observed as one an `f32`
-    ///   holds exactly, become the float — JSON writes `1.0` as `1`,
-    /// - a `Vector` field observed as an array of U64 bf16 bit patterns becomes
-    ///   [`FieldValue::Vector`],
-    /// - a `Json` field observed as the `Map` / `Array` / primitive shape of
-    ///   its payload becomes [`FieldValue::Json`] again.
-    ///
-    /// Values that are not a read-back shape of this type are left unchanged
-    /// (a following [`FieldType::validate`] reports them). Normalization is
-    /// applied at every document materialization boundary
-    /// (`Document::try_from_doc`, `Document::set_field`, ...) so downstream
-    /// consumers such as index maintenance and equality checks always observe
-    /// the declared variant.
-    pub fn normalize(&self, value: &mut FieldValue) {
-        self.normalize_at(value, 0)
-    }
-
-    /// Depth-tracked body of [`FieldType::normalize`]: stops recursing (and
-    /// leaves the value unchanged) beyond [`MAX_CONVERSION_DEPTH`], where
-    /// validation rejects the value anyway.
-    fn normalize_at(&self, value: &mut FieldValue, depth: usize) {
-        if check_conversion_depth(depth).is_err() {
-            return;
-        }
-
+    /// Folds a generic *read-back* shape of a scalar or `Vector` value into
+    /// the declared variant (see [`FieldType::validate`] for the accepted
+    /// shapes). Composite and `Json` values never get here: `prepare`
+    /// recurses into them itself. Anything else is left unchanged for the
+    /// following validation to report.
+    fn normalize_read_back(&self, value: &mut FieldValue) {
         match self {
             FieldType::I64 => {
                 if let FieldValue::U64(v) = value
@@ -559,129 +534,6 @@ impl FieldType {
                     }
                 }
             }
-            FieldType::Array(types) => {
-                if let FieldValue::Array(values) = value {
-                    match types.len() {
-                        0 => {}
-                        1 => {
-                            for v in values.iter_mut() {
-                                types[0].normalize_at(v, depth + 1);
-                            }
-                        }
-                        _ => {
-                            for (ft, v) in types.iter().zip(values.iter_mut()) {
-                                ft.normalize_at(v, depth + 1);
-                            }
-                        }
-                    }
-                }
-            }
-            FieldType::Json => {
-                // A `Json` payload is stored as its plain CBOR/JSON shape, so
-                // it reads back as a `Map`, an `Array` or a primitive.
-                // Check representability before moving payloads so an invalid
-                // value stays unchanged. Shapes that have no
-                // JSON representation (e.g. `Bytes`) are left unchanged, and
-                // so are values too deeply nested for the bounded conversion.
-                if !matches!(value, FieldValue::Json(_))
-                    && validate_json_shape(value, depth).is_ok()
-                {
-                    let owned = std::mem::replace(value, FieldValue::Null);
-                    *value = FieldValue::Json(
-                        field_value_into_json(owned, depth).expect("JSON shape checked above"),
-                    );
-                }
-            }
-            FieldType::Map(types) => {
-                if let FieldValue::Map(values) = value {
-                    if let Some((_, ft)) = as_wildcard_map(types) {
-                        for v in values.values_mut() {
-                            ft.normalize_at(v, depth + 1);
-                        }
-                    } else {
-                        for (k, v) in values.iter_mut() {
-                            if let Some(ft) = types.get(k) {
-                                ft.normalize_at(v, depth + 1);
-                            }
-                        }
-                    }
-                }
-            }
-            // `Option` wrapping is type-level nesting only; the value itself
-            // is not a container level.
-            FieldType::Option(ft) if value != &FieldValue::Null => {
-                ft.normalize_at(value, depth);
-            }
-            _ => {}
-        }
-    }
-
-    /// Drops [`FieldValue::Map`] entries whose key this type does not declare,
-    /// recursing into `Array` / `Map` / `Option` composites.
-    ///
-    /// A non-wildcard [`FieldType::Map`] — what `#[derive(FieldTyped)]` emits
-    /// for every nested struct — names its keys one by one, so a key it does
-    /// not declare can only be a *removed* nested field: stale data written
-    /// under an older schema, exactly like a top-level value stored under a
-    /// retired field index. [`FieldType::validate`] still rejects such keys,
-    /// so this runs on the read path just before validation
-    /// (`Document::try_from_doc`), which also makes the leftover disappear the
-    /// next time the document is rewritten. Without it, removing one field
-    /// from a nested struct makes every already-stored document unreadable.
-    ///
-    /// Wildcard maps declare no key names at all and are left untouched.
-    pub fn prune_undeclared(&self, value: &mut FieldValue) {
-        self.prune_undeclared_at(value, 0)
-    }
-
-    /// Depth-tracked body of [`FieldType::prune_undeclared`]: stops recursing
-    /// (and leaves the value unchanged) beyond [`MAX_CONVERSION_DEPTH`], where
-    /// validation rejects the value anyway.
-    fn prune_undeclared_at(&self, value: &mut FieldValue, depth: usize) {
-        if check_conversion_depth(depth).is_err() {
-            return;
-        }
-
-        match self {
-            FieldType::Array(types) => {
-                if let FieldValue::Array(values) = value {
-                    match types.len() {
-                        0 => {}
-                        1 => {
-                            for v in values.iter_mut() {
-                                types[0].prune_undeclared_at(v, depth + 1);
-                            }
-                        }
-                        _ => {
-                            for (ft, v) in types.iter().zip(values.iter_mut()) {
-                                ft.prune_undeclared_at(v, depth + 1);
-                            }
-                        }
-                    }
-                }
-            }
-            // An empty `Map` type declares nothing and accepts everything.
-            FieldType::Map(types) if !types.is_empty() => {
-                if let FieldValue::Map(values) = value {
-                    if let Some((_, ft)) = as_wildcard_map(types) {
-                        for v in values.values_mut() {
-                            ft.prune_undeclared_at(v, depth + 1);
-                        }
-                    } else {
-                        values.retain(|k, _| types.contains_key(k));
-                        for (k, v) in values.iter_mut() {
-                            if let Some(ft) = types.get(k) {
-                                ft.prune_undeclared_at(v, depth + 1);
-                            }
-                        }
-                    }
-                }
-            }
-            // `Option` wrapping is type-level nesting only; the value itself
-            // is not a container level.
-            FieldType::Option(ft) if value != &FieldValue::Null => {
-                ft.prune_undeclared_at(value, depth);
-            }
             _ => {}
         }
     }
@@ -703,7 +555,7 @@ impl FieldType {
     ///   emits for a nested struct — may **gain** a key, provided the new key
     ///   is optional, so documents written before the upgrade (which lack it)
     ///   still validate; and **lose** a key: stored values keep the stale
-    ///   entry, which [`FieldType::prune_undeclared`] drops on read.
+    ///   entry, which document reads drop.
     ///
     /// A key whose type changed otherwise, a new *required* key, and any
     /// change of the wildcard-ness or key variant of a map remain
@@ -833,7 +685,10 @@ pub(super) fn validate_map_fields(
         };
 
         rt.map_err(|err| {
-            SchemaError::FieldValue(format!("invalid map value at key {k:?}, error: {err}"))
+            SchemaError::FieldValue(format!(
+                "invalid map value at key {k:?}, error: {}",
+                err.detail()
+            ))
         })?;
     }
     Ok(())

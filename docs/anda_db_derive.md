@@ -196,6 +196,13 @@ type and produce a `FieldType` token stream.
 | `BytesB64`, `ByteArrayB64`, `ByteBufB64`                               | `Bytes`     |
 | `serde_bytes::Bytes`, `serde_bytes::ByteArray`, `serde_bytes::ByteBuf` | `Bytes`     |
 
+`Vec<u8>` and `[u8; N]` have no byte-string specialization in serde: they
+serialize one integer per byte, which the schema then coerces to `Bytes`. For
+large binary payloads use `serde_bytes::ByteBuf` or `ByteBufB64`, which
+serialize as a byte string; a 64 KiB `Vec<u8>` field makes
+`Document::try_from` several hundred times slower than the same payload as
+`ByteBuf`.
+
 ### 4.3 Vectors and JSON
 
 | Rust type                   | `FieldType` |

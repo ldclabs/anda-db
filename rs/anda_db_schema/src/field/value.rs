@@ -99,6 +99,8 @@ pub(super) fn field_value_to_cbor(
         FieldValue::Vector(arr) => {
             Cbor::Array(arr.into_iter().map(|f| f.to_bits().into()).collect())
         }
+        // Kept as a collect: an inline loop enlarges this recursive frame
+        // enough to overflow a 2 MiB debug-build stack at the depth bound.
         FieldValue::Array(arr) => Cbor::Array(
             arr.into_iter()
                 .map(|v| field_value_to_cbor(v, depth + 1, strict))
@@ -201,16 +203,21 @@ impl From<FieldKey> for FieldValue {
     }
 }
 
-impl TryFrom<FieldValue> for bool {
-    type Error = BoxError;
+// Scalars are `Copy`: the owned conversions reuse the borrowed ones, so both
+// directions accept exactly the same read-back and JSON number shapes.
+macro_rules! impl_try_from_owned_scalar {
+    ($($ty:ty),* $(,)?) => {$(
+        impl TryFrom<FieldValue> for $ty {
+            type Error = BoxError;
 
-    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        match value {
-            FieldValue::Bool(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Bool, got {value:?}")).into()),
+            fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
+                <$ty>::try_from(&value)
+            }
         }
-    }
+    )*};
 }
+
+impl_try_from_owned_scalar!(bool, i64, u64, f64, f32);
 
 impl<'a> TryFrom<&'a FieldValue> for bool {
     type Error = BoxError;
@@ -218,21 +225,9 @@ impl<'a> TryFrom<&'a FieldValue> for bool {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Bool(v) => Ok(*v),
-            _ => Err(SchemaError::FieldValue(format!("expected Bool, got {value:?}")).into()),
-        }
-    }
-}
-
-impl TryFrom<FieldValue> for i64 {
-    type Error = BoxError;
-
-    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        match value {
-            FieldValue::I64(v) => Ok(v),
-            // Read-back shape: a non-negative I64 comes back as U64 through
-            // generic CBOR (see `FieldType::validate`).
-            FieldValue::U64(v) if v <= i64::MAX as u64 => Ok(v as i64),
-            _ => Err(SchemaError::FieldValue(format!("expected I64, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Bool, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -246,7 +241,9 @@ impl<'a> TryFrom<&'a FieldValue> for i64 {
             // Read-back shape: a non-negative I64 comes back as U64 through
             // generic CBOR (see `FieldType::validate`).
             FieldValue::U64(v) if *v <= i64::MAX as u64 => Ok(*v as i64),
-            _ => Err(SchemaError::FieldValue(format!("expected I64, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected I64, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -257,18 +254,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a i64 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::I64(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected I64, got {value:?}")).into()),
-        }
-    }
-}
-
-impl TryFrom<FieldValue> for u64 {
-    type Error = BoxError;
-
-    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        match value {
-            FieldValue::U64(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected U64, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected I64, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -279,7 +267,9 @@ impl<'a> TryFrom<&'a FieldValue> for u64 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::U64(v) => Ok(*v),
-            _ => Err(SchemaError::FieldValue(format!("expected U64, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected U64, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -290,21 +280,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a u64 {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::U64(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected U64, got {value:?}")).into()),
-        }
-    }
-}
-
-impl TryFrom<FieldValue> for f64 {
-    type Error = BoxError;
-
-    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        match value {
-            FieldValue::F64(v) => Ok(v),
-            // JSON integer for a float field (see `FieldType::validate`).
-            FieldValue::I64(v) => Ok(v as f64),
-            FieldValue::U64(v) => Ok(v as f64),
-            _ => Err(SchemaError::FieldValue(format!("expected F64, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected U64, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -318,25 +296,9 @@ impl<'a> TryFrom<&'a FieldValue> for f64 {
             // JSON integer for a float field (see `FieldType::validate`).
             FieldValue::I64(v) => Ok(*v as f64),
             FieldValue::U64(v) => Ok(*v as f64),
-            _ => Err(SchemaError::FieldValue(format!("expected F64, got {value:?}")).into()),
-        }
-    }
-}
-
-impl TryFrom<FieldValue> for f32 {
-    type Error = BoxError;
-
-    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        match value {
-            FieldValue::F32(v) => Ok(v),
-            // Read-back shape: an F32 comes back as an F64 through generic
-            // CBOR or JSON (see `FieldType::validate` / `is_f32_read_back`).
-            FieldValue::F64(v) if is_f32_read_back(v) => Ok(v as f32),
-            // JSON integer for a float field, only when it is exact (see
-            // `FieldType::validate`).
-            FieldValue::I64(v) if exact_f32_from_integer(v as i128).is_some() => Ok(v as f32),
-            FieldValue::U64(v) if exact_f32_from_integer(v as i128).is_some() => Ok(v as f32),
-            _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected F64, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -354,7 +316,9 @@ impl<'a> TryFrom<&'a FieldValue> for f32 {
             // `FieldType::validate`).
             FieldValue::I64(v) if exact_f32_from_integer(*v as i128).is_some() => Ok(*v as f32),
             FieldValue::U64(v) if exact_f32_from_integer(*v as i128).is_some() => Ok(*v as f32),
-            _ => Err(SchemaError::FieldValue(format!("expected F32, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected F32, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -365,7 +329,9 @@ impl TryFrom<FieldValue> for Vec<u8> {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Bytes(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Bytes, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Bytes, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -376,7 +342,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a Vec<u8> {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Bytes(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Bytes, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Bytes, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -387,7 +355,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a [u8] {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Bytes(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Bytes, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Bytes, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -400,7 +370,9 @@ impl<const N: usize> TryFrom<FieldValue> for [u8; N] {
             FieldValue::Bytes(v) => Ok(v.try_into().map_err(|v: Vec<u8>| {
                 SchemaError::FieldValue(format!("expected {N} bytes, got {}", v.len()))
             })?),
-            _ => Err(SchemaError::FieldValue(format!("expected Bytes, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Bytes, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -411,7 +383,9 @@ impl TryFrom<FieldValue> for String {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Text(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Text, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Text, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -422,7 +396,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a String {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Text(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Text, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Text, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -433,7 +409,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a str {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Text(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Text, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Text, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -444,7 +422,9 @@ impl TryFrom<FieldValue> for Json {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Json(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Json, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Json, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -455,7 +435,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a Json {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Json(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Json, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Json, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -481,7 +463,9 @@ impl TryFrom<FieldValue> for Vec<bf16> {
                     })
                     .collect())
             }
-            _ => Err(SchemaError::FieldValue(format!("expected Vector, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Vector, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -492,7 +476,9 @@ impl<'a> TryFrom<&'a FieldValue> for &'a Vec<bf16> {
     fn try_from(value: &'a FieldValue) -> Result<Self, Self::Error> {
         match value {
             FieldValue::Vector(v) => Ok(v),
-            _ => Err(SchemaError::FieldValue(format!("expected Vector, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Vector, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -505,7 +491,9 @@ impl<const N: usize> TryFrom<FieldValue> for [bf16; N] {
             FieldValue::Vector(v) => Ok(v.try_into().map_err(|v: Vec<bf16>| {
                 SchemaError::FieldValue(format!("expected {N} elements, got {}", v.len()))
             })?),
-            _ => Err(SchemaError::FieldValue(format!("expected Vector, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Vector, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -525,7 +513,9 @@ where
                 }
                 Ok(rt)
             }
-            _ => Err(SchemaError::FieldValue(format!("expected Array, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Array, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -545,7 +535,9 @@ where
                 }
                 Ok(rt)
             }
-            _ => Err(SchemaError::FieldValue(format!("expected Array, got {value:?}")).into()),
+            _ => Err(
+                SchemaError::FieldValue(format!("expected Array, got {}", Brief(&value))).into(),
+            ),
         }
     }
 }
@@ -565,7 +557,9 @@ where
                 }
                 Ok(rt)
             }
-            _ => Err(SchemaError::FieldValue(format!("expected Map, got {value:?}")).into()),
+            _ => {
+                Err(SchemaError::FieldValue(format!("expected Map, got {}", Brief(&value))).into())
+            }
         }
     }
 }
@@ -615,7 +609,10 @@ impl FieldValue {
     pub fn bool_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
             Cbor::Bool(b) => Ok(FieldValue::Bool(b)),
-            v => Err(SchemaError::FieldValue(format!("expected Bool, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected Bool, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -633,7 +630,10 @@ impl FieldValue {
                     SchemaError::FieldValue(format!("expected I64, got {v:?}"))
                 })?))
             }
-            v => Err(SchemaError::FieldValue(format!("expected I64, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected I64, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -651,7 +651,10 @@ impl FieldValue {
                     SchemaError::FieldValue(format!("expected U64, got {v:?}"))
                 })?))
             }
-            v => Err(SchemaError::FieldValue(format!("expected U64, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected U64, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -670,7 +673,10 @@ impl FieldValue {
         match value {
             Cbor::Float(f) if !f.is_nan() => Ok(FieldValue::F64(f)),
             Cbor::Integer(i) => Ok(FieldValue::F64(integer_to_f64(i))),
-            v => Err(SchemaError::FieldValue(format!("expected F64, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected F64, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -710,7 +716,10 @@ impl FieldValue {
                         ))
                     })
             }
-            v => Err(SchemaError::FieldValue(format!("expected F32, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected F32, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -732,7 +741,8 @@ impl FieldValue {
             Cbor::Bytes(b) => Ok(FieldValue::Bytes(b)),
             Cbor::Array(arr) => Ok(FieldValue::Bytes(u8_array_from(arr)?)),
             v => Err(SchemaError::FieldValue(format!(
-                "expected Bytes, got {v:?}"
+                "expected Bytes, got {}",
+                Brief(&v)
             ))),
         }
     }
@@ -747,7 +757,10 @@ impl FieldValue {
     pub fn text_from(value: Cbor) -> Result<Self, SchemaError> {
         match value {
             Cbor::Text(t) => Ok(FieldValue::Text(t)),
-            v => Err(SchemaError::FieldValue(format!("expected Text, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected Text, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -779,7 +792,8 @@ impl FieldValue {
                 Ok(FieldValue::Vector(vector))
             }
             v => Err(SchemaError::FieldValue(format!(
-                "expected Vector, got {v:?}"
+                "expected Vector, got {}",
+                Brief(&v)
             ))),
         }
     }
@@ -798,7 +812,10 @@ impl FieldValue {
                     SchemaError::FieldValue(format!("expected u16, got {v:?}"))
                 })?))
             }
-            v => Err(SchemaError::FieldValue(format!("expected bf16, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected bf16, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -824,21 +841,23 @@ impl FieldValue {
         check_conversion_depth(depth)?;
 
         match value {
+            // Explicit loops keep the exact capacity; a `Result` collect
+            // loses the size hint and regrows the vector.
             Cbor::Array(values) => match types.len() {
-                0 => Ok(FieldValue::Array(
-                    values
-                        .into_iter()
-                        .map(|v| FieldValue::try_from_at(v, depth + 1))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )),
+                0 => {
+                    let mut rt = Vec::with_capacity(values.len());
+                    for v in values {
+                        rt.push(FieldValue::try_from_at(v, depth + 1)?);
+                    }
+                    Ok(FieldValue::Array(rt))
+                }
                 1 => {
-                    let ft = types.first().unwrap();
-                    Ok(FieldValue::Array(
-                        values
-                            .into_iter()
-                            .map(|v| ft.extract_at(v, depth + 1))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ))
+                    let ft = &types[0];
+                    let mut rt = Vec::with_capacity(values.len());
+                    for v in values {
+                        rt.push(ft.extract_at(v, depth + 1)?);
+                    }
+                    Ok(FieldValue::Array(rt))
                 }
                 _ => {
                     if types.len() != values.len() {
@@ -858,7 +877,8 @@ impl FieldValue {
                 }
             },
             v => Err(SchemaError::FieldValue(format!(
-                "expected Array, got {v:?}"
+                "expected Array, got {}",
+                Brief(&v)
             ))),
         }
     }
@@ -894,7 +914,7 @@ impl FieldValue {
                 let mut vals: BTreeMap<FieldKey, FieldValue> = BTreeMap::new();
                 for (k, v) in values {
                     let k: FieldKey = k.try_into().map_err(|err| {
-                        SchemaError::FieldValue(format!("invalid map key: {err:?}"))
+                        SchemaError::FieldValue(format!("invalid map key: {err}"))
                     })?;
 
                     let v = if types.is_empty() {
@@ -937,7 +957,10 @@ impl FieldValue {
                 }
                 Ok(FieldValue::Map(vals))
             }
-            v => Err(SchemaError::FieldValue(format!("expected Map, got {v:?}"))),
+            v => Err(SchemaError::FieldValue(format!(
+                "expected Map, got {}",
+                Brief(&v)
+            ))),
         }
     }
 
@@ -975,7 +998,8 @@ impl FieldValue {
             Cbor::Null => Ok(FieldValue::Null),
             Cbor::Tag(_, val) => Self::try_from_at(*val, depth + 1),
             v => Err(SchemaError::FieldValue(format!(
-                "invalid CBOR value: {v:?}"
+                "invalid CBOR value: {}",
+                Brief(&v)
             ))),
         }
     }
@@ -1088,11 +1112,13 @@ pub(super) fn json_to_cbor_at(
             }
         }
         Json::String(s) => Cbor::Text(s),
-        Json::Array(arr) => Cbor::Array(
-            arr.into_iter()
-                .map(|v| json_to_cbor_at(v, depth + 1, strict))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        Json::Array(arr) => {
+            let mut values = Vec::with_capacity(arr.len());
+            for v in arr {
+                values.push(json_to_cbor_at(v, depth + 1, strict)?);
+            }
+            Cbor::Array(values)
+        }
         Json::Object(obj) => {
             let mut entries = Vec::with_capacity(obj.len());
             for (k, v) in obj {
@@ -1113,12 +1139,14 @@ pub(super) fn u8_array_from(arr: Vec<Cbor>) -> Result<Vec<u8>, SchemaError> {
         match v {
             Cbor::Integer(i) => bytes.push(u8::try_from(i).map_err(|v| {
                 SchemaError::FieldValue(format!(
-                    "expected Bytes, got array element {v:?} outside u8 range"
+                    "expected Bytes, got array element {} outside u8 range",
+                    Brief(&v)
                 ))
             })?),
             v => {
                 return Err(SchemaError::FieldValue(format!(
-                    "expected Bytes, got array element {v:?}"
+                    "expected Bytes, got array element {}",
+                    Brief(&v)
                 )));
             }
         }

@@ -1,6 +1,6 @@
 //! Field types, keys, values and metadata. The facade preserves public paths
 //! while each module owns one part of the type system.
-use crate::{BoxError, SchemaError, validate_field_name};
+use crate::{BoxError, SchemaError, error::Brief, validate_field_name};
 use std::collections::BTreeMap;
 
 mod budget;

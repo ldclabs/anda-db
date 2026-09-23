@@ -1,4 +1,5 @@
 //! Error types used throughout the `anda_db_schema` crate.
+use std::fmt;
 use thiserror::Error;
 
 /// A boxed, thread-safe `std::error::Error`.
@@ -40,4 +41,61 @@ pub enum SchemaError {
     /// CBOR or serde (de)serialization failed.
     #[error("Serialization error: {0}")]
     Serialization(String),
+}
+
+impl SchemaError {
+    /// The message without the variant's `Display` prefix, so wrapping one
+    /// error into another does not repeat "Invalid field value: ".
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::Schema(msg)
+            | Self::FieldType(msg)
+            | Self::FieldValue(msg)
+            | Self::FieldName(msg)
+            | Self::Validation(msg)
+            | Self::Serialization(msg) => msg,
+        }
+    }
+}
+
+/// Maximum bytes of a value's `Debug` output embedded in an error message.
+const BRIEF_LIMIT: usize = 128;
+
+/// Formats a value's `Debug` output for an error message, cut off after
+/// [`BRIEF_LIMIT`] bytes. A mistyped blob or vector would otherwise produce
+/// an error larger than the payload itself; formatting also stops at the cut.
+pub(crate) struct Brief<'a, T: ?Sized>(pub(crate) &'a T);
+
+impl<T: fmt::Debug + ?Sized> fmt::Display for Brief<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Limited<'a, 'b> {
+            out: &'a mut fmt::Formatter<'b>,
+            left: usize,
+            truncated: bool,
+        }
+
+        impl fmt::Write for Limited<'_, '_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                if s.len() <= self.left {
+                    self.left -= s.len();
+                    return self.out.write_str(s);
+                }
+                self.out.write_str(&s[..s.floor_char_boundary(self.left)])?;
+                self.left = 0;
+                self.truncated = true;
+                // Stops the remaining Debug output.
+                Err(fmt::Error)
+            }
+        }
+
+        let mut out = Limited {
+            out: f,
+            left: BRIEF_LIMIT,
+            truncated: false,
+        };
+        match fmt::write(&mut out, format_args!("{:?}", self.0)) {
+            Err(_) if out.truncated => out.out.write_str("…"),
+            result => result,
+        }
+    }
 }

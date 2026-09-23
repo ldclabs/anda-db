@@ -60,7 +60,6 @@ Supporting crates:
   - anda_db_btree: exact/range index engine
   - anda_db_tfs: BM25 text index engine
   - anda_db_hnsw: vector index engine
-  - anda_db_utils: supporting utilities such as UniqueVec
 ```
 
 The core execution model is:

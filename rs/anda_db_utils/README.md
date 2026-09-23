@@ -7,8 +7,6 @@ does not depend on these helpers.
 ## What This Crate Provides
 
 - `UniqueVec<T>` for ordered unique collections
-- `Pipe` for lightweight functional-style chaining
-- `CountingWriter` for byte-counting during serialization workflows
 
 ## When to Use It
 
@@ -25,9 +23,6 @@ Add the crate to your project:
 [dependencies]
 anda_db_utils = "0.13"
 ```
-
-For CBOR encoded sizes, prefer `cbor2::serialized_size`; `CountingWriter`
-remains useful as a general-purpose counting sink for other formats.
 
 ## Related Crates
 

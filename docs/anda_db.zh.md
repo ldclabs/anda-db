@@ -60,7 +60,6 @@ Supporting crates:
   - anda_db_btree: 精确匹配/范围索引引擎
   - anda_db_tfs: BM25 全文索引引擎
   - anda_db_hnsw: 向量索引引擎
-  - anda_db_utils: 基础工具（如 UniqueVec）
 ```
 
 核心执行模型如下：

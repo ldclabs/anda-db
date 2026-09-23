@@ -252,7 +252,7 @@ pub fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttrs>
     Ok(out)
 }
 
-pub fn validate_unique_attrs(attrs: &[Attribute]) -> syn::Result<()> {
+fn validate_unique_attrs(attrs: &[Attribute]) -> syn::Result<()> {
     let mut seen = false;
     for attr in attrs.iter().filter(|a| a.path().is_ident("unique")) {
         if seen {
@@ -292,7 +292,7 @@ pub struct FieldSerdeAttrs {
 /// Only the first `rename` encountered is returned; other serde options are
 /// ignored. Attributes that fail to parse are skipped silently so that
 /// unrelated serde syntax does not break schema generation.
-pub fn parse_field_serde_attrs(attrs: &[Attribute]) -> FieldSerdeAttrs {
+fn parse_field_serde_attrs(attrs: &[Attribute]) -> FieldSerdeAttrs {
     let mut out = FieldSerdeAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("serde") {
@@ -354,7 +354,7 @@ pub struct FieldCborAttrs {
 ///
 /// Only `key = <integer>` is consumed. Other `cbor2::Cbor` options are left to
 /// cbor2 itself.
-pub fn parse_field_cbor_attrs(attrs: &[Attribute]) -> syn::Result<FieldCborAttrs> {
+fn parse_field_cbor_attrs(attrs: &[Attribute]) -> syn::Result<FieldCborAttrs> {
     let mut out = FieldCborAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("cbor") {
@@ -432,7 +432,7 @@ fn parse_cbor_i64_key(expr: &Expr) -> syn::Result<i64> {
 /// Resolve the schema field name for a field: an explicit serde `rename`
 /// wins; otherwise the container-level `rename_all` rule (if any) is applied
 /// to the Rust identifier, mirroring serde's own precedence.
-pub fn effective_field_name(
+fn effective_field_name(
     rust_name: &str,
     serde_attrs: &FieldSerdeAttrs,
     rename_all: Option<RenameRule>,
@@ -444,6 +444,48 @@ pub fn effective_field_name(
         Some(rule) => rule.apply_to_field(rust_name),
         None => rust_name.to_string(),
     }
+}
+
+/// A struct field as it appears in the serialized map, after the attribute
+/// checks both derives share.
+pub struct SerializedField {
+    /// The Rust identifier without the raw prefix.
+    pub rust_name: String,
+    /// The serialized (serde) field name.
+    pub name: String,
+    /// `#[cbor(key = N)]`: the integer map key cbor2 writes instead of `name`.
+    pub cbor_key: Option<i64>,
+}
+
+/// Parses the attributes every derive handles the same way: `#[unique]`
+/// form, serde skip/flatten/rename(_all) and `#[cbor(key = N)]`.
+///
+/// Returns `Ok(None)` for a field serde never serializes; its flatten and
+/// cbor attributes are not inspected, since they have no serialized shape.
+pub fn serialized_field(
+    field: &Field,
+    container: &ContainerAttrs,
+) -> syn::Result<Option<SerializedField>> {
+    let ident = field.ident.as_ref().expect("named field");
+    let serde_attrs = parse_field_serde_attrs(&field.attrs);
+    validate_unique_attrs(&field.attrs)?;
+    if serde_attrs.skip_serializing {
+        return Ok(None);
+    }
+    if serde_attrs.flatten {
+        return Err(syn::Error::new_spanned(
+            ident,
+            "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field",
+        ));
+    }
+    let cbor_key = parse_field_cbor_attrs(&field.attrs)?.key;
+    let rust_name = ident.unraw().to_string();
+    let name = effective_field_name(&rust_name, &serde_attrs, container.rename_all);
+    Ok(Some(SerializedField {
+        rust_name,
+        name,
+        cbor_key,
+    }))
 }
 
 /// Validate a top-level schema field name against AndaDB's naming rules
@@ -541,7 +583,8 @@ fn is_field_typed_bound(bound: &syn::TypeParamBound) -> bool {
 }
 
 /// Resolve a field's `FieldType` tokens: an explicit `#[field_type = "..."]`
-/// override wins; otherwise the type is inferred from the Rust type.
+/// override wins; otherwise the type is inferred from the Rust type, which
+/// must not refer to `owner` (the deriving struct) directly.
 ///
 /// `root` is the resolved `anda_db_schema` crate path (see
 /// [`schema_crate_path`]); `type_params` holds the container's generic type
@@ -549,22 +592,23 @@ fn is_field_typed_bound(bound: &syn::TypeParamBound) -> bool {
 /// `FieldTyped` bound or get a targeted error.
 pub fn resolve_field_type(
     field: &Field,
+    owner: &syn::Ident,
     root: &TokenStream,
     type_params: &TypeParams,
 ) -> syn::Result<TokenStream> {
     match find_field_type_attr(&field.attrs, root)? {
         Some(field_type) => Ok(field_type),
-        None => determine_field_type(&field.ty, root, type_params),
+        None => {
+            reject_direct_recursion(&field.ty, owner)?;
+            determine_field_type(&field.ty, root, type_params)
+        }
     }
 }
 
 /// Reject direct recursive fields before generating a constructor that could
 /// never produce a finite FieldType. Aliases and mutual recursion are caught
 /// by the fallible construction guard in anda_db_schema.
-pub fn reject_direct_recursion(field: &Field, owner: &syn::Ident) -> syn::Result<()> {
-    if field.attrs.iter().any(|a| a.path().is_ident("field_type")) {
-        return Ok(());
-    }
+fn reject_direct_recursion(ty: &Type, owner: &syn::Ident) -> syn::Result<()> {
     fn refers_to(ty: &Type, owner: &syn::Ident) -> bool {
         match peel_type(ty) {
             Type::Path(p) => {
@@ -604,9 +648,9 @@ pub fn reject_direct_recursion(field: &Field, owner: &syn::Ident) -> syn::Result
             _ => false,
         }
     }
-    if refers_to(&field.ty, owner) {
+    if refers_to(ty, owner) {
         Err(syn::Error::new_spanned(
-            &field.ty,
+            ty,
             "recursive fields cannot describe a finite FieldType; use an explicit non-recursive #[field_type = \"...\"] override",
         ))
     } else {

@@ -1,22 +1,5 @@
 use super::*;
-use std::{borrow::Cow, io::Write};
-
-#[test]
-fn test_pipe_trait() {
-    // Test basic pipe functionality
-    let result = 5.pipe(|x| x * 2).pipe(|x| x + 1);
-    assert_eq!(result, 11);
-
-    // Test pipe with different types
-    let string_result = "hello"
-        .pipe(|s| s.to_uppercase())
-        .pipe(|s| format!("{} world", s));
-    assert_eq!(string_result, "HELLO world");
-
-    // Test pipe with closure that changes type
-    let vec_result = vec![1, 2, 3].pipe(|v| v.len()).pipe(|len| len as f64);
-    assert_eq!(vec_result, 3.0);
-}
+use std::borrow::Cow;
 
 #[test]
 fn test_unique_vec_new() {
@@ -302,66 +285,6 @@ fn test_unique_vec_clone() {
 }
 
 #[test]
-fn test_counting_writer_new() {
-    let writer = CountingWriter::new();
-    assert_eq!(writer.size(), 0);
-}
-
-#[test]
-fn test_counting_writer_default() {
-    let writer = CountingWriter::default();
-    assert_eq!(writer.size(), 0);
-}
-
-#[test]
-fn test_counting_writer_write() {
-    let mut writer = CountingWriter::new();
-
-    let result = writer.write(b"hello");
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 5);
-    assert_eq!(writer.size(), 5);
-
-    let result = writer.write(b" world");
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 6);
-    assert_eq!(writer.size(), 11);
-}
-
-#[test]
-fn test_counting_writer_flush() {
-    let mut writer = CountingWriter::new();
-    let result = writer.flush();
-    assert!(result.is_ok());
-    assert_eq!(writer.size(), 0); // Flush doesn't change size
-}
-
-#[test]
-fn test_counting_writer_multiple_writes() {
-    let mut writer = CountingWriter::new();
-
-    // Multiple writes should accumulate
-    writer.write_all(b"a").unwrap();
-    assert_eq!(writer.size(), 1);
-
-    writer.write_all(b"bc").unwrap();
-    assert_eq!(writer.size(), 3);
-
-    writer.write_all(b"defg").unwrap();
-    assert_eq!(writer.size(), 7);
-}
-
-#[test]
-fn test_counting_writer_empty_write() {
-    let mut writer = CountingWriter::new();
-
-    let result = writer.write(b"");
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 0);
-    assert_eq!(writer.size(), 0);
-}
-
-#[test]
 fn test_unique_vec_edge_cases() {
     // Test with empty vector
     let uv = UniqueVec::from(vec![] as Vec<i32>);
@@ -391,15 +314,6 @@ fn test_unique_vec_string_type() {
     assert_eq!(uv.len(), 2);
     assert!(uv.contains("hello"));
     assert!(uv.contains("world"));
-}
-
-#[test]
-fn test_counting_writer_overflow() {
-    let mut writer = CountingWriter { count: usize::MAX };
-    let err = writer.write(b"x").unwrap_err();
-
-    assert_eq!(err.kind(), std::io::ErrorKind::Other);
-    assert_eq!(writer.size(), usize::MAX);
 }
 
 #[test]
@@ -444,17 +358,6 @@ fn test_unique_vec_cbor_round_trip_and_dedup() {
     assert_eq!(decoded.as_ref(), &[5, 1, 2]);
     assert!(decoded.contains(&2));
     assert!(!decoded.contains(&9));
-}
-
-#[test]
-fn test_counting_writer_matches_cbor2_serialized_size() {
-    let value = (42u64, "hello".to_string(), vec![1u8, 2, 3]);
-    let mut writer = CountingWriter::new();
-    cbor2::to_writer(&value, &mut writer).unwrap();
-    assert_eq!(
-        writer.size() as u64,
-        cbor2::serialized_size(&value).unwrap()
-    );
 }
 
 #[test]

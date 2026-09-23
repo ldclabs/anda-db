@@ -40,7 +40,7 @@ rs/
 ├── anda_db_btree/                # Exact-match and range index
 ├── anda_db_tfs/                  # BM25 full-text search
 ├── anda_db_hnsw/                 # HNSW vector index
-├── anda_db_utils/                # Shared utilities
+├── anda_db_utils/                # Standalone UniqueVec; no workspace users
 ├── anda_object_store/            # Metadata and encrypted storage wrappers
 ├── anda_kip/                     # KIP SDK, specs, grammar, wire schemas
 ├── anda_cognitive_nexus/         # Stateful Rust KIP executor

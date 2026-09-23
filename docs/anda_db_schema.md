@@ -237,8 +237,6 @@ crate (assigned `idx = 0` and `unique`).
 | `FieldType::validate_declaration` | Checks that `self` is a well-formed declaration: no `Option<Option<T>>`, no wildcard key mixed with other keys, bounded nesting. Run by `FieldEntry::new`, `SchemaBuilder::add_field` and `Schema` deserialization. |
 | `FieldType::extract`     | CBOR → `FieldValue`, requiring CBOR to match `self`. |
 | `FieldType::validate`    | Checks an existing `FieldValue` against `self`, accepting the read-back shapes listed in §3.3. |
-| `FieldType::normalize`   | Folds read-back shapes into the canonical variant.   |
-| `FieldType::prune_undeclared` | Drops nested-map entries the type does not declare (removed nested fields). |
 | `FieldType::is_compatible_upgrade_of` | Whether a stored field may be re-declared as `self` (§5.4). |
 
 `extract` is type-driven (used when parsing structured input), while
@@ -320,8 +318,8 @@ type, so `1.0` arrives as `1`. `f64` takes any integer (`as f64`: exact to
 2^53, rounded beyond); `f32` takes only the integers an `f32` holds exactly,
 so that a value like `16777217` is rejected in both its integer and its float
 spelling rather than being rounded in one of them. `FieldType::validate`
-applies the same rules and `FieldType::normalize` folds these shapes into the
-canonical variant.
+applies the same rules, and reading a document (`Document::try_from_doc`)
+folds these shapes into the canonical variant.
 
 For arbitrary `DeserializeOwned` types, use:
 

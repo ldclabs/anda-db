@@ -1,12 +1,11 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{DeriveInput, ext::IdentExt, parse_macro_input};
+use syn::{DeriveInput, parse_macro_input};
 
 use crate::common::{
-    TypeParams, effective_field_name, named_fields, parse_container_attrs, parse_field_cbor_attrs,
-    parse_field_serde_attrs, reject_direct_recursion, resolve_field_type, schema_crate_path,
-    validate_unique_attrs,
+    TypeParams, named_fields, parse_container_attrs, resolve_field_type, schema_crate_path,
+    serialized_field,
 };
 
 /// Implementation of `#[derive(FieldTyped)]`.
@@ -56,49 +55,27 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
     let mut field_type_mappings = Vec::with_capacity(fields.len());
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
-        let serde_attrs = parse_field_serde_attrs(&field.attrs);
-        if let Err(err) = validate_unique_attrs(&field.attrs) {
-            field_type_mappings.push(err.to_compile_error());
-            continue;
-        }
-
         // Fields serde never serializes must not appear in the type map.
-        if serde_attrs.skip_serializing {
-            continue;
-        }
-        if serde_attrs.flatten {
-            field_type_mappings.push(
-                syn::Error::new_spanned(
-                    field_ident,
-                    "#[serde(flatten)] is not supported: flattened keys are inlined into the parent map and cannot be described by a single schema field",
-                )
-                .to_compile_error(),
-            );
-            continue;
-        }
-        let cbor_attrs = match parse_field_cbor_attrs(&field.attrs) {
-            Ok(attrs) => attrs,
+        let serialized = match serialized_field(field, &container) {
+            Ok(Some(serialized)) => serialized,
+            Ok(None) => continue,
             Err(err) => {
                 field_type_mappings.push(err.to_compile_error());
                 continue;
             }
         };
 
-        // Schema field names follow the serialized names: serde renames and
-        // container-level rename_all rules are honoured unless cbor2 provides
-        // an integer map key for the CBOR serialized shape.
-        let schema_name = effective_field_name(
-            &field_ident.unraw().to_string(),
-            &serde_attrs,
-            container.rename_all,
-        );
-        let (field_key, duplicate_key) = if let Some(key) = cbor_attrs.key {
+        // Map keys follow the serialized names (serde renames and
+        // container-level rename_all rules) unless cbor2 provides an integer
+        // map key for the CBOR serialized shape.
+        let (field_key, duplicate_key) = if let Some(key) = serialized.cbor_key {
             if key == i64::MIN {
                 field_type_mappings.push(syn::Error::new_spanned(field_ident, "i64::MIN is reserved for wildcard maps and cannot name a fixed struct field").to_compile_error());
                 continue;
             }
             (quote! { #root::FieldKey::from(#key) }, format!("i64:{key}"))
         } else {
+            let schema_name = &serialized.name;
             if schema_name == "*" {
                 field_type_mappings.push(
                     syn::Error::new_spanned(
@@ -128,11 +105,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
         }
 
         // `#[field_type = "..."]` overrides auto-inference.
-        if let Err(err) = reject_direct_recursion(field, name) {
-            field_type_mappings.push(err.to_compile_error());
-            continue;
-        }
-        match resolve_field_type(field, &root, &type_params) {
+        match resolve_field_type(field, name, &root, &type_params) {
             Ok(field_type) => field_type_mappings.push(quote! {
                 (#field_key, #field_type)
             }),

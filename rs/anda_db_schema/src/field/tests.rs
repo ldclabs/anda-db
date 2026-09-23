@@ -5,6 +5,11 @@ use ic_auth_types::{Xid, cbor_into_vec};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+/// One stored value through the document read path.
+fn read_back(ft: &FieldType, value: FieldValue) -> Result<FieldValue, SchemaError> {
+    ft.prepare(value, 0, ValueMode::Read)
+}
+
 #[test]
 fn test_field_key() {
     let val = FieldValue::Map(BTreeMap::from([(
@@ -438,97 +443,91 @@ fn f32_json_read_back_round_trips() {
 }
 
 #[test]
-fn normalize_folds_read_back_shapes_into_canonical_variants() {
+fn read_back_folds_shapes_into_canonical_variants() {
     // I64 <- U64 within range.
-    let mut v = FieldValue::U64(5);
-    FieldType::I64.normalize(&mut v);
-    assert_eq!(v, FieldValue::I64(5));
-
-    // Out-of-range U64 stays put (validation rejects it later).
-    let mut v = FieldValue::U64(i64::MAX as u64 + 1);
-    FieldType::I64.normalize(&mut v);
-    assert_eq!(v, FieldValue::U64(i64::MAX as u64 + 1));
+    assert_eq!(
+        read_back(&FieldType::I64, FieldValue::U64(5)).unwrap(),
+        FieldValue::I64(5)
+    );
+    // Out-of-range U64 is rejected.
+    assert!(read_back(&FieldType::I64, FieldValue::U64(i64::MAX as u64 + 1)).is_err());
 
     // F32 <- F64 read-back shapes (both channels).
-    let mut v = FieldValue::F64(f64::from(2.71f32));
-    FieldType::F32.normalize(&mut v);
-    assert_eq!(v, FieldValue::F32(2.71));
-    let mut v = FieldValue::F64(2.71);
-    FieldType::F32.normalize(&mut v);
-    assert_eq!(v, FieldValue::F32(2.71));
-
-    // A non-read-back F64 stays put.
-    let mut v = FieldValue::F64(2.7100000000001);
-    FieldType::F32.normalize(&mut v);
-    assert_eq!(v, FieldValue::F64(2.7100000000001));
+    assert_eq!(
+        read_back(&FieldType::F32, FieldValue::F64(f64::from(2.71f32))).unwrap(),
+        FieldValue::F32(2.71)
+    );
+    assert_eq!(
+        read_back(&FieldType::F32, FieldValue::F64(2.71)).unwrap(),
+        FieldValue::F32(2.71)
+    );
+    // A non-read-back F64 is rejected.
+    assert!(read_back(&FieldType::F32, FieldValue::F64(2.7100000000001)).is_err());
 
     // Vector <- Array(U64 bf16 bits).
     let expected = vec![bf16::from_f32(1.5), bf16::from_f32(-2.0)];
-    let mut v = FieldValue::Array(
+    let v = FieldValue::Array(
         expected
             .iter()
             .map(|value| FieldValue::U64(value.to_bits() as u64))
             .collect(),
     );
-    FieldType::Vector.normalize(&mut v);
-    assert_eq!(v, FieldValue::Vector(expected));
-
-    // Invalid bit shapes stay put so validation can report the mismatch.
-    let mut v = FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64 + 1)]);
-    FieldType::Vector.normalize(&mut v);
     assert_eq!(
-        v,
-        FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64 + 1)])
+        read_back(&FieldType::Vector, v).unwrap(),
+        FieldValue::Vector(expected)
     );
+    // Invalid bit shapes are rejected.
+    let v = FieldValue::Array(vec![FieldValue::U64(u16::MAX as u64 + 1)]);
+    assert!(read_back(&FieldType::Vector, v).is_err());
 
     // Composites recurse.
-    let mut v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::I64(-2)]);
-    FieldType::Array(vec![FieldType::I64]).normalize(&mut v);
+    let v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::I64(-2)]);
     assert_eq!(
-        v,
+        read_back(&FieldType::Array(vec![FieldType::I64]), v).unwrap(),
         FieldValue::Array(vec![FieldValue::I64(1), FieldValue::I64(-2)])
     );
 
-    let mut v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::Text("x".into())]);
-    FieldType::Array(vec![FieldType::I64, FieldType::Text]).normalize(&mut v);
+    let v = FieldValue::Array(vec![FieldValue::U64(1), FieldValue::Text("x".into())]);
     assert_eq!(
-        v,
+        read_back(&FieldType::Array(vec![FieldType::I64, FieldType::Text]), v).unwrap(),
         FieldValue::Array(vec![FieldValue::I64(1), FieldValue::Text("x".into())])
     );
 
-    let mut v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
-    FieldType::Map(BTreeMap::from([("*".into(), FieldType::I64)])).normalize(&mut v);
+    let v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
+    let ft = FieldType::Map(BTreeMap::from([("*".into(), FieldType::I64)]));
     assert_eq!(
-        v,
+        read_back(&ft, v).unwrap(),
         FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::I64(3))]))
     );
 
-    let mut v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
-    FieldType::Map(BTreeMap::from([("a".into(), FieldType::I64)])).normalize(&mut v);
+    let v = FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::U64(3))]));
+    let ft = FieldType::Map(BTreeMap::from([("a".into(), FieldType::I64)]));
     assert_eq!(
-        v,
+        read_back(&ft, v).unwrap(),
         FieldValue::Map(BTreeMap::from([("a".into(), FieldValue::I64(3))]))
     );
 
     // Option unwraps; Null stays.
-    let mut v = FieldValue::U64(7);
-    FieldType::Option(Box::new(FieldType::I64)).normalize(&mut v);
-    assert_eq!(v, FieldValue::I64(7));
-    let mut v = FieldValue::Null;
-    FieldType::Option(Box::new(FieldType::I64)).normalize(&mut v);
-    assert_eq!(v, FieldValue::Null);
+    let ft = FieldType::Option(Box::new(FieldType::I64));
+    assert_eq!(
+        read_back(&ft, FieldValue::U64(7)).unwrap(),
+        FieldValue::I64(7)
+    );
+    assert_eq!(read_back(&ft, FieldValue::Null).unwrap(), FieldValue::Null);
 
-    // Unrelated declared types leave values untouched.
-    let mut v = FieldValue::U64(9);
-    FieldType::U64.normalize(&mut v);
-    assert_eq!(v, FieldValue::U64(9));
-    let mut v = FieldValue::F64(1.5);
-    FieldType::F64.normalize(&mut v);
-    assert_eq!(v, FieldValue::F64(1.5));
+    // Canonical values are left untouched.
+    assert_eq!(
+        read_back(&FieldType::U64, FieldValue::U64(9)).unwrap(),
+        FieldValue::U64(9)
+    );
+    assert_eq!(
+        read_back(&FieldType::F64, FieldValue::F64(1.5)).unwrap(),
+        FieldValue::F64(1.5)
+    );
 }
 
 #[test]
-fn normalize_restores_json_values_after_a_storage_round_trip() {
+fn read_back_restores_json_values_after_a_storage_round_trip() {
     // Regression: a `Json` payload is stored as its plain CBOR shape and
     // reads back as `Map` / `Array` / a primitive. Without normalization
     // index maintenance derives different text for the insert-time and
@@ -536,7 +535,7 @@ fn normalize_restores_json_values_after_a_storage_round_trip() {
     let value = FieldValue::Json(json!({"tags": [1, "urgent"], "note": "hello"}));
     let mut data = Vec::new();
     to_writer(&value, &mut data).unwrap();
-    let mut restored: FieldValue = from_reader(data.as_slice()).unwrap();
+    let restored: FieldValue = from_reader(data.as_slice()).unwrap();
     assert_eq!(
         restored,
         FieldValue::Map(BTreeMap::from([
@@ -547,28 +546,27 @@ fn normalize_restores_json_values_after_a_storage_round_trip() {
             ),
         ]))
     );
-    FieldType::Json.normalize(&mut restored);
-    assert_eq!(restored, value);
+    assert_eq!(read_back(&FieldType::Json, restored).unwrap(), value);
 
     // Scalar payloads and `Option(Json)` behave the same way.
-    let mut v = FieldValue::Text("hello".into());
-    FieldType::Json.normalize(&mut v);
-    assert_eq!(v, FieldValue::Json(json!("hello")));
-    let mut v = FieldValue::Array(vec![FieldValue::U64(1)]);
-    FieldType::Option(Box::new(FieldType::Json)).normalize(&mut v);
-    assert_eq!(v, FieldValue::Json(json!([1])));
-    let mut v = FieldValue::Null;
-    FieldType::Option(Box::new(FieldType::Json)).normalize(&mut v);
-    assert_eq!(v, FieldValue::Null);
+    assert_eq!(
+        read_back(&FieldType::Json, FieldValue::Text("hello".into())).unwrap(),
+        FieldValue::Json(json!("hello"))
+    );
+    let ft = FieldType::Option(Box::new(FieldType::Json));
+    assert_eq!(
+        read_back(&ft, FieldValue::Array(vec![FieldValue::U64(1)])).unwrap(),
+        FieldValue::Json(json!([1]))
+    );
+    assert_eq!(read_back(&ft, FieldValue::Null).unwrap(), FieldValue::Null);
 
-    // An already canonical value is left alone, and so is a shape with no
-    // JSON representation (validation accepts any value for `Json`).
-    let mut v = FieldValue::Json(json!({"a": 1}));
-    FieldType::Json.normalize(&mut v);
-    assert_eq!(v, FieldValue::Json(json!({"a": 1})));
-    let mut v = FieldValue::Bytes(vec![1, 2, 3]);
-    FieldType::Json.normalize(&mut v);
-    assert_eq!(v, FieldValue::Bytes(vec![1, 2, 3]));
+    // An already canonical value is left alone; a shape with no JSON
+    // representation is rejected.
+    assert_eq!(
+        read_back(&FieldType::Json, FieldValue::Json(json!({"a": 1}))).unwrap(),
+        FieldValue::Json(json!({"a": 1}))
+    );
+    assert!(read_back(&FieldType::Json, FieldValue::Bytes(vec![1, 2, 3])).is_err());
 }
 
 #[test]
@@ -758,7 +756,7 @@ fn nested_map_upgrades_are_compatible_only_when_data_stays_readable() {
 }
 
 #[test]
-fn prune_undeclared_drops_only_removed_nested_keys() {
+fn read_back_drops_only_removed_nested_keys() {
     let stale = || {
         Fv::Map(BTreeMap::from([
             ("a".into(), Fv::Text("keep".into())),
@@ -767,21 +765,18 @@ fn prune_undeclared_drops_only_removed_nested_keys() {
     };
 
     // A non-wildcard map drops what it no longer declares, at every depth.
-    let mut v = stale();
-    Ft::Map(BTreeMap::from([("a".into(), Ft::Text)])).prune_undeclared(&mut v);
+    let ft = Ft::Map(BTreeMap::from([("a".into(), Ft::Text)]));
     assert_eq!(
-        v,
+        read_back(&ft, stale()).unwrap(),
         Fv::Map(BTreeMap::from([("a".into(), Fv::Text("keep".into()))]))
     );
 
-    let mut v = Fv::Array(vec![stale()]);
-    Ft::Array(vec![Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
+    let ft = Ft::Array(vec![Ft::Option(Box::new(Ft::Map(BTreeMap::from([(
         "a".into(),
         Ft::Text,
-    )]))))])
-    .prune_undeclared(&mut v);
+    )]))))]);
     assert_eq!(
-        v,
+        read_back(&ft, Fv::Array(vec![stale()])).unwrap(),
         Fv::Array(vec![Fv::Map(BTreeMap::from([(
             "a".into(),
             Fv::Text("keep".into())
@@ -790,12 +785,12 @@ fn prune_undeclared_drops_only_removed_nested_keys() {
 
     // A wildcard map declares no key names, so nothing is dropped; an
     // empty `Map` type accepts everything, likewise.
-    let mut v = stale();
-    Ft::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::Text)])).prune_undeclared(&mut v);
-    assert_eq!(v, stale());
-    let mut v = stale();
-    Ft::Map(BTreeMap::new()).prune_undeclared(&mut v);
-    assert_eq!(v, stale());
+    let ft = Ft::Map(BTreeMap::from([(TEXT_WILDCARD_KEY.clone(), Ft::Text)]));
+    assert_eq!(read_back(&ft, stale()).unwrap(), stale());
+    assert_eq!(
+        read_back(&Ft::Map(BTreeMap::new()), stale()).unwrap(),
+        stale()
+    );
 }
 
 #[test]
@@ -1710,15 +1705,19 @@ fn float_fields_accept_integers() {
     FieldType::F32.validate(&Fv::U64(1)).unwrap();
     FieldType::F32.validate(&Fv::I64(i64::MIN)).unwrap();
 
-    let mut v = Fv::U64(1);
-    FieldType::F64.normalize(&mut v);
-    assert_eq!(v, Fv::F64(1.0));
-    let mut v = Fv::I64(-5);
-    FieldType::F32.normalize(&mut v);
-    assert_eq!(v, Fv::F32(-5.0));
-    let mut v = Fv::Array(vec![Fv::U64(1), Fv::F64(2.5)]);
-    FieldType::Array(vec![FieldType::F64]).normalize(&mut v);
-    assert_eq!(v, Fv::Array(vec![Fv::F64(1.0), Fv::F64(2.5)]));
+    assert_eq!(
+        read_back(&FieldType::F64, Fv::U64(1)).unwrap(),
+        Fv::F64(1.0)
+    );
+    assert_eq!(
+        read_back(&FieldType::F32, Fv::I64(-5)).unwrap(),
+        Fv::F32(-5.0)
+    );
+    let v = Fv::Array(vec![Fv::U64(1), Fv::F64(2.5)]);
+    assert_eq!(
+        read_back(&FieldType::Array(vec![FieldType::F64]), v).unwrap(),
+        Fv::Array(vec![Fv::F64(1.0), Fv::F64(2.5)])
+    );
 
     assert_eq!(f64::try_from(Fv::U64(4)).unwrap(), 4.0);
     assert_eq!(f64::try_from(&Fv::I64(-4)).unwrap(), -4.0);
@@ -1748,12 +1747,9 @@ fn float_fields_accept_integers() {
     );
     assert!(f32::try_from(Fv::U64(inexact)).is_err());
     assert!(f32::try_from(&Fv::I64(-(inexact as i64))).is_err());
-    let mut v = Fv::U64(inexact);
-    FieldType::F32.normalize(&mut v);
-    assert_eq!(
-        v,
-        Fv::U64(inexact),
-        "an inexact integer is left for validate"
+    assert!(
+        read_back(&FieldType::F32, Fv::U64(inexact)).is_err(),
+        "an inexact integer is rejected on read"
     );
 
     // Exact ones — every |v| <= 2^24, and larger powers of two — pass.
@@ -1848,7 +1844,7 @@ fn compatible_upgrade_allows_making_types_optional() {
 
 #[test]
 fn json_normalize_rebuilds_payload_without_cbor_round_trip() {
-    let mut v = Fv::Map(BTreeMap::from([
+    let v = Fv::Map(BTreeMap::from([
         (
             FieldKey::from("a"),
             Fv::Array(vec![
@@ -1864,9 +1860,8 @@ fn json_normalize_rebuilds_payload_without_cbor_round_trip() {
         (FieldKey::from("v"), Fv::Vector(vec![bf16::from_f32(1.0)])),
         (FieldKey::from("j"), Fv::Json(serde_json::json!({"x": 1}))),
     ]));
-    FieldType::Json.normalize(&mut v);
     assert_eq!(
-        v,
+        read_back(&FieldType::Json, v).unwrap(),
         Fv::Json(serde_json::json!({
             "a": [1, -1, 1.5, 0.5, null, true],
             "s": "txt",
@@ -1876,18 +1871,17 @@ fn json_normalize_rebuilds_payload_without_cbor_round_trip() {
     );
 
     // Mirrors the CBOR path: a non-finite float becomes JSON null.
-    let mut v = Fv::F64(f64::INFINITY);
-    FieldType::Json.normalize(&mut v);
-    assert_eq!(v, Fv::Json(Json::Null));
+    assert_eq!(
+        read_back(&FieldType::Json, Fv::F64(f64::INFINITY)).unwrap(),
+        Fv::Json(Json::Null)
+    );
 
-    // Shapes with no JSON representation are left for validation.
-    for mut v in [
+    // Shapes with no JSON representation are rejected.
+    for v in [
         Fv::Bytes(vec![1]),
         Fv::Map(BTreeMap::from([(FieldKey::from(1_i64), Fv::U64(1))])),
         Fv::Array(vec![Fv::Bytes(vec![1])]),
     ] {
-        let before = v.clone();
-        FieldType::Json.normalize(&mut v);
-        assert_eq!(v, before);
+        assert!(read_back(&FieldType::Json, v).is_err());
     }
 }

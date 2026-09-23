@@ -170,6 +170,8 @@ impl Article {
 | `BytesB64`, `ByteArrayB64`, `ByteBufB64` | `Bytes` |
 | `serde_bytes::Bytes`, `serde_bytes::ByteArray`, `serde_bytes::ByteBuf` | `Bytes` |
 
+`Vec<u8>` 与 `[u8; N]` 在 serde 中没有 byte-string 特化：它们逐字节序列化为整数，再由 Schema 端收敛为 `Bytes`。大块二进制请使用 `serde_bytes::ByteBuf` 或 `ByteBufB64`（直接序列化为字节串）；一个 64 KiB 的 `Vec<u8>` 字段会让 `Document::try_from` 比同样内容的 `ByteBuf` 慢数百倍。
+
 ### 4.3 向量与 JSON
 
 | Rust 类型 | `FieldType` |

@@ -170,7 +170,8 @@ impl TryFrom<Value> for FieldKey {
             // shape `FieldValue::bytes_from` accepts for values.
             Value::Array(arr) => Ok(FieldKey::Bytes(u8_array_from(arr)?)),
             _ => Err(SchemaError::FieldValue(format!(
-                "expected Text, I64, Bytes or an array of 0..=255 as map key, got {value:?}"
+                "expected Text, I64, Bytes or an array of 0..=255 as map key, got {}",
+                Brief(&value)
             ))
             .into()),
         }
