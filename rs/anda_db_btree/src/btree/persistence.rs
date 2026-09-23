@@ -450,16 +450,14 @@ where
         // were never persisted (e.g. the empty initial bucket) stay out.
         let committed = std::mem::take(&mut meta.buckets);
         let dirty_ids: FxHashSet<u32> = dirty.iter().copied().collect();
-        let mut manifest = BTreeMap::new();
         for entry in self.buckets.iter() {
             let id = *entry.key();
             if dirty_ids.contains(&id) {
-                manifest.insert(id, generation);
+                meta.buckets.insert(id, generation);
             } else if let Some(committed_generation) = committed.get(&id) {
-                manifest.insert(id, *committed_generation);
+                meta.buckets.insert(id, *committed_generation);
             }
         }
-        meta.buckets = manifest.clone();
 
         let mut meta_buf = Vec::with_capacity(256);
         cbor2::to_writer(&BTreeIndexRef { metadata: &meta }, &mut meta_buf).map_err(|err| {
@@ -473,7 +471,7 @@ where
         // or drops (bucket rewrites, compaction leftovers, legacy objects).
         let obsolete: Vec<BucketObject> = committed
             .iter()
-            .filter(|(id, generation)| manifest.get(id) != Some(generation))
+            .filter(|(id, generation)| meta.buckets.get(id) != Some(generation))
             .map(|(id, generation)| BucketObject {
                 bucket_id: *id,
                 generation: *generation,
@@ -519,7 +517,7 @@ where
             .fetch_max(generation, Ordering::Release);
         self.update_metadata(|m| {
             m.stats.last_saved = meta.stats.last_saved.max(m.stats.last_saved);
-            m.buckets = manifest;
+            m.buckets = meta.buckets;
         });
         for (bucket_id, dirty_version) in saved_marks {
             self.mark_bucket_snapshot_saved(bucket_id, dirty_version);

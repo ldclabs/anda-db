@@ -152,6 +152,55 @@ fn same_count_rebuild_is_reported_and_canonical_compaction_is_a_no_op() {
     assert_eq!(index.metadata(), before);
 }
 
+#[test]
+fn compaction_is_stable_across_bucket_id_encoding_widths_and_reload() {
+    for n in [32u64, 300] {
+        let index = BTreeIndex::new(
+            "stable_compaction".into(),
+            Some(BTreeConfig {
+                bucket_overload_size: 64,
+                allow_duplicates: true,
+            }),
+        );
+        for k in (0..n).rev() {
+            // Identical posting/key lengths; only the owner's CBOR width varies.
+            index
+                .insert(1u64, format!("{k:04}-{}", "x".repeat(100)), 1)
+                .unwrap();
+        }
+        let keys = index.keys(None, None);
+        let mut store = Store::default();
+        save(&index, &mut store);
+        assert!(index.compact_buckets_with_outcome().changed);
+        save(&index, &mut store);
+        let loaded = block_on(BTreeIndex::<u64, String>::load_all(
+            &store.metadata[..],
+            async |object| Ok(store.buckets.get(&object).cloned()),
+        ))
+        .unwrap();
+        for tree in [&index, &loaded] {
+            for _ in 0..3 {
+                let metadata = tree.metadata();
+                assert!(!tree.compact_buckets_with_outcome().changed);
+                assert_eq!(tree.metadata(), metadata);
+                assert!(!tree.has_dirty_buckets());
+                let outcome = block_on(tree.flush_owned_with(
+                    2,
+                    |_| -> std::future::Ready<Result<(), anda_db_btree::BoxError>> {
+                        panic!("unchanged compaction must not commit metadata")
+                    },
+                    |_, _| -> std::future::Ready<Result<(), anda_db_btree::BoxError>> {
+                        panic!("unchanged compaction must not rewrite buckets")
+                    },
+                ))
+                .unwrap();
+                assert!(!outcome.saved);
+                assert_eq!(tree.keys(None, None), keys);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct Converted(u64);
 impl TryFrom<u64> for Converted {

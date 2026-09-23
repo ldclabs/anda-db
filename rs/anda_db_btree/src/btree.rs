@@ -37,8 +37,8 @@
 //!   needed only when creating or removing a key.
 //! - Uniqueness (when `allow_duplicates == false`) is re-checked inside the
 //!   `postings` entry lock to avoid TOCTOU races against concurrent writers.
-//! - When a posting is removed, the empty-check is re-run inside the entry
-//!   lock so a concurrent `insert` cannot have the key silently deleted.
+//! - Removing the last ID also removes the posting under the same shard lock,
+//!   so queries and unique inserts never observe a transient empty posting.
 //! - Flush is lock-friendly: bucket contents are snapshotted inside the lock,
 //!   then the caller's async writer runs **after** the lock is released.
 //!
@@ -867,9 +867,6 @@ where
     {
         self.query_count.fetch_add(1, Ordering::Relaxed);
         let mut results = Vec::new();
-        if self.postings.is_empty() {
-            return results;
-        }
 
         // 从 prefix 起正序遍历，遇到第一个不以 prefix 开头的键即终止。
         // 以 prefix 开头的键在 BTreeSet 中是连续区段，因此这种写法是完备的；

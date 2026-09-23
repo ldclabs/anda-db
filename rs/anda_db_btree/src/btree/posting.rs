@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{hash::Hash, ops::Deref};
 
 const SMALL_LIMIT: usize = 8;
+const MIN_RETAINED_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug)]
 pub(super) struct PostingList<PK> {
@@ -86,6 +87,20 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
         if self.ids.len() <= SMALL_LIMIT / 2 {
             self.positions = None;
         }
+        // Reclaim peak allocations after substantial deletion, with slack for
+        // regrowth. Geometric thresholds amortize reallocation/rehashing over
+        // many removals instead of shrinking on every delete.
+        let len = self.ids.len();
+        let threshold = len.max(MIN_RETAINED_CAPACITY).saturating_mul(4);
+        let target = len.max(MIN_RETAINED_CAPACITY).saturating_mul(2);
+        if self.ids.capacity() > threshold {
+            self.ids.shrink_to(target);
+        }
+        if let Some(positions) = &mut self.positions
+            && positions.capacity() > threshold
+        {
+            positions.shrink_to(target);
+        }
         Some(removed)
     }
     #[cfg(test)]
@@ -157,6 +172,44 @@ mod tests {
             std::mem::size_of::<Vec<u64>>() + std::mem::size_of::<usize>(),
             "an unused position table must not inflate every distinct key"
         );
+    }
+
+    #[test]
+    fn heavy_deletion_reclaims_capacity_and_preserves_positions_through_regrowth() {
+        let mut posting = PostingList::from((0..100_000u64).collect::<Vec<_>>());
+        for id in 0..99_995 {
+            assert_eq!(posting.remove(&id), Some(id));
+        }
+        assert_eq!(posting.len(), 5);
+        assert!(
+            posting.ids.capacity() <= 128,
+            "vector retained its peak capacity"
+        );
+        assert!(
+            posting.positions.as_ref().unwrap().capacity() <= 128,
+            "position map retained its peak capacity"
+        );
+        for id in 99_995..100_000 {
+            assert!(posting.contains(&id));
+            assert!(!posting.push(id));
+        }
+        assert_eq!(posting.remove(&99_995), Some(99_995));
+        assert!(posting.positions.is_none());
+
+        for id in 100_000..110_000 {
+            assert!(posting.push(id));
+        }
+        // Remove non-tail ids too: shrinking must preserve swap-remove positions.
+        for id in (99_996..110_000).step_by(2) {
+            assert_eq!(posting.remove(&id), Some(id));
+        }
+        for id in (99_997..110_000).step_by(2) {
+            assert!(posting.contains(&id));
+            assert_eq!(posting.remove(&id), Some(id));
+        }
+        assert!(posting.is_empty());
+        assert!(posting.ids.capacity() <= 128);
+        assert!(posting.positions.is_none());
     }
 
     thread_local! {

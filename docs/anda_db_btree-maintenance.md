@@ -2,6 +2,76 @@
 
 [中文版](anda_db_btree-maintenance.zh.md)
 
+## 2026-09-23 Follow-up
+
+Implemented against `eb950fd623796b47ba56f6ba5db5120117d9cf4f`, without
+subagents, new dependencies, public API changes or persisted-format changes.
+
+- [x] Remove the final ID and its posting atomically under one DashMap shard
+  lock. Both single and batch deletion use `remove_if_mut`; batch deletion
+  accumulates bucket deltas directly without an intermediate removal vector.
+  Controlled thread interleavings cover empty-posting visibility, same-ID
+  reinsertion, uniqueness enforcement and flush/reload.
+- [x] Make compaction independent of the previous bucket-ID encoding width.
+  A fixed five-byte ID estimate keeps repeated packing stable. Regressions
+  cover 32 and 300 buckets, unchanged flushes and reopening.
+- [x] Remove full-shard emptiness checks from range and prefix query paths.
+  Query validation still precedes evaluation, including on empty indexes.
+- [x] Shrink posting vectors and position maps only after substantial
+  deletion, retaining growth slack. A 100,000-ID regression checks both
+  allocations, remaining membership, regrowth and non-tail removals.
+- [x] Sort/deduplicate owned Include vectors in place, collect boxed query
+  conversions directly, and move the prepared manifest into committed state
+  instead of cloning it.
+- [x] Extend the benchmark with Eq/Ge versus direct point lookup, Include
+  sizes, retained heap after deletion and repeated compaction plus flush.
+
+### Measurements
+
+arm64 macOS, 10 available CPUs, rustc 1.98.1, workspace bench profile
+(`opt-level=z`, LTO), the same counting allocator and extended harness for
+both versions. The baseline uses the pre-fix implementation. CPU-only runs
+used 100 samples for queries and 20 for compaction/flush, without concurrent
+compilation. Eq/Ge use 1,000 queries per timing sample, stop on the first
+match and allocate no result; the table divides batch time by 1,000.
+
+| Scenario | Before | After |
+|---|---:|---:|
+| Direct point lookup, median ns/query | 29.9 | 29.3 |
+| RangeQuery::Eq, median ns/query | 372.1 | 34.0 |
+| Ge first match, median ns/query | 454.8 | 114.0 |
+| Include 128 distinct keys, median μs/query | 3.833 | 1.583 |
+| Include 128 allocations/query (including input/result) | 14 | 2 |
+| Include 4,096 allocations/query (including input/result) | 378 | 2 |
+| Retained heap: 100,000 IDs reduced to 5 | 3,277,224 B | 3,608 B |
+| Retained heap: 100,000 IDs reduced to 4 | 1,048,960 B | 1,392 B |
+| Bucket writes over 20 unchanged compactions, 32 buckets | 640 | 0 |
+| Bucket writes over 20 unchanged compactions, 300 buckets | 6,000 | 0 |
+
+Retained heap is the live allocation increase relative to the already-created
+empty index, not RSS. Vector capacity at five IDs fell from 131,072 to 126.
+Deleting 99,995 IDs took 11.29 ms before and 11.70 ms after in this single
+retention run; shrinking trades occasional reallocation/rehashing for bounded
+retained capacity. Existing 100,000-ID miss/tail deletion medians stayed at
+42/125 ns. The manifest change reduced allocations per flush; no flush
+latency improvement is claimed. These microbenchmarks do not predict total
+application throughput.
+
+Raw results: [before](../rs/anda_db_btree/benches/results/review-2026-09-before.json)
+and [after](../rs/anda_db_btree/benches/results/review-2026-09-after.json).
+
+### Validation
+
+All 1,734 workspace tests passed; one fixture-generation test remains ignored
+by design. This includes B-tree recovery, crash recovery and historical format
+compatibility. The B-tree all-targets suite, including the atomic-file example,
+also passed. Workspace all-feature check, all-target/all-feature Clippy with
+`-D warnings`, formatting, agent-document consistency and 32 local documentation
+links passed. Each new correctness/capacity regression failed against the
+pre-fix implementation before passing with the changes.
+
+## 2026-09-06 Maintenance
+
 Dated 2026-09-06; implemented against the review checklist based on commit `f54fd747e3f33d5d32cf8c1686874bfb59da55fc`.
 Executed without subagents. No new production dependencies were introduced; CBOR layout of public buckets and metadata was preserved; DashMap serde features enabled only for legacy test serializers were removed.
 

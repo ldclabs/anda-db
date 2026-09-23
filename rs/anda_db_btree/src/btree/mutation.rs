@@ -30,29 +30,38 @@ where
     }
 
     pub(super) fn remove_posting_id(&self, doc_id: &PK, field_value: FV) -> Option<Removal<FV>> {
-        let mut posting = self.postings.get_mut(&field_value)?;
-        let full_size = if posting.docs.len() == 1 {
-            posting_entry_size(&field_value, &*posting)
-        } else {
-            0
-        };
-        posting.docs.remove(doc_id)?;
-        posting.version += 1;
-        Some(Removal {
+        // Keep the final ID removal and entry removal under the same shard
+        // lock. Otherwise queries can see an empty posting, and a concurrent
+        // unique insert mistakes that empty entry for a conflicting owner.
+        let mut removed = None;
+        let entry_removed = self
+            .postings
+            .remove_if_mut(&field_value, |_, posting| {
+                let full_size = if posting.docs.len() == 1 {
+                    posting_entry_size(&field_value, &*posting)
+                } else {
+                    0
+                };
+                if posting.docs.remove(doc_id).is_none() {
+                    return false;
+                }
+                posting.version += 1;
+                let empty = posting.docs.is_empty();
+                let size_decrease = if empty {
+                    full_size
+                } else {
+                    cbor_serialized_size(doc_id) + 2
+                };
+                removed = Some((posting.bucket_id, size_decrease));
+                empty
+            })
+            .is_some();
+        removed.map(|(bucket_id, size_decrease)| Removal {
             field_value,
-            bucket_id: posting.bucket_id,
-            full_size,
-            doc_size: cbor_serialized_size(doc_id) + 2,
-            empty: posting.docs.is_empty(),
+            bucket_id,
+            size_decrease,
+            entry_removed,
         })
-    }
-
-    pub(super) fn remove_empty_posting(&self, removal: &Removal<FV>) -> bool {
-        removal.empty
-            && self
-                .postings
-                .remove_if(&removal.field_value, |_, p| p.docs.is_empty())
-                .is_some()
     }
 
     // Called with the bucket lock, never with a posting write guard. A posting
@@ -256,16 +265,13 @@ where
         let Some(removal) = self.remove_posting_id(&doc_id, field_value) else {
             return false;
         };
-        let entry_removed = self.remove_empty_posting(&removal);
-        if entry_removed {
+        if removal.entry_removed {
             self.remove_btree_key_if_posting_absent(&removal.field_value);
         }
         if let Some(mut bucket) = self.buckets.get_mut(&removal.bucket_id) {
-            bucket.size = bucket
-                .size
-                .saturating_sub(removal.size_decrease(entry_removed));
+            bucket.size = bucket.size.saturating_sub(removal.size_decrease);
             self.mark_bucket_dirty(&mut bucket);
-            if entry_removed {
+            if removal.entry_removed {
                 self.detach_bucket_key(removal.bucket_id, &mut bucket, &removal.field_value);
             }
         }
@@ -595,22 +601,19 @@ where
         // Shared with other mutations, exclusive against `compact_buckets`.
         let _mutation_guard = self.mutation_gate.read();
 
-        let pending: Vec<_> = field_values
-            .into_iter()
-            .filter_map(|value| self.remove_posting_id(&doc_id, value))
-            .collect();
-        let removed_count = pending.len();
+        let mut removed_count = 0;
         let mut entries_removed = FxHashSet::default();
         let mut bucket_updates: FxHashMap<u32, (usize, FxHashSet<FV>)> = FxHashMap::default();
-        for removal in pending {
-            let entry_removed = self.remove_empty_posting(&removal);
-            if entry_removed {
+        for value in field_values {
+            let Some(removal) = self.remove_posting_id(&doc_id, value) else {
+                continue;
+            };
+            removed_count += 1;
+            if removal.entry_removed {
                 entries_removed.insert(removal.field_value.clone());
             }
             let bucket = bucket_updates.entry(removal.bucket_id).or_default();
-            bucket.0 = bucket
-                .0
-                .saturating_add(removal.size_decrease(entry_removed));
+            bucket.0 = bucket.0.saturating_add(removal.size_decrease);
             bucket.1.insert(removal.field_value);
         }
 

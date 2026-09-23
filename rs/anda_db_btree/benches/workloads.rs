@@ -145,6 +145,48 @@ fn main() {
         .max(10);
     let mut results = Vec::new();
     let index = seeded(10_000);
+    // Batch tiny queries so timer quantization does not dominate point paths.
+    for mode in 0..3 {
+        results.push(measure(
+            [
+                "query/point/batched",
+                "query/eq/batched",
+                "query/ge/batched",
+            ][mode],
+            samples,
+            1_000,
+            || {
+                for key in 0..1_000 {
+                    if mode == 0 {
+                        black_box(index.query_with(&key, |ids| Some(ids.len())));
+                    } else {
+                        let query = if mode == 1 {
+                            RangeQuery::Eq(key)
+                        } else {
+                            RangeQuery::Ge(key)
+                        };
+                        black_box(index.range_query_with(query, |_, ids| {
+                            black_box(ids.len());
+                            (false, Vec::<u64>::new())
+                        }));
+                    }
+                }
+            },
+        ));
+    }
+    for n in [8, 128, 4_096] {
+        results.push(measure(
+            &format!("query/include/{n}/first"),
+            samples,
+            1,
+            || {
+                let keys = (0..n).rev().flat_map(|key| [key, key]).collect();
+                black_box(
+                    index.range_query_with(RangeQuery::Include(keys), |key, _| (false, vec![*key])),
+                );
+            },
+        ));
+    }
     for mode in 0..5 {
         results.push(measure(
             [
@@ -212,6 +254,59 @@ fn main() {
                 black_box(tree);
             },
         ));
+    }
+    let retention = {
+        let tree = BTreeIndex::new("retention".into(), None);
+        let baseline = LIVE.load(Ordering::Relaxed);
+        for id in 0..100_000u64 {
+            tree.insert(id, 0u64, 1).unwrap();
+        }
+        let full = LIVE.load(Ordering::Relaxed) - baseline;
+        let start = Instant::now();
+        for id in 5..100_000u64 {
+            assert!(tree.remove(id, 0, 2));
+        }
+        let delete_ns = start.elapsed().as_nanos() as u64;
+        let remaining_five = LIVE.load(Ordering::Relaxed).saturating_sub(baseline);
+        let capacity_five = tree.query_with(&0, |ids| Some(ids.capacity())).unwrap();
+        assert!(tree.remove(4, 0, 2));
+        let remaining_four = LIVE.load(Ordering::Relaxed).saturating_sub(baseline);
+        serde_json::json!({"initial_ids":100_000,"full_heap_bytes":full,
+            "remaining_5_heap_bytes":remaining_five,"remaining_5_vector_capacity":capacity_five,
+            "remaining_4_heap_bytes":remaining_four,"delete_99995_ns":delete_ns})
+    };
+    let mut compaction = Vec::new();
+    for n in [32, 300] {
+        let tree = BTreeIndex::new(
+            "compact".into(),
+            Some(BTreeConfig {
+                bucket_overload_size: 64,
+                allow_duplicates: true,
+            }),
+        );
+        for key in (0..n).rev() {
+            tree.insert(1u64, format!("{key:04}-{}", "x".repeat(100)), 1)
+                .unwrap();
+        }
+        tree.compact_buckets();
+        block_on(tree.flush(Vec::new(), 1, |_, _| std::future::ready(Ok(())))).unwrap();
+        let mut changed = 0;
+        let mut writes = 0;
+        results.push(measure(
+            &format!("compact/{n}/repeat"),
+            samples.min(20),
+            1,
+            || {
+                changed += usize::from(tree.compact_buckets_with_outcome().changed);
+                block_on(tree.flush(Vec::new(), 2, |_, _| {
+                    writes += 1;
+                    std::future::ready(Ok(()))
+                }))
+                .unwrap();
+            },
+        ));
+        compaction
+            .push(serde_json::json!({"buckets":n,"changed_rounds":changed,"bucket_writes":writes}));
     }
     let shared = Arc::new(seeded(1_000));
     for threads in [1u64, 4] {
@@ -321,5 +416,6 @@ fn main() {
         }
     }
     println!("{}",serde_json::to_string_pretty(&serde_json::json!({"profile":"workspace bench/release",
-        "memory":"instrumented heap; fixture setup excluded for query/delete/flush", "measurements":results,"flush_details":details})).unwrap());
+        "memory":"instrumented heap; fixture setup excluded for query/delete/flush", "measurements":results,"flush_details":details,
+        "posting_retention":retention,"repeated_compaction":compaction})).unwrap());
 }

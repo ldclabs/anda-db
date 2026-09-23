@@ -550,20 +550,16 @@ impl<FV> RangeQuery<FV> {
             RangeQuery::And(queries) => {
                 let converted_queries = queries
                     .into_iter()
-                    .map(|query| RangeQuery::try_convert_from_inner(*query))
+                    .map(|query| RangeQuery::try_convert_from_inner(*query).map(Box::new))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(RangeQuery::And(
-                    converted_queries.into_iter().map(Box::new).collect(),
-                ))
+                Ok(RangeQuery::And(converted_queries))
             }
             RangeQuery::Or(queries) => {
                 let converted_queries = queries
                     .into_iter()
-                    .map(|query| RangeQuery::try_convert_from_inner(*query))
+                    .map(|query| RangeQuery::try_convert_from_inner(*query).map(Box::new))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(RangeQuery::Or(
-                    converted_queries.into_iter().map(Box::new).collect(),
-                ))
+                Ok(RangeQuery::Or(converted_queries))
             }
             RangeQuery::Not(query) => {
                 let converted_query = RangeQuery::try_convert_from_inner(*query)?;
@@ -722,9 +718,6 @@ where
             });
         }
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        if self.postings.is_empty() {
-            return Ok(Vec::new());
-        }
         Ok(match query {
             RangeQuery::Eq(key) => match self.postings.get(&key) {
                 Some(posting) => f(&key, &posting.docs).1,
@@ -757,8 +750,9 @@ where
                 let btree = self.btree.read();
                 self.walk_keys(btree.range(start_key..=end_key), descending, &mut f)
             }
-            RangeQuery::Include(keys) => {
-                let keys = BTreeSet::from_iter(keys);
+            RangeQuery::Include(mut keys) => {
+                keys.sort_unstable();
+                keys.dedup();
                 self.walk_keys(keys.iter(), descending, &mut f)
             }
             query @ (RangeQuery::And(_) | RangeQuery::Or(_) | RangeQuery::Not(_)) => {

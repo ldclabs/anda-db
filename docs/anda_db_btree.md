@@ -36,7 +36,9 @@ before removing; an insertion error leaves old associations in place.
 IDs are unique. Appends preserve order, but deletion swaps the last ID into
 the removed position; callers cannot rely on insertion order after a deletion.
 Small postings use a compact vector. Larger ones add an ID-to-position map
-for average constant-time membership and deletion. Only IDs are serialized.
+for average constant-time membership and amortized deletion. After substantial
+deletion, both allocations shrink geometrically, retaining room for regrowth;
+the position map is dropped at four remaining IDs. Only IDs are serialized.
 
 ## Queries and pagination
 
@@ -98,6 +100,11 @@ exclusively; queries can still run.
 Callbacks run under internal locks. Range/prefix callbacks may hold both an
 ordered-key read lock and a posting guard. They must not re-enter the same
 index; slow callbacks also delay writers.
+
+Removing the last ID and removing its posting are atomic under one posting
+shard lock. Concurrent queries do not receive a transient empty ID list, and
+unique inserts do not mistake an emptied posting for a conflicting owner.
+Ordered-key and bucket cleanup still recheck ownership after releasing that lock.
 
 The caller must exclude mutations, compaction and other flushes for the
 entire flush, including async callbacks. AndaDB's Collection operation gate
@@ -200,7 +207,9 @@ one posting.
 `CompactionOutcome { old_bucket_count, new_bucket_count, changed }`.
 Deterministic best-fit-decreasing packing repairs ownership and marks rebuilt
 buckets dirty. A canonical layout is a true no-op; a rebuild can retain the
-same bucket count.
+same bucket count. Packing uses a fixed five-byte bucket-ID contribution, so
+renumbering across CBOR integer-width boundaries cannot change the next sort
+order. This is an in-memory estimate; persisted bucket encoding is unchanged.
 
 `compact_buckets() -> (usize, usize)` is a compatibility wrapper whose counts
 cannot identify every change. Use changed or pending-flush state when deciding
@@ -214,7 +223,7 @@ N = indexed FVs, D = IDs in one posting, B = buckets, K = visited matches.
 | Operation | Main cost, excluding callbacks |
 |---|---|
 | Point lookup | Average O(1) |
-| Posting add/remove by ID | Average O(1); bounded scan for tiny vectors |
+| Posting add/remove by ID | Amortized average O(1); occasional capacity shrinking and bounded scans for tiny vectors |
 | New/last-removed FV | Additional O(log N) ordered-key change; average O(1) bucket membership insertion/removal |
 | Primitive range/prefix page | O(log N + K) |
 | Boolean range | Input-dependent interval algebra, then range scans; no full-index candidate materialization |
@@ -230,6 +239,11 @@ auxiliary PK map, so small postings only reserve one optional pointer for it.
 Hash-table capacity remains a material memory cost; bucket iteration during
 flush can scan unused capacity after extensive deletions.
 
+Range and prefix queries go directly to their lookup/iterator instead of
+checking every posting shard for emptiness. Standalone Include sorts and
+deduplicates its owned vector in place. Flush moves the prepared manifest into
+committed metadata without cloning it again.
+
 Run `ANDA_BTREE_RUN_BENCH=1 cargo bench -p anda_db_btree --bench workloads`.
 The explicit opt-in keeps harness-free benchmarks out of release-mode
 `cargo test --all-targets` runs. The harness reports
@@ -239,6 +253,9 @@ first/last pages, multi-threaded reads/writes and 4 KiB keys. Flush fixtures
 isolate one posting per bucket and assert exactly 10% or 100% dirty buckets,
 with optional injected per-bucket I/O delay. Set
 `ANDA_BTREE_BENCH_NO_IO_DELAY=1` for alternating CPU-only comparisons.
+Additional cases compare direct point lookup with Eq/Ge query paths, Include
+sizes, retained heap after deleting 99,995 of 100,000 IDs, and repeated
+compaction plus flush at 32 and 300 buckets.
 
 Both versions must use the same instrumented allocator and build configuration.
 See [maintenance results](anda_db_btree-maintenance.md) for measured comparisons,

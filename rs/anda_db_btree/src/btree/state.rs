@@ -59,16 +59,6 @@ impl<PK: Serialize> Serialize for Posting<PK> {
 pub(super) struct Removal<FV> {
     pub(super) field_value: FV,
     pub(super) bucket_id: u32,
-    pub(super) doc_size: usize,
-    pub(super) full_size: usize,
-    pub(super) empty: bool,
-}
-impl<FV> Removal<FV> {
-    pub(super) fn size_decrease(&self, entry_removed: bool) -> usize {
-        if entry_removed {
-            self.full_size
-        } else {
-            self.doc_size
-        }
-    }
+    pub(super) size_decrease: usize,
+    pub(super) entry_removed: bool,
 }

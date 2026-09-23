@@ -77,12 +77,17 @@ where
             }
         }
 
-        // Step 1: Estimate each field value's serialized contribution.
+        // Step 1: Estimate each field value's serialized contribution with a
+        // fixed bucket-id width. Using its current owner would change the sort
+        // order after renumbering across CBOR's 23/24 or 255/256 boundaries,
+        // causing repeated compactions to rewrite an otherwise stable layout.
         let mut fv_sizes: Vec<(FV, usize)> = self
             .postings
             .iter()
             .map(|entry| {
-                let size = posting_entry_size(entry.key(), entry.value());
+                let posting = entry.value();
+                let size =
+                    posting_entry_size(entry.key(), &(u32::MAX, posting.version, &posting.docs));
                 (entry.key().clone(), size)
             })
             .collect();
