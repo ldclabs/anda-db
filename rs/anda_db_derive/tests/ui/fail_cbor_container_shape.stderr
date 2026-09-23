@@ -1,0 +1,23 @@
+error: AndaDB derives do not support #[cbor(array)] or #[cbor(tag = ...)]: the serialized value must be an untagged map
+ --> tests/ui/fail_cbor_container_shape.rs:4:8
+  |
+4 | #[cbor(array)]
+  |        ^^^^^
+
+error: AndaDB derives do not support #[cbor(array)] or #[cbor(tag = ...)]: the serialized value must be an untagged map
+  --> tests/ui/fail_cbor_container_shape.rs:10:8
+   |
+10 | #[cbor(tag = 61)]
+   |        ^^^^^^^^
+
+error: AndaDB derives do not support #[cbor(array)] or #[cbor(tag = ...)]: the serialized value must be an untagged map
+  --> tests/ui/fail_cbor_container_shape.rs:16:8
+   |
+16 | #[cbor(array)]
+   |        ^^^^^
+
+error: AndaDB derives do not support #[cbor(array)] or #[cbor(tag = ...)]: the serialized value must be an untagged map
+  --> tests/ui/fail_cbor_container_shape.rs:22:8
+   |
+22 | #[cbor(tag = 61)]
+   |        ^^^^^^^^

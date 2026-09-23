@@ -87,6 +87,26 @@ impl FieldType {
                 return inner.prepare(value, depth, mode);
             }
             FieldType::Json => return Ok(FieldValue::Json(field_value_into_json(value, depth)?)),
+            FieldType::Bytes if mode == ValueMode::Write => {
+                if let FieldValue::Array(values) = &value {
+                    let mut bytes = Vec::with_capacity(values.len());
+                    for value in values {
+                        let byte = match value {
+                            FieldValue::U64(byte) if *byte <= u8::MAX as u64 => *byte as u8,
+                            FieldValue::I64(byte) if (0..=i64::from(u8::MAX)).contains(byte) => {
+                                *byte as u8
+                            }
+                            // Preserve the CBOR adapter for other accepted
+                            // shapes, including JSON integer elements.
+                            _ => break,
+                        };
+                        bytes.push(byte);
+                    }
+                    if bytes.len() == values.len() {
+                        return Ok(FieldValue::Bytes(bytes));
+                    }
+                }
+            }
             FieldType::Vector if mode == ValueMode::Write => {
                 if let FieldValue::Array(values) = &value {
                     let mut vector = Vec::with_capacity(values.len());

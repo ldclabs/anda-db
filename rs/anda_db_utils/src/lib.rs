@@ -1,4 +1,4 @@
-//! Shared utility types used by the AndaDB workspace.
+//! Standalone utility types maintained alongside the AndaDB workspace.
 //!
 //! The crate intentionally stays small and dependency-light. It currently
 //! provides:
@@ -129,8 +129,13 @@ impl<T> Default for UniqueVec<T> {
 // A small all-unique sample can justify bounded preallocation, never trusting
 // an arbitrarily large input hint. Each container reserves at most this many
 // element bytes (HashSet bucket rounding/control bytes add overhead).
+const CONSTRUCTION_SAMPLE_LEN: usize = 256;
+const CONSTRUCTION_RESERVE_BYTES: usize = 1024 * 1024;
+const SPARSE_CAPACITY_FACTOR: usize = 4;
+const MIN_SPARSE_CAPACITY: usize = 64;
+
 fn construction_reserve<T>(hint: usize) -> usize {
-    hint.min((1024 * 1024) / std::mem::size_of::<T>().max(1))
+    hint.min(CONSTRUCTION_RESERVE_BYTES / std::mem::size_of::<T>().max(1))
 }
 
 impl<T> From<Vec<T>> for UniqueVec<T>
@@ -153,18 +158,14 @@ where
             // owned payloads is avoided for duplicates.
             let inserted = (!check_duplicates || !set.contains(item)) && set.insert(item.clone());
             check_duplicates |= !inserted;
-            if seen == 256 && set.len() == 256 {
+            if seen == CONSTRUCTION_SAMPLE_LEN && set.len() == CONSTRUCTION_SAMPLE_LEN {
                 set.reserve(construction_reserve::<T>(input_len - seen));
             }
             inserted
         });
-        if vec.capacity() > vec.len().saturating_mul(4).max(64) {
-            vec.shrink_to_fit();
-        }
-        if set.capacity() > set.len().saturating_mul(4).max(64) {
-            set.shrink_to_fit();
-        }
-        Self { set, vec }
+        let mut result = Self { set, vec };
+        result.compact_sparse();
+        result
     }
 }
 
@@ -181,7 +182,7 @@ where
         while let Some(item) = iter.next() {
             check_duplicates |= !result.push_constructing(item, check_duplicates);
             seen += 1;
-            if seen == 256 && result.len() == 256 {
+            if seen == CONSTRUCTION_SAMPLE_LEN && result.len() == CONSTRUCTION_SAMPLE_LEN {
                 let reserve = construction_reserve::<T>(iter.size_hint().0);
                 result.vec.reserve(reserve);
                 result.set.reserve(reserve);
@@ -235,7 +236,11 @@ where
     }
 
     fn compact_sparse(&mut self) {
-        let threshold = self.vec.len().saturating_mul(4).max(64);
+        let threshold = self
+            .vec
+            .len()
+            .saturating_mul(SPARSE_CAPACITY_FACTOR)
+            .max(MIN_SPARSE_CAPACITY);
         if self.vec.capacity() > threshold {
             self.vec.shrink_to_fit();
         }

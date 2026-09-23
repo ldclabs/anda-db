@@ -63,6 +63,8 @@ struct ReadmeExamples;
 ///   an explicit `#[field_type = "..."]` override when they do.
 /// - `#[serde(tag = "...")]` and `#[serde(into = "...")]` are rejected:
 ///   they change the container's serialized shape.
+/// - Container `#[cbor(array)]` and `#[cbor(tag = ...)]` are rejected:
+///   AndaDB derives describe untagged maps.
 /// - Fixed map keys `"*"` and `i64::MIN` are reserved for wildcard maps.
 ///   Direct recursive fields must use an explicit non-recursive override.
 ///
@@ -161,6 +163,8 @@ pub fn field_typed_derive(input: TokenStream) -> TokenStream {
 ///   fields are stored under their text names, so an integer CBOR key could
 ///   never match the schema. (It remains supported in nested structs
 ///   deriving `FieldTyped`.)
+/// - Container `#[cbor(array)]` and `#[cbor(tag = ...)]` are rejected:
+///   documents must serialize as untagged maps.
 /// - Doc comments (`/// ...`) are concatenated and used as the field
 ///   description (`FieldEntry::with_description`).
 ///

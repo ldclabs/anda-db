@@ -373,7 +373,7 @@ struct Transaction {
 
 通过已知容器直接递归（例如 `Option<Box<Self>>`）在编译期被拒绝，除非进行了显式类型覆盖。间接递归和类型别名递归在运行时由 `try_field_type()` 捕获并返回 `SchemaError`；`schema()` 为派生的嵌套类型传播该错误。不可失败的 `field_type()` 包装函数在遇到非法声明时会触发 panic。
 
-结构体固定字段名禁止使用 `"*"` 与 `i64::MIN`。容器级 serde `tag` 与 `into`、容器级 `field_type`、重复的 `field_type`/`unique` 均会被拒绝。所有顶层字段（包含 `_id`）禁止使用整数 CBOR 键。借用与透明包装的 Map 键会根据其序列化键类型完成推断。
+结构体固定字段名禁止使用 `"*"` 与 `i64::MIN`。容器级 serde `tag` 与 `into`、容器级 `field_type`、重复的 `field_type`/`unique` 均会被拒绝。容器级 `#[cbor(array)]` 与 `#[cbor(tag = ...)]` 同样会被拒绝：两个派生宏都要求无 tag 的 map。所有顶层字段（包含 `_id`）禁止使用整数 CBOR 键。借用与透明包装的 Map 键会根据其序列化键类型完成推断。
 
 ## 7. 内部实现
 
@@ -382,7 +382,7 @@ struct Transaction {
 | 符号 | 职责说明 |
 | --- | --- |
 | `named_fields` | 两个派生宏共享的“具名字段结构体”基础校验。 |
-| `parse_container_serde_attrs` | 提取 `rename_all`（包含带方向形式）与 `transparent`。 |
+| `parse_container_attrs` | 提取 `rename_all`（包含带方向形式）与 `transparent`，拒绝不支持的 CBOR 容器形态。 |
 | `parse_field_serde_attrs` | 提取 `rename`（包含带方向形式）、`skip*` 与 `flatten`。 |
 | `RenameRule` | 兼容 serde 的 `rename_all` 大小写转换器。 |
 | `effective_field_name` | 解析最终序列化名称（显式 rename 优于 rename_all）。 |

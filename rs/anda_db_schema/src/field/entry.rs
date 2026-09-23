@@ -211,7 +211,7 @@ impl FieldEntry {
     /// # Returns
     /// * `Result<FieldValue, SchemaError>` - The canonical value or an error
     pub fn coerce(&self, value: FieldValue) -> Result<FieldValue, SchemaError> {
-        if value == FieldValue::Null {
+        if value == FieldValue::Null && self.r#type != FieldType::Json {
             // Keep `validate`'s "field is required" wording; `extract` would
             // only report the type mismatch.
             self.validate(&value)?;
@@ -256,7 +256,7 @@ impl FieldEntry {
     /// # Returns
     /// * `Result<(), SchemaError>` - Ok if valid, or an error message if invalid
     pub fn validate(&self, value: &FieldValue) -> Result<(), SchemaError> {
-        if value == &FieldValue::Null {
+        if value == &FieldValue::Null && self.r#type != FieldType::Json {
             if matches!(self.r#type, FieldType::Option(_)) {
                 return Ok(());
             }

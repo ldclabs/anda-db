@@ -164,9 +164,9 @@ impl RenameRule {
     }
 }
 
-/// Container-level serde options that affect schema generation.
+/// Container-level serialization options that affect schema generation.
 #[derive(Debug, Default)]
-pub struct ContainerSerdeAttrs {
+pub struct ContainerAttrs {
     /// The rule declared by `#[serde(rename_all = "...")]`, if any. When the
     /// directional form is used, only the `serialize` rule is honoured
     /// because AndaDB stores the serialized representation.
@@ -176,14 +176,14 @@ pub struct ContainerSerdeAttrs {
     pub transparent: bool,
 }
 
-/// Parse the container-level serde attributes relevant to schema generation.
+/// Parse container-level serde options and reject unsupported CBOR shapes.
 ///
 /// Unknown serde options are ignored; attributes that fail to parse are
 /// skipped silently so that unrelated serde syntax does not break schema
 /// generation. An unknown `rename_all` rule is an error, because silently
 /// ignoring it would produce a schema that cannot match the serialized data.
-pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<ContainerSerdeAttrs> {
-    let mut out = ContainerSerdeAttrs::default();
+pub fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttrs> {
+    let mut out = ContainerAttrs::default();
     for attr in attrs {
         if attr.path().is_ident("field_type") {
             return Err(syn::Error::new_spanned(
@@ -191,7 +191,8 @@ pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<Container
                 "#[field_type] must be applied to a field, not to the struct itself",
             ));
         }
-        if !attr.path().is_ident("serde") {
+        let is_cbor = attr.path().is_ident("cbor");
+        if !attr.path().is_ident("serde") && !is_cbor {
             continue;
         }
         let Ok(args) = attr.parse_args_with(Punctuated::<Meta, syn::Token![,]>::parse_terminated)
@@ -200,6 +201,15 @@ pub fn parse_container_serde_attrs(attrs: &[Attribute]) -> syn::Result<Container
         };
 
         for meta in args {
+            if is_cbor {
+                if meta.path().is_ident("array") || meta.path().is_ident("tag") {
+                    return Err(syn::Error::new_spanned(
+                        &meta,
+                        "AndaDB derives do not support #[cbor(array)] or #[cbor(tag = ...)]: the serialized value must be an untagged map",
+                    ));
+                }
+                continue;
+            }
             match &meta {
                 Meta::NameValue(value)
                     if value.path.is_ident("tag") || value.path.is_ident("into") =>
@@ -1359,33 +1369,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_container_serde_attrs_handles_rename_all_and_transparent() {
+    fn parse_container_attrs_handles_rename_all_and_transparent() {
         let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(rename_all = "camelCase")])];
-        let parsed = parse_container_serde_attrs(&attrs).unwrap();
+        let parsed = parse_container_attrs(&attrs).unwrap();
         assert_eq!(parsed.rename_all, Some(RenameRule::CamelCase));
         assert!(!parsed.transparent);
 
         let attrs: Vec<Attribute> =
             vec![parse_quote!(#[serde(rename_all(serialize = "kebab-case"))])];
         assert_eq!(
-            parse_container_serde_attrs(&attrs).unwrap().rename_all,
+            parse_container_attrs(&attrs).unwrap().rename_all,
             Some(RenameRule::KebabCase)
         );
 
         // A deserialize-only rule does not change serialized names.
         let attrs: Vec<Attribute> =
             vec![parse_quote!(#[serde(rename_all(deserialize = "camelCase"))])];
-        assert_eq!(
-            parse_container_serde_attrs(&attrs).unwrap().rename_all,
-            None
-        );
+        assert_eq!(parse_container_attrs(&attrs).unwrap().rename_all, None);
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(transparent)])];
-        assert!(parse_container_serde_attrs(&attrs).unwrap().transparent);
+        assert!(parse_container_attrs(&attrs).unwrap().transparent);
 
         let attrs: Vec<Attribute> = vec![parse_quote!(#[serde(rename_all = "weirdCase")])];
         assert!(
-            parse_container_serde_attrs(&attrs)
+            parse_container_attrs(&attrs)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown #[serde(rename_all")

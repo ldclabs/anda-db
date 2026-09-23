@@ -1003,9 +1003,9 @@ impl FieldValue {
     /// Deserialize a FieldValue into a value of type T
     ///
     /// The value is re-encoded as a CBOR byte stream and decoded from it:
-    /// the streaming decoder bridges CBOR byte strings into serde sequences,
-    /// which is required to deserialize [`FieldValue::Bytes`] into `Vec<u8>`
-    /// or `[u8; N]`.
+    /// avoiding a cloned value tree. The streaming decoder supports CBOR
+    /// byte strings as serde sequences (`Vec<u8>` / `[u8; N]`), as does the
+    /// current cbor2 value-tree decoder.
     ///
     /// # Returns
     /// * `Result<T, SchemaError>` - The deserialized value or an error message

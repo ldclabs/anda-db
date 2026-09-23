@@ -187,6 +187,9 @@ Ft::Map([
 A field whose type is *not* `Option` is treated as required by both
 `Schema::validate` and `FieldEntry::validate`. A required `Json` field may
 contain a JSON null payload, but its key must still be present.
+For such a field, `set_field(name, Fv::Null)` normalizes to
+`Fv::Json(Json::Null)`, matching `try_from`, `set_field_as`, and storage reads.
+`Option<Json>` keeps the optional `Fv::Null` representation.
 
 ### 2.4 `FieldKey`
 

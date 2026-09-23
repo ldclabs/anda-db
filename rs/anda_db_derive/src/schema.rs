@@ -4,7 +4,7 @@ use quote::quote;
 use syn::{Attribute, DeriveInput, Expr, Lit, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    TypeParams, effective_field_name, is_u64_type, named_fields, parse_container_serde_attrs,
+    TypeParams, effective_field_name, is_u64_type, named_fields, parse_container_attrs,
     parse_field_cbor_attrs, parse_field_serde_attrs, reject_direct_recursion, resolve_field_type,
     schema_crate_path, validate_schema_field_name, validate_unique_attrs,
 };
@@ -39,7 +39,7 @@ pub(crate) fn expand_anda_db_schema_derive(input: DeriveInput) -> TokenStream2 {
         Err(err) => return err.to_compile_error(),
     };
 
-    let container = match parse_container_serde_attrs(&input.attrs) {
+    let container = match parse_container_attrs(&input.attrs) {
         Ok(container) => container,
         Err(err) => return err.to_compile_error(),
     };

@@ -28,7 +28,7 @@
 //!
 //! CBOR (non-human-readable) encoding is unchanged: byte strings, integers
 //! and text map to their native CBOR types with no prefixes.
-use base64::{Engine, prelude::BASE64_URL_SAFE};
+use base64::{Engine, display::Base64Display, prelude::BASE64_URL_SAFE};
 use serde::{
     de,
     ser::{Serialize, SerializeMap, SerializeSeq, Serializer},
@@ -87,6 +87,16 @@ fn needs_txt_escape(text: &str) -> bool {
     text.starts_with(B64_PREFIX) || text.starts_with(TXT_PREFIX) || text.starts_with(I64_KEY_PREFIX)
 }
 
+/// Format prefixes directly into the serializer instead of allocating an
+/// intermediate string. JSON's collect_str also escapes each written chunk.
+struct Prefixed<T>(&'static str, T);
+
+impl<T: std::fmt::Display> Serialize for Prefixed<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}{}", self.0, self.1))
+    }
+}
+
 /// Human-readable serialization of the JSON payload inside
 /// [`FieldValue::Json`].
 ///
@@ -100,9 +110,7 @@ struct JsonEscaped<'a>(&'a Json);
 impl Serialize for JsonEscaped<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
-            Json::String(s) if needs_txt_escape(s) => {
-                format!("{TXT_PREFIX}{s}").serialize(serializer)
-            }
+            Json::String(s) if needs_txt_escape(s) => Prefixed(TXT_PREFIX, s).serialize(serializer),
             Json::Array(arr) => {
                 let mut seq = serializer.serialize_seq(Some(arr.len()))?;
                 for v in arr {
@@ -114,7 +122,7 @@ impl Serialize for JsonEscaped<'_> {
                 let mut map = serializer.serialize_map(Some(obj.len()))?;
                 for (k, v) in obj {
                     if needs_txt_escape(k) {
-                        map.serialize_entry(&format!("{TXT_PREFIX}{k}"), &JsonEscaped(v))?;
+                        map.serialize_entry(&Prefixed(TXT_PREFIX, k), &JsonEscaped(v))?;
                     } else {
                         map.serialize_entry(k, &JsonEscaped(v))?;
                     }
@@ -132,21 +140,22 @@ impl Serialize for FieldKey {
         match self {
             FieldKey::Text(x) => {
                 if serializer.is_human_readable() && needs_txt_escape(x) {
-                    format!("{TXT_PREFIX}{x}").serialize(serializer)
+                    Prefixed(TXT_PREFIX, x).serialize(serializer)
                 } else {
                     serializer.serialize_str(x)
                 }
             }
             FieldKey::I64(x) => {
                 if serializer.is_human_readable() {
-                    format!("{I64_KEY_PREFIX}{x}").serialize(serializer)
+                    Prefixed(I64_KEY_PREFIX, x).serialize(serializer)
                 } else {
                     serializer.serialize_i64(*x)
                 }
             }
             FieldKey::Bytes(x) => {
                 if serializer.is_human_readable() {
-                    format!("{B64_PREFIX}{}", BASE64_URL_SAFE.encode(x)).serialize(serializer)
+                    Prefixed(B64_PREFIX, Base64Display::new(x, &BASE64_URL_SAFE))
+                        .serialize(serializer)
                 } else {
                     serializer.serialize_bytes(x)
                 }
@@ -215,14 +224,15 @@ impl Serialize for FieldValue {
             }
             FieldValue::Bytes(x) => {
                 if serializer.is_human_readable() {
-                    format!("{B64_PREFIX}{}", BASE64_URL_SAFE.encode(x)).serialize(serializer)
+                    Prefixed(B64_PREFIX, Base64Display::new(x, &BASE64_URL_SAFE))
+                        .serialize(serializer)
                 } else {
                     serializer.serialize_bytes(x)
                 }
             }
             FieldValue::Text(x) => {
                 if serializer.is_human_readable() && needs_txt_escape(x) {
-                    format!("{TXT_PREFIX}{x}").serialize(serializer)
+                    Prefixed(TXT_PREFIX, x).serialize(serializer)
                 } else {
                     serializer.serialize_str(x)
                 }
@@ -293,21 +303,6 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
     }
 
     #[inline]
-    fn visit_i8<E: de::Error>(self, v: i8) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_i16<E: de::Error>(self, v: i16) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_i32<E: de::Error>(self, v: i32) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
-    }
-
-    #[inline]
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
         Ok(FieldKey::I64(v))
     }
@@ -317,21 +312,6 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
         Ok(FieldKey::I64(
             i64::try_from(v).map_err(|_| de::Error::custom("i128 overflow"))?,
         ))
-    }
-
-    #[inline]
-    fn visit_u8<E: de::Error>(self, v: u8) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_u16<E: de::Error>(self, v: u16) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_u32<E: de::Error>(self, v: u32) -> Result<Self::Value, E> {
-        Ok(FieldKey::I64(v.into()))
     }
 
     #[inline]
@@ -354,22 +334,12 @@ impl<'de> de::Visitor<'de> for KeyVisitor {
     }
 
     #[inline]
-    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
-        Ok(FieldKey::Text(v.into()))
-    }
-
-    #[inline]
     fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
         Ok(FieldKey::Text(v))
     }
 
     #[inline]
     fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-        Ok(FieldKey::Bytes(v.to_vec()))
-    }
-
-    #[inline]
-    fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
         Ok(FieldKey::Bytes(v.to_vec()))
     }
 
@@ -421,21 +391,6 @@ impl<'de> de::Visitor<'de> for Visitor {
     }
 
     #[inline]
-    fn visit_i8<E: de::Error>(self, v: i8) -> Result<Self::Value, E> {
-        Ok(FieldValue::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_i16<E: de::Error>(self, v: i16) -> Result<Self::Value, E> {
-        Ok(FieldValue::I64(v.into()))
-    }
-
-    #[inline]
-    fn visit_i32<E: de::Error>(self, v: i32) -> Result<Self::Value, E> {
-        Ok(FieldValue::I64(v.into()))
-    }
-
-    #[inline]
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
         Ok(FieldValue::I64(v))
     }
@@ -445,21 +400,6 @@ impl<'de> de::Visitor<'de> for Visitor {
         Ok(FieldValue::I64(
             i64::try_from(v).map_err(|_| de::Error::custom("i128 overflow"))?,
         ))
-    }
-
-    #[inline]
-    fn visit_u8<E: de::Error>(self, v: u8) -> Result<Self::Value, E> {
-        Ok(FieldValue::U64(v.into()))
-    }
-
-    #[inline]
-    fn visit_u16<E: de::Error>(self, v: u16) -> Result<Self::Value, E> {
-        Ok(FieldValue::U64(v.into()))
-    }
-
-    #[inline]
-    fn visit_u32<E: de::Error>(self, v: u32) -> Result<Self::Value, E> {
-        Ok(FieldValue::U64(v.into()))
     }
 
     #[inline]
@@ -485,22 +425,12 @@ impl<'de> de::Visitor<'de> for Visitor {
     }
 
     #[inline]
-    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
-        Ok(FieldValue::Text(v.into()))
-    }
-
-    #[inline]
     fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
         Ok(FieldValue::Text(v))
     }
 
     #[inline]
     fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-        Ok(FieldValue::Bytes(v.to_vec()))
-    }
-
-    #[inline]
-    fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
         Ok(FieldValue::Bytes(v.to_vec()))
     }
 
@@ -819,6 +749,40 @@ mod tests {
                 FieldValue::Text("b64:AQID".into()),
             )]))
         );
+    }
+
+    #[test]
+    fn streaming_prefixes_preserve_json_escaping_and_large_bytes() {
+        let bytes: Vec<u8> = (0..65_536).map(|i| i as u8).collect();
+        let text = "txt:\"quoted\"\\slash\n\t中文";
+        let value = FieldValue::Map(BTreeMap::from([
+            (
+                FieldKey::Bytes(bytes.clone()),
+                FieldValue::Bytes(bytes.clone()),
+            ),
+            (FieldKey::Text(text.into()), FieldValue::Text(text.into())),
+            (
+                FieldKey::I64(i64::MIN),
+                FieldValue::Json(json!({text: text})),
+            ),
+        ]));
+        let mut expected = serde_json::Map::new();
+        expected.insert(
+            format!("b64:{}", BASE64_URL_SAFE.encode(&bytes)),
+            json!(format!("b64:{}", BASE64_URL_SAFE.encode(&bytes))),
+        );
+        expected.insert(format!("txt:{text}"), json!(format!("txt:{text}")));
+        expected.insert(
+            format!("i64:{}", i64::MIN),
+            json!({format!("txt:{text}"): format!("txt:{text}")}),
+        );
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Json>(&encoded).unwrap(),
+            Json::Object(expected)
+        );
+        let decoded: FieldValue = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(cbor_roundtrip::<_, FieldValue>(&value), decoded);
     }
 
     #[test]

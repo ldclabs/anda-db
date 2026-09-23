@@ -84,6 +84,9 @@ also needs the corresponding Serde features (e.g. `serde/rc` for `Arc`).
 - `#[serde(skip)]` / `skip_serializing` excludes a field from the schema.
   `#[serde(default)]` does not make a required schema field optional.
 - `#[serde(flatten)]` and container `transparent` are rejected.
+- Container `#[cbor(array)]` and `#[cbor(tag = ...)]` are rejected by both
+  derives: they require an untagged map. Integer keys on nested fields remain
+  supported.
 - `#[unique]` is a top-level field constraint, enforced by a B-Tree index.
   It does not add uniqueness to nested `FieldTyped` maps.
 - `#[field_type = "Bytes"]` overrides inference. Other examples include
@@ -158,6 +161,11 @@ assert_eq!(decoded, value);
 Use `cbor2::serialized_size` for encoded sizes. Use
 `cbor2::to_canonical_vec` when deterministic bytes are needed for keys/digests;
 ordinary `to_writer` is not a substitute for a specified canonical format.
+
+A required `Json` field must be present, but its payload can be JSON null.
+`set_field(name, Fv::Null)` stores `Fv::Json(Json::Null)` for that declared
+type, matching creation and `set_field_as`. An `Option<Json>` field retains
+the optional `Fv::Null` representation.
 
 Untyped `FieldValue` round trips preserve data but can change variants:
 `F32 -> F64`, non-negative `I64 -> U64`, `Vector -> Array(U64 bits)`, and

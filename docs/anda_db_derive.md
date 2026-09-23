@@ -432,8 +432,10 @@ serialized shape, so that case is handled by the runtime construction guard.
 `"*"` and `i64::MIN` cannot name fixed struct fields. Container serde `tag` and
 `into`, container-level `field_type`, duplicate `field_type`/`unique`, and
 non-marker forms of `unique` are rejected. Integer CBOR keys are rejected on
-all top-level fields, including `_id`. Borrowed and transparently wrapped map
-keys are inferred through their serialized key types.
+all top-level fields, including `_id`. Container `#[cbor(array)]` and
+`#[cbor(tag = ...)]` are also rejected: both derives require untagged maps.
+Borrowed and transparently wrapped map keys are inferred through their
+serialized key types.
 
 ## 7. Internal Implementation
 
@@ -442,7 +444,7 @@ keys are inferred through their serialized key types.
 | Symbol                       | Responsibility                                                      |
 | ---------------------------- | ------------------------------------------------------------------- |
 | `named_fields`               | Shared "struct with named fields" validation for both derives.      |
-| `parse_container_serde_attrs`| Extract `rename_all` (incl. directional form) and `transparent`.    |
+| `parse_container_attrs`      | Extract serde options; reject unsupported CBOR container shapes.    |
 | `parse_field_serde_attrs`    | Extract `rename` (incl. directional form), `skip*` and `flatten`.   |
 | `RenameRule`                 | serde-compatible `rename_all` case conversion.                      |
 | `effective_field_name`       | Resolve the serialized name (explicit rename wins over rename_all). |

@@ -18,6 +18,8 @@ and keeping application data models aligned with the database type system.
 - compile-time validation: field names AndaDB cannot store, duplicate names,
   `_id` misuse, and unsupported `#[serde(flatten)]`, `#[serde(transparent)]`, container `tag` / `into`
   are reported with precise spans
+- container `#[cbor(array)]` and `#[cbor(tag = ...)]` are rejected because
+  both derives require an untagged map
 - extraction of doc comments into schema field descriptions
 
 ## When to Use It

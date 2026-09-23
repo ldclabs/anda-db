@@ -59,27 +59,35 @@ impl FieldValue {
 
     /// Validates this value against an explicit structural complexity budget.
     pub fn validate_complexity_with(&self, budget: FieldValueBudget) -> Result<(), SchemaError> {
-        if !matches!(
-            self,
-            FieldValue::Array(_) | FieldValue::Map(_) | FieldValue::Json(_)
-        ) {
-            return if budget.max_nodes == 0 {
-                Err(SchemaError::FieldValue(
-                    "FieldValue exceeds maximum node count 0".into(),
-                ))
-            } else {
-                Ok(())
-            };
-        }
         enum Item<'a> {
-            Field(&'a FieldValue, usize),
-            Json(&'a Json, usize),
+            Field(&'a FieldValue),
+            Json(&'a Json),
+        }
+        enum Children<'a> {
+            Array(std::slice::Iter<'a, FieldValue>),
+            Map(std::collections::btree_map::Values<'a, FieldKey, FieldValue>),
+            JsonArray(std::slice::Iter<'a, Json>),
+            JsonMap(serde_json::map::Values<'a>),
+        }
+        impl<'a> Children<'a> {
+            fn next(&mut self) -> Option<Item<'a>> {
+                // Preserve the previous stack's reverse visitation order.
+                match self {
+                    Self::Array(values) => values.next_back().map(Item::Field),
+                    Self::Map(values) => values.next_back().map(Item::Field),
+                    Self::JsonArray(values) => values.next_back().map(Item::Json),
+                    Self::JsonMap(values) => values.next_back().map(Item::Json),
+                }
+            }
         }
 
         let mut nodes = 0usize;
-        let mut stack = vec![Item::Field(self, 0)];
+        // Keep only the unfinished container at each depth, not all siblings.
+        // Scalars (including JSON scalars) never allocate a traversal stack.
+        let mut stack: Vec<(Children<'_>, usize)> = Vec::new();
+        let mut next = Some((Item::Field(self), 0usize));
 
-        while let Some(item) = stack.pop() {
+        while let Some((item, depth)) = next.take() {
             nodes = nodes.saturating_add(1);
             if nodes > budget.max_nodes {
                 return Err(SchemaError::FieldValue(format!(
@@ -88,9 +96,6 @@ impl FieldValue {
                 )));
             }
 
-            let depth = match &item {
-                Item::Field(_, depth) | Item::Json(_, depth) => *depth,
-            };
             if depth > budget.max_depth {
                 return Err(SchemaError::FieldValue(format!(
                     "FieldValue exceeds maximum depth {}",
@@ -98,8 +103,8 @@ impl FieldValue {
                 )));
             }
 
-            match item {
-                Item::Field(FieldValue::Array(values), depth) => {
+            let children = match item {
+                Item::Field(FieldValue::Array(values)) => {
                     if values.len() > budget.max_array_len {
                         return Err(SchemaError::FieldValue(format!(
                             "FieldValue array length {} exceeds maximum {}",
@@ -107,9 +112,9 @@ impl FieldValue {
                             budget.max_array_len
                         )));
                     }
-                    stack.extend(values.iter().map(|value| Item::Field(value, depth + 1)));
+                    Some(Children::Array(values.iter()))
                 }
-                Item::Field(FieldValue::Map(values), depth) => {
+                Item::Field(FieldValue::Map(values)) => {
                     if values.len() > budget.max_map_entries {
                         return Err(SchemaError::FieldValue(format!(
                             "FieldValue map entries {} exceed maximum {}",
@@ -117,13 +122,14 @@ impl FieldValue {
                             budget.max_map_entries
                         )));
                     }
-                    stack.extend(values.values().map(|value| Item::Field(value, depth + 1)));
+                    Some(Children::Map(values.values()))
                 }
-                Item::Field(FieldValue::Json(value), depth) => {
-                    stack.push(Item::Json(value, depth + 1));
+                Item::Field(FieldValue::Json(value)) => {
+                    // Json's wrapper remains a separate node and depth level.
+                    next = Some((Item::Json(value), depth + 1));
+                    continue;
                 }
-                Item::Field(_, _) => {}
-                Item::Json(Json::Array(values), depth) => {
+                Item::Json(Json::Array(values)) => {
                     if values.len() > budget.max_array_len {
                         return Err(SchemaError::FieldValue(format!(
                             "JSON array length {} exceeds maximum {}",
@@ -131,9 +137,9 @@ impl FieldValue {
                             budget.max_array_len
                         )));
                     }
-                    stack.extend(values.iter().map(|value| Item::Json(value, depth + 1)));
+                    Some(Children::JsonArray(values.iter()))
                 }
-                Item::Json(Json::Object(values), depth) => {
+                Item::Json(Json::Object(values)) => {
                     if values.len() > budget.max_map_entries {
                         return Err(SchemaError::FieldValue(format!(
                             "JSON object entries {} exceed maximum {}",
@@ -141,10 +147,28 @@ impl FieldValue {
                             budget.max_map_entries
                         )));
                     }
-                    stack.extend(values.values().map(|value| Item::Json(value, depth + 1)));
+                    Some(Children::JsonMap(values.values()))
                 }
-                Item::Json(_, _) => {}
+                _ => None,
+            };
+
+            if let Some(mut children) = children
+                && let Some(first) = children.next()
+            {
+                stack.push((children, depth + 1));
+                next = Some((first, depth + 1));
+                continue;
             }
+
+            next = loop {
+                let Some((children, depth)) = stack.last_mut() else {
+                    break None;
+                };
+                if let Some(item) = children.next() {
+                    break Some((item, *depth));
+                }
+                stack.pop();
+            };
         }
 
         Ok(())

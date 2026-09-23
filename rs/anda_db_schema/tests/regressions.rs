@@ -1,6 +1,7 @@
 //! Boundary regressions: exercise persisted data and the public API together.
 use anda_db_schema::{
-    Cbor, Document, DocumentOwned, Fe, FieldKey, Ft, Fv, Json, MAX_CONVERSION_DEPTH, Schema,
+    Cbor, Document, DocumentOwned, Fe, FieldKey, FieldValueBudget, Ft, Fv, Json,
+    MAX_CONVERSION_DEPTH, Schema,
 };
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -141,6 +142,204 @@ fn required_nested_json_distinguishes_missing_from_null() {
         value.deserialized::<Json>().unwrap(),
         serde_json::json!({"value":null})
     );
+}
+
+#[test]
+fn required_json_null_is_consistent_across_document_boundaries() {
+    let s = Arc::new(schema(Ft::Json, 0));
+    let mut doc = Document::try_from(
+        s.clone(),
+        &serde_json::json!({
+            "_id": 1, "payload": null
+        }),
+    )
+    .unwrap();
+    doc.set_field("payload", Fv::Null).unwrap();
+    assert_eq!(doc.get_field("payload"), Some(&Fv::Json(Json::Null)));
+    doc.set_field_as("payload", &Json::Null).unwrap();
+    assert_eq!(doc.get_field("payload"), Some(&Fv::Json(Json::Null)));
+    s.validate(doc.fields()).unwrap();
+
+    let raw = DocumentOwned {
+        fields: BTreeMap::from([(0, Fv::U64(1)), (1, Fv::Null)]),
+    };
+    s.validate(&raw.fields).unwrap();
+    doc.set_doc(raw.clone()).unwrap();
+    let restored = Document::try_from_doc(s.clone(), raw).unwrap();
+    assert_eq!(restored.get_field("payload"), Some(&Fv::Json(Json::Null)));
+    let json: Json = restored.try_into().unwrap();
+    assert_eq!(json, serde_json::json!({"_id": 1, "payload": null}));
+
+    for wire in [false, true] {
+        let raw: DocumentOwned = if wire {
+            let mut bytes = Vec::new();
+            cbor2::to_writer(&doc, &mut bytes).unwrap();
+            cbor2::from_reader(bytes.as_slice()).unwrap()
+        } else {
+            serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap()
+        };
+        s.validate(&raw.fields).unwrap();
+        let restored = Document::try_from_doc(s.clone(), raw).unwrap();
+        assert_eq!(restored.get_field("payload"), Some(&Fv::Json(Json::Null)));
+    }
+    assert!(Document::try_from(s.clone(), &serde_json::json!({"_id": 1})).is_err());
+    assert!(s.validate(&BTreeMap::from([(0, Fv::U64(1))])).is_err());
+    assert!(
+        Fe::new("required".into(), Ft::Text)
+            .unwrap()
+            .coerce(Fv::Null)
+            .is_err()
+    );
+    assert_eq!(
+        Fe::new("optional".into(), Ft::Option(Box::new(Ft::Json)))
+            .unwrap()
+            .coerce(Fv::Null)
+            .unwrap(),
+        Fv::Null
+    );
+}
+
+#[test]
+fn byte_array_coercion_preserves_compatibility_and_atomic_updates() {
+    let s = Arc::new(schema(Ft::Bytes, 0));
+    let entry = s.get_field("payload").unwrap();
+    for input in [
+        Fv::Array(vec![]),
+        Fv::Array(vec![Fv::U64(0), Fv::I64(255)]),
+        Fv::Array(vec![Fv::U64(1), Fv::Json(serde_json::json!(2))]),
+        Fv::Json(serde_json::json!([0, 255])),
+    ] {
+        let expected = entry
+            .extract(Cbor::serialized(&input).unwrap(), true)
+            .unwrap();
+        assert_eq!(entry.coerce(input).unwrap(), expected);
+    }
+    let bytes = vec![7; 4096];
+    let pointer = bytes.as_ptr();
+    let mut doc = Document::new(s);
+    doc.set_id(1)
+        .set_field("payload", Fv::Bytes(bytes))
+        .unwrap();
+    let Some(Fv::Bytes(bytes)) = doc.get_field("payload") else {
+        panic!("bytes")
+    };
+    assert_eq!(bytes.as_ptr(), pointer);
+    for invalid in [Fv::I64(-1), Fv::U64(256), Fv::F64(1.0), Fv::Null] {
+        assert!(
+            doc.set_field("payload", Fv::Array(vec![Fv::U64(0), invalid]))
+                .is_err()
+        );
+        assert_eq!(doc.get_field("payload"), Some(&Fv::Bytes(vec![7; 4096])));
+    }
+}
+
+#[test]
+fn complexity_budget_counts_mixed_containers_and_json_wrappers() {
+    // Eight nodes, maximum depth five; the Json wrapper is a separate node.
+    let mixed = Fv::Array(vec![
+        Fv::Map(BTreeMap::from([(
+            "x".into(),
+            Fv::Json(serde_json::json!({"a": [true, null]})),
+        )])),
+        Fv::U64(7),
+    ]);
+    let exact = FieldValueBudget {
+        max_nodes: 8,
+        max_depth: 5,
+        max_array_len: 2,
+        max_map_entries: 1,
+    };
+    mixed.validate_complexity_with(exact).unwrap();
+    assert!(
+        mixed
+            .validate_complexity_with(FieldValueBudget {
+                max_nodes: 7,
+                ..exact
+            })
+            .is_err()
+    );
+    assert!(
+        mixed
+            .validate_complexity_with(FieldValueBudget {
+                max_depth: 4,
+                ..exact
+            })
+            .is_err()
+    );
+    for scalar in [Json::Null, serde_json::json!(42), serde_json::json!("text")] {
+        let value = Fv::Json(scalar);
+        let budget = FieldValueBudget {
+            max_nodes: 2,
+            max_depth: 1,
+            ..exact
+        };
+        value.validate_complexity_with(budget).unwrap();
+        assert!(
+            value
+                .validate_complexity_with(FieldValueBudget {
+                    max_nodes: 1,
+                    ..budget
+                })
+                .is_err()
+        );
+        assert!(
+            value
+                .validate_complexity_with(FieldValueBudget {
+                    max_depth: 0,
+                    ..budget
+                })
+                .is_err()
+        );
+    }
+    for value in [
+        Fv::Array(vec![Fv::Null; 2]),
+        Fv::Map(BTreeMap::from([
+            ("a".into(), Fv::Null),
+            ("b".into(), Fv::Null),
+        ])),
+        Fv::Json(serde_json::json!([null, null])),
+        Fv::Json(serde_json::json!({"a": null, "b": null})),
+    ] {
+        assert!(
+            value
+                .validate_complexity_with(FieldValueBudget {
+                    max_array_len: 1,
+                    max_map_entries: 1,
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+    for value in [
+        Fv::Null,
+        Fv::Array(vec![]),
+        Fv::Map(BTreeMap::new()),
+        Fv::Json(Json::Null),
+    ] {
+        assert!(
+            value
+                .validate_complexity_with(FieldValueBudget {
+                    max_nodes: 0,
+                    ..Default::default()
+                })
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn typed_updates_enforce_write_limits_while_old_wide_values_stay_readable() {
+    let s = Arc::new(schema(Ft::Array(vec![Ft::U64]), 0));
+    let wide = vec![7u64; FieldValueBudget::default().max_array_len + 1];
+    let raw = DocumentOwned {
+        fields: BTreeMap::from([(0, Fv::U64(1)), (1, Fv::from(wide.clone()))]),
+    };
+    let mut doc = Document::try_from_doc(s.clone(), raw).unwrap();
+    assert!(doc.set_field_as("payload", &wide).is_err());
+    assert_eq!(doc.get_field_as::<Vec<u64>>("payload").unwrap(), wide);
+    assert!(Document::try_from(s, &serde_json::json!({"_id": 1, "payload": wide})).is_err());
+    doc.set_field_as("payload", &vec![1u64, 2]).unwrap();
+    assert_eq!(doc.get_field_as::<Vec<u64>>("payload").unwrap(), vec![1, 2]);
 }
 
 #[test]

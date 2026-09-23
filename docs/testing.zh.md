@@ -64,6 +64,20 @@ make coverage-html   # HTML 完整报告
 
 CI 会上传 lcov 产物。覆盖率用于定位尚未覆盖的逻辑分支；覆盖率本身不是终极质量目标——故障注入与随机属性测试往往比单纯凑覆盖率的用例能发现更多深层隐患。
 
+## Schema 性能验证
+
+```bash
+cargo bench -p anda_db_schema --bench values
+```
+
+`coerce` 与 `materialize` 用例不计入输入构造和 CBOR 解码耗时。
+`create`、`typed_update`、`decode_materialize` 分别测量文档创建、类型化更新以及完整的解码到文档路径。
+用例覆盖字节缓冲区、整数数组、向量和 JSON。`json_encode` 测量复用输出缓冲区的 JSON 编码。评估时同时比较分配成本和耗时。
+
+`typed_read_stream` 与 `typed_read_value_tree` 比较当前公共读取接口和消费所有权的 CBOR 值树方案。
+当前 cbor2 的两种解码器都支持把字节串读为序列。值树可以缩短解码时间，但会将整数数组和向量展开为独立的 CBOR 值；公共接口保留字节流路径以避免这种中间值树。
+替代方案仅用于基准比较，不增加运行时策略。
+
 ## 新特性开发 Checklist
 
 - 新增公共 API → 功能测试（第 1 层）。

@@ -4,9 +4,9 @@ use quote::quote;
 use syn::{DeriveInput, ext::IdentExt, parse_macro_input};
 
 use crate::common::{
-    TypeParams, effective_field_name, named_fields, parse_container_serde_attrs,
-    parse_field_cbor_attrs, parse_field_serde_attrs, reject_direct_recursion, resolve_field_type,
-    schema_crate_path, validate_unique_attrs,
+    TypeParams, effective_field_name, named_fields, parse_container_attrs, parse_field_cbor_attrs,
+    parse_field_serde_attrs, reject_direct_recursion, resolve_field_type, schema_crate_path,
+    validate_unique_attrs,
 };
 
 /// Implementation of `#[derive(FieldTyped)]`.
@@ -37,7 +37,7 @@ pub(crate) fn expand_field_typed_derive(input: DeriveInput) -> TokenStream2 {
         Err(err) => return err.to_compile_error(),
     };
 
-    let container = match parse_container_serde_attrs(&input.attrs) {
+    let container = match parse_container_attrs(&input.attrs) {
         Ok(container) => container,
         Err(err) => return err.to_compile_error(),
     };

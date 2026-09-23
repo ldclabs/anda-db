@@ -246,9 +246,10 @@ impl Document {
     /// Deserializes the document into the specified type.
     ///
     /// The document is re-encoded as a CBOR byte stream and decoded from it,
-    /// rather than walked as a `cbor2::Value` tree: the streaming decoder
-    /// bridges CBOR byte strings into serde sequences, which is required to
-    /// deserialize `FieldType::Bytes` fields into `Vec<u8>` / `[u8; N]`.
+    /// avoiding a second value tree for arrays and vectors. The streaming
+    /// decoder bridges CBOR byte strings into serde sequences (`Vec<u8>` /
+    /// `[u8; N]`). Current cbor2 value-tree decoding supports that bridge too;
+    /// the byte stream remains the common path for all field types.
     ///
     /// # Returns
     /// * `Result<T, SchemaError>` - The deserialized value or an error
@@ -287,14 +288,9 @@ impl Document {
             {
                 use serde::ser::SerializeMap;
 
-                // The map length hint must count only the entries actually
-                // emitted below, or the CBOR map header would be wrong.
-                let len = self
-                    .schema
-                    .iter()
-                    .filter(|field| self.fields.contains_key(&field.idx()))
-                    .count();
-                let mut map = serializer.serialize_map(Some(len))?;
+                // Document's constructors and setters keep every stored index
+                // in its schema; absent optional fields are already excluded.
+                let mut map = serializer.serialize_map(Some(self.fields.len()))?;
                 for field in self.schema.iter() {
                     if let Some(value) = self.fields.get(&field.idx()) {
                         map.serialize_entry(field.name(), value)?;
@@ -470,7 +466,10 @@ impl Document {
     {
         let field = self.schema.get_field_or_err(name)?;
         let value = Fv::serialized(value, Some(field.r#type()))?;
-        field.validate(&value)?;
+        // Typed extraction already checked the shape, as in try_from.
+        value.validate_complexity().map_err(|err| {
+            SchemaError::FieldValue(format!("field {name:?} is invalid, error: {err}"))
+        })?;
         self.fields.insert(field.idx(), value);
         Ok(self)
     }

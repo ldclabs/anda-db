@@ -1,22 +1,21 @@
 # anda_db_utils
 
-`anda_db_utils` contains small supporting utilities shared across the AndaDB
-workspace. It is not an end-user database crate on its own, but it provides
-reusable building blocks used by indexing, persistence, and supporting code.
+`anda_db_utils` provides standalone collection and serialization utilities.
+It remains available to downstream users; current workspace production code
+does not depend on these helpers.
 
 ## What This Crate Provides
 
 - `UniqueVec<T>` for ordered unique collections
 - `Pipe` for lightweight functional-style chaining
 - `CountingWriter` for byte-counting during serialization workflows
-- small helper primitives reused by multiple workspace crates
 
 ## When to Use It
 
 Use `anda_db_utils` when you need:
 
 - deterministic uniqueness with vector-like iteration order
-- a small utility dependency shared with the rest of the AndaDB stack
+- a small utility dependency for application code
 
 ## Getting Started
 
@@ -27,12 +26,12 @@ Add the crate to your project:
 anda_db_utils = "0.13"
 ```
 
-This crate is most often consumed indirectly through higher-level workspace
-crates such as `anda_db`, `anda_db_btree`, and `anda_db_tfs`.
+For CBOR encoded sizes, prefer `cbor2::serialized_size`; `CountingWriter`
+remains useful as a general-purpose counting sink for other formats.
 
 ## Related Crates
 
-- `anda_db_btree` and `anda_db_tfs` for embedded index implementations that use these helpers
+- `anda_db_btree` and `anda_db_tfs` for embedded index implementations
 - `anda_db` for the top-level embedded database layer
 
 ## License

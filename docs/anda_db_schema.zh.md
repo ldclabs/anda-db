@@ -168,6 +168,8 @@ Ft::Map([
 
 `FieldType::Option(Box<Ft>)` 是声明可空（nullable）字段的唯一方式。类型*不为* `Option` 的字段在 `Schema::validate` 与 `FieldEntry::validate` 中均被视为必填字段。必填的 `Json` 字段允许承载 JSON null 载荷，但其键本身必须存在。
 
+对此类字段，`set_field(name, Fv::Null)` 会归一化为 `Fv::Json(Json::Null)`，与 `try_from`、`set_field_as` 和存储读回一致。`Option<Json>` 则保留可选值的 `Fv::Null` 表示。
+
 ### 2.4 `FieldKey`
 
 ```rust

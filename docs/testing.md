@@ -102,6 +102,26 @@ CI uploads an lcov artifact. Coverage points at untested branches; it is not
 a quality target by itself — fault injection and randomized testing find more
 bugs than cases written to satisfy a percentage.
 
+## Schema performance checks
+
+```bash
+cargo bench -p anda_db_schema --bench values
+```
+
+The `coerce` and `materialize` cases exclude input construction and CBOR
+decoding from their measurements. `create`, `typed_update`, and
+`decode_materialize` measure document creation, typed updates, and the complete
+decode-to-document path. Cases include byte buffers, integer arrays, vectors,
+and JSON. `json_encode` measures human-readable encoding into a reused output
+buffer. Compare allocation costs as well as elapsed time.
+
+`typed_read_stream` and `typed_read_value_tree` compare the current public
+reader with an owned CBOR value-tree alternative. Both decoders in current
+cbor2 support byte strings as sequences. A value tree can improve decoding
+time but expands numeric arrays and vectors into individual CBOR values;
+the public reader retains the byte-stream path to avoid that intermediate
+tree. The alternative remains a benchmark, not another runtime strategy.
+
 ## Checklist for new features
 
 - New public API → functional tests (layer 1).
