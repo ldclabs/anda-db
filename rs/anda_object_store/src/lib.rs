@@ -41,9 +41,10 @@
 //! which is designed to run when the store is otherwise quiescent (e.g. at
 //! open) and never deletes a payload that a commit point references.
 //!
-//! Errors or cancellation after a metadata mutation has started invalidate the
-//! shared cache synchronously: the backend may have committed already. Local
-//! durability still depends on the backend and its fsync configuration.
+//! Once a metadata mutation has reached the backend its outcome is unknown on
+//! failure: an error evicts that key from the shared cache, and a
+//! cancellation synchronously invalidates the whole cache. Local durability
+//! still depends on the backend and its fsync configuration.
 //!
 //! ## Backward compatibility
 //!
@@ -58,10 +59,13 @@
 //!
 //! Concurrent mutations of the **same key** must be coordinated by the
 //! caller (AndaDB deploys one writer per store). Clones share the
-//! per-key metadata critical section; separately built instances do not. A
-//! second `PutMode::Create` writer is rejected by the backend's conditional
-//! write of the commit point, but `Overwrite`/`Update` writers and the
-//! garbage collector are only safe under the single-writer assumption.
+//! per-key metadata critical section and cache; separately built instances
+//! do not. Commits and deletes resolve the current document from that cache
+//! when it holds the key, which is the committed truth only while this
+//! instance is the sole writer. A second `PutMode::Create` writer is rejected
+//! by the backend's conditional write of the commit point, but
+//! `Overwrite`/`Update` writers and the garbage collector are only safe under
+//! the single-writer assumption.
 //!
 //! See `docs/anda_object_store.md` in the repository for the full design
 //! document.
@@ -98,8 +102,8 @@ pub use fault::{
 };
 
 use sidecar::{
-    ListingMetaPolicy, PublicationBaseline, SidecarMeta, SidecarStore, logical_last_modified,
-    new_commit_timestamp_ms,
+    PublicationBaseline, SidecarMeta, SidecarStore, head_result, logical_last_modified,
+    logical_object_meta, new_commit_timestamp_ms,
 };
 
 /// `MetaStore` is a wrapper around an `ObjectStore` implementation that adds metadata capabilities.
@@ -214,6 +218,19 @@ impl SidecarMeta for Metadata {
 }
 
 impl Metadata {
+    /// A new commit of `generation`; `committed_at_ms` is stamped right
+    /// before publication.
+    fn commit(size: u64, generation: String, committed_at_ms: Option<u64>) -> Self {
+        Self {
+            size,
+            e_tag: Some(commit_e_tag(&generation)),
+            original_tag: None,
+            original_version: None,
+            generation: Some(generation),
+            committed_at_ms,
+        }
+    }
+
     fn cache_weight(&self) -> usize {
         std::mem::size_of::<Self>()
             + [
@@ -317,6 +334,34 @@ impl<T: ObjectStore> MetaStore<T> {
     ) -> Result<usize> {
         self.inner.collect_garbage_with_options(options).await
     }
+
+    /// Serves one `get_opts` attempt against a resolved commit point.
+    async fn read_object(
+        &self,
+        location: &Path,
+        meta: Arc<Metadata>,
+        mut options: GetOptions,
+    ) -> Result<GetResult> {
+        let last_modified = logical_last_modified(meta.committed_at_ms, meta.generation.as_deref());
+        check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
+        if let Some(last_modified) = last_modified
+            && options.head
+            && options.range.is_none()
+        {
+            return Ok(head_result(logical_object_meta(
+                location,
+                &*meta,
+                last_modified,
+            )));
+        }
+
+        let payload_path = self
+            .inner
+            .payload_path(location, meta.generation.as_deref());
+        let mut res = self.inner.store.get_opts(&payload_path, options).await?;
+        res.meta = logical_object_meta(location, &*meta, res.meta.last_modified);
+        Ok(res)
+    }
 }
 
 #[async_trait]
@@ -351,14 +396,11 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
                         .put_new_generation(location, payload, opts)
                         .await?;
                     *in_flight_out = Some(in_flight);
-                    Ok(Metadata {
+                    Ok(Metadata::commit(
                         size,
-                        e_tag: Some(commit_e_tag(&generation)),
-                        original_tag: None,
-                        original_version: None,
-                        generation: Some(generation.clone()),
-                        committed_at_ms: Some(new_commit_timestamp_ms()),
-                    })
+                        generation,
+                        Some(new_commit_timestamp_ms()),
+                    ))
                 },
             )
             .await?;
@@ -375,10 +417,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         let extensions = opts.extensions.clone();
-        let (generation, flight) = self
-            .inner
-            .allocate_generation(location, extensions.clone())
-            .await?;
+        let (generation, flight) = self.inner.allocate_generation(location);
         let inner = self
             .inner
             .store
@@ -398,94 +437,27 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let mut retried = false;
-        loop {
-            let meta = self
-                .inner
-                .get_meta_with_extensions(location, options.extensions.clone())
-                .await?;
-            let mut options = options.clone();
-            let last_modified =
-                logical_last_modified(meta.committed_at_ms, meta.generation.as_deref());
-            check_get_preconditions(location, &mut options, meta.e_tag.as_deref(), last_modified)?;
-
-            let payload_path = self
-                .inner
-                .payload_path(location, meta.generation.as_deref());
-            match self
-                .inner
-                .store
-                .get_opts(&payload_path, options.clone())
-                .await
-            {
-                Ok(mut res) => {
-                    res.meta.location = location.clone();
-                    res.meta.e_tag = meta.e_tag.clone();
-                    // Report the logical object, not the payload object it
-                    // resolves to: the size comes from the commit point (the
-                    // payload's own length is whatever the backend holds),
-                    // and the timestamp from the generation pointer so
-                    // listings and reads agree.
-                    res.meta.size = meta.size;
-                    res.meta.last_modified = last_modified.unwrap_or(res.meta.last_modified);
-                    // Versions are not reported: replaced generations are
-                    // reclaimed eagerly, so version-addressed reads cannot be
-                    // honoured. Conditional updates use the logical e_tag,
-                    // which is unique per commit.
-                    res.meta.version = None;
-                    return Ok(res);
-                }
-                Err(Error::NotFound { source, .. }) => {
-                    // The cached pointer — generational or legacy — may be
-                    // stale after a concurrent overwrite: the generation was
-                    // replaced and reclaimed, or the legacy payload was
-                    // migrated away. Re-resolve once.
-                    if !retried {
-                        retried = true;
-                        self.inner
-                            .refresh_meta_with_extensions(location, options.extensions.clone())
-                            .await?;
-                        continue;
-                    }
-                    return Err(Error::NotFound {
-                        path: location.to_string(),
-                        source,
-                    });
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        let extensions = options.extensions.clone();
+        self.inner
+            .with_payload(location, extensions, |meta| {
+                self.read_object(location, meta, options.clone())
+            })
+            .await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut retried = false;
-        loop {
-            let meta = self.inner.get_meta(location).await?;
-            validate_ranges("MetaStore", ranges, meta.size)?;
-
-            let payload_path = self
-                .inner
-                .payload_path(location, meta.generation.as_deref());
-            match self.inner.store.get_ranges(&payload_path, ranges).await {
-                Ok(rt) => return Ok(rt),
-                Err(Error::NotFound { source, .. }) => {
-                    if !retried {
-                        retried = true;
-                        self.inner.refresh_meta(location).await?;
-                        continue;
-                    }
-                    return Err(Error::NotFound {
-                        path: location.to_string(),
-                        source,
-                    });
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        self.inner
+            .with_payload(location, Extensions::default(), |meta| async move {
+                validate_ranges("MetaStore", ranges, meta.size)?;
+                let payload_path = self
+                    .inner
+                    .payload_path(location, meta.generation.as_deref());
+                self.inner.store.get_ranges(&payload_path, ranges).await
+            })
+            .await
     }
 
     fn delete_stream(
@@ -496,9 +468,7 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner
-            .clone()
-            .list(prefix, ListingMetaPolicy::unchecked())
+        self.inner.clone().list(prefix)
     }
 
     fn list_with_offset(
@@ -506,15 +476,11 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner
-            .clone()
-            .list_with_offset(prefix, offset, ListingMetaPolicy::unchecked())
+        self.inner.clone().list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.inner
-            .list_with_delimiter(prefix, ListingMetaPolicy::unchecked())
-            .await
+        self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
@@ -529,49 +495,18 @@ impl<T: ObjectStore> ObjectStore for MetaStore<T> {
             .await?;
         self.inner
             .update_meta_with(to, create, extensions, async |_| {
-                Ok(Metadata {
-                    size: src.size,
-                    e_tag: Some(commit_e_tag(&generation)),
-                    original_tag: None,
-                    original_version: None,
-                    generation: Some(generation.clone()),
-                    committed_at_ms: Some(new_commit_timestamp_ms()),
-                })
+                Ok(Metadata::commit(
+                    src.size,
+                    generation,
+                    Some(new_commit_timestamp_ms()),
+                ))
             })
             .await?;
         Ok(())
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
-        if from == to {
-            // A self-rename must not be forwarded (copy + delete would
-            // destroy the object). Validate existence and target mode, then
-            // leave the object untouched.
-            return self.inner.check_self_rename(from, &options).await;
-        }
-
-        let mode = match options.target_mode {
-            RenameTargetMode::Overwrite => CopyMode::Overwrite,
-            RenameTargetMode::Create => CopyMode::Create,
-        };
-        let extensions = options.extensions.clone();
-        self.copy_opts(
-            from,
-            to,
-            CopyOptions {
-                mode,
-                extensions: options.extensions,
-            },
-        )
-        .await?;
-        match self
-            .inner
-            .delete_object_with_extensions(from, extensions)
-            .await
-        {
-            Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
-            Err(err) => Err(err),
-        }
+        self.inner.rename(self, from, to, options).await
     }
 }
 
@@ -626,14 +561,7 @@ impl<T: ObjectStore> MultipartUpload for MetaStoreUploader<T> {
         if self.lifecycle.phase == Phase::Receiving {
             let attempt = self.lifecycle.finalizing()?;
             self.inner.complete().await?;
-            self.prepared = Some(Metadata {
-                size: self.size,
-                e_tag: Some(commit_e_tag(&self.generation)),
-                original_tag: None,
-                original_version: None,
-                generation: Some(self.generation.clone()),
-                committed_at_ms: None,
-            });
+            self.prepared = Some(Metadata::commit(self.size, self.generation.clone(), None));
             attempt.materialized();
         }
         self.lifecycle.ready()?;

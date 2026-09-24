@@ -1481,8 +1481,9 @@ async fn authenticated_metadata_is_verified_once_per_cached_context() {
         .put(&path, Bytes::from(vec![1; 8192]).into())
         .await
         .unwrap();
-    let validations = store.validation.authentications.load(Ordering::Relaxed);
-    assert_eq!(validations, 1);
+    // Sealing certifies the document, so its own commit re-verifies nothing.
+    let validations = store.crypto.authentications.load(Ordering::Relaxed);
+    assert_eq!(validations, 0);
     for _ in 0..10 {
         store.head(&path).await.unwrap();
         store.get_range(&path, 3..4).await.unwrap();
@@ -1490,7 +1491,7 @@ async fn authenticated_metadata_is_verified_once_per_cached_context() {
     }
     store.clone().head(&path).await.unwrap();
     assert_eq!(
-        store.validation.authentications.load(Ordering::Relaxed),
+        store.crypto.authentications.load(Ordering::Relaxed),
         validations
     );
 

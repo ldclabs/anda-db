@@ -2,7 +2,40 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs
+## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs, anda_object_store
+
+- anda_object_store: a read that raced a delete of its key, or any failed
+  metadata refresh, cleared the whole metadata cache. The deleted key is now
+  evicted alone and other refresh errors leave the cache untouched. A metadata
+  put or delete that fails after reaching the backend likewise evicts only its
+  key; only a cancelled commit still clears the cache.
+- **Behavior change (anda_object_store):** puts, copies and deletes of a key
+  held in the metadata cache take its commit point from the cache instead of
+  re-reading it from the backend (one metadata GET less per write). Every
+  in-process commit updates the cache inside the same per-key section, so the
+  entry is the committed truth under the existing single-writer contract; a
+  separately built instance writing the same keys was already unsupported and
+  is now also invisible to `PutMode::Update` checks until its entry expires.
+- **Behavior change (anda_object_store):** HEAD requests (`get_opts` with
+  `head` and no range) are answered from the commit point without a payload
+  request, once the logical timestamp is known. They no longer detect a
+  payload missing behind a valid commit point and return no backend
+  attributes; pre-0.10 documents still consult the legacy payload.
+- anda_object_store: payload generations are written, copied and uploaded with
+  one overwrite request. The existence probe before each multipart upload,
+  the eight-attempt collision retries and the HEAD before overwrite-mode
+  fallbacks (every copy/rename on S3 without `copy_if_not_exists`) are gone;
+  the 128-bit random generation ID makes a collision negligible.
+- anda_object_store: encrypted reads of chunk-aligned spans up to 1 MiB use one
+  body read and decrypt in place instead of streaming 8 KiB file blocks, and
+  `get_ranges` decrypts uniquely owned responses without a copy. Local-disk
+  reads of 64 KiB / 1 MiB go from 263 / 1,866 µs to 127 / 718 µs, a cached HEAD
+  from 56 to 0.9 µs, and a local MetaStore put from 763 to 398 µs.
+- anda_object_store: sealing certifies the new metadata, so a commit no longer
+  authenticates its own document a second time; validation drops a redundant
+  full CBOR size walk. The four read paths share one resolve-and-retry helper,
+  the two `rename_opts` share one implementation, and `EncryptedStore` keeps
+  its key and chunk policy in one place.
 
 - anda_db_tfs: fix boolean queries that put a parenthesized group next to
   other words. `(a AND b) c` parsed as `a AND (b OR c)`, and in

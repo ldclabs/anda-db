@@ -47,6 +47,33 @@ pub(super) fn decrypt_chunk(
         })
 }
 
+/// Decrypts a contiguous run of whole chunks starting at chunk `first`, in
+/// place when the backend handed over a uniquely owned buffer.
+pub(super) fn decrypt_span(
+    cipher: &Aes256Gcm,
+    meta: &Metadata,
+    chunk_size: u64,
+    first: u64,
+    data: Bytes,
+    location: &Path,
+) -> Result<Bytes> {
+    let mut plaintext = Vec::from(data);
+    for (i, chunk) in plaintext.chunks_mut(chunk_size as usize).enumerate() {
+        decrypt_chunk(cipher, meta, chunk_size, first + i as u64, chunk, location)?;
+    }
+    Ok(Bytes::from(plaintext))
+}
+
+/// Returns `range` of `bytes`, copied out when it is less than half of the
+/// buffer so a small result does not pin a large allocation.
+pub(super) fn retain(bytes: &Bytes, range: Range<usize>) -> Bytes {
+    if range.len() >= bytes.len().div_ceil(2) {
+        bytes.slice(range)
+    } else {
+        Bytes::copy_from_slice(&bytes[range])
+    }
+}
+
 struct Fragment {
     index: usize,
     range: Range<u64>,
@@ -117,18 +144,14 @@ pub(super) async fn read_ranges<T: ObjectStore>(
                 "truncated encrypted data in range response",
             ));
         }
-        let mut plaintext = data.to_vec();
-        for (i, data) in plaintext.chunks_mut(chunk_size as usize).enumerate() {
-            decrypt_chunk(
-                cipher,
-                meta,
-                chunk_size,
-                request.span.start / chunk_size + i as u64,
-                data,
-                location,
-            )?;
-        }
-        let plaintext = Bytes::from(plaintext);
+        let plaintext = decrypt_span(
+            cipher,
+            meta,
+            chunk_size,
+            request.span.start / chunk_size,
+            data,
+            location,
+        )?;
         Ok::<_, Error>(
             request
                 .fragments
@@ -136,12 +159,11 @@ pub(super) async fn read_ranges<T: ObjectStore>(
                 .map(|fragment| {
                     let start = (fragment.range.start - request.span.start) as usize;
                     let end = (fragment.range.end - request.span.start) as usize;
-                    let bytes = if end - start >= plaintext.len().div_ceil(2) {
-                        plaintext.slice(start..end)
-                    } else {
-                        Bytes::copy_from_slice(&plaintext[start..end])
-                    };
-                    (fragment.index, fragment.range.start, bytes)
+                    (
+                        fragment.index,
+                        fragment.range.start,
+                        retain(&plaintext, start..end),
+                    )
                 })
                 .collect::<Vec<_>>(),
         )

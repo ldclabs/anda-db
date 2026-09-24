@@ -54,13 +54,21 @@ async fn committed_e_tag<T: ObjectStore>(
     location: &Path,
     _payload: &[u8],
 ) -> String {
-    let meta = storage.inner.get_meta(location).await.unwrap();
+    let meta = storage
+        .inner
+        .get_meta(location, Extensions::default())
+        .await
+        .unwrap();
     commit_e_tag(meta.generation.as_deref().unwrap())
 }
 
 /// Resolves the full backend path of `location`'s current payload.
 async fn payload_backend_path<T: ObjectStore>(storage: &MetaStore<T>, location: &Path) -> Path {
-    let meta = storage.inner.get_meta(location).await.unwrap();
+    let meta = storage
+        .inner
+        .get_meta(location, Extensions::default())
+        .await
+        .unwrap();
     storage
         .inner
         .payload_path(location, meta.generation.as_deref())
@@ -1583,7 +1591,11 @@ async fn legacy_layout_readable_and_upgraded_on_overwrite() {
         .put(&location, Bytes::from_static(b"upgraded").into())
         .await
         .unwrap();
-    let meta = storage.inner.get_meta(&location).await.unwrap();
+    let meta = storage
+        .inner
+        .get_meta(&location, Extensions::default())
+        .await
+        .unwrap();
     assert!(meta.generation.is_some());
     let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
     assert_eq!(bytes, Bytes::from_static(b"upgraded"));
@@ -1850,4 +1862,57 @@ async fn local_file_legacy_layout_upgrade() {
     let bytes = storage.get(&location).await.unwrap().bytes().await.unwrap();
     assert_eq!(bytes, Bytes::from_static(b"upgraded"));
     assert_eq!(storage.collect_garbage().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn failed_refresh_and_commit_evict_only_their_key() {
+    let inner = InMemory::new();
+    let (fault, handle) = crate::FaultStore::wrap(inner.clone());
+    let storage = MetaStoreBuilder::new(fault, 100).build();
+    let (a, b, c) = (
+        Path::from("evict/a"),
+        Path::from("evict/b"),
+        Path::from("evict/c"),
+    );
+    for path in [&a, &b, &c] {
+        storage
+            .put(path, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+    }
+
+    // A reader still holding a's pointer after the key was deleted: the
+    // payload and the refreshed commit point are both gone.
+    let meta = storage
+        .inner
+        .get_meta(&a, Extensions::default())
+        .await
+        .unwrap();
+    inner.delete(&storage.inner.meta_path(&a)).await.unwrap();
+    inner
+        .delete(&storage.inner.payload_path(&a, meta.generation.as_deref()))
+        .await
+        .unwrap();
+    assert!(matches!(storage.get(&a).await, Err(Error::NotFound { .. })));
+    assert!(!storage.inner.meta_cache.contains_key(&a));
+    assert!(storage.inner.meta_cache.contains_key(&b));
+
+    // A commit whose acknowledgement is lost has an unknown outcome.
+    handle.push_rule(crate::FaultRule {
+        op: crate::FaultOp::Put,
+        path_contains: Some("meta/evict/b".into()),
+        skip: 0,
+        times: 1,
+        kind: crate::FaultKind::ErrorAfter,
+    });
+    assert!(
+        storage
+            .put(&b, Bytes::from_static(b"v2").into())
+            .await
+            .is_err()
+    );
+    assert!(!storage.inner.meta_cache.contains_key(&b));
+    assert!(storage.inner.meta_cache.contains_key(&c));
+    let bytes = storage.get(&b).await.unwrap().bytes().await.unwrap();
+    assert_eq!(bytes, Bytes::from_static(b"v2"));
 }

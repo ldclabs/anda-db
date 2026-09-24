@@ -132,6 +132,57 @@ fn main() {
             },
         );
     }
+    // Local-disk encrypted reads: the file backend streams in small blocks.
+    let dir = tempfile::tempdir().unwrap();
+    let local = EncryptedStoreBuilder::with_secret(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+        100,
+        [0; 32],
+    )
+    .build();
+    for size in [64 * 1024, 1024 * 1024] {
+        let local_path = Path::from(format!("benchmark/local/{size}"));
+        runtime
+            .block_on(local.put(&local_path, vec![7; size].into()))
+            .unwrap();
+        support::measure(
+            &format!("encrypted/local/read/{size}"),
+            || {},
+            || {
+                runtime.block_on(async {
+                    black_box(local.get(&local_path).await.unwrap().bytes().await.unwrap());
+                });
+            },
+        );
+        support::measure(
+            &format!("encrypted/local/ranges/{size}"),
+            || {},
+            || {
+                black_box(
+                    runtime
+                        .block_on(local.get_ranges(&local_path, &[0..10, 20_000..30_000]))
+                        .unwrap(),
+                );
+            },
+        );
+        support::measure(
+            &format!("encrypted/local/head/{size}"),
+            || {},
+            || {
+                black_box(runtime.block_on(local.head(&local_path)).unwrap());
+            },
+        );
+    }
+    let local_path = Path::from("benchmark/local/overwrite");
+    support::measure(
+        "encrypted/local/overwrite",
+        || {},
+        || {
+            runtime
+                .block_on(local.put(&local_path, Bytes::from_static(b"small value").into()))
+                .unwrap();
+        },
+    );
     let backend = InMemory::new();
     let collector = MetaStoreBuilder::new(backend.clone(), 1000).build();
     runtime.block_on(async {

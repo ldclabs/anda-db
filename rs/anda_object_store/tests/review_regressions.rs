@@ -23,8 +23,6 @@ struct Controls {
     part_sizes: Mutex<Vec<usize>>,
     requests: Mutex<Vec<(String, Option<Marker>)>>,
     strict_parts: AtomicBool,
-    collide_next_generation: AtomicBool,
-    collisions: Mutex<Vec<Path>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,19 +124,6 @@ fn injected() -> Error {
 impl ObjectStore for ProbeStore {
     async fn put_opts(&self, p: &Path, payload: PutPayload, opts: PutOptions) -> Result<PutResult> {
         self.controls.request("put", p, &opts.extensions);
-        if p.as_ref().starts_with("gen/")
-            && matches!(opts.mode, PutMode::Create)
-            && self
-                .controls
-                .collide_next_generation
-                .swap(false, Ordering::SeqCst)
-        {
-            self.inner
-                .put(p, Bytes::from_static(b"reserved elsewhere").into())
-                .await?;
-            self.controls.collisions.lock().unwrap().push(p.clone());
-        }
-
         let mut result = self.inner.put_opts(p, payload, opts).await?;
         result.extensions.insert(Reply("put"));
         if p.as_ref().starts_with("meta/")
@@ -173,18 +158,6 @@ impl ObjectStore for ProbeStore {
     }
     async fn get_opts(&self, p: &Path, opts: GetOptions) -> Result<GetResult> {
         self.controls.request("get", p, &opts.extensions);
-        if p.as_ref().starts_with("gen/")
-            && opts.head
-            && self
-                .controls
-                .collide_next_generation
-                .swap(false, Ordering::SeqCst)
-        {
-            self.inner
-                .put(p, Bytes::from_static(b"reserved elsewhere").into())
-                .await?;
-            self.controls.collisions.lock().unwrap().push(p.clone());
-        }
         if p.as_ref().starts_with("gen/") {
             self.controls.payload_gets.fetch_add(1, Ordering::SeqCst);
         }
@@ -208,18 +181,6 @@ impl ObjectStore for ProbeStore {
     }
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
         self.controls.request("copy", to, &opts.extensions);
-        if to.as_ref().starts_with("gen/")
-            && matches!(opts.mode, CopyMode::Create)
-            && self
-                .controls
-                .collide_next_generation
-                .swap(false, Ordering::SeqCst)
-        {
-            self.inner
-                .put(to, Bytes::from_static(b"reserved elsewhere").into())
-                .await?;
-            self.controls.collisions.lock().unwrap().push(to.clone());
-        }
         self.inner.copy_opts(from, to, opts).await
     }
 }
@@ -1336,94 +1297,15 @@ async fn large_ranges_cross_transport_and_crypto_boundaries() {
 }
 
 #[tokio::test]
-async fn generation_collisions_never_overwrite_existing_paths() {
-    for encrypted in [false, true] {
-        let backend = InMemory::new();
-        let controls = Arc::new(Controls::default());
-        let probe = ProbeStore {
-            inner: backend.clone(),
-            controls: controls.clone(),
-        };
-        let store: Box<dyn ObjectStore> = if encrypted {
-            Box::new(EncryptedStoreBuilder::with_secret(probe, 100, [0; 32]).build())
-        } else {
-            Box::new(MetaStoreBuilder::new(probe, 100).build())
-        };
-        let path = Path::from("collisions");
-        store
-            .put(&path, Bytes::from_static(b"old").into())
-            .await
-            .unwrap();
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
-        store
-            .put(&path, Bytes::from_static(b"new").into())
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .get(&path)
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .as_ref(),
-            b"new"
-        );
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
-        store
-            .copy(&path, &Path::from("copy-collision"))
-            .await
-            .unwrap();
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
-        let mut upload = store.put_multipart(&path).await.unwrap();
-        upload
-            .put_part(Bytes::from_static(b"uploaded").into())
-            .await
-            .unwrap();
-        upload.complete().await.unwrap();
-        let paths = controls.collisions.lock().unwrap().clone();
-        assert_eq!(paths.len(), 3);
-        for path in paths {
-            assert_eq!(
-                backend
-                    .get(&path)
-                    .await
-                    .unwrap()
-                    .bytes()
-                    .await
-                    .unwrap()
-                    .as_ref(),
-                b"reserved elsewhere"
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn overwrite_only_backends_support_regular_copy_and_multipart_writes() {
     for encrypted in [false, true] {
-        let raw_backend = InMemory::new();
-        let controls = Arc::new(Controls::default());
-        let backend = OverwriteOnlyStore(ProbeStore {
-            inner: raw_backend.clone(),
-            controls: controls.clone(),
-        });
+        let backend = OverwriteOnlyStore(InMemory::new());
         let store: Box<dyn ObjectStore> = if encrypted {
             Box::new(EncryptedStoreBuilder::with_secret(backend, 100, [0; 32]).build())
         } else {
             Box::new(MetaStoreBuilder::new(backend, 100).build())
         };
         let path = Path::from("overwrite-only");
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
         let first = store
             .put(&path, Bytes::from_static(b"first").into())
             .await
@@ -1442,9 +1324,6 @@ async fn overwrite_only_backends_support_regular_copy_and_multipart_writes() {
             .unwrap();
 
         let copied = Path::from("overwrite-copy");
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
         store.copy(&path, &copied).await.unwrap();
         assert_eq!(
             store.get(&copied).await.unwrap().bytes().await.unwrap(),
@@ -1452,9 +1331,6 @@ async fn overwrite_only_backends_support_regular_copy_and_multipart_writes() {
         );
 
         let multipart = Path::from("overwrite-multipart");
-        controls
-            .collide_next_generation
-            .store(true, Ordering::SeqCst);
         let mut upload = store.put_multipart(&multipart).await.unwrap();
         upload
             .put_part(Bytes::from_static(b"multipart").into())
@@ -1465,14 +1341,6 @@ async fn overwrite_only_backends_support_regular_copy_and_multipart_writes() {
             store.get(&multipart).await.unwrap().bytes().await.unwrap(),
             Bytes::from_static(b"multipart")
         );
-        let paths = controls.collisions.lock().unwrap().clone();
-        assert_eq!(paths.len(), 3);
-        for path in paths {
-            assert_eq!(
-                raw_backend.get(&path).await.unwrap().bytes().await.unwrap(),
-                Bytes::from_static(b"reserved elsewhere")
-            );
-        }
     }
 }
 
@@ -2031,5 +1899,46 @@ async fn listing_cannot_cache_a_pointer_after_its_replacement() {
         let latest = listing_variant(store.as_ref(), 0).await;
         assert_eq!(latest[0].e_tag, committed.e_tag);
         assert_eq!(latest[0].size, 9);
+    }
+}
+
+#[tokio::test]
+async fn cached_commits_deletes_and_heads_skip_metadata_reads() {
+    for encrypted in [false, true] {
+        let controls = Arc::new(Controls::default());
+        let backend = ProbeStore {
+            inner: InMemory::new(),
+            controls: controls.clone(),
+        };
+        let store = wrapped_store(backend, encrypted, 100);
+        let path = Path::from("hot");
+        store
+            .put(&path, Bytes::from_static(b"v1").into())
+            .await
+            .unwrap();
+        controls.requests.lock().unwrap().clear();
+
+        // The cached commit point is the committed truth for this writer.
+        store
+            .put(&path, Bytes::from_static(b"v2").into())
+            .await
+            .unwrap();
+        assert_eq!(store.head(&path).await.unwrap().size, 2);
+        store.delete(&path).await.unwrap();
+        let requests: Vec<_> = controls
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(op, _)| op.clone())
+            .collect();
+        assert!(
+            requests.iter().all(|op| !op.starts_with("get:")),
+            "{requests:?}"
+        );
+        assert!(matches!(
+            store.head(&path).await,
+            Err(Error::NotFound { .. })
+        ));
     }
 }

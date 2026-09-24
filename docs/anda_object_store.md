@@ -15,18 +15,16 @@ data/<key>             legacy payload for metadata without a generation
 ```
 
 A normal put writes a new generation, publishes its metadata, then removes the
-replaced payload best-effort. Generation writes prefer `PutMode::Create` and
-retry a collision with another ID, up to eight attempts. If a backend explicitly
-reports conditional create as unsupported, generation payloads use overwrite
-mode instead; their strong IDs and the single-writer contract make collision
-with an unseen path negligible.
+replaced payload best-effort. Every generation path is fresh, so payload puts,
+copies and multipart uploads write it in overwrite mode with a single request:
+no existence probe, no conditional create and no collision retry. The 128-bit
+random salt plus the process sequence below make a collision negligible, and
+the single-writer contract rules out a foreign writer on the same key.
 
-Multipart allocates and registers a fresh ID, verifies that no payload already
-uses it, then starts the backend upload directly. It does not persist an empty
-reservation object, so abort and setup failure cannot leak placeholders or add
-an extra version. Copy likewise prefers `CopyMode::Create`, retries collisions,
-and uses overwrite mode only when conditional copy-create is unsupported.
-Metadata remains the logical commit point in every case.
+Multipart allocates and registers a fresh ID, then starts the backend upload
+directly. It does not persist an empty reservation object, so abort and setup
+failure cannot leak placeholders or add an extra version. Metadata remains the
+logical commit point in every case.
 
 New generation IDs contain a 16-digit hexadecimal millisecond timestamp, a
 32-digit random salt (128 bits), and a 16-digit process-wide monotonic sequence.
@@ -37,16 +35,26 @@ require hexadecimal characters and a single path component.
 
 A failure before metadata publication leaves the previous committed object
 readable. A failure after publication may mean the new write took effect even
-though the caller received an error. When a metadata put or delete has an
-unknown outcome, or its future is cancelled, a synchronous drop guard invalidates
-the shared metadata cache. The next lookup reloads the backend's committed state.
-This deliberately makes the whole cache cold on rare uncertain outcomes; normal
-successful operations update only their own key.
+though the caller received an error. When a metadata put or delete returns an
+error after reaching the backend, that key is evicted from the shared metadata
+cache and the next lookup reloads the backend's committed state. If the future
+is cancelled instead, a synchronous drop guard cannot run the async per-key
+eviction, so it invalidates the whole cache. Successful operations update only
+their own key.
 
 Readers resolve a commit point and read its immutable payload. If that payload
 has been replaced and reclaimed, `get`, range reads and copy refresh metadata and
-retry once on `NotFound`. This is not a general network retry policy. Older
-payloads are reclaimed, so historical version addressing is unavailable.
+retry once on `NotFound`; a key deleted meanwhile is evicted and reported as
+`NotFound`, and other refresh failures leave the cache untouched. This is not a
+general network retry policy. Older payloads are reclaimed, so historical
+version addressing is unavailable.
+
+A HEAD request (`get_opts` with `head` and no range) is answered from the commit
+point alone, without a payload request, once its logical timestamp is known.
+It therefore does not prove that the payload is still present and returns no
+backend attributes; like listings, it reports the logical object, which exists
+iff its commit point does. Pre-0.10 documents still consult the legacy payload,
+whose backend timestamp they report.
 
 ## Concurrency and conditional operations
 
@@ -56,22 +64,25 @@ Separately built wrappers do not automatically share this coordination, even if
 they are in the same process.
 
 Use one coordinated writer per logical store. Within a shared wrapper instance,
-mutations of the same key are serialized. Across independent instances,
+mutations of the same key are serialized, and every commit, reload and eviction
+of a key happens inside its per-key section. A cached commit point is therefore
+the committed truth for that instance: puts, copies and deletes resolve the
+current document from the cache when it holds the key and read the backend only
+on a miss or an entry that no longer validates. Across independent instances,
 `PutMode::Create` on an absent commit point is arbitrated by the backend's
 conditional metadata put. Cross-instance `Overwrite`, `Update` and GC require
 external single-writer coordination.
 
-The compatibility fallback for generation payloads does not emulate a backend
-conditional write. A backend without conditional metadata puts therefore cannot
-provide cross-instance logical `Create`; use external coordination when that
-operation is required.
+The wrappers do not emulate a backend conditional write. A backend without
+conditional metadata puts therefore cannot provide cross-instance logical
+`Create`; use external coordination when that operation is required.
 
 - `Create` never replaces an existing commit point, even if its metadata cannot
   be decoded or validated. A wrong encryption key or changed resource limits
   must not turn an existing object into an absent one. Explicit `Overwrite` may
   rebuild invalid metadata; its untrusted pointer is never followed for cleanup.
-- `Update` requires the current logical ETag, freshly checked against the
-  backend inside the per-key section. Invalid or absent metadata cannot satisfy
+- `Update` requires the current logical ETag, checked against the committed
+  document inside the per-key section. Invalid or absent metadata cannot satisfy
   it. `UpdateVersion::version` is rejected.
 - `if_match`, `if_none_match`, and date conditions are evaluated against the
   logical object. ETag conditions take precedence over their corresponding date
@@ -159,13 +170,18 @@ New chunk AAD binds the chunk size and index with domain separation. The fixed
 chunk tag has been verified. A malformed/truncated chunk fails the read.
 
 `get_opts(range)` expands to whole crypto chunks and trims the verified
-plaintext. The decryption stream copies bounded batches (at most 64 KiB or one
-crypto chunk, whichever is larger) out of each upstream buffer; retaining a small output chunk does not pin an entire large
-plaintext allocation. The upstream backend may still retain its own buffer.
+plaintext. A chunk-aligned span of at most 1 MiB is read with one body read and
+decrypted in place (without a copy when the backend hands over a uniquely owned
+buffer, as local files do); file backends would otherwise stream it in 8 KiB
+blocks, each read on the blocking pool. Larger spans stream through the
+decryption stream, which copies bounded batches (at most 64 KiB or one crypto
+chunk, whichever is larger) out of each upstream buffer into a preallocated
+batch buffer. The upstream backend may still retain its own buffer.
 After range trimming, a result smaller than half its plaintext allocation is
 copied into an independent buffer. Retaining a one-byte range therefore does not
 retain a whole crypto chunk; full streaming batches keep their zero-copy handoff.
-HEAD and empty-object reads do not decrypt a body.
+HEAD and empty-object reads do not decrypt a body. `get_ranges` likewise
+decrypts each range response in place when its buffer is uniquely owned.
 
 `get_ranges` plans all requested ranges together, deduplicates overlapping
 chunks, and coalesces adjacent spans without filling holes. Requests are bounded
@@ -406,3 +422,28 @@ three metadata GETs for two listings plus a head over three cached keys, versus
 seven with caching disabled. Conditional-copy rejection leaves only the original
 target generation. Successful conditional copies pay one extra metadata HEAD to
 avoid unnecessary payload copies when the target already exists.
+
+### Review-fix measurements (2026-09-24)
+
+Compared `46e3798` with these changes on macOS arm64, Rust 1.98.1, both with
+`CARGO_PROFILE_BENCH_LTO=false CARGO_PROFILE_BENCH_OPT_LEVEL=3` and the same
+extended benchmark (the local-disk encrypted cases were added in this change).
+Two alternating before/after runs; times are the median of the two per-run
+medians. Microsecond-scale InMemory cases varied by up to 2× between runs and
+showed no difference beyond that noise.
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| Encrypted local read, 64 KiB (µs) | 263.17 | 126.50 |
+| Encrypted local read, 1 MiB (µs) | 1,865.71 | 718.48 |
+| Same 1 MiB read: allocated bytes | 4,200,891 | 1,055,158 |
+| Encrypted local `get_ranges`, 64 KiB object (µs) | 152.23 | 106.71 |
+| Encrypted local HEAD, cached (µs) | 56.23 | 0.88 |
+| Encrypted local overwrite of a cached key (µs) | 828.29 | 483.54 |
+| MetaStore local put, fsync off (µs) | 763.17 | 397.98 |
+| MetaStore local put, fsync on (µs) | 33,091.96 | 19,441.31 |
+
+Spans up to 1 MiB are read with one body read instead of 8 KiB blocks, and
+decrypted in the buffer the file backend returns. Commits of cached keys skip
+the metadata GET, payload writes skip conditional creation, and HEAD skips the
+payload request.
