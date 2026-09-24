@@ -122,19 +122,29 @@ pub fn parse_kip(input: &str) -> Result<Command, KipError> {
 /// operation.ast = Some(injected);
 /// assert!(operation.parse().is_err());
 /// ```
-pub(crate) fn validate_command(command: &Command) -> Result<(), KipError> {
-    crate::validate_json(
-        &serde_json::to_value(command).map_err(|e| KipError::invalid_syntax(e.to_string()))?,
-    )?;
-    validate_shape(command)
-}
-
-fn validate_shape(command: &Command) -> Result<(), KipError> {
+///
+/// The numbers in a transported tree are checked separately, by
+/// [`validate_ast_numbers`]: an operation checks them once in
+/// [`Operation::validate`](crate::Operation::validate), and this gate then
+/// judges only the shape.
+pub(crate) fn validate_shape(command: &Command) -> Result<(), KipError> {
     match command {
         Command::Kql(query) => validate_query(query),
         Command::Kml(statement) => validate_statement(statement),
         Command::Meta(meta) => validate_meta_command(meta),
     }
+}
+
+/// Holds a transported tree's numbers to the portable profile (§9.3).
+///
+/// Text never needs this — the lexer admits only portable numbers — but a tree
+/// decoded from JSON by an ordinary deserializer can carry any `f64` or `u64`.
+/// It is the one check that needs the tree as JSON, so it serializes once.
+pub(crate) fn validate_ast_numbers(command: &Command) -> Result<(), KipError> {
+    crate::validate_json(
+        &serde_json::to_value(command)
+            .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?,
+    )
 }
 
 /// Every schema-independent rule a KQL query must satisfy.
@@ -448,7 +458,7 @@ mod tests {
     /// so a narrow entry point is `parse_kip` restricted rather than a laxer
     /// parser. The gate's *unreachable-from-text* half — the empty `FIND`
     /// projection and the unbounded `EXPORT` — is asserted through
-    /// `validate_command` in
+    /// `validate_shape` in
     /// `the_ast_channel_is_held_to_the_same_rules_as_the_text_channel`,
     /// because no command text can reach either rule: the grammar refuses
     /// both first.
@@ -503,7 +513,7 @@ mod tests {
                 "for_time":null,"epistemic":null,"order_by":null,"limit":null,"cursor":null}}"#,
         )
         .unwrap();
-        assert!(validate_command(&empty_projection).is_err());
+        assert!(validate_shape(&empty_projection).is_err());
 
         // And so must a Core registry violation, on every surface.
         let bad_search: Command = serde_json::from_str(
@@ -513,7 +523,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            validate_command(&bad_search).unwrap_err().code,
+            validate_shape(&bad_search).unwrap_err().code,
             crate::error::KipErrorCode::ConstraintViolation
         );
 
@@ -526,7 +536,7 @@ mod tests {
                 "options":null,"as_of":null}}}"#,
         )
         .unwrap();
-        let err = validate_command(&unbounded_export).expect_err("unbounded export");
+        let err = validate_shape(&unbounded_export).expect_err("unbounded export");
         assert!(err.message.contains("selection pattern"), "{}", err.message);
     }
 

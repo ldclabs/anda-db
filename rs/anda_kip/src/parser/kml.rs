@@ -19,9 +19,9 @@ use nom::{
 use std::collections::BTreeSet;
 
 use super::common::{
-    Flavor, VResult, assignments, bound_object, braced, collect_bound_object_handles,
+    Flavor, KeyFault, VResult, assignments, bound_object, braced, collect_bound_object_handles,
     collect_mutation_value_handles, collect_mutation_value_paths, collect_where_variables,
-    element_ref, fail, handle, mutation_value, object_matcher, opt_after, parenthesized,
+    element_ref, fail, handle, key_fault, mutation_value, object_matcher, opt_after, parenthesized,
     proposition_matcher, quoted_string, scalar, spanned, symbol_ref, unset_field_set, where_block,
     word, words, ws,
 };
@@ -596,7 +596,7 @@ fn ensure_proposition(input: &str) -> VResult<'_, EnsureProposition> {
     let (input, _) = ws(words(&["ENSURE", "PROPOSITION"])).parse(input)?;
     let (input, handle) = opt(ws(handle)).parse(input)?;
     let (tuple_at, matcher) = cut(ws(|i| proposition_matcher(i, Flavor::Exact))).parse(input)?;
-    let triple = match structural_tuple(matcher, input) {
+    let triple = match creatable_tuple(matcher) {
         Ok(triple) => triple,
         Err(ctx) => return fail(input, ctx),
     };
@@ -619,10 +619,7 @@ fn ensure_proposition(input: &str) -> VResult<'_, EnsureProposition> {
 /// `(id: ...)` is match-only: it names a Proposition that must already exist, so
 /// it cannot drive `ENSURE PROPOSITION` — or the `ASSERT` sugar that desugars
 /// through it — whose job is to create the tuple when it is absent.
-fn structural_tuple(
-    matcher: PropositionMatcher,
-    _at: &str,
-) -> Result<(Term, PredAtom, Term), &'static str> {
+fn creatable_tuple(matcher: PropositionMatcher) -> Result<(Term, PredAtom, Term), &'static str> {
     let triple: PropositionTriple = match matcher {
         PropositionMatcher::Id(_) => {
             return Err(
@@ -656,7 +653,7 @@ fn assert_statement(input: &str) -> VResult<'_, ClauseGroup> {
     let (input, _) = ws(word("ASSERT")).parse(input)?;
     let (input, written_handle) = opt(ws(handle)).parse(input)?;
     let (members_at, matcher) = cut(ws(|i| proposition_matcher(i, Flavor::Exact))).parse(input)?;
-    let triple = match structural_tuple(matcher, input) {
+    let triple = match creatable_tuple(matcher) {
         Ok(triple) => triple,
         Err(ctx) => return fail(input, ctx),
     };
@@ -806,6 +803,20 @@ fn evidence_refs(value: MutationValue) -> Vec<MutationValue> {
 // UPDATE and the lifecycle family
 // ---------------------------------------------------------------------------
 
+/// A statement's selection block, the bound on its match set and its guards.
+type Selection = (Option<Vec<WhereClause>>, Option<Scalar>, Vec<ExpectVersion>);
+
+/// `[WHERE {...}] [LIMIT n] {EXPECT VERSION ...}` — how every mutation that can
+/// select by pattern ends: the selection, then its bound (§52.7), then the
+/// guards, last (§52.8).
+fn selection(input: &str) -> VResult<'_, Selection> {
+    let (input, where_clauses) =
+        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
+    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
+    let (input, expect_versions) = expect_version_clauses(input)?;
+    Ok((input, (where_clauses, limit, expect_versions)))
+}
+
 fn update_statement(input: &str) -> VResult<'_, UpdateStatement> {
     let (input, _) = ws(word("UPDATE")).parse(input)?;
     let (start, target) = cut(ws(element_ref)).parse(input)?;
@@ -823,10 +834,7 @@ fn update_statement(input: &str) -> VResult<'_, UpdateStatement> {
         }
         return fail(start, "at least one SET or UNSET action");
     }
-    let (rest, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(rest)?;
-    let (rest, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(rest)?;
-    let (rest, expect_versions) = expect_version_clauses(rest)?;
+    let (rest, (where_clauses, limit, expect_versions)) = selection(rest)?;
 
     let statement = UpdateStatement {
         target,
@@ -1013,30 +1021,38 @@ fn transition_statement(input: &str) -> VResult<'_, Transition> {
     let (start, to) = cut(ws(scalar)).parse(input)?;
     let (rest, by) = opt_after(&["BY"], ws(element_ref)).parse(start)?;
 
+    /// What a transition may finalize in the same statement.
+    enum Finalize {
+        Fields(Assignments),
+        Structural(Vec<StructuralEdge>),
+    }
     let (rest, finalize) = many0(ws(spanned(alt((
         map(
             preceded(ws(words(&["SET", "FIELDS"])), cut(ws(assignments))),
-            |a| (true, Some(a), None),
+            Finalize::Fields,
         ),
         map(
             preceded(ws(words(&["SET", "STRUCTURAL"])), cut(structural_edges)),
-            |edges| (false, None, Some(edges)),
+            Finalize::Structural,
         ),
     )))))
     .parse(rest)?;
 
     let mut set_fields = None;
     let mut set_structural = None;
-    for (position, (is_fields, fields, structural)) in finalize {
-        if is_fields {
-            if set_fields.replace(fields.expect("SET FIELDS")).is_some() {
-                return fail(position, "at most one SET FIELDS clause");
-            }
-        } else if set_structural
-            .replace(structural.expect("SET STRUCTURAL"))
-            .is_some()
-        {
-            return fail(position, "at most one SET STRUCTURAL clause");
+    for (position, clause) in finalize {
+        let repeated = match clause {
+            Finalize::Fields(fields) => set_fields
+                .replace(fields)
+                .is_some()
+                .then_some("at most one SET FIELDS clause"),
+            Finalize::Structural(edges) => set_structural
+                .replace(edges)
+                .is_some()
+                .then_some("at most one SET STRUCTURAL clause"),
+        };
+        if let Some(expected) = repeated {
+            return fail(position, expected);
         }
     }
 
@@ -1047,10 +1063,7 @@ fn transition_statement(input: &str) -> VResult<'_, Transition> {
              InvalidLifecycleTransition from the wrong one; guard the version instead",
         );
     }
-    let (rest, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(rest)?;
-    let (rest, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(rest)?;
-    let (rest, expect_versions) = expect_version_clauses(rest)?;
+    let (rest, (where_clauses, limit, expect_versions)) = selection(rest)?;
 
     let statement = Transition {
         target,
@@ -1101,10 +1114,7 @@ fn set_retention(input: &str) -> VResult<'_, SetRetention> {
     let (input, _) = ws(words(&["SET", "RETENTION"])).parse(input)?;
     let (input, target) = cut(ws(element_ref)).parse(input)?;
     let (input, values) = cut(ws(assignments)).parse(input)?;
-    let (input, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    let (input, expect_versions) = expect_version_clauses(input)?;
+    let (input, (where_clauses, limit, expect_versions)) = selection(input)?;
     Ok((
         input,
         SetRetention {
@@ -1117,20 +1127,24 @@ fn set_retention(input: &str) -> VResult<'_, SetRetention> {
     ))
 }
 
-fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
-    let (input, _) = ws(word("PURGE")).parse(input)?;
-    let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    // §52.8: the guards, then the statement's own trailing words.
-    let (input, expect_versions) = expect_version_clauses(input)?;
-    let (input, reference_policy) = opt_after(&["REFERENCE", "POLICY"], ws(scalar)).parse(input)?;
+/// `CONFIRM "PURGE"`, the one spelling both erasures take, frozen so an
+/// erasure is never the result of a near-miss confirmation.
+fn purge_confirmation(input: &str) -> VResult<'_, String> {
     let (input, _) = cut(ws(word("CONFIRM"))).parse(input)?;
     let (rest, confirm) = cut(ws(quoted_string)).parse(input)?;
     if confirm != "PURGE" {
         return fail(input, "the exact confirmation literal \"PURGE\"");
     }
+    Ok((rest, confirm))
+}
+
+fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
+    let (input, _) = ws(word("PURGE")).parse(input)?;
+    let (input, target) = cut(ws(element_ref)).parse(input)?;
+    // §52.8: the guards, then the statement's own trailing words.
+    let (input, (where_clauses, limit, expect_versions)) = selection(input)?;
+    let (input, reference_policy) = opt_after(&["REFERENCE", "POLICY"], ws(scalar)).parse(input)?;
+    let (rest, confirm) = purge_confirmation(input)?;
 
     Ok((
         rest,
@@ -1152,15 +1166,8 @@ fn purge_statement(input: &str) -> VResult<'_, crate::ast::PurgeStatement> {
 fn purge_payload_statement(input: &str) -> VResult<'_, crate::ast::PurgePayloadStatement> {
     let (input, _) = ws(words(&["PURGE", "PAYLOAD"])).parse(input)?;
     let (input, target) = cut(ws(element_ref)).parse(input)?;
-    let (input, where_clauses) =
-        opt_after(&["WHERE"], |i| where_block(i, Flavor::Exact)).parse(input)?;
-    let (input, limit) = opt_after(&["LIMIT"], ws(scalar)).parse(input)?;
-    let (input, expect_versions) = expect_version_clauses(input)?;
-    let (input, _) = cut(ws(word("CONFIRM"))).parse(input)?;
-    let (rest, confirm) = cut(ws(quoted_string)).parse(input)?;
-    if confirm != "PURGE" {
-        return fail(input, "the exact confirmation literal \"PURGE\"");
-    }
+    let (input, (where_clauses, limit, expect_versions)) = selection(input)?;
+    let (rest, confirm) = purge_confirmation(input)?;
 
     Ok((
         rest,
@@ -1266,37 +1273,27 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
     let bad = |ctx: &str| Err(KipError::invalid_syntax(ctx));
 
     let check_assignments = |a: &Assignments| -> Result<(), KipError> {
-        let mut seen = BTreeSet::new();
-        for (key, _) in a {
-            if super::common::is_protected_field(key) {
-                return Err(KipError::invalid_syntax(format!(
-                    "{key} is engine-maintained state and cannot be written by a mutation"
-                )));
-            }
-            if !seen.insert(key.as_str()) {
-                return Err(KipError::invalid_syntax(format!(
-                    "{key} is assigned twice in one block"
-                )));
-            }
+        if let Some((index, fault)) = key_fault(a.iter().map(|(key, _)| key.as_str()), true) {
+            let key = &a[index].0;
+            return Err(KipError::invalid_syntax(match fault {
+                KeyFault::Protected => {
+                    format!("{key} is engine-maintained state and cannot be written by a mutation")
+                }
+                KeyFault::Duplicate => format!("{key} is assigned twice in one block"),
+            }));
         }
-        for (_, value) in a {
-            validate_mutation_value(value)?;
-        }
-        Ok(())
+        a.iter()
+            .try_for_each(|(_, value)| validate_mutation_value(value))
     };
     let check_unset = |fields: &[String]| -> Result<(), KipError> {
-        let mut seen = BTreeSet::new();
-        for key in fields {
-            if super::common::is_protected_field(key) {
-                return Err(KipError::invalid_syntax(format!(
-                    "{key} is engine-maintained state and cannot be unset by a mutation"
-                )));
-            }
-            if !seen.insert(key.as_str()) {
-                return Err(KipError::invalid_syntax(format!(
-                    "{key} is listed twice in one block"
-                )));
-            }
+        if let Some((index, fault)) = key_fault(fields.iter().map(String::as_str), true) {
+            let key = &fields[index];
+            return Err(KipError::invalid_syntax(match fault {
+                KeyFault::Protected => {
+                    format!("{key} is engine-maintained state and cannot be unset by a mutation")
+                }
+                KeyFault::Duplicate => format!("{key} is listed twice in one block"),
+            }));
         }
         Ok(())
     };

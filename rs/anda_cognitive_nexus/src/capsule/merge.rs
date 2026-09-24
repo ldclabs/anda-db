@@ -104,7 +104,6 @@ pub async fn merge(
     let origin = serde_json::json!({
         "import": {
             "capsule_digest": digest,
-            "source_nexus": capsule.payload.source.nexus_id,
             "source_space": capsule.payload.source.space_ref,
             "source_snapshot_seq": capsule.payload.source.snapshot_seq,
         }

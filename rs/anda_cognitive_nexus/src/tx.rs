@@ -1077,7 +1077,7 @@ impl Transaction {
                 staged.is_new,
                 staged.keep_origin,
             );
-            writes.push((row, op_name(prepared.entry.op).to_string()));
+            writes.push((row, prepared.entry.op.as_str().to_string()));
             changes.push(entry_json(&prepared.entry));
             written += 1;
         }
@@ -1626,19 +1626,6 @@ fn prepare(id: ElementId, staged: &Staged) -> Prepared {
 /// A change entry as the journal and the result body carry it.
 pub(crate) fn entry_json(entry: &ChangeEntry) -> Json {
     serde_json::to_value(entry).unwrap_or(Json::Null)
-}
-
-/// The version-log spelling of an operation.
-pub(crate) fn op_name(op: ChangeOp) -> &'static str {
-    match op {
-        ChangeOp::Create => "create",
-        ChangeOp::Update => "update",
-        ChangeOp::Lifecycle => "lifecycle",
-        ChangeOp::Retention => "retention",
-        ChangeOp::Merge => "merge",
-        ChangeOp::Purge => "purge",
-        ChangeOp::PayloadPurge => "payload_purge",
-    }
 }
 
 /// Seals a Receipt with its canonical digest (§33.2).

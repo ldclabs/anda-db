@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use crate::ast::{Command, CommandType, Json, Map};
 use crate::error::{ErrorObject, KipError, KipErrorCode};
-use crate::parser::{MAX_KIP_BATCH_COMMANDS, parse_kip, validate_command};
+use crate::parser::{MAX_KIP_BATCH_COMMANDS, parse_kip, validate_ast_numbers, validate_shape};
 
 /// The protocol profile this crate speaks.
 pub const KIP_VERSION: &str = "2.0";
@@ -199,15 +199,23 @@ impl Request {
     pub fn validate(&self) -> Result<(), KipError> {
         self.validate_shape()?;
         if self.ingest.is_some() {
-            check_ingest_commands(self.operations.iter().map(Operation::parse))?;
+            check_ingest_commands(self.operations.iter().map(Operation::parse_checked))?;
         }
         Ok(())
     }
 
     /// Prepare one execution without parsing ingest operations a second time.
+    ///
+    /// `validate_shape` has validated every operation, so each is parsed
+    /// without validating it again — a transported tree is serialized for its
+    /// number check once per request, not once per pass.
     pub(crate) fn prepare_operations(&self) -> Result<Vec<Result<Command, KipError>>, KipError> {
         self.validate_shape()?;
-        let parsed: Vec<_> = self.operations.iter().map(Operation::parse).collect();
+        let parsed: Vec<_> = self
+            .operations
+            .iter()
+            .map(Operation::parse_checked)
+            .collect();
         if self.ingest.is_some() {
             check_ingest_commands(parsed.iter().map(|result| result.as_ref()))?;
         }
@@ -472,19 +480,20 @@ impl EnvelopeBlock for Execution {
     }
 }
 
-/// The three execution modes (Spec §75).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionMode {
-    /// Semantically independent; separate snapshots, separate transactions,
-    /// failure isolated per operation (§75.1).
-    #[default]
-    Independent,
-    /// Ordered; each state-changing operation commits separately and earlier
-    /// commits are **not** rolled back (§75.2).
-    Sequence,
-    /// One transaction, one snapshot, read-your-writes, all-or-none (§75.3).
-    Atomic,
+wire_enum! {
+    /// The three execution modes (Spec §75).
+    #[derive(Default)]
+    pub enum ExecutionMode {
+        /// Semantically independent; separate snapshots, separate transactions,
+        /// failure isolated per operation (§75.1).
+        #[default]
+        Independent = "independent",
+        /// Ordered; each state-changing operation commits separately and earlier
+        /// commits are **not** rolled back (§75.2).
+        Sequence = "sequence",
+        /// One transaction, one snapshot, read-your-writes, all-or-none (§75.3).
+        Atomic = "atomic",
+    }
 }
 
 impl ExecutionMode {
@@ -494,16 +503,17 @@ impl ExecutionMode {
     }
 }
 
-/// What a `sequence` run does after a failure (Spec §75.2).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum OnError {
-    /// Stop at the first failure; the operations not started are reported
-    /// `skipped`. The default.
-    #[default]
-    Stop,
-    /// Keep going. Illegal under `atomic`.
-    Continue,
+wire_enum! {
+    /// What a `sequence` run does after a failure (Spec §75.2).
+    #[derive(Default)]
+    pub enum OnError {
+        /// Stop at the first failure; the operations not started are reported
+        /// `skipped`. The default.
+        #[default]
+        Stop = "stop",
+        /// Keep going. Illegal under `atomic`.
+        Continue = "continue",
+    }
 }
 
 /// Binds a request to a readable cognitive state coordinate (Spec §78).
@@ -634,10 +644,7 @@ impl Operation {
                     "an operation's command must not be empty",
                 ));
             }
-            (None, Some(ast)) => crate::validate_json(
-                &serde_json::to_value(ast)
-                    .map_err(|e| KipError::invalid_request_envelope(e.to_string()))?,
-            )?,
+            (None, Some(ast)) => validate_ast_numbers(ast)?,
             (Some(_), Some(_)) => {
                 return Err(KipError::invalid_request_envelope(
                     "an operation carries either `command` text or a pre-parsed `ast`, never both",
@@ -673,15 +680,21 @@ impl Operation {
     /// Parses this operation into a command, enforcing the language contract.
     pub fn parse(&self) -> Result<Command, KipError> {
         self.validate()?;
+        self.parse_checked()
+    }
 
+    /// [`Operation::parse`] for an operation [`Operation::validate`] has
+    /// already admitted.
+    fn parse_checked(&self) -> Result<Command, KipError> {
         let command = match (&self.command, &self.ast) {
             (Some(text), _) => parse_kip(text)?,
             (None, Some(ast)) => {
                 // A supplied AST skipped the parser, and with it every rule the
                 // grammar enforces while reading. Re-check them here, or the
                 // `ast` form becomes a way to hand an engine exactly the
-                // commands the text form exists to reject (§73).
-                validate_command(ast)?;
+                // commands the text form exists to reject (§73). Its numbers
+                // were checked by `validate`.
+                validate_shape(ast)?;
                 ast.clone()
             }
             (None, None) => unreachable!("validate rejected the empty operation"),
@@ -1201,19 +1214,20 @@ impl From<KipError> for Response {
     }
 }
 
-/// The request-level outcome (Spec §82).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum TopLevelStatus {
-    /// Every operation succeeded.
-    #[default]
-    Succeeded,
-    /// Nothing succeeded.
-    Failed,
-    /// Some operations succeeded and some did not.
-    Partial,
-    /// A write may or may not have committed (§80.3).
-    OutcomeUnknown,
+wire_enum! {
+    /// The request-level outcome (Spec §82).
+    #[derive(Default)]
+    pub enum TopLevelStatus {
+        /// Every operation succeeded.
+        #[default]
+        Succeeded = "succeeded",
+        /// Nothing succeeded.
+        Failed = "failed",
+        /// Some operations succeeded and some did not.
+        Partial = "partial",
+        /// A write may or may not have committed (§80.3).
+        OutcomeUnknown = "outcome_unknown",
+    }
 }
 
 impl TopLevelStatus {
@@ -1241,22 +1255,23 @@ impl TopLevelStatus {
     }
 }
 
-/// The per-operation outcome (Spec §83).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationStatus {
-    /// The operation ran and produced its effect.
-    #[default]
-    Succeeded,
-    /// The operation ran and failed.
-    Failed,
-    /// The operation never ran.
-    Skipped,
-    /// The operation executed tentatively inside a transaction that then
-    /// aborted; no durable state resulted (§83.1).
-    RolledBack,
-    /// The operation ran and changed nothing (§32.8).
-    NoEffect,
+wire_enum! {
+    /// The per-operation outcome (Spec §83).
+    #[derive(Default)]
+    pub enum OperationStatus {
+        /// The operation ran and produced its effect.
+        #[default]
+        Succeeded = "succeeded",
+        /// The operation ran and failed.
+        Failed = "failed",
+        /// The operation never ran.
+        Skipped = "skipped",
+        /// The operation executed tentatively inside a transaction that then
+        /// aborted; no durable state resulted (§83.1).
+        RolledBack = "rolled_back",
+        /// The operation ran and changed nothing (§32.8).
+        NoEffect = "no_effect",
+    }
 }
 
 /// The execution block echoed back on the response.
@@ -1600,20 +1615,20 @@ pub struct ReceiptOrigin {
     pub delegation_digest: Option<String>,
 }
 
-/// What a transaction did (Spec §33.2).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceiptStatus {
-    /// The transaction committed durably.
-    Committed,
-    /// The transaction aborted; no durable state resulted.
-    Aborted,
-    /// The transaction ran and changed nothing.
-    NoEffect,
-    /// The transaction is still in flight.
-    Pending,
-    /// The outcome could not be established (§80.3).
-    Unknown,
+wire_enum! {
+    /// What a transaction did (Spec §33.2).
+    pub enum ReceiptStatus {
+        /// The transaction committed durably.
+        Committed = "committed",
+        /// The transaction aborted; no durable state resulted.
+        Aborted = "aborted",
+        /// The transaction ran and changed nothing.
+        NoEffect = "no_effect",
+        /// The transaction is still in flight.
+        Pending = "pending",
+        /// The outcome could not be established (§80.3).
+        Unknown = "unknown",
+    }
 }
 
 /// A non-fatal caveat (Spec §81).
@@ -1667,6 +1682,29 @@ impl From<KipErrorCode> for Warning {
 mod tests {
     use super::*;
     use crate::error::KipErrorCode;
+
+    #[test]
+    fn envelope_vocabularies_are_strings_on_the_wire() {
+        let request = |execution: &str, language: &str| {
+            Request::from_json(&format!(
+                r#"{{"kip":"2.0","execution":{execution},"operations":[
+                    {{"command":"DESCRIBE PRIMER","language":{language}}},
+                    {{"command":"DESCRIBE PROTOCOL"}}]}}"#
+            ))
+        };
+        assert!(request(r#"{"mode":"sequence"}"#, r#""META""#).is_ok());
+        // The externally-tagged form a derived enum would have taken.
+        let tagged = request(r#"{"mode":{"sequence":null}}"#, r#""META""#).unwrap_err();
+        assert_eq!(tagged.code, KipErrorCode::InvalidRequestEnvelope);
+        // The label is the schema's exact spelling; anything else is a
+        // malformed envelope rather than a language that fails to match.
+        for label in [r#""meta""#, r#""SQL""#, r#""UNKNOWN""#] {
+            let err = request(r#"{"mode":"sequence"}"#, label).unwrap_err();
+            assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope, "{label}");
+        }
+        assert_eq!("kql".parse::<CommandType>(), Ok(CommandType::Kql));
+        assert!("UNKNOWN".parse::<CommandType>().is_err());
+    }
 
     #[test]
     fn a_lone_operation_needs_no_execution_mode() {

@@ -33,18 +33,6 @@ wire_enum! {
     }
 }
 
-impl ConformanceProfile {
-    /// The wire name, e.g. `"KIP-Core"`.
-    pub const fn name(&self) -> &'static str {
-        self.as_str()
-    }
-
-    /// Looks a level up by its wire name.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::from_wire(name)
-    }
-}
-
 wire_enum! {
     /// An area of the KIP-Core requirements (Spec §89), for test selection
     /// and diagnosis only — never a claim.
@@ -122,15 +110,15 @@ mod tests {
     fn every_level_and_area_round_trips_by_its_wire_name() {
         for profile in ConformanceProfile::ALL {
             assert_eq!(
-                ConformanceProfile::from_name(profile.name()),
+                ConformanceProfile::from_wire(profile.as_str()),
                 Some(*profile)
             );
             assert_eq!(
                 serde_json::to_string(profile).unwrap(),
-                format!("\"{}\"", profile.name())
+                format!("\"{}\"", profile.as_str())
             );
         }
-        assert!(ConformanceProfile::from_name("KIP-KQL").is_none());
+        assert!(ConformanceProfile::from_wire("KIP-KQL").is_none());
         for area in ConformanceArea::ALL {
             assert_eq!(ConformanceArea::from_wire(area.as_str()), Some(*area));
         }
@@ -190,7 +178,7 @@ mod tests {
             .filter(|line| line.starts_with("KIP-"))
             .filter_map(|line| line.split_whitespace().next())
             .collect();
-        let names: Vec<&str> = ConformanceProfile::ALL.iter().map(|p| p.name()).collect();
+        let names: Vec<&str> = ConformanceProfile::ALL.iter().map(|p| p.as_str()).collect();
         assert_eq!(printed, names);
         assert_eq!(ConformanceArea::ALL.len(), 8);
     }

@@ -9,14 +9,14 @@ pub struct ArtifactPin {
     pub content_digest: String,
 }
 
-/// Why an extraction is repaired (Spec §57.8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RepairReason {
-    /// The Brain extracted a claim the source does not make.
-    ExtractionError,
-    /// The Brain attributed a claim to the wrong actor.
-    AttributionError,
+wire_enum! {
+    /// Why an extraction is repaired (Spec §57.8).
+    pub enum RepairReason {
+        /// The Brain extracted a claim the source does not make.
+        ExtractionError = "extraction_error",
+        /// The Brain attributed a claim to the wrong actor.
+        AttributionError = "attribution_error",
+    }
 }
 
 /// The input of the protected recording-repair operation (Spec §57.8,
@@ -54,14 +54,14 @@ pub struct RecordingValidity {
     pub repair_ref: Option<String>,
 }
 
-/// What an exposure records (Spec §66.8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Exposure {
-    /// A read returned the element.
-    Retrieved,
-    /// A decision used it (a DecisionRecord's `used_refs`).
-    Used,
+wire_enum! {
+    /// What an exposure records (Spec §66.8).
+    pub enum Exposure {
+        /// A read returned the element.
+        Retrieved = "retrieved",
+        /// A decision used it (a DecisionRecord's `used_refs`).
+        Used = "used",
+    }
 }
 
 /// One entry of the append-only exposure log (Spec §66.8,
@@ -156,8 +156,9 @@ pub fn validate_lease_transition(
     now: &str,
 ) -> Result<(), KipError> {
     let fail = |message: &str| Err(KipError::constraint_violation(message));
-    let instant = |value: &str| crate::timestamp::parse(value, "lease expiry");
-    let now = instant(now)?;
+    let expiry_of =
+        |lease: &Json| crate::timestamp::parse_value(&lease["expires_at"], "lease expiry");
+    let now = crate::timestamp::parse(now, "lease expiry")?;
     let Some(after) = after else {
         if before.is_some() || matches!(after_status, "running" | "completed" | "failed") {
             return fail("running tasks require a retained fenced lease");
@@ -169,13 +170,11 @@ pub fn validate_lease_transition(
     }
     let fence = after["fencing_token"].as_u64().unwrap_or(0);
     let attempts = after["attempt_count"].as_u64().unwrap_or(0);
-    crate::timestamp::validate_value(&after["expires_at"], "lease expiry")?;
-    let expiry = instant(after["expires_at"].as_str().unwrap())?;
+    let expiry = expiry_of(after)?;
     if let Some(before) = before {
         let old_fence = before["fencing_token"].as_u64().unwrap_or(0);
         let old_attempts = before["attempt_count"].as_u64().unwrap_or(0);
-        crate::timestamp::validate_value(&before["expires_at"], "lease expiry")?;
-        let old_expiry = instant(before["expires_at"].as_str().unwrap())?;
+        let old_expiry = expiry_of(before)?;
         let expired = old_expiry <= now;
         if after_status == "running" && (expired || before_status != "running") {
             if fence != old_fence + 1

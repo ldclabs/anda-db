@@ -7,9 +7,9 @@
 //! is a change to that file, made on purpose. `ts/kip-do` pins its barrel the
 //! same way (`test/surface.test.ts`).
 //!
-//! Only items at column zero count — `impl` methods, and the enums the
-//! `wire_enum!` invocations expand to, are inside a block — and a file is read
-//! up to its `#[cfg(test)]` module. Rewrite the snapshot with
+//! Only items at column zero count — `impl` methods are inside a block — plus
+//! the enum each `wire_enum!` invocation declares, which is as public as any
+//! other; a file is read up to its `#[cfg(test)]` module. Rewrite the snapshot with
 //! `UPDATE_SURFACE=1 cargo test -p anda_kip --test surface`.
 
 use std::{
@@ -42,9 +42,26 @@ fn collect(dir: &Path, root: &Path, out: &mut BTreeSet<String>) {
             .display()
             .to_string();
         let text = fs::read_to_string(&path).expect("a readable source file");
+        let mut in_wire_enum = false;
         for line in text.lines() {
             if line.starts_with("#[cfg(test)]") {
                 break;
+            }
+            if line.starts_with("wire_enum! {") {
+                in_wire_enum = true;
+                continue;
+            }
+            if in_wire_enum {
+                if line == "}" {
+                    in_wire_enum = false;
+                } else if let Some(rest) = line.strip_prefix("    pub enum ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    out.insert(format!("{file}: enum {name}"));
+                }
+                continue;
             }
             let Some(rest) = line.strip_prefix("pub ") else {
                 continue;

@@ -51,6 +51,7 @@ import type {
   MutationValue,
   Scalar,
   StructuralEdge,
+  WhereClause,
 } from './ast.js'
 
 /** `stance` — what an Assertion does with its Proposition (§13.4). */
@@ -495,6 +496,7 @@ function analyzeKql(query: KqlQuery, out: Diagnostic[]): void {
       out,
     )
   }
+  analyzePatterns(query.where_clauses, out)
   if (!query.limit) {
     out.push({
       severity: 'warning',
@@ -503,6 +505,23 @@ function analyzeKql(query: KqlQuery, out: Diagnostic[]): void {
         'FIND without a LIMIT: an unbounded recall returns whatever the Space happens to hold',
     })
   }
+}
+
+/**
+ * A Search Pattern is the META `SEARCH` bound into a query (§43.8), so its
+ * `MODE` answers to the same registry wherever in the block it sits.
+ */
+function analyzePatterns(clauses: readonly WhereClause[], out: Diagnostic[]): void {
+  for (const clause of clauses) {
+    if ('Search' in clause) checkSearchMode(clause.Search.mode, out)
+    else if ('Not' in clause) analyzePatterns(clause.Not, out)
+    else if ('Optional' in clause) analyzePatterns(clause.Optional, out)
+    else if ('Union' in clause) analyzePatterns(clause.Union, out)
+  }
+}
+
+function checkSearchMode(mode: Scalar | null | undefined, out: Diagnostic[]): void {
+  checkEnum(scalarStr(mode), SEARCH_MODES, 'SEARCH MODE', out)
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +533,7 @@ function analyzeMeta(meta: MetaCommand, out: Diagnostic[]): void {
   // engine declares (§66.5) rather than inherits, so it carries no
   // protocol-fixed range to check it against.
   if ('Search' in meta) {
-    checkEnum(scalarStr(meta.Search.mode), SEARCH_MODES, 'SEARCH MODE', out)
+    checkSearchMode(meta.Search.mode, out)
     return
   }
   if ('Describe' in meta) {

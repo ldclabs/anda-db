@@ -78,6 +78,43 @@ pub(crate) fn is_protected_field(name: &str) -> bool {
     PROTECTED_FIELDS.contains(&name)
 }
 
+/// The refusal for an assignment to a [`PROTECTED_FIELDS`] name. A parser
+/// context is a static string, so the list is spelled out; a test holds it to
+/// the constant.
+const PROTECTED_FIELD_MESSAGE: &str = "a writable field: _system, governance, space_id, space_seq and merged_into are \
+     engine-maintained";
+
+/// How a key block breaks the rule that every key means one thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyFault {
+    /// The key repeats an earlier one. Spec §70.2 rejects it rather than
+    /// letting the last write win, which would swallow a generation slip.
+    Duplicate,
+    /// The key names engine-owned state.
+    Protected,
+}
+
+/// The first key, by position, that breaks the rule. `writable` blocks —
+/// assignments and removals — also refuse the engine-owned field names.
+///
+/// One definition for the text parser and the transported-AST checks, so the
+/// two channels cannot disagree about which blocks are well-formed.
+pub(crate) fn key_fault<'k>(
+    keys: impl IntoIterator<Item = &'k str>,
+    writable: bool,
+) -> Option<(usize, KeyFault)> {
+    let mut seen = std::collections::HashSet::new();
+    keys.into_iter().enumerate().find_map(|(index, key)| {
+        if writable && is_protected_field(key) {
+            Some((index, KeyFault::Protected))
+        } else if !seen.insert(key) {
+            Some((index, KeyFault::Duplicate))
+        } else {
+            None
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Failure helpers
 // ---------------------------------------------------------------------------
@@ -189,6 +226,15 @@ where
 // ---------------------------------------------------------------------------
 // Lexical atoms
 // ---------------------------------------------------------------------------
+
+/// Looks a registered function name up, ASCII case-insensitively and without
+/// allocating: function names are keywords, and keywords are case-insensitive.
+pub(crate) fn named<T: Copy>(table: &[(&str, T)], name: &str) -> Option<T> {
+    table
+        .iter()
+        .find(|(spelling, _)| spelling.eq_ignore_ascii_case(name))
+        .map(|(_, value)| *value)
+}
 
 /// `identifier = identifier_start, { identifier_continue }`
 pub(crate) fn identifier(input: &str) -> VResult<'_, &str> {
@@ -566,17 +612,19 @@ fn bound_entries(input: &str) -> VResult<'_, Vec<(String, BoundValue)>> {
     )
     .parse(input)?;
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out = Vec::with_capacity(entries.len());
-    for ((position, key), value) in entries {
-        // Spec §70.2: duplicate object keys are rejected rather than
-        // last-write-wins, which would silently swallow a generation slip.
-        if !seen.insert(key.clone()) {
-            return fail(position, "a key that is not already set in this object");
-        }
-        out.push((key, value));
+    if let Some((index, _)) = key_fault(entries.iter().map(|((_, key), _)| key.as_str()), false) {
+        return fail(
+            entries[index].0.0,
+            "a key that is not already set in this object",
+        );
     }
-    Ok((rest, out))
+    Ok((
+        rest,
+        entries
+            .into_iter()
+            .map(|((_, key), value)| (key, value))
+            .collect(),
+    ))
 }
 
 /// `object_literal` in a position that wants a keyed block, e.g. `WITH {...}`.
@@ -633,18 +681,18 @@ pub(crate) fn mutation_value(input: &str) -> VResult<'_, MutationValue> {
 
 /// A call to one of the registered update functions (Spec §59).
 fn update_function_call(input: &str) -> VResult<'_, UpdateExpr> {
+    const UPDATE_FUNCTIONS: &[(&str, UpdateFunction)] = &[
+        ("ADD", UpdateFunction::Add),
+        ("MUL", UpdateFunction::Mul),
+        ("CLAMP", UpdateFunction::Clamp),
+        ("COALESCE", UpdateFunction::Coalesce),
+    ];
     let (rest, name) = terminated(identifier, peek(ws(char('(')))).parse(input)?;
-    let func = match name.to_ascii_uppercase().as_str() {
-        "ADD" => UpdateFunction::Add,
-        "MUL" => UpdateFunction::Mul,
-        "CLAMP" => UpdateFunction::Clamp,
-        "COALESCE" => UpdateFunction::Coalesce,
-        _ => {
-            return fail(
-                input,
-                "a registered update function: ADD, MUL, CLAMP or COALESCE",
-            );
-        }
+    let Some(func) = named(UPDATE_FUNCTIONS, name) else {
+        return fail(
+            input,
+            "a registered update function: ADD, MUL, CLAMP or COALESCE",
+        );
     };
     let (rest, args) = cut(parenthesized(terminated(
         separated_list0(ws(char(',')), ws(update_expr)),
@@ -676,32 +724,16 @@ fn negative_number(input: &str) -> VResult<'_, Number> {
     alt((parse_number, preceded(ws(char('-')), cut(negated_number)))).parse(input)
 }
 
+/// `parse_number` has already refused every integer outside ±(2^53 − 1)
+/// and every non-finite value, so both kinds of number negate exactly.
 fn negated_number(input: &str) -> VResult<'_, Number> {
     let (rest, number) = parse_number(input)?;
-    let negated = if let Some(n) = number.as_i64() {
-        // `-i64::MIN` is not an `i64`, but it is exactly 2^63, which is a `u64`.
-        // Computing it as `-n` panics in a debug build and wraps in a release
-        // one, so `--9223372036854775808` used to abort the parser.
-        match n.checked_neg() {
-            Some(n) => Number::from(n),
-            None => Number::from(1u64 << 63),
-        }
-    } else if let Some(u) = number.as_u64() {
-        // An integer above `i64::MAX`; only 2^63 negates to an exact `i64`.
-        // Degrading the rest to `f64` would store a different number than the
-        // one written, which is what `parse_number` already refuses to do.
-        if u == 1u64 << 63 {
-            Number::from(i64::MIN)
-        } else {
-            return fail(input, "an integer whose negation is exactly representable");
-        }
-    } else if let Some(f) = number.as_f64() {
-        match Number::from_f64(-f) {
+    let negated = match number.as_i64() {
+        Some(n) => Number::from(-n),
+        None => match number.as_f64().and_then(|f| Number::from_f64(-f)) {
             Some(n) => n,
             None => return fail(input, "a finite number"),
-        }
-    } else {
-        return fail(input, "a number this build can negate");
+        },
     };
     Ok((rest, negated))
 }
@@ -728,24 +760,23 @@ pub(crate) fn assignments(input: &str) -> VResult<'_, Assignments> {
     )
     .parse(input)?;
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out: Assignments = Vec::with_capacity(entries.len());
-    for ((position, key), value) in entries {
-        if is_protected_field(&key) {
-            return fail(
-                position,
-                "a writable field: _system, governance, space_id and space_seq are engine-maintained",
-            );
-        }
-        if !seen.insert(key.clone()) {
-            return fail(
-                position,
-                "a field that is not already assigned in this block",
-            );
-        }
-        out.push((key, value));
+    if let Some((index, fault)) = key_fault(entries.iter().map(|((_, key), _)| key.as_str()), true)
+    {
+        return fail(
+            entries[index].0.0,
+            match fault {
+                KeyFault::Protected => PROTECTED_FIELD_MESSAGE,
+                KeyFault::Duplicate => "a field that is not already assigned in this block",
+            },
+        );
     }
-    Ok((rest, out))
+    Ok((
+        rest,
+        entries
+            .into_iter()
+            .map(|((_, key), value)| (key, value))
+            .collect(),
+    ))
 }
 
 /// `unset_field_set = "{" [ unset_field { "," unset_field } ] "}"`
@@ -760,21 +791,16 @@ pub(crate) fn unset_field_set(input: &str) -> VResult<'_, Vec<String>> {
     )
     .parse(input)?;
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut out = Vec::with_capacity(entries.len());
-    for (position, key) in entries {
-        if is_protected_field(&key) {
-            return fail(
-                position,
-                "a writable field: _system, governance, space_id and space_seq are engine-maintained",
-            );
-        }
-        if !seen.insert(key.clone()) {
-            return fail(position, "a field that is not already listed in this block");
-        }
-        out.push(key);
+    if let Some((index, fault)) = key_fault(entries.iter().map(|(_, key)| key.as_str()), true) {
+        return fail(
+            entries[index].0,
+            match fault {
+                KeyFault::Protected => PROTECTED_FIELD_MESSAGE,
+                KeyFault::Duplicate => "a field that is not already listed in this block",
+            },
+        );
     }
-    Ok((rest, out))
+    Ok((rest, entries.into_iter().map(|(_, key)| key).collect()))
 }
 
 // ---------------------------------------------------------------------------
@@ -905,10 +931,22 @@ fn comparison_operator(input: &str) -> VResult<'_, crate::ast::ComparisonOperato
 }
 
 fn filter_function_call(input: &str, depth: usize) -> VResult<'_, FilterExpression> {
+    const FILTER_FUNCTIONS: &[(&str, FilterFunction)] = &[
+        ("CONTAINS", FilterFunction::Contains),
+        ("STARTS_WITH", FilterFunction::StartsWith),
+        ("ENDS_WITH", FilterFunction::EndsWith),
+        ("REGEX", FilterFunction::Regex),
+        ("IN", FilterFunction::In),
+        ("IS_NULL", FilterFunction::IsNull),
+        ("IS_NOT_NULL", FilterFunction::IsNotNull),
+        ("IS_LITERAL", FilterFunction::IsLiteral),
+        ("IS_ELEMENT", FilterFunction::IsElement),
+        ("IS_KIND", FilterFunction::IsKind),
+        ("LITERAL_TYPE", FilterFunction::LiteralType),
+    ];
     let (rest, name) = terminated(identifier, peek(ws(char('(')))).parse(input)?;
-    let func = match filter_function(name) {
-        Some(func) => func,
-        None => return fail(input, "a registered KIP filter function"),
+    let Some(func) = named(FILTER_FUNCTIONS, name) else {
+        return fail(input, "a registered KIP filter function");
     };
     let (rest, args) = cut(parenthesized(terminated(
         separated_list0(ws(char(',')), ws(|i| filter_operand(i, depth + 1))),
@@ -916,23 +954,6 @@ fn filter_function_call(input: &str, depth: usize) -> VResult<'_, FilterExpressi
     )))
     .parse(rest)?;
     Ok((rest, FilterExpression::Function { func, args }))
-}
-
-fn filter_function(name: &str) -> Option<FilterFunction> {
-    Some(match name.to_ascii_uppercase().as_str() {
-        "CONTAINS" => FilterFunction::Contains,
-        "STARTS_WITH" => FilterFunction::StartsWith,
-        "ENDS_WITH" => FilterFunction::EndsWith,
-        "REGEX" => FilterFunction::Regex,
-        "IN" => FilterFunction::In,
-        "IS_NULL" => FilterFunction::IsNull,
-        "IS_NOT_NULL" => FilterFunction::IsNotNull,
-        "IS_LITERAL" => FilterFunction::IsLiteral,
-        "IS_ELEMENT" => FilterFunction::IsElement,
-        "IS_KIND" => FilterFunction::IsKind,
-        "LITERAL_TYPE" => FilterFunction::LiteralType,
-        _ => return None,
-    })
 }
 
 /// One side of a comparison, or one argument of a filter function.
@@ -1604,6 +1625,28 @@ mod tests {
         assert!(assignments(r#"{ space_seq: 1 }"#).is_err());
         assert!(assignments(r#"{ a: 1, a: 2 }"#).is_err());
         assert_eq!(parse(assignments, r#"{ a: 1, b: 2 }"#).len(), 2);
+        // The refusal names every protected field, not a stale subset.
+        for field in PROTECTED_FIELDS {
+            assert!(PROTECTED_FIELD_MESSAGE.contains(field), "{field}");
+            assert!(
+                assignments(&format!("{{ {field}: 1 }}")).is_err(),
+                "{field}"
+            );
+            assert!(
+                unset_field_set(&format!("{{ {field} }}")).is_err(),
+                "{field}"
+            );
+        }
+        // The first fault by position is the one reported.
+        assert_eq!(
+            key_fault(["a", "b", "a", "_system"], true),
+            Some((2, KeyFault::Duplicate))
+        );
+        assert_eq!(
+            key_fault(["a", "_system", "a"], true),
+            Some((1, KeyFault::Protected))
+        );
+        assert_eq!(key_fault(["_system", "a"], false), None);
     }
 
     #[test]

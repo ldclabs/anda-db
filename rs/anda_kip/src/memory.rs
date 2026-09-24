@@ -1,8 +1,9 @@
 //! Optional Agent-to-Brain interface artifacts. A raw Nexus does not acquire
 //! a Brain binding merely by installing the Cognitive Memory vocabulary.
-use crate::KipError;
+use crate::{Json, KipError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 pub mod binding;
 pub use binding::{MemorySession, MemorySessionSnapshot};
@@ -40,6 +41,74 @@ pub const KIP_RECALL_CARD: &str = include_str!("../brain/KIPRecall.md");
 pub const KIP_FORMATION_CARD: &str = include_str!("../brain/KIPFormation.md");
 pub const KIP_MAINTENANCE_CARD: &str = include_str!("../brain/KIPMaintenance.md");
 
+/// Every vendored JSON Schema, keyed by its `$id` and parsed once.
+///
+/// This is the closed resource set a validator resolves `$ref` against: no
+/// network, file or ambient cache may satisfy a reference these do not.
+pub fn vendored_schemas() -> &'static BTreeMap<String, Json> {
+    static CATALOG: LazyLock<BTreeMap<String, Json>> = LazyLock::new(|| {
+        [
+            COMMON_SCHEMA,
+            MEMORY_SCHEMA,
+            REQUEST_SCHEMA,
+            RESPONSE_SCHEMA,
+            PROJECTION_SCHEMA,
+            COGNITIVE_RECORDS_SCHEMA,
+            ELEMENT_SCHEMA,
+            CAPSULE_SCHEMA,
+            SCHEMA_PACKAGE_SCHEMA,
+            CHANGE_ENVELOPE_SCHEMA,
+        ]
+        .into_iter()
+        .map(|text| {
+            let schema = crate::parse_canonical_json(text).expect("vendored strict schema");
+            let id = schema["$id"]
+                .as_str()
+                .expect("vendored schema $id")
+                .to_string();
+            (id, schema)
+        })
+        .collect()
+    });
+    &CATALOG
+}
+
+/// Compiles a JSON Schema (draft 2020-12) against a closed resource set,
+/// validating `date-time` and `timestamp` as canonical KIP timestamps (§6.5).
+///
+/// The one place the validator is configured, so the Memory Interface, an
+/// engine's Schema Package contracts and the tests cannot drift into different
+/// notions of a valid timestamp or of which resources may be fetched.
+#[cfg(feature = "schema-validation")]
+pub fn schema_validator(
+    schema: &Json,
+    resources: BTreeMap<String, Json>,
+) -> Result<jsonschema::Validator, String> {
+    struct Pinned(BTreeMap<String, Json>);
+    impl jsonschema::Retrieve for Pinned {
+        fn retrieve(
+            &self,
+            uri: &jsonschema::Uri<String>,
+        ) -> Result<Json, Box<dyn std::error::Error + Send + Sync>> {
+            self.0
+                .get(uri.as_str())
+                .cloned()
+                .ok_or_else(|| format!("unpinned schema resource {uri}").into())
+        }
+    }
+    fn timestamp(value: &str) -> bool {
+        crate::timestamp::parse(value, "timestamp").is_ok()
+    }
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .with_format("date-time", timestamp)
+        .with_format("timestamp", timestamp)
+        .with_retriever(Pinned(resources))
+        .build(schema)
+        .map_err(|error| error.to_string())
+}
+
 /// One Memory Interface level (companion §2).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct MemoryBundle {
@@ -55,14 +124,18 @@ pub struct MemoryBundle {
     pub required_kml: Vec<String>,
 }
 
-pub fn memory_bundles() -> BTreeMap<String, MemoryBundle> {
+/// The vendored Memory Interface levels, keyed by name; parsed once.
+pub fn memory_bundles() -> &'static BTreeMap<String, MemoryBundle> {
     #[derive(Deserialize)]
     struct Registry {
         bundles: BTreeMap<String, MemoryBundle>,
     }
-    serde_json::from_str::<Registry>(MEMORY_BUNDLES)
-        .expect("vendored memory bundles")
-        .bundles
+    static BUNDLES: LazyLock<BTreeMap<String, MemoryBundle>> = LazyLock::new(|| {
+        serde_json::from_str::<Registry>(MEMORY_BUNDLES)
+            .expect("vendored memory bundles")
+            .bundles
+    });
+    &BUNDLES
 }
 
 /// Validate a host's declaration without inferring a binding from type names.

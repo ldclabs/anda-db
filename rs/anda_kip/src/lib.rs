@@ -21,9 +21,10 @@
 //!
 //! ## What is public
 //!
-//! `pub` means API. Each module is re-exported wholesale at the crate root,
-//! so an item is either part of the contract this crate keeps or it is
-//! `pub(crate)`; the nom combinators, the raw single-surface sub-parsers, the
+//! `pub` means API. Each module is re-exported wholesale at the crate root —
+//! except [`cognitive`] and [`timestamp`], which are addressed by module path,
+//! and `json`, which exports its three entry points — so an item is either
+//! part of the contract this crate keeps or it is `pub(crate)`; the nom combinators, the raw single-surface sub-parsers, the
 //! validation gates behind [`Operation::parse`] and the semantic checks the
 //! parsers apply are the latter. `tests/surface.rs` lists every public item
 //! from the sources and compares the list with
@@ -143,6 +144,8 @@ mod vocabulary;
 
 pub mod ast;
 pub mod capsule;
+/// Protected cognitive runtime host contracts.
+pub mod cognitive;
 pub mod conformance;
 pub mod draft;
 pub mod error;
@@ -280,6 +283,3 @@ mod tests {
         assert!(COGNITIVE_MEMORY_PROFILE.contains("Cognitive Memory Profile"));
     }
 }
-
-/// Protected cognitive runtime host contracts.
-pub mod cognitive;

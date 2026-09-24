@@ -133,20 +133,18 @@ pub struct CapsulePayload {
     /// What the source asks of anyone handling this Capsule.
     #[serde(default)]
     pub handling: CapsuleHandling,
-    /// Namespaced extensions.
-    #[serde(skip)]
-    pub extensions: Map<String, Json>,
 }
 
-/// The two baseline Capsule kinds (Spec §37.3).
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum CapsuleKind {
-    /// Selected cognitive state at one source snapshot (§37.4).
-    #[default]
-    Snapshot,
-    /// Ordered changes over one source lineage between two sequences (§37.5).
-    Delta,
+wire_enum! {
+    /// The two baseline Capsule kinds (Spec §37.3).
+    #[derive(Default)]
+    pub enum CapsuleKind {
+        /// Selected cognitive state at one source snapshot (§37.4).
+        #[default]
+        Snapshot = "snapshot",
+        /// Ordered changes over one source lineage between two sequences (§37.5).
+        Delta = "delta",
+    }
 }
 
 /// What the Capsule claims about itself (Spec §37.6).
@@ -160,12 +158,6 @@ pub struct CapsuleManifest {
     pub target_seq: Option<u64>,
     /// Snapshot or delta.
     pub kind: CapsuleKind,
-    /// When the Capsule was produced.
-    #[serde(skip)]
-    pub created_at: Option<String>,
-    /// How complete the selection is, e.g. `selection_complete`.
-    #[serde(skip)]
-    pub completeness: Option<String>,
     /// What the Capsule closes over (§40.3).
     pub closure: String,
 }
@@ -177,34 +169,24 @@ impl Default for CapsuleManifest {
             base_seq: None,
             target_seq: None,
             kind: CapsuleKind::Snapshot,
-            created_at: None,
-            completeness: None,
             closure: "selective".into(),
         }
     }
 }
 
 /// Where a Capsule came from (Spec §37.6, §37.5).
+///
+/// The wire shape is closed (`additionalProperties: false`): a delta's
+/// lineage bounds live on the manifest, and nothing else about the source
+/// travels.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct CapsuleSource {
-    /// The source Nexus.
-    #[serde(skip)]
-    pub nexus_id: Option<String>,
     /// The source Space.
-    #[serde(default, rename = "space_id")]
+    #[serde(default, rename = "space_id", skip_serializing_if = "Option::is_none")]
     pub space_ref: Option<String>,
     /// The pinned source snapshot a snapshot Capsule was exported at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_seq: Option<u64>,
-    /// The lower bound of a delta Capsule's lineage.
-    #[serde(skip)]
-    pub base_seq: Option<u64>,
-    /// The upper bound of a delta Capsule's lineage.
-    #[serde(skip)]
-    pub target_seq: Option<u64>,
-    /// Which Schema Environment version the records were written under.
-    #[serde(skip)]
-    pub schema_environment_version: Option<u64>,
 }
 
 /// One Schema Package a Capsule depends on (Spec §20.11).
@@ -249,26 +231,26 @@ impl<'de> Deserialize<'de> for CapsuleRecords {
     }
 }
 
-/// What kind of thing an omitted dependency was (Spec §40.1).
-///
-/// [`ExternalRefKind::Redacted`] and [`ExternalRefKind::Unavailable`] must stay
-/// distinguishable where policy permits: one means the source withheld it, the
-/// other means the source does not have it (§40.2).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalRefKind {
-    /// An element in the source Space that was not included.
-    SourceElement,
-    /// A cross-system canonical identity.
-    CanonicalIdentity,
-    /// A semantic locator rather than an identity.
-    SemanticLocator,
-    /// An artifact outside any Nexus.
-    ExternalArtifact,
-    /// The source intentionally withheld it.
-    Redacted,
-    /// The source does not possess or provide it.
-    Unavailable,
+wire_enum! {
+    /// What kind of thing an omitted dependency was (Spec §40.1).
+    ///
+    /// [`ExternalRefKind::Redacted`] and [`ExternalRefKind::Unavailable`] must stay
+    /// distinguishable where policy permits: one means the source withheld it, the
+    /// other means the source does not have it (§40.2).
+    pub enum ExternalRefKind {
+        /// An element in the source Space that was not included.
+        SourceElement = "source_element",
+        /// A cross-system canonical identity.
+        CanonicalIdentity = "canonical_identity",
+        /// A semantic locator rather than an identity.
+        SemanticLocator = "semantic_locator",
+        /// An artifact outside any Nexus.
+        ExternalArtifact = "external_artifact",
+        /// The source intentionally withheld it.
+        Redacted = "redacted",
+        /// The source does not possess or provide it.
+        Unavailable = "unavailable",
+    }
 }
 
 /// A dependency the Capsule names but does not carry (Spec §40.1).
@@ -282,31 +264,6 @@ pub struct ExternalRef {
     /// Whatever identity the source can safely disclose.
     #[serde(default, rename = "locator", skip_serializing_if = "Option::is_none")]
     pub identity: Option<Json>,
-    /// Why it was omitted, where policy permits saying.
-    #[serde(skip)]
-    pub reason: Option<String>,
-}
-
-/// A content-addressed blob a Capsule references (Spec §41.5).
-///
-/// Import MUST NOT automatically fetch arbitrary URLs; network access is a
-/// separate runtime authority.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct BlobRef {
-    /// The capsule-local reference used by the records.
-    #[serde(rename = "ref")]
-    pub reference: String,
-    /// The content digest that identifies the bytes.
-    pub digest: String,
-    /// The blob's media type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
-    /// The size in bytes, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    /// Where the bytes may be fetched from, subject to separate authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locator: Option<String>,
 }
 
 /// What the source asks of anyone handling this Capsule (Spec §37.6).
@@ -337,75 +294,6 @@ pub struct CapsuleIntegrity {
 
 /// A proof object whose members are defined by its cryptographic suite.
 pub type CapsuleProof = Map<String, Json>;
-
-/// How a Capsule is brought into a destination Space (Spec §39).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum ImportMode {
-    /// Read-only simulation; no destination cognitive state is created (§39.1).
-    Preview,
-    /// Imports into a quarantined review state rather than ordinary Recall
-    /// state (§39.2).
-    Isolate,
-    /// Merges another source's cognition under destination identity and
-    /// Governance policy (§39.3).
-    Merge,
-    /// Restores the same Brain/owner lineage under stronger identity checks
-    /// (§39.4).
-    Restore,
-}
-
-impl ImportMode {
-    /// Whether this mode can create durable destination state.
-    pub fn is_durable(&self) -> bool {
-        !matches!(self, ImportMode::Preview)
-    }
-
-    /// Whether this mode may map a source `$self` onto the destination `$self`.
-    ///
-    /// Only a verified restore may, and only when Governance has verified same
-    /// owner, same Brain identity, backup lineage and explicit restore
-    /// authority (§38.4, §38.5). Ordinary Agent-to-Agent sharing maps source
-    /// self to the *source Agent's* semantic identity instead.
-    pub fn may_map_self(&self) -> bool {
-        matches!(self, ImportMode::Restore)
-    }
-}
-
-/// The identity resolution order an import should follow (Spec §38.2).
-///
-/// Conservative on purpose: a source element id must never automatically become
-/// the destination local primary id (§38.1), and equal names are not equal
-/// identities (§38.3).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum IdentityResolution {
-    /// A prior verified import mapping.
-    PriorImportMapping,
-    /// A trusted `canonical_id`.
-    TrustedCanonicalId,
-    /// A mapping a human or policy explicitly approved.
-    ApprovedMapping,
-    /// A portable identity the Schema defines.
-    SchemaPortableIdentity,
-    /// Nothing matched; create a new Concept.
-    CreateNew,
-}
-
-impl IdentityResolution {
-    /// The resolution steps in the order §38.2 recommends trying them.
-    pub const ORDER: &'static [IdentityResolution] = &[
-        IdentityResolution::PriorImportMapping,
-        IdentityResolution::TrustedCanonicalId,
-        IdentityResolution::ApprovedMapping,
-        IdentityResolution::SchemaPortableIdentity,
-        IdentityResolution::CreateNew,
-    ];
-}
-
-/// A capsule-local reference map, from `ref` to whatever the caller resolved it
-/// to. Kept ordered so an import plan renders deterministically.
-pub type CapsuleRefMap = BTreeMap<String, String>;
 
 // ---------------------------------------------------------------------------
 // Canonical serialization (Spec §37.7)
@@ -585,16 +473,12 @@ mod tests {
             CapsulePayload {
                 manifest: CapsuleManifest {
                     kind: CapsuleKind::Snapshot,
-                    created_at: None,
-                    completeness: None,
                     closure: "closed".into(),
                     ..Default::default()
                 },
                 source: CapsuleSource {
-                    nexus_id: None,
                     space_ref: Some("space:project-kip".into()),
                     snapshot_seq: Some(8123),
-                    ..Default::default()
                 },
                 schema: vec![SchemaDependency {
                     package: "kip://core".into(),
@@ -714,22 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_verified_restore_may_map_self() {
-        // Spec §38.4/§38.5: ordinary sharing must not carry a source `$self`
-        // onto the destination's own identity.
-        for mode in [ImportMode::Preview, ImportMode::Isolate, ImportMode::Merge] {
-            assert!(!mode.may_map_self(), "{mode:?} must not map $self");
-        }
-        assert!(ImportMode::Restore.may_map_self());
-    }
-
-    #[test]
-    fn preview_creates_no_durable_state() {
-        assert!(!ImportMode::Preview.is_durable());
-        assert!(ImportMode::Merge.is_durable());
-    }
-
-    #[test]
     fn redacted_and_unavailable_stay_distinguishable() {
         // Spec §40.2: collapsing these loses whether the source *had* the thing.
         let redacted = serde_json::to_string(&ExternalRefKind::Redacted).unwrap();
@@ -737,18 +605,5 @@ mod tests {
         assert_eq!(redacted, r#""redacted""#);
         assert_eq!(unavailable, r#""unavailable""#);
         assert_ne!(redacted, unavailable);
-    }
-
-    #[test]
-    fn identity_resolution_tries_creation_last() {
-        assert_eq!(
-            IdentityResolution::ORDER.last(),
-            Some(&IdentityResolution::CreateNew)
-        );
-        assert_eq!(
-            IdentityResolution::ORDER.first(),
-            Some(&IdentityResolution::PriorImportMapping)
-        );
-        assert_eq!(IdentityResolution::ORDER.len(), 5);
     }
 }

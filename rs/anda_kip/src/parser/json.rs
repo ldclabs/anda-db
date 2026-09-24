@@ -10,13 +10,13 @@ use nom::{
     },
     combinator::{cut, map, map_opt, map_res, opt, recognize, value, verify},
     error::context,
-    multi::{fold, many0, separated_list0},
+    multi::{many0, separated_list0},
     number::complete::recognize_float,
     sequence::{delimited, pair, preceded, separated_pair, terminated},
 };
 use nom_language::error::{VerboseError, VerboseErrorKind};
-use std::collections::HashSet;
 
+use super::common::{key_fault, spanned};
 use crate::{Json, Map, Number};
 
 /// Parse a non-standard JSON:
@@ -77,17 +77,38 @@ pub(super) fn skip_ws_and_comments(input: &str) -> IResult<&str, (), VerboseErro
 fn string<'a>() -> impl Parser<&'a str, Output = String, Error = VerboseError<&'a str>> {
     context(
         "JSON string \"...\"",
-        preceded(
-            char('"'),
-            cut(terminated(
-                fold(0.., character(), String::new, |mut string, c| {
-                    string.push(c);
-                    string
-                }),
-                char('"'),
-            )),
-        ),
+        preceded(char('"'), cut(terminated(string_body, char('"')))),
     )
+}
+
+/// The characters of a string, up to (not including) whatever ends it.
+///
+/// A run of plain characters is copied in one slice; only an escape goes
+/// through [`character`]. Feeding every character through the combinator
+/// cost ~30 ns a byte, which a long Evidence payload written inline paid in
+/// full. What ends the run — a quote, a control character, a malformed escape
+/// — is left for the closing `"` to reject, exactly as before.
+fn string_body(input: &str) -> IResult<&str, String, VerboseError<&str>> {
+    let mut out = String::new();
+    let mut rest = input;
+    loop {
+        let run = rest
+            .find(|c: char| c == '"' || c == '\\' || c < '\u{20}')
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..run]);
+        rest = &rest[run..];
+        if !rest.starts_with('\\') {
+            return Ok((rest, out));
+        }
+        match character().parse(rest) {
+            Ok((next, c)) => {
+                out.push(c);
+                rest = next;
+            }
+            Err(nom::Err::Error(_)) => return Ok((rest, out)),
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 // It is not a standard JSON:
@@ -117,48 +138,6 @@ pub(super) fn identifier<'a>()
     ))
 }
 
-/// An object key paired with the input position where it starts, so that
-/// duplicate-key errors can point at the offending key instead of at the
-/// start of the enclosing object.
-pub(super) type SpannedKey<'a> = (&'a str, String);
-
-/// Wraps a key parser so that it also captures the input slice at which the
-/// key starts. Used with [`ensure_unique_keys`] to anchor duplicate-key
-/// errors at the duplicated key itself.
-pub(super) fn spanned<'a, O, F>(
-    mut f: F,
-) -> impl Parser<&'a str, Output = (&'a str, O), Error = VerboseError<&'a str>>
-where
-    F: Parser<&'a str, Output = O, Error = VerboseError<&'a str>>,
-{
-    move |input: &'a str| {
-        let (rest, value) = f.parse(input)?;
-        Ok((rest, (input, value)))
-    }
-}
-
-/// Rejects duplicate keys in an object literal.
-///
-/// In an LLM-facing protocol, a duplicate key is almost always a generation
-/// error; silently keeping the last value would mask it, so parsing fails
-/// (`nom::Err::Failure` anchored at the first duplicated key occurrence).
-pub(super) fn ensure_unique_keys<'a, V>(
-    entries: &[(SpannedKey<'a>, V)],
-) -> Result<(), nom::Err<VerboseError<&'a str>>> {
-    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
-    for ((position, key), _) in entries {
-        if !seen.insert(key.as_str()) {
-            return Err(nom::Err::Failure(VerboseError {
-                errors: vec![(
-                    *position,
-                    VerboseErrorKind::Context("duplicate key in object (keys must be unique)"),
-                )],
-            }));
-        }
-    }
-    Ok(())
-}
-
 fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = VerboseError<&'a str>> {
     context("JSON object { key: value, ... }", |input: &'a str| {
         let (remaining, key_values) = delimited(
@@ -180,7 +159,18 @@ fn object<'a>() -> impl Parser<&'a str, Output = Map<String, Json>, Error = Verb
             cut(char('}')),
         )
         .parse(input)?;
-        ensure_unique_keys(&key_values)?;
+        // In an LLM-facing protocol a duplicate key is almost always a
+        // generation error; keeping the last value would mask it.
+        if let Some((index, _)) =
+            key_fault(key_values.iter().map(|((_, key), _)| key.as_str()), false)
+        {
+            return Err(nom::Err::Failure(VerboseError {
+                errors: vec![(
+                    key_values[index].0.0,
+                    VerboseErrorKind::Context("duplicate key in object (keys must be unique)"),
+                )],
+            }));
+        }
         Ok((
             remaining,
             key_values.into_iter().map(|((_, k), v)| (k, v)).collect(),

@@ -12,7 +12,7 @@ use nom::{
 };
 
 use super::common::{
-    Flavor, VResult, bound_object, dot_path_var, fail, identifier, opt_after, parenthesized,
+    Flavor, VResult, bound_object, dot_path_var, fail, identifier, named, opt_after, parenthesized,
     scalar, where_block, word, words, ws,
 };
 use crate::ast::{
@@ -80,30 +80,38 @@ pub(crate) fn as_of_clause(input: &str) -> VResult<'_, AsOf> {
 /// `projection_expression = aggregate_expression | expression`
 ///
 /// Both spellings must resolve to one variable plus a path: a projection names
-/// a column, and an arbitrary expression has no column to name.
-fn find_expression(input: &str) -> VResult<'_, FindExpression> {
-    if let Ok((rest, (func, distinct, var))) = aggregate_call(input) {
-        return Ok((
-            rest,
-            FindExpression::Aggregation {
-                func,
-                var,
-                distinct,
-            },
-        ));
-    }
-    map(dot_path_var, FindExpression::Variable).parse(input)
-}
-
-/// `order_item = projection_expression [ "ASC" | "DESC" ]`
-fn order_item(input: &str) -> VResult<'_, OrderByItem> {
-    let (input, (variable, aggregation, distinct)) = alt((
+/// a column, and an arbitrary expression has no column to name. `FIND` and
+/// `ORDER BY` name the same columns, so they read them with the same rule.
+fn projection_expression(
+    input: &str,
+) -> VResult<'_, (DotPathVar, Option<AggregationFunction>, bool)> {
+    alt((
         map(aggregate_call, |(func, distinct, var)| {
             (var, Some(func), distinct)
         }),
         map(dot_path_var, |var| (var, None, false)),
     ))
-    .parse(input)?;
+    .parse(input)
+}
+
+fn find_expression(input: &str) -> VResult<'_, FindExpression> {
+    map(
+        projection_expression,
+        |(var, aggregation, distinct)| match aggregation {
+            Some(func) => FindExpression::Aggregation {
+                func,
+                var,
+                distinct,
+            },
+            None => FindExpression::Variable(var),
+        },
+    )
+    .parse(input)
+}
+
+/// `order_item = projection_expression [ "ASC" | "DESC" ]`
+fn order_item(input: &str) -> VResult<'_, OrderByItem> {
+    let (input, (variable, aggregation, distinct)) = projection_expression(input)?;
     let (input, direction) = opt(ws(alt((
         value(OrderDirection::Asc, word("ASC")),
         value(OrderDirection::Desc, word("DESC")),
@@ -123,14 +131,16 @@ fn order_item(input: &str) -> VResult<'_, OrderByItem> {
 
 /// `aggregate_expression = aggregate_name "(" [ "DISTINCT" ] expression ")"`
 fn aggregate_call(input: &str) -> VResult<'_, (AggregationFunction, bool, DotPathVar)> {
+    const AGGREGATES: &[(&str, AggregationFunction)] = &[
+        ("COUNT", AggregationFunction::Count),
+        ("SUM", AggregationFunction::Sum),
+        ("AVG", AggregationFunction::Avg),
+        ("MIN", AggregationFunction::Min),
+        ("MAX", AggregationFunction::Max),
+    ];
     let (rest, name) = identifier(input)?;
-    let func = match name.to_ascii_uppercase().as_str() {
-        "COUNT" => AggregationFunction::Count,
-        "SUM" => AggregationFunction::Sum,
-        "AVG" => AggregationFunction::Avg,
-        "MIN" => AggregationFunction::Min,
-        "MAX" => AggregationFunction::Max,
-        _ => return fail(input, "an aggregate: COUNT, SUM, AVG, MIN or MAX"),
+    let Some(func) = named(AGGREGATES, name) else {
+        return fail(input, "an aggregate: COUNT, SUM, AVG, MIN or MAX");
     };
     let (rest, (distinct, var)) = cut(parenthesized((
         map(opt(ws(word("DISTINCT"))), |d| d.is_some()),
@@ -215,6 +225,17 @@ mod tests {
             let err = crate::parse_kql(source).expect_err("not a history axis");
             assert!(err.message.contains("SEQ"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_malformed_aggregate_is_reported_where_it_breaks() {
+        // The projection is committed once the aggregate's name is read, so
+        // the error points inside the call rather than at a missing `?var`.
+        let err = crate::parse_kql(r#"FIND(COUNT(?x.)) WHERE { ?x {a: 1} }"#)
+            .expect_err("truncated path");
+        assert!(err.message.contains("column 15"), "{err}");
+        assert!(!err.message.contains("a variable such as"), "{err}");
+        assert!(crate::parse_kql(r#"find(count(?x)) where { ?x {a: 1} }"#).is_ok());
     }
 
     #[test]

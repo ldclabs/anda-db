@@ -267,15 +267,7 @@ fn compare(left: &Binding, right: &Binding, operator: ComparisonOperator) -> boo
 }
 
 fn arity(func: FilterFunction, count: usize) -> Result<(), KipError> {
-    let valid = match func {
-        FilterFunction::IsNull
-        | FilterFunction::IsNotNull
-        | FilterFunction::IsElement
-        | FilterFunction::IsLiteral => count == 1,
-        FilterFunction::LiteralType => count == 1 || count == 2,
-        _ => count == 2,
-    };
-    if valid {
+    if func.arity().contains(&count) {
         Ok(())
     } else {
         Err(KipError::invalid_syntax(format!(

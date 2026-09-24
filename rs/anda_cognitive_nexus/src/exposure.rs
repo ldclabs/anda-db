@@ -154,10 +154,7 @@ impl Session {
                     _id: 0,
                     space: space.to_string(),
                     element: element.id().to_string(),
-                    exposure: match entry.exposure {
-                        Exposure::Retrieved => "retrieved".into(),
-                        Exposure::Used => "used".into(),
-                    },
+                    exposure: entry.exposure.as_str().into(),
                     snapshot_seq: entry.snapshot_seq,
                     recorded_at: recorded_at.clone(),
                     principal_id: self.auth.principal_id.clone(),
@@ -264,11 +261,7 @@ impl Session {
                 records.push(ExposureRecord {
                     space_id: row.space,
                     element_id: row.element,
-                    exposure: if row.exposure == "used" {
-                        Exposure::Used
-                    } else {
-                        Exposure::Retrieved
-                    },
+                    exposure: Exposure::from_wire(&row.exposure).unwrap_or(Exposure::Retrieved),
                     snapshot_seq: row.snapshot_seq,
                     recorded_at: row.recorded_at,
                     principal_id: row.principal_id,

@@ -1035,11 +1035,11 @@ mod tests {
             .as_array()
             .map(|list| list.iter().filter_map(Json::as_str).collect())
             .unwrap_or_default();
-        let claimed: Vec<&str> = CONFORMANCE_PROFILES.iter().map(|p| p.name()).collect();
+        let claimed: Vec<&str> = CONFORMANCE_PROFILES.iter().map(|p| p.as_str()).collect();
         assert_eq!(profiles, claimed);
         for name in profiles {
             assert!(
-                anda_kip::ConformanceProfile::from_name(name).is_some(),
+                anda_kip::ConformanceProfile::from_wire(name).is_some(),
                 "{name} is not a level §89 names"
             );
         }

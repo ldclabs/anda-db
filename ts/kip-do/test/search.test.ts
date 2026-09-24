@@ -169,6 +169,14 @@ describe('SEARCH', () => {
         nexus.query('FIND(?x) WHERE { ?x CONCEPT {} NOT { ?y SEARCH CONCEPT "x" LIMIT 1 } }'),
       ).toThrow()
       expect(() => nexus.query('FIND(?x) WHERE { ?x SEARCH CONCEPT "x" }')).toThrow()
+      // The mode is the META SEARCH registry, refused before execution the
+      // same way META refuses it — in a nested block too.
+      for (const query of [
+        'FIND(?x) WHERE { ?x SEARCH CONCEPT "x" MODE "fuzzy" LIMIT 5 }',
+        'FIND(?x) WHERE { ?y CONCEPT {} OPTIONAL { ?x SEARCH CONCEPT "x" MODE "fuzzy" LIMIT 5 } }',
+      ]) {
+        expect(() => nexus.query(query)).toThrow(/SEARCH MODE must be one of/)
+      }
     })
   })
 

@@ -31,8 +31,9 @@ use crate::ast::{Json, Map};
 /// Engine-maintained `_system` members ordinary KML must never write (§6.3).
 ///
 /// These are the members *inside* `_system`. The top-level field names a
-/// mutation may not assign to at all — `_system` itself among them — are
-/// [`crate::parser::PROTECTED_FIELDS`], which is what the parser checks.
+/// mutation may not assign to at all — `_system` itself among them — are the
+/// parser's own protected-field list, which is what every assignment is
+/// checked against.
 pub const PROTECTED_SYSTEM_FIELDS: &[&str] = &[
     "version",
     "created_at",
@@ -943,24 +944,24 @@ pub struct ChangeEntry {
     pub extensions: Option<Map<String, Json>>,
 }
 
-/// The operations a Change Envelope entry records (Spec §36.1).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeOp {
-    /// The element was created.
-    Create,
-    /// Mutable state changed.
-    Update,
-    /// The lifecycle status moved (`TRANSITION`).
-    Lifecycle,
-    /// The retention record changed.
-    Retention,
-    /// The Concept was merged into another.
-    Merge,
-    /// The element was physically erased.
-    Purge,
-    /// The Evidence payload was erased; the record survives.
-    PayloadPurge,
+wire_enum! {
+    /// The operations a Change Envelope entry records (Spec §36.1).
+    pub enum ChangeOp {
+        /// The element was created.
+        Create = "create",
+        /// Mutable state changed.
+        Update = "update",
+        /// The lifecycle status moved (`TRANSITION`).
+        Lifecycle = "lifecycle",
+        /// The retention record changed.
+        Retention = "retention",
+        /// The Concept was merged into another.
+        Merge = "merge",
+        /// The element was physically erased.
+        Purge = "purge",
+        /// The Evidence payload was erased; the record survives.
+        PayloadPurge = "payload_purge",
+    }
 }
 
 /// A lifecycle move, as an entry records it.
@@ -1071,8 +1072,11 @@ mod tests {
                     "kip/not-a-value".parse::<$ty>().is_err(),
                     "{label}: FromStr"
                 );
+                // Built from a real spelling: a derived enum rejects an
+                // unknown name either way, and accepts `{"<name>": null}`.
+                let tagged = serde_json::json!({ names[0]: null });
                 assert!(
-                    serde_json::from_str::<$ty>(r#"{"kip/not-a-value":null}"#).is_err(),
+                    serde_json::from_value::<$ty>(tagged).is_err(),
                     "{label}: a wire vocabulary is a string, never a tagged map"
                 );
 
@@ -1093,6 +1097,31 @@ mod tests {
         check!(crate::request::SearchMode);
         check!(crate::conformance::ConformanceProfile);
         check!(crate::conformance::ConformanceArea);
+        check!(ChangeOp);
+        check!(crate::request::ExecutionMode);
+        check!(crate::request::OnError);
+        check!(crate::request::TopLevelStatus);
+        check!(crate::request::OperationStatus);
+        check!(crate::request::ReceiptStatus);
+        check!(crate::capsule::CapsuleKind);
+        check!(crate::capsule::ExternalRefKind);
+        check!(crate::cognitive::RepairReason);
+        check!(crate::cognitive::Exposure);
+        check!(crate::memory::binding::Bundle);
+        check!(crate::memory::binding::Operation);
+        check!(crate::memory::binding::RecallMode);
+        check!(crate::memory::binding::RecallDetail);
+        check!(crate::memory::binding::ChangeKind);
+        check!(crate::memory::binding::ForgetMode);
+        check!(crate::memory::binding::Status);
+        check!(crate::memory::binding::Phase);
+        check!(crate::memory::binding::Disposition);
+        check!(crate::memory::binding::ForgetStatus);
+        check!(crate::memory::binding::ItemRole);
+        check!(crate::memory::binding::EpistemicStatus);
+        check!(crate::memory::binding::Standing);
+        check!(crate::memory::binding::ChannelState);
+        check!(crate::memory::binding::AttentionKind);
     }
 
     #[test]

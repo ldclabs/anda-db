@@ -2,47 +2,12 @@
 //! may satisfy a package's missing transitive dependency (KIP §20.5).
 use super::SchemaPackage;
 use anda_kip::{Json, KipError, KipErrorCode};
-use jsonschema::{Retrieve, Uri, Validator};
+use jsonschema::Validator;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     sync::{Arc, LazyLock, RwLock},
 };
-
-const DOCUMENTS: &[&str] = &[
-    anda_kip::PROJECTION_SCHEMA,
-    anda_kip::COGNITIVE_RECORDS_SCHEMA,
-    anda_kip::ELEMENT_SCHEMA,
-    anda_kip::CAPSULE_SCHEMA,
-    anda_kip::SCHEMA_PACKAGE_SCHEMA,
-    anda_kip::CHANGE_ENVELOPE_SCHEMA,
-    anda_kip::MEMORY_SCHEMA,
-    anda_kip::COMMON_SCHEMA,
-];
-
-static CATALOG: LazyLock<BTreeMap<String, Json>> = LazyLock::new(|| {
-    DOCUMENTS
-        .iter()
-        .map(|s| {
-            let value = anda_kip::parse_canonical_json(s).expect("vendored strict schema");
-            (value["$id"].as_str().expect("schema id").to_string(), value)
-        })
-        .collect()
-});
-
-#[derive(Clone)]
-struct Locked(BTreeMap<String, Json>);
-impl Retrieve for Locked {
-    fn retrieve(
-        &self,
-        uri: &Uri<String>,
-    ) -> Result<Json, Box<dyn std::error::Error + Send + Sync>> {
-        self.0
-            .get(uri.as_str())
-            .cloned()
-            .ok_or_else(|| format!("unpinned schema resource {uri}").into())
-    }
-}
 
 pub fn digest(value: &Json) -> Result<String, KipError> {
     Ok(format!(
@@ -78,20 +43,9 @@ pub fn verify_artifact(value: &Json) -> Result<(), KipError> {
 }
 
 fn compile(schema: &Json, resources: &BTreeMap<String, Json>) -> Result<Validator, KipError> {
-    jsonschema::options()
-        .with_draft(jsonschema::Draft::Draft202012)
-        .should_validate_formats(true)
-        .with_format("date-time", |value| {
-            anda_kip::timestamp::parse(value, "value_schema").is_ok()
-        })
-        .with_format("timestamp", |value| {
-            anda_kip::timestamp::parse(value, "value_schema").is_ok()
-        })
-        .with_retriever(Locked(resources.clone()))
-        .build(schema)
-        .map_err(|e| {
-            KipError::unsupported_capability(format!("unavailable value_schema contract: {e}"))
-        })
+    anda_kip::schema_validator(schema, resources.clone()).map_err(|e| {
+        KipError::unsupported_capability(format!("unavailable value_schema contract: {e}"))
+    })
 }
 
 /// Visit every schema reference, including unused definitions and HTTPS IDs.
@@ -180,7 +134,7 @@ pub fn validate_package(package: &SchemaPackage) -> Result<(), KipError> {
             let id = pin["id"]
                 .as_str()
                 .ok_or_else(|| KipError::type_mismatch("schema pin needs id"))?;
-            let schema = CATALOG.get(id).ok_or_else(|| {
+            let schema = anda_kip::vendored_schemas().get(id).ok_or_else(|| {
                 KipError::unsupported_capability(format!("validation schema unavailable: {id}"))
             })?;
             if pin["content_digest"].as_str() != Some(digest(schema)?.as_str()) {
@@ -220,7 +174,7 @@ pub fn validate_value(schema: &Json, value: &Json) -> Result<(), KipError> {
     let validator = match cached {
         Some(v) => v,
         None => {
-            let validator = Arc::new(compile(schema, &CATALOG)?);
+            let validator = Arc::new(compile(schema, anda_kip::vendored_schemas())?);
             VALIDATORS.write().unwrap().insert(key, validator.clone());
             validator
         }
@@ -249,7 +203,10 @@ fn timestamp_type_error(error: &jsonschema::ValidationError<'_>, schema: &Json) 
     }
     let location = error.absolute_keyword_location().map(|uri| uri.as_str());
     let (root, path) = match location.and_then(|s| s.split_once('#')) {
-        Some((id, path)) => (CATALOG.get(id).unwrap_or(schema), path.to_string()),
+        Some((id, path)) => (
+            anda_kip::vendored_schemas().get(id).unwrap_or(schema),
+            path.to_string(),
+        ),
         None => (schema, error.schema_path().to_string()),
     };
     path.rsplit_once('/')

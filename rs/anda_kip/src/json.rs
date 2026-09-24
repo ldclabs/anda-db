@@ -31,6 +31,13 @@ pub(crate) fn validate_number(number: &Number) -> Result<(), KipError> {
 /// Validate the source token before serde or an adapter discards its digits.
 pub fn portable_number(source: &str) -> Result<Number, String> {
     serde_json::from_str::<Number>(source).map_err(|_| "invalid JSON number syntax".to_string())?;
+    normalized(safe_value(source)?).ok_or_else(|| "non-finite JSON number".into())
+}
+
+/// The binary64 a number token denotes, when kip-jcs-safe-v1 admits it: finite,
+/// integral only within ±(2^53 − 1), and not a nonzero spelling that rounds to
+/// zero. Syntax is not checked here — the caller's decoder rejects that.
+fn safe_value(source: &str) -> Result<f64, String> {
     let value: f64 = source
         .parse()
         .map_err(|_| "invalid JSON number".to_string())?;
@@ -47,10 +54,16 @@ pub fn portable_number(source: &str) -> Result<Number, String> {
     {
         return Err("nonzero JSON number underflows to zero".into());
     }
+    Ok(value)
+}
+
+/// An admitted value as a JSON number: integral values are integers, so `1.0`
+/// and `1` are one number, as they are in canonical bytes.
+fn normalized(value: f64) -> Option<Number> {
     if value.fract() == 0.0 {
-        Ok(Number::from(value as i64))
+        Some(Number::from(value as i64))
     } else {
-        Number::from_f64(value).ok_or_else(|| "non-finite JSON number".into())
+        Number::from_f64(value)
     }
 }
 
@@ -86,6 +99,7 @@ pub fn validate_json(value: &Json) -> Result<(), KipError> {
 /// lossy numeric source tokens. `&str` already guarantees valid UTF-8.
 pub fn parse_canonical_json(source: &str) -> Result<Json, KipError> {
     // Scan outside strings, before the deserializer can round/underflow numbers.
+    // Each token is read once, as a value; its syntax is serde's to reject.
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut quoted = false;
@@ -104,7 +118,7 @@ pub fn parse_canonical_json(source: &str) -> Result<Json, KipError> {
                 {
                     i += 1;
                 }
-                portable_number(&source[start..i]).map_err(KipError::invalid_request_envelope)?;
+                safe_value(&source[start..i]).map_err(KipError::invalid_request_envelope)?;
             }
             _ => i += 1,
         }
@@ -138,7 +152,8 @@ impl<'de> Deserialize<'de> for StrictValue {
                 Ok(StrictValue(v.into()))
             }
             fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                let number = portable_number(&v.to_string()).map_err(E::custom)?;
+                // The scan already admitted the token this value came from.
+                let number = normalized(v).ok_or_else(|| E::custom("non-finite JSON number"))?;
                 Ok(StrictValue(Json::Number(number)))
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -201,5 +216,23 @@ mod tests {
         ] {
             assert!(parse_canonical_json(source).is_ok(), "{source}");
         }
+    }
+
+    #[test]
+    fn admitted_numbers_decode_to_the_value_written() {
+        // Integral spellings collapse to integers; every other admitted float
+        // is the exact binary64 serde itself reads.
+        assert_eq!(
+            parse_canonical_json("[1.0, 1e2, -0]").unwrap(),
+            serde_json::json!([1, 100, 0])
+        );
+        let floats: Vec<f64> = (1..2000)
+            .map(|i| (i as f64 * 0.618_033_988_7).sin() / 7.0)
+            .collect();
+        let source = serde_json::to_string(&floats).unwrap();
+        assert_eq!(
+            parse_canonical_json(&source).unwrap(),
+            serde_json::from_str::<Json>(&source).unwrap()
+        );
     }
 }

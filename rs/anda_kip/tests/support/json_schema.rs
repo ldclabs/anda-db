@@ -4,28 +4,18 @@
 use jsonschema::{Retrieve, Uri, Validator};
 use serde_json::Value;
 
+/// The crate's own closed resource set (`anda_kip::vendored_schemas`), so a
+/// test resolves exactly the references a runtime validator would.
 struct Vendored;
 impl Retrieve for Vendored {
     fn retrieve(
         &self,
         uri: &Uri<String>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        for source in [
-            anda_kip::ELEMENT_SCHEMA,
-            anda_kip::CAPSULE_SCHEMA,
-            anda_kip::PROJECTION_SCHEMA,
-            anda_kip::COGNITIVE_RECORDS_SCHEMA,
-            anda_kip::CHANGE_ENVELOPE_SCHEMA,
-            anda_kip::SCHEMA_PACKAGE_SCHEMA,
-            anda_kip::MEMORY_SCHEMA,
-            anda_kip::COMMON_SCHEMA,
-        ] {
-            let schema: Value = serde_json::from_str(source)?;
-            if schema["$id"] == uri.as_str() {
-                return Ok(schema);
-            }
-        }
-        Err(format!("unregistered schema {uri}").into())
+        anda_kip::vendored_schemas()
+            .get(uri.as_str())
+            .cloned()
+            .ok_or_else(|| format!("unregistered schema {uri}").into())
     }
 }
 

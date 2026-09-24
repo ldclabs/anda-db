@@ -77,11 +77,8 @@ capsule.rs: const CAPSULE_FORMAT
 capsule.rs: const CAPSULE_VERSION
 capsule.rs: enum CapsuleKind
 capsule.rs: enum ExternalRefKind
-capsule.rs: enum IdentityResolution
-capsule.rs: enum ImportMode
 capsule.rs: fn canonical_json
 capsule.rs: fn try_canonical_json
-capsule.rs: struct BlobRef
 capsule.rs: struct Capsule
 capsule.rs: struct CapsuleHandling
 capsule.rs: struct CapsuleIntegrity
@@ -92,7 +89,6 @@ capsule.rs: struct CapsuleSource
 capsule.rs: struct ExternalRef
 capsule.rs: struct SchemaDependency
 capsule.rs: type CapsuleProof
-capsule.rs: type CapsuleRefMap
 cognitive.rs: enum Exposure
 cognitive.rs: enum RepairReason
 cognitive.rs: fn evaluate_binary_rule
@@ -108,6 +104,8 @@ cognitive.rs: struct RecordingRepair
 cognitive.rs: struct RecordingValidity
 cognitive.rs: trait EvaluationRule
 conformance.rs: const PROTOCOL_SURFACE
+conformance.rs: enum ConformanceArea
+conformance.rs: enum ConformanceProfile
 conformance.rs: fn capability_engine_names
 conformance.rs: fn capability_registry_names
 draft.rs: const DRAFT_ATTRIBUTE_TYPES
@@ -118,6 +116,8 @@ draft.rs: const DRAFT_PREDICATE_MEMBERS
 draft.rs: const DRAFT_TYPE_MEMBERS
 draft.rs: fn check_draft_definition
 draft.rs: fn draft_symbol_ref
+error.rs: enum ErrorCategory
+error.rs: enum RetryClass
 error.rs: struct ErrorObject
 error.rs: struct KipError
 error.rs: struct RetryInfo
@@ -133,6 +133,7 @@ json.rs: fn portable_number
 json.rs: fn validate_json
 lib.rs: mod ast
 lib.rs: mod capsule
+lib.rs: mod cognitive
 lib.rs: mod conformance
 lib.rs: mod draft
 lib.rs: mod error
@@ -182,7 +183,9 @@ memory.rs: const RESPONSE_SCHEMA
 memory.rs: const SCHEMA_PACKAGE_SCHEMA
 memory.rs: const VALIDATED_LEARNING
 memory.rs: fn memory_bundles
+memory.rs: fn schema_validator
 memory.rs: fn validate_memory_bundles
+memory.rs: fn vendored_schemas
 memory.rs: mod binding
 memory.rs: struct MemoryBundle
 memory.rs: use binding::{MemorySession, MemorySessionSnapshot};
@@ -244,6 +247,7 @@ request.rs: enum OnError
 request.rs: enum OperationStatus
 request.rs: enum PolicyVersion
 request.rs: enum ReceiptStatus
+request.rs: enum SearchMode
 request.rs: enum TopLevelStatus
 request.rs: enum Warning
 request.rs: mod limits
@@ -289,6 +293,7 @@ semantics.rs: fn core_structural_owner
 semantics.rs: struct Diagnostic
 timestamp.rs: const FORMAT
 timestamp.rs: fn parse
+timestamp.rs: fn parse_value
 timestamp.rs: fn validate_value
 types.rs: const ACTIVITY_CLASSES
 types.rs: const AUTHORITY_CLASSES
@@ -296,7 +301,12 @@ types.rs: const CHANGE_TRANSITION_EXTENSION
 types.rs: const EVIDENCE_CLASSES
 types.rs: const PROTECTED_SYSTEM_FIELDS
 types.rs: const SCORE_SEMANTICS
+types.rs: enum AssertionMode
+types.rs: enum AssertionStatus
+types.rs: enum BeliefStatus
 types.rs: enum ChangeOp
+types.rs: enum ElementKind
+types.rs: enum Stance
 types.rs: enum TimePoint
 types.rs: struct Activity
 types.rs: struct Assertion

@@ -1,7 +1,5 @@
 //! Shape checks shared by text parsing and transported executable ASTs.
-use std::collections::BTreeSet;
-
-use super::common::Flavor;
+use super::common::{Flavor, key_fault};
 use crate::KipError;
 use crate::ast::*;
 
@@ -30,16 +28,13 @@ pub(super) fn bound(value: &BoundValue) -> Result<(), KipError> {
 }
 
 pub(super) fn entries_unique(entries: &[(String, BoundValue)]) -> Result<(), KipError> {
-    let mut seen = BTreeSet::new();
-    for (key, value) in entries {
-        if !seen.insert(key) {
-            return Err(KipError::invalid_syntax(format!(
-                "duplicate object key {key:?}"
-            )));
-        }
-        bound(value)?;
+    if let Some((index, _)) = key_fault(entries.iter().map(|(key, _)| key.as_str()), false) {
+        return Err(KipError::invalid_syntax(format!(
+            "duplicate object key {:?}",
+            entries[index].0
+        )));
     }
-    Ok(())
+    entries.iter().try_for_each(|(_, value)| bound(value))
 }
 
 pub(super) fn bound_object(object: &BoundObject) -> Result<(), KipError> {

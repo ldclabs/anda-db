@@ -169,7 +169,6 @@ pub async fn export(
                     ExternalRefKind::Unavailable
                 },
                 identity: Some(serde_json::json!({"id": id.to_string()})),
-                reason: None,
             });
             continue;
         }
@@ -195,10 +194,6 @@ pub async fn export(
                 reference: referenced.to_string(),
                 kind: ExternalRefKind::SourceElement,
                 identity: Some(serde_json::json!({"id": referenced.to_string()})),
-                reason: Some(format!(
-                    "outside the {} closure of this export",
-                    closure.as_str()
-                )),
             });
         }
     }
@@ -222,23 +217,14 @@ pub async fn export(
     let payload = CapsulePayload {
         manifest: CapsuleManifest {
             kind: CapsuleKind::Snapshot,
-            created_at: None,
             roots: ids.iter().map(ToString::to_string).collect(),
             base_seq: None,
             target_seq: None,
-            // `partial` unless the closure ran and nothing was dropped: a
-            // Capsule that claimed completeness it does not have would import
-            // as a graph the destination believes is whole.
-            completeness: None,
             closure: closure.as_str().into(),
         },
         source: CapsuleSource {
-            nexus_id: Some(cx.store.db.name().to_string()),
             space_ref: Some(space.space_id.clone()),
             snapshot_seq: Some(space.seq),
-            base_seq: None,
-            target_seq: Some(space.seq),
-            schema_environment_version: Some(cx.env.version),
         },
         // §20.4: the exact refs travel with the records. A Capsule that
         // exported local names would arrive meaning whatever the destination
@@ -259,7 +245,6 @@ pub async fn export(
                 Map::from_iter([("anda/source_control".into(), Json::Object(source_control))])
             },
         },
-        extensions: Map::new(),
     };
 
     let digest = payload_digest(&payload)?;
@@ -717,8 +702,6 @@ mod tests {
         let payload = CapsulePayload {
             manifest: CapsuleManifest {
                 kind: CapsuleKind::Snapshot,
-                created_at: Some("2026-08-16T00:00:00.000Z".into()),
-                completeness: Some("roots_only".into()),
                 closure: "selective".into(),
                 ..Default::default()
             },

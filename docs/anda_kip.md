@@ -703,12 +703,12 @@ construct records with `CapsuleRecords(vec![...])`. Put handling members in
 `CapsuleHandling.extra` and proof members in `CapsuleProof`'s map. When building
 `CapsuleIntegrity` directly, supply its optional `covers` field.
 
-`ImportMode` is `preview` / `isolate` / `merge` / `restore`, and
-`ImportMode::may_map_self()` is true only for `restore`: source `$self` must
-never silently become destination `$self`. `IdentityResolution::ORDER` encodes
-the conservative resolution sequence, ending in "create new".
-`ExternalRefKind` keeps `redacted` (the source withheld it) distinguishable
-from `unavailable` (the source does not have it).
+The frame types carry exactly the members `kip-capsule.schema.json` admits:
+`CapsuleSource` is `space_id` plus `snapshot_seq`, a delta's `base_seq` /
+`target_seq` live on the manifest, and an `ExternalRef` is `id`, `kind` and an
+optional `locator`. `ExternalRefKind` keeps `redacted` (the source withheld
+it) distinguishable from `unavailable` (the source does not have it). Import
+modes and identity resolution are the engine's; this crate models the artifact.
 
 ---
 

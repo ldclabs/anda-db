@@ -573,7 +573,7 @@ Evidence    evidence_class  payload  content_digest  media_type
 直接构造 `CapsuleIntegrity` 时需要提供新增的可选 `covers` 字段。
 
 
-`ImportMode` 包括 `preview` / `isolate` / `merge` / `restore`，且 `ImportMode::may_map_self()` 仅在 `restore` 模式下为 true：源端 `$self` 严禁静默映射为目标端 `$self`。`IdentityResolution::ORDER` 规定了保守的冲突解决序列，最终落脚于“新建实体”。`ExternalRefKind` 明确区分 `redacted`（源端刻意隐匿）与 `unavailable`（源端本身缺失）。
+帧类型只携带 `kip-capsule.schema.json` 允许的成员：`CapsuleSource` 是 `space_id` 加 `snapshot_seq`，delta 的 `base_seq` / `target_seq` 位于 manifest，`ExternalRef` 是 `id`、`kind` 和可选的 `locator`。`ExternalRefKind` 明确区分 `redacted`（源端刻意隐匿）与 `unavailable`（源端本身缺失）。导入模式与身份解析属于引擎，本 crate 只建模制品本身。
 
 ---
 

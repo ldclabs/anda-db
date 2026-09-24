@@ -109,7 +109,7 @@ impl HostCapabilities {
 fn claims_level(level: &str) -> bool {
     super::CONFORMANCE_PROFILES
         .iter()
-        .any(|profile| profile.name() == level)
+        .any(|profile| profile.as_str() == level)
 }
 
 #[cfg(test)]

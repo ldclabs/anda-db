@@ -214,6 +214,41 @@ for the parser, the executable AST and stored draft Spaces.
   feature validates requests, responses and descriptors against the vendored
   schemas. New `REQUEST_SCHEMA` / `RESPONSE_SCHEMA` constants and
   `anda_kip::cognitive::{RecordingRepair, RecordingValidity, ExposureRecord}`.
+- **Fixed — Search Pattern `MODE`:** `?x SEARCH … MODE "fuzzy" LIMIT k` is
+  refused with `ConstraintViolation` at parse time in both engines, exactly as
+  the META `SEARCH` form already was, wherever in the WHERE block it sits.
+  Previously it parsed and failed at execution as `SearchModeUnsupported`.
+- **Breaking — wire vocabularies are strings only (`anda_kip`):** the 25
+  enums that still used a serde derive (`ExecutionMode`, `OnError`, the
+  response statuses, `ChangeOp`, `CapsuleKind`, `ExternalRefKind`,
+  `RepairReason`, `Exposure` and the Memory Interface enums) are declared with
+  `wire_enum!`, so the externally-tagged form `{"sequence": null}` is refused
+  and each gains `ALL` / `NAMES` / `from_wire` / `FromStr`. `Operation.language`
+  accepts exactly `KQL`, `KML` or `META`; any other label is
+  `InvalidRequestEnvelope` instead of a `LanguageMismatch`. `CommandType`
+  converts from a `Command` through `From<&Command>`, and its `FromStr`
+  refuses unknown labels.
+- **Breaking — Capsule frame (`anda_kip`):** the members that were never
+  serialized are removed — `CapsulePayload.extensions`,
+  `CapsuleManifest.created_at` / `completeness`, `CapsuleSource.nexus_id` /
+  `base_seq` / `target_seq` / `schema_environment_version` and
+  `ExternalRef.reason` — as are the unused `BlobRef`, `CapsuleRefMap`,
+  `ImportMode` and `IdentityResolution`. A `CapsuleSource` without a Space no
+  longer serializes `"space_id": null`.
+- **Changed — `anda_kip` API:** `FilterFunction::arity()` states each filter
+  function's argument count, and the Rust engine checks calls against it;
+  `ConformanceProfile::name` / `from_name` are removed in favour of `as_str` /
+  `from_wire`; `memory_bundles()` returns a cached `&'static` map;
+  `timestamp::parse_value` parses a JSON timestamp. `vendored_schemas()` is
+  the closed schema catalog and, with `schema-validation`,
+  `schema_validator()` compiles against it with the KIP timestamp formats —
+  shared by the Memory Interface validators and the engine's Schema Package
+  contracts.
+- **Performance — `anda_kip`:** `parse_canonical_json` reads each number
+  token once (a 1536-float embedding decodes ~4.5× faster); string literals
+  are copied a run at a time instead of a character at a time (~11× on a
+  250 KB literal); a request carrying a pre-parsed `ast` serializes it for its
+  number check once instead of three times (about half the preparation time).
 
 ### Storage and index crates
 

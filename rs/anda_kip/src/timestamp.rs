@@ -32,12 +32,17 @@ pub fn parse(value: &str, field: &str) -> Result<DateTime<Utc>, KipError> {
         .map_err(|_| invalid())
 }
 
-/// Checks a JSON timestamp. Callers decide whether absence/null is permitted.
-pub fn validate_value(value: &Json, field: &str) -> Result<(), KipError> {
+/// Parses a JSON timestamp. Callers decide whether absence/null is permitted.
+pub fn parse_value(value: &Json, field: &str) -> Result<DateTime<Utc>, KipError> {
     let text = value
         .as_str()
         .ok_or_else(|| KipError::type_mismatch(format!("`{field}` must be a timestamp string")))?;
-    parse(text, field).map(|_| ())
+    parse(text, field)
+}
+
+/// Checks a JSON timestamp. Callers decide whether absence/null is permitted.
+pub fn validate_value(value: &Json, field: &str) -> Result<(), KipError> {
+    parse_value(value, field).map(|_| ())
 }
 
 #[cfg(test)]

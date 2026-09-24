@@ -48,7 +48,7 @@ use std::fmt;
 
 use crate::ast::{
     BoundValue, Command, KipValue, KmlStatement, KqlQuery, MetaCommand, MutationClause,
-    MutationValue, Scalar, StructuralEdge, UpdateAction,
+    MutationValue, Scalar, StructuralEdge, UpdateAction, WhereClause,
 };
 use crate::error::{KipError, KipErrorCode};
 
@@ -142,8 +142,9 @@ pub const EXPLANATION_LEVELS: &[&str] = &["none", "summary", "ledger"];
 /// How much a diagnostic matters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Severity {
-    /// The command violates a rule the Core Package fixes. [`check`] turns
-    /// these into errors, so a command carrying one never reaches an engine.
+    /// The command violates a rule the Core Package fixes. Every parse entry
+    /// point ([`crate::parse_kip`] and the narrower ones) turns these into
+    /// errors, so a command carrying one never reaches an engine.
     Error,
     /// The command is legal but is the shape a mistake usually takes.
     Warning,
@@ -202,7 +203,7 @@ impl From<Diagnostic> for KipError {
 /// Reports everything the Core Package can decide about a parsed command.
 ///
 /// Warnings are included, so this is the entry point for a tool that shows
-/// findings rather than rejecting; [`check`] is the one that rejects.
+/// findings rather than rejecting; the parsers are what reject.
 ///
 /// # Examples
 ///
@@ -228,21 +229,21 @@ pub fn analyze(command: &Command) -> Vec<Diagnostic> {
     out
 }
 
-/// [`check`] for a query that was parsed on its own.
+/// The first Core Package error in a query, if any.
 pub(crate) fn check_kql(query: &KqlQuery) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_kql(query, &mut out);
     first_error(out)
 }
 
-/// [`check`] for a mutation that was parsed on its own.
+/// The first Core Package error in a mutation, if any.
 pub(crate) fn check_kml(statement: &KmlStatement) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_kml(statement, &mut out);
     first_error(out)
 }
 
-/// [`check`] for a META command that was parsed on its own.
+/// The first Core Package error in a META command, if any.
 pub(crate) fn check_meta(meta: &MetaCommand) -> Result<(), KipError> {
     let mut out = Vec::new();
     analyze_meta(meta, &mut out);
@@ -556,12 +557,31 @@ fn analyze_kql(query: &KqlQuery, out: &mut Vec<Diagnostic>) {
             out,
         );
     }
+    analyze_patterns(&query.where_clauses, out);
     if query.limit.is_none() {
         out.push(Diagnostic::warning(
             KipErrorCode::ResultLimitExceeded,
             "FIND without a LIMIT: an unbounded recall returns whatever the Space happens to hold",
         ));
     }
+}
+
+/// A Search Pattern is the META `SEARCH` bound into a query (§43.8), so its
+/// `MODE` answers to the same registry wherever in the block it sits.
+fn analyze_patterns(clauses: &[WhereClause], out: &mut Vec<Diagnostic>) {
+    for clause in clauses {
+        match clause {
+            WhereClause::Search(pattern) => check_search_mode(pattern.mode.as_ref(), out),
+            WhereClause::Not(inner) | WhereClause::Optional(inner) | WhereClause::Union(inner) => {
+                analyze_patterns(inner, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_search_mode(mode: Option<&Scalar>, out: &mut Vec<Diagnostic>) {
+    check_enum(mode.and_then(scalar_str), SEARCH_MODES, "SEARCH MODE", out);
 }
 
 // ---------------------------------------------------------------------------
@@ -572,12 +592,7 @@ fn analyze_meta(meta: &MetaCommand, out: &mut Vec<Diagnostic>) {
     match meta {
         // The engine checks literal and parameter thresholds together after
         // binding against the normalized retrieval-score range in §66.4.
-        MetaCommand::Search(search) => check_enum(
-            search.mode.as_ref().and_then(scalar_str),
-            SEARCH_MODES,
-            "SEARCH MODE",
-            out,
-        ),
+        MetaCommand::Search(search) => check_search_mode(search.mode.as_ref(), out),
         MetaCommand::Describe(crate::ast::DescribeTarget::Primer { mode }) => check_enum(
             mode.as_ref().and_then(scalar_str),
             PRIMER_MODES,
@@ -604,6 +619,10 @@ mod tests {
             r#"RETRACT ASSERTION :a EXPECT STATE "banana""#,
             r#"SUPERSEDE ASSERTION :a BY :b EXPECT STATE "banana""#,
             r#"SEARCH CONCEPT "x" MODE "fuzzy""#,
+            // The Search Pattern is the same retrieval, so the same registry,
+            // however deep in the block it sits.
+            r#"FIND(?x) WHERE { ?x SEARCH CONCEPT "x" MODE "fuzzy" LIMIT 5 } LIMIT 5"#,
+            r#"FIND(?x) WHERE { ?y {a: 1} OPTIONAL { ?x SEARCH EVIDENCE "x" MODE "fuzzy" LIMIT 5 } } LIMIT 5"#,
             r#"DESCRIBE PRIMER MODE "verbose""#,
         ] {
             assert!(
@@ -651,6 +670,8 @@ mod tests {
         for input in [
             r#"ASSERT (:a, "p", :b) { by: :me, mode: :mode, stance: :stance, confidence: :c }"#,
             r#"SEARCH CONCEPT "x" MODE :mode THRESHOLD :threshold"#,
+            r#"FIND(?x) WHERE { ?x SEARCH CONCEPT "x" MODE :mode LIMIT 5 } LIMIT 5"#,
+            r#"FIND(?x) WHERE { ?x SEARCH CONCEPT "x" MODE "hybrid" LIMIT 5 } LIMIT 5"#,
             r#"DESCRIBE PRIMER MODE :mode"#,
             r#"TRANSITION :a TO :state"#,
         ] {

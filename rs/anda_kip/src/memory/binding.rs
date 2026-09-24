@@ -63,24 +63,17 @@ pub struct Budget {
     pub tokenizer: Option<String>,
 }
 
-/// A Memory Interface level (`profiles/memory-bundles.json`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Bundle {
-    MemoryBasic,
-    MemoryExperience,
-    MemoryLearning,
+wire_enum! {
+    /// A Memory Interface level (`profiles/memory-bundles.json`).
+    #[derive(PartialOrd, Ord)]
+    pub enum Bundle {
+        MemoryBasic = "memory_basic",
+        MemoryExperience = "memory_experience",
+        MemoryLearning = "memory_learning",
+    }
 }
 
 impl Bundle {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MemoryBasic => "memory_basic",
-            Self::MemoryExperience => "memory_experience",
-            Self::MemoryLearning => "memory_learning",
-        }
-    }
-
     /// The level this one depends on, if any.
     pub fn requires(self) -> Option<Self> {
         match self {
@@ -91,28 +84,18 @@ impl Bundle {
     }
 }
 
-/// One of the five intents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Operation {
-    Observe,
-    Recall,
-    Revise,
-    Feedback,
-    Forget,
+wire_enum! {
+    /// One of the five intents.
+    pub enum Operation {
+        Observe = "observe",
+        Recall = "recall",
+        Revise = "revise",
+        Feedback = "feedback",
+        Forget = "forget",
+    }
 }
 
 impl Operation {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Observe => "observe",
-            Self::Recall => "recall",
-            Self::Revise => "revise",
-            Self::Feedback => "feedback",
-            Self::Forget => "forget",
-        }
-    }
-
     /// Whether the intent mutates memory, and so needs an idempotency key and
     /// answers with a receipt (§3, §5).
     pub fn is_mutation(self) -> bool {
@@ -127,22 +110,24 @@ pub struct ObserveInput {
     pub source_ref: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecallMode {
-    #[default]
-    Answer,
-    Action,
-    Resume,
-    Attention,
+wire_enum! {
+    #[derive(Default)]
+    pub enum RecallMode {
+        #[default]
+        Answer = "answer",
+        Action = "action",
+        Resume = "resume",
+        Attention = "attention",
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecallDetail {
-    #[default]
-    Brief,
-    Evidence,
+wire_enum! {
+    #[derive(Default)]
+    pub enum RecallDetail {
+        #[default]
+        Brief = "brief",
+        Evidence = "evidence",
+    }
 }
 
 /// World time and retained cognitive history, kept apart (§4).
@@ -233,19 +218,20 @@ impl RecallInput {
     }
 }
 
-/// Which of three histories a revision describes (§4, Spec §14.2).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeKind {
-    /// The actor's earlier claim was wrong: supersession by the same actor.
-    Correction,
-    /// The world moved on: one new Assertion; temporal succession ends the old.
-    WorldChange,
-    /// The Brain recorded what the actor never said: recording repair (§57.8).
-    Misrecorded,
-    /// The Adapter decides and discloses; it never supersedes on a guess.
-    #[default]
-    Unspecified,
+wire_enum! {
+    /// Which of three histories a revision describes (§4, Spec §14.2).
+    #[derive(Default)]
+    pub enum ChangeKind {
+        /// The actor's earlier claim was wrong: supersession by the same actor.
+        Correction = "correction",
+        /// The world moved on: one new Assertion; temporal succession ends the old.
+        WorldChange = "world_change",
+        /// The Brain recorded what the actor never said: recording repair (§57.8).
+        Misrecorded = "misrecorded",
+        /// The Adapter decides and discloses; it never supersedes on a guess.
+        #[default]
+        Unspecified = "unspecified",
+    }
 }
 
 /// `revise`: a captured correction, change or misrecording report.
@@ -270,11 +256,11 @@ pub struct FeedbackInput {
     pub attempt_ref: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgetMode {
-    PayloadOnly,
-    Semantic,
+wire_enum! {
+    pub enum ForgetMode {
+        PayloadOnly = "payload_only",
+        Semantic = "semantic",
+    }
 }
 
 /// `forget`: a bounded, governed ErasurePlan over an exact target.
@@ -349,7 +335,7 @@ impl Request {
             }
             check_refs("context_refs", &scope.context_refs)?;
         }
-        let input = self.input.clone();
+        let input = &self.input;
         let parse = |error: serde_json::Error| {
             KipError::invalid_request_envelope(format!(
                 "invalid {} input: {error}",
@@ -358,17 +344,17 @@ impl Request {
         };
         let intent = match self.operation {
             Operation::Observe => {
-                let input: ObserveInput = serde_json::from_value(input).map_err(parse)?;
+                let input: ObserveInput = Deserialize::deserialize(input).map_err(parse)?;
                 check_ref(&input.source_ref)?;
                 Intent::Observe(input)
             }
             Operation::Recall => {
-                let input: RecallInput = serde_json::from_value(input).map_err(parse)?;
+                let input: RecallInput = Deserialize::deserialize(input).map_err(parse)?;
                 input.validate()?;
                 Intent::Recall(input)
             }
             Operation::Revise => {
-                let input: ReviseInput = serde_json::from_value(input).map_err(parse)?;
+                let input: ReviseInput = Deserialize::deserialize(input).map_err(parse)?;
                 check_ref(&input.source_ref)?;
                 if let Some(target) = &input.target_ref {
                     check_ref(target)?;
@@ -376,7 +362,7 @@ impl Request {
                 Intent::Revise(input)
             }
             Operation::Feedback => {
-                let input: FeedbackInput = serde_json::from_value(input).map_err(parse)?;
+                let input: FeedbackInput = Deserialize::deserialize(input).map_err(parse)?;
                 for reference in std::iter::once(&input.source_ref)
                     .chain(&input.decision_ref)
                     .chain(&input.attempt_ref)
@@ -386,7 +372,7 @@ impl Request {
                 Intent::Feedback(input)
             }
             Operation::Forget => {
-                let input: ForgetInput = serde_json::from_value(input).map_err(parse)?;
+                let input: ForgetInput = Deserialize::deserialize(input).map_err(parse)?;
                 check_ref(&input.target_ref)?;
                 Intent::Forget(input)
             }
@@ -404,13 +390,13 @@ impl Request {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Succeeded,
-    Pending,
-    Partial,
-    Failed,
+wire_enum! {
+    pub enum Status {
+        Succeeded = "succeeded",
+        Pending = "pending",
+        Partial = "partial",
+        Failed = "failed",
+    }
 }
 
 /// The immutable intake acknowledgement (§5). Distinct from a KIP
@@ -424,24 +410,25 @@ pub struct Receipt {
     pub accepted_seq: u64,
 }
 
-/// Processing phases; monotone except that recorded or processed may fail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    Recorded,
-    Processed,
-    Available,
-    Failed,
+wire_enum! {
+    /// Processing phases; monotone except that recorded or processed may fail.
+    #[derive(PartialOrd, Ord)]
+    pub enum Phase {
+        Recorded = "recorded",
+        Processed = "processed",
+        Available = "available",
+        Failed = "failed",
+    }
 }
 
-/// Terminal dispositions; `erased` only for a completed forget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Disposition {
-    Formed,
-    EvidenceOnly,
-    Skipped,
-    Erased,
+wire_enum! {
+    /// Terminal dispositions; `erased` only for a completed forget.
+    pub enum Disposition {
+        Formed = "formed",
+        EvidenceOnly = "evidence_only",
+        Skipped = "skipped",
+        Erased = "erased",
+    }
 }
 
 /// Current progress of one receipt: a read view, never a rewritten outcome.
@@ -529,13 +516,13 @@ pub struct FormationResult {
     pub memory_refs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForgetStatus {
-    Pending,
-    Partial,
-    Blocked,
-    Completed,
+wire_enum! {
+    pub enum ForgetStatus {
+        Pending = "pending",
+        Partial = "partial",
+        Blocked = "blocked",
+        Completed = "completed",
+    }
 }
 
 /// An erasure operation; `completed` only after every in-scope surface is
@@ -549,37 +536,37 @@ pub struct ForgetResult {
     pub coverage_ref: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemRole {
-    Fact,
-    Constraint,
-    Experience,
-    Procedure,
-    Warning,
-    /// Raw source material, never silently accepted knowledge (§6).
-    Source,
+wire_enum! {
+    pub enum ItemRole {
+        Fact = "fact",
+        Constraint = "constraint",
+        Experience = "experience",
+        Procedure = "procedure",
+        Warning = "warning",
+        /// Raw source material, never silently accepted knowledge (§6).
+        Source = "source",
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EpistemicStatus {
-    Accepted,
-    Rejected,
-    Contested,
-    Uncertain,
-    /// Not enough basis — never "no".
-    Insufficient,
-    NotApplicable,
+wire_enum! {
+    pub enum EpistemicStatus {
+        Accepted = "accepted",
+        Rejected = "rejected",
+        Contested = "contested",
+        Uncertain = "uncertain",
+        /// Not enough basis — never "no".
+        Insufficient = "insufficient",
+        NotApplicable = "not_applicable",
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Standing {
-    Unproven,
-    Validated,
-    Revoked,
-    Unverifiable,
+wire_enum! {
+    pub enum Standing {
+        Unproven = "unproven",
+        Validated = "validated",
+        Revoked = "revoked",
+        Unverifiable = "unverifiable",
+    }
 }
 
 /// One typed item of a briefing.
@@ -599,13 +586,13 @@ pub struct MemoryItem {
     pub standing: Option<Standing>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChannelState {
-    Complete,
-    Incomplete,
-    /// Only after an authoritative scoped absence or irrelevance determination.
-    NotApplicable,
+wire_enum! {
+    pub enum ChannelState {
+        Complete = "complete",
+        Incomplete = "incomplete",
+        /// Only after an authoritative scoped absence or irrelevance determination.
+        NotApplicable = "not_applicable",
+    }
 }
 
 /// The seven recall channels (§6, Profile §20.2).
@@ -702,11 +689,11 @@ pub struct Details {
     pub elements: Vec<Json>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttentionKind {
-    WatchFired,
-    CommitmentDue,
+wire_enum! {
+    pub enum AttentionKind {
+        WatchFired = "watch_fired",
+        CommitmentDue = "commitment_due",
+    }
 }
 
 /// A fired Watch or a due Commitment (§4). It grants nothing.
@@ -1050,55 +1037,18 @@ pub use validate::{validate_descriptor, validate_request, validate_response};
 /// Validation against the vendored `kip-memory.schema.json` and its closure.
 #[cfg(feature = "schema-validation")]
 mod validate {
-    use crate::{Json, KipError, Map};
-    use jsonschema::{Retrieve, Uri, Validator};
+    use crate::{Json, KipError};
+    use jsonschema::Validator;
     use std::sync::LazyLock;
 
-    const DOCUMENTS: &[&str] = &[
-        crate::memory::MEMORY_SCHEMA,
-        crate::memory::COMMON_SCHEMA,
-        crate::memory::REQUEST_SCHEMA,
-        crate::memory::RESPONSE_SCHEMA,
-        crate::memory::PROJECTION_SCHEMA,
-        crate::memory::COGNITIVE_RECORDS_SCHEMA,
-        crate::memory::ELEMENT_SCHEMA,
-    ];
-
-    struct Pinned(Map<String, Json>);
-    impl Retrieve for Pinned {
-        fn retrieve(
-            &self,
-            uri: &Uri<String>,
-        ) -> Result<Json, Box<dyn std::error::Error + Send + Sync>> {
-            self.0
-                .get(uri.as_str())
-                .cloned()
-                .ok_or_else(|| format!("unpinned schema resource {uri}").into())
-        }
-    }
-
     fn compile(definition: &str) -> Validator {
-        let resources = DOCUMENTS
-            .iter()
-            .map(|text| {
-                let value: Json = serde_json::from_str(text).expect("vendored schema");
-                (value["$id"].as_str().expect("schema id").to_string(), value)
-            })
-            .collect();
-        jsonschema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .should_validate_formats(true)
-            .with_format("date-time", |value| {
-                crate::timestamp::parse(value, "timestamp").is_ok()
-            })
-            .with_format("timestamp", |value| {
-                crate::timestamp::parse(value, "timestamp").is_ok()
-            })
-            .with_retriever(Pinned(resources))
-            .build(&serde_json::json!({
+        crate::memory::schema_validator(
+            &serde_json::json!({
                 "$ref": format!("urn:kip:2.0:schema:memory#/$defs/{definition}")
-            }))
-            .expect("vendored memory schema compiles")
+            }),
+            crate::memory::vendored_schemas().clone(),
+        )
+        .expect("vendored memory schema compiles")
     }
 
     static REQUEST: LazyLock<Validator> = LazyLock::new(|| compile("Request"));

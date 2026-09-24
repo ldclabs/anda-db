@@ -385,15 +385,24 @@ pub enum CommandType {
     Unknown,
 }
 
-impl CommandType {
-    /// Returns the command family for a parsed [`Command`].
-    pub fn from(val: &Command) -> CommandType {
-        match val {
+impl From<&Command> for CommandType {
+    /// The command family of a parsed [`Command`].
+    fn from(command: &Command) -> CommandType {
+        match command {
             Command::Kql(_) => CommandType::Kql,
             Command::Kml(_) => CommandType::Kml,
             Command::Meta(_) => CommandType::Meta,
         }
     }
+}
+
+impl CommandType {
+    /// The three language labels, in their wire spelling.
+    const LANGUAGES: [(&'static str, CommandType); 3] = [
+        ("KQL", CommandType::Kql),
+        ("KML", CommandType::Kml),
+        ("META", CommandType::Meta),
+    ];
 }
 
 impl fmt::Display for CommandType {
@@ -410,13 +419,14 @@ impl fmt::Display for CommandType {
 impl FromStr for CommandType {
     type Err = String;
 
+    /// Reads a language label a person typed, ignoring ASCII case. `UNKNOWN`
+    /// is a classification result, never a label, so it is refused.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_uppercase().as_str() {
-            "KQL" => Ok(CommandType::Kql),
-            "KML" => Ok(CommandType::Kml),
-            "META" => Ok(CommandType::Meta),
-            _ => Ok(CommandType::Unknown),
-        }
+        CommandType::LANGUAGES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(s))
+            .map(|(_, language)| *language)
+            .ok_or_else(|| format!("{s:?} is not one of KQL | KML | META"))
     }
 }
 
@@ -429,13 +439,20 @@ impl Serialize for CommandType {
     }
 }
 
+/// The wire label is exactly `KQL`, `KML` or `META` (`kip-request.schema.json`):
+/// a label the schema refuses is a malformed envelope, not a language that
+/// happens to mismatch the command.
 impl<'de> Deserialize<'de> for CommandType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        CommandType::from_str(&s).map_err(serde::de::Error::custom)
+        let label = String::deserialize(deserializer)?;
+        CommandType::LANGUAGES
+            .iter()
+            .find(|(name, _)| *name == label)
+            .map(|(_, language)| *language)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&label, &["KQL", "KML", "META"]))
     }
 }
 
@@ -768,6 +785,30 @@ pub enum FilterFunction {
     IsKind,
     /// `LITERAL_TYPE(?x)`
     LiteralType,
+}
+
+impl FilterFunction {
+    /// How many arguments this function takes.
+    ///
+    /// Every function is unary or binary except `LITERAL_TYPE`, which answers
+    /// with the operand's type or, given a second argument, tests against it.
+    /// Engines check a call against this range, so the two engines cannot
+    /// disagree about which calls are well-formed.
+    pub fn arity(&self) -> std::ops::RangeInclusive<usize> {
+        match self {
+            FilterFunction::IsNull
+            | FilterFunction::IsNotNull
+            | FilterFunction::IsLiteral
+            | FilterFunction::IsElement => 1..=1,
+            FilterFunction::LiteralType => 1..=2,
+            FilterFunction::Contains
+            | FilterFunction::StartsWith
+            | FilterFunction::EndsWith
+            | FilterFunction::Regex
+            | FilterFunction::In
+            | FilterFunction::IsKind => 2..=2,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
