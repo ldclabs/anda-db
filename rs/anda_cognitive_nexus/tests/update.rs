@@ -40,9 +40,20 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -119,7 +130,7 @@ async fn seeded(name: &str) -> (CognitiveNexus, Json) {
                 SET ATTRIBUTES {goal: "rest", outcome_status: "success"}
                 SET FACET "MnemonicState" {memory_strength: 0.2, salience: 0.5}
             }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?ev {
                 SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode."}
@@ -400,7 +411,7 @@ async fn update_edits_concept_topology_only() {
     };
 
     let response = run_with(
-        r#"UPDATE :first SET STRUCTURAL { ("derived_from", :second) ("derived_from", :third) }"#,
+        r#"UPDATE :first SET STRUCTURAL { ("mentions", :second) ("mentions", :third) }"#,
         json!({
             "first": first.to_string(),
             "second": second.to_string(),
@@ -420,7 +431,7 @@ async fn update_edits_concept_topology_only() {
         r#"FIND(?target.name)
            WHERE {
              ?source CONCEPT {name: "First"}
-             STRUCTURAL (?source, "derived_from", ?target)
+             STRUCTURAL (?source, "mentions", ?target)
            }
            ORDER BY ?target.name"#,
     )
@@ -428,7 +439,7 @@ async fn update_edits_concept_topology_only() {
     assert_eq!(rows(&linked), &vec![json!("Second"), json!("Third")]);
 
     let response = run_with(
-        r#"UPDATE :first UNSET STRUCTURAL { ("derived_from", :second) }"#,
+        r#"UPDATE :first UNSET STRUCTURAL { ("mentions", :second) }"#,
         json!({"first": first.to_string(), "second": second.to_string()}),
     )
     .await;
@@ -439,11 +450,25 @@ async fn update_edits_concept_topology_only() {
         r#"FIND(?target.name)
            WHERE {
              ?source CONCEPT {name: "First"}
-             STRUCTURAL (?source, "derived_from", ?target)
+             STRUCTURAL (?source, "mentions", ?target)
            }"#,
     )
     .await;
     assert_eq!(rows(&linked), &vec![json!("Third")]);
+
+    // Lineage is computed from Activity provenance (Profile §7), so the
+    // computed `derived_from` is never written (§18.2).
+    let response = run_with(
+        r#"UPDATE :first SET STRUCTURAL { ("derived_from", :second) }"#,
+        json!({"first": first.to_string(), "second": second.to_string()}),
+    )
+    .await;
+    let error = response
+        .results
+        .into_iter()
+        .find_map(|result| result.error)
+        .expect("a computed field is read-only");
+    assert_eq!(error.code, "ConstraintViolation", "{error:?}");
 
     // An Assertion's citations are not topology anyone may edit.
     let assertion = handle(&created, "a");
@@ -840,7 +865,7 @@ async fn upsert_applies_every_action_it_accepts() {
                             MATCH {id: :id}
                             SET FACET "MnemonicState" {salience: 0.9}
                             UNSET FACET "MnemonicState" {memory_strength}
-                            SET STRUCTURAL { ("derived_from", :other) }
+                            SET STRUCTURAL { ("mentions", :other) }
                           }"#,
             "parameters": {"id": first.to_string(), "other": handle(&created, "e2").to_string()}
         }]
@@ -870,7 +895,7 @@ async fn upsert_applies_every_action_it_accepts() {
         r#"FIND(?target.name)
            WHERE {
              ?source CONCEPT {name: "First"}
-             STRUCTURAL (?source, "derived_from", ?target)
+             STRUCTURAL (?source, "mentions", ?target)
            }"#,
     )
     .await;

@@ -54,6 +54,7 @@ export type KipErrorCode =
   | "DuplicateMutationTarget"
   | "SchemaSymbolNotFound"
   | "SchemaSymbolAmbiguous"
+  | "SchemaSymbolConflict"
   | "SchemaFieldNotFound"
   | "SchemaPackageUnavailable"
   | "SchemaEnvironmentChanged"
@@ -133,6 +134,7 @@ export const KIP_ERROR_CODES: readonly KipErrorCode[] = [
   "DuplicateMutationTarget",
   "SchemaSymbolNotFound",
   "SchemaSymbolAmbiguous",
+  "SchemaSymbolConflict",
   "SchemaFieldNotFound",
   "SchemaPackageUnavailable",
   "SchemaEnvironmentChanged",
@@ -272,6 +274,11 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
     retry: "requires_different_input",
     hint: "The local name resolves in more than one package. Qualify it with its package path.",
   },
+  "SchemaSymbolConflict": {
+    category: "schema",
+    retry: "non_retryable",
+    hint: "That name already resolves in this Schema Environment. `DEFINE` only adds: use the existing symbol, or define a distinct name.",
+  },
   "SchemaFieldNotFound": {
     category: "schema",
     retry: "requires_different_input",
@@ -350,7 +357,7 @@ export const KIP_ERROR_REGISTRY: Readonly<Record<KipErrorCode, KipErrorSpec>> = 
   "EpistemicRevisionRequired": {
     category: "epistemic",
     retry: "requires_different_input",
-    hint: "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`.",
+    hint: "An Assertion's epistemic payload never changes. Record a new Assertion instead: a changed world is a new Assertion from the time of the change, which ends the old value (§25.4); add `SUPERSEDING :old` only when the old Assertion was wrong (§14.2).",
   },
   "EvidenceCorrectionRequired": {
     category: "epistemic",

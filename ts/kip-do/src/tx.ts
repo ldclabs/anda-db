@@ -1222,7 +1222,7 @@ export class Transaction {
         actor_binding_id: this.actorBinding,
         control_changes: this.controlEffects
           .filter((c) =>
-            ['schema', 'identity', 'policy', 'trust', 'authorization'].includes(
+            ['schema', 'identity', 'policy', 'trust', 'authorization', 'recording'].includes(
               c.kind,
             ),
           )

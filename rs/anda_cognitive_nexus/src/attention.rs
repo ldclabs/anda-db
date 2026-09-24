@@ -26,7 +26,7 @@ pub use evaluation::{
 pub use lookup::{DispatchLookup, DispatchLookupObserver, DispatchLookupStatus};
 pub use resume::{WakeResumeInput, WakeResumeVerifier};
 
-const PROFILE: &str = "kip://profiles/cognitive-memory@2.1.0/";
+const PROFILE: &str = cognitive_memory!("");
 const FORMAT: &str = "anda-brain:attention-v1";
 const CONTINUATION: &str = "anda-brain:attention-continuation-v1";
 const CONFIG: &str = "attention/config";

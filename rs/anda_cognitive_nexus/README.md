@@ -1,6 +1,7 @@
 # anda_cognitive_nexus
 
-Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP at `3251912`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 The reference **KIP 2.0** Cognitive Nexus — a persistent memory brain for AI
@@ -195,18 +196,17 @@ anda_cognitive_nexus = { version = "0.13", features = ["simulation"] }
 ```rust
 let simulated = nexus.system_session()
     .with_simulated_lifecycle_time("2030-01-01T00:00:00.000Z")?;
-simulated.expire_lapsed_assertions(DEFAULT_SPACE, 100).await?;
 simulated.sweep_expired(DEFAULT_SPACE, RetentionAction::Archive, 100).await?;
 ```
 
 Only a direct engine system session may set this canonical UTC millisecond value.
 It is local to that session and its clones, not global Nexus state. It changes
-only the eligibility time of these two sweeps, including the Assertion
-per-record expiry recheck. Legal holds and all operation permissions remain in
-force. Normal KIP requests have no clock-control field; other sessions retain
+only the eligibility time of the retention sweep. An Assertion's `expired` is
+computed from world time at every read and never stored (§14.3), so no clock
+moves it. Legal holds and all operation permissions remain in force. Normal KIP requests have no clock-control field; other sessions retain
 the real clock.
 
-Use an isolated store: the sweeps still persist real lifecycle changes.
+Use an isolated store: the sweep still persists real lifecycle changes.
 Authentication, policy/Grant validity, task leases, the default KQL/BELIEF
 time, transaction timestamps and Governance audit always retain real time.
 Queries that mean a simulated world-valid time must explicitly use `FOR TIME`.

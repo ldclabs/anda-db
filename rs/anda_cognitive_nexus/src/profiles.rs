@@ -9,31 +9,53 @@
 //! This module ships the baseline profile so a host can hand a fresh Space a
 //! working ontology without going looking for a file. It is the artifact
 //! **verbatim** from the specification repository
-//! (`profiles/cognitive-memory-2.1.0.schema.json`), not a Rust transcription of
+//! (`profiles/cognitive-memory-2.0.0.schema.json`), not a Rust transcription of
 //! it: a hand-maintained copy would drift toward whatever this engine happens
 //! to support, and the point of a profile is that two engines mean the same
-//! thing by `Preference`.
+//! thing by `prefers`.
+//!
+//! The 2.0 draft rewrote `cognitive-memory@2.0.0` in place, so the reference
+//! alone no longer tells two revisions apart: only the content digest does
+//! (`integrity.content_digest`). This engine ships exactly one revision and
+//! does not migrate Spaces activated under an earlier draft.
 //!
 //! Installing is not activating (§20.12). Bundling the bytes says nothing
 //! about which Space may resolve symbols through them; that stays a decision
 //! the host makes with
 //! [`CognitiveNexus::ensure_schema`](crate::CognitiveNexus::ensure_schema).
 
-/// The KIP Cognitive Memory Profile, version 2.1.0.
+/// The KIP Cognitive Memory Profile package, `cognitive-memory@2.0.0`.
 ///
 /// Re-copy it from the spec repository when the profile changes; nothing here
 /// edits it.
-pub const COGNITIVE_MEMORY: &str = include_str!("../profiles/cognitive-memory-2.1.0.json");
+pub const COGNITIVE_MEMORY: &str = include_str!("../profiles/cognitive-memory-2.0.0.json");
 
 /// The package id [`COGNITIVE_MEMORY`] declares.
 pub const COGNITIVE_MEMORY_ID: &str = "kip://profiles/cognitive-memory";
 
 /// The version [`COGNITIVE_MEMORY`] declares.
-pub const COGNITIVE_MEMORY_VERSION: &str = "2.1.0";
+pub const COGNITIVE_MEMORY_VERSION: &str = "2.0.0";
 
-/// Previous draft package for explicit compatibility and migration only.
-pub const LEGACY_COGNITIVE_MEMORY: &str =
-    include_str!("../profiles/legacy/cognitive-memory-2.0.0.json");
+/// The exact package reference [`COGNITIVE_MEMORY`] declares.
+pub const COGNITIVE_MEMORY_REF: &str = cognitive_memory!();
+
+/// The content digest of the bundled [`COGNITIVE_MEMORY`] revision.
+pub const COGNITIVE_MEMORY_DIGEST: &str =
+    "sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9";
+
+/// The minimal general domain package, `kip://domains/general@1.0.0`: places,
+/// organizations, topics and everyday relations. Optional; a host installs it
+/// beside [`COGNITIVE_MEMORY`] when it wants those symbols.
+pub const GENERAL_DOMAIN: &str = include_str!("../profiles/general-domain-1.0.0.json");
+
+/// The package id [`GENERAL_DOMAIN`] declares.
+pub const GENERAL_DOMAIN_ID: &str = "kip://domains/general";
+
+/// The version [`GENERAL_DOMAIN`] declares.
+pub const GENERAL_DOMAIN_VERSION: &str = "1.0.0";
+
+/// The machine-readable `kip:memory-default` policy artifact (Spec §21.13).
+pub const MEMORY_DEFAULT_POLICY: &str = include_str!("../profiles/policy-memory-default.json");
 
 #[cfg(test)]
 mod tests {
@@ -49,6 +71,21 @@ mod tests {
         let package_ref = package.package_ref().expect("it declares a package ref");
         assert_eq!(package_ref.package_id, COGNITIVE_MEMORY_ID);
         assert_eq!(package_ref.version.to_string(), COGNITIVE_MEMORY_VERSION);
+        assert_eq!(package_ref.to_string(), COGNITIVE_MEMORY_REF);
+        let artifact: anda_kip::Json = serde_json::from_str(COGNITIVE_MEMORY).unwrap();
+        assert_eq!(
+            artifact["integrity"]["content_digest"],
+            COGNITIVE_MEMORY_DIGEST
+        );
+        crate::schema::contracts::verify_artifact(&artifact).expect("the digest covers the bytes");
+
+        let general = SchemaPackage::parse(GENERAL_DOMAIN).expect("the general domain parses");
+        let general_ref = general.package_ref().unwrap();
+        assert_eq!(general_ref.package_id, GENERAL_DOMAIN_ID);
+        assert_eq!(general_ref.version.to_string(), GENERAL_DOMAIN_VERSION);
+
+        let policy: anda_kip::Json = serde_json::from_str(MEMORY_DEFAULT_POLICY).unwrap();
+        assert_eq!(policy["policy_id"], "kip:memory-default");
     }
 
     /// The syntax card a model reads must name everything this Profile declares.

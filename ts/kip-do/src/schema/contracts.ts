@@ -5,6 +5,7 @@ import { sha256Text } from '../digest.js'
 import { facetDef, type SchemaPackage } from './package.js'
 import type { SchemaEnvironment } from './env.js'
 import { SCHEMA_DOCUMENTS, SCHEMA_DIGESTS, VALUE_VALIDATORS, MEMORY_BUNDLE_MANIFEST } from './contracts.generated.js'
+import { PROFILE_PREFIX } from './profile-ref.js'
 
 const documents = structuredClone(SCHEMA_DOCUMENTS) as unknown as Record<string, JsonMap>
 const digests: Record<string, string> = { ...SCHEMA_DIGESTS }
@@ -95,7 +96,7 @@ export function validateRecord(env: SchemaEnvironment, view: JsonMap, before: Js
   canonicalJson(view)
   const terminal = (v: JsonMap) => ['completed', 'failed', 'cancelled'].includes(String(v.status))
   for (const [name, value] of Object.entries((view.facets ?? {}) as JsonMap)) {
-    if (name === 'kip://profiles/cognitive-memory@2.1.0/OutcomeRecord' && isJsonMap(before?.facets) && before.facets[name] !== undefined && canonicalJson(before.facets[name]) !== canonicalJson(value)) throw errors.immutableField('attached OutcomeRecord is immutable, including previously absent optional members')
+    if (name === `${PROFILE_PREFIX}OutcomeRecord` && isJsonMap(before?.facets) && before.facets[name] !== undefined && canonicalJson(before.facets[name]) !== canonicalJson(value)) throw errors.immutableField('attached OutcomeRecord is immutable, including previously absent optional members')
     const symbol = env.resolveSymbol('Facet', name, 'write')
     const pkg = env.definitionPackage(symbol)
     const def = pkg && facetDef(pkg, symbol.name)
@@ -118,7 +119,7 @@ export function validateRecord(env: SchemaEnvironment, view: JsonMap, before: Js
   }
   const name = String(view.schema_ref ?? '')
   const attributes = view.attributes as JsonMap | undefined
-  if (name.startsWith('kip://profiles/cognitive-memory@2.1.0/')) {
+  if (name.startsWith(PROFILE_PREFIX)) {
     if (name.endsWith('/SkillRevision')) {
       const { behavior_digest, ...behavior } = attributes ?? {}
       if (behavior_digest !== 'sha256:' + sha256Text(canonicalJson(behavior))) throw errors.digestMismatch('SkillRevision behavior_digest must cover the immutable behavior fields')
@@ -165,14 +166,14 @@ export function pinnedPlane(planes: JsonMap, name: string): Json | undefined {
 export const digest = (value: Json): string => `sha256:${sha256Text(canonicalJson(value))}`
 
 export function normalizeRecordRefs(name: string, members: JsonMap): void {
-  if (!name.startsWith('kip://profiles/cognitive-memory@2.1.0/')) return
+  if (!name.startsWith(PROFILE_PREFIX)) return
   const paths: Record<string,string[]> = {
     DependencyBasis:['groups.*.pins.*.id','policy_basis.context_refs.*'],
     DecisionRecord:['retrieved_refs.*','used_refs.*','applied_revisions.*','basis.context_refs.*'],
     AttemptRecord:['decision_ref','applied_revisions.*','trial_ref'], OutcomeRecord:['attempt_ref'],
     TrialRecord:['revision_refs.*','baseline_attempt_refs.*','baseline_outcome_refs.*','basis.context_refs.*'],
     EvaluationRecord:['trial_ref','revision_refs.*','attempt_refs.*','outcome_refs.*','missing_attempt_refs.*','excluded_samples.*.ref'],
-    TrialState:['trial_ref','revision_ref'],GradingState:['revision_ref','evaluation_ref'],ErasurePlan:['source_event_refs.*','targets.*.ref'],
+    ErasurePlan:['source_event_refs.*','targets.*.ref'],
   }
   function visit(value: Json, path: string[]): Json {
     if (!path.length) return isJsonMap(value) && Object.keys(value).length === 1 && typeof value.id === 'string' && /^[CPAEX]-[1-9][0-9]*$/.test(value.id) ? value.id : value

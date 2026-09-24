@@ -6,8 +6,9 @@ import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { digest } from '../src/schema/contracts.js'
 import { parseElementId } from '../src/id.js'
 import type { Json, JsonMap } from '../src/json.js'
+import { OPTIONS } from './support/options.js'
 
-const SETUP = `MUTATE {CREATE CONCEPT ?a {TYPE "Person" NAME "Ada"} CREATE CONCEPT ?b {TYPE "Preference" NAME "tea"} ENSURE PROPOSITION ?p (?a,"prefers",?b) CREATE EVIDENCE ?e {SET FIELDS {evidence_class:"observation",payload:"material"}}}`
+const SETUP = `MUTATE {CREATE CONCEPT ?a {TYPE "Person" NAME "Ada"} CREATE CONCEPT ?b {TYPE "Option" NAME "tea"} ENSURE PROPOSITION ?p (?a,"prefers",?b) CREATE EVIDENCE ?e {SET FIELDS {evidence_class:"observation",payload:"material"}}}`
 const BELIEF = 'FIND(?b) WHERE { ?p PROPOSITION (id:"P-1") ?b BELIEF (?p) }'
 describe('Nexus host contracts', () => {
   it('opens a trial and commits a validated verdict with guarded caches', async () => {
@@ -15,7 +16,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-learning-flow'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute(
           `MUTATE {
@@ -119,15 +120,17 @@ describe('Nexus host contracts', () => {
           success: number,
         ): string => `MUTATE {
         CREATE ACTIVITY ?verdict {SET FIELDS {activity_class:"lifecycle_verdict",status:"completed"} SET FACET "EvaluationRecord" ${JSON.stringify(record)} SET STRUCTURAL {("inputs","C-4") ("inputs","${trialRef}") ("outputs","C-3")}}
-        UPDATE "C-3" SET ATTRIBUTES {status:"trialed"} SET FACET "TrialState" {revision_ref:"C-4",trial_ref:"${trialRef}"} SET FACET "GradingState" {revision_ref:"C-4",evaluation_ref:?verdict,success_count:${success},failure_count:0,graded_count:0} EXPECT VERSION ${version}
+        UPDATE "C-3" SET ATTRIBUTES {status:"trialed"} SET STRUCTURAL {("current_trial","${trialRef}") ("current_evaluation",?verdict)}${success === 0 ? '' : ' SET FACET "GradingState" {success_count:' + success + '}'} EXPECT VERSION ${version}
       }`
         n.execute(write(evaluation, 1, 0))
         expect(
           n.query('FIND(?s.attributes.status) WHERE {?s CONCEPT {id:"C-3"}}'),
         ).toEqual(['trialed'])
+        // GradingState is a computed view of the current evaluation (§18.2):
+        // a write to it is refused rather than kept as a second copy.
         expect(() =>
           n.execute(write({ ...evaluation, from_status: 'trialed' }, 2, 99)),
-        ).toThrow('counts')
+        ).toThrow('computed')
       },
     )
   })
@@ -136,7 +139,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-dispatch-recovery'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute(
           'CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}',
@@ -218,7 +221,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-revalidation'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         let basis = (n.query(BELIEF)[0] as JsonMap).basis as JsonMap
         n.execute(
@@ -255,7 +258,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-controls'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute(
           'CREATE ASSERTION ?a {SET FIELDS {proposition:"P-1",asserted_by:"C-1",mode:"stated",stance:"support",confidence:0.9}}',
@@ -285,7 +288,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-identity'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute('CREATE CONCEPT ?alias {TYPE "Person" NAME "A. Lovelace"}')
         const merged = n.execute('MERGE CONCEPT "C-3" INTO "C-1"'),
@@ -311,7 +314,7 @@ describe('Nexus host contracts', () => {
   it('creates bidirectional revisions and refuses unvalidated standing', async () => {
     await runInDurableObject(env.KIP_DB.getByName('host-skill'), (_, state) => {
       const n = CognitiveNexus.connect(state.storage)
-      n.activatePackages([COGNITIVE_MEMORY])
+      n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       n.execute(
         `MUTATE {
         CREATE CONCEPT ?skill {TYPE "Skill" NAME "verify" SET ATTRIBUTES {skill_class:"workflow",summary:"verify",status:"proposed"} SET STRUCTURAL {("current_revision",?revision)}}
@@ -340,7 +343,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-durable'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute(`MUTATE {
         CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"review",status:"pending"}}
@@ -378,7 +381,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-offset-lease'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(
           'CREATE CONCEPT ?task {TYPE "SleepTask" SET ATTRIBUTES {task_class:"review_skill",summary:"action",status:"pending"}}',
         )
@@ -407,7 +410,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-reference-audit'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         n.execute(
           `MUTATE {
@@ -453,7 +456,7 @@ describe('Nexus host contracts', () => {
       env.KIP_DB.getByName('host-erasure'),
       (_, state) => {
         const n = CognitiveNexus.connect(state.storage)
-        n.activatePackages([COGNITIVE_MEMORY])
+        n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
         n.execute(SETUP)
         const s = n.systemSession(),
           pin = s.putArtifact({ source: 'material' }, ['E-1'])

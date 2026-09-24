@@ -102,7 +102,8 @@ dependencies and existing feature conventions when editing workspace crates.
 ## KIP and Brain boundaries
 
 KIP protocol versions are distinct from Cargo package versions. The repository
-implements KIP 2.0 with the vendored 2.1.0 memory vocabulary; use the
+implements KIP 2.0 (KIP `3251912`) with the vendored `cognitive-memory@2.0.0`
+draft package; use the
 [vendored specification](rs/anda_kip/SPECIFICATION.md) and
 [syntax reference](rs/anda_kip/KIPSyntax.md).
 

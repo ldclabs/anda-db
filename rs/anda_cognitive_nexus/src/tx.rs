@@ -1113,7 +1113,12 @@ impl Transaction {
                     .filter(|c| {
                         matches!(
                             c.kind.as_str(),
-                            "schema" | "identity" | "policy" | "trust" | "authorization"
+                            "schema"
+                                | "identity"
+                                | "policy"
+                                | "trust"
+                                | "authorization"
+                                | "recording"
                         )
                     })
                     .map(|c| serde_json::json!({"kind":c.kind,"version":self.cx.seq.to_string()}))

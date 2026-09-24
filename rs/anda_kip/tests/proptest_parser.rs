@@ -19,6 +19,7 @@ use proptest::prelude::*;
 
 /// Valid documents used both as mutation seeds and as parse-Ok regressions.
 const KQL_SEEDS: &[&str] = &[
+    r#"FIND(?x.name) WHERE { ?x SEARCH CONCEPT "dark mode" WITH TYPE "ColorScheme" LIMIT 5 }"#,
     r#"
     FIND(?drug.name)
     WHERE {
@@ -50,6 +51,7 @@ const KQL_SEEDS: &[&str] = &[
 ];
 
 const KML_SEEDS: &[&str] = &[
+    r#"DEFINE PREDICATE "mentors" { description: "The subject mentors the object." }"#,
     r#"
     ASSERT ?a (:alice, "prefers", :dark_mode) {
         by: :alice,
@@ -90,7 +92,7 @@ const META_SEEDS: &[&str] = &[
     "DESCRIBE PRIMER MODE \"compact\"",
     "DESCRIBE TYPE \"Person\"",
     "LIST SCHEMA PACKAGES STATUS \"active\" LIMIT 20 CURSOR :page",
-    "SEARCH COGNITION \"dark mode\" WITH TYPE \"Preference\" MODE \"hybrid\" THRESHOLD 0.7 LIMIT 5",
+    "SEARCH PROPOSITION \"dark mode\" WITH TYPE \"ColorScheme\" MODE \"hybrid\" THRESHOLD 0.7 LIMIT 5",
     "HISTORY ELEMENT \"C-1\" FROM SEQ 1 TO SEQ 99 LIMIT 10",
     "EXPORT CAPSULE :out WHERE { ?c CONCEPT {type: \"Experience\"} } WITH { redact: true } AS OF SEQ 7",
 ];

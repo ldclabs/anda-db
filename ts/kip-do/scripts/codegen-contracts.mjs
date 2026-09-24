@@ -30,7 +30,8 @@ function collect(value) {
     else collect(child)
   }
 }
-collect(parseCanonicalJson(readFileSync(resolve(root, 'rs/anda_cognitive_nexus/profiles/cognitive-memory-2.1.0.json'), 'utf8')))
+for (const name of ['cognitive-memory-2.0.0.json', 'general-domain-1.0.0.json'])
+  collect(parseCanonicalJson(readFileSync(resolve(root, 'rs/anda_cognitive_nexus/profiles', name), 'utf8')))
 // Public companion schemas and named record definitions can be checked by SDKs.
 for (const [id, schema] of Object.entries(documents)) {
   contracts.set(canonicalize({ $ref: id }), { $ref: id })

@@ -80,7 +80,6 @@ import {
   isPermitted,
   parsePermission,
   principalClass,
-  expireAssertion,
   quarantine,
   release,
   tombstoneExpired,
@@ -125,6 +124,7 @@ import {
   formatPackageRef,
   parsePackage,
   rejectCoreShadowing,
+  checkFunctionalBy,
   type SchemaLock,
   type SchemaPackage,
 } from './schema/index.js'
@@ -256,6 +256,7 @@ export class CognitiveNexus {
     verifyArtifact(artifact)
     const ref = formatPackageRef(packageRefOf(artifact))
     rejectCoreShadowing(artifact)
+    checkFunctionalBy(artifact)
     const digest = sha256Text(canonicalJson(artifact))
     const existing = this.store.packageByRef(ref)
     if (existing !== null) {
@@ -748,6 +749,14 @@ export class Session {
       operation: options.operation,
       ingest: options.ingest,
     })
+    // §20.16: without `draft_vocabulary` a DEFINE is refused before any
+    // authorization, replay or write.
+    if (statement.clauses.some((clause) => 'Define' in clause)) {
+      throw errors.unsupportedCapability(
+        'DEFINE needs the draft_vocabulary capability, which this engine does not ' +
+          'advertise; install a Schema Package that declares the symbol instead',
+      )
+    }
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     const needed = kmlPermissions(statement)
@@ -1083,35 +1092,6 @@ export class Session {
         }
       }
       return report
-    })
-  }
-
-  /**
-   * Marks the Assertions whose validity windows have closed as `expired`.
-   *
-   * §14.3's lifecycle state, reached explicitly. The alternative — deriving it
-   * on every read and never recording it — leaves `expired` as a state the
-   * model names and nothing produces, and leaves a caller unable to ask which
-   * claims have lapsed without recomputing the answer itself.
-   *
-   * Not retraction and not supersession (§14.1, §14.2): nobody withdrew these
-   * and nothing replaced them; their own stated windows ran out.
-   */
-  expireLapsedAssertions(limit = 100, space = this.nexus.space): string[] {
-    return this.nexus.transact(() => {
-      const cx = this.governanceContext(space)
-      const now = nowTime()
-      const expired: string[] = []
-      for (const id of this.nexus.store.lapsedAssertions(space, now)) {
-        if (expired.length >= limit) break
-        try {
-          if (expireAssertion(cx, id, now)) expired.push(formatElementId(id))
-        } catch {
-          // An Assertion this caller may not maintain stays as it is; the
-          // sweep is not a way around per-element authorization.
-        }
-      }
-      return expired
     })
   }
 

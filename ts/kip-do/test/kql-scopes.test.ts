@@ -4,15 +4,16 @@ import { CognitiveNexus } from '../src/nexus.js'
 import { parseKip, parseKipAll, parseKipBatch } from '../src/kip/parser.js'
 import type { KqlQuery } from '../src/kip/ast.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
+import { OPTIONS } from './support/options.js'
 
 async function withNexus(name: string, body: (n: CognitiveNexus) => void): Promise<void> {
   await runInDurableObject(env.KIP_DB.getByName(`kql-scope-${name}`), (_instance, state) => {
     const n = CognitiveNexus.connect(state.storage)
-    n.activatePackages([COGNITIVE_MEMORY])
+    n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     n.execute(`MUTATE {
       CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" SET ATTRIBUTES { display_name: "Alice A" } }
       CREATE CONCEPT ?b { TYPE "Person" NAME "Bob" }
-      CREATE CONCEPT ?d { TYPE "Preference" NAME "Dark" }
+      CREATE CONCEPT ?d { TYPE "Option" NAME "Dark" }
       ENSURE PROPOSITION ?p (?a, "prefers", ?d)
     }`)
     body(n)
@@ -155,9 +156,9 @@ describe('KQL scope and value contracts', () => {
   it('matches inline Concept endpoint descriptions and nested Proposition tuples without creation', async () => {
     await withNexus('inline-endpoints', (n) => {
       const before = n.store.currentSeq(n.space)
-      expect(n.query('FIND(?name) WHERE { PROPOSITION ({type: "Person", name: ?name}, "prefers", {type: "Preference", name: "Dark"}) }')).toEqual(['Alice'])
+      expect(n.query('FIND(?name) WHERE { PROPOSITION ({type: "Person", name: ?name}, "prefers", {type: "Option", name: "Dark"}) }')).toEqual(['Alice'])
       expect(n.query('FIND(?c.name) WHERE { ?c {name: "Alice"} PROPOSITION (?c, "prefers", {id: "C-3", name: "Wrong"}) }')).toEqual([])
-      expect(n.query('FIND(?c.name) WHERE { ?c {name: "Alice"} PROPOSITION (?c, "prefers", {type: "Preference", name: "Missing"}) }')).toEqual([])
+      expect(n.query('FIND(?c.name) WHERE { ?c {name: "Alice"} PROPOSITION (?c, "prefers", {type: "Option", name: "Missing"}) }')).toEqual([])
       expect(n.store.currentSeq(n.space)).toBe(before)
     })
   })
@@ -174,7 +175,7 @@ describe('KQL scope and value contracts', () => {
 
   it('binds stored scalar Literal endpoints as scalar values with distinct null/unbound identity', async () => {
     await withNexus('literal-endpoints', (n) => {
-      n.activatePackages([COGNITIVE_MEMORY, {
+      n.activatePackages([COGNITIVE_MEMORY, OPTIONS, {
         format: 'KIP-Schema-Package',
         manifest: {package_id: 'kip://test/kql-values', version: '1.0.0'},
         definitions: {predicates: {amount: {kind: 'PredicateType', object: {nullable: true}}}},
@@ -204,7 +205,7 @@ describe('KQL scope and value contracts', () => {
       n.execute(`MUTATE {
         CREATE CONCEPT ?a2 {TYPE "Person" NAME "Alice"}
         CREATE CONCEPT ?a3 {TYPE "Person" NAME "Alice"}
-        CREATE CONCEPT ?coffee {TYPE "Preference" NAME "Coffee"}
+        CREATE CONCEPT ?coffee {TYPE "Option" NAME "Coffee"}
         ENSURE PROPOSITION ?p2 (?a2, "prefers", {id: "C-3"})
         ENSURE PROPOSITION ?p3 (?a3, "prefers", {id: "C-3"})
         ENSURE PROPOSITION ?p4 ({id: "C-2"}, "prefers", {id: "C-3"})

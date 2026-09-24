@@ -1,4 +1,5 @@
 import {
+  COGNITIVE_MEMORY,
   KipDatabase,
   mergeRequestContext,
   principalAuth,
@@ -6,6 +7,7 @@ import {
   type RequestContext,
   type SchemaPackage,
 } from '../src/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * Test harness object.
@@ -14,7 +16,12 @@ import {
  * with `runInDurableObject` and build their own `CognitiveNexus`, but the HTTP
  * surface has to be exercised as a host would deploy it.
  */
-export class TestKipDatabase extends KipDatabase {}
+export class TestKipDatabase extends KipDatabase {
+  /** The Profile, and the options package the tests type preferences with. */
+  protected override packages(): readonly SchemaPackage[] {
+    return [COGNITIVE_MEMORY, OPTIONS]
+  }
+}
 
 /**
  * A host that authenticates its callers, as a multi-tenant deployment would.
@@ -27,6 +34,10 @@ export class TestKipDatabase extends KipDatabase {}
 export const TENANT_PRINCIPAL = 'kip:principal:tenant'
 
 export class TenantKipDatabase extends KipDatabase {
+  protected override packages(): readonly SchemaPackage[] {
+    return [COGNITIVE_MEMORY, OPTIONS]
+  }
+
   protected override authenticate(
     context: RequestContext | undefined,
   ): AuthContext {
@@ -51,9 +62,18 @@ export class TenantKipDatabase extends KipDatabase {
  * reach of anything a command could say.
  */
 export class ConformanceKipDatabase extends KipDatabase {
+  /**
+   * Nothing on construction: the fixture's Schema Environment is activated
+   * once, Profile and fixture packages together, as the reference harness
+   * does — a second activation would advance `schema_environment_version`,
+   * which the history fixtures compare.
+   */
+  protected override packages(): readonly SchemaPackage[] {
+    return []
+  }
+
   activateFixturePackages(packages: readonly SchemaPackage[]): void {
-    if (packages.length === 0) return
-    this.nexus.activatePackages([...this.packages(), ...packages])
+    this.nexus.activatePackages([COGNITIVE_MEMORY, ...packages])
   }
 }
 

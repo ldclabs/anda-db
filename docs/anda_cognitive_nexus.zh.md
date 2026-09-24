@@ -12,7 +12,9 @@ KQL/HISTORY 分页保留首个快照；cursor 按 Principal 记录在当前 Stor
 
 查询另有 100,000 次中间结果/候选配对工作预算；LIMIT 不豁免 JOIN 预算。历史重建对扫描版本收费，并在同一查询内按 kind 复用结果。性能测量见[审查基准](benchmarks/anda_nexus_2026-09-23/README.md)。
 
-追踪 KIP v2 提交 `dcde1de`，包含 2.1.0 记忆词汇表。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
+追踪 KIP 提交 `3251912`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:3ea9e459…`）。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
+
+世界时间与信念遵循该提交的 2.0 草案：没有 `from` 的主张按 `{latest: asserted_at}` 起算；`valid_time` 端点可以是 `{earliest, latest}` 区间，无法定位的主张投影为 `uncertain`，原因为 `temporal_indeterminate`。同一 actor 后续 stated/observed 的值在其起点结束先前开放的值（时序继承，§25.4），因此世界变化只需一次 `ASSERT`，`SUPERSEDING` 仅用于纠正错误的主张。`functional` 槽位形成冲突集，`functional_by: "object_type"` 按对象的 Concept Type 分区，`WITH EPISTEMIC {policy: "kip:memory-default"}` 依次按上下文特异性、第一人称证言与时间就近解决冲突。`expired` 为计算状态，从不存储。`?x SEARCH <KIND> "term" LIMIT k` 把关键词检索并入 `FIND`。`DEFINE`（草案词汇）与 recording repair 尚未实现，因此引擎声明 `KIP-Core`，不声明 `KIP-CognitiveMemory`。
 
 > 参考实现 **KIP 2.0** Cognitive Nexus —— 构建在 Anda DB 之上的嵌入式 AI Agent 记忆大脑。
 
@@ -394,7 +396,6 @@ nexus.session(auth)                            // 建立经身份验证的会话
 // 位于 Session 之上的方法，因为每项操作均属于背后有明确 Principal 的治理决策
 session.designate_self(space_id, Some(concept)) // 指定该 Space 的语义主体 $self（Spec §5.6）
 session.sweep_expired(space_id, action, limit)  // 保留期到期清理（Spec §19.1）
-session.expire_lapsed_assertions(space_id, n)   // 断言失效流转至 `expired`（Spec §14.3）
 session.classify / elevate_authority / quarantine / release_quarantine
 
 // 针对控制平面的操作，以 Session 当前 Principal 的身份进行授权鉴权（Spec §29）

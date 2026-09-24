@@ -4,7 +4,7 @@
 (* ========================================================================= *)
 (* KIP 2.0 KML Formal EBNF                                                   *)
 (* ========================================================================= *)
-(* Status: Formal syntax draft aligned to KIP-2.0-SPECIFICATION.md 2.0-draft.
+(* Status: Formal syntax draft aligned to SPECIFICATION.md 2.0-draft.
    Language: KML — Cognitive Mutation Language.
 
    This grammar defines syntax only. Runtime validation still decides:
@@ -175,7 +175,8 @@ kml_statement    = mutate_statement
                  | set_retention
                  | purge_statement
                  | purge_payload_statement
-                 | merge_concept ;
+                 | merge_concept
+                 | define_statement ;
 
 mutate_statement = "MUTATE", "{", { mutation_clause }, "}" ;
 
@@ -233,7 +234,7 @@ ensure_proposition
 
 (* Normative sugar (Spec §55.1): ensure Proposition + create Assertion,
    with optional supersession (TRANSITION ... TO "superseded" BY the new
-   Assertion). Member keys (by, mode, stance, confidence, at, valid,
+   Assertion). Member keys (by, mode, stance, confidence, at, valid, context,
    evidence, key) are validated semantically. *)
 assert_statement = "ASSERT", [ handle ], proposition_tuple,
                    assignment_object,
@@ -372,6 +373,12 @@ merge_concept    = "MERGE", "CONCEPT", target_ref,
                    "INTO", target_ref,
                    [ "WHERE", where_block ],
                    { expect_version_clause } ;
+
+(* DEFINE adds one symbol to the Space's draft vocabulary (Spec §20.16). It
+   is a statement, not a mutation_clause: it commits alone because every
+   later clause resolves against the Schema Environment it changes. *)
+define_statement = "DEFINE", ( "PREDICATE" | "CONCEPT", "TYPE" ),
+                   schema_symbol, object_literal ;
 
 (* ------------------------------------------------------------------------- *)
 (* Preconditions                                                             *)

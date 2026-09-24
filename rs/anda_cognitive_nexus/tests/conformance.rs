@@ -1,19 +1,20 @@
-//! The cross-engine KIP 2.0 conformance suite.
+//! The KIP 2.0 engine suite, run against this engine.
 //!
-//! Fixtures live in `fixtures/kip-conformance-2.0/` and are meant to be run by
-//! *both* this engine and `ts/kip-do`, so they are plain data: a schema to
-//! activate, a setup script, and cases with expected results.
+//! The fixtures in `fixtures/kip-conformance-2.0/` are a byte-for-byte copy of
+//! KIP's `conformance/engine-suite/` (`make sync-kip-conformance`), which both
+//! reference engines run. This harness reproduces KIP's own runner
+//! (`conformance/engine-runner.mjs`): one command per case, flattened to a
+//! result or an error code, ids normalized by a sorted-key walk.
 //!
-//! ## Why the normalization exists
+//! Three outcomes besides PASS and FAIL, all reported rather than hidden:
 //!
-//! Element ids are engine-assigned and differ between runs and between
-//! engines, so a fixture cannot name them. They are rewritten to `C:<1>`,
-//! `P:<2>` and so on by order of first appearance, which compares *structure*
-//! while still catching a wrong reference. Timestamps and transaction ids are
-//! dropped for the same reason.
-//!
-//! Everything else is compared exactly. A fixture that had to be loose about
-//! its expected values would not be pinning behaviour down.
+//! - an `UnsupportedCapability` the case did not expect is **SKIP**, never a
+//!   pass — the capability is optional and this engine says it lacks it;
+//! - a fixture marked `"status": "pending_engine"` has been verified by no
+//!   engine yet; its failures are listed but do not fail this test, and its
+//!   passes are new evidence;
+//! - `expect.result_contains` matches deployment-extensible META answers
+//!   partially, exactly as the runner does.
 
 use anda_cognitive_nexus::{
     CognitiveNexus,
@@ -34,12 +35,31 @@ struct Fixture {
     name: String,
     #[allow(dead_code)]
     description: String,
+    /// `pending_engine` while no engine has verified the fixture.
+    #[serde(default)]
+    status: Option<String>,
     /// Extra Schema Package artifacts to install and activate, inline.
     #[serde(default)]
     packages: Vec<Json>,
     #[serde(default)]
-    setup: Vec<String>,
+    setup: Vec<Setup>,
     cases: Vec<Case>,
+}
+
+/// A setup step: a bare command, or one whose raw result is captured into
+/// parameters for later steps and cases.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Setup {
+    Command(String),
+    Step {
+        command: String,
+        #[serde(default)]
+        params: Map<String, Json>,
+        /// Parameter name → JSON Pointer into the command's raw result.
+        #[serde(default)]
+        capture: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -53,20 +73,9 @@ struct Case {
     #[serde(default)]
     ordered: bool,
     /// Extra request-envelope members, merged over the ones the harness builds.
-    ///
-    /// Most behaviour is decided by the command, but some of it is decided by
-    /// the envelope around the command — `ingest`, `execution.idempotency_key`
-    /// — and those are cross-engine contracts too.
     #[serde(default)]
     envelope: Map<String, Json>,
-    /// The normative conformance vectors this case pins, by their §27 short
-    /// names (`CORE-001`, `KML-031`, …) — the ones §102's invariant registry
-    /// names, which is what the coverage matrix is about.
-    ///
-    /// Declared, not derived: a case covers a vector when someone has read
-    /// both and decided they test the same thing. `tests/coverage.rs` turns
-    /// these into the §27 coverage matrix for §102's invariants, and refuses a
-    /// name the invariant registry does not know.
+    /// The parent-suite vectors this case pins (`tests/coverage.rs`).
     #[serde(default)]
     #[allow(dead_code)]
     vectors: Vec<String>,
@@ -76,6 +85,9 @@ struct Case {
 struct Expectation {
     #[serde(default)]
     result: Option<Json>,
+    /// A partial match: members and rows the answer must contain.
+    #[serde(default)]
+    result_contains: Option<Json>,
     /// The registry code this case must fail with.
     #[serde(default)]
     error: Option<String>,
@@ -183,55 +195,53 @@ async fn execute(
     (response.first_result().cloned(), error)
 }
 
-/// Rewrites engine-assigned ids to stable ordinals, and drops volatile fields.
+/// Engine truth rather than behaviour: dropped before comparison.
+const VOLATILE: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "authorization_view",
+    "created_tx",
+    "updated_tx",
+    "tx_id",
+    "committed_at",
+    "valid_at",
+    "content_digest",
+    "score",
+];
+
+/// Ids become `C:<1>`, `P:<2>`, … in the order a sorted-key walk reaches them,
+/// one counter across every kind (KIP `engine-runner.mjs`).
 #[derive(Default)]
 struct Normalizer {
     seen: BTreeMap<String, String>,
 }
 
 impl Normalizer {
-    fn id(&mut self, raw: &str) -> String {
-        let next = self.seen.len() + 1;
-        self.seen
-            .entry(raw.to_string())
-            .or_insert_with(|| {
-                let tag = raw.split('-').next().unwrap_or("?");
-                format!("{tag}:<{next}>")
-            })
-            .clone()
-    }
-
     fn value(&mut self, value: &Json) -> Json {
         match value {
             Json::String(text) => {
                 if text.parse::<anda_cognitive_nexus::id::ElementId>().is_ok() {
-                    Json::String(self.id(text))
+                    let next = self.seen.len() + 1;
+                    let tag = text.split('-').next().unwrap_or("?");
+                    Json::String(
+                        self.seen
+                            .entry(text.clone())
+                            .or_insert_with(|| format!("{tag}:<{next}>"))
+                            .clone(),
+                    )
                 } else {
                     value.clone()
                 }
             }
             Json::Array(items) => Json::Array(items.iter().map(|v| self.value(v)).collect()),
             Json::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
                 let mut out = Map::new();
-                for (key, item) in map {
-                    // Wall-clock times and transaction ids differ every run and
-                    // between engines; they are engine truth, not behaviour.
-                    if matches!(
-                        key.as_str(),
-                        "created_at"
-                            | "updated_at"
-                            | "created_tx"
-                            | "updated_tx"
-                            | "tx_id"
-                            | "committed_at"
-                            | "valid_at"
-                            | "content_digest"
-                            | "authorization_view"
-                            | "score"
-                    ) {
-                        continue;
+                for key in keys {
+                    if !VOLATILE.contains(&key.as_str()) {
+                        out.insert(key.clone(), self.value(&map[key]));
                     }
-                    out.insert(key.clone(), self.value(item));
                 }
                 Json::Object(out)
             }
@@ -277,84 +287,191 @@ fn canonical(value: &Json) -> String {
     out
 }
 
+/// `expect.result_contains`: objects match member by member, an expected array
+/// needs a matching actual row per expected row, scalars match exactly.
+fn contains(actual: &Json, expected: &Json) -> bool {
+    match expected {
+        Json::Array(rows) => actual.as_array().is_some_and(|actual| {
+            rows.iter()
+                .all(|row| actual.iter().any(|a| contains(a, row)))
+        }),
+        Json::Object(members) => actual.as_object().is_some_and(|actual| {
+            members
+                .iter()
+                .all(|(key, value)| actual.get(key).is_some_and(|a| contains(a, value)))
+        }),
+        scalar => actual == scalar,
+    }
+}
+
+enum Outcome {
+    Pass,
+    Skip(String),
+    Fail(String),
+}
+
+async fn run_case(nexus: &CognitiveNexus, case: &Case, captured: &Map<String, Json>) -> Outcome {
+    let mut params = captured.clone();
+    params.extend(case.params.clone());
+    let (result, error) = execute(nexus, &case.command, &params, &case.envelope).await;
+    let expected_error = case.expect.error.as_deref();
+    if let Some(error) = error {
+        return if error == "UnsupportedCapability" && expected_error != Some(error.as_str()) {
+            Outcome::Skip(error)
+        } else if expected_error == Some(error.as_str()) {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(format!(
+                "expected {}, got {error}",
+                expected_error.unwrap_or("a result")
+            ))
+        };
+    }
+    if let Some(expected) = expected_error {
+        return Outcome::Fail(format!("expected {expected}, got {result:?}"));
+    }
+    let result = result.unwrap_or(Json::Null);
+    let mut normalizer = Normalizer::default();
+    let mut actual = normalizer.value(&result);
+    if let Some(expected) = &case.expect.result {
+        let mut expected = expected.clone();
+        if !case.ordered
+            && let (Json::Array(a), Json::Array(b)) = (&mut actual, &mut expected)
+        {
+            a.sort_by_key(canonical);
+            b.sort_by_key(canonical);
+        }
+        if canonical(&actual) != canonical(&expected) {
+            return Outcome::Fail(format!(
+                "\n  expected {}\n  actual   {}",
+                serde_json::to_string(&expected).unwrap(),
+                serde_json::to_string(&actual).unwrap(),
+            ));
+        }
+    }
+    if let Some(expected) = &case.expect.result_contains
+        && !contains(&result, expected)
+    {
+        return Outcome::Fail(format!(
+            "\n  expected to contain {}\n  actual {}",
+            serde_json::to_string(expected).unwrap(),
+            serde_json::to_string(&actual).unwrap(),
+        ));
+    }
+    Outcome::Pass
+}
+
+fn pointer(value: &Json, path: &str) -> Option<Json> {
+    if path.is_empty() {
+        Some(value.clone())
+    } else {
+        value.pointer(path).cloned()
+    }
+}
+
 #[tokio::test]
 async fn kip_2_conformance() {
     let dir = fixtures_dir();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("the fixture directory must be readable")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && path.file_name().is_some_and(|name| name != "manifest.json")
+        })
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no fixtures found in {}", dir.display());
 
     let mut failures: Vec<String> = Vec::new();
-    let mut cases = 0usize;
+    let mut pending: Vec<String> = Vec::new();
+    let mut skips: Vec<String> = Vec::new();
+    let (mut cases, mut passed) = (0usize, 0usize);
 
     for path in files {
         let source = std::fs::read_to_string(&path).unwrap();
         let fixture: Fixture =
             serde_json::from_str(&source).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let is_pending = fixture.status.as_deref() == Some("pending_engine");
+        let report = if is_pending {
+            &mut pending
+        } else {
+            &mut failures
+        };
         let nexus = open(&fixture).await;
 
-        for (index, command) in fixture.setup.iter().enumerate() {
-            let (_, error) = execute(&nexus, command, &Map::new(), &Map::new()).await;
+        let mut captured = Map::new();
+        let mut setup_ok = true;
+        for (index, step) in fixture.setup.iter().enumerate() {
+            let (command, params, capture) = match step {
+                Setup::Command(command) => (command, Map::new(), BTreeMap::new()),
+                Setup::Step {
+                    command,
+                    params,
+                    capture,
+                } => (command, params.clone(), capture.clone()),
+            };
+            let mut merged = captured.clone();
+            merged.extend(params);
+            let (result, error) = execute(&nexus, command, &merged, &Map::new()).await;
             if let Some(error) = error {
-                failures.push(format!(
+                report.push(format!(
                     "{} setup[{index}] failed with {error}:\n{command}",
                     fixture.name
                 ));
+                setup_ok = false;
+                break;
             }
+            let result = result.unwrap_or(Json::Null);
+            for (name, path) in capture {
+                match pointer(&result, &path) {
+                    Some(value) => {
+                        captured.insert(name, value);
+                    }
+                    None => {
+                        report.push(format!(
+                            "{} setup[{index}] result is missing {path}",
+                            fixture.name
+                        ));
+                        setup_ok = false;
+                    }
+                }
+            }
+            if !setup_ok {
+                break;
+            }
+        }
+        if !setup_ok {
+            cases += fixture.cases.len();
+            continue;
         }
 
         for case in &fixture.cases {
             cases += 1;
-            let (result, error) =
-                execute(&nexus, &case.command, &case.params, &case.envelope).await;
-
-            if let Some(expected) = &case.expect.error {
-                if error.as_deref() != Some(expected.as_str()) {
-                    failures.push(format!(
-                        "{} / {}: expected error {expected}, got {error:?} with result {result:?}",
-                        fixture.name, case.name
-                    ));
+            match run_case(&nexus, case, &captured).await {
+                Outcome::Pass => passed += 1,
+                Outcome::Skip(code) => {
+                    skips.push(format!("{} / {}: {code}", fixture.name, case.name))
                 }
-                continue;
-            }
-            if let Some(error) = error {
-                failures.push(format!(
-                    "{} / {}: unexpected error {error}",
-                    fixture.name, case.name
-                ));
-                continue;
-            }
-            let Some(expected) = &case.expect.result else {
-                continue;
-            };
-
-            let mut normalizer = Normalizer::default();
-            let mut actual = normalizer.value(&result.unwrap_or(Json::Null));
-            let mut expected = expected.clone();
-            if !case.ordered {
-                // Only the top level reorders: a nested array is usually a
-                // list whose order is part of the value.
-                if let (Json::Array(a), Json::Array(b)) = (&mut actual, &mut expected) {
-                    a.sort_by_key(canonical);
-                    b.sort_by_key(canonical);
+                Outcome::Fail(message) => {
+                    report.push(format!("{} / {}: {message}", fixture.name, case.name))
                 }
-            }
-            if canonical(&actual) != canonical(&expected) {
-                failures.push(format!(
-                    "{} / {}:\n  expected {}\n  actual   {}",
-                    fixture.name,
-                    case.name,
-                    serde_json::to_string(&expected).unwrap(),
-                    serde_json::to_string(&actual).unwrap(),
-                ));
             }
         }
     }
 
+    println!(
+        "engine suite: {passed} passed, {} skipped, {} failed, {} pending-engine failures, of {cases}",
+        skips.len(),
+        failures.len(),
+        pending.len()
+    );
+    for skip in &skips {
+        println!("SKIP_UNSUPPORTED {skip}");
+    }
+    for failure in &pending {
+        println!("PENDING_ENGINE {failure}");
+    }
     assert!(
         failures.is_empty(),
         "{} of {cases} conformance case(s) failed:\n\n{}",

@@ -32,6 +32,7 @@ import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
 import { nowTime } from '../src/time.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { Store, classificationOf } from '../src/store/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * The Governance plane's storage and its lattices.
@@ -106,7 +107,7 @@ describe('review regressions', () => {
     const stub = env.KIP_DB.getByName(`review-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -863,7 +864,7 @@ describe('the command gate', () => {
     const stub = env.KIP_DB.getByName(`gate-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -1178,7 +1179,7 @@ describe('the command gate', () => {
       // Assertion all saying the agent administers this Brain…
       session.execute(`MUTATE {
         CREATE CONCEPT ?agent { TYPE "Person" NAME "the agent" }
-        CREATE CONCEPT ?role { TYPE "Preference" NAME "administrator" }
+        CREATE CONCEPT ?role { TYPE "Option" NAME "administrator" }
         ENSURE PROPOSITION ?p (?agent, "prefers", ?role)
         CREATE ASSERTION ?a {
           SET FIELDS {
@@ -1200,7 +1201,7 @@ describe('the command gate', () => {
 describe('the read path', () => {
   const SETUP = `MUTATE {
     CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" SET ATTRIBUTES { salary: 210000 } }
-    CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+    CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
     ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   }`
 
@@ -1218,7 +1219,7 @@ describe('the read path', () => {
     const stub = env.KIP_DB.getByName(`read-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       nexus.execute(SETUP)
       nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:reader' })
       nexus.store.governance.createGrant(
@@ -1418,11 +1419,11 @@ describe('the read path', () => {
     const stub = env.KIP_DB.getByName('read-projection')
     await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
         CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?yes {
           SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -1496,7 +1497,7 @@ describe('the write path', () => {
     const stub = env.KIP_DB.getByName(`write-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       nexus.store.governance.ensurePrincipal({ principal_id: 'kip:principal:agent' })
       nexus.store.governance.createGrant(
         {
@@ -1597,7 +1598,7 @@ describe('the write path', () => {
     await withWriter('attribution', ['create', 'read', 'assert'], (nexus, session) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
       }`)
       const ASSERT = `CREATE ASSERTION ?a {
@@ -1634,7 +1635,7 @@ describe('the write path', () => {
       (nexus, session) => {
         nexus.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
           ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }`)
         // A binding that says this Principal *represents* Alice moves the
@@ -1677,7 +1678,7 @@ describe('the write path', () => {
         // neither wrote it nor represents her.
         nexus.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
           ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
           CREATE ASSERTION ?a {
             SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -1706,7 +1707,7 @@ describe('the write path', () => {
       (nexus, session) => {
         nexus.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
           ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
           CREATE ASSERTION ?a {
             SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -1783,7 +1784,7 @@ describe('the write path', () => {
       (_nexus, session) => {
         session.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-          CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+          CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
           ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
           CREATE ASSERTION ?a {
             SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -1832,7 +1833,7 @@ describe('classification and influence authority', () => {
     const stub = env.KIP_DB.getByName(`class-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -2066,7 +2067,7 @@ describe('classification and influence authority', () => {
 describe('erasure', () => {
   const SETUP = `MUTATE {
     CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-    CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+    CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
     ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   }`
 
@@ -2077,7 +2078,7 @@ describe('erasure', () => {
     const stub = env.KIP_DB.getByName(`purge-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       nexus.execute(SETUP)
       return body(nexus)
     })
@@ -2411,7 +2412,7 @@ describe('the audit and the past', () => {
     const stub = env.KIP_DB.getByName(`audit-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -2561,7 +2562,7 @@ describe('the threat model', () => {
     const stub = env.KIP_DB.getByName(`threat-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -2752,7 +2753,7 @@ describe('the threat model', () => {
       // every answer rather than letting the absence read as calibration.
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?src { TYPE "Person" NAME "Source" }
-        CREATE CONCEPT ?all { TYPE "Preference" NAME "Everything" }
+        CREATE CONCEPT ?all { TYPE "Option" NAME "Everything" }
         ENSURE PROPOSITION ?p (?src, "prefers", ?all)
         CREATE ASSERTION ?a {
           SET FIELDS { proposition: ?p, asserted_by: ?src, stance: "support", mode: "stated", confidence: 1.0 }
@@ -2822,7 +2823,7 @@ describe('the host operations no command can reach', () => {
     const stub = env.KIP_DB.getByName(`host-${name}`)
     return await runInDurableObject(stub, (_instance, state) => {
       const nexus = CognitiveNexus.connect(state.storage)
-      nexus.activatePackages([COGNITIVE_MEMORY])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
       return body(nexus)
     })
   }
@@ -2894,11 +2895,11 @@ describe('the host operations no command can reach', () => {
     })
   })
 
-  it('marks a lapsed Assertion expired without calling it retracted', async () => {
+  it('never stores expired: a lapsed Assertion stays active and is computed out', async () => {
     await withNexus('assertion-expiry', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?a {
           SET FIELDS {
@@ -2908,16 +2909,14 @@ describe('the host operations no command can reach', () => {
         }
       }`)
 
-      const expired = nexus.systemSession().expireLapsedAssertions()
-      expect(expired).toHaveLength(1)
-      // §14.1: administrative action must not mark an Assertion retracted when
-      // no withdrawal occurred. Nobody withdrew this; its own window ran out.
+      // §14.3: `expired` is computed from world time at a read and never
+      // stored, so the lifecycle stays `active` and nobody is called retracted.
       expect(
         nexus.query('FIND(?a.lifecycle.status) WHERE { ?a ASSERTION {} }'),
-      ).toEqual(['expired'])
+      ).toEqual(['active'])
       expect(
-        nexus.query('FIND(?a.lifecycle.retracted_at) WHERE { ?a ASSERTION {} }'),
-      ).toEqual([null])
+        nexus.query('FIND(?b.status) WHERE { ?p PROPOSITION (?s, "prefers", ?o) ?b BELIEF (?p) }'),
+      ).toEqual(['insufficient'])
     })
   })
 })

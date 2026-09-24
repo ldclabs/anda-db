@@ -396,7 +396,11 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
             purge.limit.is_some(),
             out,
         ),
-        MutationClause::EnsureProposition(_) | MutationClause::MergeConcept(_) => {}
+        // DEFINE's draft rules (§20.16) depend on the Schema Environment the
+        // symbol joins, so the engine owns them.
+        MutationClause::EnsureProposition(_)
+        | MutationClause::MergeConcept(_)
+        | MutationClause::Define(_) => {}
     }
 }
 

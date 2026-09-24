@@ -33,9 +33,20 @@ async fn fresh(name: &str, with_schema: bool) -> CognitiveNexus {
             .unwrap();
         let mut lock = SchemaLock::default();
         lock.packages
-            .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+            .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
         lock.states
             .insert(PROFILE_ID.to_string(), PackageState::Active);
+        nexus
+            .install_package(
+                &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+                "test",
+            )
+            .await
+            .unwrap();
+        lock.packages
+            .insert("kip://test/options".into(), "1.0.0".into());
+        lock.states
+            .insert("kip://test/options".into(), PackageState::Active);
         nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     }
     nexus
@@ -79,7 +90,7 @@ async fn seeded(name: &str) -> CognitiveNexus {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?e {
                 SET FIELDS {evidence_class: "user_statement", payload: "I prefer dark mode.", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"}
@@ -172,19 +183,20 @@ async fn an_export_carries_exact_schema_refs_and_the_packages_they_need() {
         concept["schema_ref"]
             .as_str()
             .unwrap()
-            .starts_with("kip://profiles/cognitive-memory@2.1.0/")
+            .starts_with("kip://profiles/cognitive-memory@2.0.0/")
     );
 
     let dependencies = capsule["payload"]["schema_dependencies"]
         .as_array()
         .unwrap();
-    assert_eq!(dependencies.len(), 1);
-    assert_eq!(
-        dependencies[0]["package_ref"],
-        format!("{PROFILE_ID}@2.1.0")
-    );
+    // The Profile, and the test options package the exported options use.
+    assert_eq!(dependencies.len(), 2);
+    let profile = dependencies
+        .iter()
+        .find(|d| d["package_ref"] == format!("{PROFILE_ID}@2.0.0"))
+        .expect("the Profile is a dependency");
     // The digest the destination checks its own copy against.
-    assert!(dependencies[0]["content_digest"].is_string());
+    assert!(profile["content_digest"].is_string());
 
     // The source coordinate travels too, so a destination can say where the
     // records came from without guessing.
@@ -356,7 +368,7 @@ async fn an_import_rebuilds_the_graph_under_destination_identity() {
         &destination,
         r#"MUTATE {
             CREATE CONCEPT ?other { TYPE "Person" NAME "Someone else" }
-            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
+            CREATE CONCEPT ?light { TYPE "Option" NAME "Light" }
             ENSURE PROPOSITION ?p (?other, "prefers", ?light)
             CREATE EVIDENCE ?e { SET FIELDS {evidence_class: "observation", payload: "unrelated"} }
             CREATE ASSERTION ?a {
@@ -445,11 +457,22 @@ async fn a_second_import_of_the_same_capsule_resolves_instead_of_duplicating() {
         .install_package(&SchemaPackage::parse(COGNITIVE_MEMORY).unwrap(), "test")
         .await
         .unwrap();
+    destination
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     destination
         .activate_schema(DEFAULT_SPACE, lock)
         .await
@@ -500,7 +523,7 @@ async fn an_imported_tuple_binds_the_proposition_the_destination_already_has() {
         &destination,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice Local" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }"#,
     )

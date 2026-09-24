@@ -17,6 +17,7 @@ const DOCUMENTS: &[&str] = &[
     anda_kip::SCHEMA_PACKAGE_SCHEMA,
     anda_kip::CHANGE_ENVELOPE_SCHEMA,
     anda_kip::MEMORY_SCHEMA,
+    anda_kip::COMMON_SCHEMA,
 ];
 
 static CATALOG: LazyLock<BTreeMap<String, Json>> = LazyLock::new(|| {
@@ -283,7 +284,7 @@ pub(crate) fn validate_record_with_intent(
     };
     if let Some(facets) = view["facets"].as_object() {
         for (name, value) in facets {
-            if name == "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord"
+            if name == cognitive_memory!("OutcomeRecord")
                 && before.is_some_and(|b| {
                     b["facets"].get(name).is_some_and(|old| {
                         anda_kip::canonical_json(old) != anda_kip::canonical_json(value)
@@ -342,7 +343,7 @@ pub(crate) fn validate_record_with_intent(
     }
     if let Some(name) = view["schema_ref"]
         .as_str()
-        .filter(|r| r.starts_with("kip://profiles/cognitive-memory@2.1.0/"))
+        .filter(|r| r.starts_with(cognitive_memory!("")))
         && name.ends_with("/SkillRevision")
     {
         let mut behavior = view["attributes"].clone();
@@ -371,10 +372,6 @@ pub fn is_derived(element: &crate::store::Element) -> bool {
                     .structural
                     .keys()
                     .any(|key| key.ends_with("/derived_from"))
-                || row
-                    .facets
-                    .keys()
-                    .any(|key| key.ends_with("/DerivationState"))
         }
         _ => false,
     }
@@ -395,7 +392,7 @@ pub(crate) fn pinned_plane(planes: &Json, name: &str) -> Option<u64> {
 /// serialize as strings, including forward handles in an atomic MUTATE.
 /// Only declared reference slots are normalized; arbitrary JSON stays intact.
 pub(crate) fn normalize_record_refs(name: &str, members: &mut anda_kip::Map<String, Json>) {
-    if !name.starts_with("kip://profiles/cognitive-memory@2.1.0/") {
+    if !name.starts_with(cognitive_memory!("")) {
         return;
     }
     let local = name.rsplit('/').next().unwrap_or("");
@@ -423,8 +420,6 @@ pub(crate) fn normalize_record_refs(name: &str, members: &mut anda_kip::Map<Stri
             "missing_attempt_refs.*",
             "excluded_samples.*.ref",
         ],
-        "TrialState" => &["trial_ref", "revision_ref"],
-        "GradingState" => &["revision_ref", "evaluation_ref"],
         "ErasurePlan" => &["source_event_refs.*", "targets.*.ref"],
         _ => &[],
     };

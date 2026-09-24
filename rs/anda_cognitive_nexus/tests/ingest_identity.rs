@@ -17,7 +17,13 @@ async fn fresh() -> CognitiveNexus {
     .unwrap();
     let nexus = CognitiveNexus::connect(Arc::new(db)).await.unwrap();
     nexus
-        .install_and_activate(&[("test", COGNITIVE_MEMORY)], DEFAULT_SPACE)
+        .install_and_activate(
+            &[
+                ("test", COGNITIVE_MEMORY),
+                ("test", include_str!("support/options.json")),
+            ],
+            DEFAULT_SPACE,
+        )
         .await
         .unwrap();
     nexus
@@ -119,7 +125,7 @@ async fn assertions_share_a_tuple_created_in_their_own_transaction() {
             r#"MUTATE {
       CREATE CONCEPT ?alice {TYPE "Person" NAME "Alice"}
       CREATE CONCEPT ?bob {TYPE "Person" NAME "Bob"}
-      CREATE CONCEPT ?p {TYPE "Preference" NAME "Dark"}
+      CREATE CONCEPT ?p {TYPE "Option" NAME "Dark"}
       ASSERT ?a (?alice, "prefers", ?p) {by: ?alice, mode: "stated"}
       ASSERT ?b (?alice, "prefers", ?p) {by: ?bob, mode: "stated"}
     }"#,

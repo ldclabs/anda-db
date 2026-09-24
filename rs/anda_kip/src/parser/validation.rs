@@ -95,8 +95,33 @@ pub(super) fn patterns(clauses: &[WhereClause], flavor: Flavor) -> Result<(), Ki
                 term(subject, flavor)?;
                 term(object, flavor)?;
             }
+            WhereClause::Not(inner) if contains_search(inner) => {
+                return Err(KipError::invalid_syntax(
+                    "a Search Pattern cannot appear inside NOT: a search miss never proves \
+                     absence (Spec §66.6)",
+                ));
+            }
             WhereClause::Not(inner) | WhereClause::Optional(inner) | WhereClause::Union(inner) => {
                 patterns(inner, flavor)?
+            }
+            WhereClause::Search(_) if flavor == Flavor::Exact => {
+                return Err(KipError::invalid_syntax(
+                    "a Search Pattern is approximate and cannot select mutation or export targets",
+                ));
+            }
+            WhereClause::Search(pattern) => {
+                scalars(
+                    [
+                        Some(&pattern.term),
+                        pattern.with_type.as_ref(),
+                        pattern.with_predicate.as_ref(),
+                        pattern.mode.as_ref(),
+                        pattern.threshold.as_ref(),
+                        Some(&pattern.limit),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?;
             }
             WhereClause::Belief { .. } | WhereClause::BeliefSlot { .. }
                 if flavor == Flavor::Exact =>
@@ -120,6 +145,16 @@ pub(super) fn patterns(clauses: &[WhereClause], flavor: Flavor) -> Result<(), Ki
         }
     }
     Ok(())
+}
+
+/// Whether a Search Pattern is reachable in these clauses without crossing
+/// another `NOT` (which is checked on its own).
+fn contains_search(clauses: &[WhereClause]) -> bool {
+    clauses.iter().any(|clause| match clause {
+        WhereClause::Search(_) => true,
+        WhereClause::Optional(inner) | WhereClause::Union(inner) => contains_search(inner),
+        _ => false,
+    })
 }
 
 pub(super) fn proposition_subject(value: &Term, flavor: Flavor) -> Result<(), KipError> {

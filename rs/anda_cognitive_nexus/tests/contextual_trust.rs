@@ -36,16 +36,22 @@ async fn fresh(store: Arc<dyn ObjectStore>) -> CognitiveNexus {
         .unwrap(),
     );
     let n = CognitiveNexus::connect(db).await.unwrap();
-    n.install_and_activate(&[("brain", COGNITIVE_MEMORY)], DEFAULT_SPACE)
-        .await
-        .unwrap();
+    n.install_and_activate(
+        &[
+            ("brain", COGNITIVE_MEMORY),
+            ("test", include_str!("support/options.json")),
+        ],
+        DEFAULT_SPACE,
+    )
+    .await
+    .unwrap();
     n
 }
 
 async fn seed(n: &CognitiveNexus) -> Json {
     run(n,r#"MUTATE {
       CREATE CONCEPT ?actor {TYPE "Person" NAME "source"}
-      CREATE CONCEPT ?object {TYPE "Preference" NAME "tea"}
+      CREATE CONCEPT ?object {TYPE "Option" NAME "tea"}
       CREATE CONCEPT ?work {TYPE "Event" NAME "work" SET ATTRIBUTES {summary:"work context"}}
       CREATE CONCEPT ?home {TYPE "Event" NAME "home" SET ATTRIBUTES {summary:"home context"}}
       ENSURE PROPOSITION ?p (?actor,"prefers",?object)
@@ -61,7 +67,7 @@ fn configuration(ids: &Json, weight: f64) -> TrustConfiguration {
         rules: vec![ContextualTrustRule {
             id: "work-preference".into(),
             actor_ref: ids["actor"].as_str().unwrap().into(),
-            predicate_ref: Some("kip://profiles/cognitive-memory@2.1.0/prefers".into()),
+            predicate_ref: Some("kip://profiles/cognitive-memory@2.0.0/prefers".into()),
             context_ref: Some(ids["work"].as_str().unwrap().into()),
             weight,
         }],

@@ -36,7 +36,6 @@ import {
   type OnError,
 } from './request.js'
 import {
-  BUNDLED_PACKAGES,
   COGNITIVE_MEMORY,
   type SchemaPackage,
 } from './schema/index.js'
@@ -184,13 +183,20 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
     // Core declares no Concept types at all — so an object that skipped this
     // would refuse every `CREATE CONCEPT` with a message about schema rather
     // than about what the caller did. Activating the bundled profile is the
-    // default a host can override by subclassing.
-    this.nexus.activatePackages(this.packages())
+    // default a host can override by subclassing; one that returns nothing
+    // activates its environment itself, once.
+    const packages = this.packages()
+    if (packages.length > 0) this.nexus.activatePackages(packages)
   }
 
-  /** The Schema Packages this object activates on construction. */
+  /**
+   * The Schema Packages this object activates on construction: the Cognitive
+   * Memory Profile. Every bundled package is installed, but a domain package
+   * such as `kip://domains/general@1.0.0` is optional vocabulary a host
+   * activates by overriding this.
+   */
   protected packages(): readonly SchemaPackage[] {
-    return BUNDLED_PACKAGES.length > 0 ? BUNDLED_PACKAGES : [COGNITIVE_MEMORY]
+    return [COGNITIVE_MEMORY]
   }
 
   /**

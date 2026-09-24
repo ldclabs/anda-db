@@ -5,6 +5,7 @@ import { parsePermission, principalAuth } from '../src/governance/index.js'
 import { parseElementId } from '../src/id.js'
 import { COGNITIVE_MEMORY, type SchemaPackage } from '../src/schema/index.js'
 import type { ConceptRow, PropositionRow } from '../src/store/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * Identity and matching after 793af73: canonical Literals (§9.4, §9.6),
@@ -21,7 +22,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`canonical-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY, ...extra])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS, ...extra])
     body(nexus)
   })
 }
@@ -192,8 +193,8 @@ describe('Predicate definition fields', () => {
       (nexus) => {
         nexus.execute(`MUTATE {
           CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-          CREATE CONCEPT ?x { TYPE "Preference" NAME "X" }
-          CREATE CONCEPT ?y { TYPE "Preference" NAME "Y" }
+          CREATE CONCEPT ?x { TYPE "Option" NAME "X" }
+          CREATE CONCEPT ?y { TYPE "Option" NAME "Y" }
           ENSURE PROPOSITION ?px (?alice, "timeless", ?x)
           ENSURE PROPOSITION ?py (?alice, "timeless", ?y)
           CREATE ASSERTION ?a { SET FIELDS { proposition: ?px, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 } }
@@ -217,7 +218,7 @@ describe('leading', () => {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
         CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
         CREATE CONCEPT ?carol { TYPE "Person" NAME "Carol" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?a { SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 } }
         CREATE ASSERTION ?b { SET FIELDS { proposition: ?p, asserted_by: ?bob, stance: "support", mode: "stated", confidence: 0.9 } }
@@ -252,7 +253,7 @@ describe('canonical matching', () => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" SET FIELDS {key: "person:alice"} }
         CREATE CONCEPT ?alicia { TYPE "Person" NAME "Alicia" SET FIELDS {key: "person:alicia"} }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alicia, "prefers", ?dark)
       }`)
       const before = nexus.store.currentSeq(nexus.space)
@@ -320,7 +321,7 @@ describe('symbol lineage', () => {
 
   it('keeps keys, tuples and type matches on the lineage across a package upgrade', async () => {
     await withNexus('upgrade', (nexus) => {
-      nexus.activatePackages([COGNITIVE_MEMORY, v1])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS, v1])
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?a { TYPE "Thing" NAME "A" SET FIELDS {key: "thing:a"} }
         CREATE CONCEPT ?b { TYPE "Thing" NAME "B" SET FIELDS {key: "thing:b"} }
@@ -335,7 +336,7 @@ describe('symbol lineage', () => {
 
       // This engine activates one version per package path at a time; the
       // upgrade replaces 1.0.0 with 1.1.0 in the lock.
-      nexus.activatePackages([COGNITIVE_MEMORY, v2])
+      nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS, v2])
 
       // `type:` matches every readable version of the lineage (§43.1), and
       // each element reports its own exact schema_ref.
@@ -447,7 +448,7 @@ describe('governance additions', () => {
     await withNexus('asserted-by', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
       }`)
       const missing = refused(() =>

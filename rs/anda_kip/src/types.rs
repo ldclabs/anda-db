@@ -340,17 +340,48 @@ wire_enum! {
     }
 }
 
-/// The world-time window a claim applies to.
+/// The world-time window a claim applies to, half-open `[from, until)`.
 ///
 /// Independent of `retention.expires_at`, which is storage lifecycle (§19.2).
+/// A missing `from` means the value began no later than the claim was made
+/// (§25.2); an open `until` states no end, not "forever" (§25.4).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ValidTime {
     /// When the claim starts applying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
+    pub from: Option<TimePoint>,
     /// When it stops; `None` means open-ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<String>,
+    pub until: Option<TimePoint>,
+}
+
+/// One `valid_time` endpoint (§25.5, `kip-common` `TimePoint`): an exact
+/// Timestamp, or a time bound for an instant known only within a range.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TimePoint {
+    /// An exact instant (§6.5).
+    Instant(String),
+    /// The true instant lies in `[earliest, latest]`.
+    Bound(TimeBound),
+}
+
+/// A time bound (§25.5): at least one side, `earliest <= latest`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TimeBound {
+    /// The earliest possible instant; `None` is unbounded below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest: Option<String>,
+    /// The latest possible instant; `None` is unbounded above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+}
+
+impl From<&str> for TimePoint {
+    fn from(instant: &str) -> Self {
+        TimePoint::Instant(instant.to_string())
+    }
 }
 
 /// One Evidence citation, with the role it plays (Spec §13.2).
@@ -675,9 +706,14 @@ pub struct Projection {
     /// Why the answer is not firmer than it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uncertainty: Option<ProjectionUncertainty>,
-    /// The coordinates the projection ran at.
+    /// The side the policy would favor if forced to choose (§27.2):
+    /// `support`, `opposition` or `none`. Disclosure, never resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temporal: Option<ProjectionTemporal>,
+    pub leading: Option<String>,
+    /// The precedence rule that decided this candidate's final status, when
+    /// one did (§21.13): `{rule, prevailed_over}` or `{rule, outranked_by}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precedence: Option<Json>,
     /// Which policy decided it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<crate::request::PolicyIdentity>,
@@ -721,17 +757,6 @@ pub struct ProjectionUncertainty {
     /// looked and found nothing".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
-}
-
-/// The two independent time axes a projection ran under (Spec §27.2, §48.3).
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub struct ProjectionTemporal {
-    /// The world moment the claims were evaluated for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub valid_at: Option<String>,
-    /// The cognitive history the projection read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub as_of_seq: Option<u64>,
 }
 
 /// KIP Cognitive Consistency §2. Opaque control identities disclose no grants.
@@ -971,7 +996,7 @@ pub struct ChangeRefs {
 /// enumeration itself to be redacted.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Capabilities {
-    /// The conformance profiles the runtime claims (§89).
+    /// The conformance levels the runtime claims (§89).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<crate::conformance::ConformanceProfile>,
     /// What this runtime or Space technically implements (§67.1).
@@ -1063,6 +1088,7 @@ mod tests {
         check!(crate::error::RetryClass);
         check!(crate::request::SearchMode);
         check!(crate::conformance::ConformanceProfile);
+        check!(crate::conformance::ConformanceArea);
     }
 
     #[test]
@@ -1122,12 +1148,9 @@ mod tests {
             }),
             uncertainty: Some(ProjectionUncertainty {
                 level: Some(serde_json::json!("high")),
-                reasons: vec!["conflicting independent roots".into()],
+                reasons: vec!["temporal_indeterminate".into()],
             }),
-            temporal: Some(ProjectionTemporal {
-                valid_at: Some("2026-01-01T00:00:00.000Z".into()),
-                as_of_seq: Some(1500),
-            }),
+            leading: Some("support".into()),
             policy: Some(crate::request::PolicyIdentity::new("kip:policy:baseline")),
             explanation: None,
             ..Default::default()
@@ -1140,7 +1163,9 @@ mod tests {
         assert_eq!(json["support"]["score"], 0.8);
         assert_eq!(json["opposition"]["score"], 0.7);
         assert_eq!(json["support"]["score_semantics"], "ordinal_strength");
-        assert_eq!(json["temporal"]["as_of_seq"], 1500);
+        assert_eq!(json["leading"], "support");
+        // The world time and snapshot live in `basis`; there is no second copy.
+        assert!(json.get("temporal").is_none());
         assert_eq!(
             serde_json::from_value::<Projection>(json).unwrap(),
             projection
@@ -1242,7 +1267,7 @@ mod tests {
         let capabilities = Capabilities {
             profiles: vec![
                 crate::conformance::ConformanceProfile::Core,
-                crate::conformance::ConformanceProfile::Kql,
+                crate::conformance::ConformanceProfile::CognitiveMemory,
             ],
             supported: serde_json::json!({ "belief_slot": true, "capsule_import": true })
                 .as_object()
@@ -1260,7 +1285,10 @@ mod tests {
         };
 
         let json = serde_json::to_value(&capabilities).unwrap();
-        assert_eq!(json["profiles"], serde_json::json!(["KIP-Core", "KIP-KQL"]));
+        assert_eq!(
+            json["profiles"],
+            serde_json::json!(["KIP-Core", "KIP-CognitiveMemory"])
+        );
         assert_eq!(json["supported"]["capsule_import"], true);
         assert!(
             json["available"].get("capsule_import").is_none(),
@@ -1316,7 +1344,23 @@ mod tests {
             until: Some("2026-06-01T00:00:00.000Z".into()),
             ..Default::default()
         };
-        assert_ne!(retention.expires_at, valid.until);
+        assert_ne!(retention.expires_at.map(TimePoint::Instant), valid.until);
+    }
+
+    #[test]
+    fn a_valid_time_endpoint_is_an_instant_or_a_time_bound() {
+        // §25.5: "in 2019" is a bound, never an instant picked inside it.
+        let valid: ValidTime = serde_json::from_value(serde_json::json!({
+            "from": {"earliest": "2019-01-01T00:00:00.000Z", "latest": "2019-12-31T23:59:59.999Z"},
+            "until": "2020-06-01T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert!(matches!(valid.from, Some(TimePoint::Bound(_))));
+        assert!(matches!(valid.until, Some(TimePoint::Instant(_))));
+        assert!(
+            serde_json::from_value::<ValidTime>(serde_json::json!({"from": {"soon": true}}))
+                .is_err()
+        );
     }
 
     #[test]

@@ -296,26 +296,6 @@ export class Store extends RowStore {
     return out
   }
 
-  /**
-   * Every active Assertion in a Space whose validity window has closed (§14.3).
-   *
-   * Ordered by id, so a bounded pass is repeatable.
-   */
-  lapsedAssertions(spaceId: string, now: string): ElementId[] {
-    return this.sql
-      .exec<{ id: number }>(
-        `SELECT id FROM assertions
-           WHERE space = ? AND state = ? AND status = 'active'
-             AND valid_until <> '' AND valid_until <= ?
-           ORDER BY id`,
-        spaceId,
-        State.ACTIVE,
-        now,
-      )
-      .toArray()
-      .map((row) => ({ kind: 'Assertion' as const, seq: row.id }))
-  }
-
   /** The Space's current sequence coordinate, without advancing it. */
   currentSeq(spaceId: string): number {
     return this.space(spaceId)?.seq ?? 0

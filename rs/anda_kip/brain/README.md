@@ -1,15 +1,13 @@
 # KIP 2.0 Brain — Autonomous Experience & Graph Memory for AI Agents
 
 
-The normative [Cognitive Consistency contract](../KIP-2.0-Cognitive-Consistency.md) binds final belief, immutable Skill revisions, independent attempts, replayable trials/evaluations, dependency validity, identity repair and durable workers. Lifecycle counters aggregate attempts; unlinked family outcomes are never automatically controls. Stored summaries are used only with a validated computation basis.
-
-**[English](./README.md) | [中文](./README_CN.md)**
+Normative contracts: the [Specification](../SPECIFICATION.md) (final belief §21.11, temporal succession §25.4, dependency validity §57.6, recording repair §57.8), the [Cognitive Memory Profile](../profiles/CognitiveMemoryProfile-2.0.md), and the optional [Validated Learning](../brain/Validated-Learning.md) and [Brain Runtime](../brain/Brain-Runtime.md) companions. A world change is one new Assertion; stored summaries are used only with a validated computation basis; unlinked family outcomes are never controls.
 
 ## Status
 
 **Reference Brain-Layer Overview**
 
-This directory holds one reference Brain design for KIP 2.0. It is not part of KIP Core conformance; normative semantics come from [KIP-2.0-SPECIFICATION.md](../KIP-2.0-SPECIFICATION.md).
+This directory holds one reference Brain design for KIP 2.0. It is not part of KIP Core conformance; normative semantics come from [SPECIFICATION.md](../SPECIFICATION.md).
 
 The Brain is a Module that manages a Cognitive Nexus on behalf of business AI agents.
 Its Interface accepts memory intent and returns usable, attributable memory. An
@@ -54,14 +52,14 @@ https://github.com/ldclabs/anda-brain
 ```
 
 Business agents do not need to understand KIP syntax. The optional normative
-[Memory Interface](../KIP-2.0-Memory-Interface.md) standardizes observe, recall,
+[Memory Interface](../Memory-Interface.md) standardizes observe, recall,
 revise, feedback and forget, including processing receipts and recall barriers.
 Start with the [Agent card](./MemoryInterface.md). The Brain translates intent into
 KIP while preserving the same source, belief, scope and authority distinctions.
 
 ## Start small
 
-The [capability bundles](../KIP-2.0-Memory-Interface.md#2-capability-bundles) separate
+The [capability bundles](../Memory-Interface.md#2-levels) separate
 basic memory, experience, validated learning, durable workers and exchange. A
 basic Brain can remember preferences, correct facts, recall unfinished tasks and
 preserve feedback without running trials. Unproven procedures remain labeled as
@@ -91,7 +89,7 @@ The Cognitive Nexus distinguishes four related but non-equivalent products:
 | **Event**      | What happened?                                                    | episodic anchor Concept + Evidence refs            |
 | **Experience** | What did the agent try, observe, and learn while pursuing a goal? | Experience + ordered ExperienceSteps               |
 | **Knowledge**  | What is generally true?                                           | Proposition + Assertion (+ Evidence); Insight      |
-| **Skill**      | What tends to work, under which conditions?                       | Skill Concept + GradingState / TrialState + compilation lineage |
+| **Skill**      | What tends to work, under which conditions?                       | Skill + immutable SkillRevision + compilation Activity; standing via current_evaluation |
 
 A useful mental model is:
 
@@ -175,7 +173,7 @@ It also:
 - walks `LIST DEPENDENTS` after a material revision and flags derived artifacts `stale` for review, so a revised root cannot leave ghosts in its derivations;
 - evaluates armed Watches against the change stream — delta and silence triggers alike — recording each firing as a `watch_fire` Activity and each outward decision as an `action_gate` Activity whose `DecisionRecord` says act / ask / defer / silence and whose inputs name what was applied;
 - compares successful and failed experiences to identify discriminating actions or conditions;
-- runs the Skill lifecycle through validated immutable EvaluationRecord: promotion is trialed → adopted over independent attempts and an explicitly selected comparable baseline frozen in TrialRecord; TrialState only selects the current trial. Same-state monitoring preserves prior adoption evidence under authorized policy, withdrawal may have zero outcomes, and revoked re-entry opens a new trial. GradingState caches the evaluation; family membership and self-report never confer standing;
+- runs the Skill lifecycle through validated immutable EvaluationRecord: promotion is trialed → adopted over independent attempts and an explicitly selected comparable baseline frozen in TrialRecord; `current_trial` only selects the current trial. Same-state monitoring preserves prior adoption evidence under authorized policy, withdrawal may have zero outcomes, and revoked re-entry opens a new trial. the GradingState view is computed from that evaluation; family membership and self-report never confer standing; all of this belongs to the optional Validated Learning companion;
 - reviews identity suspicions (`same_as`) before any non-destructive `MERGE CONCEPT`;
 - refreshes `$self`'s SelfModel from evidence rather than from the latest conversation;
 - rebuilds the WorkingState digest — stamped with its `basis_seq` — that the next waking session resumes from;
@@ -223,7 +221,7 @@ KIP 2.0 keeps these orthogonal, and each lives in a different place:
 | `confidence`      | Strength of one actor's stance toward one Proposition | Assertion             | new evidence → new Assertion        |
 | `memory_strength` | How available a memory should be for future cognition | `MnemonicState` Facet | reinforcement and disuse            |
 | `salience`        | How noteworthy a memory is                            | `MnemonicState` Facet | impact, correction, identity weight |
-| `utility`         | Expected future decision value — the admission bet (Skills too; their graded record is `GradingState`) | `MnemonicState` Facet | explicit calibration through the decision an outcome is linked to |
+| `utility`         | Expected future decision value — the admission bet (Skills too; their graded record is the computed `GradingState` view) | `MnemonicState` Facet | explicit calibration through the decision an outcome is linked to |
 | supersession      | An actor's own revision of an earlier claim           | Assertion lifecycle   | explicit correction                 |
 | retention         | Storage lifecycle                                     | `retention` state     | policy, review, archive ladder      |
 | trust             | How much a source is credited                         | Governance            | policy, never cognition             |
@@ -231,7 +229,7 @@ KIP 2.0 keeps these orthogonal, and each lives in a different place:
 
 **Do not decay epistemic `confidence` merely because a fact has not been recalled recently.** Disuse reduces `memory_strength`. A stable fact may remain highly credible after a long period without retrieval, and a vivid memory may be false.
 
-For Skills, the graded record is tracked in `GradingState` separately from truth confidence, and it counts only outcomes linked through an `outcome_observation` Activity to an `action_gate` decision that applied the Skill — the `task_family` locates comparison candidates; TrialRecord selects the baseline, and attempt/decision links provide attribution. Repeating a failed procedure three times is not three votes that the procedure is correct.
+For Skills, the graded record is the computed `GradingState` view, separate from truth confidence; and it counts only outcomes linked through an `outcome_observation` Activity to an `action_gate` decision that applied the Skill — the `task_family` locates comparison candidates; TrialRecord selects the baseline, and attempt/decision links provide attribution. Repeating a failed procedure three times is not three votes that the procedure is correct.
 
 ## Memory Quality Principles
 
@@ -299,11 +297,18 @@ LLM + Experience + Skill consolidation
 - **Procedural memory** that can become workflows, heuristics, prompts, code, or tool policies.
 - **Multi-agent support** while keeping memory ownership scoped by MemorySpace and Governance.
 
+## Implementation
+
+[ImplementationGuide.md](https://github.com/ldclabs/KIP/blob/main/brain/ImplementationGuide.md) specifies a concrete minimal
+reference policy, lazy maintenance and host mechanics. The actual service lives in
+[Anda Brain](https://github.com/ldclabs/anda-brain); [verified implementation evidence](https://github.com/ldclabs/KIP/blob/main/conformance/Brain-Implementation-Evidence.md) records its tested revision and
+separates mechanism tests from unmeasured behavioral gains.
+
 ## Related Documents
 
 - [ExperienceLearningArchitecture.md](./ExperienceLearningArchitecture.md) — the learning loop this Brain implements
 - [../profiles/CognitiveMemoryProfile-2.0.md](../profiles/CognitiveMemoryProfile-2.0.md) — the types, Facets, and structural fields used above
-- [../KIP-2.0-Architecture.md](../KIP-2.0-Architecture.md) — how the Brain sits inside the wider KIP architecture
+- [../KIP-2.0-Architecture.md](https://github.com/ldclabs/KIP/blob/main/KIP-2.0-Architecture.md) — how the Brain sits inside the wider KIP architecture
 
 ## Dependencies
 

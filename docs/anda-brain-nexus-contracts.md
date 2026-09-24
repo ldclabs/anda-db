@@ -2,7 +2,7 @@
 
 [中文版](anda-brain-nexus-contracts.zh.md)
 
-This implementation corresponds to KIP commit `dcde1de`. The protocol version remains KIP 2.0, with standard package `kip://profiles/cognitive-memory@2.1.0`. Both the Rust and SQLite/Durable Object engines provide the interfaces below. Retrieval policies, scheduling loops, tool adapters, and the 5-intent Memory Interface are integrated by Anda Brain; the database enforces permissions, references, versions, transactions, and record validity.
+This implementation corresponds to KIP commit `3251912`. The protocol version remains KIP 2.0, with standard package `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`; the draft rewrote 2.0.0 in place, so Spaces activated under the earlier 2.1.0 draft are not migrated). Both the Rust and SQLite/Durable Object engines provide the interfaces below. Retrieval policies, scheduling loops, tool adapters, and the 5-intent Memory Interface are integrated by Anda Brain; the database enforces permissions, references, versions, transactions, and record validity.
 
 All protocol timestamp inputs must adhere strictly to `YYYY-MM-DDTHH:mm:ss.SSSZ`, where whole seconds must include `.000Z`. Non-canonical strings (including timezone offsets and invalid calendar dates) yield `ConstraintViolation`; non-string values like numbers return `TypeMismatch`. Omission or `null` is allowed only when permitted by the field contract. Host interfaces, profile fields, and query time arguments follow the exact same rules. Engine-generated timestamps are truncated to milliseconds and never coerce client input; commit ordering is governed by `space_seq` and must not rely on timestamp uniqueness.
 
@@ -76,7 +76,7 @@ MUTATE {
 }
 ```
 
-Switching to a new revision requires a CAS commit, resetting status to `proposed` and clearing current `TrialState` and `GradingState`. Non-structural annotations do not reset status. Creating a revision does not mean dependencies are verified; automated execution requires either a production Activity with a `DependencyBasis` or explicit dependency revalidation.
+Switching to a new revision requires a CAS commit, resetting status to `proposed` and clearing `current_trial` and `current_evaluation`; `GradingState` is a computed, read-only view of the current evaluation. Non-structural annotations do not reset status. Creating a revision does not mean dependencies are verified; automated execution requires either a production Activity with a `DependencyBasis` or explicit dependency revalidation.
 
 The learning lifecycle commits in the following order:
 

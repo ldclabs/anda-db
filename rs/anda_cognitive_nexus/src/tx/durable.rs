@@ -245,10 +245,8 @@ impl Transaction {
             let Element::Concept(row) = &mut staged.row else {
                 continue;
             };
-            if row.schema_ref == "kip://profiles/cognitive-memory@2.1.0/SleepTask"
-                && let Some(lease) = row
-                    .facets
-                    .get_mut("kip://profiles/cognitive-memory@2.1.0/LeaseState")
+            if row.schema_ref == cognitive_memory!("SleepTask")
+                && let Some(lease) = row.facets.get_mut(cognitive_memory!("LeaseState"))
             {
                 lease["expires_at"] = Json::String(crate::time::normalize(
                     lease["expires_at"].as_str().unwrap_or(""),
@@ -263,7 +261,7 @@ impl Transaction {
             let Element::Concept(row) = &s.row else {
                 continue;
             };
-            if row.schema_ref == "kip://profiles/cognitive-memory@2.1.0/SleepTask" {
+            if row.schema_ref == cognitive_memory!("SleepTask") {
                 self.require_changed_guards(*id, s)?;
                 let before = s
                     .before
@@ -284,7 +282,7 @@ impl Transaction {
                     &self.cx.at,
                 )?;
             }
-            if row.schema_ref == "kip://profiles/cognitive-memory@2.1.0/Watch" {
+            if row.schema_ref == cognitive_memory!("Watch") {
                 self.require_changed_guards(*id, s)?;
                 let old = s.before.as_ref().and_then(|r| facet(r, "WatchState"));
                 let new = facet(&s.row, "WatchState");

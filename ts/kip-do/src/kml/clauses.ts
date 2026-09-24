@@ -104,7 +104,14 @@ import {
   tupleKey,
   type Endpoint,
 } from '../term.js'
-import { normalizeTime } from '../time.js'
+import {
+  TIME_MAX,
+  TIME_MIN,
+  normalizeTime,
+  readTimePoint,
+  storeTimePoint,
+  timePointRange,
+} from '../time.js'
 import { render } from '../view.js'
 import type { Transaction, VersionGuard } from '../tx.js'
 import { resolveTargets } from './select.js'
@@ -666,10 +673,17 @@ function assertionRow(
     return canonicalizeReference(tx, ref)
   })
   const validTime = fields.json('valid_time')
-  const from = validTimePart(validTime, 'from')
-  const until = validTimePart(validTime, 'until')
-  if (from && until && from >= until)
-    throw errors.constraintViolation('valid_time requires from < until')
+  if (Object.keys(validTime).some((k) => k !== 'from' && k !== 'until'))
+    throw errors.constraintViolation('valid_time has only `from` and `until` (§25.2)')
+  const from = readTimePoint(validTime.from, 'valid_time.from')
+  const until = readTimePoint(validTime.until, 'valid_time.until')
+  // §25.5: an interval is invalid when its earliest possible start is not
+  // before its latest possible end; exact bounds need from < until.
+  if (from !== null && until !== null) {
+    const start = timePointRange(from).lo, end = timePointRange(until).hi
+    if (start !== TIME_MIN && end !== TIME_MAX && start >= end)
+      throw errors.constraintViolation('valid_time requires from < until')
+  }
   const confidence = fields.confidence()
   const row: AssertionRow = {
     ...draft.envelope,
@@ -690,8 +704,8 @@ function assertionRow(
     // ASSERT lowers to CREATE ASSERTION; §55.1 uses transaction time when
     // `at` is omitted, independently of any simulated evaluation clock.
     asserted_at: fields.timestamp('asserted_at') || tx.cx.at,
-    valid_from: validTimePart(validTime, 'from'),
-    valid_until: validTimePart(validTime, 'until'),
+    valid_from: storeTimePoint(from),
+    valid_until: storeTimePoint(until),
     evidence_refs: evidence,
     context_refs: [
       ...new Map(contextRefs.map((r) => [canonicalJson(r), r])).entries(),
@@ -1320,12 +1334,22 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
   const newer = requireKind(tx, by, 'Assertion')
   requireStanding(tx, id, older.row, 'TRANSITION TO "superseded"')
   if (older.row.proposition_id !== newer.row.proposition_id) {
-    // Supersession is a claim about the same Proposition; across two of them it
-    // would silently retire a claim nobody revised.
-    throw errors.supersessionMismatch(
-      `${newerId} is about ${newer.row.proposition_id} and ` +
-        `${olderId} about ${older.row.proposition_id}`,
-    )
+    // A value-only correction replaces the claim with another value of the
+    // same slot (§14.2): the same subject and predicate lineage. Anything
+    // wider would silently retire a claim nobody revised.
+    const slotOf = (reference: string): string | null => {
+      const element = tx.load(parseElementIdOfKind(reference, 'Proposition'))
+      return element.kind === 'Proposition'
+        ? `${element.row.subject_key}\u001f${lineageText(element.row.predicate_ref)}`
+        : null
+    }
+    const olderSlot = slotOf(older.row.proposition_id)
+    if (olderSlot === null || olderSlot !== slotOf(newer.row.proposition_id)) {
+      throw errors.supersessionMismatch(
+        `${newerId} is about ${newer.row.proposition_id}, which is neither ` +
+          `${older.row.proposition_id} nor another value of its slot`,
+      )
+    }
   }
   older.row.superseded_by.push(newerId)
   older.row.status = 'superseded'
@@ -2636,16 +2660,6 @@ function expiresAt(retention: JsonMap): string {
     throw errors.typeMismatch('`retention.expires_at` must be a timestamp')
   }
   return normalizeTime(value, 'retention.expires_at')
-}
-
-/** `valid_time: {from, until}` — world validity, never storage lifecycle (§34). */
-function validTimePart(validTime: JsonMap, part: 'from' | 'until'): string {
-  const value = validTime[part]
-  if (value === undefined || value === null) return ''
-  if (typeof value !== 'string') {
-    throw errors.typeMismatch(`\`valid_time.${part}\` must be a timestamp`)
-  }
-  return normalizeTime(value, `valid_time.${part}`)
 }
 
 /** Evidence carries its payload inline or by content reference (§19). */

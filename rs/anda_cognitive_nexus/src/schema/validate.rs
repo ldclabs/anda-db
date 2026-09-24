@@ -282,6 +282,7 @@ fn validate_fields(
     for (name, spec) in declared {
         let path = format!("{prefix}.{name}");
         match values.get(name) {
+            Some(_) if spec.computed => into.push(computed(schema_ref, &path)),
             Some(value) => validate_field(schema_ref, &path, spec, value, into),
             None if spec.required => into.push(error(
                 "SCHEMA_REQUIRED_MISSING",
@@ -416,9 +417,25 @@ pub fn validate_facet_mutability(
     result
 }
 
+/// A write that reaches an engine-derived, read-only member (§18.2).
+fn computed(schema_ref: &str, path: &str) -> Violation {
+    error(
+        "SCHEMA_COMPUTED_MEMBER",
+        schema_ref,
+        path,
+        "a computed member is derived by the engine when a read is evaluated and is never \
+         written (§18.2); write the state it is computed from instead"
+            .to_string(),
+    )
+}
+
 /// Validates one Facet's members against its definition (§58–§60).
 pub fn validate_facet(schema_ref: &str, def: &FacetDef, values: &Map<String, Json>) -> Validation {
     let mut result = Validation::default();
+    if def.computed {
+        result.push(computed(schema_ref, "facets"));
+        return result;
+    }
     validate_fields(
         schema_ref,
         "facets",
@@ -454,6 +471,10 @@ pub fn validate_structural(
     targets: &[String],
 ) -> Validation {
     let mut result = Validation::default();
+    if def.computed && !targets.is_empty() {
+        result.push(computed(schema_ref, "structural"));
+        return result;
+    }
     let count = targets.len() as u32;
     if count < def.cardinality.min {
         result.push(error(

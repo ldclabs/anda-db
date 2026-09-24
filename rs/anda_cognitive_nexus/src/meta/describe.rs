@@ -1,7 +1,7 @@
 //! # `DESCRIBE` and `LIST`
 //!
 //! Introspection returns **canonical identity** (Spec §65): a `DESCRIBE TYPE
-//! "Person"` answers with `kip://profiles/cognitive-memory@2.1.0/Person`, not
+//! "Person"` answers with `kip://profiles/cognitive-memory@2.0.0/Person`, not
 //! with the local name the caller happened to write. A caller that stored the
 //! local name would have stored something whose meaning changes when the
 //! Space's schema does.
@@ -266,6 +266,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
         ListTarget::EpistemicPolicies => vec![
             policy(cx, &Policy::baseline().id).await?,
             policy(cx, &Policy::forecast().id).await?,
+            policy(cx, &Policy::memory_default().id).await?,
         ],
         ListTarget::Dependents => {
             let (rows, cut) = dependents(cx, command).await?;
@@ -962,6 +963,14 @@ async fn policy(cx: &Context<'_>, name: &str) -> Result<Json, KipError> {
         "material_threshold": policy.material,
         "unstated_confidence_weight": policy.unstated_confidence,
         "conflict_set_expansion": policy.expand_conflicts,
+        // §21.10: a structural policy counts root groups and weighs nothing.
+        "structural": policy.structural,
+        // §21.13's ordered precedence rules, when the policy resolves conflicts.
+        "precedence": if policy.precedence {
+            serde_json::json!(["context_specificity", "first_person_testimony", "recency"])
+        } else {
+            Json::Array(Vec::new())
+        },
         "notes": [
             "mode gates eligibility and never weights a claim: a mode does not grant trust",
             "corroboration groups are counted once; repetition is not evidence",
@@ -969,7 +978,7 @@ async fn policy(cx: &Context<'_>, name: &str) -> Result<Json, KipError> {
     }))
 }
 
-pub(super) fn scalar_str(
+pub(crate) fn scalar_str(
     cx: &Context<'_>,
     scalar: &Scalar,
     what: &str,
@@ -982,7 +991,7 @@ pub(super) fn scalar_str(
     }
 }
 
-pub(super) fn scalar_usize(
+pub(crate) fn scalar_usize(
     cx: &Context<'_>,
     scalar: &Scalar,
     what: &str,
@@ -1003,7 +1012,7 @@ pub(super) fn scalar_usize(
     }
 }
 
-pub(super) fn scalar_json(cx: &Context<'_>, scalar: &Scalar) -> Result<Json, KipError> {
+pub(crate) fn scalar_json(cx: &Context<'_>, scalar: &Scalar) -> Result<Json, KipError> {
     Ok(match scalar {
         Scalar::Literal(literal) => Json::from(literal.clone()),
         Scalar::Param(name) => cx.param_ref(name)?,

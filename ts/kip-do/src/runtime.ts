@@ -25,7 +25,7 @@ import { render } from './view.js'
 import type { Element, TransactionRow } from './store/rows.js'
 import type { Session } from './nexus.js'
 
-const PROFILE = 'kip://profiles/cognitive-memory@2.1.0/'
+import { PROFILE_PREFIX as PROFILE } from './schema/profile-ref.js'
 const obj = (v: Json | undefined): JsonMap => (isJsonMap(v) ? v : {})
 const facet = (e: Element, n: string): JsonMap | undefined =>
   e.row.facets[PROFILE + n] as JsonMap | undefined

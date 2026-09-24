@@ -73,7 +73,17 @@ export function kqlPermissions(
   const needed: Permission[] = ['read']
   if (query.as_of !== null || boundToSnapshot) needed.push('read_history')
   if (query.where_clauses.some(projectsBelief)) needed.push('project')
+  // A Search Pattern is the same disclosure as META `SEARCH` (§43.8).
+  if (query.where_clauses.some(searches)) needed.push('search')
   return needed
+}
+
+function searches(clause: WhereClause): boolean {
+  if ('Search' in clause) return true
+  if ('Not' in clause) return clause.Not.some(searches)
+  if ('Optional' in clause) return clause.Optional.some(searches)
+  if ('Union' in clause) return clause.Union.some(searches)
+  return false
 }
 
 function projectsBelief(clause: WhereClause): boolean {
@@ -176,6 +186,11 @@ export function clausePermissions(clause: MutationClause): Permission[] {
   // approval, not through a second permission name.
   if ('Purge' in clause || 'PurgePayload' in clause) return ['purge']
   if ('MergeConcept' in clause) return ['merge_identity', 'maintain']
+  // `propose_schema` exists only where `draft_vocabulary` is advertised
+  // (§29, §20.16), and this engine does not advertise it: `mutate` refuses
+  // DEFINE as UnsupportedCapability before any authorization, so a caller is
+  // never told it lacks a permission nothing grants.
+  if ('Define' in clause) return []
   return FALLBACK
 }
 

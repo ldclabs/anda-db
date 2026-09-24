@@ -55,33 +55,27 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   semantic_search: false, // §66.3: no embedding model
   hybrid_search: false, // §66.3
   search_index_freshness: { mode: 'synchronous' }, // §66.5: written by the committing transaction
-  belief_slot: true, // §47
   weighted_projection: true, // §21.10: the structural baseline only
-  materialized_projection: false, // §21.9: every projection is computed on read
   signed_receipts: false, // §33.3: no signing keys
-  ingestion_context: true, // §71.1
   streaming: false, // §84
   artifacts: true, // §85: governed canonical-JSON artifacts
   change_stream: true, // §36, §68
   filtered_delivery: true, // §36.3: CHANGES is unfiltered
   watch_evaluation: true, // Cognitive Memory Profile §5.11
-  list_dependents: true, // §63.5
-  payload_purge: true, // §60.6
+  exposure_log: false, // §66.8: reads are not logged
+  draft_vocabulary: false, // §20.16: DEFINE is refused before authorization
   identity_repair: true,
-  dependency_validity: true,
-  durable_brain_runtime: false,
+  recording_repair: false, // §57.8: so KIP-CognitiveMemory is not claimed
+  derive_permission: true, // §29.6: derived outputs and dependency contracts are gated
+  record_outcome_permission: true, // §29.8
   capsule_export: true, // §63.4
   capsule_import: false, // §39
   capsule_signatures: false, // §37.8
-  derive_permission: true, // §29.6: derived outputs and dependency contracts are gated
-  record_outcome_permission: true, // §29.8
   kip1_migration: false, // §103: no DESCRIBE COMPATIBILITY, no 1.x conversions
   memory_interface: false,
-  memory_basic: false,
-  memory_experience: false,
-  memory_learning: false,
-  memory_durable: false,
-  memory_exchange: false,
+  durable_brain_runtime: false,
+  receiver_fencing: false,
+  prospective_trials: false,
 }
 
 /**
@@ -129,6 +123,11 @@ const SUPPORTED_NAMES: readonly string[] = [
   'opaque_cursors',
   'payload_purge',
   'list_dependents',
+  // §67.4: registry entries of earlier drafts that are now level
+  // requirements, still answered as engine-local names.
+  'belief_slot',
+  'ingestion_context',
+  'dependency_validity',
   'transition',
   'version_planes',
   'snapshot_at_time',
@@ -165,6 +164,7 @@ const UNSUPPORTED_NAMES: readonly string[] = [
   'retention_policy',
   'capsule_restore_mode',
   'deadlines',
+  'materialized_projection',
 ]
 
 /**
@@ -215,7 +215,7 @@ export function capabilities(): Json {
     // §21.9, §27: what the old DESCRIBE PROJECTION CAPABILITY reported, now a
     // member here (§68).
     projection: {
-      policies: [BASELINE_ID, 'kip:policy:forecast'],
+      policies: [BASELINE_ID, 'kip:policy:forecast', 'kip:memory-default'],
       statuses: [...BELIEF_STATUSES],
       leading: ['support', 'opposition', 'none'],
       score_semantics: 'normalized_support_not_probability',
@@ -231,31 +231,13 @@ export function capabilities(): Json {
         },
       ],
     },
-    // §89 makes declaring the conformance profiles a MUST. A claim, not a
-    // wish — each of these is exercised by the shared conformance fixtures both
-    // engines run, and the three §89 names that are absent are absent for a
-    // reason a caller can check in `unsupported`. `KIP-KQL` is claimed against
-    // §96's own list, which every item of is built; the KQL gaps that remain —
-    // `nested_proposition_endpoint`, `hop_quantifiers`, the projection ledger —
-    // are outside that list and stay in `unsupported`:
-    //
-    //   KIP-Transactions    claimed against §94's own list: one statement or one
-    //                       MUTATE block is the transaction it means, and several
-    //                       operations in one is the `atomic_batch` capability
-    //   Capsule import, historical reads and 1.x migration are capabilities
-    //   (`capsule_import`, `historical_reads`, `kip1_migration`), answered in
-    //   the registry rather than claimed as profiles (§89).
-    profiles: [
-      'KIP-Core',
-      'KIP-Schema',
-      'KIP-Epistemic',
-      'KIP-Governance',
-      'KIP-Transactions',
-      'KIP-KQL',
-      'KIP-KML',
-      'KIP-META',
-      'KIP-Runtime',
-    ],
+    // §89's conformance levels, claimed rather than wished for: the KIP
+    // engine suite runs against this engine in `test/conformance.test.ts`,
+    // world time, `functional_by`, `kip:memory-default` and the Search Pattern
+    // included. DEFINE is the optional `draft_vocabulary` capability, skipped
+    // rather than failed. `KIP-CognitiveMemory` also needs recording repair
+    // (§57.8) and computed mnemonic strength, which this engine lacks.
+    profiles: ['KIP-Core'],
     languages: ['KQL', 'KML', 'META'],
     supported: {
       // §67.4: the registry, by the names the Specification fixes, at the
@@ -600,7 +582,7 @@ export function capabilities(): Json {
         'DESCRIBE',
         'LIST',
         'LIST DEPENDENTS',
-        'SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION, keyword mode',
+        'SEARCH CONCEPT | PROPOSITION | EVIDENCE and the KQL Search Pattern, keyword mode',
         'VALIDATE KQL',
         'VALIDATE KML',
         'PREVIEW KML',
@@ -616,7 +598,7 @@ export function capabilities(): Json {
       },
       search: {
         modes: ['keyword'],
-        kinds: ['Concept', 'Proposition', 'Evidence', 'Cognition'],
+        kinds: ['Concept', 'Proposition', 'Evidence'],
         ranking: 'SQLite FTS5 BM25 over segmented text',
         // Not the same numbers as the Rust engine's, and saying so is the
         // point: both are BM25, over the same corpus, under different
@@ -1017,6 +999,36 @@ export function capabilities(): Json {
           'one MUTATE block is already one Transaction (§53)',
       },
 
+      {
+        capability: 'materialized_projection',
+        detail: 'serving a cached Projection under its ProjectionBasis (§21.9)',
+        reason:
+          'every BELIEF is computed at read time; nothing is cached, so there ' +
+          'is no stale result to disclose',
+      },
+      {
+        capability: 'draft_vocabulary',
+        detail: 'DEFINE PREDICATE / DEFINE CONCEPT TYPE and the propose_schema permission (§20.16)',
+        reason:
+          'the Space-local draft package is not built; DEFINE is refused before ' +
+          'authorization. Install a Schema Package that declares the symbol ' +
+          'instead. rs/anda_cognitive_nexus has the same gap',
+      },
+      {
+        capability: 'recording_repair',
+        detail: 'the protected RecordingRepair operation and the repair_recording permission (§57.8)',
+        reason:
+          'a misrecorded claim can be retracted or quarantined, but the repair ' +
+          'operation that keeps it apart from the actor\'s own history is not ' +
+          'built, so this engine does not claim KIP-CognitiveMemory',
+      },
+      {
+        capability: 'exposure_log',
+        detail: 'the append-only retrieval/use log (§66.8)',
+        reason:
+          'reads are not logged; Maintenance cannot fold exposures into ' +
+          'strength updates',
+      },
       {
         capability: 'deadlines',
         detail: 'options.deadline_ms (§80.1)',

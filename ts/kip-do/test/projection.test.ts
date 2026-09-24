@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY, type SchemaPackage } from '../src/schema/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * The Epistemic Projection, against the cases the conformance suite pins.
@@ -38,8 +39,8 @@ const SETUP = [
      CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
      CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
      CREATE CONCEPT ?carol { TYPE "Person" NAME "Carol" }
-     CREATE CONCEPT ?quiet { TYPE "Preference" NAME "Quiet" }
-     CREATE CONCEPT ?loud { TYPE "Preference" NAME "Loud" }
+     CREATE CONCEPT ?quiet { TYPE "Option" NAME "Quiet" }
+     CREATE CONCEPT ?loud { TYPE "Option" NAME "Loud" }
      ENSURE PROPOSITION ?unspoken (?alice, "prefers", ?quiet)
      ENSURE PROPOSITION ?repeated (?alice, "prefers", ?loud)
    }`,
@@ -59,7 +60,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`proj-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY, STATUS_PACKAGE])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS, STATUS_PACKAGE])
     for (const setup of SETUP) nexus.execute(setup)
     body(nexus)
   })
@@ -155,7 +156,7 @@ describe('the Epistemic Projection', () => {
       expect(nexus.query(`FIND(?b.policy.id) ${BELIEF('Quiet')}`)).toEqual([
         'kip:policy:baseline',
       ])
-      expect(nexus.query(`FIND(?b.policy.version) ${BELIEF('Quiet')}`)).toEqual([2])
+      expect(nexus.query(`FIND(?b.policy.version) ${BELIEF('Quiet')}`)).toEqual([3])
     })
   })
 

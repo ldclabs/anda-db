@@ -4,11 +4,12 @@ import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { parseKip } from '../src/kip/parser.js'
 import type { IngestEvidence } from '../src/kml/ingest.js'
+import { OPTIONS } from './support/options.js'
 
 async function withNexus(name: string, body: (nexus: CognitiveNexus) => void): Promise<void> {
   await runInDurableObject(env.KIP_DB.getByName(`ingest-identity-${name}`), (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     body(nexus)
   })
 }
@@ -52,7 +53,7 @@ it('shares the tuple created by repeated ASSERT clauses in the same transaction'
     nexus.execute(`MUTATE {
       CREATE CONCEPT ?alice {TYPE "Person" NAME "Alice"}
       CREATE CONCEPT ?bob {TYPE "Person" NAME "Bob"}
-      CREATE CONCEPT ?p {TYPE "Preference" NAME "Dark"}
+      CREATE CONCEPT ?p {TYPE "Option" NAME "Dark"}
       ASSERT ?a (?alice, "prefers", ?p) {by: ?alice, mode: "stated"}
       ASSERT ?b (?alice, "prefers", ?p) {by: ?bob, mode: "stated"}
     }`)

@@ -251,7 +251,7 @@ async fn repair_completed_commitments(
         let crate::store::Element::Concept(row) = nexus.store.get_element(id).await? else {
             continue;
         };
-        if row.schema_ref != "kip://profiles/cognitive-memory@2.1.0/Commitment"
+        if row.schema_ref != cognitive_memory!("Commitment")
             || row.attributes.get("status").and_then(Json::as_str) != Some("blocked")
             || row.plane_versions["attributes"].as_u64() != Some(1)
             || !row.facets.iter().any(|(name, value)| {

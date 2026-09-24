@@ -11,6 +11,8 @@ import { digest } from './schema/contracts.js'
 import {
   baseline,
   forecast,
+  memoryDefault,
+  MEMORY_DEFAULT_ID,
   policyFromSettings,
   type Policy,
 } from './projection/policy.js'
@@ -32,6 +34,7 @@ export interface ControlRecord {
 export const initialProjection = (): JsonMap => ({
   baseline: baseline() as unknown as Json,
   forecast: forecast() as unknown as Json,
+  'memory-default': memoryDefault() as unknown as Json,
 })
 
 export function publishControl(
@@ -75,6 +78,7 @@ export function publishControl(
         'identity',
         'authorization',
         'schema',
+        'recording',
       ].includes(kind)
         ? [{ kind, version: String(seq) }]
         : [],
@@ -102,9 +106,16 @@ export function projectionPolicyAt(
   const requested = policyFromSettings(settings)
   const name = requested.id.startsWith('kip:policy:forecast')
     ? 'forecast'
-    : 'baseline'
-  const policy = structuredClone(
-    (saved.value as JsonMap)[name],
+    : requested.id.startsWith(MEMORY_DEFAULT_ID)
+      ? 'memory-default'
+      : 'baseline'
+  // The standard memory policy is fixed by its artifact (§21.13), so a Space
+  // created before it was bundled still resolves it.
+  const stored = (saved.value as JsonMap)[name]
+  const policy = (
+    stored === undefined && name === 'memory-default'
+      ? memoryDefault()
+      : structuredClone(stored)
   ) as unknown as Policy
   if ('accept' in settings) policy.accept = requested.accept
   if ('material' in settings) policy.material = requested.material

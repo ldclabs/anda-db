@@ -5,6 +5,7 @@ import { principalAuth } from '../src/governance/index.js'
 import { parseElementId } from '../src/id.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import type { ActivityRow, AssertionRow, EvidenceRow } from '../src/store/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * `TRANSITION` — the one lifecycle statement (Spec §52.5).
@@ -22,14 +23,14 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`transition-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     body(nexus)
   })
 }
 
 const SETUP = `MUTATE {
   CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE ASSERTION ?a {
     SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -111,7 +112,7 @@ describe('TRANSITION', () => {
     })
   })
 
-  it('supersedes within one Proposition, from active only', async () => {
+  it('supersedes within one slot, from active only', async () => {
     await withNexus('supersede', (nexus) => {
       nexus.execute(SETUP)
       nexus.execute(`CREATE ASSERTION ?b {
@@ -143,13 +144,15 @@ describe('TRANSITION', () => {
         refused(() => nexus.execute('TRANSITION "A-1" TO "superseded" BY "A-3"')).code,
       ).toBe('InvalidLifecycleTransition')
 
-      // Self, and another Proposition, are mismatches rather than moves.
+      // Self, and another slot, are mismatches rather than moves; a
+      // value-only correction stays inside one slot (§14.2).
       expect(
         refused(() => nexus.execute('TRANSITION "A-3" TO "superseded" BY "A-3"')).code,
       ).toBe('SupersessionMismatch')
       nexus.execute(`MUTATE {
-        CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
-        ENSURE PROPOSITION ?q ({id: "C-1"}, "prefers", ?light)
+        CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+        CREATE CONCEPT ?light { TYPE "Option" NAME "Light" }
+        ENSURE PROPOSITION ?q (?bob, "prefers", ?light)
         CREATE ASSERTION ?d { SET FIELDS { proposition: ?q, asserted_by: "C-1", stance: "support", mode: "stated" } }
       }`)
       expect(
@@ -253,7 +256,7 @@ describe('TRANSITION', () => {
         expect.objectContaining({
           op: 'lifecycle',
           kind: 'concept',
-          schema_ref: expect.stringContaining('/Preference'),
+          schema_ref: expect.stringContaining('/Option'),
           state: { from: 'active', to: 'archived' },
         }),
       )

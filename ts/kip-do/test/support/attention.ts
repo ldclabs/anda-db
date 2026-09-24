@@ -9,13 +9,14 @@ import type {
   WatchEvaluation,
   WakeRecord,
 } from '../../src/attention/types.js'
+import { OPTIONS } from './options.js'
 export const pin = (id: string) => ({ id, digest: digest({ id }) })
 export const expiry = () => new Date(Date.now() + 120000).toISOString()
 export const version = (n: CognitiveNexus, ref: string) =>
   n.store.load(parseElementId(ref))!.row.version
 export function fresh(storage: DurableObjectStorage) {
   const n = CognitiveNexus.connect(storage)
-  n.activatePackages([COGNITIVE_MEMORY])
+  n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
   return n
 }
 export function fixture(

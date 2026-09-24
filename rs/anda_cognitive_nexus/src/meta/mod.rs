@@ -646,34 +646,20 @@ fn unsupported_prose() -> Json {
     PROSE.clone()
 }
 
-/// The §89 profiles this engine claims.
+/// The §89 conformance levels this engine claims.
 ///
-/// A claim, not a wish: each of these is exercised by the shared conformance
-/// fixtures both engines run. §89 lists nine; this engine claims all nine.
-/// `KIP-Transactions` is claimed against §94's own list — one statement or
-/// one MUTATE block is the transaction it means, and several operations in
-/// one transaction is the `atomic_batch` capability this engine answers
-/// false to, not a profile requirement.
+/// A claim, not a wish: §89 makes a level rest on the engine suite run against
+/// the engine itself, and `tests/conformance.rs` runs KIP's suite here — world
+/// time, `functional_by`, `kip:memory-default` and the Search Pattern
+/// included. `DEFINE` is the optional `draft_vocabulary` capability and is
+/// skipped, not failed. Several operations in one transaction is the
+/// `atomic_batch` capability, not a level requirement.
 ///
-/// `KIP-KQL` is claimed against §96's own list, which every item of is built.
-/// The two KQL gaps that remain — `nested_proposition_endpoint` and the
-/// projection ledger — are outside that list and stay in `unsupported`, where
-/// a caller can find them.
-///
-/// Capsule support, historical reads and 1.x migration are capabilities
-/// (`capsule_export` / `capsule_import`, `historical_reads`,
-/// `kip1_migration`), answered in the registry rather than claimed here.
-pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] = &[
-    anda_kip::ConformanceProfile::Core,
-    anda_kip::ConformanceProfile::Schema,
-    anda_kip::ConformanceProfile::Epistemic,
-    anda_kip::ConformanceProfile::Governance,
-    anda_kip::ConformanceProfile::Transactions,
-    anda_kip::ConformanceProfile::Kql,
-    anda_kip::ConformanceProfile::Kml,
-    anda_kip::ConformanceProfile::Meta,
-    anda_kip::ConformanceProfile::Runtime,
-];
+/// `KIP-CognitiveMemory` is not claimed: it adds recording repair (§57.8) and
+/// computed mnemonic strength (Profile §18), which this engine lacks and
+/// lists in `unsupported`.
+pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] =
+    &[anda_kip::ConformanceProfile::Core];
 
 /// What the calling Principal may request, in at least some scope (§67.2).
 ///
@@ -752,34 +738,28 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
         true,
         Some(r#"{"mode": "synchronous"}"#),
     ),
-    ("belief_slot", true, None),
     // §21.10: the structural baseline; no trust-weighted policy.
     ("weighted_projection", true, None),
-    ("materialized_projection", false, None),
     ("signed_receipts", false, None),
-    ("ingestion_context", true, None),
     ("streaming", false, None),
     ("artifacts", true, None),
     ("change_stream", true, None),
     ("filtered_delivery", true, None),
     ("watch_evaluation", true, None),
-    ("list_dependents", true, None),
-    ("payload_purge", true, None),
+    ("exposure_log", false, None),
+    ("draft_vocabulary", false, None),
     ("identity_repair", true, None),
-    ("dependency_validity", true, None),
-    ("durable_brain_runtime", false, None),
+    ("recording_repair", false, None),
+    ("derive_permission", true, None),
+    ("record_outcome_permission", true, None),
     ("capsule_export", true, None),
     ("capsule_import", true, None),
     ("capsule_signatures", false, None),
-    ("derive_permission", true, None),
-    ("record_outcome_permission", true, None),
     ("kip1_migration", true, None),
     ("memory_interface", false, None),
-    ("memory_basic", false, None),
-    ("memory_experience", false, None),
-    ("memory_learning", false, None),
-    ("memory_durable", false, None),
-    ("memory_exchange", false, None),
+    ("durable_brain_runtime", false, None),
+    ("receiver_fencing", false, None),
+    ("prospective_trials", false, None),
 ];
 
 /// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4).
@@ -831,6 +811,11 @@ const SUPPORTED_NAMES: &[&str] = &[
     "opaque_cursors",
     "payload_purge",
     "list_dependents",
+    // §67.4: registry entries of earlier drafts that are now level
+    // requirements, still answered as engine-local names.
+    "belief_slot",
+    "ingestion_context",
+    "dependency_validity",
     // §52.5, §35.1, §68, §33.2, §12.3, §20.14: the vocabulary the 2026-09-02
     // consolidation added. Every one of them is built here; they are named so
     // a `requires` block gets `true` rather than the `unrecognized` §67.4
@@ -865,6 +850,7 @@ const UNSUPPORTED_NAMES: &[&str] = &[
     "retention_policy",
     "deadlines",
     "nested_proposition_endpoint",
+    "materialized_projection",
 ];
 
 /// The protocol this engine speaks.
@@ -938,7 +924,7 @@ mod tests {
             declared["supported"]["registry"]["weighted_projection"],
             true
         );
-        assert_eq!(declared["supported"]["registry"]["belief_slot"], true);
+        assert_eq!(capability_state("belief_slot"), Some(true));
         assert!(declared["supported"]["projection"]["missing_stages"].is_array());
     }
 
@@ -1009,26 +995,22 @@ mod tests {
         assert_eq!(registry, spec);
     }
 
-    /// §89 makes declaring the profiles a MUST, and the names are §89's.
+    /// §89's levels are the only names a claim may use, and every claimed
+    /// level is one this engine is held to.
     #[test]
-    fn the_declared_profiles_are_the_ones_the_spec_names() {
+    fn the_declared_levels_are_the_ones_the_spec_names() {
         let declared = capabilities(None, &AuthContext::system());
-        let profiles = declared["profiles"].as_array().expect("a profile list");
-        assert!(!profiles.is_empty());
-        for profile in profiles {
-            let name = profile.as_str().expect("a profile name");
+        let profiles: Vec<&str> = declared["profiles"]
+            .as_array()
+            .map(|list| list.iter().filter_map(Json::as_str).collect())
+            .unwrap_or_default();
+        let claimed: Vec<&str> = CONFORMANCE_PROFILES.iter().map(|p| p.name()).collect();
+        assert_eq!(profiles, claimed);
+        for name in profiles {
             assert!(
-                anda_kip::ConformanceProfile::ALL
-                    .iter()
-                    .any(|known| known.name() == name),
-                "{name} is not a profile §89 names"
+                anda_kip::ConformanceProfile::from_name(name).is_some(),
+                "{name} is not a level §89 names"
             );
         }
-        // Claimed only where it is true: this engine signs nothing (§101).
-        assert!(
-            profiles
-                .iter()
-                .any(|p| p.as_str() == Some("KIP-Transactions"))
-        );
     }
 }

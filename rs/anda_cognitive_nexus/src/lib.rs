@@ -109,6 +109,19 @@
 // to fit a default would scatter the one document a caller reads as a whole.
 #![recursion_limit = "256"]
 
+/// The bundled Cognitive Memory package reference, or one of its symbols:
+/// `cognitive_memory!()` is `kip://profiles/cognitive-memory@2.0.0` and
+/// `cognitive_memory!("Skill")` its `Skill`. One spelling, so a package bump is
+/// one edit (see [`profiles`]).
+macro_rules! cognitive_memory {
+    () => {
+        "kip://profiles/cognitive-memory@2.0.0"
+    };
+    ($symbol:literal) => {
+        concat!("kip://profiles/cognitive-memory@2.0.0/", $symbol)
+    };
+}
+
 pub mod attention;
 pub mod capsule;
 pub mod control;

@@ -7,13 +7,14 @@ import { principalAuth } from '../src/governance/index.js'
 import { parseElementId } from '../src/id.js'
 import { trustWeight, type TrustConfiguration } from '../src/trust.js'
 import type { Json, JsonMap } from '../src/json.js'
-const P = 'kip://profiles/cognitive-memory@2.1.0/prefers'
+import { OPTIONS } from './support/options.js'
+const P = 'kip://profiles/cognitive-memory@2.0.0/prefers'
 function fixture(storage: DurableObjectStorage) {
   const n = CognitiveNexus.connect(storage)
-  n.activatePackages([COGNITIVE_MEMORY])
+  n.activatePackages([COGNITIVE_MEMORY, OPTIONS])
   const ids = n.execute(`MUTATE {
     CREATE CONCEPT ?actor {TYPE "Person" NAME "source"}
-    CREATE CONCEPT ?object {TYPE "Preference" NAME "tea"}
+    CREATE CONCEPT ?object {TYPE "Option" NAME "tea"}
     CREATE CONCEPT ?work {TYPE "Event" NAME "work" SET ATTRIBUTES {summary:"work context"}}
     CREATE CONCEPT ?home {TYPE "Event" NAME "home" SET ATTRIBUTES {summary:"home context"}}
     ENSURE PROPOSITION ?p (?actor,"prefers",?object)

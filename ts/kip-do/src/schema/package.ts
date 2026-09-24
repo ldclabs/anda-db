@@ -44,6 +44,8 @@ export interface FieldSpec {
   enum?: Json[]
   /** The value used when the field is absent (§40). */
   default?: Json
+  /** Engine-derived and read-only (§18.2): a write fails ConstraintViolation. */
+  computed?: boolean
   [extra: string]: Json | undefined
 }
 
@@ -132,6 +134,12 @@ export interface PredicateDef {
    */
   functional?: boolean
   /**
+   * `"object_type"`: functional within each partition of candidate objects
+   * that share a Concept Type lineage (§20.15). Never with `functional: true`,
+   * and only over Concept objects.
+   */
+  functional_by?: string
+  /**
    * Whether absence of a Proposition means insufficient (§24) rather than a
    * closed-world absence (§24.2). Defaults to `true`.
    */
@@ -175,6 +183,8 @@ export interface FacetDef {
   closed?: boolean
   applicable_to?: EndpointSpec
   fields?: Record<string, FieldSpec>
+  /** Engine-derived and read-only (§18.2): no write may carry it. */
+  computed?: boolean
   /**
    * Anything a later format revision added.
    *
@@ -213,6 +223,8 @@ export interface StructuralFieldDef {
    */
   ordered?: boolean
   unique?: boolean
+  /** Engine-derived and read-only (§18.2): no write may set it. */
+  computed?: boolean
   /**
    * Anything a later format revision added.
    *
@@ -408,6 +420,28 @@ export const CORE_STRUCTURAL_FIELD_OWNERS: Readonly<Record<string, string>> = {
 }
 
 /**
+ * Refuses a `functional_by` declaration §20.15 does not admit: any value but
+ * `"object_type"`, together with `functional: true`, or over an object that is
+ * not declared as Concepts — a Literal has no Concept Type to partition by.
+ */
+export function checkFunctionalBy(artifact: SchemaPackage): void {
+  for (const [name, def] of Object.entries(artifact.definitions?.predicates ?? {})) {
+    if (def.functional_by === undefined) continue
+    const object = def.object ?? {}
+    const concepts =
+      (object.concept_types?.length ?? 0) > 0 ||
+      ((object.kinds?.length ?? 0) > 0 && object.kinds!.every((kind) => kind === 'Concept'))
+    const literal = (object.literal_types?.length ?? 0) + (object.datatypes?.length ?? 0) > 0
+    if (def.functional_by !== 'object_type' || def.functional === true || literal || !concepts) {
+      throw errors.constraintViolation(
+        `predicate ${name}: functional_by must be "object_type", never with functional: true, ` +
+          'and its object must be declared as Concepts (§20.15)',
+      )
+    }
+  }
+}
+
+/**
  * Refuses a package that would shadow a reserved Core symbol (§20.13).
  *
  * `kip://core` is implicitly active in every Schema Environment and cannot be
@@ -490,6 +524,8 @@ export const predicateDef = (
  */
 export interface PredicateRules {
   functional: boolean
+  /** `functional_by: "object_type"` (§20.15). */
+  functional_by: boolean
   open_world: boolean
   complete: boolean
   boolean_completeness: boolean
@@ -499,6 +535,7 @@ export interface PredicateRules {
 export function predicateRules(def: PredicateDef | undefined): PredicateRules {
   return {
     functional: def?.functional === true,
+    functional_by: def?.functional_by === 'object_type',
     open_world: def?.open_world !== false,
     complete: def?.complete === true,
     boolean_completeness: def?.boolean_completeness === true,

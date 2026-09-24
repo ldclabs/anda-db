@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * Reading the Space at a past coordinate.
@@ -18,7 +19,7 @@ async function withNexus<T>(
   const stub = env.KIP_DB.getByName(`history-${name}`)
   return await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     return body(nexus)
   })
 }
@@ -116,11 +117,11 @@ describe('AS OF', () => {
     await withNexus('tuples', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
       }`)
       nexus.execute(`MUTATE {
-        CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
+        CREATE CONCEPT ?light { TYPE "Option" NAME "Light" }
         ENSURE PROPOSITION ?q ({id: "C-1"}, "prefers", ?light)
       }`)
 
@@ -139,7 +140,7 @@ describe('AS OF', () => {
     await withNexus('projection', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?a {
           SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -363,7 +364,7 @@ describe('FOR TIME', () => {
     await withNexus('valid-time', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?a {
           SET FIELDS {
@@ -391,7 +392,7 @@ describe('FOR TIME', () => {
     await withNexus('axes', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+        CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         CREATE ASSERTION ?a {
           SET FIELDS {

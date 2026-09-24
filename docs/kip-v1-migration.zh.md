@@ -10,7 +10,7 @@ Nexus 在打开其 v2 存储前会自动检测已持久化的 v1 集合结构。
 
 已发布的 v1 属性布局采用 `a` / `m` 缩写，迁移逻辑同时兼容恢复导出时所使用的长字段表示 `attributes` / `metadata`。`LegacyRecord` 完整保留源数据：包括 Concept 的原始记录行，或 Assertion 对应的每个谓词的源属性与旧身份标识。这些仅作为来源记录 (provenance)，不构成独立证据 (Evidence) 或治理授权。
 
-- Person、Event、Preference、Insight、Commitment 和 SleepTask 均映射为兼容的原生类型。摘要、时间与任务字段完成标准化规范化；原处于 running、completed 或 failed 状态的 v1 任务在原生任务中统一转为 blocked，且不获取 v2 租约。其原始执行状态与执行结果完整保存在 LegacyRecord 中；原生任务需要显式人工或流程复核，绝不会自动恢复执行或获得虚构租约。
+- Person、Event、Insight、Commitment 和 SleepTask 均映射为兼容的原生类型。2.0 Profile 没有 Preference 类型（偏好是一条 `prefers` 主张），因此 1.x 的 `Preference` 保留为 legacy 包中的开放类型（`kip://legacy/nexus@1.1.0/Preference`），不会被改写成其 actor 从未做出的主张。摘要、时间与任务字段完成标准化规范化；原处于 running、completed 或 failed 状态的 v1 任务在原生任务中统一转为 blocked，且不获取 v2 租约。其原始执行状态与执行结果完整保存在 LegacyRecord 中；原生任务需要显式人工或流程复核，绝不会自动恢复执行或获得虚构租约。
 - Commitment 的 `completed` 映射为 `fulfilled`（这与 SleepTask 的执行状态处理不同）。对于此前迁移中属性尚未被修改的历史记录，数据库在打开时执行一次受属性版本保护的校正；用户后续编辑的内容及原始 LegacyRecord 内容保持不变，已归档记录继续维持归档状态。
 - 与原生字段类型不兼容的可选值保留在 LegacyRecord 中。无法安全兼容的旧学习或运行时产物赋予独立的 Legacy 类型，保留其原始数据内容但不授予经过验证的正式语义地位。生成的类型名称避免与现有词汇表冲突。
 - 关系元组两端节点若满足宿主谓词约束，则保留该谓词；不符合新约束的旧关系使用独立的 Legacy 谓词，符合约束的关系则保留在宿主常规查询使用的标准词汇表中。

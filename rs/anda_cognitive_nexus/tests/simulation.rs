@@ -34,7 +34,10 @@ async fn fresh() -> (Arc<AndaDB>, CognitiveNexus) {
     let nexus = CognitiveNexus::connect(db.clone()).await.unwrap();
     nexus
         .install_and_activate(
-            &[("test", anda_cognitive_nexus::profiles::COGNITIVE_MEMORY)],
+            &[
+                ("test", anda_cognitive_nexus::profiles::COGNITIVE_MEMORY),
+                ("test", include_str!("support/options.json")),
+            ],
             DEFAULT_SPACE,
         )
         .await
@@ -62,7 +65,7 @@ async fn seed(nexus: &CognitiveNexus) -> Json {
         &session,
         r#"MUTATE {
         CREATE CONCEPT ?person {TYPE "Person" NAME "Actor"}
-        CREATE CONCEPT ?preference {TYPE "Preference" NAME "Dark"}
+        CREATE CONCEPT ?preference {TYPE "Option" NAME "Dark"}
         CREATE CONCEPT ?retained {TYPE "Person" NAME "Retained"}
         CREATE CONCEPT ?held {TYPE "Person" NAME "Held"}
         ENSURE PROPOSITION ?p (?person, "prefers", ?preference)
@@ -96,21 +99,13 @@ async fn view(nexus: &CognitiveNexus, id: &Json) -> Json {
 }
 
 #[tokio::test]
-async fn simulation_expires_both_lifecycles_but_preserves_session_isolation_holds_and_real_timestamps()
- {
+async fn simulation_sweeps_retention_but_preserves_session_isolation_holds_and_real_timestamps() {
     for action in [RetentionAction::Archive, RetentionAction::Tombstone] {
         let (db, nexus) = fresh().await;
         let handles = seed(&nexus).await;
         let normal = nexus.system_session();
         let simulated = normal.clone().with_simulated_lifecycle_time(AFTER).unwrap();
         // Setting one session's clock never moves the original or another session.
-        assert!(
-            normal
-                .expire_lapsed_assertions(DEFAULT_SPACE, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         assert!(
             normal
                 .sweep_expired(DEFAULT_SPACE, action, 10)
@@ -129,13 +124,8 @@ async fn simulation_expires_both_lifecycles_but_preserves_session_isolation_hold
             json!({}),
         )
         .await;
-        let valid_at = projection[0]["temporal"]["valid_at"].as_str().unwrap();
+        let valid_at = projection[0]["basis"]["valid_at"].as_str().unwrap();
         assert!(valid_at >= before.as_str() && valid_at <= time::now().as_str());
-        let expired = simulated
-            .expire_lapsed_assertions(DEFAULT_SPACE, 10)
-            .await
-            .unwrap();
-        assert_eq!(expired, vec![handles["a"].as_str().unwrap()]);
         let sweep = simulated
             .sweep_expired(DEFAULT_SPACE, action, 10)
             .await
@@ -143,8 +133,10 @@ async fn simulation_expires_both_lifecycles_but_preserves_session_isolation_hold
         assert_eq!(sweep.swept, vec![handles["retained"].as_str().unwrap()]);
         assert_eq!(sweep.held, 1);
         assert_eq!(sweep.refused, 0);
+        // `expired` is computed from world time at a read and never stored
+        // (§14.3): no clock moves an Assertion's lifecycle.
         let assertion = view(&nexus, &handles["a"]).await;
-        assert_eq!(assertion["lifecycle"]["status"], "expired");
+        assert_eq!(assertion["lifecycle"]["status"], "active");
         let retained = view(&nexus, &handles["retained"]).await;
         assert_eq!(
             retained["_system"]["state"],
@@ -158,20 +150,13 @@ async fn simulation_expires_both_lifecycles_but_preserves_session_isolation_hold
             "active"
         );
         let after = time::now();
-        for value in [&assertion, &retained] {
-            let updated = value["_system"]["updated_at"].as_str().unwrap();
-            assert!(updated >= before.as_str() && updated <= after.as_str());
-            assert_ne!(updated, AFTER);
-        }
+        let updated = retained["_system"]["updated_at"].as_str().unwrap();
+        assert!(updated >= before.as_str() && updated <= after.as_str());
+        assert_ne!(updated, AFTER);
         let audits = normal.read_audit(DEFAULT_SPACE, 100).await.unwrap();
         let expiries: Vec<_> = audits
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.operation.as_str(),
-                    "expire_assertion" | "retention_expiry"
-                )
-            })
+            .filter(|row| row.operation == "retention_expiry")
             .collect();
         assert!(!expiries.is_empty());
         assert!(
@@ -228,9 +213,10 @@ async fn simulation_is_not_a_request_option_or_an_ordinary_principal_capability(
     assert!(
         nexus
             .system_session()
-            .expire_lapsed_assertions(DEFAULT_SPACE, 10)
+            .sweep_expired(DEFAULT_SPACE, RetentionAction::Archive, 10)
             .await
             .unwrap()
+            .swept
             .is_empty()
     );
     db.close().await.unwrap();
@@ -265,13 +251,6 @@ async fn simulation_does_not_bypass_element_policy_denials() {
         .system_session()
         .with_simulated_lifecycle_time(AFTER)
         .unwrap();
-    assert!(
-        simulated
-            .expire_lapsed_assertions(DEFAULT_SPACE, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
     for action in [RetentionAction::Archive, RetentionAction::Tombstone] {
         let report = simulated
             .sweep_expired(DEFAULT_SPACE, action, 10)
@@ -385,7 +364,7 @@ async fn evaluation_simulation_changes_cutoff_eligibility_only() {
     let command = format!(
         r#"MUTATE {{
         CREATE ACTIVITY ?v {{SET FIELDS {{activity_class:"lifecycle_verdict",status:"completed"}} SET FACET "EvaluationRecord" {evaluation} SET STRUCTURAL {{("inputs","{revision}") ("outputs","{skill}")}}}}
-        UPDATE "{skill}" SET ATTRIBUTES {{status:"revoked"}} SET FACET "GradingState" {{revision_ref:"{revision}",evaluation_ref:?v,success_count:0,failure_count:0,graded_count:0}} EXPECT VERSION 1
+        UPDATE "{skill}" SET ATTRIBUTES {{status:"revoked"}} SET STRUCTURAL {{("current_evaluation",?v)}} EXPECT VERSION 1
     }}"#
     );
     let mut request = Request::single(command);
@@ -426,20 +405,19 @@ async fn evaluation_simulation_changes_cutoff_eligibility_only() {
         "audit time must remain real"
     );
     assert_eq!(
-        row["facets"]["kip://profiles/cognitive-memory@2.1.0/EvaluationRecord"]["cutoff"],
+        row["facets"]["kip://profiles/cognitive-memory@2.0.0/EvaluationRecord"]["cutoff"],
         EXPIRY
     );
     // A simulated cutoff must not silently change normal lifecycle sweeps.
-    let seeded = seed(&nexus).await;
-    assert_eq!(
+    seed(&nexus).await;
+    assert!(
         simulated
-            .expire_lapsed_assertions(DEFAULT_SPACE, 100)
+            .sweep_expired(DEFAULT_SPACE, RetentionAction::Archive, 100)
             .await
             .unwrap()
-            .len(),
-        0
+            .swept
+            .is_empty()
     );
-    let _ = seeded;
     nexus.close().await.unwrap();
     db.close().await.unwrap();
 }

@@ -517,7 +517,14 @@ impl Session {
                     cs.iter().any(|c| {
                         matches!(
                             c["kind"].as_str(),
-                            Some("schema" | "identity" | "policy" | "trust" | "authorization")
+                            Some(
+                                "schema"
+                                    | "identity"
+                                    | "policy"
+                                    | "trust"
+                                    | "authorization"
+                                    | "recording"
+                            )
                         )
                     })
                 }) {

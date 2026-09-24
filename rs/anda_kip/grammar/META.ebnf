@@ -4,7 +4,7 @@
 (* ========================================================================= *)
 (* KIP 2.0 META Formal EBNF                                                  *)
 (* ========================================================================= *)
-(* Status: Formal syntax draft aligned to KIP-2.0-SPECIFICATION.md 2.0-draft.
+(* Status: Formal syntax draft aligned to SPECIFICATION.md 2.0-draft.
    Language: META — Introspection, Grounding, Verification, Validation,
    Preview, History, Changes, Snapshot, and Capsule Export.
 
@@ -281,8 +281,7 @@ search_kind      = "CONCEPT"
                  | "PROPOSITION"
                  | "ASSERTION"
                  | "EVIDENCE"
-                 | "ACTIVITY"
-                 | "COGNITION" ;
+                 | "ACTIVITY" ;
 
 search_mode      = '"keyword"'
                  | '"semantic"'

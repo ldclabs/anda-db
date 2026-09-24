@@ -23,7 +23,15 @@ use anda_kip::{AssertionMode, Json, KipError, Map};
 pub const BASELINE_ID: &str = "kip:policy:baseline";
 /// The baseline policy's version. Any change to the constants below is a new
 /// version, because it changes what a past "accepted" would have meant.
-pub const BASELINE_VERSION: u64 = 2;
+///
+/// 3: an unstated confidence is weighed by its stance alone (§13.6 — missing
+/// confidence is not 0.5), and world time follows temporal succession and
+/// time bounds (§25.4, §25.5).
+pub const BASELINE_VERSION: u64 = 3;
+/// The standard memory policy (§21.13, `profiles/policy-memory-default.json`).
+pub const MEMORY_DEFAULT_ID: &str = "kip:memory-default";
+/// Its version, as the artifact states it.
+pub const MEMORY_DEFAULT_VERSION: u64 = 1;
 
 /// The knobs a projection runs under.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -59,6 +67,14 @@ pub struct Policy {
     pub unstated_confidence: f64,
     /// Whether a functional predicate's competing values oppose one another.
     pub expand_conflicts: bool,
+    /// Structural classification (§21.10): every eligible root group counts
+    /// once, and no confidence or trust weight enters the arithmetic.
+    #[serde(default)]
+    pub structural: bool,
+    /// The `kip:memory-default` precedence rules resolve slot conflicts
+    /// (§21.13): context specificity, first-person testimony, recency.
+    #[serde(default)]
+    pub precedence: bool,
     /// How much of the Epistemic Ledger the answer carries (§49.1).
     pub explanation: Explanation,
 }
@@ -125,9 +141,29 @@ impl Policy {
             ],
             accept: 0.7,
             material: 0.3,
-            unstated_confidence: 0.5,
+            unstated_confidence: 1.0,
             expand_conflicts: true,
+            structural: false,
+            precedence: false,
             explanation: Explanation::Ledger,
+        }
+    }
+
+    /// `kip:memory-default` (§21.13): the structural baseline plus three
+    /// ordered precedence rules. Deterministic and unweighted, so two engines
+    /// given the same visible state answer the same.
+    pub fn memory_default() -> Self {
+        Self {
+            id: MEMORY_DEFAULT_ID.to_string(),
+            version: MEMORY_DEFAULT_VERSION,
+            modes: vec![
+                AssertionMode::Observed,
+                AssertionMode::Stated,
+                AssertionMode::Inferred,
+            ],
+            structural: true,
+            precedence: true,
+            ..Self::baseline()
         }
     }
 
@@ -156,12 +192,13 @@ impl Policy {
             Some(Json::String(name)) => match name.as_str() {
                 BASELINE_ID | "baseline" => Policy::baseline(),
                 "forecast" | "kip:policy:forecast" => Policy::forecast(),
+                MEMORY_DEFAULT_ID | "memory-default" => Policy::memory_default(),
                 other => {
                     return Err(KipError::new(
                         anda_kip::KipErrorCode::ProjectionPolicyUnavailable,
                         format!(
-                            "this Nexus knows the epistemic policies \"baseline\" and \
-                             \"forecast\"; it has no {other:?}"
+                            "this Nexus knows the epistemic policies \"baseline\", \
+                             \"forecast\" and \"kip:memory-default\"; it has no {other:?}"
                         ),
                     ));
                 }
@@ -432,8 +469,20 @@ mod tests {
     }
 
     #[test]
-    fn silence_about_confidence_is_neither_denial_nor_certainty() {
+    fn silence_about_confidence_is_not_a_number_the_actor_chose() {
+        // §13.6: missing confidence is not 0, 0.5 or untrusted. The claim is
+        // weighed by its stance alone, and no confidence is invented for it.
         let policy = Policy::baseline();
-        assert!(policy.unstated_confidence > 0.0 && policy.unstated_confidence < 1.0);
+        assert_eq!(policy.unstated_confidence, 1.0);
+        // The standard memory policy weighs nothing at all (§21.10, §21.13).
+        let memory = Policy::memory_default();
+        assert!(memory.structural && memory.precedence);
+        assert_eq!(memory.identity().id, MEMORY_DEFAULT_ID);
+        assert_eq!(
+            Policy::from_settings(&settings(json!({"policy": "kip:memory-default"})))
+                .unwrap()
+                .id,
+            MEMORY_DEFAULT_ID
+        );
     }
 }

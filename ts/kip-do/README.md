@@ -1,6 +1,7 @@
 # @ldclabs/kip-do
 
-Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP at `3251912`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
 [Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
 
 A [KIP](https://github.com/ldclabs/KIP) Cognitive Nexus running inside a
@@ -179,7 +180,7 @@ Then `POST` a KIP request envelope:
 {
   "kip": "2.0",
   "operations": [
-    { "command": "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a { SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n}" },
+    { "command": "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Person\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a { SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 } }\n}" },
     { "command": "FIND(?b.status) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) ?b BELIEF (?p) }" }
   ]
 }
@@ -230,7 +231,7 @@ leaking into it is a failing test.
 
 ## Full-text search and multilingual text
 
-`SEARCH CONCEPT | PROPOSITION | EVIDENCE | COGNITION` supports keyword retrieval.
+`SEARCH CONCEPT | PROPOSITION | EVIDENCE` and the KQL Search Pattern (`?x SEARCH CONCEPT "term" LIMIT k`, §43.8) support keyword retrieval.
 The corpus contains visible Concept `name` / `aliases` / `attributes`,
 Proposition `predicate_ref`, and Evidence payload text. Each query applies
 Governance and field redaction before building BM25 statistics in memory.

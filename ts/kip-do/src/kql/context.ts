@@ -168,6 +168,15 @@ export class Context {
   }
 
   /** The rendered Core view of an element, computed once per query. */
+  /**
+   * Adds a transient, read-scoped member to an admitted element's view — the
+   * `retrieval` a Search Pattern hit carries (§43.8). Never stored.
+   */
+  annotate(id: ElementId, member: string, value: Json): void {
+    const view = this.view(id)
+    if (view !== null) this.views.set(formatElementId(id), { ...view, [member]: value })
+  }
+
   view(id: ElementId): JsonMap | null {
     const key = formatElementId(id)
     const cached = this.views.get(key)

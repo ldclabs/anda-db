@@ -117,6 +117,10 @@ export function validateWhere(cx: Context, clauses: readonly WhereClause[], b: R
       term(pattern.subject)
       pred(pattern.predicate)
       scope.add(pattern.variable)
+    } else if ('Search' in clause) {
+      // §43.8: a Search Pattern binds its hits; its term and modifiers are
+      // read when it runs, where a wrong type is reported.
+      scope.add(clause.Search.variable)
     } else {
       const pattern = 'Concept' in clause ? clause.Concept : 'Assertion' in clause ? clause.Assertion : 'Evidence' in clause ? clause.Evidence : clause.Activity
       scope.add(pattern.variable)

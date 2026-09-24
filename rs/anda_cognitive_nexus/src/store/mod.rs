@@ -353,8 +353,8 @@ async fn init_assertions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["status"]).await?;
     c.create_btree_index_nx(&["mode"]).await?;
     c.create_btree_index_nx(&["stance"]).await?;
-    // The lifecycle sweep ranges over closed validity windows. Projection
-    // checks valid_from on the Assertions fetched by proposition_id.
+    // Kept for range reads over closed validity windows; projection decides
+    // world time on the Assertions fetched by proposition_id (§25.4).
     c.create_btree_index_nx(&["valid_until"]).await?;
     Ok(())
 }
@@ -970,40 +970,6 @@ impl Store {
                     .map_err(crate::error::db_error)?,
             )),
         }
-    }
-
-    /// Every active Assertion in a Space whose validity window has closed.
-    ///
-    /// Ordered by id, so a bounded pass is repeatable.
-    pub async fn lapsed_assertions(
-        &self,
-        space: &str,
-        now: &str,
-    ) -> Result<Vec<ElementId>, KipError> {
-        let ids = self
-            .elements(ElementKind::Assertion)
-            .query_all_ids(anda_db::query::Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(space.to_string()))),
-                Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                Box::new(eq_field("status", Fv::Text("active".to_string()))),
-                // Open-ended windows are absent from the sparse index; this
-                // range selects actual normalized timestamps through `now`.
-                Box::new(anda_db::query::Filter::Field((
-                    "valid_until".to_string(),
-                    anda_db::query::RangeQuery::Between(
-                        Fv::Text("0".to_string()),
-                        Fv::Text(now.to_string()),
-                    ),
-                ))),
-            ]))
-            .await
-            .map_err(crate::error::db_error)?;
-        let mut out: Vec<ElementId> = ids
-            .into_iter()
-            .map(|seq| ElementId::new(ElementKind::Assertion, seq))
-            .collect();
-        out.sort();
-        Ok(out)
     }
 
     /// Every active element in a Space whose retention has lapsed (§19.1).

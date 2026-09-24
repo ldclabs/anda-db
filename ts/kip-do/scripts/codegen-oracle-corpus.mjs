@@ -79,9 +79,11 @@ for (const crate of ['anda_kip', 'anda_cognitive_nexus']) {
 }
 
 const fixtureDir = join(repoRoot, 'fixtures', 'kip-conformance-2.0')
-for (const name of readdirSync(fixtureDir).filter((f) => f.endsWith('.json'))) {
+for (const name of readdirSync(fixtureDir).filter((f) => f.endsWith('.json') && f !== 'manifest.json')) {
   const fixture = JSON.parse(readFileSync(join(fixtureDir, name), 'utf8'))
-  for (const setup of fixture.setup ?? []) commands.add(setup.trim())
+  for (const setup of fixture.setup ?? []) {
+    commands.add((typeof setup === 'string' ? setup : setup.command).trim())
+  }
   for (const testCase of fixture.cases ?? []) {
     if (testCase.command) commands.add(testCase.command.trim())
   }

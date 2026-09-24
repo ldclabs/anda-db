@@ -39,6 +39,7 @@ import { canonicalJson } from '../json.js'
 
 import { formatElementId, tryParseElementId, type ElementId } from '../id.js'
 import { isJsonMap, jsonEquals, type Json, type JsonMap } from '../json.js'
+import { boundariesAfter, place, succeed, timed, type Placement, type Timed } from './world.js'
 import {
   lineageText,
   parseSymbolRef,
@@ -46,7 +47,7 @@ import {
   predicateRules,
   type PredicateRules,
 } from '../schema/index.js'
-import { endpointFromJson, endpointKey } from '../term.js'
+import { endpointFromJson } from '../term.js'
 import {
   State,
   type AssertionRow,
@@ -91,10 +92,14 @@ interface Ledger {
   supporting: string[]
   opposing: string[]
   uncertain: string[]
+  /** Eligible, but indeterminate at the instant (§25.5). */
+  indeterminate: string[]
   excluded: { assertion_id: string; reason: string }[]
   supportGroups: Group[]
   oppositionGroups: Group[]
   warnings: string[]
+  /** §27.2 uncertainty reasons: `temporal_indeterminate`, `outranked`. */
+  reasons: string[]
 }
 
 /** A projected belief, as a query binds and projects it. */
@@ -116,6 +121,12 @@ export interface Belief {
   support: number
   opposition: number
   ledger: Ledger
+  /** The precedence rule that decided this candidate, when one did (§21.13). */
+  precedence: JsonMap | null
+  /** `leading` recomputed over a slot's final conflict set (§21.11). */
+  slotLeading: 'support' | 'opposition' | 'none' | null
+  /** Inferred support without a verified dependency basis. */
+  unverified: boolean
   policy: Policy
   validAt: string
   /** The cognitive coordinate it read, when the read was bound to one. */
@@ -134,7 +145,138 @@ const MISSING_STAGE_WARNINGS = [
     'for its independence, never for how good it is',
 ]
 
-/** Projects the belief about one Proposition. */
+/** The Propositions projected together, and how their values relate. */
+interface Frame {
+  /**
+   * Every candidate value, the target included: the whole slot when the
+   * predicate constrains one (§20.15).
+   */
+  members: ElementId[]
+  /** Each member's `functional_by` partition: its object's Concept Type lineage. */
+  partitions: Map<string, string>
+  /** Functional or `functional_by` without `complete`: a conflict set (§21.11). */
+  conflict: boolean
+  /** Slot lines take part in temporal succession (§25.4). */
+  slotLines: boolean
+  /** For each member, the rivals whose support opposes it (§25). */
+  opposing: Map<string, ElementId[]>
+  /** The slot subject's equality key, for first-person testimony (§21.13). */
+  subjectKeys: string[]
+  /** Which constraint a standing conflict names. */
+  reason: string
+  rules: PredicateRules
+}
+
+const partitionOf = (frame: Frame, member: ElementId): string =>
+  frame.partitions.get(formatElementId(member)) ?? ''
+
+/** The Propositions projected together with `target` (§20.15). */
+function frameOf(cx: Context, target: ElementId): Frame {
+  const rules = predicateRulesOf(cx, target)
+  const frame: Frame = {
+    members: [target], partitions: new Map(), conflict: false, slotLines: false,
+    opposing: new Map(), subjectKeys: [], reason: 'functional_value', rules,
+  }
+  const element = cx.load(target)
+  // §20.15, §25.2: values that never conflict on time form no slot.
+  if (element === null || element.kind !== 'Proposition' || rules.temporal_conflict === 'none') return frame
+  const slot = rules.functional || rules.functional_by
+  if (!slot && !rules.boolean_completeness) return frame
+  const row = element.row
+  frame.members = slotPropositions(cx, [row.subject_key], lineageText(row.predicate_ref))
+  if (!frame.members.some((id) => id.seq === target.seq)) frame.members.push(target)
+  frame.subjectKeys = [row.subject_key]
+  frame.slotLines = slot
+  // `complete` makes a functional slot's values exclusive: accepting one
+  // rejects the others. Without it, competing values are a conflict set and
+  // never opposition (§21.11, §25).
+  frame.conflict = slot && !rules.complete
+  frame.reason = slot ? 'functional_value' : 'exclusive_value'
+  const objects = new Map<string, Json>()
+  for (const member of frame.members) {
+    const value = cx.load(member)
+    if (value === null || value.kind !== 'Proposition') continue
+    if (rules.functional_by) {
+      // The partition is the object's Concept Type lineage.
+      let partition = ''
+      const object = endpointFromJson(value.row.object as Json)
+      if (object.kind === 'local') {
+        const concept = cx.load(object.id)
+        if (concept !== null && concept.kind === 'Concept') partition = lineageText(concept.row.schema_ref)
+      }
+      frame.partitions.set(formatElementId(member), partition)
+    }
+    objects.set(formatElementId(member), value.row.object as Json)
+  }
+  for (const [member, object] of objects) {
+    // §12.7, §20.15: under `boolean_completeness`, object `false` is the
+    // negation of object `true`, so each opposes the other.
+    const flag = booleanObject(object)
+    const rivals: ElementId[] = []
+    for (const [other, value] of objects) {
+      if (other === member) continue
+      const otherId = parseElementId(other)
+      const exclusive =
+        (slot && rules.complete && partitionOf(frame, otherId) === partitionOf(frame, parseElementId(member))) ||
+        (rules.boolean_completeness && flag !== null && booleanObject(value) === !flag)
+      if (exclusive) rivals.push(otherId)
+    }
+    if (rivals.length > 0) frame.opposing.set(member, rivals)
+  }
+  return frame
+}
+
+function booleanObject(object: Json): boolean | null {
+  const value = isJsonMap(object) ? object.value : object
+  return typeof value === 'boolean' ? value : null
+}
+
+/** One eligible Assertion with its world-time placement. */
+interface Row {
+  timed: Timed
+  candidate: Candidate
+  source: AssertionRow
+  contexts: string[]
+  placement: Placement
+}
+
+/** One eligible, inside support of a candidate, as §21.13's rules read it. */
+interface Support {
+  contexts: string[]
+  firstPerson: boolean
+  bySubject: boolean
+  observed: boolean
+  startKey: string
+}
+
+/**
+ * `kip:memory-default` precedence (§21.13): the first rule under which one
+ * candidate prevails over every other candidate of the conflict set decides it.
+ */
+function precedence(set: number[], supportOf: (i: number) => Support[]): [string, number] | null {
+  const supports = new Map(set.map((i) => [i, supportOf(i)]))
+  const strictSuperset = (a: string[], b: string[]): boolean =>
+    a.length > b.length && b.every((value) => a.includes(value))
+  const newest = (i: number): string =>
+    supports.get(i)!.map((s) => s.startKey).reduce((a, b) => (a > b ? a : b), '')
+  const rules: [string, (a: number, b: number) => boolean][] = [
+    ['context_specificity', (a, b) =>
+      supports.get(a)!.some((x) => supports.get(b)!.every((y) => strictSuperset(x.contexts, y.contexts)))],
+    ['first_person_testimony', (a, b) =>
+      supports.get(a)!.some((x) => x.firstPerson) &&
+      !supports.get(b)!.some((y) => y.bySubject || y.observed)],
+    // Recency compares start keys — when values were claimed to hold, never
+    // when they were recorded (§13.2).
+    ['recency', (a, b) => newest(a) > newest(b)],
+  ]
+  for (const [rule, prevails] of rules) {
+    const winners = set.filter((a) => set.every((b) => b === a || prevails(a, b)))
+    if (winners.length === 1) return [rule, winners[0]!]
+  }
+  return null
+}
+
+/** Projects the belief about one Proposition, together with its slot. */
 export function project(
   cx: Context,
   proposition: ElementId,
@@ -142,94 +284,205 @@ export function project(
   validAt: string = cx.validAt,
 ): Belief {
   checkProjectionHistory(cx, policy)
-  const ledger: Ledger = {
-    supporting: [],
-    opposing: [],
-    uncertain: [],
-    excluded: [],
-    supportGroups: [],
-    oppositionGroups: [],
-    warnings: [...MISSING_STAGE_WARNINGS],
-  }
+  const frame = frameOf(cx, proposition)
+  const beliefs = projectFrame(cx, frame, policy, validAt)
+  return beliefs.find((b) => b.proposition?.seq === proposition.seq) ?? beliefs[0]!
+}
 
-  const candidates: Candidate[] = []
-  for (const row of assertionsAbout(cx, proposition)) {
-    const candidate = admit(cx, row, policy, ledger, false, validAt)
-    if (candidate !== null) candidates.push(candidate)
-  }
+/**
+ * Projects every candidate of one slot at one basis (§21.11): a single
+ * `BELIEF` and a `BELIEF SLOT` at one basis agree.
+ */
+export function projectSlot(
+  cx: Context,
+  members: ElementId[],
+  policy: Policy,
+  validAt: string = cx.validAt,
+): Belief[] {
+  checkProjectionHistory(cx, policy)
+  if (members.length === 0) return []
+  const frame = frameOf(cx, members[0]!)
+  // An unconstrained slot projects every value on its own.
+  if (frame.members.length < members.length) frame.members = members
+  return projectFrame(cx, frame, policy, validAt)
+}
 
-  const localLedger = { ...ledger }
-  const [localSupport, localGroups] = aggregate(candidates, false)
-  const [localOpposition, localOpposingGroups] = aggregate(candidates, true)
-  localLedger.supportGroups = localGroups
-  localLedger.oppositionGroups = localOpposingGroups
-  const candidateStatus = classify(localSupport, localOpposition, localLedger, policy)
-  const conflictRefs: string[] = []
-  const boundaries: string[] = []
-  for (const row of assertionsAbout(cx, proposition)) boundaries.push(row.valid_from, row.valid_until)
-  // Conflict-set expansion (§25, §20.15): support for a rival value of a
-  // functional slot is opposition to this one. The schema says the slot holds
-  // one value, so somebody claiming another value *is* disagreeing — even
-  // though no Assertion anywhere says "not this". `complete` says the
-  // candidates are exclusive, which this expansion already treats them as;
-  // `boolean_completeness` does the same for `true` against `false` on a
-  // non-functional Predicate; and `temporal_conflict: "none"` turns the whole
-  // rule off, because values that never conflict on time never conflict.
-  const rules = predicateRulesOf(cx, proposition)
-  if (policy.expand_conflicts && rules.temporal_conflict !== 'none') {
-    for (const rival of exclusiveRivals(cx, proposition, rules)) {
-      const rivalCandidates: Candidate[] = []
-      for (const row of assertionsAbout(cx, rival)) {
-        boundaries.push(row.valid_from, row.valid_until)
-        if (row.stance !== 'support') continue
-        const candidate = admit(cx, row, policy, ledger, true, validAt)
-        if (candidate !== null) rivalCandidates.push(candidate)
+/**
+ * Eligibility, then world time over the eligible set — succession narrows
+ * intervals, and each Assertion is inside, outside or indeterminate at the
+ * instant (§25.4, §25.5) — then candidate status from what is inside, then the
+ * slot stage: a conflict set stands `contested` unless the policy's precedence
+ * rules resolve it (§21.11, §21.13).
+ */
+function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string): Belief[] {
+  const rows: Row[] = []
+  const excluded = new Map<string, { assertion_id: string; reason: string }[]>()
+  for (const member of frame.members) {
+    const key = formatElementId(member)
+    for (const row of assertionsAbout(cx, member)) {
+      const admitted = admit(cx, row, policy)
+      if (typeof admitted === 'string') {
+        const list = excluded.get(key) ?? []
+        list.push({ assertion_id: formatElementId({ kind: 'Assertion', seq: row.id }), reason: admitted })
+        excluded.set(key, list)
+        continue
       }
-      const [rivalSupport] = aggregate(rivalCandidates.map((c) => ({ ...c, opposesTarget: false })), false)
-      if (localSupport >= policy.material && rivalSupport >= policy.material) conflictRefs.push(formatElementId(rival))
-      candidates.push(...rivalCandidates)
+      rows.push({
+        timed: timed(row, key, partitionOf(frame, member)),
+        candidate: admitted,
+        source: row,
+        contexts: [...new Set(row.context_refs.map((ref) => JSON.stringify(ref)))].sort(),
+        placement: 'outside',
+      })
     }
   }
+  const timedRows = rows.map((r) => r.timed)
+  succeed(timedRows, frame.slotLines)
+  let nextInvalid: string | null = null
+  for (const row of rows) {
+    row.placement = place(row.timed, validAt)
+    for (const t of boundariesAfter(row.timed, validAt)) if (nextInvalid === null || t < nextInvalid) nextInvalid = t
+  }
+  const weigh = (candidate: Candidate): Candidate =>
+    policy.structural === true ? { ...candidate, confidence: 1 } : candidate
 
-  const [support, supportGroups] = aggregate(candidates, false)
-  const [opposition, oppositionGroups] = aggregate(candidates, true)
-  ledger.supportGroups = supportGroups
-  ledger.oppositionGroups = oppositionGroups
+  const beliefs: Belief[] = []
+  for (const member of frame.members) {
+    const key = formatElementId(member)
+    const ledger: Ledger = {
+      supporting: [], opposing: [], uncertain: [], indeterminate: [],
+      excluded: excluded.get(key) ?? [], supportGroups: [], oppositionGroups: [],
+      warnings: [...MISSING_STAGE_WARNINGS], reasons: [],
+    }
+    let next = nextInvalid
+    let unverified = false
+    const candidates: Candidate[] = []
+    for (const row of rows.filter((r) => r.timed.proposition === key)) {
+      const id = row.candidate.id
+      if (row.placement === 'outside') { ledger.excluded.push({ assertion_id: id, reason: 'outside_valid_time' }); continue }
+      // Material, but it cannot decide a status (§25.5).
+      if (row.placement === 'indeterminate') { ledger.indeterminate.push(id); continue }
+      if (row.source.mode === 'inferred' || cx.store.controlAt(cx.space, `identity_review/A-${row.source.id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) {
+        const checked = dependencyValidity(cx, { kind: 'Assertion', row: row.source }, policy, validAt)
+        if (checked.action_eligible !== true && row.candidate.stance === 'support') unverified = true
+        const t = (checked.basis as JsonMap).next_invalid_at
+        if (typeof t === 'string' && (next === null || t < next)) next = t
+      }
+      // An `uncertain` stance engages the question without taking a side: it
+      // keeps the belief out of `insufficient` without pushing it either way.
+      if (row.candidate.stance === 'uncertain') { ledger.uncertain.push(id); continue }
+      ;(row.candidate.stance === 'reject' ? ledger.opposing : ledger.supporting).push(id)
+      candidates.push(weigh(row.candidate))
+    }
+    const [localSupport, localGroups] = aggregate(candidates, false)
+    const [localOpposition, localOpposingGroups] = aggregate(candidates, true)
+    let candidateStatus = classify(localSupport, localOpposition, ledger, policy)
+    if (candidateStatus === 'insufficient' && ledger.indeterminate.length > 0) candidateStatus = 'uncertain'
+    if (ledger.indeterminate.length > 0) ledger.reasons.push('temporal_indeterminate')
+    ledger.supportGroups = localGroups
+    ledger.oppositionGroups = localOpposingGroups
 
-  if (!rules.open_world) {
-    ledger.warnings.push(
-      'the Predicate is declared closed-world (§24.2): an absence of ' +
-        'Propositions may be read as closed-world, but this projection still ' +
-        'reports insufficient rather than inferring rejection from silence',
-    )
+    // Exclusive values (§25, `complete`, boolean negation): a rival's support
+    // opposes this value.
+    const conflictRefs: string[] = []
+    if (policy.expand_conflicts) {
+      for (const rival of frame.opposing.get(key) ?? []) {
+        const rivalKey = formatElementId(rival)
+        const rivalCandidates = rows
+          .filter((r) => r.timed.proposition === rivalKey && r.placement === 'inside' && r.candidate.stance === 'support')
+          .map((r) => weigh(r.candidate))
+        const [rivalSupport] = aggregate(rivalCandidates, false)
+        if (localSupport >= policy.material && rivalSupport >= policy.material) conflictRefs.push(rivalKey)
+        for (const candidate of rivalCandidates) {
+          ledger.opposing.push(candidate.id)
+          candidates.push({ ...candidate, opposesTarget: true })
+        }
+      }
+    }
+    const [support, supportGroups] = aggregate(candidates, false)
+    const [opposition, oppositionGroups] = aggregate(candidates, true)
+    ledger.supportGroups = supportGroups
+    ledger.oppositionGroups = oppositionGroups
+    if (!frame.rules.open_world) {
+      ledger.warnings.push(
+        'the Predicate is declared closed-world (§24.2): an absence of ' +
+          'Propositions may be read as closed-world, but this projection still ' +
+          'reports insufficient rather than inferring rejection from silence',
+      )
+    }
+    const engaged = ledger.supporting.length + ledger.opposing.length + ledger.uncertain.length > 0
+    let status = conflictRefs.length ? 'contested' : engaged ? classify(support, opposition, ledger, policy) : candidateStatus
+    if (unverified && status === 'accepted') {
+      status = 'uncertain'
+      ledger.warnings.push('inferred support has no verified recursive dependency basis')
+    }
+    beliefs.push({
+      proposition: member,
+      status,
+      basis: projectionBasis(cx, policy, validAt, next),
+      candidateStatus,
+      conflictRefs,
+      conflictReasons: conflictRefs.length ? ['exclusive_value'] : [],
+      precedence: null,
+      slotLeading: null,
+      unverified,
+      support,
+      opposition,
+      ledger,
+      policy,
+      validAt,
+      asOf: cx.asOf ?? null,
+    })
   }
 
-  let unverified = false
-  for (const row of assertionsAbout(cx, proposition)) {
-    if ((row.mode !== 'inferred' && !cx.store.controlAt(cx.space, `identity_review/A-${row.id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) || !ledger.supporting.includes(formatElementId({ kind: 'Assertion', seq: row.id }))) continue
-    const checked = dependencyValidity(cx, { kind: 'Assertion', row }, policy, validAt)
-    if (checked.action_eligible !== true) unverified = true
-    const next = (checked.basis as JsonMap).next_invalid_at
-    if (typeof next === 'string') boundaries.push(next)
+  // The slot stage (§21.11): materially supported values of one functional
+  // slot — per partition under `functional_by` — conflict.
+  if (frame.conflict) {
+    const partitions = [...new Set(frame.members.map((m) => partitionOf(frame, m)))].sort()
+    for (const partition of partitions) {
+      const supported = beliefs
+        .map((b, i) => [b, i] as const)
+        .filter(([b, i]) => partitionOf(frame, frame.members[i]!) === partition &&
+          b.support >= policy.material && !b.unverified)
+        .map(([, i]) => i)
+      if (supported.length < 2) continue
+      const supportRows = (i: number): Support[] => {
+        const key = formatElementId(frame.members[i]!)
+        return rows
+          .filter((r) => r.timed.proposition === key && r.placement === 'inside' && r.candidate.stance === 'support')
+          .map((r) => ({
+            contexts: r.contexts,
+            firstPerson: frame.subjectKeys.includes(r.timed.actor) && (r.source.mode === 'stated' || r.source.mode === 'observed'),
+            bySubject: frame.subjectKeys.includes(r.timed.actor),
+            observed: r.source.mode === 'observed',
+            startKey: r.timed.startKey,
+          }))
+      }
+      const winner = policy.precedence === true ? precedence(supported, supportRows) : null
+      const ids = supported.map((i) => formatElementId(frame.members[i]!))
+      const supports = beliefs.map((b) => b.support)
+      for (const i of supported) {
+        const me = formatElementId(frame.members[i]!)
+        const belief = beliefs[i]!
+        if (winner !== null && winner[1] === i) {
+          belief.precedence = { rule: winner[0], prevailed_over: ids.filter((id) => id !== me) }
+        } else if (winner !== null) {
+          belief.status = 'uncertain'
+          belief.ledger.reasons.push('outranked')
+          belief.precedence = { rule: winner[0], outranked_by: formatElementId(frame.members[winner[1]]!) }
+        } else {
+          // Leading over the final conflict set: a tie between the values is
+          // `none` (§21.11).
+          const best = Math.max(...supported.filter((j) => j !== i).map((j) => supports[j]!))
+          belief.slotLeading = belief.support > best ? 'support' : belief.support < best ? 'opposition' : 'none'
+          belief.status = 'contested'
+          belief.conflictRefs = ids.filter((id) => id !== me)
+          belief.conflictReasons = [frame.reason]
+        }
+      }
+    }
   }
-  let status = conflictRefs.length ? 'contested' : classify(support, opposition, ledger, policy)
-  if (unverified && status === 'accepted') {
-    status = 'uncertain'
-    ledger.warnings.push('inferred support has no verified recursive dependency basis')
-  }
-  return {
-    proposition,
-    status,
-    basis: projectionBasis(cx, policy, validAt, boundaries.filter((t) => t > validAt).sort()[0] ?? null),
-    candidateStatus, conflictRefs,
-    conflictReasons: conflictRefs.length ? [rules.functional ? 'functional_value' : 'exclusive_value'] : [],
-    support,
-    opposition,
-    ledger,
-    policy,
-    validAt,
-    asOf: cx.asOf ?? null,
-  }
+  return beliefs
 }
 
 /**
@@ -261,6 +514,7 @@ export function ungroundedBelief(
       supporting: [],
       opposing: [],
       uncertain: [],
+      indeterminate: [],
       excluded: [],
       supportGroups: [],
       oppositionGroups: [],
@@ -268,56 +522,42 @@ export function ungroundedBelief(
         'no Proposition exists for this tuple in this Space, so nothing has ' +
           'been asserted about it; that is an open-world absence, not a denial',
       ],
+      reasons: [],
     },
+    precedence: null,
+    slotLeading: null,
+    unverified: false,
     policy,
     validAt,
     asOf: cx.asOf ?? null,
   }
 }
 
-/** Whether one Assertion is eligible, recording why when it is not. */
-function admit(
-  cx: Context,
-  row: AssertionRow,
-  policy: Policy,
-  ledger: Ledger,
-  opposesTarget: boolean,
-  validAt: string,
-): Candidate | null {
+/**
+ * Lifecycle, visibility, context, Evidence and mode eligibility: the
+ * Candidate, or the reason it was left out. World time is decided over the
+ * eligible set afterwards, because succession needs every eligible Assertion
+ * of the slot (§25.4).
+ */
+function admit(cx: Context, row: AssertionRow, policy: Policy): Candidate | string {
   const id = formatElementId({ kind: 'Assertion', seq: row.id })
-
   // A retracted claim was withdrawn and a superseded one was revised: both are
   // history, and history is not what this Brain currently holds (§59).
-  if (row.status !== 'active') {
-    ledger.excluded.push({ assertion_id: id, reason: `lifecycle_${row.status}` })
-    return null
-  }
-  if (row.state !== State.ACTIVE) {
-    ledger.excluded.push({ assertion_id: id, reason: `record_${row.state}` })
-    return null
-  }
-  const exclude = (reason: string): null => { ledger.excluded.push({ assertion_id: id, reason }); return null }
-  if ((row.valid_from && row.valid_from > validAt) || (row.valid_until && row.valid_until <= validAt)) return exclude('outside_valid_time')
+  // `expired` is computed from world time and never stored (§14.3); a row an
+  // earlier draft stored it on is read as active.
+  if (row.status !== 'active' && row.status !== 'expired') return `lifecycle_${row.status}`
+  if (row.state !== State.ACTIVE) return `record_${row.state}`
   for (const reference of row.context_refs) {
     const canonical = cx.canonicalEndpoint(reference as Json) as JsonMap
-    if (!policy.context_refs.includes(String(canonical.id))) return exclude('context_mismatch')
+    if (!policy.context_refs.includes(String(canonical.id))) return 'context_mismatch'
   }
   for (const reference of row.evidence_refs) {
     const eid = tryParseElementId(reference.id)
     const root = eid === null ? null : cx.load(eid)
-    if (!root || root.kind !== 'Evidence') return exclude('evidence_unavailable')
-    if (root.row.status === 'corrected') return exclude('corrected_evidence')
+    if (!root || root.kind !== 'Evidence') return 'evidence_unavailable'
+    if (root.row.status === 'corrected') return 'corrected_evidence'
   }
-  if (!admits(policy, row.mode)) {
-    ledger.excluded.push({ assertion_id: id, reason: modeExclusion(row.mode) })
-    return null
-  }
-  // An `uncertain` stance engages the question without taking a side: it keeps
-  // the belief out of `insufficient` without pushing it either way.
-  if (row.stance === 'uncertain') {
-    ledger.uncertain.push(id)
-    return null
-  }
+  if (!admits(policy, row.mode)) return modeExclusion(row.mode)
 
   const actor =
     typeof row.asserted_by === 'string'
@@ -326,13 +566,7 @@ function admit(
   let trust = policy.trust_weights[actor] ?? policy.default_trust_weight
   if (policy.contextual_trust_rules?.length) {
     const proposition = cx.load(parseElementId(row.proposition_id))
-    if (!proposition || proposition.kind !== 'Proposition') {
-      ledger.excluded.push({
-        assertion_id: id,
-        reason: 'proposition_unavailable',
-      })
-      return null
-    }
+    if (!proposition || proposition.kind !== 'Proposition') return 'proposition_unavailable'
     trust = trustWeight(
       policy.contextual_trust_rules,
       trust,
@@ -341,9 +575,6 @@ function admit(
       policy.context_refs,
     )
   }
-  const side = opposesTarget ? ledger.opposing : row.stance === 'reject' ? ledger.opposing : ledger.supporting
-  side.push(id)
-
   return {
     id,
     // An Assertion with no recorded actor cannot be grouped with anything, so
@@ -358,7 +589,7 @@ function admit(
     confidence:
       (row.confidence < 0 ? policy.unstated_confidence : row.confidence) *
       trust,
-    opposesTarget,
+    opposesTarget: false,
   }
 }
 
@@ -477,6 +708,7 @@ function classify(
  * anyway; it never changes `status`.
  */
 export function leadingSide(belief: Belief): 'support' | 'opposition' | 'none' {
+  if (belief.slotLeading !== null) return belief.slotLeading
   switch (belief.status) {
     case 'accepted':
       return 'support'
@@ -521,7 +753,7 @@ export function beliefToJson(belief: Belief): JsonMap {
       // what makes it actionable.
       reasons: uncertaintyReasons(belief),
     },
-    temporal: { valid_at: belief.validAt, as_of_seq: belief.asOf },
+    ...(belief.precedence === null ? {} : { precedence: belief.precedence }),
     policy: { id: belief.policy.id, version: belief.policy.version },
     // §49.1, §49.2: `none` returns no ledger at all rather than an empty one.
     // An empty object reads as "we looked and found nothing to explain", and
@@ -540,6 +772,7 @@ export function beliefToJson(belief: Belief): JsonMap {
             explanation: {
               excluded: belief.ledger.excluded as unknown as Json,
               uncertain_assertions: belief.ledger.uncertain,
+              indeterminate_assertions: belief.ledger.indeterminate,
               warnings: belief.ledger.warnings,
             },
           }),
@@ -576,23 +809,13 @@ function uncertaintyLevel(belief: Belief): string {
   }
 }
 
+/**
+ * Why the answer is as uncertain as it is (§27.2): the machine codes a caller
+ * can act on — `temporal_indeterminate` (§25.5) and `outranked` (§21.13). The
+ * prose behind them is the Epistemic Ledger.
+ */
 function uncertaintyReasons(belief: Belief): string[] {
-  const reasons: string[] = []
-  const supportGroups = belief.ledger.supportGroups.length
-  const oppositionGroups = belief.ledger.oppositionGroups.length
-  if (supportGroups === 0 && oppositionGroups === 0) {
-    reasons.push('no eligible assertions')
-  }
-  if (supportGroups > 0 && oppositionGroups > 0) {
-    reasons.push(
-      `${supportGroups} independent source(s) support and ` +
-        `${oppositionGroups} oppose`,
-    )
-  }
-  if (supportGroups === 1 && oppositionGroups === 0) {
-    reasons.push('a single independent source')
-  }
-  return reasons
+  return [...belief.ledger.reasons]
 }
 
 /**
@@ -750,42 +973,6 @@ function predicateRulesOf(cx: Context, target: ElementId): PredicateRules {
     // declares no exclusivity either.
     return predicateRules(undefined)
   }
-}
-
-/**
- * The Propositions whose support counts against this one (§25, §20.15).
- *
- * On a `functional` slot every other object is a rival — the slot holds one
- * value, and `complete` only says out loud that accepting one rejects the
- * others. Under `boolean_completeness` the one rival is the other boolean
- * value: `(s, p, false)` is the negation of `(s, p, true)`, and nothing else
- * in the slot is.
- */
-export function exclusiveRivals(
-  cx: Context,
-  target: ElementId,
-  rules: PredicateRules,
-): ElementId[] {
-  const element = cx.load(target)
-  if (element === null || element.kind !== 'Proposition') return []
-  const row = element.row
-  const others = () =>
-    slotPropositions(cx, [row.subject_key], lineageText(row.predicate_ref)).filter(
-      (id) => id.seq !== target.seq,
-    )
-
-  if (rules.functional) return others()
-  if (rules.boolean_completeness) {
-    const object = row.object as Json
-    const value = isJsonMap(object) ? object.value : undefined
-    if (typeof value !== 'boolean') return []
-    const negation = endpointKey(endpointFromJson({ value: !value, datatype: 'kip:boolean' }))
-    return others().filter((id) => {
-      const rival = cx.load(id)
-      return rival?.kind === 'Proposition' && rival.row.object_key === negation
-    })
-  }
-  return []
 }
 
 /**

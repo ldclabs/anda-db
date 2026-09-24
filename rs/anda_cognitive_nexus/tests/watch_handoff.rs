@@ -53,7 +53,13 @@ impl Fixture {
         );
         let nexus = CognitiveNexus::connect(db).await.unwrap();
         nexus
-            .install_and_activate(&[("brain", COGNITIVE_MEMORY)], DEFAULT_SPACE)
+            .install_and_activate(
+                &[
+                    ("brain", COGNITIVE_MEMORY),
+                    ("test", include_str!("support/options.json")),
+                ],
+                DEFAULT_SPACE,
+            )
             .await
             .unwrap();
         let target = run(
@@ -1010,7 +1016,7 @@ async fn wake_dispatch_rechecks_native_attempt_and_never_replays_a_send_permissi
             .claim_wake(DEFAULT_SPACE, wake, 1, 0, &expiry_in(120))
             .await
             .unwrap();
-        let created=run(&fixture.nexus,r#"MUTATE {CREATE CONCEPT ?preference {TYPE "Preference" NAME "delivery"} ENSURE PROPOSITION ?basis (:target,"prefers",?preference)}"#,json!({"target":fixture.target})).await;
+        let created=run(&fixture.nexus,r#"MUTATE {CREATE CONCEPT ?preference {TYPE "Option" NAME "delivery"} ENSURE PROPOSITION ?basis (:target,"prefers",?preference)}"#,json!({"target":fixture.target})).await;
         let projection = run(
             &fixture.nexus,
             "FIND(?b) WHERE {?p PROPOSITION(id: :id) ?b BELIEF(?p)}",

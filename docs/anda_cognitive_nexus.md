@@ -28,9 +28,24 @@ Queries also have a 100,000 intermediate-row/candidate-pair work budget; LIMIT
 does not bypass it. Historical reconstruction charges scanned versions and is
 reused per kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
 
-Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP at `3251912`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
+
+World time and belief follow the 2.0 draft at that commit. A claim with no
+`from` holds from `{latest: asserted_at}`; `valid_time` endpoints may be
+`{earliest, latest}` bounds, and a projection that cannot place a claim is
+`uncertain` with reason `temporal_indeterminate`. One actor's later stated or
+observed value ends the earlier open one at its start (temporal succession,
+§25.4), so a world change is one `ASSERT` and `SUPERSEDING` is only for a claim
+that was wrong. `functional` slots hold a conflict set, `functional_by:
+"object_type"` partitions them by the object's Concept Type, and
+`WITH EPISTEMIC {policy: "kip:memory-default"}` resolves conflicts by context
+specificity, first-person testimony and recency. `expired` is computed, never
+stored. `?x SEARCH <KIND> "term" LIMIT k` joins keyword retrieval into a
+`FIND`. `DEFINE` (draft vocabulary) and recording repair are not built, so the
+engine claims `KIP-Core` and not `KIP-CognitiveMemory`.
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI
 > agents, built on Anda DB.
@@ -680,7 +695,6 @@ nexus.session(auth)                            // an authenticated caller
 // on a Session, because each is a Governance decision with a Principal behind it
 session.designate_self(space_id, Some(concept)) // the Space's semantic $self (§5.6)
 session.sweep_expired(space_id, action, limit)  // retention expiry (§19.1)
-session.expire_lapsed_assertions(space_id, n)   // the `expired` lifecycle (§14.3)
 session.classify / elevate_authority / quarantine / release_quarantine
 
 // the control plane, authorized as the Session's Principal (§29)

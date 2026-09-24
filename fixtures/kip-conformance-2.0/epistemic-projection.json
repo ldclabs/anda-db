@@ -27,12 +27,27 @@
           }
         }
       }
+    },
+    {
+      "format": "KIP-Schema-Package",
+      "manifest": {
+        "package_id": "kip://conformance/options",
+        "version": "1.0.0"
+      },
+      "definitions": {
+        "concept_types": {
+          "Option": {
+            "kind": "ConceptType",
+            "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+          }
+        }
+      }
     }
   ],
   "setup": [
-    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Preference\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Preference\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Option\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Option\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
     "MUTATE {\n  CREATE CONCEPT ?svc { TYPE \"Service\" NAME \"api\" }\n  CREATE CONCEPT ?healthy { TYPE \"Status\" NAME \"healthy\" }\n  CREATE CONCEPT ?degraded { TYPE \"Status\" NAME \"degraded\" }\n  ENSURE PROPOSITION ?ok (?svc, \"status\", ?healthy)\n  ENSURE PROPOSITION ?bad (?svc, \"status\", ?degraded)\n}",
-    "MUTATE {\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?warm { TYPE \"Preference\" NAME \"Warm\" }\n  ENSURE PROPOSITION ?p (?dave, \"prefers\", ?warm)\n  CREATE EVIDENCE ?seen { SET FIELDS { evidence_class: \"observation\", payload: \"one observation\" } }\n  CREATE ASSERTION ?a1 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n  CREATE ASSERTION ?a2 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n}"
+    "MUTATE {\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?warm { TYPE \"Option\" NAME \"Warm\" }\n  ENSURE PROPOSITION ?p (?dave, \"prefers\", ?warm)\n  CREATE EVIDENCE ?seen { SET FIELDS { evidence_class: \"observation\", payload: \"one observation\" } }\n  CREATE ASSERTION ?a1 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n  CREATE ASSERTION ?a2 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n}"
   ],
   "cases": [
     {

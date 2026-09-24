@@ -945,7 +945,50 @@ impl<'a> Context<'a> {
                     .await?;
                 self.join(solutions, table)?
             }
+            WhereClause::Search(pattern) => {
+                let table = self.match_search(pattern).await?;
+                self.join(solutions, table)?
+            }
         })
+    }
+
+    /// `?x SEARCH <KIND> <term> ... LIMIT <k>` (§43.8): the top `k` authorized
+    /// hits of the same retrieval as META `SEARCH`, against this query's
+    /// snapshot, each bound as an element. A hit's view carries the transient
+    /// `retrieval.score` / `retrieval.mode`; a miss proves nothing (§66.6).
+    async fn match_search(
+        &mut self,
+        pattern: &anda_kip::SearchPattern,
+    ) -> Result<Solutions, KipError> {
+        if self.is_historical() {
+            return Err(KipError::new(
+                anda_kip::KipErrorCode::HistoricalSearchUnavailable,
+                "this engine keeps no historical index, so a Search Pattern under AS OF is \
+                 unavailable (historical_search)",
+            ));
+        }
+        let limit = crate::meta::describe::scalar_usize(self, &pattern.limit, "LIMIT")?;
+        let (hits, cap) = crate::meta::inspect::rank(
+            self,
+            pattern.target,
+            &pattern.term,
+            pattern.with_type.as_ref(),
+            pattern.with_predicate.as_ref(),
+            pattern.mode.as_ref(),
+            pattern.threshold.as_ref(),
+        )
+        .await?;
+        let limit = cap.map_or(limit, |cap| cap.min(limit));
+        let mut rows = Vec::new();
+        for (score, id, _) in hits.into_iter().take(limit) {
+            if let Some(view) = self.views.get_mut(&id) {
+                let mut view = view.as_ref().clone();
+                view["retrieval"] = serde_json::json!({"score": score, "mode": "keyword"});
+                self.views.insert(id, Arc::new(view));
+            }
+            rows.push(vec![binding::Binding::Element(id)]);
+        }
+        Ok(Solutions::table(vec![pattern.variable.clone()], rows))
     }
 }
 

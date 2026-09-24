@@ -34,7 +34,7 @@ async fn main() {
             at: "2026-09-23T00:00:00.000Z".into(), origin: json!({}) };
         let mut first = ConceptRow::default();
         for i in 0..size {
-            let mut row = ConceptRow { name: format!("memory keyword {i}"), schema_ref: format!("kip://profiles/cognitive-memory@2.1.0/{}", if i % 100 == 0 {"Person"} else {"Preference"}), ..Default::default() };
+            let mut row = ConceptRow { name: format!("memory keyword {i}"), schema_ref: format!("kip://profiles/cognitive-memory@2.0.0/{}", if i % 100 == 0 {"Person"} else {"Preference"}), ..Default::default() };
             n.store.insert(&cx, &mut row).await.unwrap();
             if i == 0 { first = row; }
             n.store.insert(&cx, &mut ActivityRow { activity_class: "semantic_consolidation".into(), status: "completed".into(), ..Default::default() }).await.unwrap();

@@ -1,0 +1,15 @@
+{
+  "format": "KIP-Schema-Package",
+  "manifest": {
+    "package_id": "kip://test/options",
+    "version": "1.0.0"
+  },
+  "definitions": {
+    "concept_types": {
+      "Option": {
+        "kind": "ConceptType",
+        "description": "A preference option used by these tests. The Profile has no Preference type (Profile §5.5); a real Space types each option by its kind, because prefers partitions by the option's Concept Type."
+      }
+    }
+  }
+}

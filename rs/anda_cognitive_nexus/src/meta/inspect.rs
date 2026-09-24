@@ -28,9 +28,25 @@ use crate::id::ElementId;
 use crate::kql::Context;
 use crate::store::history::CursorFamily;
 
-pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
-    let term = scalar_str(cx, &command.term, "SEARCH")?;
-    if let Some(mode) = &command.mode {
+/// One ranked, authorized hit: relevance score, element, redacted view.
+pub(crate) type Hit = (f64, ElementId, std::sync::Arc<Json>);
+
+/// Ranks the authorized, redacted corpus for one search (§66), best first.
+///
+/// Shared by the META `SEARCH` statement and the KQL Search Pattern (§43.8),
+/// so the two cannot drift into different notions of a hit. The second value
+/// is the tightest `max_results` a Grant placed on the hits.
+pub(crate) async fn rank(
+    cx: &mut Context<'_>,
+    target: SearchTarget,
+    term: &Scalar,
+    with_type: Option<&Scalar>,
+    with_predicate: Option<&Scalar>,
+    mode: Option<&Scalar>,
+    threshold: Option<&Scalar>,
+) -> Result<(Vec<Hit>, Option<usize>), KipError> {
+    let term = scalar_str(cx, term, "SEARCH")?;
+    if let Some(mode) = mode {
         let mode = scalar_str(cx, mode, "MODE")?;
         if mode != "keyword" {
             return Err(KipError::new(
@@ -42,13 +58,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             ));
         }
     }
-    if command.as_of_seq.is_some() {
-        return Err(KipError::new(
-            KipErrorCode::HistoricalSearchUnavailable,
-            "this engine keeps no historical index, so AS OF SEQ search is unavailable",
-        ));
-    }
-    let threshold = match &command.threshold {
+    let threshold = match threshold {
         Some(scalar) => match scalar_json(cx, scalar)? {
             Json::Number(n) => n.as_f64().unwrap_or(0.0),
             other => {
@@ -64,39 +74,14 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
             "THRESHOLD must be a number in [0, 1]",
         ));
     }
-    if (command.with_type.is_some()
-        && !matches!(
-            command.target,
-            SearchTarget::Concept | SearchTarget::Cognition
-        ))
-        || (command.with_predicate.is_some()
-            && !matches!(
-                command.target,
-                SearchTarget::Proposition | SearchTarget::Cognition
-            ))
+    if (with_type.is_some() && target != SearchTarget::Concept)
+        || (with_predicate.is_some() && target != SearchTarget::Proposition)
     {
         return Err(KipError::invalid_syntax(
             "SEARCH modifier is not meaningful for this kind",
         ));
     }
-    let limit = match &command.limit {
-        Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?.min(100),
-        None => 10,
-    };
-    let offset = match &command.cursor {
-        Some(scalar) => {
-            let cursor = super::read_cursor(cx, scalar, CursorFamily::Search)?;
-            if cursor.snapshot_seq != cx.pinned_seq {
-                return Err(KipError::cursor_expired(
-                    "search",
-                    "SEARCH index changed; start a new traversal",
-                ));
-            }
-            cursor.offset
-        }
-        None => 0,
-    };
-    let with_type = match &command.with_type {
+    let with_type = match with_type {
         Some(scalar) => Some(
             cx.env
                 .resolve_symbol(
@@ -108,7 +93,7 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         ),
         None => None,
     };
-    let with_predicate = match &command.with_predicate {
+    let with_predicate = match with_predicate {
         Some(scalar) => Some(
             cx.env
                 .resolve_symbol(
@@ -121,20 +106,10 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         None => None,
     };
 
-    let kinds: Vec<(ElementKind, &[&str])> = match command.target {
-        SearchTarget::Concept => vec![(
-            ElementKind::Concept,
-            &["name", "aliases", "attributes"] as &[&str],
-        )],
-        SearchTarget::Proposition => {
-            vec![(ElementKind::Proposition, &["predicate_ref"] as &[&str])]
-        }
-        SearchTarget::Evidence => vec![(ElementKind::Evidence, &["payload_inline"])],
-        SearchTarget::Cognition => vec![
-            (ElementKind::Concept, &["name", "aliases", "attributes"]),
-            (ElementKind::Proposition, &["predicate_ref"]),
-            (ElementKind::Evidence, &["payload_inline"]),
-        ],
+    let kind = match target {
+        SearchTarget::Concept => ElementKind::Concept,
+        SearchTarget::Proposition => ElementKind::Proposition,
+        SearchTarget::Evidence => ElementKind::Evidence,
         // An Assertion's content is a stance and a number, and an Activity's is
         // a class and two timestamps. Neither carries text worth indexing, and
         // returning nothing would read as "no such claim exists".
@@ -156,116 +131,158 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
     // Rank only the authorized, redacted corpus. Filtering global BM25 hits
     // afterwards leaks hidden document statistics and can crowd visible hits
     // out of an over-fetch window. This temporary index changes no stored state.
-    let mut hits: Vec<(f64, Json)> = Vec::new();
-    let mut search_limit = limit;
-    for (kind, _) in kinds {
-        let index = anda_db_tfs::BM25Index::new(
-            "authorized-search".into(),
-            anda_db_tfs::jieba_tokenizer(),
-            None,
-        );
-        let mut views = std::collections::BTreeMap::new();
-        let mut filters = vec![
-            crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
-            crate::store::eq_field("state", anda_db_schema::Fv::Text("active".into())),
-        ];
-        let selector = match kind {
-            ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
-            ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
-            _ => None,
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut cap: Option<usize> = None;
+    let index = anda_db_tfs::BM25Index::new(
+        "authorized-search".into(),
+        anda_db_tfs::jieba_tokenizer(),
+        None,
+    );
+    let mut views = std::collections::BTreeMap::new();
+    let mut filters = vec![
+        crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
+        crate::store::eq_field("state", anda_db_schema::Fv::Text("active".into())),
+    ];
+    let selector = match kind {
+        ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
+        ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
+        _ => None,
+    };
+    if let Some((field, symbol)) = selector
+        && let Some((low, high)) = crate::schema::lineage_range(symbol)
+    {
+        filters.push(anda_db::query::Filter::Field((
+            field.into(),
+            anda_db::query::RangeQuery::Between(
+                anda_db_schema::Fv::Text(low),
+                anda_db_schema::Fv::Text(high),
+            ),
+        )));
+    }
+    let ids = cx
+        .candidates(
+            kind,
+            Some(anda_db::query::Filter::And(
+                filters.into_iter().map(Box::new).collect(),
+            )),
+        )
+        .await?;
+    cx.charge(ids.len())?;
+    for id in ids {
+        let Some(element) = cx.load(id).await? else {
+            continue;
         };
-        if let Some((field, symbol)) = selector
-            && let Some((low, high)) = crate::schema::lineage_range(symbol)
+        if !element.is_active() {
+            continue;
+        }
+        let decision = cx.authority.authorize(
+            crate::governance::Permission::Search,
+            &crate::governance::ResourceContext::of_element(&element),
+            cx.auth,
+        );
+        if !decision.is_permitted() {
+            continue;
+        }
+        if let Some(max) = decision.constraints.max_results {
+            cap = Some(cap.map_or(max as usize, |c| c.min(max as usize)));
+        }
+        let mut rendered = cx.view_of(id).as_ref().clone();
+        crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
+        let rendered = std::sync::Arc::new(rendered);
+        if let Some(expected) = &with_type
+            && !rendered["schema_ref"]
+                .as_str()
+                .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
         {
-            filters.push(anda_db::query::Filter::Field((
-                field.into(),
-                anda_db::query::RangeQuery::Between(
-                    anda_db_schema::Fv::Text(low),
-                    anda_db_schema::Fv::Text(high),
-                ),
-            )));
+            continue;
         }
-        let ids = cx
-            .candidates(
-                kind,
-                Some(anda_db::query::Filter::And(
-                    filters.into_iter().map(Box::new).collect(),
-                )),
-            )
-            .await?;
-        cx.charge(ids.len())?;
-        for id in ids {
-            let Some(element) = cx.load(id).await? else {
-                continue;
-            };
-            if !element.is_active() {
-                continue;
-            }
-            let decision = cx.authority.authorize(
-                crate::governance::Permission::Search,
-                &crate::governance::ResourceContext::of_element(&element),
-                cx.auth,
-            );
-            if !decision.is_permitted() {
-                continue;
-            }
-            if let Some(max) = decision.constraints.max_results {
-                search_limit = search_limit.min(max as usize);
-            }
-            let mut rendered = cx.view_of(id).as_ref().clone();
-            crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
-            let rendered = std::sync::Arc::new(rendered);
-            if let Some(expected) = &with_type
-                && !rendered["schema_ref"]
-                    .as_str()
-                    .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
-            {
-                continue;
-            }
-            if let Some(expected) = &with_predicate
-                && !rendered["predicate_ref"]
-                    .as_str()
-                    .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
-            {
-                continue;
-            }
-            let text = grounding_text(kind, rendered.as_ref());
-            match index.insert(id.seq, &text, 0) {
-                Ok(()) => {
-                    views.insert(id.seq, rendered);
-                }
-                Err(anda_db_tfs::BM25Error::TokenizeFailed { .. }) => {}
-                Err(err) => return Err(KipError::internal_error(err.to_string())),
-            }
+        if let Some(expected) = &with_predicate
+            && !rendered["predicate_ref"]
+                .as_str()
+                .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
+        {
+            continue;
         }
-        // Score all admitted documents before applying the threshold or page.
-        for (seq, raw_score) in index.search(&term, views.len(), None) {
-            let raw_score = f64::from(raw_score);
-            if !raw_score.is_finite() || raw_score < 0.0 {
-                return Err(KipError::internal_error("invalid SEARCH ranking score"));
+        let text = grounding_text(kind, rendered.as_ref());
+        match index.insert(id.seq, &text, 0) {
+            Ok(()) => {
+                views.insert(id.seq, rendered);
             }
-            let score = raw_score / (1.0 + raw_score);
-            if score < threshold {
-                continue;
-            }
-            let id = ElementId::new(kind, seq);
-            let rendered = &views[&seq];
-            hits.push((
-                score,
-                serde_json::json!({
-                    "id": id.to_string(), "kind": kind.to_string(),
-                    "score": score,
-                    "retrieval": {"score": score, "mode": "keyword"},
-                    "snippet": snippet_of(kind, rendered.as_ref(), &term),
-                    "element": rendered.as_ref(),
-                }),
-            ));
+            Err(anda_db_tfs::BM25Error::TokenizeFailed { .. }) => {}
+            Err(err) => return Err(KipError::internal_error(err.to_string())),
         }
+    }
+    // Score all admitted documents before applying the threshold or page.
+    for (seq, raw_score) in index.search(&term, views.len(), None) {
+        let raw_score = f64::from(raw_score);
+        if !raw_score.is_finite() || raw_score < 0.0 {
+            return Err(KipError::internal_error("invalid SEARCH ranking score"));
+        }
+        let score = raw_score / (1.0 + raw_score);
+        if score < threshold {
+            continue;
+        }
+        let rendered = views[&seq].clone();
+        hits.push((score, ElementId::new(kind, seq), rendered));
     }
     hits.sort_by(|a, b| {
         b.0.total_cmp(&a.0)
-            .then_with(|| a.1["id"].as_str().cmp(&b.1["id"].as_str()))
+            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
     });
+    Ok((hits, cap))
+}
+
+pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
+    if command.as_of_seq.is_some() {
+        return Err(KipError::new(
+            KipErrorCode::HistoricalSearchUnavailable,
+            "this engine keeps no historical index, so AS OF SEQ search is unavailable",
+        ));
+    }
+    let limit = match &command.limit {
+        Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?.min(100),
+        None => 10,
+    };
+    let offset = match &command.cursor {
+        Some(scalar) => {
+            let cursor = super::read_cursor(cx, scalar, CursorFamily::Search)?;
+            if cursor.snapshot_seq != cx.pinned_seq {
+                return Err(KipError::cursor_expired(
+                    "search",
+                    "SEARCH index changed; start a new traversal",
+                ));
+            }
+            cursor.offset
+        }
+        None => 0,
+    };
+    let term = scalar_str(cx, &command.term, "SEARCH")?;
+    let (ranked, cap) = rank(
+        cx,
+        command.target,
+        &command.term,
+        command.with_type.as_ref(),
+        command.with_predicate.as_ref(),
+        command.mode.as_ref(),
+        command.threshold.as_ref(),
+    )
+    .await?;
+    let search_limit = cap.map_or(limit, |cap| cap.min(limit));
+    let hits: Vec<(f64, Json)> = ranked
+        .into_iter()
+        .map(|(score, id, rendered)| {
+            (
+                score,
+                serde_json::json!({
+                    "id": id.to_string(), "kind": id.kind.to_string(),
+                    "score": score,
+                    "retrieval": {"score": score, "mode": "keyword"},
+                    "snippet": snippet_of(id.kind, rendered.as_ref(), &term),
+                    "element": rendered.as_ref(),
+                }),
+            )
+        })
+        .collect();
 
     let limit = search_limit.min(cx.governed_limit().unwrap_or(limit));
     let total = hits.len();

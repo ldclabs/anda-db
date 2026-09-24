@@ -63,7 +63,7 @@ describe('receipts', () => {
       operations: [
         { command: CREATE },
         { command: 'FIND(?c.name) WHERE { ?c CONCEPT {} }' },
-        { command: 'CREATE CONCEPT ?d { TYPE "Preference" NAME "Dark" }' },
+        { command: 'CREATE CONCEPT ?d { TYPE "Option" NAME "Dark" }' },
       ],
     })
     expect(body.status).toBe('succeeded')
@@ -168,7 +168,7 @@ describe('receipts', () => {
         {
           command: `MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
           }`,
         },

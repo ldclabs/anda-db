@@ -1,19 +1,16 @@
 //! The §27 coverage matrix, computed rather than asserted.
 //!
-//! `KIP-2.0-Invariants.md` Part A registers the 38 cross-cutting invariants
+//! `KIP-2.0-Invariants.md` Part A registers the 49 cross-cutting invariants
 //! §102 requires of every implementation, and names, for each, the conformance
 //! vectors that pin it. The registry is blunt about what that means:
 //!
 //! > A Core invariant without a vector does not exist.
 //!
-//! The shared fixtures in `fixtures/kip-conformance-2.0/` are this repository's
-//! own suite, not the normative one, so a case covers a normative vector only
-//! when someone has read both and said so — which is what a case's `vectors`
-//! field is. This test turns those declarations into the matrix and holds two
-//! lines:
+//! The shared fixtures in `fixtures/kip-conformance-2.0/` are KIP's engine
+//! suite, copied byte for byte; a case covers a parent vector only where its
+//! authors read both and said so — which is what a case's `vectors` field is.
+//! This test turns those declarations into the matrix and holds one line:
 //!
-//! - **no invented vector.** A name the registry does not know is a typo or a
-//!   vector that moved, and either way the coverage it claims is imaginary.
 //! - **no silent regression.** Coverage may rise; a change that drops a
 //!   fixture's declaration has to lower the floor deliberately.
 //!
@@ -31,7 +28,7 @@ use std::{
 ///
 /// A floor, not a target: it goes up when a fixture declares a vector, and it
 /// is lowered only by someone who has decided to stop covering something.
-const COVERED_INVARIANTS_FLOOR: usize = 20;
+const COVERED_INVARIANTS_FLOOR: usize = 29;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -104,7 +101,10 @@ fn declared() -> BTreeMap<String, Vec<String>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(fixtures_dir())
         .expect("the fixture directory is readable")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && path.file_name().is_some_and(|name| name != "manifest.json")
+        })
         .collect();
     files.sort();
     for path in files {
@@ -127,8 +127,8 @@ fn the_invariant_coverage_matrix_is_honest_and_does_not_shrink() {
     let registry = registry();
     assert_eq!(
         registry.len(),
-        43,
-        "§102 registers 43 Core invariants; the vendored registry parsed {} rows",
+        49,
+        "§102 registers 49 Core invariants; the vendored registry parsed {} rows",
         registry.len()
     );
 
@@ -138,23 +138,23 @@ fn the_invariant_coverage_matrix_is_honest_and_does_not_shrink() {
         .collect();
     let declared = declared();
 
-    // A name nobody registered pins nothing, whatever it looks like.
-    let invented: Vec<&String> = declared
+    // The suite is KIP's own, so its vectors are the parent suite's names;
+    // one outside Part A pins a Profile invariant (Part B) or a vector with no
+    // §102 row, and is reported rather than counted.
+    let outside: Vec<&String> = declared
         .keys()
         .filter(|name| !known.contains(name.as_str()))
         .collect();
-    assert!(
-        invented.is_empty(),
-        "these fixtures declare vectors the invariant registry does not name. Either it is a \
-         typo, claiming coverage that does not exist, or it is a real vector that pins no §102 \
-         invariant — this field is the §102 matrix, and a vector outside it has nothing to \
-         report:\n  {}",
-        invented
-            .iter()
-            .map(|name| format!("{name} ({})", declared[*name].join(", ")))
-            .collect::<Vec<_>>()
-            .join("\n  ")
-    );
+    if !outside.is_empty() {
+        println!(
+            "\nvectors outside §102 Part A: {}",
+            outside
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let mut covered = 0;
     println!("\n§102 invariant coverage, from the shared fixtures' own declarations:\n");
@@ -183,7 +183,7 @@ fn the_invariant_coverage_matrix_is_honest_and_does_not_shrink() {
         );
     }
     println!(
-        "\n  {covered}/43 invariants pinned by at least one declared vector \
+        "\n  {covered}/49 invariants pinned by at least one declared vector \
          ({} vectors declared across the suite)\n",
         declared.len()
     );

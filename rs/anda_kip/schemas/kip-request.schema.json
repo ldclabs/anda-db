@@ -505,8 +505,7 @@
           "maxLength": 256
         },
         "observed_at": {
-          "type": "string",
-          "format": "date-time"
+          "$ref": "urn:kip:2.0:schema:common#/$defs/Timestamp"
         },
         "source_actor": {
           "$ref": "#/$defs/ElementReference",

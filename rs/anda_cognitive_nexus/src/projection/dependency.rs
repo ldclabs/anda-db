@@ -98,17 +98,15 @@ impl Context<'_> {
                 return Ok(Validity::issue(1, "dependency evidence corrected"));
             }
             Element::Assertion(row) => {
-                if row.status != "active"
-                    || (!row.valid_from.is_empty() && row.valid_from.as_str() > at)
-                    || (!row.valid_until.is_empty() && row.valid_until.as_str() <= at)
+                // Its own written interval, with a missing `from` read as
+                // {latest: asserted_at} (§25.2); `expired` is computed (§14.3).
+                let timed = super::world::Timed::new(row, id, String::new());
+                if !matches!(row.status.as_str(), "active" | "expired")
+                    || timed.place(at) == super::world::Placement::Outside
                 {
                     return Ok(Validity::issue(1, "dependency no longer eligible"));
                 }
-                result.next = [&row.valid_from, &row.valid_until]
-                    .into_iter()
-                    .filter(|t| t.as_str() > at)
-                    .min()
-                    .cloned();
+                result.next = timed.boundaries_after(at).min().map(str::to_string);
             }
             _ => {}
         }

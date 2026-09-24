@@ -26,8 +26,11 @@ verbose `attributes` / `metadata` representation used by recovery exports.
 Assertion's per-predicate source properties and legacy identity. It is
 provenance, not independent Evidence or permission.
 
-- Person, Event, Preference, Insight, Commitment and SleepTask adopt compatible
-  native types. Summary, time and task fields are normalized; a previously
+- Person, Event, Insight, Commitment and SleepTask adopt compatible native
+  types. The 2.0 Profile has no Preference type (a preference is a `prefers`
+  claim), so a 1.x `Preference` keeps its own open type in the legacy package
+  (`kip://legacy/nexus@1.1.0/Preference`) rather than being rewritten into a
+  claim its actor never made. Summary, time and task fields are normalized; a previously
   running, completed or failed v1 task becomes blocked without acquiring a v2
   lease. Its original execution status and result remain in LegacyRecord; the
   native task requires explicit review rather than resuming automatically.

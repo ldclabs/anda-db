@@ -34,11 +34,21 @@ mod tests {
         .unwrap();
         let mut lock = SchemaLock::default();
         lock.packages
-            .insert("kip://profiles/cognitive-memory".into(), "2.1.0".into());
+            .insert("kip://profiles/cognitive-memory".into(), "2.0.0".into());
         lock.states.insert(
             "kip://profiles/cognitive-memory".into(),
             PackageState::Active,
         );
+        n.install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+        lock.packages
+            .insert("kip://test/options".into(), "1.0.0".into());
+        lock.states
+            .insert("kip://test/options".into(), PackageState::Active);
         n.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
         n
     }
@@ -121,7 +131,7 @@ mod tests {
     async fn masked_proposition_endpoints() {
         let n = fresh("masked").await;
         agent(&n, "reader").await;
-        let seed=run(&n.system_session(),r#"MUTATE { CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" } CREATE CONCEPT ?b { TYPE "Preference" NAME "Secret" } ENSURE PROPOSITION ?p (?a, "prefers", ?b) }"#,false).await;
+        let seed=run(&n.system_session(),r#"MUTATE { CREATE CONCEPT ?a { TYPE "Person" NAME "Alice" } CREATE CONCEPT ?b { TYPE "Option" NAME "Secret" } ENSURE PROPOSITION ?p (?a, "prefers", ?b) }"#,false).await;
         assert_eq!(seed.status, TopLevelStatus::Succeeded, "{seed:?}");
         n.governance()
             .create_grant(
@@ -297,7 +307,7 @@ mod tests {
         let mut cap: anda_kip::Capsule =
             serde_json::from_value(out.first_result().unwrap().clone()).unwrap();
         cap.payload.records.0[0]["schema_ref"] =
-            serde_json::json!("kip://profiles/cognitive-memory@2.1.0/NonexistentType");
+            serde_json::json!("kip://profiles/cognitive-memory@2.0.0/NonexistentType");
         cap.integrity.content_digest =
             anda_cognitive_nexus::capsule::payload_digest(&cap.payload).unwrap();
         let result = d.import_capsule(&cap, DEFAULT_SPACE).await;
@@ -661,7 +671,7 @@ mod tests {
     async fn masked_tuple_cannot_be_read_by_id_or_fixed_endpoint() {
         let n = fresh("tuple_masks").await;
         agent(&n, "masked").await;
-        assert_eq!(run(&n.system_session(),r#"MUTATE {CREATE CONCEPT ?a {TYPE "Person" NAME "Alice"} CREATE CONCEPT ?b {TYPE "Preference" NAME "Secret"} ENSURE PROPOSITION ?p (?a,"prefers",?b)}"#,false).await.status,TopLevelStatus::Succeeded);
+        assert_eq!(run(&n.system_session(),r#"MUTATE {CREATE CONCEPT ?a {TYPE "Person" NAME "Alice"} CREATE CONCEPT ?b {TYPE "Option" NAME "Secret"} ENSURE PROPOSITION ?p (?a,"prefers",?b)}"#,false).await.status,TopLevelStatus::Succeeded);
         n.governance()
             .create_grant(
                 GrantDraft {
@@ -736,7 +746,7 @@ mod tests {
         .await;
         let mut cap: anda_kip::Capsule =
             serde_json::from_value(out.first_result().unwrap().clone()).unwrap();
-        cap.payload.records.0[0]["facets"] = serde_json::json!({"kip://profiles/cognitive-memory@2.1.0/MnemonicState":{"memory_strength":"strong"}});
+        cap.payload.records.0[0]["facets"] = serde_json::json!({"kip://profiles/cognitive-memory@2.0.0/MnemonicState":{"memory_strength":"strong"}});
         cap.integrity.content_digest =
             anda_cognitive_nexus::capsule::payload_digest(&cap.payload).unwrap();
         assert!(d.import_capsule(&cap, DEFAULT_SPACE).await.is_err());
@@ -930,11 +940,21 @@ mod tests {
             "kip://profiles/cognitive-memory".into(),
             PackageState::ValidationOnly,
         );
+        dest.install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+        lock.packages
+            .insert("kip://test/options".into(), "1.0.0".into());
+        lock.states
+            .insert("kip://test/options".into(), PackageState::Active);
         dest.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
         dest.import_capsule_isolated(&capsule, DEFAULT_SPACE)
             .await
             .unwrap();
         assert_eq!(dest.store.concepts().len(), 1);
-        assert_eq!(run(&dest.system_session(),r#"CREATE CONCEPT ?a {TYPE "kip://profiles/cognitive-memory@2.1.0/Person" NAME "Local"}"#,false).await.status,TopLevelStatus::Failed);
+        assert_eq!(run(&dest.system_session(),r#"CREATE CONCEPT ?a {TYPE "kip://profiles/cognitive-memory@2.0.0/Person" NAME "Local"}"#,false).await.status,TopLevelStatus::Failed);
     }
 }

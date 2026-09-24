@@ -29,6 +29,17 @@ async fn fresh(name: &str) -> CognitiveNexus {
         .insert(COGNITIVE_MEMORY_ID.into(), COGNITIVE_MEMORY_VERSION.into());
     lock.states
         .insert(COGNITIVE_MEMORY_ID.into(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -55,7 +66,7 @@ async fn ok(nexus: &CognitiveNexus, command: &str, parameters: Json) -> Json {
 }
 const SETUP: &str = r#"MUTATE {
  CREATE CONCEPT ?a { TYPE "Person" NAME "Ada" }
- CREATE CONCEPT ?p { TYPE "Preference" NAME "tea" }
+ CREATE CONCEPT ?p { TYPE "Option" NAME "tea" }
  ENSURE PROPOSITION ?claim (?a, "prefers", ?p)
  CREATE EVIDENCE ?source { SET FIELDS {evidence_class: "observation", payload: "source", observed_at: "2026-09-07T00:00:00.000Z", content_digest: "sha256:41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d"} }
 }"#;
@@ -161,7 +172,7 @@ fn activation_verifies_schema_resource_closure_even_after_a_warm_cache() {
     value["manifest"]["validation_schemas"]
         .as_array_mut()
         .unwrap()
-        .retain(|p| !p["id"].as_str().unwrap().starts_with("https:"));
+        .retain(|p| p["id"] != "urn:kip:2.0:schema:common");
     let incomplete = SchemaPackage::parse(&value.to_string()).unwrap();
     assert!(contracts::validate_package(&incomplete).is_err());
     value["manifest"]["validation_schemas"][0]["content_digest"] =

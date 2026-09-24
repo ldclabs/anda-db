@@ -9,7 +9,7 @@ use crate::{
 };
 use anda_kip::{Json, KipError, Map};
 use serde_json::json;
-const PROFILE: &str = "kip://profiles/cognitive-memory@2.1.0/";
+const PROFILE: &str = cognitive_memory!("");
 
 pub(crate) fn structured_condition(condition: &Json) -> bool {
     ["element", "slot", "type"]

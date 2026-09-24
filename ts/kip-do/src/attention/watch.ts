@@ -535,7 +535,7 @@ export function advanceWatch(
 export function checkControls(envelope: JsonMap): void {
   if (
     (envelope.control_changes as JsonMap[]).some((c) =>
-      ['schema', 'identity', 'policy', 'trust', 'authorization'].includes(
+      ['schema', 'identity', 'policy', 'trust', 'authorization', 'recording'].includes(
         String(c.kind),
       ),
     )

@@ -1,7 +1,5 @@
 # Brain Evaluation and Release Gates
 
-**[English](./BrainEvaluation.md) | [中文](./BrainEvaluation_CN.md)**
-
 **Reference evaluation workflow; report integrity is normative for learning claims.**
 
 Protocol conformance, reliable execution and improved behavior are separate gates.

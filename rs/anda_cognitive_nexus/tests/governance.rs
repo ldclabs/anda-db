@@ -751,11 +751,22 @@ async fn stocked(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert("kip://profiles/cognitive-memory".into(), "2.1.0".into());
+        .insert("kip://profiles/cognitive-memory".into(), "2.0.0".into());
     lock.states.insert(
         "kip://profiles/cognitive-memory".into(),
         PackageState::Active,
     );
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -3191,7 +3202,7 @@ async fn moderating_somebody_elses_claim_asks_for_more_than_tidying_ones_own() {
             &owner,
             r#"MUTATE {
                 CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-                CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+                CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
                 ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
                 CREATE ASSERTION ?a {
                     SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support",

@@ -4,6 +4,7 @@ import { CognitiveNexus } from '../src/nexus.js'
 import { parseElementId } from '../src/id.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import type { ChangeEntry } from '../src/store/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * Version planes (Spec §6.3, §35.1, §35.2) and the Change Envelope entries
@@ -21,7 +22,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`planes-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     body(nexus)
   })
 }
@@ -171,7 +172,7 @@ describe('version planes', () => {
       const twice = refused(() =>
         nexus.execute(
           'UPDATE "C-1" SET FIELDS {name: "B"} EXPECT VERSION 1 OF FACET :a EXPECT VERSION 1 OF FACET :b',
-          { a: 'MnemonicState', b: 'kip://profiles/cognitive-memory@2.1.0/MnemonicState' },
+          { a: 'MnemonicState', b: 'kip://profiles/cognitive-memory@2.0.0/MnemonicState' },
         ),
       )
       expect(twice.code).toBe('InvalidSyntax')
@@ -182,7 +183,7 @@ describe('version planes', () => {
     await withNexus('envelope', (nexus) => {
       nexus.execute(`MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" SET ATTRIBUTES { note: "one" } }
+        CREATE CONCEPT ?dark { TYPE "Event" NAME "Dark" SET ATTRIBUTES { summary: "a dark theme", note: "one" } }
         ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
       }`)
       const created = nexus.describe('CHANGES AFTER SEQ 0') as unknown as {
@@ -195,14 +196,14 @@ describe('version planes', () => {
           op: 'create',
           kind: 'concept',
           id: 'C-1',
-          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Person',
+          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Person',
           new_version: 1,
         },
         {
           op: 'create',
           kind: 'concept',
           id: 'C-2',
-          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Preference',
+          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Event',
           new_version: 1,
         },
         {
@@ -212,7 +213,7 @@ describe('version planes', () => {
           new_version: 1,
           refs: {
             subject: 'C-1',
-            predicate_ref: 'kip://profiles/cognitive-memory@2.1.0/prefers',
+            predicate_ref: 'kip://profiles/cognitive-memory@2.0.0/prefers',
           },
         },
       ])
@@ -226,7 +227,7 @@ describe('version planes', () => {
           op: 'update',
           kind: 'concept',
           id: 'C-2',
-          schema_ref: 'kip://profiles/cognitive-memory@2.1.0/Preference',
+          schema_ref: 'kip://profiles/cognitive-memory@2.0.0/Event',
           old_version: 1,
           new_version: 2,
           // Names only, never values (§36.1), and sorted: the same commit
@@ -259,7 +260,7 @@ describe('version planes', () => {
       // A merge moves `merged_into` and the engine state, and neither belongs
       // to a plane (§6.3) — so the entry names both paths and reports no
       // counters at all.
-      nexus.execute('CREATE CONCEPT ?canonical { TYPE "Preference" }')
+      nexus.execute('CREATE CONCEPT ?canonical { TYPE "Event" SET ATTRIBUTES { summary: "canonical" } }')
       const merged = nexus.execute('MERGE CONCEPT "C-2" INTO "C-3"')
       expect(merged.changes).toEqual([
         expect.objectContaining({

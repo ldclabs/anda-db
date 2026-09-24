@@ -69,7 +69,6 @@ export {
   ceilingOf,
   classify,
   elevateAuthority,
-  expireAssertion,
   lineageOf,
   quarantine,
   release,

@@ -2,10 +2,10 @@
   "name": "merge-identity",
   "description": "Non-destructive identity consolidation (§11). The merged-away Concept stays addressable and keeps forwarding; the history that referenced it keeps referencing it (§11.2); ordinary new writes land on the identity that survived (§11.3); and no merge may make canonical resolution — following `merged_into` to its fixpoint — cycle (§11.1).",
   "setup": [
-    "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Al\" SET FIELDS {key: \"al\"} }\n  CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" SET FIELDS {key: \"dark\"} }\n  ENSURE PROPOSITION ?old (?a, \"prefers\", ?dark)\n}",
+    "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Al\" SET FIELDS {key: \"al\"} }\n  CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" SET FIELDS {key: \"dark\"} }\n  ENSURE PROPOSITION ?old (?a, \"prefers\", ?dark)\n}",
     "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"al\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
-    "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?new (?a, \"prefers\", ?dark)\n}",
-    "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?again (?a, \"prefers\", ?dark)\n}"
+    "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Option\", key: \"dark\"} }\n  ENSURE PROPOSITION ?new (?a, \"prefers\", ?dark)\n}",
+    "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Option\", key: \"dark\"} }\n  ENSURE PROPOSITION ?again (?a, \"prefers\", ?dark)\n}"
   ],
   "cases": [
     {
@@ -74,6 +74,23 @@
       "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
       "expect": {
         "result": null
+      }
+    }
+  ],
+  "packages": [
+    {
+      "format": "KIP-Schema-Package",
+      "manifest": {
+        "package_id": "kip://conformance/options",
+        "version": "1.0.0"
+      },
+      "definitions": {
+        "concept_types": {
+          "Option": {
+            "kind": "ConceptType",
+            "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+          }
+        }
       }
     }
   ]

@@ -438,7 +438,7 @@ describe('a host that authenticates its callers', () => {
         {
           command: `MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?a {
               SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "observed" }

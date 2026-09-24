@@ -38,14 +38,11 @@ import {
   familyOf,
   describePermission,
   isPermitted,
-  resourceOfElement,
-  redactView,
   spaceResource,
   type AuthContext,
 } from '../governance/index.js'
 import {
   compareElementId,
-  elementId,
   formatElementId,
   parseElementId,
   tryParseElementId,
@@ -73,7 +70,6 @@ import { Context } from '../kql/context.js'
 import { bindCoordinate, type KqlContext } from '../kql/index.js'
 import {
   readCount,
-  readNumber,
   readText,
   scalarValue,
   type ReadBindings,
@@ -84,8 +80,6 @@ import {
   conceptTypeDef,
   facetDef,
   formatSymbolRef,
-  lineageOfSymbol,
-  lineageText,
   predicateDef,
   structuralFieldDef,
   symbols,
@@ -109,7 +103,7 @@ import {
   type TransactionRow,
 } from '../store/index.js'
 import { normalizeTime } from '../time.js'
-import { segment, MAX_QUERY_TOKENS } from '../tokenizer.js'
+import { groundingText, rank } from '../kql/search.js'
 import {
   capabilities,
   KIP_VERSION,
@@ -710,6 +704,12 @@ function policyJson(policy: Policy): Json {
     material_threshold: policy.material,
     unstated_confidence_weight: policy.unstated_confidence,
     conflict_set_expansion: policy.expand_conflicts,
+    // §21.10: a structural policy counts root groups and weighs nothing.
+    structural: policy.structural === true,
+    // §21.13's ordered precedence rules, when the policy resolves conflicts.
+    precedence: policy.precedence === true
+      ? ['context_specificity', 'first_person_testimony', 'recency']
+      : [],
     notes: [
       'mode gates eligibility and never weights a claim: a mode does not ' +
         'grant trust',
@@ -804,7 +804,8 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     case 'StructuralFields':
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
-      return page(['baseline','forecast'].map((policy)=>policyJson(projectionPolicyAt(cx.store,cx.space,cx.store.currentSeq(cx.space),{policy}))))
+      return page(['baseline', 'forecast', 'kip:memory-default'].map((policy) =>
+        policyJson(projectionPolicyAt(cx.store, cx.space, cx.store.currentSeq(cx.space), { policy }))))
     case 'Dependents': {
       // §63.5: the result carries `truncated: true` when traversal was cut
       // short by an element the caller may not discover — without saying
@@ -1368,16 +1369,6 @@ function changes(
  */
 function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json {
   const term = readText(command.term, b, 'SEARCH')
-
-  if (command.mode !== null) {
-    const mode = readText(command.mode, b, 'MODE')
-    if (mode !== 'keyword') {
-      throw errors.searchModeUnsupported(
-        `this engine has no embedding model, so ${JSON.stringify(mode)} search is ` +
-          `unavailable; "keyword" is the only mode`,
-      )
-    }
-  }
   if (command.as_of_seq !== null) {
     // The index is maintained with the current state and keeps no history of
     // itself, so answering this from today's index would be searching the
@@ -1385,15 +1376,6 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     throw errors.historicalSearchUnavailable(
       'this engine keeps no historical index, so AS OF SEQ search is unavailable',
     )
-  }
-
-  const threshold = command.threshold === null ? 0 : readNumber(command.threshold, b, 'THRESHOLD')
-  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
-    throw errors.typeMismatch('THRESHOLD must be a number in [0, 1]')
-  }
-  if ((command.with_type !== null && !['Concept', 'Cognition'].includes(command.target)) ||
-      (command.with_predicate !== null && !['Proposition', 'Cognition'].includes(command.target))) {
-    throw errors.invalidSyntax('SEARCH modifier is not meaningful for this kind')
   }
   // A count, not a number: `LIMIT -1` would reach `slice(0, -1)` and answer
   // with every hit but the last, and `LIMIT 2.5` would truncate — a mistyped
@@ -1407,102 +1389,15 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
     throw detailed.cursorExpired('search', 'SEARCH index changed; start a new traversal')
   }
   const offset = cursor?.offset ?? 0
-  // §20.14: a symbol in a search narrows to its lineage, so a hit written
-  // under an earlier package version is still a hit.
-  const withType =
-    command.with_type === null
-      ? null
-      : lineageOfSymbol(
-          cx.env.resolveSymbol('ConceptType', readText(command.with_type, b, 'WITH TYPE'), 'read'),
-        )
-  const withPredicate =
-    command.with_predicate === null
-      ? null
-      : lineageOfSymbol(
-          cx.env.resolveSymbol(
-            'PredicateType',
-            readText(command.with_predicate, b, 'WITH PREDICATE'),
-            'read',
-          ),
-        )
-
-  let kinds: ElementKind[]
-  switch (command.target) {
-    case 'Concept':
-      kinds = ['Concept']
-      break
-    case 'Proposition':
-      kinds = ['Proposition']
-      break
-    case 'Evidence':
-      kinds = ['Evidence']
-      break
-    case 'Cognition':
-      kinds = ['Concept', 'Proposition', 'Evidence']
-      break
-    default:
-      // An Assertion's content is a stance and a number; an Activity's is a
-      // class and two timestamps. Refusing says so; answering nothing would
-      // read as "no such claim exists".
-      throw errors.unsupportedCapability(
-        'Assertions and Activities carry no free text, so this engine builds no ' +
-          'full-text index over them; reach them through the Proposition or Evidence ' +
-          'they are about',
-      )
-  }
 
   const context = reader(cx)
-  const scored: { score: number; hit: JsonMap }[] = []
-  let searchLimit = limit
-  const queryTokens = [...new Set(segment(term, MAX_QUERY_TOKENS))]
-  for (const kind of kinds) {
-    // Authorize and redact BEFORE building corpus statistics. Global FTS5 BM25
-    // scores leak hidden text, even when the final hit itself is readable.
-    const documents: { id: string; view: JsonMap; tokens: string[] }[] = []
-    for (const row of cx.store.sql.exec<{ id: number }>(
-      `SELECT id FROM ${TABLES[kind]} WHERE space = ? AND state = 'active' ORDER BY id`, cx.space,
-    )) {
-      context.spend('scans', 1)
-      const id = elementId(kind, row.id)
-      const element = context.load(id)
-      if (element === null) continue
-      const decision = cx.authority.authorize('search', resourceOfElement(element), cx.auth)
-      if (!isPermitted(decision.decision)) continue
-      if (decision.constraints.max_results !== null) searchLimit = Math.min(searchLimit, decision.constraints.max_results)
-      const readable = context.view(id)
-      if (readable === null) continue
-      const view = structuredClone(readable)
-      redactView(view, decision.constraints, context.readOrigin)
-      if (withType !== null && lineageText(String(view.schema_ref ?? '')) !== withType) continue
-      if (withPredicate !== null && lineageText(String(view.predicate_ref ?? '')) !== withPredicate) continue
-      const tokens = segment(groundingText(kind, view))
-      if (tokens.length > 0) documents.push({id: formatElementId(id), view, tokens})
-    }
-    const avgLength = documents.reduce((n, doc) => n + doc.tokens.length, 0) / (documents.length || 1)
-    const frequencies = new Map(queryTokens.map(token => [token,
-      documents.reduce((n, doc) => n + Number(doc.tokens.includes(token)), 0)]))
-    for (const doc of documents) {
-      let rawScore = 0
-      const counts = new Map<string, number>()
-      for (const token of doc.tokens) counts.set(token, (counts.get(token) ?? 0) + 1)
-      for (const token of queryTokens) {
-        const tf = counts.get(token) ?? 0
-        if (tf === 0) continue
-        const df = frequencies.get(token) ?? 0
-        const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5))
-        rawScore += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * doc.tokens.length / avgLength))
-      }
-      if (rawScore <= 0) continue
-      const score = rawScore / (1 + rawScore)
-      if (score < threshold) continue
-      scored.push({score, hit: {
-        id: doc.id, kind: kind.toLowerCase(), score,
-        retrieval: {score, mode: 'keyword'},
-        snippet: snippetOf(kind, doc.view, term), element: doc.view,
-      }})
-    }
-  }
-  scored.sort((a, b2) => b2.score - a.score || compareCodePoints(String(a.hit.id), String(b2.hit.id)))
+  const { hits, cap } = rank(context, command, b)
+  const searchLimit = cap === null ? limit : Math.min(limit, cap)
+  const scored = hits.map(({ score, id, kind, view }) => ({ score, hit: {
+    id: formatElementId(id), kind: kind.toLowerCase(), score,
+    retrieval: {score, mode: 'keyword'},
+    snippet: snippetOf(kind, view, term), element: view,
+  } as JsonMap }))
 
   const total = scored.length
   const pageLimit = Math.min(searchLimit, context.resultLimit() ?? limit)
@@ -1710,29 +1605,6 @@ const SNIPPET_WIDTH = 200
  */
 function snippetOf(kind: ElementKind, view: JsonMap, term: string): string {
   return windowOf(groundingText(kind, view), term, SNIPPET_WIDTH)
-}
-
-function groundingText(kind: ElementKind, view: JsonMap): string {
-  const fields =
-    kind === 'Concept'
-      ? ['name', 'aliases', 'attributes']
-      : kind === 'Proposition'
-        ? ['predicate_ref']
-        : kind === 'Evidence'
-          ? ['payload']
-          : []
-  let text = ''
-  const collect = (value: unknown): void => {
-    if (typeof value === 'string') {
-      text = text === '' ? value : `${text} ${value}`
-    } else if (Array.isArray(value)) {
-      value.forEach(collect)
-    } else if (value !== null && typeof value === 'object') {
-      Object.values(value as Record<string, unknown>).forEach(collect)
-    }
-  }
-  for (const field of fields) collect(view[field])
-  return text
 }
 
 function windowOf(text: string, term: string, width: number): string {

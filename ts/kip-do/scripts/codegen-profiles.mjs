@@ -27,8 +27,11 @@ const source = join(pkgRoot, '..', '..', 'rs', 'anda_cognitive_nexus', 'profiles
 const artifacts = readdirSync(source)
   .filter((name) => name.endsWith('.json'))
   .sort()
-  .map((name) => {
-    const artifact = JSON.parse(readFileSync(join(source, name), 'utf8'))
+  .map((name) => ({ name, artifact: JSON.parse(readFileSync(join(source, name), 'utf8')) }))
+  // The directory also holds the `kip:memory-default` policy artifact, which
+  // is a Projection Policy, not a Schema Package.
+  .filter(({ artifact }) => artifact.format === 'KIP-Schema-Package')
+  .map(({ name, artifact }) => {
     const id = artifact.manifest?.package_id
     const version = artifact.manifest?.version
     if (!id || !version) {

@@ -1,10 +1,12 @@
 import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
+import type { Json } from '../src/json.js'
 import { CognitiveNexus, SYSTEM_PRINCIPAL } from '../src/nexus.js'
 import { principalAuth } from '../src/governance/index.js'
 import { parseElementId } from '../src/id.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
 import { segment, segmenterMark } from '../src/tokenizer.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * `SEARCH` end to end, through the real parser and the real index.
@@ -22,7 +24,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`search-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     body(nexus)
   })
 }
@@ -50,7 +52,7 @@ const SETUP = `MUTATE {
   }
   CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob Stone" }
   CREATE CONCEPT ?dark {
-    TYPE "Preference"
+    TYPE "Option"
     NAME "深色模式"
     SET ATTRIBUTES { scope: "所有应用" }
   }
@@ -137,7 +139,7 @@ describe('SEARCH', () => {
     })
   })
 
-  it('reaches Propositions and Evidence, and Cognition reaches all three', async () => {
+  it('reaches Propositions and Evidence, and COGNITION is gone', async () => {
     await withNexus('kinds', (nexus) => {
       nexus.execute(SETUP)
       const predicate = nexus.describe('SEARCH PROPOSITION "prefers"') as unknown as Answer
@@ -148,24 +150,39 @@ describe('SEARCH', () => {
       expect(evidence.hits).toHaveLength(1)
       expect(evidence.hits[0]?.kind).toBe('evidence')
 
-      const cognition = nexus.describe('SEARCH COGNITION "深色模式"') as unknown as Answer
-      expect(new Set(cognition.hits.map((h) => h.kind))).toEqual(
-        new Set(['concept', 'evidence']),
-      )
+      // §43.8 removed the undefined COGNITION kind from the language.
+      expect(() => nexus.describe('SEARCH COGNITION "深色模式"')).toThrow(/COGNITION/)
+    })
+  })
+
+  it('binds hits in a KQL Search Pattern, bounded by LIMIT and never inside NOT', async () => {
+    await withNexus('pattern', (nexus) => {
+      nexus.execute(SETUP)
+      // The same retrieval as META SEARCH, joined into one snapshot (§43.8).
+      const rows = nexus.query(
+        'FIND(?x.name, ?x.retrieval.mode) WHERE { ?x SEARCH CONCEPT "深色模式" LIMIT 5 }',
+      ) as Json[][]
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.[1]).toBe('keyword')
+      // A miss never proves absence, so NOT cannot test for one (§66.6).
+      expect(() =>
+        nexus.query('FIND(?x) WHERE { ?x CONCEPT {} NOT { ?y SEARCH CONCEPT "x" LIMIT 1 } }'),
+      ).toThrow()
+      expect(() => nexus.query('FIND(?x) WHERE { ?x SEARCH CONCEPT "x" }')).toThrow()
     })
   })
 
   it('narrows by type and by predicate through the Schema Environment', async () => {
     await withNexus('narrow', (nexus) => {
       nexus.execute(SETUP)
-      // "深色模式" is a Preference; asking for People finds nothing rather than
+      // "深色模式" is an option; asking for People finds nothing rather than
       // finding it under the wrong type.
       const wrong = nexus.describe(
         'SEARCH CONCEPT "深色模式" WITH TYPE "Person"',
       ) as unknown as Answer
       expect(wrong.hits).toHaveLength(0)
       const right = nexus.describe(
-        'SEARCH CONCEPT "深色模式" WITH TYPE "Preference"',
+        'SEARCH CONCEPT "深色模式" WITH TYPE "Option"',
       ) as unknown as Answer
       expect(right.hits).toHaveLength(1)
 

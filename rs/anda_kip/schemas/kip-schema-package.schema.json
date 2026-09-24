@@ -168,6 +168,16 @@
               },
               "value_schema": {
                 "type": "object"
+              },
+              "reference_paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ReferencePath"
+                }
+              },
+              "computed": {
+                "type": "boolean",
+                "description": "Engine-derived, read-only member (Spec §18.2): never written, never a version plane, never exported as state."
               }
             },
             "required": [
@@ -282,13 +292,83 @@
               },
               "value_schema": {
                 "type": "object"
+              },
+              "reference_paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ReferencePath"
+                }
+              },
+              "computed": {
+                "type": "boolean",
+                "description": "Engine-derived, read-only member (Spec §18.2): never written, never a version plane, never exported as state."
+              },
+              "subject": {
+                "type": "object"
+              },
+              "object": {
+                "type": "object"
+              },
+              "functional": {
+                "type": "boolean"
+              },
+              "functional_by": {
+                "enum": [
+                  "object_type"
+                ],
+                "description": "Functional within each partition of candidate objects sharing a Concept Type lineage (Spec §20.15)."
+              },
+              "open_world": {
+                "type": "boolean"
+              },
+              "complete": {
+                "type": "boolean"
+              },
+              "boolean_completeness": {
+                "type": "boolean"
+              },
+              "temporal_conflict": {
+                "enum": [
+                  "overlapping_valid_time",
+                  "none"
+                ]
               }
             },
             "required": [
               "ref",
               "kind"
             ],
-            "additionalProperties": true
+            "additionalProperties": true,
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "functional",
+                    "functional_by"
+                  ],
+                  "properties": {
+                    "functional": {
+                      "const": true
+                    }
+                  }
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "functional_by"
+                  ],
+                  "properties": {
+                    "object": {
+                      "required": [
+                        "literal_types"
+                      ]
+                    }
+                  }
+                },
+                "$comment": "functional_by partitions by the object's Concept Type, so a Literal object has nothing to partition by (Spec §20.15)."
+              }
+            ]
           }
         },
         "facets": {
@@ -396,6 +476,16 @@
               },
               "value_schema": {
                 "type": "object"
+              },
+              "reference_paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ReferencePath"
+                }
+              },
+              "computed": {
+                "type": "boolean",
+                "description": "Engine-derived, read-only member (Spec §18.2): never written, never a version plane, never exported as state."
               }
             },
             "required": [
@@ -510,6 +600,16 @@
               },
               "value_schema": {
                 "type": "object"
+              },
+              "reference_paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/ReferencePath"
+                }
+              },
+              "computed": {
+                "type": "boolean",
+                "description": "Engine-derived, read-only member (Spec §18.2): never written, never a version plane, never exported as state."
               }
             },
             "required": [
@@ -581,5 +681,28 @@
     "definitions",
     "integrity"
   ],
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "ReferencePath": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "target": {
+          "const": "element"
+        },
+        "namespace": {
+          "const": "source"
+        }
+      },
+      "required": [
+        "path",
+        "target",
+        "namespace"
+      ],
+      "additionalProperties": false
+    }
+  }
 }

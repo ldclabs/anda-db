@@ -1,6 +1,7 @@
 # anda_kip
 
-Tracks KIP v2 at `dcde1de`, including the 2.1.0 memory vocabulary. See the
+Tracks KIP at `3251912`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 `anda_kip` is the protocol SDK of the AndaDB workspace: the parser, executable
@@ -120,17 +121,36 @@ See the [paired measurements](../../docs/benchmarks/anda_kip_2026-09-23/README.m
 cargo run -p anda_kip --bin kip-cli -- path/to/commands
 ```
 
+## Vendored KIP documents
+
+The Specification, syntax card, companions, grammars, schemas, profile and
+`brain/` cards are copies of KIP `3251912`, byte for byte except:
+
+- file names drop the `KIP-2.0-` prefix (`KIP-2.0-Memory-Interface.md` →
+  `Memory-Interface.md`, `grammar/KIP-2.0-KQL.ebnf` → `grammar/KQL.ebnf`,
+  `brain/KIP-2.0-Brain-Runtime.md` → `brain/Brain-Runtime.md`), and relative
+  links follow the renames;
+- the English/Chinese navigation line is removed;
+- links to documents not vendored here (the Architecture, the resolution
+  records, `conformance/`, `migration/`) point at the KIP repository.
+
+`Cognitive-Consistency.md` is upstream's redirect table: its contracts moved
+into the Specification and the Brain Runtime / Validated Learning companions
+(`BRAIN_RUNTIME`, `VALIDATED_LEARNING`). The bundled Schema Package artifacts
+live in `anda_cognitive_nexus/profiles/`.
+
 ## Technical reference
 
 - [docs/anda_kip.md](../../docs/anda_kip.md)
 - [`SPECIFICATION.md`](./SPECIFICATION.md) — the normative KIP 2.0 specification
 - [`Capsule-Specification.md`](./Capsule-Specification.md) — its §37–§41 and §95, the Cognitive Capsule, carried in a companion under the same numbering
 - [`Optional-Profiles-and-Migration.md`](./Optional-Profiles-and-Migration.md) — its §100, §101, §103 and Appendix I: the optional Historical and High-Assurance profiles, and KIP 1.x migration
-- [`Invariants.md`](./Invariants.md) — the invariant registry: the 38 Core invariants and the Cognitive Memory Profile's 35, one list
+- [`Invariants.md`](./Invariants.md) — the invariant registry: the 49 Core invariants and the Cognitive Memory Profile's 49, one list
 - [`grammar/`](./grammar) and [`schemas/`](./schemas) — the normative EBNF grammars and the request / response / change-envelope wire schemas
 - [`KIPSyntax.md`](./KIPSyntax.md) — the LLM-facing syntax reference
 - [`SelfInstructions.md`](./SelfInstructions.md) — how an Agent should use its memory
 - [`SystemInstructions.md`](./SystemInstructions.md) — what a runtime owes its callers
+- [`brain/`](./brain) — the Brain cards and the Brain Runtime / Validated Learning companions
 
 ## Related crates
 

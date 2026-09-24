@@ -11,8 +11,7 @@ export function isDerived(element: Element): boolean {
   if (element.kind === 'Assertion') return element.row.mode === 'inferred'
   if (element.kind !== 'Concept') return false
   return ['SkillRevision', 'Insight', 'WorkingState'].some((name) => element.row.schema_ref.endsWith('/' + name)) ||
-    Object.keys(element.row.structural).some((name) => name.endsWith('/derived_from')) ||
-    Object.keys(element.row.facets).some((name) => name.endsWith('/DerivationState'))
+    Object.keys(element.row.structural).some((name) => name.endsWith('/derived_from'))
 }
 interface Validity { state: number; reasons: string[]; next: string | null }
 const issue = (state: number, reason: string): Validity => ({ state, reasons: [reason], next: null })

@@ -2,6 +2,74 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [Unreleased] — anda_kip, anda_cognitive_nexus, @ldclabs/kip-do (KIP `3251912`)
+
+Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..3251912`). Breaking
+for the parser, the executable AST and stored draft Spaces; a 0.14 release is
+suggested, `anda_kip` first.
+
+- **Breaking — draft Spaces:** the bundled package is the rewritten
+  `kip://profiles/cognitive-memory@2.0.0`, content digest
+  `sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9`.
+  The 2.0 draft rewrote 2.0.0 in place, so only the digest tells revisions
+  apart. Spaces activated under the 2.1.0 draft are not migrated; start a new
+  Space. The legacy 2.0.0 copy is removed. `kip://domains/general@1.0.0`
+  (`sha256:affede50…`) is bundled as optional vocabulary (installed, not
+  activated), and the `kip:memory-default` policy artifact (`sha256:b70ae00c…`)
+  ships beside it.
+- **Breaking — Profile content:** no `Preference` type and no `TrialState` /
+  `DerivationState` facets. A Skill's lifecycle points at its records through
+  `current_trial` / `current_evaluation`; `GradingState`, `effective_strength`
+  and the `derived_from` / `compiled_from` / `compiled_by` / `consolidated_to`
+  fields are computed members (§18.2) and every write to one fails
+  `ConstraintViolation`. The 1.x migration keeps a 1.x `Preference` as an open
+  type in its legacy package instead of adopting it.
+- **Breaking — language:** `DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` parse
+  and lower to a standalone `Define` clause (rejected inside `MUTATE`); the KQL
+  Search Pattern `?x SEARCH <KIND> <term> … LIMIT k` lowers to a `Search`
+  where-clause (never inside `NOT`, never in a mutation or export selection);
+  `SEARCH COGNITION` is removed; ASSERT takes `context`, and `context_refs` is
+  immutable Assertion payload. The AST matches `@ldclabs/kip-lang` 2.4.0 and
+  the WASM oracle is rebuilt.
+- **Breaking — SDK:** `ConformanceProfile` has the two §89 levels (`KIP-Core`,
+  `KIP-CognitiveMemory`); the eight areas are `ConformanceArea` and
+  `PROTOCOL_SURFACE` lists areas. `ValidTime` endpoints are `TimePoint`
+  (instant or `{earliest, latest}` bound). `Projection` drops `temporal`
+  (the basis carries `valid_at` and the snapshot) and gains `leading` and
+  `precedence`. New `SchemaSymbolConflict` error. `COGNITIVE_CONSISTENCY` is
+  kept as the upstream redirect text; new `BRAIN_RUNTIME`,
+  `VALIDATED_LEARNING` and `COMMON_SCHEMA` constants. Memory bundles are the
+  three levels with `nexus_level`; `memory_interface` no longer implies
+  `memory_basic`.
+- **Behavior — world time (§25.2–§25.5):** a missing `from` reads as
+  `{latest: asserted_at}`; `valid_time` endpoints may be time bounds and
+  projection is three-valued (`uncertain` / `temporal_indeterminate`);
+  temporal succession ends an actor's open value at its successor's start,
+  per proposition and per functional (or `functional_by`) slot, with tied
+  successors combined bound by bound; inferences without a written `from`
+  never succeed one another. `expired` is computed and never stored: the
+  `expire_lapsed_assertions` sweep is removed from both engines.
+- **Behavior — projection:** `functional` without `complete` makes rival
+  values a conflict set (`contested`), never opposition; `functional_by:
+  "object_type"` partitions the slot by the object's Concept Type and is
+  checked on install. `kip:memory-default` resolves conflicts by context
+  specificity, first-person testimony and recency (`uncertain` + `outranked`,
+  `precedence` disclosed). `uncertainty.reasons` carries machine codes only.
+  The baseline (now version 3) weighs an unstated confidence by stance alone.
+  A value-only correction may supersede an Assertion about another value of
+  the same slot.
+- **Capabilities:** the §67.4 registry follows the Specification (29 names);
+  `belief_slot`, `ingestion_context`, `dependency_validity` and
+  `materialized_projection` are engine-local names. Both engines claim
+  `KIP-Core`; `draft_vocabulary`, `recording_repair`, `exposure_log`,
+  `receiver_fencing` and `prospective_trials` answer `false`, so neither
+  claims `KIP-CognitiveMemory`. `recording` is a Change Envelope control kind.
+- **Conformance:** `fixtures/kip-conformance-2.0/` is now a byte copy of KIP's
+  `conformance/engine-suite/` (`make sync-kip-conformance`), and both
+  harnesses follow KIP's runner (captures, `result_contains`,
+  `pending_engine`, SKIP for unexpected `UnsupportedCapability`). Both
+  engines: 384 passed, 4 skipped (DEFINE), 0 failed of 388.
+
 ## [Unreleased] — anda_db, anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs, anda_object_store
 
 - anda_object_store: a read that raced a delete of its key, or any failed

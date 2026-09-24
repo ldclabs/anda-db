@@ -38,6 +38,17 @@ async fn fresh(name: &str) -> (CognitiveNexus, Arc<AndaDB>) {
         .insert(COGNITIVE_MEMORY_ID.into(), COGNITIVE_MEMORY_VERSION.into());
     lock.states
         .insert(COGNITIVE_MEMORY_ID.into(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     (nexus, db)
 }
@@ -59,7 +70,7 @@ async fn ok(n: &CognitiveNexus, command: &str, p: Json) -> Json {
 }
 const SETUP: &str = r#"MUTATE {
 CREATE CONCEPT ?a {TYPE "Person" NAME "Ada"}
-CREATE CONCEPT ?b {TYPE "Preference" NAME "tea"}
+CREATE CONCEPT ?b {TYPE "Option" NAME "tea"}
 ENSURE PROPOSITION ?p (?a,"prefers",?b)
 CREATE EVIDENCE ?e { SET FIELDS {evidence_class:"observation",payload:"material"} }
 }"#;
@@ -289,29 +300,45 @@ async fn trial_entry_and_guarded_verdict_are_usable_without_a_brain_process() {
     let mutation = format!(
         r#"MUTATE {{
         CREATE ACTIVITY ?verdict {{SET FIELDS {{activity_class:"lifecycle_verdict",status:"completed"}} SET FACET "EvaluationRecord" {evaluation} SET STRUCTURAL {{("inputs","C-4") ("inputs","{trial_ref}") ("outputs","C-3")}}}}
-        UPDATE "C-3" SET ATTRIBUTES {{status:"trialed"}} SET FACET "TrialState" {{revision_ref:"C-4",trial_ref:"{trial_ref}"}} SET FACET "GradingState" {{revision_ref:"C-4",evaluation_ref:?verdict,success_count:0,failure_count:0,graded_count:0}} EXPECT VERSION 1
+        UPDATE "C-3" SET ATTRIBUTES {{status:"trialed"}} SET STRUCTURAL {{("current_trial","{trial_ref}") ("current_evaluation",?verdict)}} EXPECT VERSION 1
     }}"#
     );
     ok(&n, &mutation, Json::Null).await;
     let skill = n.store.get_element("C-3".parse().unwrap()).await.unwrap();
     let v = anda_cognitive_nexus::view::render(&skill);
     assert_eq!(v["attributes"]["status"], "trialed");
-    assert!(
-        v["facets"]["kip://profiles/cognitive-memory@2.1.0/GradingState"]["evaluation_ref"]
+    let pointer = |name: &str| {
+        v["structural"][format!("kip://profiles/cognitive-memory@2.0.0/{name}")][0]
             .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                v["structural"][format!("kip://profiles/cognitive-memory@2.0.0/{name}")][0]["id"]
+                    .as_str()
+                    .map(str::to_string)
+            })
             .unwrap()
-            .starts_with("X-")
-    );
-    assert_eq!(
-        run(
-            &n,
-            r#"UPDATE "C-3" SET FACET "GradingState" {success_count:99} EXPECT VERSION 2"#,
-            Json::Null
-        )
-        .await
-        .status,
-        TopLevelStatus::Failed
-    );
+    };
+    assert!(pointer("current_evaluation").starts_with("X-"));
+    assert_eq!(pointer("current_trial"), trial_ref);
+    // GradingState is a computed view of that evaluation (§18.2): a write
+    // to it is refused rather than kept as a second copy.
+    let refused = run(
+        &n,
+        r#"UPDATE "C-3" SET FACET "GradingState" {success_count:99} EXPECT VERSION 2"#,
+        Json::Null,
+    )
+    .await;
+    assert_eq!(refused.status, TopLevelStatus::Failed);
+    // And a lifecycle pointer never moves outside a verdict transaction.
+    let moved = run(
+        &n,
+        &format!(
+            r#"UPDATE "C-3" UNSET STRUCTURAL {{("current_trial","{trial_ref}")}} EXPECT VERSION 2"#
+        ),
+        Json::Null,
+    )
+    .await;
+    assert_eq!(moved.status, TopLevelStatus::Failed);
 }
 
 #[tokio::test]

@@ -39,9 +39,20 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -93,7 +104,7 @@ async fn a_claim_lands_as_a_proposition_plus_an_assertion() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?e {
                 SET FIELDS {
@@ -124,7 +135,7 @@ async fn a_claim_lands_as_a_proposition_plus_an_assertion() {
         panic!("?p must be a Proposition");
     };
     assert_eq!(
-        tuple.predicate_ref, "kip://profiles/cognitive-memory@2.1.0/prefers",
+        tuple.predicate_ref, "kip://profiles/cognitive-memory@2.0.0/prefers",
         "a local predicate name is persisted as its exact symbol"
     );
     assert_eq!(tuple.subject["id"], alice.to_string());
@@ -188,7 +199,7 @@ async fn ensure_resolves_an_existing_tuple_instead_of_duplicating_it() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }"#,
     )
@@ -235,7 +246,7 @@ async fn correcting_a_claim_supersedes_it_rather_than_rewriting_it() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?old {
                 SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9}
@@ -296,17 +307,19 @@ async fn correcting_a_claim_supersedes_it_rather_than_rewriting_it() {
 #[tokio::test]
 async fn supersession_must_stay_inside_one_lineage() {
     // Epistemic Model §31: a contradiction is not a supersession. Replacing a
-    // claim about one tuple with a claim about another would silently rewrite
-    // what the first claim was about.
+    // claim about one slot with a claim about another would silently rewrite
+    // what the first claim was about; a value-only correction stays inside
+    // one slot (§14.2).
     let nexus = nexus("lineage").await;
     let setup = ok(
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
-            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
+            CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
+            CREATE CONCEPT ?light { TYPE "Option" NAME "Light" }
             ENSURE PROPOSITION ?p1 (?alice, "prefers", ?dark)
-            ENSURE PROPOSITION ?p2 (?alice, "prefers", ?light)
+            ENSURE PROPOSITION ?p2 (?bob, "prefers", ?light)
             CREATE ASSERTION ?a1 {
                 SET FIELDS {proposition: ?p1, asserted_by: ?alice, stance: "support", mode: "stated"}
             }
@@ -428,7 +441,7 @@ async fn retraction_withdraws_a_claim_without_deleting_it() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?a {
                 SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.7}
@@ -572,7 +585,7 @@ async fn an_upsert_creates_the_type_its_match_declares() {
     };
     assert_eq!(
         row.schema_ref,
-        "kip://profiles/cognitive-memory@2.1.0/Person"
+        "kip://profiles/cognitive-memory@2.0.0/Person"
     );
 
     // The point of carrying the type: the Concept is reachable by it.
@@ -614,7 +627,7 @@ async fn an_upsert_creates_the_type_its_match_declares() {
     let other = ok(
         &nexus,
         r#"UPSERT CONCEPT ?p {
-             MATCH {type: "Preference", key: "person:ada"}
+             MATCH {type: "Option", key: "person:ada"}
              SET FIELDS {name: "Dark"}
            }"#,
     )
@@ -658,7 +671,7 @@ async fn an_upsert_creates_the_type_its_match_declares() {
     // not a match — reported existence-neutrally either way (§86.4).
     for command in [
         r#"UPSERT CONCEPT ?p { MATCH {id: "C-9999"} SET FIELDS {name: "Nobody"} }"#,
-        r#"UPSERT CONCEPT ?p { MATCH {type: "Preference", id: :id} SET FIELDS {name: "Wrong"} }"#,
+        r#"UPSERT CONCEPT ?p { MATCH {type: "Option", id: :id} SET FIELDS {name: "Wrong"} }"#,
     ] {
         let request = Request {
             parameters: Some(serde_json::Map::from_iter([(
@@ -707,8 +720,8 @@ async fn a_logical_key_is_identity_within_its_type() {
     let together = run(
         &nexus,
         r#"MUTATE {
-             CREATE CONCEPT ?a { TYPE "Preference" NAME "One" SET FIELDS {key: "dark"} }
-             CREATE CONCEPT ?b { TYPE "Preference" NAME "Two" SET FIELDS {key: "dark"} }
+             CREATE CONCEPT ?a { TYPE "Option" NAME "One" SET FIELDS {key: "dark"} }
+             CREATE CONCEPT ?b { TYPE "Option" NAME "Two" SET FIELDS {key: "dark"} }
            }"#,
     )
     .await;
@@ -722,7 +735,7 @@ async fn a_logical_key_is_identity_within_its_type() {
     // key without merging unrelated Concepts.
     ok(
         &nexus,
-        r#"CREATE CONCEPT ?p { TYPE "Preference" NAME "Alice" SET FIELDS {key: "alice"} }"#,
+        r#"CREATE CONCEPT ?p { TYPE "Option" NAME "Alice" SET FIELDS {key: "alice"} }"#,
     )
     .await;
 
@@ -773,7 +786,7 @@ async fn archiving_removes_from_recall_without_breaking_references() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }"#,
     )
@@ -930,7 +943,7 @@ async fn with_cited_evidence(name: &str) -> CognitiveNexus {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE EVIDENCE ?e {
                 SET FIELDS {
@@ -1132,7 +1145,7 @@ async fn lifecycle_ground(name: &str) -> CognitiveNexus {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             CREATE CONCEPT ?exp { TYPE "Experience" NAME "First"
               SET ATTRIBUTES {goal: "learn", outcome_status: "success"} }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
@@ -1687,7 +1700,7 @@ async fn one_commit_is_one_envelope_however_many_elements_it_touched() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?a {
                 SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated"}

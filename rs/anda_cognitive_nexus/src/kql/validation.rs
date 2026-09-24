@@ -148,6 +148,9 @@ pub(super) fn validate_block(
                 }
                 scope.insert(variable.clone());
             }
+            WhereClause::Search(pattern) => {
+                scope.insert(pattern.variable.clone());
+            }
             WhereClause::Filter { expression: expr } => {
                 expression(cx, expr, &scope)?;
                 super::filter::validate_expression(cx, expr)?;

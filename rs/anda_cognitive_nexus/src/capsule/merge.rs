@@ -374,13 +374,18 @@ fn build(
 ) -> Result<Element, KipError> {
     let view = &record.view;
     let client_key = import_key(digest, &record.source_id);
-    let mut facets = map_of(view, "facets");
+    let facets = map_of(view, "facets");
     let mut attributes = map_of(view, "attributes");
-    if view["schema_ref"].as_str() == Some("kip://profiles/cognitive-memory@2.1.0/Skill") {
+    let mut structural = map_of(view, "structural");
+    // Standing does not transfer: an imported Skill enters `proposed` with no
+    // current_trial or current_evaluation (Profile §9).
+    if view["schema_ref"].as_str() == Some(cognitive_memory!("Skill")) {
         attributes.insert("status".into(), Json::String("proposed".into()));
-        facets.retain(|name, _| !name.ends_with("/TrialState") && !name.ends_with("/GradingState"));
+        structural.retain(|name, _| {
+            !name.ends_with("/current_trial") && !name.ends_with("/current_evaluation")
+        });
     }
-    let structural = rewrite_structural(map_of(view, "structural"), mapping)?;
+    let structural = rewrite_structural(structural, mapping)?;
     let retention = view
         .get("retention")
         .cloned()

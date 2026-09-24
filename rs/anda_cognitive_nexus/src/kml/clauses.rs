@@ -146,6 +146,7 @@ pub async fn apply(
         MutationClause::CreateActivity(c) => {
             create_record(store, tx, c, ElementKind::Activity, request, operation).await
         }
+        MutationClause::Define(_) => Err(crate::kml::define_unsupported()),
         MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
         MutationClause::Transition(c) => transition(store, tx, c, request, operation).await,
         MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
@@ -817,9 +818,25 @@ async fn assertion_row(
     context_refs.sort_by_key(Json::to_string);
     context_refs.dedup();
     let valid_time = fields.json("valid_time");
-    let from = valid_time_part(&valid_time, "from")?;
-    let until = valid_time_part(&valid_time, "until")?;
-    if !from.is_empty() && !until.is_empty() && from >= until {
+    if let Some(members) = valid_time.as_object()
+        && members.keys().any(|k| k != "from" && k != "until")
+    {
+        return Err(KipError::constraint_violation(
+            "valid_time has only `from` and `until` (§25.2)",
+        ));
+    } else if !valid_time.is_null() && !valid_time.is_object() {
+        return Err(KipError::type_mismatch(
+            "valid_time must be an object with `from` and `until`",
+        ));
+    }
+    let from = time::Point::read(valid_time.get("from"), "valid_time.from")?;
+    let until = time::Point::read(valid_time.get("until"), "valid_time.until")?;
+    // §25.5: an interval is invalid when its earliest possible start is not
+    // before its latest possible end; exact bounds need from < until.
+    if let (Some(from), Some(until)) = (&from, &until)
+        && let (Some(start), Some(end)) = (from.range().lo, until.range().hi)
+        && start >= end
+    {
         return Err(KipError::constraint_violation(
             "valid_time requires from < until",
         ));
@@ -840,8 +857,8 @@ async fn assertion_row(
         } else {
             asserted_at
         },
-        valid_from: valid_time_part(&valid_time, "from")?,
-        valid_until: valid_time_part(&valid_time, "until")?,
+        valid_from: from.as_ref().map(time::Point::store).unwrap_or_default(),
+        valid_until: until.as_ref().map(time::Point::store).unwrap_or_default(),
         evidence_ids: evidence.iter().filter_map(evidence_id).collect(),
         evidence_refs: evidence,
         context_refs,
@@ -1906,11 +1923,28 @@ async fn supersede(
         .await?
         .proposition_id
         .clone();
+    // A value-only correction replaces the claim with another value of the
+    // same slot (§14.2): the same subject and predicate lineage. Anything
+    // wider is a different claim, never a revision of this one.
     if replacement != proposition {
-        return Err(KipError::new(
-            KipErrorCode::SupersessionMismatch,
-            format!("{new} is about {replacement}, not about {proposition}"),
-        ));
+        let slot_of = |element: Element| match element {
+            Element::Proposition(row) => Some((
+                row.subject_key,
+                crate::schema::lineage_of(&row.predicate_ref),
+            )),
+            _ => None,
+        };
+        let old_slot = slot_of(tx.final_element(proposition.parse()?).await?);
+        let new_slot = slot_of(tx.final_element(replacement.parse()?).await?);
+        if old_slot.is_none() || old_slot != new_slot {
+            return Err(KipError::new(
+                KipErrorCode::SupersessionMismatch,
+                format!(
+                    "{new} is about {replacement}, which is neither {proposition} nor another \
+                     value of its slot"
+                ),
+            ));
+        }
     }
     link_revision::<AssertionRow>(tx, id, new, REVISION.state).await
 }
@@ -2724,16 +2758,6 @@ fn reference_id(value: &Json) -> String {
             .unwrap_or_default()
             .to_string(),
         _ => String::new(),
-    }
-}
-
-fn valid_time_part(valid_time: &Json, part: &str) -> Result<String, KipError> {
-    match valid_time.get(part) {
-        None | Some(Json::Null) => Ok(String::new()),
-        Some(Json::String(text)) => time::normalize(text, &format!("valid_time.{part}")),
-        Some(other) => Err(KipError::type_mismatch(format!(
-            "`valid_time.{part}` must be a timestamp, got {other}"
-        ))),
     }
 }
 

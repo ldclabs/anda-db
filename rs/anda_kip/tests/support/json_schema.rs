@@ -18,6 +18,7 @@ impl Retrieve for Vendored {
             anda_kip::CHANGE_ENVELOPE_SCHEMA,
             anda_kip::SCHEMA_PACKAGE_SCHEMA,
             anda_kip::MEMORY_SCHEMA,
+            anda_kip::COMMON_SCHEMA,
         ] {
             let schema: Value = serde_json::from_str(source)?;
             if schema["$id"] == uri.as_str() {

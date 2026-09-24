@@ -597,7 +597,7 @@ async fn lookup_fixture(
     s.claim_wake(DEFAULT_SPACE, &wake, 1, 0, &expiry_in(120))
         .await
         .unwrap();
-    let made=run(&f.nexus,r#"MUTATE {CREATE CONCEPT ?preference {TYPE "Preference" NAME "lookup"} ENSURE PROPOSITION ?basis (:target,"prefers",?preference)}"#,json!({"target":f.target})).await;
+    let made=run(&f.nexus,r#"MUTATE {CREATE CONCEPT ?preference {TYPE "Option" NAME "lookup"} ENSURE PROPOSITION ?basis (:target,"prefers",?preference)}"#,json!({"target":f.target})).await;
     let projection = run(
         &f.nexus,
         "FIND(?b) WHERE {?p PROPOSITION(id: :id) ?b BELIEF(?p)}",

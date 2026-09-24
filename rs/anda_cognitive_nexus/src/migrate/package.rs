@@ -52,8 +52,8 @@ fn symbol(name: &str) -> String {
 /// resolve are *adopted* — a migrated element is written against the host's own
 /// symbol — and only what is left is declared here.
 ///
-/// That split is the whole point. A 1.x Brain used `Person`, `Event` and
-/// `Preference`, and so does the Cognitive Memory Profile a 2.0 host activates.
+/// That split is the whole point. A 1.x Brain used `Person` and `Event`, and so
+/// does the Cognitive Memory Profile a 2.0 host activates.
 /// Minting a legacy `Person` beside the profile's would leave two symbols
 /// spelled the same, and every command naming the bare local name would resolve
 /// to neither — `SchemaSymbolAmbiguous`, on a Space whose data migrated
@@ -158,15 +158,8 @@ impl Vocabulary {
                         // content under a distinct, open legacy type instead.
                         if kind == SymbolKind::ConceptType
                             && reference.package.package_id == crate::profiles::COGNITIVE_MEMORY_ID
-                            && ![
-                                "Person",
-                                "Event",
-                                "Preference",
-                                "Insight",
-                                "Commitment",
-                                "SleepTask",
-                            ]
-                            .contains(&name.as_str())
+                            && !["Person", "Event", "Insight", "Commitment", "SleepTask"]
+                                .contains(&name.as_str())
                         {
                             let base = format!("Legacy{name}");
                             let mut legacy_name = base.clone();

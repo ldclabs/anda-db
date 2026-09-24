@@ -226,6 +226,10 @@ kip_error_codes! {
     /// A local name resolves to more than one package symbol.
     SchemaSymbolAmbiguous: Schema =>
         "The local name resolves in more than one package. Qualify it with its package path.";
+    /// A draft symbol would reuse a local name that already resolves.
+    SchemaSymbolConflict: Schema, NonRetryable =>
+        "That name already resolves in this Schema Environment. `DEFINE` only adds: use the \
+         existing symbol, or define a distinct name.";
     /// The field is not declared on this type or facet.
     SchemaFieldNotFound: Schema =>
         "Run `DESCRIBE TYPE` / `DESCRIBE FACET` to see which fields the element actually \
@@ -286,10 +290,11 @@ kip_error_codes! {
     /// The field is immutable after creation.
     ImmutableField: Epistemic =>
         "The field is immutable after creation; express the change as new state instead.";
-    /// Changing this requires a new Assertion plus supersession.
+    /// Changing this requires a new Assertion, never a rewrite of the old one.
     EpistemicRevisionRequired: Epistemic =>
-        "An Assertion's epistemic payload never changes. Record a new Assertion with `ASSERT \
-         ... SUPERSEDING :old`, or `TRANSITION :old TO \"superseded\" BY :new`.";
+        "An Assertion's epistemic payload never changes. Record a new Assertion instead: a \
+         changed world is a new Assertion from the time of the change, which ends the old value \
+         (§25.4); add `SUPERSEDING :old` only when the old Assertion was wrong (§14.2).";
     /// Changing this requires `TRANSITION :old TO "corrected" BY :new`.
     EvidenceCorrectionRequired: Epistemic =>
         "Evidence payload never changes. Record the corrected Evidence and `TRANSITION :old TO \
@@ -603,6 +608,7 @@ kip_error_constructors! {
     duplicate_local_handle => DuplicateLocalHandle,
     duplicate_mutation_target => DuplicateMutationTarget,
     schema_symbol_not_found => SchemaSymbolNotFound,
+    schema_symbol_conflict => SchemaSymbolConflict,
     schema_field_not_found => SchemaFieldNotFound,
     type_mismatch => TypeMismatch,
     constraint_violation => ConstraintViolation,
@@ -819,11 +825,11 @@ mod tests {
 
     #[test]
     fn registry_covers_the_whole_spec_listing() {
-        // §87 lists 77 codes across ten sections (the four cursor codes of
+        // §87 lists 78 codes across ten sections (the four cursor codes of
         // earlier drafts collapsed into `CursorExpired` / `CursorInvalid`,
         // §87.7); a miss here means a section was dropped when the registry
         // was transcribed.
-        assert_eq!(KipErrorCode::ALL.len(), 77);
+        assert_eq!(KipErrorCode::ALL.len(), 78);
         let mut names: Vec<&str> = KipErrorCode::ALL.iter().map(|c| c.name()).collect();
         names.sort_unstable();
         let unique = names.len();

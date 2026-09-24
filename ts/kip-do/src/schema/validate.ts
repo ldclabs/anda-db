@@ -246,7 +246,9 @@ function validateFields(
 ): void {
   for (const [name, spec] of Object.entries(declared)) {
     const path = `${prefix}.${name}`
-    if (Object.hasOwn(values, name)) {
+    if (Object.hasOwn(values, name) && spec.computed === true) {
+      into.push(computed(schemaRef, path))
+    } else if (Object.hasOwn(values, name)) {
       validateField(schemaRef, path, spec, values[name] as Json, into)
     } else if (spec.required === true) {
       into.push(
@@ -619,6 +621,17 @@ export function validateStructuralEndpoints(
   return result
 }
 
+/** A write that reaches an engine-derived, read-only member (§18.2). */
+function computed(schemaRef: string, path: string): Violation {
+  return error(
+    'SCHEMA_COMPUTED_MEMBER',
+    schemaRef,
+    path,
+    'a computed member is derived by the engine when a read is evaluated and is never ' +
+      'written (§18.2); write the state it is computed from instead',
+  )
+}
+
 /** Validates one Facet's members against its definition (§58–§60). */
 export function validateFacet(
   schemaRef: string,
@@ -626,6 +639,10 @@ export function validateFacet(
   values: JsonMap,
 ): Validation {
   const result = new Validation()
+  if (def.computed === true) {
+    result.push(computed(schemaRef, 'facets'))
+    return result
+  }
   validateFields(
     schemaRef,
     'facets',
@@ -655,6 +672,10 @@ export function validateStructural(
 ): Validation {
   const result = new Validation()
   const count = targets.length
+  if (def.computed === true && count > 0) {
+    result.push(computed(schemaRef, 'structural'))
+    return result
+  }
   const min = def.cardinality?.min ?? 0
   const max = def.cardinality?.max
   if (count < min) {

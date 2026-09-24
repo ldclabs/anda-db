@@ -36,9 +36,20 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -103,8 +114,8 @@ async fn seeded(name: &str) -> CognitiveNexus {
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" SET ATTRIBUTES {display_name: "Alice A"} }
             CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
-            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
+            CREATE CONCEPT ?light { TYPE "Option" NAME "Light mode" }
             ENSURE PROPOSITION ?p1 (?alice, "prefers", ?dark)
             ENSURE PROPOSITION ?p2 (?bob, "prefers", ?light)
             CREATE ASSERTION ?a1 {
@@ -140,7 +151,7 @@ async fn a_concept_pattern_finds_by_type_and_projects_dot_paths() {
     // index, so writing the canonical form finds the same Concepts.
     let qualified = ok(
         &nexus,
-        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "kip://profiles/cognitive-memory@2.1.0/Person"} }
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "kip://profiles/cognitive-memory@2.0.0/Person"} }
            ORDER BY ?c.name"#,
     )
     .await;
@@ -166,7 +177,7 @@ async fn a_bare_variable_projects_the_whole_element() {
     assert_eq!(concept["_system"]["version"], 1);
     assert_eq!(
         concept["schema_ref"],
-        "kip://profiles/cognitive-memory@2.1.0/Person"
+        "kip://profiles/cognitive-memory@2.0.0/Person"
     );
 }
 
@@ -467,7 +478,7 @@ async fn for_time_restricts_by_world_validity() {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?old {
                 SET FIELDS {
@@ -671,7 +682,7 @@ async fn a_cursor_continues_only_the_traversal_that_issued_it() {
     let elsewhere = run(
         &nexus,
         &format!(
-            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{type: "Preference"}} }} ORDER BY ?c.name LIMIT 1 CURSOR "{cursor}""#
+            r#"FIND(?c.name) WHERE {{ ?c CONCEPT {{type: "Option"}} }} ORDER BY ?c.name LIMIT 1 CURSOR "{cursor}""#
         ),
     )
     .await;
@@ -1016,7 +1027,7 @@ async fn inline_endpoint_patterns_find_existing_elements_and_export_fields() {
         ok(
             &nexus,
             r#"FIND(?person, ?preference) WHERE {
-        ({type: "Person", name: ?person}, "prefers", {type: "Preference", name: ?preference})
+        ({type: "Person", name: ?person}, "prefers", {type: "Option", name: ?preference})
     } ORDER BY ?person"#
         )
         .await,

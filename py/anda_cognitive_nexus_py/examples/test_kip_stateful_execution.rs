@@ -26,7 +26,7 @@ use anda_kip::{Json, Map, TopLevelStatus};
 static RECORD_A_PREFERENCE: &str = r#"
     MUTATE {
         CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-        CREATE CONCEPT ?dark { TYPE "Preference" NAME :preference_name }
+        CREATE CONCEPT ?dark { TYPE "Person" NAME :preference_name }
         CREATE EVIDENCE ?said {
             SET FIELDS {
                 evidence_class: "user_statement",
@@ -49,7 +49,7 @@ static RECORD_A_PREFERENCE: &str = r#"
 /// returned, bound as the `:alice` parameter.
 static CHANGE_OF_MIND: &str = r#"
     MUTATE {
-        CREATE CONCEPT ?light { TYPE "Preference" NAME "Light mode" }
+        CREATE CONCEPT ?light { TYPE "Person" NAME "Light mode" }
         ASSERT ?a (:alice, "prefers", ?light) {
             by: :alice, mode: "stated", confidence: 0.7
         }
@@ -74,7 +74,7 @@ async fn main() {
         db_desc: Some("Local file DB for the KIP binding example".to_string()),
         meta_cache_capacity: Some(10000),
         // The bundled Cognitive Memory Profile, which is what `Person` and
-        // `Preference` below are symbols of.
+        // `Person` below are symbols of.
         schema_packages: None,
     };
 

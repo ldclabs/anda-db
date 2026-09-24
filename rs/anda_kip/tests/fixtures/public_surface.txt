@@ -6,6 +6,7 @@ ast.rs: enum ChangesCommand
 ast.rs: enum Command
 ast.rs: enum CommandType
 ast.rs: enum ComparisonOperator
+ast.rs: enum DefineKind
 ast.rs: enum DescribeTarget
 ast.rs: enum ElementRef
 ast.rs: enum FilterExpression
@@ -40,6 +41,7 @@ ast.rs: enum WhereClause
 ast.rs: mod transition_state
 ast.rs: struct ConceptCreate
 ast.rs: struct ConceptUpsert
+ast.rs: struct DefineCommand
 ast.rs: struct DotPathVar
 ast.rs: struct EnsureProposition
 ast.rs: struct ExpectVersion
@@ -59,6 +61,7 @@ ast.rs: struct PurgePayloadStatement
 ast.rs: struct PurgeStatement
 ast.rs: struct RecordCreate
 ast.rs: struct SearchCommand
+ast.rs: struct SearchPattern
 ast.rs: struct SetRetention
 ast.rs: struct StructuralEdge
 ast.rs: struct StructuralRemoval
@@ -144,10 +147,12 @@ lib.rs: use parser::*;
 lib.rs: use request::*;
 lib.rs: use semantics::*;
 lib.rs: use types::*;
+memory.rs: const BRAIN_RUNTIME
 memory.rs: const CAPSULE_SCHEMA
 memory.rs: const CHANGE_ENVELOPE_SCHEMA
 memory.rs: const COGNITIVE_CONSISTENCY
 memory.rs: const COGNITIVE_RECORDS_SCHEMA
+memory.rs: const COMMON_SCHEMA
 memory.rs: const ELEMENT_SCHEMA
 memory.rs: const KIP_FORMATION_CARD
 memory.rs: const KIP_MAINTENANCE_CARD
@@ -158,6 +163,7 @@ memory.rs: const MEMORY_INTERFACE
 memory.rs: const MEMORY_SCHEMA
 memory.rs: const PROJECTION_SCHEMA
 memory.rs: const SCHEMA_PACKAGE_SCHEMA
+memory.rs: const VALIDATED_LEARNING
 memory.rs: fn memory_bundles
 memory.rs: fn validate_memory_bundles
 memory.rs: struct MemoryBundle
@@ -230,6 +236,7 @@ types.rs: const EVIDENCE_CLASSES
 types.rs: const PROTECTED_SYSTEM_FIELDS
 types.rs: const SCORE_SEMANTICS
 types.rs: enum ChangeOp
+types.rs: enum TimePoint
 types.rs: struct Activity
 types.rs: struct Assertion
 types.rs: struct AssertionLifecycle
@@ -253,9 +260,9 @@ types.rs: struct Projection
 types.rs: struct ProjectionBasis
 types.rs: struct ProjectionPolicyVersion
 types.rs: struct ProjectionSide
-types.rs: struct ProjectionTemporal
 types.rs: struct ProjectionUncertainty
 types.rs: struct Proposition
 types.rs: struct Retention
 types.rs: struct SystemState
+types.rs: struct TimeBound
 types.rs: struct ValidTime

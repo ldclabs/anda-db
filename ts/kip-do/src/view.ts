@@ -23,6 +23,7 @@
  */
 
 import { formatElementId, type ElementId } from './id.js'
+import { loadTimePoint, timePointJson } from './time.js'
 import { isJsonMap, type Json, type JsonMap } from './json.js'
 import type { PathStep } from './kip/ast.js'
 import {
@@ -132,7 +133,10 @@ function assertion(id: ElementId, row: AssertionRow): JsonMap {
       // reach a reader as a confidence of minus one.
       confidence: row.confidence < 0 ? undefined : row.confidence,
       asserted_at: row.asserted_at,
-      valid_time: present({ from: row.valid_from, until: row.valid_until }),
+      valid_time: present({
+        from: validEndpoint(row.valid_from),
+        until: validEndpoint(row.valid_until),
+      }),
       evidence: row.evidence_refs as unknown as Json,
       context_refs: row.context_refs,
       lifecycle: present({
@@ -253,4 +257,10 @@ function resolveMember(
     }
   }
   return name
+}
+
+/** A stored `valid_time` endpoint in its wire form (§25.5): instant or bound. */
+function validEndpoint(stored: string): Json {
+  const point = loadTimePoint(stored)
+  return point === null ? '' : (timePointJson(point) as Json)
 }

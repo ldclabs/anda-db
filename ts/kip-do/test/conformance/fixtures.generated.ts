@@ -6,9 +6,14 @@
  * `pnpm run codegen:fixtures`.
  */
 
-/** One expectation: a result to match, or the registry code to fail with. */
+/**
+ * One expectation: a result to match, members and rows the result must
+ * contain, or the registry code to fail with. An empty expectation passes on
+ * any result.
+ */
 export interface Expectation {
   result?: unknown
+  result_contains?: unknown
   error?: string
 }
 
@@ -36,12 +41,22 @@ export interface Case {
   vectors?: string[]
 }
 
+/**
+ * A setup step: a bare command, or one whose raw result is captured into
+ * parameters (JSON Pointers) for later steps and every case of the fixture.
+ */
+export type Setup =
+  | string
+  | { command: string; params?: Record<string, unknown>; capture?: Record<string, string> }
+
 export interface Fixture {
   name: string
   description: string
+  /** `pending_engine` while no engine has verified the fixture. */
+  status?: string
   /** Extra Schema Package artifacts to install and activate, inline. */
   packages?: unknown[]
-  setup?: string[]
+  setup?: Setup[]
   cases: Case[]
 }
 
@@ -186,11 +201,11 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "no scoped support is borrowed; matching-context functional opposition remains",
+        "name": "a context-mismatched candidate is insufficient without exclusive completeness",
         "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"scoped\", \"travel\") } WITH EPISTEMIC {context_refs: [\"C-2\"]}",
         "expect": {
           "result": [
-            "rejected"
+            "insufficient"
           ]
         },
         "vectors": [
@@ -210,11 +225,11 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "until is excluded exactly at the boundary",
+        "name": "until is excluded exactly at the boundary: an expired value contributes nothing",
         "command": "FIND(?b.status) WHERE { ?a CONCEPT {name: \"Ada\"} ?b BELIEF (?a, \"temporal\", \"old\") } FOR TIME \"2026-09-07T00:00:00.000Z\"",
         "expect": {
           "result": [
-            "rejected"
+            "insufficient"
           ]
         },
         "vectors": [
@@ -604,7 +619,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "core-truth-neutrality",
     "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
       "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}",
       "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}"
     ],
@@ -642,7 +657,7 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?p.predicate_ref) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
         "expect": {
           "result": [
-            "kip://profiles/cognitive-memory@2.1.0/prefers"
+            "kip://profiles/cognitive-memory@2.0.0/prefers"
           ]
         }
       },
@@ -651,7 +666,7 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: \"Alice\"} }",
         "expect": {
           "result": [
-            "kip://profiles/cognitive-memory@2.1.0/Person"
+            "kip://profiles/cognitive-memory@2.0.0/Person"
           ]
         }
       },
@@ -793,6 +808,23 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
@@ -801,7 +833,7 @@ export const FIXTURES: readonly Fixture[] = [
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?event {\n    TYPE \"Event\"\n    NAME \"Migration meeting\"\n    SET ATTRIBUTES {summary: \"The team agreed to migrate on Friday\"}\n  }\n  CREATE CONCEPT ?insight {\n    TYPE \"Insight\"\n    NAME \"Migrations need a rollback plan\"\n    SET ATTRIBUTES {summary: \"Every migration ships with a rollback\"}\n  }\n  CREATE ACTIVITY ?consolidate {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?event)\n      (\"outputs\", ?insight)\n    }\n  }\n}",
       "MUTATE {\n  CREATE CONCEPT ?skill {\n    TYPE \"Insight\"\n    NAME \"Plan a migration\"\n    SET ATTRIBUTES {\n      summary: \"Write the rollback first\"\n    }\n  }\n  CREATE ACTIVITY ?compile {\n    SET FIELDS {activity_class: \"procedural_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", \"C-2\")\n      (\"outputs\", ?skill)\n    }\n  }\n}",
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode, and my address is 12 Elm Street.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n}"
     ],
     "cases": [
       {
@@ -1011,6 +1043,23 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "PURGE PAYLOAD \"E-1\" CONFIRM \"PURGE\"",
         "expect": {}
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
@@ -1042,12 +1091,27 @@ export const FIXTURES: readonly Fixture[] = [
             }
           }
         }
+      },
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
       }
     ],
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Preference\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Preference\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?quiet { TYPE \"Option\" NAME \"Quiet\" }\n  CREATE CONCEPT ?loud { TYPE \"Option\" NAME \"Loud\" }\n  ENSURE PROPOSITION ?unspoken (?alice, \"prefers\", ?quiet)\n  ENSURE PROPOSITION ?repeated (?alice, \"prefers\", ?loud)\n}",
       "MUTATE {\n  CREATE CONCEPT ?svc { TYPE \"Service\" NAME \"api\" }\n  CREATE CONCEPT ?healthy { TYPE \"Status\" NAME \"healthy\" }\n  CREATE CONCEPT ?degraded { TYPE \"Status\" NAME \"degraded\" }\n  ENSURE PROPOSITION ?ok (?svc, \"status\", ?healthy)\n  ENSURE PROPOSITION ?bad (?svc, \"status\", ?degraded)\n}",
-      "MUTATE {\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?warm { TYPE \"Preference\" NAME \"Warm\" }\n  ENSURE PROPOSITION ?p (?dave, \"prefers\", ?warm)\n  CREATE EVIDENCE ?seen { SET FIELDS { evidence_class: \"observation\", payload: \"one observation\" } }\n  CREATE ASSERTION ?a1 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n  CREATE ASSERTION ?a2 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?warm { TYPE \"Option\" NAME \"Warm\" }\n  ENSURE PROPOSITION ?p (?dave, \"prefers\", ?warm)\n  CREATE EVIDENCE ?seen { SET FIELDS { evidence_class: \"observation\", payload: \"one observation\" } }\n  CREATE ASSERTION ?a1 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n  CREATE ASSERTION ?a2 {\n    SET FIELDS { proposition: ?p, asserted_by: ?dave, stance: \"support\", mode: \"stated\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?seen) { role: \"support\" } }\n  }\n}"
     ],
     "cases": [
       {
@@ -1255,7 +1319,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "governance",
     "description": "Governance is a protected control plane, and these are the properties that make it one rather than a description of one. An engine claiming KIP 2.0 Governance conformance has to keep every distinction here: cognitive content that describes authority acquires none, an element's Governance block is unreachable from any mutation, a derived artifact records what it came from so its influence-authority ceiling can never be raised past it, and erasure refuses by default while anything still points at the target.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?admin { TYPE \"Person\" NAME \"Administrator\" SET ATTRIBUTES {authority: \"executable\", trust: 1.0} }\n  CREATE EVIDENCE ?secret { SET FIELDS {evidence_class: \"Document\", payload: \"an observation\"} }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"inferred\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?secret) {role: \"support\"} }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  CREATE CONCEPT ?admin { TYPE \"Person\" NAME \"Administrator\" SET ATTRIBUTES {authority: \"executable\", trust: 1.0} }\n  CREATE EVIDENCE ?secret { SET FIELDS {evidence_class: \"Document\", payload: \"an observation\"} }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"inferred\", confidence: 0.6 }\n    SET STRUCTURAL { (\"evidence\", ?secret) {role: \"support\"} }\n  }\n}"
     ],
     "cases": [
       {
@@ -1355,13 +1419,30 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "history",
     "description": "Two independent time axes. FOR TIME asks what was true then; AS OF asks what this Brain held then. A coordinate keeps what was later corrected, retracted or archived, because the record of what was once believed is the point. And the chronology itself is reported in transition envelopes (§36.1): §68.1 defines HISTORY as transition chronology and §36.2 defines a transition as one envelope, so HISTORY ELEMENT, HISTORY SPACE and CHANGES are the same unit asked for over different ranges — which is what lets a consumer deduplicate on space_id + space_seq + tx_id (§36.3). Each entry of `changes` is the normative shape of schemas/kip-change-envelope.schema.json: op, kind, id, new_version, old_version where the element existed, state {from, to} for a lifecycle move, refs.proposition on an Assertion entry — names and versions, never values.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
     "cases": [
       {
@@ -1625,9 +1706,26 @@ export const FIXTURES: readonly Fixture[] = [
                 "kind": "concept",
                 "id": "C:<1>",
                 "new_version": 1,
-                "schema_ref": "kip://profiles/cognitive-memory@2.1.0/Person"
+                "schema_ref": "kip://profiles/cognitive-memory@2.0.0/Person"
               }
             ]
+          }
+        }
+      }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
           }
         }
       }
@@ -1637,7 +1735,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "lifecycle",
     "description": "Nothing is rewritten and nothing is erased. An Assertion's epistemic payload is immutable, so correcting a claim records a new one and supersedes the old; an element that leaves ordinary recall keeps resolving as a reference.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?old {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?old {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
     "cases": [
       {
@@ -1704,16 +1802,33 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "merge-identity",
     "description": "Non-destructive identity consolidation (§11). The merged-away Concept stays addressable and keeps forwarding; the history that referenced it keeps referencing it (§11.2); ordinary new writes land on the identity that survived (§11.3); and no merge may make canonical resolution — following `merged_into` to its fixpoint — cycle (§11.1).",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Al\" SET FIELDS {key: \"al\"} }\n  CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" SET FIELDS {key: \"dark\"} }\n  ENSURE PROPOSITION ?old (?a, \"prefers\", ?dark)\n}",
+      "MUTATE {\n  CREATE CONCEPT ?a { TYPE \"Person\" NAME \"Al\" SET FIELDS {key: \"al\"} }\n  CREATE CONCEPT ?b { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" SET FIELDS {key: \"dark\"} }\n  ENSURE PROPOSITION ?old (?a, \"prefers\", ?dark)\n}",
       "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"al\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
-      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?new (?a, \"prefers\", ?dark)\n}",
-      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Preference\", key: \"dark\"} }\n  ENSURE PROPOSITION ?again (?a, \"prefers\", ?dark)\n}"
+      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Option\", key: \"dark\"} }\n  ENSURE PROPOSITION ?new (?a, \"prefers\", ?dark)\n}",
+      "MUTATE {\n  UPSERT CONCEPT ?a { MATCH {type: \"Person\", key: \"al\"} }\n  UPSERT CONCEPT ?dark { MATCH {type: \"Option\", key: \"dark\"} }\n  ENSURE PROPOSITION ?again (?a, \"prefers\", ?dark)\n}"
     ],
     "cases": [
       {
@@ -1782,6 +1897,23 @@ export const FIXTURES: readonly Fixture[] = [
         "command": "MERGE CONCEPT ?source INTO ?target WHERE {\n  ?source CONCEPT {key: \"alice\"}\n  ?target CONCEPT {key: \"alice\"}\n}",
         "expect": {
           "result": null
+        }
+      }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
         }
       }
     ]
@@ -1861,21 +1993,21 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
               "local_name": "caused_by",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/prefers",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/prefers",
               "local_name": "prefers",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/same_as",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/same_as",
               "local_name": "same_as",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
@@ -1894,87 +2026,99 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/AttemptRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/AttemptRecord",
               "local_name": "AttemptRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/CompressionRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/CompressionRecord",
               "local_name": "CompressionRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/DecisionRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/DecisionRecord",
               "local_name": "DecisionRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/DependencyBasis",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/DependencyBasis",
               "local_name": "DependencyBasis",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/DerivationState",
-              "local_name": "DerivationState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
-              "status": "active"
-            },
-            {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/EvaluationRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/EvaluationRecord",
               "local_name": "EvaluationRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/GradingState",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/GradingState",
               "local_name": "GradingState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/LeaseState",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/LeaseState",
               "local_name": "LeaseState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/MnemonicState",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/MemoryScope",
+              "local_name": "MemoryScope",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/MnemonicState",
               "local_name": "MnemonicState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/OutcomeRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/OutcomeRecord",
               "local_name": "OutcomeRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/RecallCoverage",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/ProcedureAssessment",
+              "local_name": "ProcedureAssessment",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/RecallCoverage",
               "local_name": "RecallCoverage",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/TrialRecord",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/RecordingRepair",
+              "local_name": "RecordingRepair",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/RestoreReport",
+              "local_name": "RestoreReport",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
+              "status": "active"
+            },
+            {
+              "ref": "kip://profiles/cognitive-memory@2.0.0/TrialRecord",
               "local_name": "TrialRecord",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/TrialState",
-              "local_name": "TrialState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
-              "status": "active"
-            },
-            {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/WatchState",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/WatchState",
               "local_name": "WatchState",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             },
             {
@@ -1993,76 +2137,32 @@ export const FIXTURES: readonly Fixture[] = [
         "expect": {
           "result": [
             {
-              "ref": "kip://profiles/cognitive-memory@2.1.0/caused_by",
+              "ref": "kip://profiles/cognitive-memory@2.0.0/caused_by",
               "local_name": "caused_by",
-              "package_ref": "kip://profiles/cognitive-memory@2.1.0",
+              "package_ref": "kip://profiles/cognitive-memory@2.0.0",
               "status": "active"
             }
           ]
         }
       },
       {
-        "name": "a policy list carries the policy, in the wire names both engines write",
+        "name": "policy introspection includes the standard memory policy and permits deployment policies",
         "command": "LIST EPISTEMIC POLICIES",
-        "ordered": true,
+        "ordered": false,
         "expect": {
-          "result": [
+          "result_contains": [
             {
-              "id": "kip:policy:baseline",
-              "version": 2,
-              "eligible_modes": [
-                "observed",
-                "stated",
-                "inferred",
-                "imported"
-              ],
-              "accept_threshold": 0.7,
-              "material_threshold": 0.3,
-              "unstated_confidence_weight": 0.5,
-              "conflict_set_expansion": true,
-              "notes": [
-                "mode gates eligibility and never weights a claim: a mode does not grant trust",
-                "corroboration groups are counted once; repetition is not evidence"
-              ]
-            },
-            {
-              "id": "kip:policy:forecast",
-              "version": 2,
-              "eligible_modes": [
-                "predicted",
-                "inferred"
-              ],
-              "accept_threshold": 0.7,
-              "material_threshold": 0.3,
-              "unstated_confidence_weight": 0.5,
-              "conflict_set_expansion": true,
-              "notes": [
-                "mode gates eligibility and never weights a claim: a mode does not grant trust",
-                "corroboration groups are counted once; repetition is not evidence"
-              ]
+              "id": "kip:memory-default"
             }
           ]
         }
       },
       {
-        "name": "and DESCRIBE answers about one in exactly the same shape",
-        "command": "DESCRIBE EPISTEMIC POLICY \"kip:policy:forecast\"",
+        "name": "the standard memory policy can be described without engine-specific thresholds",
+        "command": "DESCRIBE EPISTEMIC POLICY \"kip:memory-default\"",
         "expect": {
-          "result": {
-            "id": "kip:policy:forecast",
-            "version": 2,
-            "eligible_modes": [
-              "predicted",
-              "inferred"
-            ],
-            "accept_threshold": 0.7,
-            "material_threshold": 0.3,
-            "unstated_confidence_weight": 0.5,
-            "conflict_set_expansion": true,
-            "notes": [
-              "mode gates eligibility and never weights a claim: a mode does not grant trust",
-              "corroboration groups are counted once; repetition is not evidence"
-            ]
+          "result_contains": {
+            "id": "kip:memory-default"
           }
         }
       }
@@ -2072,7 +2172,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "mutation-selection",
     "description": "A mutation may choose what it acts on. The judgement calls an engine has to make here are what this fixture pins down: UPDATE reaches mutable state and nothing else, a bounded sweep takes a documented order, a selection block reads the transaction's starting state, and a merge consolidates identity without copying or erasing anything.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?e1 { TYPE \"Experience\" NAME \"First\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.8, salience: 0.5} }\n  CREATE CONCEPT ?e2 { TYPE \"Experience\" NAME \"Second\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"failure\"} SET FACET \"MnemonicState\" {memory_strength: 0.4, salience: 0.5} }\n  CREATE CONCEPT ?e3 { TYPE \"Experience\" NAME \"Third\" SET ATTRIBUTES {goal: \"rest\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.2, salience: 0.5} }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  CREATE CONCEPT ?e1 { TYPE \"Experience\" NAME \"First\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.8, salience: 0.5} }\n  CREATE CONCEPT ?e2 { TYPE \"Experience\" NAME \"Second\" SET ATTRIBUTES {goal: \"learn\", outcome_status: \"failure\"} SET FACET \"MnemonicState\" {memory_strength: 0.4, salience: 0.5} }\n  CREATE CONCEPT ?e3 { TYPE \"Experience\" NAME \"Third\" SET ATTRIBUTES {goal: \"rest\", outcome_status: \"success\"} SET FACET \"MnemonicState\" {memory_strength: 0.2, salience: 0.5} }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
     "cases": [
       {
@@ -2173,7 +2273,7 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "so another type may carry the same key, and it is a second identity",
-        "command": "UPSERT CONCEPT ?b { MATCH {type: \"Preference\", key: \"shared:label\"} SET FIELDS {name: \"A preference\"} }",
+        "command": "UPSERT CONCEPT ?b { MATCH {type: \"Option\", key: \"shared:label\"} SET FIELDS {name: \"A preference\"} }",
         "expect": {}
       },
       {
@@ -2273,13 +2373,30 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "query-scope-contracts",
     "description": "KIP 2.0 §§42.4–45: correlated scopes, independent union, complete-solution identity, null logic and empty aggregates, exercised identically by both engines.",
     "setup": [
-      "MUTATE { CREATE CONCEPT ?alice {TYPE \"Person\" NAME \"Alice\"} CREATE CONCEPT ?bob {TYPE \"Person\" NAME \"Bob\"} CREATE CONCEPT ?tea {TYPE \"Preference\" NAME \"Tea\"} CREATE CONCEPT ?coffee {TYPE \"Preference\" NAME \"Coffee\"} ENSURE PROPOSITION ?t (?alice,\"prefers\",?tea) ENSURE PROPOSITION ?c (?alice,\"prefers\",?coffee) }"
+      "MUTATE { CREATE CONCEPT ?alice {TYPE \"Person\" NAME \"Alice\"} CREATE CONCEPT ?bob {TYPE \"Person\" NAME \"Bob\"} CREATE CONCEPT ?tea {TYPE \"Option\" NAME \"Tea\"} CREATE CONCEPT ?coffee {TYPE \"Option\" NAME \"Coffee\"} ENSURE PROPOSITION ?t (?alice,\"prefers\",?tea) ENSURE PROPOSITION ?c (?alice,\"prefers\",?coffee) }"
     ],
     "cases": [
       {
@@ -2500,13 +2617,30 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "reads",
     "description": "The read language: joins on shared variables, OPTIONAL pads rather than drops, NOT asks about the record and never about the world, typed comparison, nulls last, deterministic paging.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET ATTRIBUTES { display_name: \"Alice A\" } }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET ATTRIBUTES { display_name: \"Alice A\" } }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
     ],
     "cases": [
       {
@@ -2714,13 +2848,30 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "request-envelope",
     "description": "Two things the envelope decides rather than the command (§71, §26, §33). `ingest` mints Evidence from the payload the transport carried, so the observation never passes through model-generated command text — the fidelity risk §88.12 names, where a model retyping what it saw truncates or paraphrases it and the record then says the source said something it did not. `execution.idempotency_key` makes a lost response recoverable: a timeout is not an abort, so a resend replays the outcome the first attempt produced rather than writing a second time. Both are envelope contracts, so both are pinned through the envelope. `requires` is the third: §67.4 fixes the capability names, so a fail-fast precondition written once must get the same answer from either engine — including for an entry whose value is a detail object rather than a bare `true`, and for a name no registry knows, which fails exactly as an unsupported one does. And an `ingest` block is minted inside the request's transaction, so a request that carries only reads opens no scope to mint into: refused, because minting nothing while answering `succeeded` leaves the caller believing the observation was recorded. And `extensions` is the fourth: a block marked `critical` is a precondition the runtime must honor or refuse, never one it may silently drop.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {canonical_id: \"urn:x:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {canonical_id: \"urn:x:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n}"
     ],
     "cases": [
       {
@@ -3074,13 +3225,30 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
     "name": "retention",
     "description": "`SET RETENTION` writes storage lifecycle and nothing else (§19). The judgement calls pinned here are the ones an engine gets to make wrong quietly: the block replaces rather than patches, a member outside §19.1's shape is refused rather than stored and lost, and a lapsed `expires_at` changes what a sweep may collect without changing what recall returns — retention says how long the record is kept, never whether the claim still holds.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n}"
     ],
     "cases": [
       {
@@ -3210,6 +3378,23 @@ export const FIXTURES: readonly Fixture[] = [
               "short"
             ]
           ]
+        }
+      }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
         }
       }
     ]
@@ -3624,10 +3809,25 @@ export const FIXTURES: readonly Fixture[] = [
             }
           }
         }
+      },
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
       }
     ],
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  CREATE CONCEPT ?note { TYPE \"Note\" NAME \"A note\" }\n  CREATE CONCEPT ?citing {\n    TYPE \"Note\"\n    NAME \"Citing note\"\n    SET STRUCTURAL { (\"evidence\", ?note) }\n  }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n  CREATE ACTIVITY ?run {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?alice)\n      (\"outputs\", ?dark)\n      (\"associated_actors\", ?alice)\n      (\"reviewed\", ?note)\n    }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  CREATE CONCEPT ?note { TYPE \"Note\" NAME \"A note\" }\n  CREATE CONCEPT ?citing {\n    TYPE \"Note\"\n    NAME \"Citing note\"\n    SET STRUCTURAL { (\"evidence\", ?note) }\n  }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS {\n      evidence_class: \"user_statement\",\n      payload: \"I prefer dark mode.\",\n      content_digest: \"sha3-256:d1ge5t\",\n      media_type: \"text/plain\",\n      observed_at: \"2026-08-16T09:00:00.000Z\"\n    }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) {role: \"support\"} }\n  }\n  CREATE ACTIVITY ?run {\n    SET FIELDS {activity_class: \"semantic_consolidation\", status: \"completed\"}\n    SET STRUCTURAL {\n      (\"inputs\", ?alice)\n      (\"outputs\", ?dark)\n      (\"associated_actors\", ?alice)\n      (\"reviewed\", ?note)\n    }\n  }\n}"
     ],
     "cases": [
       {
@@ -4331,7 +4531,7 @@ export const FIXTURES: readonly Fixture[] = [
     "name": "transactions",
     "description": "A MUTATE block is one transaction, not a script that happens to run in order: everything in it commits or none of it does. A precondition that fails leaves the element exactly as the caller last saw it. EXPECT VERSION is the one guard, and it is always the trailing clause (Spec §52.8); there is no EXPECT STATE — TRANSITION validates the target's current lifecycle state itself and fails InvalidLifecycleTransition from the wrong one (§35.3, §52.5), while a move to the state already held is a no_effect rather than an error.",
     "setup": [
-      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" SET FIELDS {key: \"person:alice\"} }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n  }\n}"
     ],
     "cases": [
       {
@@ -4513,6 +4713,23 @@ export const FIXTURES: readonly Fixture[] = [
           ]
         }
       }
+    ],
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/options",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Option": {
+              "kind": "ConceptType",
+              "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+            }
+          }
+        }
+      }
     ]
   },
   {
@@ -4591,8 +4808,437 @@ export const FIXTURES: readonly Fixture[] = [
         }
       }
     ]
+  },
+  {
+    "name": "world-time",
+    "status": "pending_engine",
+    "description": "This revision's memory behavior, written before an engine implements it (Specification Status: a case may enter marked pending_engine; the release requires every case verified). Temporal succession (§25.4): a world change is one Assertion, the old value answers for its time, nothing is superseded; a claim with no stated start is indeterminate before it was made (§25.2); time bounds are three-valued (§25.5); functional_by partitions preferences by option kind (§20.15); kip:memory-default decides by context specificity, first-person testimony and recency, and discloses the rule (§21.13); two inferences without a written start never succeed one another; DEFINE adds to the draft vocabulary (§20.16); the Search Pattern is bounded and never inside NOT (§43.8).",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/world-time",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "concept_types": {
+            "Place": {
+              "kind": "ConceptType",
+              "description": "A place."
+            },
+            "ColorScheme": {
+              "kind": "ConceptType",
+              "description": "A color scheme: one kind of preference option."
+            },
+            "Editor": {
+              "kind": "ConceptType",
+              "description": "An editor: another kind of preference option."
+            }
+          },
+          "predicates": {
+            "lives_in": {
+              "kind": "PredicateType",
+              "description": "Primary residence; one at a time.",
+              "functional": true
+            },
+            "located_in": {
+              "kind": "PredicateType",
+              "description": "The smaller place lies within the larger.",
+              "functional": true
+            },
+            "timezone": {
+              "kind": "PredicateType",
+              "description": "Current timezone as a UTC offset string.",
+              "functional": true
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?bob { TYPE \"Person\" NAME \"Bob\" }\n  CREATE CONCEPT ?carol { TYPE \"Person\" NAME \"Carol\" }\n  CREATE CONCEPT ?dave { TYPE \"Person\" NAME \"Dave\" }\n  CREATE CONCEPT ?sensor { TYPE \"Person\" NAME \"Sensor\" }\n  CREATE CONCEPT ?brain { TYPE \"Person\" NAME \"Brain\" }\n  CREATE CONCEPT ?beijing { TYPE \"Place\" NAME \"Beijing\" }\n  CREATE CONCEPT ?shanghai { TYPE \"Place\" NAME \"Shanghai\" }\n  CREATE CONCEPT ?berlin { TYPE \"Place\" NAME \"Berlin\" }\n  CREATE CONCEPT ?austin { TYPE \"Place\" NAME \"Austin\" }\n  CREATE CONCEPT ?dallas { TYPE \"Place\" NAME \"Dallas\" }\n  CREATE CONCEPT ?campus { TYPE \"Place\" NAME \"Acme campus\" }\n  CREATE CONCEPT ?dark { TYPE \"ColorScheme\" NAME \"Dark\" }\n  CREATE CONCEPT ?light { TYPE \"ColorScheme\" NAME \"Light\" }\n  CREATE CONCEPT ?vim { TYPE \"Editor\" NAME \"Vim\" }\n  ENSURE PROPOSITION ?p_bj (?alice, \"lives_in\", ?beijing)\n  ENSURE PROPOSITION ?p_sh (?alice, \"lives_in\", ?shanghai)\n  ENSURE PROPOSITION ?p_be (?carol, \"lives_in\", ?berlin)\n  ENSURE PROPOSITION ?p_dark (?alice, \"prefers\", ?dark)\n  ENSURE PROPOSITION ?p_light (?alice, \"prefers\", ?light)\n  ENSURE PROPOSITION ?p_vim (?alice, \"prefers\", ?vim)\n  ENSURE PROPOSITION ?p_tz8 (?alice, \"timezone\", \"+08:00\")\n  ENSURE PROPOSITION ?p_tz9 (?alice, \"timezone\", \"+09:00\")\n  ENSURE PROPOSITION ?p_d1 (?dave, \"timezone\", \"+01:00\")\n  ENSURE PROPOSITION ?p_d2 (?dave, \"timezone\", \"+02:00\")\n  ENSURE PROPOSITION ?p_au (?campus, \"located_in\", ?austin)\n  ENSURE PROPOSITION ?p_da (?campus, \"located_in\", ?dallas)\n  CREATE ASSERTION ?a1 { SET FIELDS { proposition: ?p_bj, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-10T00:00:00.000Z\" } }\n  CREATE ASSERTION ?a2 { SET FIELDS { proposition: ?p_sh, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-09-10T00:00:00.000Z\", valid_time: { from: \"2026-09-01T00:00:00.000Z\" } } }\n  CREATE ASSERTION ?a3 { SET FIELDS { proposition: ?p_be, asserted_by: ?carol, stance: \"support\", mode: \"stated\", asserted_at: \"2026-03-01T00:00:00.000Z\", valid_time: { from: { earliest: \"2026-01-01T00:00:00.000Z\", latest: \"2026-12-31T23:59:59.999Z\" } } } }\n  CREATE ASSERTION ?a4 { SET FIELDS { proposition: ?p_dark, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-01T00:00:00.000Z\", valid_time: { from: \"2026-01-01T00:00:00.000Z\" } } }\n  CREATE ASSERTION ?a5 { SET FIELDS { proposition: ?p_light, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-09-01T00:00:00.000Z\", valid_time: { from: \"2026-09-01T00:00:00.000Z\" } } }\n  CREATE ASSERTION ?a6 { SET FIELDS { proposition: ?p_vim, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-02-01T00:00:00.000Z\", valid_time: { from: \"2026-02-01T00:00:00.000Z\" } } }\n  CREATE ASSERTION ?a7 { SET FIELDS { proposition: ?p_tz8, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-01T00:00:00.000Z\" } }\n  CREATE ASSERTION ?a8 { SET FIELDS { proposition: ?p_tz9, asserted_by: ?bob, stance: \"support\", mode: \"stated\", asserted_at: \"2026-09-01T00:00:00.000Z\" } }\n  CREATE ASSERTION ?a9 { SET FIELDS { proposition: ?p_d1, asserted_by: ?dave, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-01T00:00:00.000Z\" } }\n  CREATE ASSERTION ?a10 { SET FIELDS { proposition: ?p_d2, asserted_by: ?sensor, stance: \"support\", mode: \"observed\", asserted_at: \"2026-09-05T00:00:00.000Z\" } }\n  CREATE EVIDENCE ?source_austin { SET FIELDS { evidence_class: \"document\", payload: \"Acme campus is in Austin\", observed_at: \"2026-01-10T00:00:00.000Z\" } }\n  CREATE EVIDENCE ?source_dallas { SET FIELDS { evidence_class: \"document\", payload: \"Acme campus is in Dallas\", observed_at: \"2026-09-10T00:00:00.000Z\" } }\n}",
+      {
+        "command": "FIND(?campus.id, ?austin.id, ?dallas.id, ?brain.id, ?e1.id, ?e1._system.version, ?e2.id, ?e2._system.version, ?b.basis)\nWHERE {\n  ?campus CONCEPT {name: \"Acme campus\"}\n  ?austin CONCEPT {name: \"Austin\"}\n  ?dallas CONCEPT {name: \"Dallas\"}\n  ?brain CONCEPT {name: \"Brain\"}\n  ?e1 EVIDENCE {observed_at: \"2026-01-10T00:00:00.000Z\"}\n  ?e2 EVIDENCE {observed_at: \"2026-09-10T00:00:00.000Z\"}\n  ?b BELIEF (?campus, \"located_in\", ?austin)\n}\nFOR TIME \"2026-09-20T00:00:00.000Z\"\nWITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "capture": {
+          "campus": "/0/0",
+          "austin": "/0/1",
+          "dallas": "/0/2",
+          "brain": "/0/3",
+          "source_austin": "/0/4",
+          "source_austin_version": "/0/5",
+          "source_dallas": "/0/6",
+          "source_dallas_version": "/0/7",
+          "inference_basis": "/0/8",
+          "inference_seq": "/0/8/snapshot_seq"
+        }
+      },
+      "MUTATE {\n  ASSERT ?inference_austin (:campus, \"located_in\", :austin) {\n    by: :brain, mode: \"inferred\", at: \"2026-01-10T00:00:00.000Z\", evidence: :source_austin\n  }\n  ASSERT ?inference_dallas (:campus, \"located_in\", :dallas) {\n    by: :brain, mode: \"inferred\", at: \"2026-09-10T00:00:00.000Z\", evidence: :source_dallas\n  }\n  CREATE ACTIVITY ?derive_austin {\n    SET FIELDS {activity_class: \"extraction\", status: \"completed\"}\n    SET FACET \"DependencyBasis\" {\n      basis_seq: :inference_seq,\n      groups: [{role: \"all_of\", pins: [{id: :source_austin, version: :source_austin_version}]}],\n      policy_basis: :inference_basis\n    }\n    SET STRUCTURAL { (\"inputs\", :source_austin) (\"outputs\", ?inference_austin) }\n  }\n  CREATE ACTIVITY ?derive_dallas {\n    SET FIELDS {activity_class: \"extraction\", status: \"completed\"}\n    SET FACET \"DependencyBasis\" {\n      basis_seq: :inference_seq,\n      groups: [{role: \"all_of\", pins: [{id: :source_dallas, version: :source_dallas_version}]}],\n      policy_basis: :inference_basis\n    }\n    SET STRUCTURAL { (\"inputs\", :source_dallas) (\"outputs\", ?inference_dallas) }\n  }\n}",
+      {
+        "command": "FIND(?alice.id, ?a.id) WHERE { ?alice CONCEPT {name: \"Alice\"} ?p PROPOSITION (?alice, \"timezone\", \"+08:00\") ?a ASSERTION {proposition: ?p} }",
+        "capture": {
+          "alice": "/0/0",
+          "old_timezone_assertion": "/0/1"
+        }
+      }
+    ],
+    "cases": [
+      {
+        "name": "a world change is one Assertion: the new value holds from its start",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Shanghai\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "the succeeded value is outside its effective interval after the change",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Beijing\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "insufficient"
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "the succeeded value still answers for its time",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Beijing\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-06-01T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "and the successor is not yet valid then",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Shanghai\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-06-01T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "insufficient"
+          ]
+        },
+        "vectors": [
+          "EPI-031"
+        ]
+      },
+      {
+        "name": "nothing was superseded or retracted",
+        "command": "FIND(?a.lifecycle.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Beijing\"} ?p PROPOSITION (?s, \"lives_in\", ?o) ?a ASSERTION {proposition: ?p} }",
+        "expect": {
+          "result": [
+            "active"
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "a claim with no stated start is indeterminate before it was made",
+        "command": "FIND(?b.status, ?b.uncertainty.reasons) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Beijing\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-01-05T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            [
+              "uncertain",
+              [
+                "temporal_indeterminate"
+              ]
+            ]
+          ]
+        },
+        "vectors": [
+          "EPI-032",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "a coarse start is indeterminate inside its range",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Carol\"} ?o CONCEPT {name: \"Berlin\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2026-06-01T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "uncertain"
+          ]
+        },
+        "vectors": [
+          "EPI-032",
+          "MEM-027"
+        ]
+      },
+      {
+        "name": "and certain after it",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Carol\"} ?o CONCEPT {name: \"Berlin\"} ?b BELIEF (?s, \"lives_in\", ?o) } FOR TIME \"2027-01-01T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-032",
+          "MEM-027"
+        ]
+      },
+      {
+        "name": "functional_by: the newer preference of one kind succeeds the older",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Dark\"} ?b BELIEF (?s, \"prefers\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "insufficient"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-021",
+          "MEM-028"
+        ]
+      },
+      {
+        "name": "the newer preference is accepted",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Light\"} ?b BELIEF (?s, \"prefers\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-021",
+          "MEM-028"
+        ]
+      },
+      {
+        "name": "a preference of another kind coexists",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?o CONCEPT {name: \"Vim\"} ?b BELIEF (?s, \"prefers\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-021",
+          "MEM-028"
+        ]
+      },
+      {
+        "name": "memory-default: the subject's own statement outranks hearsay",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Alice\"} ?b BELIEF (?s, \"timezone\", \"+08:00\") } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-033",
+          "MEM-029"
+        ]
+      },
+      {
+        "name": "the outranked hearsay is uncertain and names the rule",
+        "command": "FIND(?b.status, ?b.uncertainty.reasons, ?b.precedence.rule) WHERE { ?s CONCEPT {name: \"Alice\"} ?b BELIEF (?s, \"timezone\", \"+09:00\") } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            [
+              "uncertain",
+              [
+                "outranked"
+              ],
+              "first_person_testimony"
+            ]
+          ]
+        },
+        "vectors": [
+          "EPI-033",
+          "MEM-029"
+        ]
+      },
+      {
+        "name": "memory-default: a newer observation prevails over older testimony by recency",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Dave\"} ?b BELIEF (?s, \"timezone\", \"+02:00\") } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-033",
+          "MEM-029"
+        ]
+      },
+      {
+        "name": "the older testimony is outranked by recency, never rejected",
+        "command": "FIND(?b.status, ?b.uncertainty.reasons, ?b.precedence.rule) WHERE { ?s CONCEPT {name: \"Dave\"} ?b BELIEF (?s, \"timezone\", \"+01:00\") } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            [
+              "uncertain",
+              [
+                "outranked"
+              ],
+              "recency"
+            ]
+          ]
+        },
+        "vectors": [
+          "EPI-033",
+          "MEM-029"
+        ]
+      },
+      {
+        "name": "two inferences never succeed one another: the older is still eligible and outranked, not expired",
+        "command": "FIND(?b.status, ?b.uncertainty.reasons, ?b.precedence.rule) WHERE { ?s CONCEPT {name: \"Acme campus\"} ?o CONCEPT {name: \"Austin\"} ?b BELIEF (?s, \"located_in\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            [
+              "uncertain",
+              [
+                "outranked"
+              ],
+              "recency"
+            ]
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "the newer inference prevails by recency, not by an invented world change",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Acme campus\"} ?o CONCEPT {name: \"Dallas\"} ?b BELIEF (?s, \"located_in\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "EPI-031",
+          "MEM-026"
+        ]
+      },
+      {
+        "name": "DEFINE adds a Predicate to the draft vocabulary",
+        "command": "DEFINE PREDICATE \"mentors\" {\n  description: \"The subject mentors the object.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Person\"]}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {},
+        "vectors": [
+          "SCHEMA-022",
+          "GOV-031"
+        ]
+      },
+      {
+        "name": "the draft symbol resolves for the next operation",
+        "command": "FIND(?p) WHERE { ?p (?x, \"mentors\", ?y) }",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result": []
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a name that already resolves fails SchemaSymbolConflict",
+        "command": "DEFINE PREDICATE \"prefers\" {\n  description: \"already a Profile Predicate\"\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "SchemaSymbolConflict"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Predicate cannot claim a closed world",
+        "command": "DEFINE PREDICATE \"closed_relation\" {\n  description: \"authority over the data belongs to installed packages\",\n  open_world: false\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a Search Pattern binds hits with a bounded candidate set",
+        "command": "FIND(?x.name) WHERE { ?x SEARCH CONCEPT \"Alice\" WITH TYPE \"Person\" MODE \"keyword\" LIMIT 5 }",
+        "expect": {
+          "result": [
+            "Alice"
+          ]
+        },
+        "vectors": [
+          "KQL-032"
+        ]
+      },
+      {
+        "name": "a Search Pattern requires LIMIT",
+        "command": "FIND(?x) WHERE { ?x SEARCH CONCEPT \"Alice\" }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "KQL-032"
+        ]
+      },
+      {
+        "name": "a Search Pattern never proves absence",
+        "command": "FIND(?x) WHERE { ?x CONCEPT {name: \"Alice\"} NOT { ?y SEARCH CONCEPT \"Bob\" LIMIT 5 } }",
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "KQL-033"
+        ]
+      },
+      {
+        "name": "a value-only correction keeps the original world interval and the correction time",
+        "command": "MUTATE {\n  CREATE EVIDENCE ?correction_source {\n    SET FIELDS {evidence_class: \"user_statement\", payload: \"I meant +07:00, not +08:00\", observed_at: \"2026-09-21T00:00:00.000Z\"}\n  }\n  ASSERT (:alice, \"timezone\", \"+07:00\") {\n    by: :alice, mode: \"stated\", at: \"2026-09-21T00:00:00.000Z\", evidence: ?correction_source,\n    valid: {from: {latest: \"2026-01-01T00:00:00.000Z\"}}\n  } SUPERSEDING :old_timezone_assertion\n}",
+        "expect": {},
+        "vectors": [
+          "KML-017"
+        ]
+      },
+      {
+        "name": "the corrected value answers before the correction was stated",
+        "command": "FIND(?b.status) WHERE { ?alice CONCEPT {name: \"Alice\"} ?b BELIEF (?alice, \"timezone\", \"+07:00\") } FOR TIME \"2026-06-01T00:00:00.000Z\" WITH EPISTEMIC {policy: \"kip:memory-default\"}",
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "KML-017"
+        ]
+      }
+    ]
   }
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 362
+export const CASE_COUNT = 388

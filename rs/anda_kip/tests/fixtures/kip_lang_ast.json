@@ -1,5 +1,5 @@
 {
- "source": "@ldclabs/kip-lang 2.2.0 — lower(parse(command).ast)",
+ "source": "@ldclabs/kip-lang 2.4.0 — lower(parse(command).ast)",
  "note": "Regenerate with tests/fixtures/README.md; every entry must decode to the same anda_kip AST.",
  "cases": [
   {
@@ -2703,11 +2703,11 @@
    }
   },
   {
-   "command": "SEARCH COGNITION :term",
+   "command": "SEARCH ACTIVITY :term",
    "ast": {
     "Meta": {
      "Search": {
-      "target": "Cognition",
+      "target": "Activity",
       "term": {
        "Param": "term"
       },
@@ -3561,6 +3561,342 @@
           "plane": "Attributes"
          }
         ]
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "DEFINE PREDICATE \"mentors\" {\n  description: \"The subject mentors the object.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Person\"]},\n  functional: true\n}",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Define": {
+        "kind": "Predicate",
+        "name": {
+         "Name": "mentors"
+        },
+        "definition": {
+         "description": {
+          "Value": {
+           "String": "The subject mentors the object."
+          }
+         },
+         "subject": {
+          "Value": {
+           "Object": {
+            "concept_types": {
+             "Array": [
+              {
+               "String": "Person"
+              }
+             ]
+            }
+           }
+          }
+         },
+         "object": {
+          "Value": {
+           "Object": {
+            "concept_types": {
+             "Array": [
+              {
+               "String": "Person"
+              }
+             ]
+            }
+           }
+          }
+         },
+         "functional": {
+          "Value": {
+           "Bool": true
+          }
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "DEFINE CONCEPT TYPE \"Instrument\" { description: \"A musical instrument.\", attributes: { family: { type: \"string\" } } }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "Define": {
+        "kind": "ConceptType",
+        "name": {
+         "Name": "Instrument"
+        },
+        "definition": {
+         "description": {
+          "Value": {
+           "String": "A musical instrument."
+          }
+         },
+         "attributes": {
+          "Value": {
+           "Object": {
+            "family": {
+             "Object": {
+              "type": {
+               "String": "string"
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "command": "FIND(?x.name, ?x.retrieval.score) WHERE { ?x SEARCH CONCEPT \"Alice\" WITH TYPE \"Person\" MODE \"keyword\" THRESHOLD 0.2 LIMIT 5 ?b BELIEF (?x, \"lives_in\", ?city) }",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "x",
+         "path": [
+          {
+           "Field": "name"
+          }
+         ]
+        }
+       },
+       {
+        "Variable": {
+         "var": "x",
+         "path": [
+          {
+           "Field": "retrieval"
+          },
+          {
+           "Field": "score"
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Search": {
+        "variable": "x",
+        "target": "Concept",
+        "term": {
+         "Literal": {
+          "String": "Alice"
+         }
+        },
+        "with_type": {
+         "Literal": {
+          "String": "Person"
+         }
+        },
+        "with_predicate": null,
+        "mode": {
+         "Literal": {
+          "String": "keyword"
+         }
+        },
+        "threshold": {
+         "Literal": {
+          "Number": 0.2
+         }
+        },
+        "limit": {
+         "Literal": {
+          "Number": 5
+         }
+        }
+       }
+      },
+      {
+       "Belief": {
+        "variable": "b",
+        "target": {
+         "Tuple": {
+          "subject": {
+           "Variable": "x"
+          },
+          "predicate": {
+           "Atom": {
+            "Literal": "lives_in"
+           }
+          },
+          "object": {
+           "Variable": "city"
+          }
+         }
+        }
+       }
+      }
+     ],
+     "as_of": null,
+     "for_time": null,
+     "epistemic": null,
+     "order_by": null,
+     "limit": null,
+     "cursor": null
+    }
+   }
+  },
+  {
+   "command": "FIND(?a) WHERE { ?a SEARCH ASSERTION :term WITH PREDICATE \"prefers\" LIMIT :k }",
+   "ast": {
+    "Kql": {
+     "find_clause": {
+      "expressions": [
+       {
+        "Variable": {
+         "var": "a",
+         "path": []
+        }
+       }
+      ]
+     },
+     "where_clauses": [
+      {
+       "Search": {
+        "variable": "a",
+        "target": "Assertion",
+        "term": {
+         "Param": "term"
+        },
+        "with_type": null,
+        "with_predicate": {
+         "Literal": {
+          "String": "prefers"
+         }
+        },
+        "mode": null,
+        "threshold": null,
+        "limit": {
+         "Param": "k"
+        }
+       }
+      }
+     ],
+     "as_of": null,
+     "for_time": null,
+     "epistemic": null,
+     "order_by": null,
+     "limit": null,
+     "cursor": null
+    }
+   }
+  },
+  {
+   "command": "ASSERT (:alice, \"prefers\", :dark) { by: :alice, mode: \"stated\", context: [:work, :night], at: \"2026-01-01T00:00:00.000Z\", valid: {from: {earliest: \"2025-01-01T00:00:00.000Z\", latest: \"2025-12-31T23:59:59.999Z\"}} }",
+   "ast": {
+    "Kml": {
+     "explicit_transaction": false,
+     "clauses": [
+      {
+       "EnsureProposition": {
+        "handle": "#assert0#proposition",
+        "subject": {
+         "Param": "alice"
+        },
+        "predicate": {
+         "Literal": "prefers"
+        },
+        "object": {
+         "Param": "dark"
+        },
+        "expect_versions": []
+       }
+      },
+      {
+       "CreateAssertion": {
+        "handle": "#assert0",
+        "client_key": null,
+        "set_fields": [
+         [
+          "proposition",
+          {
+           "Handle": "#assert0#proposition"
+          }
+         ],
+         [
+          "asserted_by",
+          {
+           "Param": "alice"
+          }
+         ],
+         [
+          "mode",
+          {
+           "Value": {
+            "String": "stated"
+           }
+          }
+         ],
+         [
+          "stance",
+          {
+           "Value": {
+            "String": "support"
+           }
+          }
+         ],
+         [
+          "asserted_at",
+          {
+           "Value": {
+            "String": "2026-01-01T00:00:00.000Z"
+           }
+          }
+         ],
+         [
+          "valid_time",
+          {
+           "Value": {
+            "Object": {
+             "from": {
+              "Object": {
+               "earliest": {
+                "String": "2025-01-01T00:00:00.000Z"
+               },
+               "latest": {
+                "String": "2025-12-31T23:59:59.999Z"
+               }
+              }
+             }
+            }
+           }
+          }
+         ],
+         [
+          "context_refs",
+          {
+           "Array": [
+            {
+             "Param": "work"
+            },
+            {
+             "Param": "night"
+            }
+           ]
+          }
+         ]
+        ],
+        "set_facets": [],
+        "set_structural": null
        }
       }
      ]

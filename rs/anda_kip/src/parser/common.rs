@@ -29,8 +29,8 @@ use super::json::{identifier as json_identifier, parse_number, skip_ws_and_comme
 use crate::ast::{
     Assignments, BoundObject, BoundValue, DotPathVar, ElementRef, FilterExpression, FilterFunction,
     FilterOperand, HopRange, KipValue, MatchValue, MutationValue, Number, ObjectMatcher, PathStep,
-    PredAtom, PredPathAtom, PredTerm, PropositionMatcher, PropositionTriple, Scalar, SymbolRef,
-    Term, UpdateExpr, UpdateFunction, WhereClause,
+    PredAtom, PredPathAtom, PredTerm, PropositionMatcher, PropositionTriple, Scalar, SearchPattern,
+    SearchTarget, SymbolRef, Term, UpdateExpr, UpdateFunction, WhereClause,
 };
 
 pub(crate) use super::json::{quoted_string, ws};
@@ -1088,6 +1088,17 @@ fn variable_led_clause(input: &str, flavor: Flavor) -> VResult<'_, WhereClause> 
             },
         ));
     }
+    if let Ok((rest, _)) = ws(word("SEARCH")).parse(rest) {
+        if flavor != Flavor::Kql {
+            return fail(
+                input,
+                "an exact pattern: a Search Pattern is approximate and cannot select mutation or \
+                 export targets",
+            );
+        }
+        let (rest, pattern) = cut(|i| search_pattern(i, var.clone())).parse(rest)?;
+        return Ok((rest, WhereClause::Search(pattern)));
+    }
     if let Ok((rest, _)) = ws(word("BELIEF")).parse(rest) {
         if flavor != Flavor::Kql {
             return fail(
@@ -1152,6 +1163,64 @@ fn variable_led_clause(input: &str, flavor: Flavor) -> VResult<'_, WhereClause> 
         WhereClause::Proposition {
             variable: Some(var),
             matcher,
+        },
+    ))
+}
+
+/// The kind word after `SEARCH`, shared by the META statement and the pattern.
+pub(crate) fn search_target(input: &str) -> VResult<'_, SearchTarget> {
+    ws(alt((
+        value(SearchTarget::Concept, word("CONCEPT")),
+        value(SearchTarget::Proposition, word("PROPOSITION")),
+        value(SearchTarget::Assertion, word("ASSERTION")),
+        value(SearchTarget::Evidence, word("EVIDENCE")),
+        value(SearchTarget::Activity, word("ACTIVITY")),
+    )))
+    .parse(input)
+}
+
+/// `WITH TYPE`, `WITH PREDICATE`, `MODE`, `THRESHOLD`, in grammar order.
+pub(crate) type SearchModifiers = (
+    Option<Scalar>,
+    Option<Scalar>,
+    Option<Scalar>,
+    Option<Scalar>,
+);
+
+/// The optional modifiers shared by the META `SEARCH` and the Search Pattern.
+pub(crate) fn search_modifiers(input: &str) -> VResult<'_, SearchModifiers> {
+    let (input, with_type) = opt_after(&["WITH", "TYPE"], ws(scalar)).parse(input)?;
+    let (input, with_predicate) = opt_after(&["WITH", "PREDICATE"], ws(scalar)).parse(input)?;
+    let (input, mode) = opt_after(&["MODE"], ws(scalar)).parse(input)?;
+    let (input, threshold) = opt_after(&["THRESHOLD"], ws(scalar)).parse(input)?;
+    Ok((input, (with_type, with_predicate, mode, threshold)))
+}
+
+/// `?x SEARCH <KIND> <term> [modifiers] LIMIT <k>` after the `SEARCH` word
+/// (Spec §43.8). The LIMIT bounds the candidate set and is required; the
+/// pattern takes no CURSOR and no AS OF, which belong to the enclosing FIND.
+fn search_pattern(input: &str, variable: String) -> VResult<'_, SearchPattern> {
+    let (input, target) = search_target(input)?;
+    let (input, term) = ws(scalar).parse(input)?;
+    let (input, (with_type, with_predicate, mode, threshold)) = search_modifiers(input)?;
+    let Ok((input, _)) = ws(word("LIMIT")).parse(input) else {
+        return fail(
+            input,
+            "LIMIT: a Search Pattern requires LIMIT, which bounds the candidate set",
+        );
+    };
+    let (input, limit) = ws(scalar).parse(input)?;
+    Ok((
+        input,
+        SearchPattern {
+            variable,
+            target,
+            term,
+            with_type,
+            with_predicate,
+            mode,
+            threshold,
+            limit,
         },
     ))
 }
@@ -1250,6 +1319,9 @@ pub(crate) fn collect_where_variables(clauses: &[WhereClause], out: &mut BTreeSe
                         collect_triple_variables(triple, out)
                     }
                 }
+            }
+            WhereClause::Search(pattern) => {
+                out.insert(pattern.variable.clone());
             }
             WhereClause::BeliefSlot {
                 variable,

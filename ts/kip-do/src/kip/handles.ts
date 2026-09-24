@@ -44,7 +44,7 @@ function where(clauses: WhereClause[], names: Set<string>): void {
       if (clause.Structural.variable !== null) names.add(clause.Structural.variable)
       term(clause.Structural.subject, names); term(clause.Structural.object, names)
     }
-    // BELIEF never reaches a mutation WHERE.
+    // BELIEF and a Search Pattern never reach a mutation WHERE (§43.8).
   }
 }
 function bound(value: BoundValue | MutationValue, names: Set<string>): void {

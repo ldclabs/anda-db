@@ -72,7 +72,7 @@ async fn installing_a_package_does_not_activate_it() {
     let package_ref = store.install_package(&profile, "test").await.unwrap();
     assert_eq!(
         package_ref.to_string(),
-        "kip://profiles/cognitive-memory@2.1.0"
+        "kip://profiles/cognitive-memory@2.0.0"
     );
 
     // Installed, and inert: the Space still resolves only Core.
@@ -85,7 +85,7 @@ async fn installing_a_package_does_not_activate_it() {
     );
 
     let after = store
-        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.1.0", PackageState::Active)]))
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     assert_eq!(after.version, 1);
@@ -94,7 +94,7 @@ async fn installing_a_package_does_not_activate_it() {
             .resolve_symbol(SymbolKind::ConceptType, "Person", Intent::Write)
             .unwrap()
             .to_string(),
-        "kip://profiles/cognitive-memory@2.1.0/Person"
+        "kip://profiles/cognitive-memory@2.0.0/Person"
     );
 
     // And the Space now reports it as current.
@@ -237,7 +237,7 @@ async fn a_published_version_cannot_be_replaced_with_different_content() {
     // The original content survived the attempt.
     let installed = store.installed_packages().await.unwrap();
     assert!(
-        installed["kip://profiles/cognitive-memory@2.1.0"]
+        installed["kip://profiles/cognitive-memory@2.0.0"]
             .defines(SymbolKind::ConceptType, "Person")
     );
 }
@@ -257,14 +257,14 @@ async fn a_historical_environment_version_stays_reconstructible() {
         .unwrap();
 
     store
-        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.1.0", PackageState::Active)]))
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     store
         .activate_schema(
             SPACE,
             lock(&[
-                (PROFILE_ID, "2.1.0", PackageState::Active),
+                (PROFILE_ID, "2.0.0", PackageState::Active),
                 ("kip://acme/hr", "1.0.0", PackageState::Active),
             ]),
         )
@@ -289,7 +289,7 @@ async fn a_historical_environment_version_stays_reconstructible() {
             .resolve_symbol(SymbolKind::ConceptType, "Person", Intent::Write)
             .unwrap()
             .to_string(),
-        "kip://profiles/cognitive-memory@2.1.0/Person"
+        "kip://profiles/cognitive-memory@2.0.0/Person"
     );
 
     // Version 0 is the pre-activation environment: Core, and nothing else.
@@ -315,7 +315,7 @@ async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
         .await
         .unwrap();
     store
-        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.1.0", PackageState::Active)]))
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
 
@@ -323,7 +323,7 @@ async fn activating_an_uninstalled_package_leaves_the_space_untouched() {
         .activate_schema(
             SPACE,
             lock(&[
-                (PROFILE_ID, "2.1.0", PackageState::Active),
+                (PROFILE_ID, "2.0.0", PackageState::Active),
                 ("kip://acme/nowhere", "1.0.0", PackageState::Active),
             ]),
         )
@@ -375,7 +375,7 @@ async fn the_schema_registries_survive_a_reopen() {
         .await
         .unwrap();
     store
-        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.1.0", PackageState::Active)]))
+        .activate_schema(SPACE, lock(&[(PROFILE_ID, "2.0.0", PackageState::Active)]))
         .await
         .unwrap();
     store.flush(1_755_000_000_000).await.unwrap();

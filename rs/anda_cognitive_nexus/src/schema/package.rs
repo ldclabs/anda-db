@@ -9,7 +9,7 @@
 //! Governance.
 //!
 //! The structs below mirror the shipped artifact format — the same JSON as
-//! `KIP/v2/profiles/cognitive-memory-2.1.0.schema.json`, which the tests parse
+//! `KIP/profiles/cognitive-memory-2.0.0.schema.json`, which the tests parse
 //! rather than a hand-written imitation of it.
 //!
 //! Everything is `#[serde(default)]` and unknown fields are kept: a package
@@ -219,6 +219,10 @@ pub struct FieldSpec {
     /// The value used when the field is absent (§40).
     #[serde(default)]
     pub default: Option<Json>,
+    /// Engine-derived and read-only (§18.2): a write to it fails
+    /// `ConstraintViolation`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub computed: bool,
     /// Anything else.
     #[serde(flatten)]
     pub extra: Map<String, Json>,
@@ -253,6 +257,11 @@ pub struct PredicateDef {
     /// engine must be able to store in order to report it (§46, §95).
     #[serde(default)]
     pub functional: bool,
+    /// `"object_type"`: functional within each partition of candidate objects
+    /// that share a Concept Type lineage (§20.15). Never together with
+    /// [`functional`](Self::functional), and only over Concept objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub functional_by: Option<String>,
     /// Whether absence of a claim means unknown rather than false (§51).
     #[serde(default = "yes")]
     pub open_world: bool,
@@ -382,6 +391,9 @@ pub struct FacetDef {
     /// Advisory guidance.
     #[serde(default)]
     pub model_hints: Option<Json>,
+    /// Engine-derived and read-only (§18.2): no write may carry it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub computed: bool,
     /// Anything else.
     #[serde(flatten)]
     pub extra: Map<String, Json>,
@@ -421,6 +433,9 @@ pub struct StructuralFieldDef {
     /// Whether the same target may appear twice.
     #[serde(default)]
     pub unique: bool,
+    /// Engine-derived and read-only (§18.2): no write may set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub computed: bool,
     /// Anything else.
     #[serde(flatten)]
     pub extra: Map<String, Json>,
@@ -572,7 +587,7 @@ mod tests {
         assert_eq!(package.format, "KIP-Schema-Package");
         assert_eq!(
             package.package_ref().unwrap().to_string(),
-            "kip://profiles/cognitive-memory@2.1.0"
+            cognitive_memory!()
         );
         // It depends on Core, exactly.
         let core = &package.dependencies[0];
@@ -597,7 +612,7 @@ mod tests {
         assert!(!prefers.complete);
         assert_eq!(
             prefers.subject.concept_types,
-            vec!["kip://profiles/cognitive-memory@2.1.0/Person"]
+            vec![cognitive_memory!("Person")]
         );
         assert_eq!(prefers.object.kinds, vec!["Concept"]);
     }

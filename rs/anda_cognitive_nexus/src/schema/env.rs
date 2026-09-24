@@ -463,7 +463,7 @@ mod tests {
             1,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.1.0",
+                "2.0.0",
                 PackageState::Active,
             )]),
             &available(),
@@ -479,10 +479,7 @@ mod tests {
         let symbol = env
             .resolve_symbol(SymbolKind::ConceptType, "Person", Intent::Write)
             .unwrap();
-        assert_eq!(
-            symbol.to_string(),
-            "kip://profiles/cognitive-memory@2.1.0/Person"
-        );
+        assert_eq!(symbol.to_string(), cognitive_memory!("Person"));
         // The same name resolves the same way through its canonical spelling.
         assert_eq!(
             env.resolve_symbol(SymbolKind::ConceptType, &symbol.to_string(), Intent::Write)
@@ -500,7 +497,7 @@ mod tests {
             lock(&[
                 (
                     "kip://profiles/cognitive-memory",
-                    "2.1.0",
+                    "2.0.0",
                     PackageState::Active,
                 ),
                 ("kip://acme/hr", "1.0.0", PackageState::Active),
@@ -516,10 +513,7 @@ mod tests {
         // §86.1: the recovery hint has to be actionable, which means naming
         // both candidates.
         assert!(err.effective_hint().contains("kip://acme/hr@1.0.0/Person"));
-        assert!(
-            err.effective_hint()
-                .contains("kip://profiles/cognitive-memory@2.1.0/Person")
-        );
+        assert!(err.effective_hint().contains(cognitive_memory!("Person")));
 
         // An unambiguous name in the same environment still resolves, and the
         // qualified spelling always does.
@@ -558,7 +552,7 @@ mod tests {
             3,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.1.0",
+                "2.0.0",
                 PackageState::Deprecated,
             )]),
             &available(),
@@ -575,13 +569,13 @@ mod tests {
             4,
             lock(&[(
                 "kip://profiles/cognitive-memory",
-                "2.1.0",
+                "2.0.0",
                 PackageState::Blocked,
             )]),
             &available(),
         )
         .unwrap();
-        let qualified = "kip://profiles/cognitive-memory@2.1.0/Person";
+        let qualified = cognitive_memory!("Person");
         assert!(
             blocked
                 .resolve_symbol(SymbolKind::ConceptType, qualified, Intent::Read)
@@ -603,7 +597,7 @@ mod tests {
             lock(&[
                 (
                     "kip://profiles/cognitive-memory",
-                    "2.1.0",
+                    "2.0.0",
                     PackageState::Active,
                 ),
                 ("kip://acme/hr", "1.0.0", PackageState::Quarantined),
@@ -615,10 +609,7 @@ mod tests {
         let symbol = env
             .resolve_symbol(SymbolKind::ConceptType, "Person", Intent::Write)
             .unwrap();
-        assert_eq!(
-            symbol.to_string(),
-            "kip://profiles/cognitive-memory@2.1.0/Person"
-        );
+        assert_eq!(symbol.to_string(), cognitive_memory!("Person"));
         let err = env
             .resolve_symbol(
                 SymbolKind::ConceptType,
@@ -636,7 +627,7 @@ mod tests {
         let mut lock = lock(&[
             (
                 "kip://profiles/cognitive-memory",
-                "2.1.0",
+                "2.0.0",
                 PackageState::Active,
             ),
             ("kip://acme/hr", "1.0.0", PackageState::Active),
@@ -720,21 +711,21 @@ mod tests {
         // another during a dual-version period (§20.9).
         let mut lock = lock(&[(
             "kip://profiles/cognitive-memory",
-            "2.1.0",
+            "2.0.0",
             PackageState::Active,
         )]);
         lock.write_defaults.insert(
             "kip://profiles/cognitive-memory".to_string(),
-            "2.1.0".to_string(),
+            "2.0.0".to_string(),
         );
         let env = SchemaEnvironment::resolve(8, lock, &available()).unwrap();
         assert_eq!(
             env.package_ref("kip://profiles/cognitive-memory", Intent::Read),
-            Some("kip://profiles/cognitive-memory@2.1.0".to_string())
+            Some(cognitive_memory!().to_string())
         );
         assert_eq!(
             env.package_ref("kip://profiles/cognitive-memory", Intent::Write),
-            Some("kip://profiles/cognitive-memory@2.1.0".to_string())
+            Some(cognitive_memory!().to_string())
         );
     }
 }

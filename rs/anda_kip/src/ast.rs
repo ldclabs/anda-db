@@ -610,6 +610,13 @@ pub enum WhereClause {
         /// The slot predicate.
         predicate: PredAtom,
     },
+    /// `?x SEARCH <KIND> <term> ... LIMIT <k>` — a Search Pattern (Spec §43.8).
+    ///
+    /// The same retrieval as the META `SEARCH`, binding each hit so the query
+    /// can join, filter and project it against one snapshot. Never inside
+    /// `NOT` (a miss never proves absence) and never in a mutation or export
+    /// selection (approximate retrieval cannot pick targets).
+    Search(SearchPattern),
     /// `FILTER (...)`
     Filter {
         /// The filter expression.
@@ -621,6 +628,30 @@ pub enum WhereClause {
     Optional(Vec<WhereClause>),
     /// `UNION { ... }`
     Union(Vec<WhereClause>),
+}
+
+/// A Search Pattern inside `WHERE` (Spec §43.8).
+///
+/// `limit` bounds the candidate set and is always present; paging and `AS OF`
+/// belong to the enclosing `FIND`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SearchPattern {
+    /// The variable each hit binds.
+    pub variable: String,
+    /// What kind of element is searched.
+    pub target: SearchTarget,
+    /// The search term.
+    pub term: Scalar,
+    /// `WITH TYPE ...`
+    pub with_type: Option<Scalar>,
+    /// `WITH PREDICATE ...`
+    pub with_predicate: Option<Scalar>,
+    /// `MODE "keyword" | "semantic" | "hybrid"`
+    pub mode: Option<Scalar>,
+    /// `THRESHOLD ...`
+    pub threshold: Option<Scalar>,
+    /// The candidate bound, `LIMIT k`.
+    pub limit: Scalar,
 }
 
 /// What a `BELIEF` projects.
@@ -783,6 +814,31 @@ pub enum MutationClause {
     PurgePayload(PurgePayloadStatement),
     /// `MERGE CONCEPT source INTO target`
     MergeConcept(MergeConcept),
+    /// `DEFINE PREDICATE "name" {...}` / `DEFINE CONCEPT TYPE "name" {...}`
+    /// (Spec §20.16): one symbol added to the Space's draft vocabulary. Only
+    /// ever the single clause of a standalone statement, never inside `MUTATE`.
+    Define(DefineCommand),
+}
+
+/// What a `DEFINE` adds to the draft vocabulary (Spec §20.16).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DefineCommand {
+    /// Which kind of symbol is defined.
+    pub kind: DefineKind,
+    /// The new symbol's local name.
+    pub name: SymbolRef,
+    /// The definition body, with the fields of §20.15 (Predicate) or a
+    /// description and open attributes (Concept Type).
+    pub definition: BoundObject,
+}
+
+/// The kind of symbol a `DEFINE` adds.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum DefineKind {
+    /// `DEFINE PREDICATE`
+    Predicate,
+    /// `DEFINE CONCEPT TYPE`
+    ConceptType,
 }
 
 impl MutationClause {
@@ -1420,8 +1476,6 @@ pub enum SearchTarget {
     Evidence,
     /// `SEARCH ACTIVITY`
     Activity,
-    /// `SEARCH COGNITION`
-    Cognition,
 }
 
 /// What a `VERIFY` checks.

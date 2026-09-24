@@ -311,7 +311,7 @@ async def test_execute_request_carries_space_ingest_and_a_sequence():
                 "command": """
                     MUTATE {
                         CREATE CONCEPT ?alice { TYPE "Person" NAME :who }
-                        CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+                        CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
                         ASSERT ?a (?alice, "prefers", ?dark) {
                             by: ?alice, mode: "stated", confidence: 0.9, evidence: :msg
                         }
@@ -416,7 +416,7 @@ async def test_import_capsule_carries_cognition_into_another_nexus():
     written = await source.execute_kip("""
         MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
             ASSERT ?a (?alice, "prefers", ?dark) {
                 by: ?alice, mode: "stated", confidence: 0.9
             }
@@ -505,7 +505,7 @@ async def test_import_capsule_can_quarantine_instead_of_recalling():
     await source.execute_kip("""
         MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
             ASSERT ?a (?alice, "prefers", ?dark) {
                 by: ?alice, mode: "stated", confidence: 0.9
             }

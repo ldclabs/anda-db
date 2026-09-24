@@ -11,6 +11,7 @@ import type {
   EvidenceRow,
   PropositionRow,
 } from '../src/store/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * KML runs end to end, through the real parser.
@@ -29,7 +30,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`kml-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY, ...extra])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS, ...extra])
     body(nexus)
   })
 }
@@ -52,12 +53,12 @@ const OPEN_PACKAGE = {
   },
 } as unknown as SchemaPackage
 
-const CM = 'kip://profiles/cognitive-memory@2.1.0'
+const CM = 'kip://profiles/cognitive-memory@2.0.0'
 
 /** The setup every fixture in the conformance suite starts from. */
 const SETUP = `MUTATE {
   CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE ASSERTION ?a {
     SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9 }
@@ -399,11 +400,12 @@ describe('KML', () => {
       expect(older.superseded_by).toEqual([second.handles.a])
       expect(newer.supersedes).toEqual([first.handles.a])
 
-      // Across two Propositions it would silently retire a claim nobody
-      // revised.
+      // Across two slots it would silently retire a claim nobody revised; a
+      // value-only correction stays inside one slot (§14.2).
       const other = nexus.execute(`MUTATE {
-        CREATE CONCEPT ?light { TYPE "Preference" NAME "Light" }
-        ENSURE PROPOSITION ?q ({id: "${first.handles.alice}"}, "prefers", ?light)
+        CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+        CREATE CONCEPT ?light { TYPE "Option" NAME "Light" }
+        ENSURE PROPOSITION ?q (?bob, "prefers", ?light)
         CREATE ASSERTION ?b {
           SET FIELDS { proposition: ?q, asserted_by: {id: "${first.handles.alice}"}, stance: "support", mode: "stated" }
         }
@@ -628,7 +630,7 @@ describe('KML', () => {
         `UPSERT CONCEPT ?p { MATCH {type: "Person", id: "C-9999"} SET FIELDS {name: "Nobody"} }`,
         // A declared type the element does not carry is simply not a match,
         // and the refusal says no more than that (§86.4).
-        `UPSERT CONCEPT ?p { MATCH {type: "Preference", id: "${alice}"} SET FIELDS {name: "Wrong"} }`,
+        `UPSERT CONCEPT ?p { MATCH {type: "Option", id: "${alice}"} SET FIELDS {name: "Wrong"} }`,
       ]) {
         const outcome = nexus.tryExecute(command)
         expect('error' in outcome && outcome.error.code).toBe('NotFoundOrNotVisible')
@@ -793,7 +795,7 @@ describe('KML', () => {
   /** One Evidence record with an inline payload, cited by an Assertion. */
   const CITED_EVIDENCE = `MUTATE {
   CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE EVIDENCE ?e {
     SET FIELDS {

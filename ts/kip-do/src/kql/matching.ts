@@ -35,9 +35,11 @@ import type {
   PredAtom,
   PropositionMatcher,
   PropositionTriple,
+  SearchPatternClause,
   Term,
   WhereClause,
 } from '../kip/ast.js'
+import { rank } from './search.js'
 import { kipValue as kipLiteral } from '../kml/value.js'
 import {
   formatSymbolRef,
@@ -52,6 +54,7 @@ import { readPath } from '../view.js'
 import {
   beliefToJson,
   project,
+  projectSlot,
   slotPropositions,
   slotToJson,
   projectionBasis,
@@ -281,12 +284,49 @@ function solveClause(
   if ('BeliefSlot' in clause) {
     return beliefSlot(cx, clause.BeliefSlot, incoming, b)
   }
+  if ('Search' in clause) {
+    return searchPattern(cx, clause.Search, incoming, b)
+  }
 
   const name = Object.keys(clause)[0] ?? 'this pattern'
   throw errors.unsupportedCapability(
     `the ${name} pattern is not implemented by this engine yet; see ` +
       `DESCRIBE CAPABILITIES`,
   )
+}
+
+// --- the Search Pattern -----------------------------------------------------
+
+/**
+ * `?x SEARCH <KIND> <term> ... LIMIT <k>` (§43.8): the top `k` authorized hits
+ * of the same retrieval as META `SEARCH`, against this query's snapshot, each
+ * bound as an element. A hit's view carries the transient `retrieval.score` /
+ * `retrieval.mode`; a miss proves nothing (§66.6).
+ */
+function searchPattern(
+  cx: Context,
+  pattern: SearchPatternClause,
+  incoming: readonly Solution[],
+  b: ReadBindings,
+): Solution[] {
+  if (cx.historical) {
+    throw errors.historicalSearchUnavailable(
+      'this engine keeps no historical index, so a Search Pattern under AS OF is ' +
+        'unavailable (historical_search)',
+    )
+  }
+  const limit = readCount(pattern.limit, b, 'LIMIT')
+  const { hits, cap } = rank(cx, pattern, b)
+  const out: Solution[] = []
+  const bounded = hits.slice(0, cap === null ? limit : Math.min(limit, cap))
+  for (const hit of bounded) cx.annotate(hit.id, 'retrieval', { score: hit.score, mode: 'keyword' })
+  for (const solution of incoming) {
+    for (const hit of bounded) {
+      const next = extend(solution, pattern.variable, elementBinding(hit.id))
+      if (next !== null) out.push(next)
+    }
+  }
+  return out
 }
 
 // --- element patterns -------------------------------------------------------
@@ -1282,9 +1322,7 @@ function beliefSlot(
       // §12.3: the slot sees every Assertion in it, whichever version its
       // Proposition was created under and whichever merged spelling of the
       // subject it was recorded on.
-      candidates: slotPropositions(cx, keys, predicateLineage).map((id) =>
-        project(cx, id, b.policy, validAt),
-      ),
+      candidates: projectSlot(cx, slotPropositions(cx, keys, predicateLineage), b.policy, validAt),
       policy: b.policy,
       validAt,
       asOf: cx.asOf ?? null,

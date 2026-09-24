@@ -8,12 +8,14 @@ import { CASE_COUNT, FIXTURES, type Case, type Fixture } from './conformance/fix
 import { sameResult } from './conformance/normalize.js'
 
 /**
- * The cross-engine KIP 2.0 conformance suite.
+ * The KIP 2.0 engine suite.
  *
- * These are the same fixtures `rs/anda_cognitive_nexus/tests/conformance.rs`
- * runs, byte for byte. A case that passes in one engine and fails in the other
- * is a divergence report, which is the whole reason the fixtures are plain data
- * rather than either engine's tests.
+ * KIP's `conformance/engine-suite/`, copied byte for byte into
+ * `fixtures/kip-conformance-2.0/` — the same fixtures
+ * `rs/anda_cognitive_nexus/tests/conformance.rs` runs, compared the way KIP's
+ * own runner compares them. A case that passes in one engine and fails in the
+ * other is a divergence report, which is the whole reason the fixtures are
+ * plain data rather than either engine's tests.
  *
  * Every case goes through the **request envelope**, the same way the reference
  * harness builds a `Request` and hands it to the `Executor`. An earlier version
@@ -33,24 +35,61 @@ async function runFixture(fixture: Fixture): Promise<Outcome[]> {
   // installed. Installing one is a host decision, so it does not go through
   // the envelope: no command can install a Schema Package, by design.
   const packages = (fixture.packages ?? []) as SchemaPackage[]
-  if (packages.length > 0) {
-    await runInDurableObject(stub, (instance: ConformanceKipDatabase) =>
-      instance.activateFixturePackages(packages),
-    )
-  }
+  await runInDurableObject(stub, (instance: ConformanceKipDatabase) =>
+    instance.activateFixturePackages(packages),
+  )
 
+  // A setup step may capture raw result values into parameters for later
+  // steps and every case: actual ids, versions and bases, never invented ones.
+  const captured: JsonMap = {}
   for (const setup of fixture.setup ?? []) {
-    const outcome = await post(stub, setup, {})
+    const step = typeof setup === 'string' ? { command: setup } : setup
+    const outcome = await post(stub, step.command, { ...captured, ...(step.params ?? {}) } as JsonMap)
     if ('error' in outcome) {
       throw new Error(
-        `${fixture.name}: setup failed with ${outcome.error.code}: ${outcome.error.message}\n${setup}`,
+        `${fixture.name}: setup failed with ${outcome.error.code}: ${outcome.error.message}\n${step.command}`,
       )
+    }
+    for (const [name, path] of Object.entries('capture' in step ? step.capture ?? {} : {})) {
+      const value = pointer(outcome.result, path)
+      if (value === undefined) throw new Error(`${fixture.name}: setup result is missing ${path}`)
+      captured[name] = value
     }
   }
 
   const outcomes: Outcome[] = []
-  for (const testCase of fixture.cases) outcomes.push(await runCase(stub, testCase))
+  for (const testCase of fixture.cases) outcomes.push(await runCase(stub, testCase, captured))
   return outcomes
+}
+
+/** A JSON Pointer into a raw result; `undefined` when the path is missing. */
+function pointer(value: Json, path: string): Json | undefined {
+  if (path === '') return value
+  let current: Json | undefined = value
+  for (const segment of path.slice(1).split('/')) {
+    const key = segment.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (current === null || typeof current !== 'object') return undefined
+    current = Array.isArray(current) ? current[Number(key)] : (current as JsonMap)[key]
+    if (current === undefined) return undefined
+  }
+  return current
+}
+
+/**
+ * `expect.result_contains` (KIP runner): objects match member by member, an
+ * expected array needs a matching actual row per expected row, and scalars
+ * match exactly. Extra members and rows are allowed.
+ */
+function contains(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual) && expected.every((row) => actual.some((a) => contains(a, row)))
+  }
+  if (expected !== null && typeof expected === 'object') {
+    return actual !== null && typeof actual === 'object' && !Array.isArray(actual) &&
+      Object.entries(expected).every(([key, value]) =>
+        Object.hasOwn(actual, key) && contains((actual as Record<string, unknown>)[key], value))
+  }
+  return actual === expected
 }
 
 type Outcome =
@@ -104,11 +143,12 @@ async function post(
 async function runCase(
   stub: DurableObjectStub<ConformanceKipDatabase>,
   testCase: Case,
+  captured: JsonMap,
 ): Promise<Outcome> {
   const outcome = await post(
     stub,
     testCase.command,
-    (testCase.params ?? {}) as JsonMap,
+    { ...captured, ...(testCase.params ?? {}) } as JsonMap,
     testCase.envelope ?? {},
   )
   const expectedError = testCase.expect.error
@@ -149,19 +189,17 @@ async function runCase(
       detail: `expected ${expectedError}, got a result: ${JSON.stringify(outcome.result)}`,
     }
   }
-  if (testCase.expect.result === undefined) {
-    return { kind: 'pass', name: testCase.name }
-  }
-  return sameResult(
-    outcome.result,
-    testCase.expect.result as Json,
-    testCase.ordered === true,
-  )
+  const pass =
+    (testCase.expect.result === undefined ||
+      sameResult(outcome.result, testCase.expect.result as Json, testCase.ordered === true)) &&
+    (testCase.expect.result_contains === undefined ||
+      contains(outcome.result, testCase.expect.result_contains))
+  return pass
     ? { kind: 'pass', name: testCase.name }
     : {
         kind: 'fail',
         name: testCase.name,
-        detail: `expected ${JSON.stringify(testCase.expect.result)}, got ${JSON.stringify(outcome.result)}`,
+        detail: `expected ${JSON.stringify(testCase.expect)}, got ${JSON.stringify(outcome.result)}`,
       }
 }
 
@@ -173,14 +211,15 @@ async function runCase(
  * fixture twice would replay its setup against a Space that already has it.
  */
 const UNBUILT: string[] = []
+const PENDING: string[] = []
 let PASSED = 0
 
 describe('KIP 2.0 conformance', () => {
   it('runs the same fixtures the reference engine runs', () => {
     // A shrinking suite is a silent loss of coverage; the generator reads the
     // fixture directory, so a bad path shows up here first.
-    expect(FIXTURES.length).toBeGreaterThanOrEqual(17)
-    expect(CASE_COUNT).toBeGreaterThanOrEqual(230)
+    expect(FIXTURES.length).toBeGreaterThanOrEqual(22)
+    expect(CASE_COUNT).toBeGreaterThanOrEqual(388)
   })
 
   for (const fixture of FIXTURES) {
@@ -192,11 +231,16 @@ describe('KIP 2.0 conformance', () => {
           UNBUILT.push(`${fixture.name} / ${outcome.name}`)
         }
       }
-      const failures = outcomes.filter((o) => o.kind === 'fail')
-      expect(
-        failures.map((f) => `${f.name}: ${'detail' in f ? f.detail : ''}`),
-        `${fixture.name} disagrees with the reference engine`,
-      ).toEqual([])
+      const failures = outcomes
+        .filter((o) => o.kind === 'fail')
+        .map((f) => `${f.name}: ${'detail' in f ? f.detail : ''}`)
+      // A pending fixture has been verified by no engine yet (KIP engine-suite
+      // README): its failures are reported, and its passes are new evidence.
+      if (fixture.status === 'pending_engine') {
+        PENDING.push(...failures.map((f) => `${fixture.name} / ${f}`))
+        return
+      }
+      expect(failures, `${fixture.name} disagrees with the reference engine`).toEqual([])
     })
   }
 
@@ -204,11 +248,17 @@ describe('KIP 2.0 conformance', () => {
     // Nothing falls between the two: a case that fails for a reason other than
     // "not built" already failed its fixture above, so reaching here means the
     // whole suite is accounted for.
-    expect(PASSED + UNBUILT.length).toBe(CASE_COUNT)
+    expect(PASSED + UNBUILT.length + PENDING.length).toBe(CASE_COUNT)
+    expect(PENDING, 'pending-engine fixtures this engine does not pass yet').toEqual([])
 
-    // Empty, and it is the list rather than a count that says so: a *new* gap
-    // cannot hide inside a number that happens to match, and closing the last
-    // one had to be acknowledged here by deleting its name.
-    expect(UNBUILT).toEqual([])
+    // The list rather than a count, so a *new* gap cannot hide inside a number
+    // that happens to match. DEFINE is the optional `draft_vocabulary`
+    // capability (§20.16), which this engine does not advertise.
+    expect(UNBUILT).toEqual([
+      'world-time / DEFINE adds a Predicate to the draft vocabulary',
+      'world-time / the draft symbol resolves for the next operation',
+      'world-time / a name that already resolves fails SchemaSymbolConflict',
+      'world-time / a draft Predicate cannot claim a closed world',
+    ])
   })
 })

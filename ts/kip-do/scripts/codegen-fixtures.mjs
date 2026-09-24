@@ -2,10 +2,12 @@
 /**
  * Inlines the cross-engine conformance fixtures into TypeScript.
  *
- * The fixtures in `fixtures/kip-conformance-2.0/` are plain data specifically
- * so that both engines run the same cases: the Rust harness reads them from
- * disk, and this one cannot — tests run inside workerd, which has no
- * filesystem. Inlining is the only way to hand workerd the same bytes.
+ * The fixtures in `fixtures/kip-conformance-2.0/` are KIP's engine suite
+ * (`conformance/engine-suite/`, copied byte for byte by `make
+ * sync-kip-conformance`), plain data so that both engines run the same cases:
+ * the Rust harness reads them from disk, and this one cannot — tests run
+ * inside workerd, which has no filesystem. Inlining is the only way to hand
+ * workerd the same bytes. `manifest.json` is provenance, not a fixture.
  *
  * The generated module is committed. Regenerate whenever a fixture changes;
  * `test/conformance.test.ts` asserts the case count so a silent shrink shows up.
@@ -19,7 +21,7 @@ const pkgRoot = dirname(here)
 const dir = join(pkgRoot, '..', '..', 'fixtures', 'kip-conformance-2.0')
 
 const fixtures = readdirSync(dir)
-  .filter((name) => name.endsWith('.json'))
+  .filter((name) => name.endsWith('.json') && name !== 'manifest.json')
   .sort()
   .map((name) => JSON.parse(readFileSync(join(dir, name), 'utf8')))
 
@@ -33,9 +35,14 @@ const out = `/**
  * \`pnpm run codegen:fixtures\`.
  */
 
-/** One expectation: a result to match, or the registry code to fail with. */
+/**
+ * One expectation: a result to match, members and rows the result must
+ * contain, or the registry code to fail with. An empty expectation passes on
+ * any result.
+ */
 export interface Expectation {
   result?: unknown
+  result_contains?: unknown
   error?: string
 }
 
@@ -63,12 +70,22 @@ export interface Case {
   vectors?: string[]
 }
 
+/**
+ * A setup step: a bare command, or one whose raw result is captured into
+ * parameters (JSON Pointers) for later steps and every case of the fixture.
+ */
+export type Setup =
+  | string
+  | { command: string; params?: Record<string, unknown>; capture?: Record<string, string> }
+
 export interface Fixture {
   name: string
   description: string
+  /** \`pending_engine\` while no engine has verified the fixture. */
+  status?: string
   /** Extra Schema Package artifacts to install and activate, inline. */
   packages?: unknown[]
-  setup?: string[]
+  setup?: Setup[]
   cases: Case[]
 }
 

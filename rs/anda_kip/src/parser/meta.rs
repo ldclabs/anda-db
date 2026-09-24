@@ -12,14 +12,14 @@ use nom::{
 };
 
 use super::common::{
-    Flavor, VResult, bound_object, element_ref, fail, opt_after, scalar, where_block, word, words,
-    ws,
+    Flavor, VResult, bound_object, element_ref, fail, opt_after, scalar, search_modifiers,
+    search_target, where_block, word, words, ws,
 };
 use super::kql::as_of_clause;
 use crate::ast::{
     ChangesCommand, DescribeTarget, ExportCapsuleCommand, HistoryCommand, ListCommand, ListTarget,
-    MetaCommand, PreviewCommand, Scalar, SearchCommand, SearchTarget, ValidateCommand,
-    ValidateTarget, VerifyTarget,
+    MetaCommand, PreviewCommand, Scalar, SearchCommand, ValidateCommand, ValidateTarget,
+    VerifyTarget,
 };
 
 /// Parses one META command.
@@ -242,21 +242,10 @@ fn paging(input: &str) -> VResult<'_, (Option<Scalar>, Option<Scalar>)> {
 
 fn search(input: &str) -> VResult<'_, SearchCommand> {
     let (input, _) = ws(word("SEARCH")).parse(input)?;
-    let (input, target) = cut(ws(alt((
-        value(SearchTarget::Concept, word("CONCEPT")),
-        value(SearchTarget::Proposition, word("PROPOSITION")),
-        value(SearchTarget::Assertion, word("ASSERTION")),
-        value(SearchTarget::Evidence, word("EVIDENCE")),
-        value(SearchTarget::Activity, word("ACTIVITY")),
-        value(SearchTarget::Cognition, word("COGNITION")),
-    ))))
-    .parse(input)?;
+    let (input, target) = cut(search_target).parse(input)?;
 
     let (input, term) = cut(ws(scalar)).parse(input)?;
-    let (input, with_type) = opt_after(&["WITH", "TYPE"], ws(scalar)).parse(input)?;
-    let (input, with_predicate) = opt_after(&["WITH", "PREDICATE"], ws(scalar)).parse(input)?;
-    let (input, mode) = opt_after(&["MODE"], ws(scalar)).parse(input)?;
-    let (input, threshold) = opt_after(&["THRESHOLD"], ws(scalar)).parse(input)?;
+    let (input, (with_type, with_predicate, mode, threshold)) = search_modifiers(input)?;
     let (input, as_of_seq) = opt_after(&["AS", "OF", "SEQ"], ws(scalar)).parse(input)?;
     let (input, (limit, cursor)) = paging(input)?;
 
@@ -573,17 +562,19 @@ mod tests {
     #[test]
     fn search_carries_its_whole_option_set() {
         let MetaCommand::Search(command) = meta(
-            r#"SEARCH COGNITION "dark mode" WITH TYPE "Preference" WITH PREDICATE "prefers"
+            r#"SEARCH PROPOSITION "dark mode" WITH TYPE "ColorScheme" WITH PREDICATE "prefers"
                MODE "hybrid" THRESHOLD 0.7 AS OF SEQ 100 LIMIT 5 CURSOR :c"#,
         ) else {
             panic!("expected SEARCH");
         };
-        assert_eq!(command.target, SearchTarget::Cognition);
+        assert_eq!(command.target, crate::ast::SearchTarget::Proposition);
         assert!(command.with_type.is_some());
         assert!(command.with_predicate.is_some());
         assert!(command.mode.is_some());
         assert!(command.threshold.is_some());
         assert!(command.as_of_seq.is_some());
+        // The kind is gone from the language, not just unimplemented (§43.8).
+        assert!(crate::parser::parse_meta(r#"SEARCH COGNITION "x""#).is_err());
     }
 
     #[test]

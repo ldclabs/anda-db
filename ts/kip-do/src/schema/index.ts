@@ -59,6 +59,7 @@ export {
   predicateDef,
   predicateRules,
   rejectCoreShadowing,
+  checkFunctionalBy,
   structuralFieldDef,
   symbolRefOf,
   symbols,

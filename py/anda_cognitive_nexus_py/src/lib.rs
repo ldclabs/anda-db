@@ -572,7 +572,7 @@ fn anda_cognitive_nexus_py(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("KIP_VERSION", KIP_VERSION)?;
     // The bundled baseline ontology, verbatim as the specification publishes
     // it. A host that activates its own Schema Packages passes this alongside
-    // them when it still wants `Person`, `Preference`, `Event` and the rest —
+    // them when it still wants `Person`, `Event` and the rest —
     // a Schema Lock names exactly the packages in force, so leaving it out
     // deactivates it (§20.9).
     m.add("COGNITIVE_MEMORY_PROFILE", COGNITIVE_MEMORY)?;
@@ -993,7 +993,7 @@ mod tests {
     static RECORD_A_PREFERENCE: &str = r#"
         MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
             CREATE EVIDENCE ?said {
                 SET FIELDS {
                     evidence_class: "user_statement",
@@ -1013,7 +1013,7 @@ mod tests {
     static RECORD_ANOTHER_PREFERENCE: &str = r#"
         MUTATE {
             CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
-            CREATE CONCEPT ?light { TYPE "Preference" NAME "Light mode" }
+            CREATE CONCEPT ?light { TYPE "Person" NAME "Light mode" }
             CREATE EVIDENCE ?said {
                 SET FIELDS {
                     evidence_class: "user_statement",
@@ -1252,7 +1252,7 @@ mod tests {
                     "command": r#"
                         MUTATE {
                             CREATE CONCEPT ?alice { TYPE "Person" NAME :who }
-                            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+                            CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
                             ASSERT ?a (?alice, "prefers", ?dark) {
                                 by: ?alice, mode: "stated", confidence: 0.9, evidence: :msg
                             }

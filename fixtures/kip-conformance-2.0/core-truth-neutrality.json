@@ -2,7 +2,7 @@
   "name": "core-truth-neutrality",
   "description": "The distinction the version exists for: a Proposition existing is not the Proposition being true. A tuple carries no confidence, the same tuple resolves to one Proposition, and a raw read reports claims rather than beliefs.",
   "setup": [
-    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Preference\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
+    "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?dark { TYPE \"Option\" NAME \"Dark\" }\n  ENSURE PROPOSITION ?p (?alice, \"prefers\", ?dark)\n  CREATE EVIDENCE ?e {\n    SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n  }\n  CREATE ASSERTION ?a {\n    SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: \"support\", mode: \"stated\", confidence: 0.9 }\n    SET STRUCTURAL { (\"evidence\", ?e) { role: \"support\" } }\n  }\n}",
     "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}",
     "CREATE EVIDENCE ?e {\n  CLIENT KEY \"message:42:evidence\"\n  SET FIELDS { evidence_class: \"user_statement\", payload: \"I prefer dark mode\" }\n}"
   ],
@@ -40,7 +40,7 @@
       "command": "FIND(?p.predicate_ref) WHERE { ?p PROPOSITION (?s, \"prefers\", ?o) }",
       "expect": {
         "result": [
-          "kip://profiles/cognitive-memory@2.1.0/prefers"
+          "kip://profiles/cognitive-memory@2.0.0/prefers"
         ]
       }
     },
@@ -49,7 +49,7 @@
       "command": "FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: \"Alice\"} }",
       "expect": {
         "result": [
-          "kip://profiles/cognitive-memory@2.1.0/Person"
+          "kip://profiles/cognitive-memory@2.0.0/Person"
         ]
       }
     },
@@ -189,6 +189,23 @@
         "result": [
           2
         ]
+      }
+    }
+  ],
+  "packages": [
+    {
+      "format": "KIP-Schema-Package",
+      "manifest": {
+        "package_id": "kip://conformance/options",
+        "version": "1.0.0"
+      },
+      "definitions": {
+        "concept_types": {
+          "Option": {
+            "kind": "ConceptType",
+            "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+          }
+        }
       }
     }
   ]

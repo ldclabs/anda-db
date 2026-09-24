@@ -21,9 +21,15 @@ export const BASELINE_ID = 'kip:policy:baseline'
  * The baseline's version.
  *
  * Bumped whenever its numbers move, because that changes what a past
- * "accepted" would have meant.
+ * "accepted" would have meant. 3: an unstated confidence is weighed by its
+ * stance alone (§13.6 — missing confidence is not 0.5), and world time
+ * follows temporal succession and time bounds (§25.4, §25.5).
  */
-export const BASELINE_VERSION = 2
+export const BASELINE_VERSION = 3
+
+/** The standard memory policy (§21.13, `profiles/policy-memory-default.json`). */
+export const MEMORY_DEFAULT_ID = 'kip:memory-default'
+export const MEMORY_DEFAULT_VERSION = 1
 
 export interface Policy {
   trust_weights: Record<string, number>
@@ -46,6 +52,16 @@ export interface Policy {
   unstated_confidence: number
   /** Whether support for a rival value of a functional slot opposes this one. */
   expand_conflicts: boolean
+  /**
+   * Structural classification (§21.10): every eligible root group counts
+   * once, and no confidence or trust weight enters the arithmetic.
+   */
+  structural?: boolean
+  /**
+   * The `kip:memory-default` precedence rules resolve slot conflicts
+   * (§21.13): context specificity, first-person testimony, recency.
+   */
+  precedence?: boolean
   /** How much of the Epistemic Ledger the answer carries (§49.1). */
   explanation: Explanation
 }
@@ -98,9 +114,27 @@ export function baseline(): Policy {
     modes: ['observed', 'stated', 'inferred', 'imported'],
     accept: 0.7,
     material: 0.3,
-    unstated_confidence: 0.5,
+    unstated_confidence: 1,
     expand_conflicts: true,
+    structural: false,
+    precedence: false,
     explanation: 'ledger',
+  }
+}
+
+/**
+ * `kip:memory-default` (§21.13): the structural baseline plus three ordered
+ * precedence rules. Deterministic and unweighted, so two engines given the
+ * same visible state answer the same.
+ */
+export function memoryDefault(): Policy {
+  return {
+    ...baseline(),
+    id: MEMORY_DEFAULT_ID,
+    version: MEMORY_DEFAULT_VERSION,
+    modes: ['observed', 'stated', 'inferred'],
+    structural: true,
+    precedence: true,
   }
 }
 
@@ -127,6 +161,8 @@ export function policyFromSettings(settings: JsonMap): Policy {
     policy = baseline()
   } else if (named === 'forecast' || named === 'kip:policy:forecast') {
     policy = forecast()
+  } else if (named === MEMORY_DEFAULT_ID || named === 'memory-default') {
+    policy = memoryDefault()
   } else {
     // Naming the policy rather than defaulting to the baseline: a caller that
     // asked for a stricter reading and silently got the ordinary one would act

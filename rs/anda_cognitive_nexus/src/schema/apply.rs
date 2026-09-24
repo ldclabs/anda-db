@@ -390,7 +390,7 @@ mod tests {
             Arc::new(package),
         )]);
         let mut lock = SchemaLock::default();
-        lock.packages.insert(PROFILE.into(), "2.1.0".into());
+        lock.packages.insert(PROFILE.into(), "2.0.0".into());
         lock.states.insert(PROFILE.into(), PackageState::Active);
         SchemaEnvironment::resolve(1, lock, &available).unwrap()
     }
@@ -409,7 +409,7 @@ mod tests {
     fn person() -> EndpointFacts {
         EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.1.0/Person")),
+            schema_ref: Some(format!("{PROFILE}@2.0.0/Person")),
         }
     }
 
@@ -425,7 +425,7 @@ mod tests {
                 Intent::Write,
             )
             .unwrap();
-        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.1.0/Person"));
+        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.0.0/Person"));
         assert!(result.is_valid());
     }
 
@@ -437,7 +437,7 @@ mod tests {
         let env = env();
         let dark = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.1.0/Preference")),
+            schema_ref: Some(format!("{PROFILE}@2.0.0/Preference")),
         };
         for _ in 0..2 {
             let (_, result) = env
@@ -464,7 +464,7 @@ mod tests {
 
         let wrong_subject = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.1.0/Event")),
+            schema_ref: Some(format!("{PROFILE}@2.0.0/Event")),
         };
         let (_, result) = env
             .prepare_proposition(
@@ -642,41 +642,62 @@ mod tests {
 
     #[test]
     fn a_facet_declaring_concept_types_is_state_about_those_concepts() {
-        // §58: `GradingState` tallies graded outcomes for an artifact that
-        // carries a task_family, so it belongs on a Skill. Checking only the
+        // §58: `LeaseState` is the lease of a SleepTask. Checking only the
         // carrier's *kind* would leave half the declaration unenforceable, and
-        // a Person carrying it would read as a grade nobody awarded.
+        // a Person carrying it would read as a lease nobody granted.
         let env = env();
-        let skill = format!("{PROFILE}@2.1.0/Skill");
+        let lease = || {
+            map(json!({"LeaseState": {
+                "owner": "worker", "fencing_token": 1,
+                "expires_at": "2026-01-01T00:00:00.000Z", "attempt_count": 1
+            }}))
+        };
+        let task = format!("{PROFILE}@2.0.0/SleepTask");
         let ok = env
-            .validate_facets(
-                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
-                &concept_carrier(Some(&skill)),
-                Intent::Write,
-            )
+            .validate_facets(&lease(), &concept_carrier(Some(&task)), Intent::Write)
             .unwrap();
-        assert!(ok.is_valid());
+        assert!(ok.is_valid(), "{ok:?}");
 
-        let person = format!("{PROFILE}@2.1.0/Person");
+        let person = format!("{PROFILE}@2.0.0/Person");
         let wrong = env
-            .validate_facets(
-                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
-                &concept_carrier(Some(&person)),
-                Intent::Write,
-            )
+            .validate_facets(&lease(), &concept_carrier(Some(&person)), Intent::Write)
             .unwrap();
         assert_eq!(wrong.violations[0].code, "SCHEMA_ENDPOINT_NOT_ALLOWED");
 
         // A carrier whose type was not supplied is not a Concept of the wrong
         // type, so it is not refused on that ground.
         let unknown = env
+            .validate_facets(&lease(), &concept_carrier(None), Intent::Write)
+            .unwrap();
+        assert!(unknown.is_valid());
+    }
+
+    #[test]
+    fn a_computed_member_is_never_written() {
+        // §18.2: GradingState is a read-only view of the current evaluation,
+        // and `effective_strength` is computed from base, anchor and policy.
+        let env = env();
+        let skill = format!("{PROFILE}@2.0.0/Skill");
+        let grade = env
             .validate_facets(
-                &map(json!({"GradingState": {"revision_ref":"C-1", "evaluation_ref":"X-1", "graded_count": 3}})),
-                &concept_carrier(None),
+                &map(json!({"GradingState": {"graded_count": 3}})),
+                &concept_carrier(Some(&skill)),
                 Intent::Write,
             )
             .unwrap();
-        assert!(unknown.is_valid());
+        assert_eq!(grade.violations[0].code, "SCHEMA_COMPUTED_MEMBER");
+        let strength = env
+            .validate_facets(
+                &map(json!({"MnemonicState": {"effective_strength": 0.5}})),
+                &concept_carrier(Some(&skill)),
+                Intent::Write,
+            )
+            .unwrap();
+        assert_eq!(strength.violations[0].code, "SCHEMA_COMPUTED_MEMBER");
+        assert_eq!(
+            strength.into_result().unwrap_err().code,
+            anda_kip::KipErrorCode::ConstraintViolation
+        );
     }
 
     #[test]
@@ -684,14 +705,14 @@ mod tests {
         let env = env();
         let experience = EndpointFacts::Element {
             kind: ElementKind::Concept,
-            schema_ref: Some(format!("{PROFILE}@2.1.0/Experience")),
+            schema_ref: Some(format!("{PROFILE}@2.0.0/Experience")),
         };
         let step = |id: &str| {
             (
                 id.to_string(),
                 EndpointFacts::Element {
                     kind: ElementKind::Concept,
-                    schema_ref: Some(format!("{PROFILE}@2.1.0/ExperienceStep")),
+                    schema_ref: Some(format!("{PROFILE}@2.0.0/ExperienceStep")),
                 },
             )
         };
@@ -704,7 +725,7 @@ mod tests {
                 Intent::Write,
             )
             .unwrap();
-        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.1.0/has_step"));
+        assert_eq!(symbol.to_string(), format!("{PROFILE}@2.0.0/has_step"));
         assert!(ok.is_valid());
 
         let (_, duplicated) = env
@@ -725,7 +746,7 @@ mod tests {
                     "C-9".to_string(),
                     EndpointFacts::Element {
                         kind: ElementKind::Concept,
-                        schema_ref: Some(format!("{PROFILE}@2.1.0/Person")),
+                        schema_ref: Some(format!("{PROFILE}@2.0.0/Person")),
                     },
                 )],
                 Intent::Write,

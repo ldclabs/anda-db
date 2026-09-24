@@ -41,7 +41,7 @@ function dispatchFixture(
     wake = String(fired.wake_ref)
   f.s.claimWake(wake, 1, 0, expiry())
   const prop = f.n.execute(
-    'MUTATE {CREATE CONCEPT ?o {TYPE "Preference" NAME "delivery"} ENSURE PROPOSITION ?p (:target,"prefers",?o)}',
+    'MUTATE {CREATE CONCEPT ?o {TYPE "Option" NAME "delivery"} ENSURE PROPOSITION ?p (:target,"prefers",?o)}',
     { target: f.target },
   ).handles.p!
   const basis = (

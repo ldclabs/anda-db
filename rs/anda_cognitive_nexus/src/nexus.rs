@@ -436,10 +436,11 @@ impl Session {
     /// Overrides only expiry eligibility for this trusted engine session.
     ///
     /// Available only with `simulation`, for isolated host-driven experiments.
-    /// Ordinary KIP requests cannot set it. It affects `sweep_expired` and
-    /// `expire_lapsed_assertions`, including the latter's per-record recheck;
+    /// Ordinary KIP requests cannot set it. It affects `sweep_expired`;
     /// authentication, grants/policies, task leases, KQL's default valid time,
     /// transaction timestamps and Governance audit continue using real time.
+    /// An Assertion's `expired` is computed from world time at every read
+    /// (§14.3), so no clock here stores it.
     #[cfg(feature = "simulation")]
     pub fn with_simulated_lifecycle_time(mut self, at: &str) -> Result<Self, KipError> {
         if self.auth.principal_id != SYSTEM_PRINCIPAL
@@ -721,46 +722,6 @@ impl Session {
             Ok(report)
         })
         .await
-    }
-
-    /// Marks the Assertions whose validity windows have closed as `expired`.
-    ///
-    /// §14.3's lifecycle state, reached explicitly. The alternative — deriving
-    /// it on every read and never recording it — leaves `expired` as a state
-    /// the model names and nothing ever produces, and leaves a caller unable
-    /// to ask which claims have lapsed without recomputing the answer itself.
-    ///
-    /// Not retraction and not supersession (§14.1, §14.2): nobody withdrew
-    /// these and nothing replaced them; their own stated windows ran out.
-    pub async fn expire_lapsed_assertions(
-        &self,
-        space_id: &str,
-        limit: usize,
-    ) -> Result<Vec<String>, KipError> {
-        let _guard = self.nexus.lock.write().await;
-        self.nexus.store.reopen_if_poisoned().await?;
-        let authority = self.authority(space_id, &self.auth).await?;
-        let now = self.lifecycle_time();
-        let mut expired = Vec::new();
-        for id in self.nexus.store.lapsed_assertions(space_id, &now).await? {
-            if expired.len() >= limit {
-                break;
-            }
-            if crate::governance::element::expire_assertion_at(
-                &self.nexus.store,
-                space_id,
-                id,
-                &authority,
-                &self.auth,
-                &now,
-            )
-            .await
-            .unwrap_or(false)
-            {
-                expired.push(id.to_string());
-            }
-        }
-        Ok(expired)
     }
 
     /// Designates the Concept this Space treats as its semantic `$self` (§5.6).
@@ -1291,6 +1252,9 @@ impl Session {
     /// The write lane (§32): one exclusive lock, the replay a retried key is
     /// owed, the gate, and the reopen a poisoned handle needs afterwards.
     async fn run_write(&self, call: &Call<'_>, statement: &anda_kip::KmlStatement) -> Response {
+        if let Some(err) = crate::kml::unsupported_clause(statement) {
+            return Response::from(err);
+        }
         let _guard = self.nexus.lock.write().await;
         if let Err(err) = self.nexus.store.reopen_if_poisoned().await {
             return Response::from(err);

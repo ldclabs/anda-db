@@ -181,7 +181,7 @@ async fn open_v2(store: Arc<InMemory>, name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
     nexus.ensure_schema(DEFAULT_SPACE, lock).await.unwrap();
@@ -241,6 +241,16 @@ async fn a_1_x_database_migrates_on_the_first_2_0_start() {
         json!(["kip://legacy/nexus@1.1.0/Spaceship"]),
         "the legacy type must resolve to a real package symbol"
     );
+
+    // The Profile has no Preference type (Profile §5.5): a 1.x Preference
+    // keeps its own symbol in the legacy package rather than being retyped
+    // as a claim the actor never made.
+    let dark = query(
+        &nexus,
+        r#"FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: "Dark mode"} }"#,
+    )
+    .await;
+    assert_eq!(dark, json!(["kip://legacy/nexus@1.1.0/Preference"]));
 
     // The multi-predicate row fanned out, and each tuple kept its own
     // confidence — the reason the fan-out cannot be collapsed.
@@ -860,7 +870,7 @@ async fn legacy_task_execution_states_are_preserved_without_fabricated_leases() 
             );
             assert!(
                 row["facets"]
-                    .get("kip://profiles/cognitive-memory@2.1.0/LeaseState")
+                    .get("kip://profiles/cognitive-memory@2.0.0/LeaseState")
                     .is_none()
             );
         }

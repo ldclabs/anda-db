@@ -124,7 +124,7 @@ impl FromStr for Version {
     }
 }
 
-/// One immutable package version: `kip://profiles/cognitive-memory@2.1.0`.
+/// One immutable package version: `kip://profiles/cognitive-memory@2.0.0`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackageRef {
     /// The stable namespace-qualified name, including the `kip://` scheme.
@@ -167,7 +167,7 @@ impl FromStr for PackageRef {
     }
 }
 
-/// One canonical symbol: `kip://profiles/cognitive-memory@2.1.0/has_step`.
+/// One canonical symbol: `kip://profiles/cognitive-memory@2.0.0/has_step`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolRef {
     /// The package version the symbol belongs to.
@@ -308,18 +308,15 @@ mod tests {
 
     #[test]
     fn a_symbol_round_trips_through_its_canonical_form() {
-        let text = "kip://profiles/cognitive-memory@2.1.0/has_step";
+        let text = cognitive_memory!("has_step");
         let symbol: SymbolRef = text.parse().unwrap();
         assert_eq!(symbol.to_string(), text);
         assert_eq!(symbol.name, "has_step");
         assert_eq!(symbol.package.package_id, "kip://profiles/cognitive-memory");
-        assert_eq!(symbol.package.version, Version::new(2, 1, 0));
+        assert_eq!(symbol.package.version, Version::new(2, 0, 0));
         // The package path's own slashes must not be mistaken for the symbol
         // separator.
-        assert_eq!(
-            symbol.package.to_string(),
-            "kip://profiles/cognitive-memory@2.1.0"
-        );
+        assert_eq!(symbol.package.to_string(), cognitive_memory!());
     }
 
     #[test]

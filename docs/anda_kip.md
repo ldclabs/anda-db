@@ -2,7 +2,8 @@
 
 [中文版](anda_kip.zh.md)
 
-Tracks KIP at `dcde1de`, including the 2.1.0 memory vocabulary and the strict
+Tracks KIP at `3251912`, including the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`) and the strict
 UTC millisecond timestamp contract (§6.5). See the
 [Cognitive Nexus documentation](anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
@@ -201,7 +202,7 @@ DESCRIBE PRIMER MODE "compact"
 DESCRIBE TYPE "Person"
 LIST SCHEMA PACKAGES STATUS "active" LIMIT 20
 LIST DEPENDENTS "C-1" DEPTH 2 LIMIT 50
-SEARCH COGNITION "dark mode" MODE "hybrid" THRESHOLD 0.7 LIMIT 5
+SEARCH CONCEPT "dark mode" MODE "hybrid" THRESHOLD 0.7 LIMIT 5
 HISTORY ELEMENT "C-1" FROM SEQ 1 TO SEQ 99
 VERIFY CAPSULE :artifact
 VALIDATE KML :command

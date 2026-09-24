@@ -2,8 +2,8 @@
 
 Use this reference for KIP/Brain work, not ordinary document CRUD. KIP protocol
 versions and Cargo package versions are different: the current Rust crates
-are in the 0.13 family, implementing KIP 2.0 with the vendored 2.1.0 memory
-vocabulary. Check the checked-out specifications and runtime capabilities
+are in the 0.13 family, implementing KIP 2.0 (KIP `3251912`) with the vendored
+`cognitive-memory@2.0.0` draft package. Check the checked-out specifications and runtime capabilities
 rather than inferring support from a package version.
 
 ## Choose the layer
@@ -36,7 +36,7 @@ Principal; do not replace authenticated user sessions with it.
 
 ## Data and capability boundaries
 
-KIP §6.5 (upstream `dcde1de`) requires timestamp inputs to be UTC strings
+KIP §6.5 requires timestamp inputs to be UTC strings
 with exactly three fractional digits: `YYYY-MM-DDTHH:mm:ss.SSSZ`. Whole
 seconds use `.000Z`. Invalid strings are `ConstraintViolation`; non-strings
 are `TypeMismatch`. Null/absence follows each field's contract. Inputs are
@@ -67,6 +67,18 @@ KIP 1.x data needs the explicit
 [migration guide](../../../docs/kip-v1-migration.md). Core schema evolution is
 not sufficient to migrate the old graph model; collection replacement is
 one-way and should be rehearsed on a backup.
+
+World time (KIP `3251912`): record a changed value as one `ASSERT` with the
+source's `at` and, when known, `valid: {from: ...}` — the new value ends the
+same actor's older open value (§25.4). Use `SUPERSEDING` only when the old
+claim was wrong; a value-only correction may name another value of the same
+slot. Coarse dates are `{earliest, latest}` bounds, never an invented instant.
+Type preference options by their kind (`prefers` is `functional_by:
+"object_type"`); there is no `Preference` type. Use
+`WITH EPISTEMIC {policy: "kip:memory-default"}` for recall that should resolve
+conflicts deterministically, and read `uncertainty.reasons` as codes
+(`temporal_indeterminate`, `outranked`). `DEFINE` answers
+`UnsupportedCapability` on both engines.
 
 ## SDK wire handling
 

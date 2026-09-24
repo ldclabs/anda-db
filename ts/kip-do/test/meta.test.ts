@@ -15,6 +15,7 @@ import {
   CAPABILITY_ENGINE_NAMES,
   CAPABILITY_REGISTRY_NAMES,
 } from '../src/meta/capability-names.generated.js'
+import { OPTIONS } from './support/options.js'
 
 /** Profiles this raw Nexus advertises; KIP-CognitiveMemory is a separate full contract. */
 const KIP_CONFORMANCE_PROFILES = [
@@ -44,7 +45,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`meta-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     nexus.execute(SETUP)
     body(nexus)
   })
@@ -52,14 +53,14 @@ async function withNexus(
 
 const SETUP = `MUTATE {
   CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
   CREATE ASSERTION ?a {
     SET FIELDS { proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9, asserted_at: "2026-09-07T00:00:00.000Z" }
   }
 }`
 
-const CM = 'kip://profiles/cognitive-memory@2.1.0'
+const CM = 'kip://profiles/cognitive-memory@2.0.0'
 
 describe('META', () => {
   it('reports what it cannot do, as data rather than as an error', async () => {
@@ -144,13 +145,9 @@ describe('META', () => {
     for (const name of report.profiles) {
       expect(KIP_CONFORMANCE_PROFILES, name).toContain(name)
     }
-    // Claimed only where it is true. Each absence has an entry in
-    // `unsupported` a caller can read the reason from.
-    expect(report.profiles).toContain('KIP-KQL')
-    // §94 names one statement or one MUTATE block as the transaction; the
-    // batch form is the `atomic_batch` capability, answered false.
-    expect(report.profiles).toContain('KIP-Transactions')
-    expect(report.profiles).toHaveLength(9)
+    // §89 has two levels. KIP-Core rests on the engine suite; the
+    // KIP-CognitiveMemory gaps (recording repair) are in `unsupported`.
+    expect(report.profiles).toEqual(['KIP-Core'])
   })
 
   it('verifies a Schema Package against its declared digest and the installed artifact', async () => {
@@ -160,7 +157,7 @@ describe('META', () => {
         p: artifact as never,
       }) as Record<string, unknown>
       expect(report.valid).toBe(true)
-      expect(report.package_ref).toBe('kip://profiles/cognitive-memory@2.1.0')
+      expect(report.package_ref).toBe('kip://profiles/cognitive-memory@2.0.0')
       expect(report.declared).toMatchObject({ checked: true })
       expect(report.installed).toEqual({ known: true, matches: true })
       // A byte changed after sealing fails the declared digest (§20.11).
@@ -271,7 +268,7 @@ describe('META', () => {
         (nexus.describe('LIST EPISTEMIC POLICIES') as { id: string }[]).map(
           (policy) => policy.id,
         ),
-      ).toEqual(['kip:policy:baseline', 'kip:policy:forecast'])
+      ).toEqual(['kip:policy:baseline', 'kip:policy:forecast', 'kip:memory-default'])
     })
   })
 

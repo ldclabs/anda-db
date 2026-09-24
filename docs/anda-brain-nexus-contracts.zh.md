@@ -2,8 +2,8 @@
 
 [English](anda-brain-nexus-contracts.md)
 
-本次实现对应 KIP `dcde1de`。协议版本仍是 KIP 2.0，标准包是
-`kip://profiles/cognitive-memory@2.1.0`。Rust 与 SQLite/Durable Object 引擎均已提供
+本次实现对应 KIP `3251912`。协议版本仍是 KIP 2.0，标准包是
+`kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:3ea9e459…`；草案原地重写了 2.0.0，用 2.1.0 草案激活过的 Space 不迁移）。Rust 与 SQLite/Durable Object 引擎均已提供
 下列接口。Brain 的检索策略、调度循环、工具适配器与五意图 Memory Interface
 由 Anda Brain 接入；数据库负责权限、引用、版本、事务和记录有效性。
 
@@ -96,8 +96,8 @@ MUTATE {
 }
 ```
 
-换用新 revision 必须以 CAS 提交，状态重置为 `proposed`，清除当前 TrialState 和
-GradingState。普通注释不会重置状态。创建 revision 本身不代表依赖已验证；自动使用
+换用新 revision 必须以 CAS 提交，状态重置为 `proposed`，清除 `current_trial` 和
+`current_evaluation`；GradingState 是当前评估的只读计算视图。普通注释不会重置状态。创建 revision 本身不代表依赖已验证；自动使用
 前还需要生产 Activity 的 DependencyBasis 或一次明确的依赖重验证。
 
 学习流程按以下顺序提交：

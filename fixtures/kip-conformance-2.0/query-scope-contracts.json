@@ -1,8 +1,8 @@
 {
   "name": "query-scope-contracts",
-  "description": "KIP 2.0 \u00a7\u00a742.4\u201345: correlated scopes, independent union, complete-solution identity, null logic and empty aggregates, exercised identically by both engines.",
+  "description": "KIP 2.0 §§42.4–45: correlated scopes, independent union, complete-solution identity, null logic and empty aggregates, exercised identically by both engines.",
   "setup": [
-    "MUTATE { CREATE CONCEPT ?alice {TYPE \"Person\" NAME \"Alice\"} CREATE CONCEPT ?bob {TYPE \"Person\" NAME \"Bob\"} CREATE CONCEPT ?tea {TYPE \"Preference\" NAME \"Tea\"} CREATE CONCEPT ?coffee {TYPE \"Preference\" NAME \"Coffee\"} ENSURE PROPOSITION ?t (?alice,\"prefers\",?tea) ENSURE PROPOSITION ?c (?alice,\"prefers\",?coffee) }"
+    "MUTATE { CREATE CONCEPT ?alice {TYPE \"Person\" NAME \"Alice\"} CREATE CONCEPT ?bob {TYPE \"Person\" NAME \"Bob\"} CREATE CONCEPT ?tea {TYPE \"Option\" NAME \"Tea\"} CREATE CONCEPT ?coffee {TYPE \"Option\" NAME \"Coffee\"} ENSURE PROPOSITION ?t (?alice,\"prefers\",?tea) ENSURE PROPOSITION ?c (?alice,\"prefers\",?coffee) }"
   ],
   "cases": [
     {
@@ -221,6 +221,23 @@
           "Same",
           "Same"
         ]
+      }
+    }
+  ],
+  "packages": [
+    {
+      "format": "KIP-Schema-Package",
+      "manifest": {
+        "package_id": "kip://conformance/options",
+        "version": "1.0.0"
+      },
+      "definitions": {
+        "concept_types": {
+          "Option": {
+            "kind": "ConceptType",
+            "description": "A preference option used by these fixtures. A real Space types each option by its kind (Profile §5.5, §7), because prefers partitions by the option's Concept Type; one catch-all type is one partition."
+          }
+        }
       }
     }
   ]

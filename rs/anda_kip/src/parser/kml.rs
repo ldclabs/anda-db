@@ -19,16 +19,16 @@ use nom::{
 use std::collections::BTreeSet;
 
 use super::common::{
-    Flavor, VResult, assignments, braced, collect_bound_object_handles,
+    Flavor, VResult, assignments, bound_object, braced, collect_bound_object_handles,
     collect_mutation_value_handles, collect_mutation_value_paths, collect_where_variables,
     element_ref, fail, handle, mutation_value, object_matcher, opt_after, parenthesized,
     proposition_matcher, quoted_string, scalar, spanned, symbol_ref, unset_field_set, where_block,
     word, words, ws,
 };
 use crate::ast::{
-    Assignments, BoundValue, ConceptCreate, ConceptUpsert, DotPathVar, ElementRef,
-    EnsureProposition, ExpectVersion, FacetAssignment, FacetUnset, KipValue, KmlStatement,
-    MatchValue, MergeConcept, MutationClause, MutationValue, ObjectMatcher, PredAtom,
+    Assignments, BoundValue, ConceptCreate, ConceptUpsert, DefineCommand, DefineKind, DotPathVar,
+    ElementRef, EnsureProposition, ExpectVersion, FacetAssignment, FacetUnset, KipValue,
+    KmlStatement, MatchValue, MergeConcept, MutationClause, MutationValue, ObjectMatcher, PredAtom,
     PropositionMatcher, PropositionTriple, RecordCreate, Scalar, SetRetention, StructuralEdge,
     StructuralRemoval, SymbolRef, Term, Transition, UpdateAction, UpdateExpr, UpdateStatement,
     VersionPlane, WhereClause, transition_state,
@@ -58,6 +58,7 @@ const ASSERTION_IMMUTABLE: &[&str] = &[
     "confidence",
     "asserted_at",
     "valid_time",
+    "context_refs",
     "evidence",
 ];
 
@@ -76,6 +77,18 @@ const PROPOSITION_IMMUTABLE: &[&str] = &["subject", "predicate", "object"];
 /// Parses a KML statement: a `MUTATE` block, or a single mutation that is still
 /// a one-clause transaction.
 pub(crate) fn parse_kml_statement(input: &str) -> VResult<'_, KmlStatement> {
+    // DEFINE changes the Schema Environment every later clause resolves
+    // against, so it is a statement of its own (Spec §20.16).
+    if let Ok((rest, _)) = ws(word("DEFINE")).parse(input) {
+        let (rest, define) = cut(define_body).parse(rest)?;
+        return Ok((
+            rest,
+            KmlStatement {
+                explicit_transaction: false,
+                clauses: vec![MutationClause::Define(define)],
+            },
+        ));
+    }
     if let Ok((rest, _)) = ws(word("MUTATE")).parse(input) {
         let (rest, groups) = cut(braced(many0(ws(mutation_clause)))).parse(rest)?;
         if groups.is_empty() {
@@ -187,6 +200,13 @@ fn mutation_clause(input: &str) -> VResult<'_, ClauseGroup> {
         }),
         map(purge_statement, |c| single(MutationClause::Purge(c))),
         map(merge_concept, |c| single(MutationClause::MergeConcept(c))),
+        // Only reachable inside MUTATE: a standalone DEFINE is taken first.
+        preceded(ws(word("DEFINE")), |i| {
+            fail(
+                i,
+                "a mutation: DEFINE is a standalone operation and cannot appear inside MUTATE",
+            )
+        }),
     ))
     .parse(input)
 }
@@ -665,6 +685,7 @@ struct AssertMembers {
     confidence: Option<MutationValue>,
     asserted_at: Option<MutationValue>,
     valid_time: Option<MutationValue>,
+    context: Option<MutationValue>,
     evidence: Option<MutationValue>,
     client_key: Option<Scalar>,
 }
@@ -673,6 +694,7 @@ impl AssertMembers {
     fn read(members: Assignments) -> Result<Self, &'static str> {
         let (mut by, mut mode, mut stance, mut confidence) = (None, None, None, None);
         let (mut asserted_at, mut valid_time, mut evidence, mut key) = (None, None, None, None);
+        let mut context = None;
         for (name, value) in members {
             let slot = match name.as_str() {
                 "by" => &mut by,
@@ -681,11 +703,13 @@ impl AssertMembers {
                 "confidence" => &mut confidence,
                 "at" => &mut asserted_at,
                 "valid" => &mut valid_time,
+                "context" => &mut context,
                 "evidence" => &mut evidence,
                 "key" => &mut key,
                 _ => {
                     return Err(
-                        "an ASSERT member: by, mode, stance, confidence, at, valid, evidence or key",
+                        "an ASSERT member: by, mode, stance, confidence, at, valid, context, \
+                         evidence or key",
                     );
                 }
             };
@@ -710,6 +734,7 @@ impl AssertMembers {
             confidence,
             asserted_at,
             valid_time,
+            context,
             evidence,
             client_key,
         })
@@ -729,6 +754,8 @@ impl AssertMembers {
             ("confidence", self.confidence),
             ("asserted_at", self.asserted_at),
             ("valid_time", self.valid_time),
+            // The scope the stance holds under (§13.3), immutable payload.
+            ("context_refs", self.context),
         ] {
             if let Some(value) = value {
                 fields.push((name.into(), value));
@@ -934,7 +961,8 @@ fn guard_structural_mutation(kind: Option<BoundKind>) -> Result<(), &'static str
     match kind {
         Some(BoundKind::Assertion) => Err(
             "a mutable target: an Assertion's citations are immutable payload — record a new \
-             Assertion with SUPERSEDING",
+             Assertion instead: a changed world is a new Assertion from the time of the change \
+             (§25.4); add SUPERSEDING only when the old Assertion was wrong (§14.2)",
         ),
         Some(BoundKind::Evidence) => Err(
             "a mutable target: correct Evidence topology with TRANSITION :old TO \"corrected\" \
@@ -954,8 +982,9 @@ fn guard_structural_mutation(kind: Option<BoundKind>) -> Result<(), &'static str
 fn guard_immutable_field(field: &str, kind: Option<BoundKind>) -> Result<(), &'static str> {
     match kind {
         Some(BoundKind::Assertion) if ASSERTION_IMMUTABLE.contains(&field) => Err(
-            "a mutable field: immutable Assertion payload changes by recording a new Assertion \
-             with SUPERSEDING, never by rewriting the old one",
+            "a mutable field: immutable Assertion payload is never rewritten — record a new \
+             Assertion instead: a changed world is a new Assertion from the time of the change \
+             (§25.4); add SUPERSEDING only when the old Assertion was wrong (§14.2)",
         ),
         Some(BoundKind::Evidence) if EVIDENCE_IMMUTABLE.contains(&field) => Err(
             "a mutable field: immutable Evidence payload is corrected with TRANSITION :old TO \
@@ -1160,6 +1189,26 @@ fn merge_concept(input: &str) -> VResult<'_, MergeConcept> {
             into,
             where_clauses,
             expect_versions,
+        },
+    ))
+}
+
+/// `DEFINE ( PREDICATE | CONCEPT TYPE ) schema_symbol object_literal`, after
+/// the `DEFINE` word (Spec §20.16).
+fn define_body(input: &str) -> VResult<'_, DefineCommand> {
+    let (input, kind) = ws(alt((
+        value(DefineKind::Predicate, word("PREDICATE")),
+        value(DefineKind::ConceptType, words(&["CONCEPT", "TYPE"])),
+    )))
+    .parse(input)?;
+    let (input, name) = ws(symbol_ref).parse(input)?;
+    let (input, definition) = ws(bound_object).parse(input)?;
+    Ok((
+        input,
+        DefineCommand {
+            kind,
+            name,
+            definition,
         },
     ))
 }
@@ -1404,6 +1453,7 @@ fn validate_clause(clause: &MutationClause) -> Result<(), KipError> {
             }
         }
         MutationClause::MergeConcept(c) => check_guards(&c.expect_versions)?,
+        MutationClause::Define(c) => super::validation::bound_object(&c.definition)?,
     }
     Ok(())
 }
@@ -1420,6 +1470,16 @@ pub(crate) fn validate_plan(statement: &KmlStatement) -> Result<(), KipError> {
     }
     for clause in &statement.clauses {
         validate_clause(clause)?;
+    }
+    if (statement.explicit_transaction || statement.clauses.len() > 1)
+        && statement
+            .clauses
+            .iter()
+            .any(|clause| matches!(clause, MutationClause::Define(_)))
+    {
+        return Err(KipError::invalid_syntax(
+            "DEFINE is a standalone operation and cannot appear inside MUTATE (Spec §20.16)",
+        ));
     }
 
     // Handles are block-local names. Two clauses claiming the same handle make
@@ -1541,6 +1601,7 @@ fn collect_clause_handles(clause: &MutationClause, out: &mut BTreeSet<String>) {
             element(&c.source);
             element(&c.into);
         }
+        MutationClause::Define(c) => collect_bound_object_handles(&c.definition, out),
     }
 }
 

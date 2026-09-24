@@ -70,7 +70,7 @@ async fn nexus(name: &str) -> CognitiveNexus {
             .install_package(&SchemaPackage::parse(source).unwrap(), "test")
             .await
             .unwrap();
-        let version = if id == PROFILE_ID { "2.1.0" } else { "1.0.0" };
+        let version = if id == PROFILE_ID { "2.0.0" } else { "1.0.0" };
         lock.packages.insert(id.to_string(), version.to_string());
         lock.states.insert(id.to_string(), PackageState::Active);
     }

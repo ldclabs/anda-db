@@ -5,7 +5,7 @@ use super::*;
 use anda_kip::cognitive::{EvaluationInput, EvaluationPolicy, EvaluationSamples};
 use serde_json::json;
 
-const PROFILE: &str = "kip://profiles/cognitive-memory@2.1.0/";
+const PROFILE: &str = cognitive_memory!("");
 fn fail(message: &str) -> KipError {
     KipError::constraint_violation(message)
 }
@@ -161,8 +161,6 @@ impl Transaction {
                             "OutcomeRecord",
                             "TrialRecord",
                             "EvaluationRecord",
-                            "TrialState",
-                            "GradingState",
                         ]
                         .iter()
                         .any(|n| k.ends_with(&format!("/{n}")))
@@ -251,67 +249,46 @@ impl Transaction {
                     .before
                     .as_ref()
                     .is_none_or(|before| edge(before, "current_revision") != revisions);
+                let trial_ptr = edge(row, "current_trial");
+                let evaluation_ptr = edge(row, "current_evaluation");
                 if changed_revision {
                     self.require_changed_guards(*id, staged)?;
-                    if status != "proposed"
-                        || facet(row, "TrialState").is_some()
-                        || facet(row, "GradingState").is_some()
-                    {
+                    if status != "proposed" || !trial_ptr.is_empty() || !evaluation_ptr.is_empty() {
                         return Err(fail(
-                            "selecting new behavior resets standing to proposed and clears current trial and grade",
+                            "selecting new behavior resets standing to proposed and clears current_trial and current_evaluation",
                         ));
                     }
                 } else {
                     let before = staged.before.as_ref().unwrap();
                     let old = crate::view::render(before);
                     let lifecycle = old["attributes"]["status"] != view["attributes"]["status"]
-                        || facet(before, "TrialState") != facet(row, "TrialState")
-                        || facet(before, "GradingState") != facet(row, "GradingState");
+                        || edge(before, "current_trial") != trial_ptr
+                        || edge(before, "current_evaluation") != evaluation_ptr;
                     if lifecycle {
                         self.require_changed_guards(*id, staged)?;
-                        let eval=activities.iter().find(|a| self.staged.get(&a.id()).is_some_and(|s|s.changed && s.is_new) && record(a,"EvaluationRecord").is_ok_and(|e| e["from_status"]==old["attributes"]["status"] && e["to_status"]==view["attributes"]["status"] && refs(&e["revision_refs"]).contains(&revisions[0])) && matches!(a,Element::Activity(a) if a.output_keys.iter().any(|k|k.contains(&id.to_string())) || a.outputs.iter().any(|r|r["id"]==id.to_string() || r.as_str()==Some(id.to_string().as_str())))).ok_or_else(||fail("lifecycle and caches require a new validated EvaluationRecord in the same transaction"))?;
+                        let eval=activities.iter().find(|a| self.staged.get(&a.id()).is_some_and(|s|s.changed && s.is_new) && record(a,"EvaluationRecord").is_ok_and(|e| e["from_status"]==old["attributes"]["status"] && e["to_status"]==view["attributes"]["status"] && refs(&e["revision_refs"]).contains(&revisions[0])) && matches!(a,Element::Activity(a) if a.output_keys.iter().any(|k|k.contains(&id.to_string())) || a.outputs.iter().any(|r|r["id"]==id.to_string() || r.as_str()==Some(id.to_string().as_str())))).ok_or_else(||fail("lifecycle and its pointers change only with a new validated EvaluationRecord in the same transaction"))?;
                         let evaluation = record(eval, "EvaluationRecord")?;
-                        if let Some(grade) = facet(row, "GradingState") {
-                            if grade["revision_ref"] != revisions[0]
-                                || grade["evaluation_ref"] != eval.id().to_string()
-                            {
-                                return Err(fail(
-                                    "grade cache must bind the exact revision and evaluation",
-                                ));
-                            }
-                            let mut success = 0u64;
-                            let mut partial = 0u64;
-                            for outcome_ref in refs(&evaluation["outcome_refs"]) {
-                                let (_, outcome) = self
-                                    .referenced_record(&outcome_ref, "OutcomeRecord")
-                                    .await?;
-                                if outcome["outcome_status"] == "success" {
-                                    success += 1;
-                                } else if outcome["outcome_status"] == "partial" {
-                                    partial += 1;
-                                }
-                            }
-                            let graded = refs(&evaluation["attempt_refs"]).len() as u64;
-                            for (key, expected) in [
-                                ("success_count", success),
-                                ("failure_count", graded.saturating_sub(success + partial)),
-                                ("graded_count", graded),
-                            ] {
-                                if let Some(actual) = grade.get(key)
-                                    && actual.as_u64() != Some(expected)
-                                {
-                                    return Err(fail(
-                                        "grade cache counts must match independent attempts in the evaluation",
-                                    ));
-                                }
-                            }
-                        }
-                        if let Some(trial) = facet(row, "TrialState")
-                            && (trial["revision_ref"] != revisions[0]
-                                || trial["trial_ref"] != evaluation["trial_ref"])
+                        // The pointers select immutable records; they are never
+                        // a second copy that could disagree with them.
+                        if !evaluation_ptr.is_empty()
+                            && evaluation_ptr != vec![eval.id().to_string()]
                         {
                             return Err(fail(
-                                "trial cache must bind the evaluation trial and revision",
+                                "current_evaluation must point to the verdict of this transaction",
+                            ));
+                        }
+                        if !trial_ptr.is_empty()
+                            && (evaluation["trial_ref"].as_str() != Some(trial_ptr[0].as_str())
+                                || !refs(
+                                    &self
+                                        .referenced_record(&trial_ptr[0], "TrialRecord")
+                                        .await?
+                                        .1["revision_refs"],
+                                )
+                                .contains(&revisions[0]))
+                        {
+                            return Err(fail(
+                                "current_trial must select the evaluation's trial of the current revision",
                             ));
                         }
                     }

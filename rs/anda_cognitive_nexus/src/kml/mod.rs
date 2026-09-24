@@ -31,6 +31,25 @@ use crate::store::Store;
 use crate::store::space::JournalEntry;
 use crate::tx::{Outcome, Transaction};
 
+/// The refusal for `DEFINE` while this engine advertises no draft vocabulary
+/// (§20.16, §67.4 `draft_vocabulary`).
+pub(crate) fn define_unsupported() -> KipError {
+    KipError::unsupported_capability(
+        "DEFINE needs the draft_vocabulary capability, which this engine does not advertise; \
+         install a Schema Package that declares the symbol instead",
+    )
+}
+
+/// A clause this engine refuses before any authorization or replay, so the
+/// caller learns the feature is missing rather than that a permission is.
+pub(crate) fn unsupported_clause(statement: &KmlStatement) -> Option<KipError> {
+    statement
+        .clauses
+        .iter()
+        .any(|clause| matches!(clause, anda_kip::MutationClause::Define(_)))
+        .then(define_unsupported)
+}
+
 /// Runs one KML statement as a transaction.
 pub async fn execute(
     store: &Store,

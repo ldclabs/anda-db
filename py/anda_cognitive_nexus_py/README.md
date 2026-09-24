@@ -9,7 +9,7 @@ It speaks **KIP 2.0**. Three consequences for anyone porting 1.x code:
 - **A type is not graph state.** There is no `$ConceptType` node to write before
   using a type: types come from an immutable Schema Package, and
   `PyAndaDB.create` activates the bundled cognitive-memory profile (`Person`,
-  `Preference`, `Event`, `Experience`, …) in the default MemorySpace.
+  `Event`, `Experience`, …) in the default MemorySpace.
 - **`response` is the KIP 2.0 response envelope**, not a bare result:
   `{"kip", "status", "results": [{"status", "result", "error"}], "receipt", …}`.
   A command that fails reports on its own result entry; the request-level
@@ -158,7 +158,7 @@ async def main():
 		await db.execute_kip("""
 			MUTATE {
 				CREATE CONCEPT ?alice { TYPE "Person" NAME :who }
-				CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+				CREATE CONCEPT ?dark { TYPE "Person" NAME "Dark mode" }
 				ASSERT ?a (?alice, "prefers", ?dark) {
 					by: ?alice, mode: "stated", confidence: 0.9
 				}

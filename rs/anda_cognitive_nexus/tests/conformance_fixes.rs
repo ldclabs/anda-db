@@ -41,9 +41,20 @@ async fn nexus(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -100,7 +111,7 @@ async fn seeded(name: &str) -> (CognitiveNexus, Json) {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }"#,
         json!({}),
@@ -324,7 +335,7 @@ async fn a_grounded_belief_about_a_missing_proposition_is_insufficient_not_empty
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
         }"#,
         json!({}),
     )
@@ -767,7 +778,7 @@ async fn a_new_assertion_canonicalizes_its_actor_through_a_merge() {
         r#"MUTATE {
             CREATE CONCEPT ?old { TYPE "Person" NAME "Alice" }
             CREATE CONCEPT ?new { TYPE "Person" NAME "Alice Smith" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode" }
         }"#,
         json!({}),
     )

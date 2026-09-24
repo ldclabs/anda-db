@@ -3,7 +3,11 @@ KIP_FUZZ_RUNS ?= 1000
 KIP_FUZZ_ARGS ?= -runs=$(KIP_FUZZ_RUNS)
 KIP_FUZZ_TARGETS ?= fuzz-kip fuzz-kql fuzz-kml fuzz-meta
 
-.PHONY: build-wasm build-did lint fix test test-all test-full test-ts test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-agents-doc check-agents-doc
+.PHONY: build-wasm build-did lint fix test test-all test-full test-ts test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-agents-doc check-agents-doc sync-kip-conformance check-kip-conformance
+
+# The shared engine suite is KIP's `conformance/engine-suite/`, copied here
+# byte for byte. KIP_REPO points at a checkout of github.com/ldclabs/KIP.
+KIP_REPO ?= ../KIP
 
 lint: check-agents-doc
 	@cargo fmt
@@ -18,6 +22,16 @@ sync-agents-doc:
 check-agents-doc:
 	@cmp -s CLAUDE.md AGENTS.md || \
 		(echo "AGENTS.md has drifted from CLAUDE.md; run 'make sync-agents-doc'" >&2; exit 1)
+
+sync-kip-conformance:
+	@cp $(KIP_REPO)/conformance/engine-suite/*.json fixtures/kip-conformance-2.0/
+	@echo "fixtures/kip-conformance-2.0 synced from $(KIP_REPO) at $$(git -C $(KIP_REPO) rev-parse --short HEAD)"
+
+check-kip-conformance:
+	@for f in $(KIP_REPO)/conformance/engine-suite/*.json; do \
+		cmp -s "$$f" "fixtures/kip-conformance-2.0/$$(basename $$f)" || \
+		(echo "fixtures/kip-conformance-2.0/$$(basename $$f) has drifted from $(KIP_REPO); run 'make sync-kip-conformance'" >&2; exit 1); \
+	done
 
 fix:
 	@cargo fmt --all

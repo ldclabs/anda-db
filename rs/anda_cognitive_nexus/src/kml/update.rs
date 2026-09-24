@@ -804,8 +804,10 @@ fn immutable_target(kind: ElementKind, id: ElementId, what: &str) -> KipError {
         ElementKind::Assertion => KipError::new(
             KipErrorCode::EpistemicRevisionRequired,
             format!(
-                "{what} would rewrite {id}'s epistemic payload; a changed commitment is a new \
-                 Assertion with SUPERSEDING, so the record of what was believed survives"
+                "{what} would rewrite {id}'s epistemic payload; record a new Assertion instead: \
+                 a changed world is a new Assertion from the time of the change, which ends the \
+                 old value (§25.4), and SUPERSEDING is only for an Assertion that was wrong \
+                 (§14.2)"
             ),
         ),
         ElementKind::Evidence => KipError::new(

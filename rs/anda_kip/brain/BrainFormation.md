@@ -1,7 +1,5 @@
 # KIP 2.0 Brain — Memory Formation
 
-**[English](./BrainFormation.md) | [中文](./BrainFormation_CN.md)**
-
 ## Status
 
 **Reference Anda Brain Formation Policy**
@@ -11,7 +9,7 @@ This document defines one reference memory-formation policy for a KIP 2.0 Brain.
 It assumes:
 
 ```text
-KIP-2.0-SPECIFICATION.md
+SPECIFICATION.md
 brain/KIPFormation.md        (role card; full KIPSyntax.md only as needed)
 profiles/CognitiveMemoryProfile-2.0.md
 brain/ExperienceLearningArchitecture.md
@@ -62,7 +60,7 @@ For `Alice: "I prefer dark mode"`, Formation may record `asserted_by = Alice`, `
       "content": "I always prefer dark mode.",
       "actor_ref": "alice",
       "message_id": "msg-123",
-      "timestamp": "2026-08-14T01:00:00Z"
+      "timestamp": "2026-08-14T01:00:00.000Z"
     }
   ],
   "context": {
@@ -368,11 +366,16 @@ TRANSITION A1 TO "superseded" BY A2
 belief_revision Activity
 ```
 
-Sugar form: `ASSERT (...) {by: ..., mode: ..., evidence: :e2} SUPERSEDING :a1`.
+Sugar form: `ASSERT (...) {by: ..., mode: ..., at: :corrected_at, valid: :corrected_valid_time, evidence: :e2} SUPERSEDING :a1`. For a value-only correction, preserve the interval being corrected; materialize a missing original start as `{latest: <original asserted_at>}` (Spec §14.2), so historical recall sees the corrected value.
 
 Never overwrite A1. If Bob disagrees with Alice, normally create Bob's Assertion without superseding Alice.
 
-Supersession means A1 was wrong. When the world changed instead — Alice moved, the project's status advanced — A1 was true for its time: re-assert it with its interval closed (`valid: {from, until: <change>}`, superseding the open-ended A1 only for its interval) and assert the new value with `valid: {from: <change>}`. Both stay active, and `FOR TIME` before the change still answers the old value (Spec §14.2, F.2).
+Supersession means A1 was wrong. When the world changed instead — Alice moved, the project's status advanced — A1 was true for its time: assert only the new value, with `valid: {from: <change>}`. Temporal succession ends A1 at that instant without touching it, both stay active, and `FOR TIME` before the change still answers the old value (Spec §14.2, §25.4, F.2). With no change date, write no `from` at all — a missing start already means "no later than the claim" (Spec §25.2) — and set `asserted_at` to the statement's time, because that is the claim's start key (Spec §13.2); never an invented instant. Two `inferred` claims without a written `from` never succeed one another (Spec §25.4): a disagreement between two sources stays a conflict, not an invented change. A value that ended with no successor is Alice's `stance: "reject"` from the end. When Formation cannot tell a correction from a change, it records a change and discloses the ambiguity.
+
+Encoding/attribution mistakes use the protected recording_repair contract
+(Spec §57.8), not an invented actor withdrawal or correction of sound source
+Evidence. Capture a digest-bound source locator and keep related input processing
+causally ordered (Memory Interface §5.1). Apply MemoryScope to all products (Profile §20.3).
 
 # 17. Literal-Valued Facts
 
@@ -405,7 +408,6 @@ MUTATE {
     SET STRUCTURAL {
       ("involves", :alice)
       ("mentions", :topic)
-      ("derived_from", :msg)
     }
   }
   CREATE ACTIVITY ?formation {
@@ -449,7 +451,7 @@ Create Commitment for promises, deadlines, follow-ups, reminders, and future obl
 
 Commitment does not automatically schedule an external action.
 
-A Commitment that waits on the world gets its trigger stated as a Watch — delta ("when the reply arrives") or silence ("if nothing by Thursday") — referencing the Commitment through `derived_from`. The Watch holds the condition; firing it later grants nothing.
+A Commitment that waits on the world gets its trigger stated as a Watch — delta ("when the reply arrives") or silence ("if nothing by Thursday") — referencing the Commitment through `watches`. The Watch holds the condition; firing it later grants nothing.
 
 ```prolog
 CREATE CONCEPT ?commitment {
@@ -478,7 +480,7 @@ CREATE CONCEPT ?watch {
   }
   SET STRUCTURAL {
     ("watches", :alice)
-    ("derived_from", :commitment_id)
+    ("watches", :commitment_id)
     ("assigned_to", :system)
   }
 }
@@ -488,7 +490,7 @@ CREATE CONCEPT ?watch {
 
 # 23. Preference Formation
 
-Explicit preference statement remains Evidence + Proposition + Assertion. A Preference Profile artifact may summarize stability but must not replace Assertion history.
+Explicit preference statement remains Evidence + Proposition + Assertion: `(person, prefers, option)`. The option is a Concept typed by its kind (`ColorScheme`, `Editor`, …) because `prefers` partitions by that type (Profile §5.5, §7); when no installed package names the kind, `DEFINE CONCEPT TYPE` it first, and never use a catch-all type such as `Topic`. A newer preference of one kind succeeds the older by temporal succession. There is no Preference type: a summary of a stable pattern is an Insight `about` the kind, derived through a recorded Activity, and it never replaces the claim history.
 
 # 24. SelfModel Candidates
 
@@ -588,8 +590,8 @@ schema and processing receipt. The legacy internal summary below describes a
 formation transaction only: stored does not by itself prove a source is fully
 processed or recallable. Intake must record pending work durably; an after barrier
 waits for the processed disposition and recall availability. Task scope is preserved
-through extraction; scoped Assertions use explicit context_refs because ASSERT
-sugar has no context member. Missing estimates are not guessed to fill fields.
+through every product using MemoryScope; scoped ASSERT uses `context` and lowers
+to the same explicit context_refs. Missing estimates are not guessed to fill fields.
 
 ```json
 {

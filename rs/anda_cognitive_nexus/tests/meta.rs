@@ -32,9 +32,20 @@ async fn fresh(name: &str) -> CognitiveNexus {
         .unwrap();
     let mut lock = SchemaLock::default();
     lock.packages
-        .insert(PROFILE_ID.to_string(), "2.1.0".to_string());
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
     lock.states
         .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -64,7 +75,7 @@ async fn seeded(name: &str) -> CognitiveNexus {
         &nexus,
         r#"MUTATE {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice Anderson" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark mode theme" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark mode theme" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
             CREATE ASSERTION ?a {
                 SET FIELDS {proposition: ?p, asserted_by: ?alice, stance: "support", mode: "stated", confidence: 0.9}
@@ -166,12 +177,12 @@ async fn describe_answers_with_canonical_identity_not_the_local_name() {
     let described = ok(&nexus, r#"DESCRIBE TYPE "Person""#).await;
     assert_eq!(
         described["ref"],
-        "kip://profiles/cognitive-memory@2.1.0/Person"
+        "kip://profiles/cognitive-memory@2.0.0/Person"
     );
     assert_eq!(described["local_name"], "Person");
     assert_eq!(
         described["package_ref"],
-        "kip://profiles/cognitive-memory@2.1.0"
+        "kip://profiles/cognitive-memory@2.0.0"
     );
     assert!(described["definition"]["attributes"]["open"].is_boolean());
 
@@ -203,8 +214,15 @@ async fn list_enumerates_the_schema_environment_and_pages() {
     assert!(names.contains(&"Experience"));
 
     let packages = ok(&nexus, "LIST SCHEMA PACKAGES").await;
-    assert_eq!(packages.as_array().unwrap().len(), 1);
-    assert_eq!(packages[0]["status"], "active");
+    // The Profile and the test options package.
+    assert_eq!(packages.as_array().unwrap().len(), 2);
+    assert!(
+        packages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|package| package["status"] == "active")
+    );
 
     // Filtering by a status nothing has returns nothing, rather than
     // everything.
@@ -260,7 +278,7 @@ async fn search_grounds_and_says_what_its_score_is_not() {
     assert!(result["search_context"]["index_seq"].is_number());
 
     // Narrowing by type still resolves the local name to its exact symbol.
-    let typed = ok(&nexus, r#"SEARCH CONCEPT "Dark" WITH TYPE "Preference""#).await;
+    let typed = ok(&nexus, r#"SEARCH CONCEPT "Dark" WITH TYPE "Option""#).await;
     assert_eq!(typed["hits"].as_array().unwrap().len(), 1);
     let mismatched = ok(&nexus, r#"SEARCH CONCEPT "Dark" WITH TYPE "Person""#).await;
     assert!(mismatched["hits"].as_array().unwrap().is_empty());
@@ -468,7 +486,7 @@ async fn verify_schema_package_checks_the_declared_digest_and_the_installed_arti
     assert_eq!(report["valid"], true);
     assert_eq!(
         report["package_ref"],
-        "kip://profiles/cognitive-memory@2.1.0"
+        "kip://profiles/cognitive-memory@2.0.0"
     );
     assert_eq!(report["declared"]["checked"], true);
     assert_eq!(report["installed"]["known"], true);
@@ -720,7 +738,15 @@ async fn trust_refuses_rather_than_reporting_an_empty_judgement() {
 async fn the_epistemic_policy_is_introspectable_before_it_is_used() {
     let nexus = fresh("policies").await;
     let policies = ok(&nexus, "LIST EPISTEMIC POLICIES").await;
-    assert_eq!(policies.as_array().unwrap().len(), 2);
+    // The baseline, the forecast and the standard memory policy (§21.13).
+    assert_eq!(policies.as_array().unwrap().len(), 3);
+    assert!(
+        policies
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == "kip:memory-default")
+    );
 
     let baseline = ok(&nexus, r#"DESCRIBE EPISTEMIC POLICY "baseline""#).await;
     assert_eq!(baseline["id"], "kip:policy:baseline");
@@ -747,8 +773,9 @@ async fn the_epistemic_policy_is_introspectable_before_it_is_used() {
     // not a silence a caller has to interpret.
     let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
     assert_eq!(registry["weighted_projection"], json!(true));
-    assert_eq!(registry["materialized_projection"], json!(false));
-    assert_eq!(registry["belief_slot"], json!(true));
+    // Level requirements are no longer registry entries (§67.4).
+    assert!(registry.get("belief_slot").is_none());
+    assert!(registry.get("materialized_projection").is_none());
 }
 
 /// §67.4 is a closed registry: a `requires` block names an entry from it, and
@@ -766,18 +793,17 @@ async fn the_capability_registry_names_everything_the_spec_registered() {
         "semantic_search",
         "hybrid_search",
         "search_index_freshness",
-        "belief_slot",
         "weighted_projection",
-        "materialized_projection",
         "signed_receipts",
-        "ingestion_context",
         "streaming",
         "artifacts",
         "change_stream",
         "filtered_delivery",
         "watch_evaluation",
-        "list_dependents",
-        "payload_purge",
+        "exposure_log",
+        "draft_vocabulary",
+        "identity_repair",
+        "recording_repair",
         "capsule_export",
         "capsule_import",
         "capsule_signatures",

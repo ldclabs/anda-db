@@ -22,7 +22,7 @@ import type {
   WakeRecord,
 } from './types.js'
 
-export const PROFILE = 'kip://profiles/cognitive-memory@2.1.0/'
+export { PROFILE_PREFIX as PROFILE } from '../schema/profile-ref.js'
 export const FORMAT = 'anda-brain:attention-v1'
 export const CONTINUATION = 'anda-brain:attention-continuation-v1'
 export const CONFIG = 'attention/config'

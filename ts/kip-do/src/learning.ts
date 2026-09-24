@@ -10,7 +10,7 @@ import { type EvaluationPolicy, type EvaluationSamples } from './cognitive.js'
 import { diffPlanes } from './tx.js'
 import type { Transaction, Staged } from './tx.js'
 
-const PROFILE = 'kip://profiles/cognitive-memory@2.1.0/'
+import { PROFILE_PREFIX as PROFILE } from './schema/profile-ref.js'
 const obj = (v: Json | undefined): JsonMap => (isJsonMap(v) ? v : {})
 const refs = (v: Json | undefined): string[] =>
   Array.isArray(v)
@@ -52,8 +52,6 @@ export function validateLearning(tx: Transaction): void {
           'OutcomeRecord',
           'TrialRecord',
           'EvaluationRecord',
-          'TrialState',
-          'GradingState',
         ].some((n) => facet(s.element, n)),
     )
   )
@@ -545,18 +543,18 @@ export function validateLearning(tx: Transaction): void {
         fail('current_revision and revision_of must be bidirectional')
       const before = s.baseRow ? store.load(parseElementId(id)) : null,
         status = obj(render(row).attributes).status
+      const trialPtr = edge(row, 'current_trial'),
+        evaluationPtr = edge(row, 'current_evaluation')
       if (!before || !same(edge(before, 'current_revision'), revisions)) {
         guarded(id, s)
-        if (
-          status !== 'proposed' ||
-          facet(row, 'TrialState') ||
-          facet(row, 'GradingState')
-        )
-          fail('new revision resets standing and clears trial and grade')
+        if (status !== 'proposed' || trialPtr.length > 0 || evaluationPtr.length > 0)
+          fail(
+            'selecting new behavior resets standing to proposed and clears current_trial and current_evaluation',
+          )
       } else if (
         obj(render(before).attributes).status !== status ||
-        !same(facet(before, 'TrialState'), facet(row, 'TrialState')) ||
-        !same(facet(before, 'GradingState'), facet(row, 'GradingState'))
+        !same(edge(before, 'current_trial'), trialPtr) ||
+        !same(edge(before, 'current_evaluation'), evaluationPtr)
       ) {
         guarded(id, s)
         const evaluation = activities.find((a) => {
@@ -573,45 +571,18 @@ export function validateLearning(tx: Transaction): void {
         })
         if (!evaluation)
           fail(
-            'lifecycle and caches need new validated EvaluationRecord in the same transaction',
+            'lifecycle and its pointers change only with a new validated EvaluationRecord in the same transaction',
           )
-        const grade = facet(row, 'GradingState'),
-          trial = facet(row, 'TrialState')
+        // The pointers select immutable records; they are never a second
+        // copy that could disagree with them (GradingState is computed).
+        if (evaluationPtr.length > 0 && !same(evaluationPtr, [idOf(evaluation!)]))
+          fail('current_evaluation must point to the verdict of this transaction')
         if (
-          grade &&
-          (grade.revision_ref !== revisions[0] ||
-            grade.evaluation_ref !== idOf(evaluation!))
+          trialPtr.length > 0 &&
+          (facet(evaluation!, 'EvaluationRecord')!.trial_ref !== trialPtr[0] ||
+            !refs(record(trialPtr[0]!, 'TrialRecord')[1].revision_refs).includes(revisions[0]!))
         )
-          fail('grade cache must bind exact revision and evaluation')
-        if (grade) {
-          const r = facet(evaluation!, 'EvaluationRecord')!,
-            selected = refs(r.attempt_refs),
-            samples = refs(r.outcome_refs).map(
-              (ref) => record(ref, 'OutcomeRecord')[1],
-            )
-          const success = samples.filter(
-              (o) => o.outcome_status === 'success',
-            ).length,
-            partial = samples.filter(
-              (o) => o.outcome_status === 'partial',
-            ).length
-          for (const [key, count] of Object.entries({
-            success_count: success,
-            failure_count: Math.max(0, selected.length - success - partial),
-            graded_count: selected.length,
-          }))
-            if (grade[key] !== undefined && grade[key] !== count)
-              fail(
-                'grade cache counts must match independent attempts in evaluation',
-              )
-        }
-        if (
-          trial &&
-          (trial.revision_ref !== revisions[0] ||
-            trial.trial_ref !==
-              facet(evaluation!, 'EvaluationRecord')!.trial_ref)
-        )
-          fail('trial cache must bind evaluation trial and revision')
+          fail('current_trial must select the evaluation\'s trial of the current revision')
       }
     }
     const decision = facet(row, 'DecisionRecord')

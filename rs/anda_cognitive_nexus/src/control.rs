@@ -11,7 +11,11 @@ use anda_kip::{Json, KipError, KipErrorCode, Map};
 use serde_json::json;
 
 pub fn initial_projection() -> Json {
-    json!({"baseline": Policy::baseline(), "forecast": Policy::forecast()})
+    json!({
+        "baseline": Policy::baseline(),
+        "forecast": Policy::forecast(),
+        "memory-default": Policy::memory_default(),
+    })
 }
 
 impl Store {
@@ -166,7 +170,7 @@ impl Store {
         };
         let controls = if matches!(
             kind,
-            "policy" | "trust" | "identity" | "authorization" | "schema"
+            "policy" | "trust" | "identity" | "authorization" | "schema" | "recording"
         ) {
             json!([{"kind":kind,"version":cx.seq.to_string()}])
         } else {
@@ -220,11 +224,26 @@ impl Store {
         let requested = Policy::from_settings(settings)?;
         let name = if requested.id.starts_with("kip:policy:forecast") {
             "forecast"
+        } else if requested
+            .id
+            .starts_with(crate::projection::policy::MEMORY_DEFAULT_ID)
+        {
+            "memory-default"
         } else {
             "baseline"
         };
-        let mut policy: Policy = serde_json::from_value(control.value[name].clone())
-            .map_err(|e| KipError::internal_error(e.to_string()))?;
+        // The standard memory policy is fixed by its artifact (§21.13), so a
+        // Space created before it was bundled still resolves it.
+        let mut policy: Policy = match control.value.get(name) {
+            Some(stored) => serde_json::from_value(stored.clone())
+                .map_err(|e| KipError::internal_error(e.to_string()))?,
+            None if name == "memory-default" => Policy::memory_default(),
+            None => {
+                return Err(KipError::internal_error(format!(
+                    "projection control has no {name} policy"
+                )));
+            }
+        };
         // Apply only settings explicitly requested by the reader.
         if settings.contains_key("accept") {
             policy.accept = requested.accept;

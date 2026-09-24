@@ -74,6 +74,30 @@ pub fn content_digest(artifact: &Json) -> String {
     )
 }
 
+/// Refuses a `functional_by` declaration §20.15 does not admit: any value but
+/// `"object_type"`, together with `functional: true`, or over an object that
+/// is not declared as Concepts — a Literal has no Concept Type to partition by.
+pub(crate) fn check_functional_by(package: &SchemaPackage) -> Result<(), KipError> {
+    for (name, def) in &package.definitions.predicates {
+        let Some(by) = &def.functional_by else {
+            continue;
+        };
+        let concepts = !def.object.concept_types.is_empty()
+            || (!def.object.kinds.is_empty() && def.object.kinds.iter().all(|k| k == "Concept"));
+        if by != "object_type"
+            || def.functional
+            || !def.object.literal_datatypes().is_empty()
+            || !concepts
+        {
+            return Err(KipError::constraint_violation(format!(
+                "predicate {name}: functional_by must be \"object_type\", never with \
+                 functional: true, and its object must be declared as Concepts (§20.15)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a package that would shadow a reserved Core symbol (§20.13).
 ///
 /// `kip://core` is implicitly active in every Schema Environment and cannot be
@@ -152,6 +176,7 @@ impl Store {
     ) -> Result<PackageRef, KipError> {
         let package_ref = package.package_ref()?;
         reject_core_shadowing(package)?;
+        check_functional_by(package)?;
         let artifact = package.artifact()?;
         crate::schema::contracts::verify_artifact(&artifact)?;
         let digest = content_digest(&artifact);

@@ -88,6 +88,10 @@ export type {
   ListTarget,
   SearchCommand,
   SearchTarget,
+  // `?x SEARCH <KIND> ... LIMIT <k>` inside WHERE (Spec §43.8).
+  SearchPatternClause,
+  // `DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` (Spec §20.16).
+  DefineCommand,
   VerifyTarget,
   ValidateCommand,
   ValidateTarget,

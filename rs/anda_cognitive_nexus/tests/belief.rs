@@ -62,10 +62,21 @@ async fn fresh(name: &str) -> CognitiveNexus {
             .unwrap();
     }
     let mut lock = SchemaLock::default();
-    for (id, version) in [(PROFILE_ID, "2.1.0"), ("kip://test/status", "1.0.0")] {
+    for (id, version) in [(PROFILE_ID, "2.0.0"), ("kip://test/status", "1.0.0")] {
         lock.packages.insert(id.to_string(), version.to_string());
         lock.states.insert(id.to_string(), PackageState::Active);
     }
+    nexus
+        .install_package(
+            &SchemaPackage::parse(include_str!("support/options.json")).unwrap(),
+            "test",
+        )
+        .await
+        .unwrap();
+    lock.packages
+        .insert("kip://test/options".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/options".into(), PackageState::Active);
     nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
     nexus
 }
@@ -116,7 +127,7 @@ async fn base(name: &str) -> CognitiveNexus {
             CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
             CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
             CREATE CONCEPT ?carol { TYPE "Person" NAME "Carol" }
-            CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+            CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
             ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
         }"#,
     )
@@ -182,10 +193,10 @@ async fn nothing_on_record_is_insufficient_and_never_rejected() {
     assert_eq!(projected["status"], "insufficient");
     assert_eq!(projected["support"]["score"], 0.0);
     assert_eq!(projected["opposition"]["score"], 0.0);
-    assert_eq!(
-        projected["uncertainty"]["reasons"][0],
-        "no eligible Assertion bears on this Proposition"
-    );
+    assert_eq!(projected["uncertainty"]["level"], "total");
+    // Reasons are machine codes (§27.2); nothing indeterminate or outranked
+    // happened here, so none applies.
+    assert!(projected["uncertainty"].get("reasons").is_none());
 }
 
 #[tokio::test]
@@ -208,14 +219,9 @@ async fn one_confident_source_is_accepted_and_says_it_stands_alone() {
             .len(),
         1
     );
-    // Accepted, and still honest about resting on one voice.
-    let reasons = projected["uncertainty"]["reasons"].as_array().unwrap();
-    assert!(
-        reasons
-            .iter()
-            .any(|r| r.as_str().unwrap().contains("single source")),
-        "{reasons:?}"
-    );
+    // Accepted, and still honest about resting on one voice: one root group
+    // in the ledger, and a low rather than absent uncertainty level.
+    assert_eq!(projected["uncertainty"]["level"], "low");
     // §76: the score must declare what it is, and it is not a probability.
     assert_eq!(
         projected["support"]["score_semantics"],
@@ -387,7 +393,7 @@ async fn the_policy_travels_with_the_answer() {
 
     let default = belief(&nexus, "").await;
     assert_eq!(default["policy"]["id"], "kip:policy:baseline");
-    assert_eq!(default["policy"]["version"], 2);
+    assert_eq!(default["policy"]["version"], 3);
     assert_eq!(default["status"], "accepted");
 
     // Raising the bar changes the answer — and changes the reported identity,
@@ -419,9 +425,10 @@ async fn the_policy_travels_with_the_answer() {
 }
 
 #[tokio::test]
-async fn a_functional_predicate_makes_rival_values_oppose_each_other() {
-    // Spec §34.2 and §58: conflict-set expansion. Nobody rejected "healthy";
-    // they asserted "degraded", and the schema says only one can apply.
+async fn a_functional_predicate_makes_rival_values_conflict() {
+    // Spec §21.11, §25.1: nobody rejected "healthy"; they asserted "degraded",
+    // and the schema says only one can apply. Without `complete` that is a
+    // conflict set, never opposition: neither value is rejected.
     let nexus = fresh("functional").await;
     ok(
         &nexus,
@@ -455,13 +462,12 @@ async fn a_functional_predicate_makes_rival_values_oppose_each_other() {
     .await;
     let projected = &result.as_array().unwrap()[0];
     assert_eq!(projected["status"], "contested");
-    assert_eq!(
-        projected["opposition"]["root_groups"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1,
-        "the rival value opposes without anyone rejecting"
+    assert_eq!(projected["candidate_status"], "accepted");
+    assert_eq!(projected["conflict_reasons"], json!(["functional_value"]));
+    assert_eq!(projected["conflict_refs"].as_array().unwrap().len(), 1);
+    assert!(
+        projected["opposition"].get("root_groups").is_none(),
+        "a rival value conflicts; nobody opposed this one"
     );
 
     // A non-functional predicate has no such rivalry: two values coexist.
@@ -560,8 +566,8 @@ async fn a_belief_slot_reports_the_conflict_set_not_a_winner() {
     assert!(slot["policy"]["id"].is_string());
     assert!(slot.get("temporal").is_some());
     assert_eq!(slot["uncertainty"]["level"], "high");
-    // Neither candidate is accepted: each opposes the other through the
-    // functional predicate, so the slot has no settled value at all.
+    // Neither candidate is accepted: they conflict through the functional
+    // predicate, so the slot has no settled value at all.
     assert!(slot["accepted_values"].as_array().unwrap().is_empty());
     // A leading side exists and is named as *leading*, not as the value.
     assert!(slot["leading"].is_string());

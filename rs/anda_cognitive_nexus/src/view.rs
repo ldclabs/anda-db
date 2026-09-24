@@ -45,7 +45,7 @@ pub fn render(element: &Element) -> Json {
 /// Reads one dot path out of a rendered view, resolving a Facet's local name.
 ///
 /// A Facet is stored under its exact symbol —
-/// `kip://profiles/cognitive-memory@2.1.0/MnemonicState` — because a persisted
+/// `kip://profiles/cognitive-memory@2.0.0/MnemonicState` — because a persisted
 /// reference must name one version forever (§21). A command writes the local
 /// name the environment resolves: `?m.facets["MnemonicState"].salience`. That
 /// resolution belongs here, on the read, rather than in a second copy of the
@@ -268,9 +268,13 @@ pub fn endpoint_view(value: &Json) -> Json {
 }
 
 fn assertion(row: &AssertionRow) -> Json {
+    let point = |stored: &str| {
+        crate::time::Point::load(stored)
+            .and_then(|point| serde_json::from_value(point.to_json()).ok())
+    };
     let valid_time = ValidTime {
-        from: some_text(&row.valid_from),
-        until: some_text(&row.valid_until),
+        from: point(&row.valid_from),
+        until: point(&row.valid_until),
     };
     let value = Assertion {
         envelope: envelope(row),

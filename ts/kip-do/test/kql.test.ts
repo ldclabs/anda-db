@@ -2,6 +2,7 @@ import { env, runInDurableObject } from 'cloudflare:test'
 import { describe, expect, it } from 'vitest'
 import { CognitiveNexus } from '../src/nexus.js'
 import { COGNITIVE_MEMORY } from '../src/schema/index.js'
+import { OPTIONS } from './support/options.js'
 
 /**
  * The read language, tested against the cases the conformance suite pins.
@@ -18,7 +19,7 @@ async function withNexus(
   const stub = env.KIP_DB.getByName(`kql-${name}`)
   await runInDurableObject(stub, (_instance, state) => {
     const nexus = CognitiveNexus.connect(state.storage)
-    nexus.activatePackages([COGNITIVE_MEMORY])
+    nexus.activatePackages([COGNITIVE_MEMORY, OPTIONS])
     nexus.execute(SETUP)
     body(nexus)
   })
@@ -28,7 +29,7 @@ async function withNexus(
 const SETUP = `MUTATE {
   CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" SET ATTRIBUTES { display_name: "Alice A" } }
   CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
-  CREATE CONCEPT ?dark { TYPE "Preference" NAME "Dark" }
+  CREATE CONCEPT ?dark { TYPE "Option" NAME "Dark" }
   ENSURE PROPOSITION ?p (?alice, "prefers", ?dark)
 }`
 
@@ -218,7 +219,7 @@ describe('KQL', () => {
 
   it('resolves a local type name to its exact symbol on the read side too', async () => {
     await withNexus('symbols', (nexus) => {
-      const CM = 'kip://profiles/cognitive-memory@2.1.0'
+      const CM = 'kip://profiles/cognitive-memory@2.0.0'
       expect(
         nexus.query(`FIND(?c.schema_ref) WHERE { ?c CONCEPT {name: "Alice"} }`),
       ).toEqual([`${CM}/Person`])
