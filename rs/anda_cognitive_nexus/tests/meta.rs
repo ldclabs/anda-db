@@ -1073,3 +1073,112 @@ async fn search_pages_refuse_a_changed_index() {
     .await;
     assert_eq!(response.error.unwrap().code.as_str(), "CursorExpired");
 }
+
+/// Memory Interface §2: a raw Nexus MUST NOT advertise a binding its
+/// connected Brain cannot serve, so `memory_interface`,
+/// `durable_brain_runtime` and `receiver_fencing` are `false` until the host
+/// declares them — and then `DESCRIBE CAPABILITIES`, the Primer and every
+/// `requires` block answer with the declaration.
+#[tokio::test]
+async fn host_capabilities_are_the_hosts_to_declare() {
+    use anda_cognitive_nexus::meta::HostCapabilities;
+    use anda_kip::memory::binding::{Budget, Bundle, Descriptor};
+
+    let nexus = fresh("host_capabilities").await;
+    let requires = |name: &str| {
+        let request: Request = serde_json::from_value(json!({
+            "kip": "2.0",
+            "requires": {name: true},
+            "operations": [{"command": "DESCRIBE SPACE"}]
+        }))
+        .unwrap();
+        let parsed = anda_kip::parse_kip("DESCRIBE SPACE").unwrap();
+        let nexus = nexus.clone();
+        async move {
+            nexus
+                .execute(parsed, &request, &request.operations[0])
+                .await
+                .status
+        }
+    };
+    let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
+    for name in [
+        "memory_interface",
+        "durable_brain_runtime",
+        "receiver_fencing",
+    ] {
+        assert_eq!(registry[name], json!(false), "{name}");
+    }
+    assert_ne!(
+        requires("memory_interface").await,
+        TopLevelStatus::Succeeded
+    );
+    assert!(
+        ok(&nexus, "DESCRIBE PRIMER")
+            .await
+            .get("extensions")
+            .is_none()
+    );
+
+    let descriptor = Descriptor {
+        kip_memory: "2.0".into(),
+        bundles: vec![Bundle::MemoryBasic],
+        default_scope: None,
+        default_budget: Budget {
+            max_output_tokens: Some(4096),
+            deadline_ms: Some(30_000),
+            tokenizer: None,
+        },
+        tokenizer: "o200k_base".into(),
+        minimum_response_tokens: 256,
+        default_space: None,
+    };
+    // A level this engine's conformance claim cannot carry is refused.
+    let mut experience = descriptor.clone();
+    experience.bundles.push(Bundle::MemoryExperience);
+    let claims_memory = ok(&nexus, "DESCRIBE CAPABILITIES").await["profiles"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("KIP-CognitiveMemory"));
+    assert_eq!(
+        nexus
+            .set_host_capabilities(HostCapabilities {
+                memory_interface: Some(experience),
+                ..Default::default()
+            })
+            .is_ok(),
+        claims_memory
+    );
+
+    nexus
+        .set_host_capabilities(HostCapabilities {
+            memory_interface: Some(descriptor),
+            durable_brain_runtime: true,
+            receiver_fencing: false,
+        })
+        .unwrap();
+    let registry = ok(&nexus, "DESCRIBE CAPABILITIES").await["supported"]["registry"].clone();
+    assert_eq!(
+        registry["memory_interface"]["bundles"],
+        json!(["memory_basic"])
+    );
+    assert_eq!(registry["durable_brain_runtime"], json!(true));
+    assert_eq!(registry["receiver_fencing"], json!(false));
+    assert_eq!(
+        requires("memory_interface").await,
+        TopLevelStatus::Succeeded
+    );
+    assert_eq!(
+        requires("durable_brain_runtime").await,
+        TopLevelStatus::Succeeded
+    );
+    assert_ne!(
+        requires("receiver_fencing").await,
+        TopLevelStatus::Succeeded
+    );
+    let primer = ok(&nexus, "DESCRIBE PRIMER").await;
+    assert_eq!(
+        primer["extensions"]["memory_interface"]["kip_memory"],
+        "2.0"
+    );
+}

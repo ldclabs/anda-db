@@ -136,6 +136,12 @@ impl Store {
                 Element::Activity(row) => put!(row),
             }
         }
+        // §66.8, §60.7: an erased element's exposure entries go with it.
+        for (element, op) in &plan.writes {
+            if op == "purge" {
+                self.remove_exposures(&element.id().to_string()).await?;
+            }
+        }
         if let Some(row) = &plan.space {
             // Raw write: the plan already owns the audit and notification.
             let mut row = row.clone();

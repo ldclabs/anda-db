@@ -188,6 +188,10 @@ pub struct SystemState {
     pub output_versions: Option<Map<String, Json>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_validity: Option<Json>,
+    /// Whether this extraction still stands or was invalidated by a recording
+    /// repair (§57.8); rendered on Assertions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_validity: Option<crate::cognitive::RecordingValidity>,
     /// Monotonic mutation counter; the target of a bare `EXPECT VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
@@ -557,11 +561,12 @@ pub struct Activity {
     /// When it ended; terminal outputs freeze with it (§16.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
-    /// What it consumed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// What it consumed. Always present, possibly empty: the element schema
+    /// requires the member on every Activity.
+    #[serde(default)]
     pub inputs: Vec<Json>,
-    /// What it produced.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// What it produced. Always present, possibly empty.
+    #[serde(default)]
     pub outputs: Vec<Json>,
     /// The semantic actors involved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

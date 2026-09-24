@@ -16,6 +16,7 @@ import type { Json } from '../json.js'
 import { BELIEF_STATUSES } from '../kip/semantics.js'
 import { specRevision, parserVersion } from '../kip/parser.js'
 import { BASELINE_ID } from '../projection/policy.js'
+import { CONFORMANCE_PROFILES, type HostCapabilities, hostRegistryValue, hostState } from './host.js'
 
 /** The KIP revision this engine implements. */
 export const KIP_VERSION = '2.0'
@@ -62,10 +63,10 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   change_stream: true, // §36, §68
   filtered_delivery: true, // §36.3: CHANGES is unfiltered
   watch_evaluation: true, // Cognitive Memory Profile §5.11
-  exposure_log: false, // §66.8: reads are not logged
+  exposure_log: true, // §66.8: Session.recordExposures / readExposures, outside the cognitive store
   draft_vocabulary: true, // §20.16: DEFINE adds to the Space's draft package
   identity_repair: true,
-  recording_repair: false, // §57.8: so KIP-CognitiveMemory is not claimed
+  recording_repair: true, // §57.8: Session.repairRecording and _system.recording_validity
   derive_permission: true, // §29.6: derived outputs and dependency contracts are gated
   record_outcome_permission: true, // §29.8
   capsule_export: true, // §63.4
@@ -174,7 +175,10 @@ const UNSUPPORTED_NAMES: readonly string[] = [
  * passed because nobody recognized the name is the failure mode the mechanism
  * exists to prevent, because the caller believes it ran.
  */
-export function capabilityState(name: string): boolean | undefined {
+export function capabilityState(name: string, host: HostCapabilities = {}): boolean | undefined {
+  // The names a host answers for (§67.4): false for a raw Nexus.
+  const hosted = hostState(host, name)
+  if (hosted !== undefined) return hosted
   // An entry that carries a detail object is supported; only a literal `false`
   // is a refusal. Reading the value's truthiness instead would make a future
   // `{"seconds": 0}` read as unsupported.
@@ -208,7 +212,7 @@ export function unsupportedCapabilityNames(): string[] {
   ]
 }
 
-export function capabilities(): Json {
+export function capabilities(host: HostCapabilities = {}): Json {
   return {
     kip: KIP_VERSION,
     limits: { ...CAPABILITY_LIMITS },
@@ -235,9 +239,10 @@ export function capabilities(): Json {
     // engine suite runs against this engine in `test/conformance.test.ts`,
     // world time, `functional_by`, `kip:memory-default`, the Search Pattern
     // and the optional draft vocabulary (`DEFINE`) included.
-    // `KIP-CognitiveMemory` also needs recording repair (§57.8), which this
-    // engine lacks.
-    profiles: ['KIP-Core'],
+    // `KIP-CognitiveMemory` also needs the Profile's computed views (GradingState
+    // and the lineage fields, Profile §6.2, §7), which this engine refuses to
+    // have written but does not yet compute on read.
+    profiles: [...CONFORMANCE_PROFILES],
     languages: ['KQL', 'KML', 'META'],
     supported: {
       // §67.4: the registry, by the names the Specification fixes, at the
@@ -245,7 +250,12 @@ export function capabilities(): Json {
       // to look for in a different place on each engine is not a negotiation
       // surface. Reported beside this engine's own names rather than instead
       // of them, because clients read those too.
-      registry: { ...CAPABILITY_REGISTRY },
+      registry: Object.fromEntries(
+        Object.entries(CAPABILITY_REGISTRY).map(([name, value]) => [
+          name,
+          hostRegistryValue(host, name) ?? value,
+        ]),
+      ),
       kml: [
         'CREATE CONCEPT',
         'UPSERT CONCEPT (matching an existing identity)',
@@ -1005,21 +1015,6 @@ export function capabilities(): Json {
         reason:
           'every BELIEF is computed at read time; nothing is cached, so there ' +
           'is no stale result to disclose',
-      },
-      {
-        capability: 'recording_repair',
-        detail: 'the protected RecordingRepair operation and the repair_recording permission (§57.8)',
-        reason:
-          'a misrecorded claim can be retracted or quarantined, but the repair ' +
-          'operation that keeps it apart from the actor\'s own history is not ' +
-          'built, so this engine does not claim KIP-CognitiveMemory',
-      },
-      {
-        capability: 'exposure_log',
-        detail: 'the append-only retrieval/use log (§66.8)',
-        reason:
-          'reads are not logged; Maintenance cannot fold exposures into ' +
-          'strength updates',
       },
       {
         capability: 'deadlines',

@@ -4,6 +4,9 @@ use crate::KipError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod binding;
+pub use binding::{MemorySession, MemorySessionSnapshot};
+
 pub const MEMORY_INTERFACE: &str = include_str!("../Memory-Interface.md");
 /// The former Cognitive Consistency companion, now an informative redirect:
 /// its contracts moved into the Specification (§11.5–§11.6, §21.11–§21.13,
@@ -19,6 +22,10 @@ pub const VALIDATED_LEARNING: &str = include_str!("../brain/Validated-Learning.m
 /// Shared `$defs` (`TimeBound`, `TimePoint`, ...) the other schemas reference.
 pub const COMMON_SCHEMA: &str = include_str!("../schemas/kip-common.schema.json");
 pub const MEMORY_SCHEMA: &str = include_str!("../schemas/kip-memory.schema.json");
+/// The request envelope schema; the Memory Interface reuses its `SpaceSelector`.
+pub const REQUEST_SCHEMA: &str = include_str!("../schemas/kip-request.schema.json");
+/// The response envelope schema; the Memory Interface reuses its `Error`.
+pub const RESPONSE_SCHEMA: &str = include_str!("../schemas/kip-response.schema.json");
 pub const PROJECTION_SCHEMA: &str = include_str!("../schemas/kip-projection.schema.json");
 pub const COGNITIVE_RECORDS_SCHEMA: &str =
     include_str!("../schemas/kip-cognitive-records.schema.json");

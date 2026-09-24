@@ -220,11 +220,42 @@ SleepTask 的派发顺序是：提交 AttemptRecord → enqueue_dispatch → beg
 `dispatch`、`lookup`、`outcome_unknown`、`done`；不支持幂等或查询时，丢失结果后禁止
 自动重派。外部工具自己的权限、实际环境与工具版本检查仍由执行适配器完成。
 
+## Memory Interface 宿主合同
+
+`memory_interface`、`durable_brain_runtime` 与 `receiver_fencing` 描述宿主在 Nexus 之外提供的能力，
+裸 Nexus 对三者都回答 `false`。提供这些能力的 Brain 在共享 Nexus 之前调用
+`CognitiveNexus::set_host_capabilities`（Rust）/ `setHostCapabilities`（TypeScript）声明。
+声明是进程状态，不持久化，并按引擎能力校验：每个声明的级别都必须运行在引擎声明的一致性级别上
+（两个引擎都只声明 `KIP-Core`，所以目前只接受 `memory_basic`），`receiver_fencing` 需要
+`durable_brain_runtime`。之后 `DESCRIBE CAPABILITIES` 把描述符作为 `memory_interface` 的注册表值，
+`DESCRIBE PRIMER` 在 `extensions.memory_interface` 里带上它，请求的 `requires` 检查也按声明回答。
+Rust 宿主用 `anda_kip::memory::binding` 构造描述符与线上形状，其中 `MemorySession` 保存未完成回执
+和 attention 游标；`schema-validation` 特性按随附 schema 校验请求、响应与描述符。
+
+`Session::repair_recording` / `repairRecording` 实现 Memory Interface 的 `misrecorded` 路线（§57.8）。
+宿主传入 `RecordingRepair`：已捕获的来源 Evidence、它的 `content_digest`、指向内联载荷的定位器
+（JSON Pointer，或针对载荷文本的 `bytes=<start>-<end>`）、错误断言及其当前 `_system.version`，
+以及可选的替换断言。调用者需要对每条被失效的断言持有 `repair_recording`，且必须是记录它的 Principal；
+替换断言必须已由调用者写入、引用同一来源，`asserted_at` 等于来源的 `observed_at`（原主张时间，
+绝不是修复时间）；`extraction_error` 不改 actor，`attribution_error` 可以改。修复在一个事务里提交
+终态 `recording_repair` Activity（inputs 为来源与被失效断言，`RecordingRepair` Facet 列出替换断言）、
+`recording` 控制变更，以及每条错误断言上的受保护失效标记。每条断言都带
+`_system.recording_validity`（`{status, repair_ref}`）；投影排除被失效的抽取，依赖它的派生读为
+`needs_review`，历史读取取快照当时的状态。同一修复重试返回 `replayed: true`，不再写入。
+两个引擎都不会把误记映射成更正或撤回。
+
+`Session::record_exposures` / `recordExposures` 是 §66.8 曝光日志：宿主为返回的条目记录
+`retrieved`，为 DecisionRecord 的 `used_refs` 记录 `used`（附决策 Activity）。条目不占 Space 序号、
+不产生 Change Envelope、不改任何元素；Space、时间与 Principal 由引擎填写，调用者必须能读取每个元素。
+`read_exposures` / `readExposures` 在 `read_audit` 下分页读取，读者看不到的元素直接省略。
+Maintenance 只能通过显式、带守卫的 `MnemonicState` 写入把使用折算进强度。
+
 ## 保留与清除
 
 ErasurePlan 是 Memory Interface 的报告对象，不是标准包里的 Facet。Brain 在返回报告前
 调用 `validate_erasure_plan` / `validateErasurePlan`，验证每个声称 erased 的目标和
-completed 的依赖闭包。验证不会执行删除，也不会推进 Space 序列。
+completed 的依赖闭包。验证不会执行删除，也不会推进 Space 序列。surface 为 `exposure`
+的目标只有在该元素已无曝光条目时才算已清除；清除元素会一并删除它的曝光条目。
 
 来源被 PURGE/PURGE PAYLOAD 时，拥有该来源的重放内容及其存储版本一起清除，保留
 非内容的摘要墓碑防止同一材料被重新放回。删除生产 Activity 时保留非内容依赖边，防止

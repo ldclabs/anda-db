@@ -115,6 +115,19 @@ Parser and ingest benchmarks run with
 `cargo bench -p anda_kip --bench protocol --profile release-speed`.
 See the [paired measurements](../../docs/benchmarks/anda_kip_2026-09-23/README.md).
 
+## Memory Interface binding
+
+`anda_kip::memory::binding` types the optional Agent-to-Brain binding of
+`Memory-Interface.md` (`schemas/kip-memory.schema.json`): `Request` /
+`Response`, receipts and `Progress`, `Briefing` and `Coverage`, and the
+`Descriptor` a deployment advertises. `Request::intent` applies the envelope
+rules (an idempotency key on every mutation and none on a recall), and
+`MemorySession` keeps a host session's outstanding receipts and attention
+cursor across restarts. Enable the `schema-validation` feature to validate
+requests, responses and descriptors against the vendored schemas. Typing the
+wire shapes does not give a Nexus a binding: a Brain declares the levels it
+serves.
+
 ## Command-line syntax check
 
 ```bash

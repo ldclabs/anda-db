@@ -1032,6 +1032,11 @@ impl Context<'_> {
         if row.state != crate::store::rows::state::ACTIVE {
             return reject("not_visible");
         }
+        // §57.8: an extraction a recording repair invalidated is not a claim
+        // anyone made; it keeps its payload and history, and stays out.
+        if crate::repair::repair_ref(&row.governance).is_some() {
+            return reject("recording_invalidated");
+        }
 
         for reference in &row.context_refs {
             let canonical = self.canonical_endpoint(reference).await?;

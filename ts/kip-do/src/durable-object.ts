@@ -396,6 +396,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
       checkEnvelope(envelope, {
         id: this.nexus.space,
         row: () => this.nexus.spaceRow(),
+        host: this.nexus.store.hostCapabilities,
       })
     } catch (err) {
       const error = KipError.from(err)

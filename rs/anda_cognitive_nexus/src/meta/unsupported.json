@@ -58,15 +58,5 @@
     "capability": "materialized_projection",
     "detail": "serving a cached Projection under its ProjectionBasis (\u00a721.9)",
     "reason": "every BELIEF is computed at read time; nothing is cached, so there is no stale result to disclose"
-  },
-  {
-    "capability": "recording_repair",
-    "detail": "the protected RecordingRepair operation and the repair_recording permission (\u00a757.8)",
-    "reason": "a misrecorded claim can be retracted or quarantined, but the repair operation that keeps it apart from the actor's own history is not built, so this engine does not claim KIP-CognitiveMemory"
-  },
-  {
-    "capability": "exposure_log",
-    "detail": "the append-only retrieval/use log (\u00a766.8)",
-    "reason": "reads are not logged; Maintenance cannot fold exposures into strength updates"
   }
 ]

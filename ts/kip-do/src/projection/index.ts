@@ -1,4 +1,5 @@
 import { parseElementId } from '../id.js'
+import { repairRef } from '../recording.js'
 import { trustWeight } from '../trust.js'
 import { errors } from '../errors.js'
 import { dependencyValidity } from './dependency.js'
@@ -566,6 +567,9 @@ function admit(cx: Context, row: AssertionRow, policy: Policy): Candidate | stri
   // earlier draft stored it on is read as active.
   if (row.status !== 'active' && row.status !== 'expired') return `lifecycle_${row.status}`
   if (row.state !== State.ACTIVE) return `record_${row.state}`
+  // §57.8: an extraction a recording repair invalidated is not a claim anyone
+  // made; it keeps its payload and history, and stays out.
+  if (repairRef(row.governance) !== null) return 'recording_invalidated'
   for (const reference of row.context_refs) {
     const canonical = cx.canonicalEndpoint(reference as Json) as JsonMap
     if (!policy.context_refs.includes(String(canonical.id))) return 'context_mismatch'

@@ -22,6 +22,8 @@ import { Context } from './kql/context.js'
 import { projectionBasis } from './projection/index.js'
 import { normalizeTime, nowTime } from './time.js'
 import { render } from './view.js'
+import { REPAIR_CLASS, REPAIR_FACET } from './recording.js'
+import { exposureCount } from './exposure.js'
 import type { Element, TransactionRow } from './store/rows.js'
 import type { Session } from './nexus.js'
 
@@ -113,6 +115,11 @@ function verifyErasurePlan(tx: Transaction, plan: JsonMap): void {
       requirePermitted(
         tx.authority.authorize('read', resourceOfElement(local), tx.auth),
       )
+    if (target.surface === 'exposure') {
+      if (exposureCount(tx.store, tx.cx.space, ref) !== 0)
+        fail('ErasurePlan cannot claim erased exposure entries that remain')
+      continue
+    }
     const erased = ['replay', 'blob'].includes(String(target.surface))
       ? obj(tx.store.controlAt(tx.cx.space, `artifact/${ref}`)?.value).state ===
         'erased'
@@ -148,6 +155,21 @@ export function validateErasurePlan(
 }
 
 export function validateDurable(tx: Transaction): void {
+  // §57.8: a repair record is written only by the protected repair, so an
+  // author-created Activity of that class, or one carrying its Facet, cannot
+  // pass for one.
+  for (const [id, s] of tx.staged) {
+    if (
+      s.changed &&
+      s.element.kind === 'Activity' &&
+      (s.element.row.activity_class === REPAIR_CLASS ||
+        Object.keys(s.element.row.facets).some((name) => name.endsWith(`/${REPAIR_FACET}`))) &&
+      !tx.authorizedRecordingRepairs.has(id)
+    )
+      throw errors.notAuthorized(
+        'recording_repair records are written only by the protected recording repair (§57.8)',
+      )
+  }
   for (const [id, s] of tx.staged) {
     if (
       s.isNew &&

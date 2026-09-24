@@ -145,6 +145,11 @@ export const PERMISSIONS = {
     family: 'epistemic_mutation',
     description: "record one's own epistemic commitment",
   },
+  repair_recording: {
+    family: 'epistemic_mutation',
+    description:
+      "invalidate an extraction the recorder got wrong without writing it as the actor's withdrawal (§57.8)",
+  },
   record_attributed_assertion: {
     family: 'epistemic_mutation',
     description:

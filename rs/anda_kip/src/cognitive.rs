@@ -9,6 +9,83 @@ pub struct ArtifactPin {
     pub content_digest: String,
 }
 
+/// Why an extraction is repaired (Spec §57.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairReason {
+    /// The Brain extracted a claim the source does not make.
+    ExtractionError,
+    /// The Brain attributed a claim to the wrong actor.
+    AttributionError,
+}
+
+/// The input of the protected recording-repair operation (Spec §57.8,
+/// `kip-cognitive-records.schema.json#/$defs/RecordingRepair`).
+///
+/// A repair is neither the actor's retraction nor a correction of sound
+/// Evidence: the source bytes, the original Assertion payload and the actor's
+/// lifecycle are preserved, and the wrong extraction is invalidated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingRepair {
+    /// The immutable source the extraction was made from.
+    pub source_ref: String,
+    /// The digest the source carries; a mismatch refuses the repair.
+    pub source_digest: String,
+    /// A JSON Pointer or `bytes=<start>-<end>` range inside the source.
+    pub source_locator: String,
+    /// The extracted Assertions being invalidated.
+    pub invalidated_refs: Vec<String>,
+    /// Existing Assertions that describe what the source actually said.
+    #[serde(default)]
+    pub replacement_refs: Vec<String>,
+    pub reason: RepairReason,
+    /// `_system.version` each named element must still have.
+    pub expected_versions: BTreeMap<String, u64>,
+}
+
+/// `_system.recording_validity` of an Assertion (Spec §57.8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingValidity {
+    /// `valid` or `invalidated`.
+    pub status: String,
+    /// The `recording_repair` Activity that invalidated it.
+    pub repair_ref: Option<String>,
+}
+
+/// What an exposure records (Spec §66.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Exposure {
+    /// A read returned the element.
+    Retrieved,
+    /// A decision used it (a DecisionRecord's `used_refs`).
+    Used,
+}
+
+/// One entry of the append-only exposure log (Spec §66.8,
+/// `kip-cognitive-records.schema.json#/$defs/ExposureRecord`). Never a
+/// Cognitive Element, never Evidence, never a change to confidence, strength
+/// or utility.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureRecord {
+    pub space_id: String,
+    pub element_id: String,
+    pub exposure: Exposure,
+    /// The snapshot sequence of the read that exposed the element.
+    pub snapshot_seq: u64,
+    /// When the engine recorded the entry.
+    pub recorded_at: String,
+    /// The authenticated Principal that recorded it.
+    pub principal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_ref: Option<String>,
+}
+
 /// A protected observer binding. Distinct names do not establish independence:
 /// the operator explicitly attests a control domain and permitted configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]

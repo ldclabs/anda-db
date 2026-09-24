@@ -19,7 +19,11 @@ use crate::store::history::CursorFamily;
 pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer, KipError> {
     Ok(match target {
         DescribeTarget::Protocol => Answer::whole(protocol()),
-        DescribeTarget::Capabilities => Answer::whole(capabilities(Some(cx.authority), cx.auth)),
+        DescribeTarget::Capabilities => Answer::whole(capabilities(
+            &cx.store.host_capabilities(),
+            Some(cx.authority),
+            cx.auth,
+        )),
         DescribeTarget::Primer { mode } => Answer::whole(primer(cx, mode.as_ref()).await?),
         DescribeTarget::Space { value } => {
             let id = match value {
@@ -650,8 +654,15 @@ async fn primer(cx: &mut Context<'_>, mode: Option<&Scalar>) -> Result<Json, Kip
         "golden_path": ["SEARCH or FIND to ground", "exact id", "BELIEF or FIND", "MUTATE"],
     });
 
+    // Memory Interface §2: a deployment advertising the binding MAY carry its
+    // descriptor in the Primer's extension data, so an Agent that reads the
+    // Primer first learns which levels its Brain serves.
+    if let Some(descriptor) = &cx.store.host_capabilities().memory_interface {
+        primer["extensions"] = serde_json::json!({ "memory_interface": descriptor });
+    }
     if mode == "full" {
-        primer["capabilities"] = capabilities(Some(cx.authority), cx.auth);
+        primer["capabilities"] =
+            capabilities(&cx.store.host_capabilities(), Some(cx.authority), cx.auth);
         primer["protocol"] = protocol();
     } else if mode != "compact" {
         return Err(KipError::invalid_syntax(format!(

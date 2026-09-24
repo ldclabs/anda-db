@@ -1,5 +1,6 @@
 /** Cognitive Consistency §3: computed validity, never an author-written flag. */
 import type { Context } from '../kql/context.js'
+import { isInvalidated } from '../recording.js'
 import { tryParseElementId, formatElementId } from '../id.js'
 import { canonicalJson, isJsonMap, type JsonMap } from '../json.js'
 import { State, type ActivityRow, type Element } from '../store/index.js'
@@ -29,6 +30,7 @@ export function dependencyValidity(cx: Context, element: Element, policy: Policy
     const visibility = cx.authority.mayRead(element, cx.auth)
     if (!visibility?.content || visibility.constraints.fields.length) return issue(2, 'dependency source unavailable')
     if (element.row.state !== State.ACTIVE && element.row.state !== State.MERGED) return issue(1, 'dependency lifecycle changed')
+    if (isInvalidated(element)) return issue(1, 'dependency extraction repaired')
     const result: Validity = { state: 0, reasons: [], next: null }
     if (element.kind === 'Evidence' && element.row.status === 'corrected') return issue(1, 'dependency evidence corrected')
     if (element.kind === 'Assertion') {

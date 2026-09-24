@@ -58,8 +58,20 @@ and kept by every later activation, and `Session::promote_draft_symbol`
 (`manage_schema`) maps a draft symbol onto an installed package's symbol so
 both read as one lineage — for matching and for identity, so a tuple, logical
 key or `CLIENT KEY` written under the draft resolves to the same element
-afterwards. Recording repair is not built, so the engine claims
-`KIP-Core` and not `KIP-CognitiveMemory`.
+afterwards.
+
+`Session::repair_recording` repairs an extraction the recorder got wrong
+(§57.8): against the exact source digest and locator, with CAS on the wrong
+Assertion, it appends a terminal `recording_repair` Activity, marks the
+Assertion invalidated in its protected governance block (payload and lifecycle
+untouched, `_system.recording_validity` shows the repair) and removes it from
+projection. `Session::record_exposures` keeps the §66.8 exposure log outside
+the cognitive store; `read_exposures` needs `read_audit`. The engine still
+claims `KIP-Core` and not `KIP-CognitiveMemory`: GradingState and the lineage
+fields are refused on write but not computed on read, and selection
+dependencies (§57.7) are not evaluated. `CognitiveNexus::set_host_capabilities`
+is how a Brain declares the Memory Interface and Brain Runtime capabilities it
+serves.
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI
 > agents, built on Anda DB.

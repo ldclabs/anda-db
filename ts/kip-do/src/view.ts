@@ -23,6 +23,7 @@
  */
 
 import { formatElementId, type ElementId } from './id.js'
+import { recordingValidity } from './recording.js'
 import { loadTimePoint, timePointJson } from './time.js'
 import { isJsonMap, type Json, type JsonMap } from './json.js'
 import type { PathStep } from './kip/ast.js'
@@ -119,8 +120,12 @@ function proposition(id: ElementId, row: PropositionRow): JsonMap {
 }
 
 function assertion(id: ElementId, row: AssertionRow): JsonMap {
+  const base = envelope(id, row)
+  // §57.8: an extraction's recording state; an Assertion carries it whether or
+  // not a repair touched it.
+  base._system = { ...(base._system as JsonMap), recording_validity: recordingValidity(row.governance) as unknown as Json }
   return {
-    ...envelope(id, row),
+    ...base,
     ...present({
       // The wire form of a reference is an object, never a bare id string
       // (§8.1, §13.2): a string can spell a local id and nothing else, and a
@@ -176,12 +181,14 @@ function evidence(id: ElementId, row: EvidenceRow): JsonMap {
 function activity(id: ElementId, row: ActivityRow): JsonMap {
   return {
     ...envelope(id, row),
+    // Always present, possibly empty: the element schema requires both members
+    // on every Activity, so an Activity with no outputs still exports.
+    inputs: row.inputs,
+    outputs: row.outputs,
     ...present({
       activity_class: row.activity_class,
       started_at: row.started_at,
       ended_at: row.ended_at,
-      inputs: row.inputs,
-      outputs: row.outputs,
       associated_actors: row.associated_actors,
       parameters_digest: row.parameters_digest,
       status: row.status,

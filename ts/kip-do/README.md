@@ -87,6 +87,15 @@ then. A caller holding a wall-clock time gets its coordinate from
 resolve through the Schema Environment that was in force at the coordinate
 rather than today's.
 
+Recording repair (`Session.repairRecording`, §57.8) and the exposure log
+(`Session.recordExposures` / `readExposures`, §66.8) are built, as in the Rust
+engine: a misrecording is invalidated against its exact source and never written
+as the actor's retraction, and exposure entries live outside the cognitive
+store. The engine still claims `KIP-Core` only — GradingState and the lineage
+fields are refused on write but not computed on read. A Brain that serves the
+Memory Interface declares it with `CognitiveNexus.setHostCapabilities`; a raw
+Nexus answers `memory_interface: false`.
+
 A multi-tenant host authenticates its callers by overriding
 `KipDatabase.authenticate`, which returns the identity the *host observed* about
 the connection. It deliberately cannot be read off the request body: a request

@@ -481,6 +481,25 @@ pub struct ControlRecordRow {
     pub origin: Json,
 }
 
+/// One append-only exposure log entry (Spec §66.8). Not cognitive state: no
+/// element, no Space sequence, no Change Envelope entry.
+#[derive(Clone, Debug, Serialize, Deserialize, AndaDBSchema)]
+pub struct ExposureRow {
+    pub _id: u64,
+    pub space: String,
+    /// The exposed element's id.
+    pub element: String,
+    /// `retrieved` or `used`.
+    pub exposure: String,
+    pub snapshot_seq: u64,
+    pub recorded_at: String,
+    pub principal_id: String,
+    /// The decision that used it; empty when none.
+    pub decision_ref: String,
+    /// The recall that returned it; empty when none.
+    pub recall_ref: String,
+}
+
 /// Durable redo intent, removed only after all of its effects are flushed.
 #[derive(Clone, Debug, Serialize, Deserialize, AndaDBSchema)]
 pub struct CommitLogRow {

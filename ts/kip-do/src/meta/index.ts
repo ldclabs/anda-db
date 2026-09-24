@@ -197,7 +197,7 @@ function describe(
   b: ReadBindings,
 ): Json {
   if (target === 'Protocol') return protocol()
-  if (target === 'Capabilities') return capabilities()
+  if (target === 'Capabilities') return capabilities(cx.store.hostCapabilities)
 
   if ('Primer' in target) {
     return primer(
@@ -590,8 +590,14 @@ function primer(cx: MetaContext, mode: string): Json {
       'MUTATE',
     ],
   }
+  // Memory Interface §2: a deployment advertising the binding MAY carry its
+  // descriptor in the Primer's extension data.
+  const descriptor = cx.store.hostCapabilities.memory_interface
+  if (descriptor !== undefined) {
+    primer.extensions = { memory_interface: structuredClone(descriptor) as unknown as Json }
+  }
   if (mode === 'full') {
-    primer.capabilities = capabilities()
+    primer.capabilities = capabilities(cx.store.hostCapabilities)
     primer.protocol = protocol()
   }
   return primer as Json

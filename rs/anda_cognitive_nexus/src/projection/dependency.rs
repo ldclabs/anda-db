@@ -92,6 +92,9 @@ impl Context<'_> {
         if element.state() != state::ACTIVE && element.state() != state::MERGED {
             return Ok(Validity::issue(1, "dependency lifecycle changed"));
         }
+        if crate::repair::is_invalidated(element) {
+            return Ok(Validity::issue(1, "dependency extraction repaired"));
+        }
         let mut result = Validity::default();
         match element {
             Element::Evidence(row) if row.status == "corrected" => {

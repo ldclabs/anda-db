@@ -81,6 +81,8 @@ pub struct Transaction {
     pub(crate) identity_changed: bool,
     pub(crate) authorized_watch_updates: BTreeSet<ElementId>,
     pub(crate) authorized_watch_fires: BTreeSet<ElementId>,
+    /// `recording_repair` Activities staged by the protected repair (§57.8).
+    pub(crate) authorized_recording_repairs: BTreeSet<ElementId>,
     guarded: BTreeMap<ElementId, BTreeSet<String>>,
     handles: BTreeMap<String, ElementId>,
     pub(crate) declared_types: BTreeMap<ElementId, String>,
@@ -186,6 +188,7 @@ impl Transaction {
             identity_changed: false,
             authorized_watch_updates: BTreeSet::new(),
             authorized_watch_fires: BTreeSet::new(),
+            authorized_recording_repairs: BTreeSet::new(),
             guarded: BTreeMap::new(),
             staged: BTreeMap::new(),
             shells: Vec::new(),

@@ -270,6 +270,8 @@ export class Transaction {
     fence: number
   }[] = []
   readonly authorizedWatchFires = new Set<string>()
+  /** `recording_repair` Activities staged by the protected repair (§57.8). */
+  readonly authorizedRecordingRepairs = new Set<string>()
   identityChanged = false
   readonly authorizedWatchUpdates = new Set<string>()
   readonly guarded = new Map<string, Set<string>>()

@@ -55,7 +55,15 @@ data with a reason, so an Agent reads what is missing instead of discovering it
 by triggering an error — or, worse, reading an absent feature as an absent fact.
 Gaps are refused as `UnsupportedCapability`. Host methods do not install a
 scheduler, executor or independent observer, and installing a Schema Package
-does not advertise a complete Brain or the optional Memory Interface.
+does not advertise a complete Brain or the optional Memory Interface: a Brain
+that serves the binding declares it with `CognitiveNexus::set_host_capabilities`,
+and a raw Nexus answers `memory_interface: false`.
+
+Recording repair (`Session::repair_recording`, §57.8) and the exposure log
+(`Session::record_exposures` / `read_exposures`, §66.8) are built. The engine
+still claims `KIP-Core` only: the computed GradingState view and lineage fields
+are refused on write but not computed on read, and selection dependencies
+(`DependencyBasis.queries`, §57.7) are not evaluated.
 
 ## Durable Watch handoff (0.13.1)
 

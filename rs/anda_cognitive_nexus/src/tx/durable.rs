@@ -216,6 +216,7 @@ impl Transaction {
                             .iter()
                             .any(|r| r.key == format!("artifact/{reference}"))
                 }
+                Some("exposure") => self.store.exposure_count(reference).await? == 0,
                 // Backend backups need their own verified deletion receipt;
                 // a model-authored plan is not such a receipt.
                 _ => false,
@@ -230,6 +231,27 @@ impl Transaction {
     }
 
     pub(crate) fn validate_durable(&mut self) -> Result<(), KipError> {
+        // §57.8: a repair record is written only by the protected repair, so
+        // an author-created Activity of that class, or one carrying its Facet,
+        // cannot pass for one. A Capsule import carries another Brain's repair
+        // history; it invalidates nothing here, so it is not refused.
+        let importing = self.cx.origin.get("import").is_some();
+        for (id, staged) in &self.staged {
+            if !importing
+                && staged.changed
+                && let Element::Activity(row) = &staged.row
+                && (row.activity_class == crate::repair::REPAIR_CLASS
+                    || row
+                        .facets
+                        .keys()
+                        .any(|name| name.ends_with(&format!("/{}", crate::repair::REPAIR_FACET))))
+                && !self.authorized_recording_repairs.contains(id)
+            {
+                return Err(KipError::not_authorized(
+                    "recording_repair records are written only by the protected recording repair (§57.8)",
+                ));
+            }
+        }
         for (id, staged) in &self.staged {
             if staged.is_new
                 && let Element::Activity(row) = &staged.row

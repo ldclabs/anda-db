@@ -1,4 +1,5 @@
 import { EvaluationRules } from '../evaluation.js'
+import type { HostCapabilities } from '../meta/host.js'
 import { initialProjection, type ControlRecord } from '../control.js'
 /**
  * The persistent home of one Cognitive Nexus.
@@ -131,6 +132,12 @@ export class Store extends RowStore {
    * `store.createGrant(...)` would read as one more table.
    */
   readonly evaluationRules = new EvaluationRules()
+  /**
+   * What the host declares around this Nexus (§67.4): a Brain binding and its
+   * runtime. Empty until `CognitiveNexus.setHostCapabilities` says otherwise;
+   * process state, never persisted.
+   */
+  hostCapabilities: HostCapabilities = {}
   readonly governance: GovernanceStore
 
   constructor(sql: SqlStorage) {
@@ -540,6 +547,10 @@ export class Store extends RowStore {
     this.updateRow(table, row)
 
     const id = formatElementId({ kind: element.kind, seq: row.id })
+    // §66.8, §60.7: an erased element's exposure entries go with it.
+    if (verb === 'purge') {
+      this.sql.exec('DELETE FROM kip_exposures WHERE space = ? AND element = ?', row.space, id)
+    }
     this.appendVersion({
       space: row.space,
       element: id,

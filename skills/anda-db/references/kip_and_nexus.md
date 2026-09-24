@@ -56,6 +56,10 @@ Core AndaDB's vector search does not imply KIP semantic/hybrid `SEARCH`
 support or a configured embedding model. Use the
 [TypeScript engine guide](../../../ts/kip-do/README.md) for its own boundaries
 and host APIs; do not assume Rust/TypeScript host methods are interchangeable.
+Both engines build recording repair (§57.8) and the exposure log (§66.8) as
+host `Session` methods; `memory_interface`, `durable_brain_runtime` and
+`receiver_fencing` answer `false` until the host declares them with
+`set_host_capabilities` / `setHostCapabilities`.
 
 For Watch, wake, dispatch, contextual trust, and Brain host integration,
 read [Anda Brain host contracts](../../../docs/anda-brain-nexus-contracts.zh.md).

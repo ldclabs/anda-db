@@ -16,12 +16,15 @@ import type { JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import { checkIngest, type IngestContext } from './kml/index.js'
 import { capabilityState, KIP_VERSION } from './meta/capabilities.js'
+import type { HostCapabilities } from './meta/host.js'
 import type { ReadOptions } from './nexus.js'
 
 /** The Space a request runs in, as the check needs it. */
 export interface EnvelopeSpace {
   id: string
   row(): { seq: number; schema_environment_version: number }
+  /** What the host declares around this Nexus (§67.4); empty when omitted. */
+  host?: HostCapabilities
 }
 
 /** The execution modes §75 names. */
@@ -283,7 +286,7 @@ export function checkEnvelope(envelope: KipRequestEnvelope, space: EnvelopeSpace
   // wearing a success status — and a requirement nobody recognized must not
   // pass, because the caller believes it ran.
   for (const [name, wanted] of Object.entries(envelope.requires ?? {})) {
-    const have = capabilityState(name)
+    const have = capabilityState(name, space.host)
     if (have === undefined) {
       throw new KipError(
         'UnsupportedCapability',

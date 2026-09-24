@@ -166,6 +166,8 @@ permissions! {
         "supersede an Assertion one is authorized to represent";
     ModerateAssertion => "moderate_assertion", EpistemicMutation,
         "administratively exclude a third party's Assertion without claiming they retracted it";
+    RepairRecording => "repair_recording", EpistemicMutation,
+        "invalidate an extraction the recorder got wrong without writing it as the actor's withdrawal (§57.8)";
     RecordOutcome => "record_outcome", EpistemicMutation,
         "write outcome-class Evidence and the observation Activity that links it to a decision (§29.8)";
 

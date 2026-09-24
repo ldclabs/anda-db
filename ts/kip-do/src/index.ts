@@ -55,6 +55,9 @@ export {
 } from './nexus.js'
 
 export { KIP_VERSION, capabilities } from './meta/index.js'
+export type { HostCapabilities, MemoryDescriptor, MemoryBundleName } from './meta/host.js'
+export type { RecordingRepair, RecordingValidity } from './repair.js'
+export type { Exposure, ExposureInput, ExposureQuery, ExposureRecord } from './exposure.js'
 
 // --- Failure ----------------------------------------------------------------
 //

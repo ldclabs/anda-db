@@ -31,7 +31,10 @@
 
 pub mod describe;
 pub mod history;
+pub mod host;
 pub mod inspect;
+
+pub use host::HostCapabilities;
 
 use anda_kip::{
     Json, KipError, Map, MetaCommand, Operation, Request, Response, ResponseContext, ResultContext,
@@ -252,7 +255,11 @@ async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<
 /// Built through [`anda_kip::Capabilities`] so that the profile list §89
 /// requires an implementation to declare is spelled the way §89 spells it,
 /// rather than being invented per engine.
-pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) -> Json {
+pub fn capabilities(
+    host: &HostCapabilities,
+    authority: Option<&EffectiveAuthority>,
+    auth: &AuthContext,
+) -> Json {
     let capabilities = anda_kip::Capabilities {
         profiles: CONFORMANCE_PROFILES.to_vec(),
         supported: as_map(serde_json::json!({
@@ -260,7 +267,7 @@ pub fn capabilities(authority: Option<&EffectiveAuthority>, auth: &AuthContext) 
             // each with its value. Reported beside the engine's own names —
             // which stay, because clients read them — rather than instead
             // of them.
-            "registry": registry_json(),
+            "registry": registry_json(host),
             "kml": [
                 "CREATE CONCEPT", "UPSERT CONCEPT", "ENSURE PROPOSITION",
                 "CREATE EVIDENCE", "CREATE ASSERTION", "CREATE ACTIVITY",
@@ -702,7 +709,10 @@ fn as_map(value: Json) -> Map<String, Json> {
 /// registry nor a name this engine reports. A fail-fast check that passes
 /// because nobody recognized the requirement is worse than no check at all,
 /// because the caller believes it ran.
-pub fn capability_state(name: &str) -> Option<bool> {
+pub fn capability_state(host: &HostCapabilities, name: &str) -> Option<bool> {
+    if let Some(state) = host.state(name) {
+        return Some(state);
+    }
     if let Some((_, supported, _)) = REGISTRY.iter().find(|(entry, _, _)| *entry == name) {
         return Some(*supported);
     }
@@ -745,10 +755,14 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ("change_stream", true, None),
     ("filtered_delivery", true, None),
     ("watch_evaluation", true, None),
-    ("exposure_log", false, None),
+    // §66.8: `Session::record_exposures` / `read_exposures`, outside the
+    // cognitive store and erased with the element.
+    ("exposure_log", true, None),
     ("draft_vocabulary", true, None),
     ("identity_repair", true, None),
-    ("recording_repair", false, None),
+    // §57.8: the protected repair, `_system.recording_validity` and the
+    // projection exclusion (`Session::repair_recording`).
+    ("recording_repair", true, None),
     ("derive_permission", true, None),
     ("record_outcome_permission", true, None),
     ("capsule_export", true, None),
@@ -761,13 +775,15 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ("prospective_trials", false, None),
 ];
 
-/// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4).
-fn registry_json() -> Json {
+/// The registry as `DESCRIBE CAPABILITIES` reports it (§67.4), with the
+/// host's answers for the names it owns ([`host::HOST_NAMES`]).
+fn registry_json(host: &HostCapabilities) -> Json {
     let mut out = Map::new();
     for (name, supported, value) in REGISTRY {
-        let value = match value {
-            Some(text) => serde_json::from_str(text).unwrap_or(Json::Bool(*supported)),
-            None => Json::Bool(*supported),
+        let value = match (host.registry_value(name), value) {
+            (Some(hosted), _) => hosted,
+            (None, Some(text)) => serde_json::from_str(text).unwrap_or(Json::Bool(*supported)),
+            (None, None) => Json::Bool(*supported),
         };
         out.insert((*name).to_string(), value);
     }
@@ -882,15 +898,24 @@ mod tests {
                 !UNSUPPORTED_NAMES.contains(name),
                 "{name} is in both capability lists"
             );
-            assert_eq!(capability_state(name), Some(true));
+            assert_eq!(
+                capability_state(&HostCapabilities::default(), name),
+                Some(true)
+            );
         }
         for name in UNSUPPORTED_NAMES {
-            assert_eq!(capability_state(name), Some(false));
+            assert_eq!(
+                capability_state(&HostCapabilities::default(), name),
+                Some(false)
+            );
         }
         // An unknown name is not "supported by omission" (§67): a `requires`
         // check that passed because nobody recognized it is the failure mode
         // this exists to prevent.
-        assert_eq!(capability_state("read_everything"), None);
+        assert_eq!(
+            capability_state(&HostCapabilities::default(), "read_everything"),
+            None
+        );
     }
 
     /// The §67.4 registry and the engine's own names agree about every gap
@@ -898,7 +923,11 @@ mod tests {
     #[test]
     fn the_registry_agrees_with_the_local_names() {
         for (name, supported, _) in REGISTRY {
-            assert_eq!(capability_state(name), Some(*supported), "{name}");
+            assert_eq!(
+                capability_state(&HostCapabilities::default(), name),
+                Some(*supported),
+                "{name}"
+            );
             if UNSUPPORTED_NAMES.contains(name) {
                 assert!(
                     !supported,
@@ -912,7 +941,7 @@ mod tests {
                 );
             }
         }
-        let declared = capabilities(None, &AuthContext::system());
+        let declared = capabilities(&HostCapabilities::default(), None, &AuthContext::system());
         for (name, _, _) in REGISTRY {
             assert!(
                 declared["supported"]["registry"].get(name).is_some(),
@@ -923,7 +952,10 @@ mod tests {
             declared["supported"]["registry"]["weighted_projection"],
             true
         );
-        assert_eq!(capability_state("belief_slot"), Some(true));
+        assert_eq!(
+            capability_state(&HostCapabilities::default(), "belief_slot"),
+            Some(true)
+        );
         assert!(declared["supported"]["projection"]["missing_stages"].is_array());
     }
 
@@ -936,7 +968,7 @@ mod tests {
     /// §67's whole point is that an unrecognized requirement must not pass.
     #[test]
     fn every_documented_gap_is_a_capability_requires_can_ask_about() {
-        let declared = capabilities(None, &AuthContext::system());
+        let declared = capabilities(&HostCapabilities::default(), None, &AuthContext::system());
         let listed = declared["unsupported"]
             .as_array()
             .expect("an unsupported list");
@@ -944,7 +976,7 @@ mod tests {
         for entry in listed {
             let name = entry["capability"].as_str().expect("a capability name");
             assert_eq!(
-                capability_state(name),
+                capability_state(&HostCapabilities::default(), name),
                 Some(false),
                 "{name} is documented as a gap but `requires` does not know it"
             );
@@ -998,7 +1030,7 @@ mod tests {
     /// level is one this engine is held to.
     #[test]
     fn the_declared_levels_are_the_ones_the_spec_names() {
-        let declared = capabilities(None, &AuthContext::system());
+        let declared = capabilities(&HostCapabilities::default(), None, &AuthContext::system());
         let profiles: Vec<&str> = declared["profiles"]
             .as_array()
             .map(|list| list.iter().filter_map(Json::as_str).collect())

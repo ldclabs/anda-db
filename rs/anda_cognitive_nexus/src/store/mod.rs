@@ -96,6 +96,8 @@ pub const SCHEMA_ENVS: &str = "schema_envs";
 pub const ELEMENT_VERSIONS: &str = "element_versions";
 pub const CONTROL_RECORDS: &str = "kip_control_records";
 pub const COMMIT_LOG: &str = "kip_commit_log";
+/// The exposure log collection name (Spec §66.8).
+pub const EXPOSURES: &str = "kip_exposures";
 
 /// A collection handle that survives poisoning.
 #[derive(Clone, Debug)]
@@ -135,6 +137,9 @@ macro_rules! collections {
             /// which is what keeps an ordinary cognitive write off the control plane.
             pub governance: crate::governance::store::GovernanceStore,
             pub evaluation_rules: crate::evaluation::EvaluationRules,
+            /// What the host declares around this Nexus (§67.4): a Brain binding
+            /// and its runtime. Empty until the host says otherwise.
+            host_capabilities: Arc<parking_lot::RwLock<crate::meta::HostCapabilities>>,
             issued_cursors: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String)>>>,
             $($field: Slot,)*
             /// Resolved Schema Environments, keyed by Space and version.
@@ -167,6 +172,7 @@ macro_rules! collections {
                     db,
                     governance,
                     evaluation_rules: crate::evaluation::EvaluationRules::default(),
+                    host_capabilities: Arc::new(parking_lot::RwLock::new(Default::default())),
                     issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
                     $($field,)*
                     environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
@@ -238,6 +244,8 @@ collections! {
     control_records: ControlRecordRow =
         (CONTROL_RECORDS, init_control, "Protected, versioned Nexus control records"),
     commit_log: CommitLogRow = (COMMIT_LOG, init_commit_log, "Recoverable multi-collection commits"),
+    /// The exposure log handle (Spec §66.8).
+    exposures: ExposureRow = (EXPOSURES, init_exposures, "Append-only exposure log; not cognitive state"),
 }
 
 /// Used only for Core elements and the transaction journal. These fields use
@@ -277,6 +285,12 @@ async fn init_control(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["key"]).await?;
     c.create_btree_index_nx(&["seq"]).await?;
     c.create_btree_index_nx(&["record_id"]).await?;
+    Ok(())
+}
+
+async fn init_exposures(c: &mut Collection) -> Result<(), DBError> {
+    c.create_btree_index_nx(&["space"]).await?;
+    c.create_btree_index_nx(&["element"]).await?;
     Ok(())
 }
 
@@ -451,6 +465,15 @@ async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 impl Store {
+    /// What the host declares around this Nexus; see [`crate::meta::host`].
+    pub fn host_capabilities(&self) -> crate::meta::HostCapabilities {
+        self.host_capabilities.read().clone()
+    }
+
+    pub(crate) fn set_host_capabilities(&self, host: crate::meta::HostCapabilities) {
+        *self.host_capabilities.write() = host;
+    }
+
     fn attach_control_notifications(&self) {
         self.governance.attach_notifications(
             self.spaces.clone(),

@@ -114,6 +114,15 @@ import { executeKml, type IngestContext, type KmlContext } from './kml/index.js'
 import { boundValue, parameter } from './kml/value.js'
 import { executeKqlPage, type KqlAnswer, type KqlContext } from './kql/index.js'
 import { executeMeta, type MetaContext } from './meta/index.js'
+import { capabilityState } from './meta/capabilities.js'
+import { type HostCapabilities, validateHostCapabilities } from './meta/host.js'
+import { repairRecording as runRepair, type RecordingRepair } from './repair.js'
+import {
+  readExposures as runReadExposures,
+  recordExposures as runRecordExposures,
+  type ExposureInput,
+  type ExposureQuery,
+} from './exposure.js'
 import {
   BUNDLED_PACKAGES,
   CORE_PACKAGE,
@@ -196,6 +205,25 @@ export class CognitiveNexus {
   /** Restore trusted bindings on startup. A digest cannot be rebound live. */
   registerEvaluationRule(artifact: Json, evaluator: EvaluationRule): string {
     return this.store.evaluationRules.register(artifact, evaluator)
+  }
+
+  /**
+   * Declares what the host serves around this Nexus: a Memory Interface
+   * binding, durable Brain Runtime workers, receiver fencing (§67.4).
+   *
+   * A raw Nexus answers `false` for all three. The declaration is checked
+   * against this engine — a level whose Nexus level this engine does not claim
+   * is refused rather than advertised (Memory Interface §2) — and replaces any
+   * earlier one. It is process state: a restarted host declares it again.
+   */
+  setHostCapabilities(host: HostCapabilities): void {
+    validateHostCapabilities(host, (name) => capabilityState(name) === true)
+    this.store.hostCapabilities = structuredClone(host)
+  }
+
+  /** What the host has declared; empty for a raw Nexus. */
+  hostCapabilities(): HostCapabilities {
+    return structuredClone(this.store.hostCapabilities)
   }
 
   readonly store: Store
@@ -2039,6 +2067,62 @@ export class Session {
         complete,
       }
     })
+  }
+
+  /**
+   * Repairs an extraction the recorder got wrong (§57.8).
+   *
+   * Requires `repair_recording` on every invalidated element and reaches only
+   * the caller's own source-backed outputs. Replacements must already exist as
+   * the caller's own Assertions citing the same source, with `asserted_at`
+   * recovered from that source. A retry answers from the recorded repair.
+   */
+  repairRecording(repair: RecordingRepair, space = this.nexus.space): JsonMap {
+    return this.nexus.transact(() => {
+      const authority = this.effectiveAuthority(space)
+      return runRepair(
+        {
+          store: this.nexus.store,
+          authority,
+          auth: this.auth,
+          begin: () =>
+            new Transaction(
+              this.nexus.store,
+              space,
+              this.nexus.environment(space),
+              this.origin(),
+              false,
+              authority,
+              this.auth,
+            ),
+        },
+        space,
+        repair,
+      )
+    })
+  }
+
+  /**
+   * Appends exposure entries (§66.8): no Space sequence, no element, no
+   * change to confidence, strength or utility.
+   */
+  recordExposures(entries: ExposureInput[], space = this.nexus.space): JsonMap {
+    return this.nexus.transact(() =>
+      runRecordExposures(
+        { store: this.nexus.store, authority: this.effectiveAuthority(space), auth: this.auth },
+        space,
+        entries,
+      ),
+    )
+  }
+
+  /** Reads the exposure log under `read_audit`, oldest first (§66.8). */
+  readExposures(query: ExposureQuery = {}, space = this.nexus.space): JsonMap {
+    return runReadExposures(
+      { store: this.nexus.store, authority: this.effectiveAuthority(space), auth: this.auth },
+      space,
+      query,
+    )
   }
 
   setProjectionPolicy(

@@ -182,6 +182,10 @@ fn envelope(row: &impl Row) -> ElementEnvelope {
                 .as_object()
                 .cloned(),
             dependency_validity: None,
+            // §57.8: an extraction's recording state; an Assertion carries it
+            // whether or not a repair touched it.
+            recording_validity: (kind == anda_kip::ElementKind::Assertion)
+                .then(|| crate::repair::validity(governance)),
             version: Some(version),
             // Facet counters keyed by local name, so
             // `?x._system.plane_versions.facets["MnemonicState"]` reads the

@@ -29,7 +29,10 @@ fuzz harness keeps `0.0.0`.
    hosts that called `expire_lapsed_assertions` remove the call (`expired` is
    computed on read). A correction that supersedes across actors or context
    sets now fails `SupersessionMismatch`. Check `DESCRIBE CAPABILITIES`: both
-   engines claim `KIP-Core` and advertise `draft_vocabulary`.
+   engines claim `KIP-Core` and advertise `draft_vocabulary`,
+   `recording_repair` and `exposure_log`. A Brain that serves the Memory
+   Interface declares it with `set_host_capabilities` /
+   `setHostCapabilities`; a raw Nexus answers `memory_interface: false`.
 4. Callers of `FieldType::normalize` / `prune_undeclared` (`anda_db_schema`)
    or `Pipe` / `CountingWriter` (`anda_db_utils`) remove them; see below.
 5. 0.14 keeps reading the checked-in 0.8, 0.11 and 0.13 format fixtures, and
@@ -131,10 +134,12 @@ for the parser, the executable AST and stored draft Spaces.
 - **Capabilities:** the §67.4 registry follows the Specification (29 names);
   `belief_slot`, `ingestion_context`, `dependency_validity` and
   `materialized_projection` are engine-local names. Both engines claim
-  `KIP-Core` and advertise `draft_vocabulary`; `recording_repair`,
-  `exposure_log`, `receiver_fencing` and `prospective_trials` answer `false`,
-  so neither claims `KIP-CognitiveMemory`. `recording` is a Change Envelope
-  control kind. kip-do's `LIST SCHEMA PACKAGES` rows now match the Rust engine
+  `KIP-Core` and advertise `draft_vocabulary`, `recording_repair` and
+  `exposure_log`; `prospective_trials` answers `false`. Neither claims
+  `KIP-CognitiveMemory`: the computed GradingState view and lineage fields
+  (Profile §6.2, §7) are refused on write but not yet computed on read, and
+  selection dependencies (`DependencyBasis.queries`, §57.7) are not evaluated.
+  `recording` is a Change Envelope control kind. kip-do's `LIST SCHEMA PACKAGES` rows now match the Rust engine
   (`package_ref`, `package_id`, `version`, `status`, `name`, `description`,
   from the Schema Lock), and `DESCRIBE <symbol>` adds `local_name` and
   `package_ref`.
@@ -147,6 +152,60 @@ for the parser, the executable AST and stored draft Spaces.
 - **Storage:** new stores no longer index `assertions.valid_until` (existing
   indexes stay, unread); a Capsule import keeps time-bound `valid_time`
   endpoints instead of dropping them.
+- **New — recording repair (§57.8):** `Session::repair_recording` /
+  `repairRecording` takes the `RecordingRepair` record (source ref, digest and
+  locator — a JSON Pointer or `bytes=<start>-<end>` over the inline payload —
+  invalidated and replacement refs, reason, expected versions). It needs the
+  new `repair_recording` permission on each invalidated Assertion and reaches
+  only the caller's own source-backed outputs; replacements must be the
+  caller's existing Assertions citing the same source, with `asserted_at`
+  taken from the source's `observed_at`, and an extraction error keeps the
+  actor. One transaction appends a terminal `recording_repair` Activity
+  (inputs: the source and the invalidated Assertions; `RecordingRepair`
+  Facet) and a `recording` control change, and marks each invalidated
+  Assertion in its protected governance block: a new version, payload and
+  lifecycle untouched. Every Assertion view carries
+  `_system.recording_validity` (`{status: valid | invalidated, repair_ref}`),
+  historical reads see the state at their snapshot, projection excludes an
+  invalidated extraction (`recording_invalidated`) and dependent derivations
+  read `needs_review`. A retried repair answers from the recorded Activity
+  (`replayed: true`) without writing; author-created `recording_repair`
+  Activities or `RecordingRepair` Facets fail `NotAuthorized`.
+- **Fix — Activity views:** an Activity's view always carries `inputs` and
+  `outputs`, empty or not, as the element schema requires. Both engines used
+  to omit an empty list, so a Capsule export dropped every Activity without
+  outputs (a `watch_fire`, a `commitment_review`, a `recording_repair`) as
+  unavailable and its import then failed on the missing root.
+- **New — exposure log (§66.8):** `Session::record_exposures` /
+  `recordExposures` append `retrieved` / `used` entries (a `used` entry names
+  its decision Activity) to a new `kip_exposures` collection/table outside the
+  cognitive store: no Space sequence, no Change Envelope entry, no element.
+  The Space, time and Principal are the engine's; the caller must be able to
+  read each element. `read_exposures` / `readExposures` pages the log oldest
+  first under `read_audit` and omits elements the reader may not discover.
+  Purging an element removes its entries, and an ErasurePlan target with
+  surface `exposure` is verified against them.
+- **New — host capabilities (§67.4, Memory Interface §2):**
+  `memory_interface`, `durable_brain_runtime` and `receiver_fencing` describe
+  what a host serves around the Nexus, so a raw Nexus answers `false`.
+  `CognitiveNexus::set_host_capabilities` / `setHostCapabilities` declares
+  them, checked against this engine (every advertised level must run on a
+  conformance level the engine claims, so only `memory_basic` is accepted
+  today; `receiver_fencing` needs `durable_brain_runtime`). `DESCRIBE
+  CAPABILITIES` then reports the descriptor as the registry value, `DESCRIBE
+  PRIMER` carries it under `extensions.memory_interface`, and `requires`
+  answers accordingly.
+- **New — Memory Interface wire shapes (Rust SDK):** `anda_kip::memory::binding`
+  types the requests, responses, receipts, progress, briefings, coverage and
+  descriptor of `kip-memory.schema.json`, with `Request::intent`,
+  `Descriptor::validate` / `check_requires`, `Progress::validate` /
+  `satisfies` and `Coverage::new` enforcing the rules the schema cannot state
+  alone. `MemorySession` is the Rust counterpart of kip-lang's: outstanding
+  receipts stay barriers until a trusted recall accounts for them, and the
+  attention cursor is kept across restarts. The optional `schema-validation`
+  feature validates requests, responses and descriptors against the vendored
+  schemas. New `REQUEST_SCHEMA` / `RESPONSE_SCHEMA` constants and
+  `anda_kip::cognitive::{RecordingRepair, RecordingValidity, ExposureRecord}`.
 
 ### Storage and index crates
 

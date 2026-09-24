@@ -218,6 +218,29 @@ impl CognitiveNexus {
         }
     }
 
+    /// Declares what the host serves around this Nexus: a Memory Interface
+    /// binding, durable Brain Runtime workers, receiver fencing (§67.4).
+    ///
+    /// A raw Nexus answers `false` for all three; this is how a host that
+    /// serves them says so, before it shares the Nexus. The declaration is
+    /// checked against this engine — a level whose Nexus level this engine
+    /// does not claim is refused rather than advertised (Memory Interface §2)
+    /// — and replaces any earlier one. It is process state, never persisted:
+    /// a restarted host declares again what it serves.
+    pub fn set_host_capabilities(
+        &self,
+        host: crate::meta::HostCapabilities,
+    ) -> Result<(), KipError> {
+        host.validate()?;
+        self.store.set_host_capabilities(host);
+        Ok(())
+    }
+
+    /// What the host has declared; empty for a raw Nexus.
+    pub fn host_capabilities(&self) -> crate::meta::HostCapabilities {
+        self.store.host_capabilities()
+    }
+
     /// A session as the engine's own Principal (§28.2).
     pub fn system_session(&self) -> Session {
         self.session(AuthContext::system())
@@ -1622,7 +1645,8 @@ impl Session {
             // name. An unknown one is refused rather than assumed present: a
             // fail-fast check that passes because nobody recognized it is worse
             // than no check, because the caller believes it ran.
-            let satisfied = crate::meta::capability_state(name);
+            let satisfied =
+                crate::meta::capability_state(&self.nexus.store.host_capabilities(), name);
             match (satisfied, wanted) {
                 (Some(true), Json::Bool(true)) | (Some(false), Json::Bool(false)) => {}
                 (Some(have), wanted) => {
