@@ -44,6 +44,7 @@ import {
 } from './matching.js'
 import { bindingKey, compareSolutions, type Solution } from './solution.js'
 import { policyFromSettings } from '../projection/index.js'
+import { placeWritten } from '../projection/world.js'
 import { boundValue } from '../kml/value.js'
 
 /** What one KQL execution needs from its caller. */
@@ -321,10 +322,11 @@ function time(scalar: Scalar, b: ReadBindings): string {
  * Keeps only the solutions whose Assertions applied at a world time.
  *
  * `FOR TIME` filters on `valid_time`, the axis that says when a claim *applies*
- * — never `asserted_at`, which says when somebody said it, and never the engine
- * sequence, which says when this Brain recorded it (§36). A solution binding no
- * Assertion is untouched: the clause narrows claims, and a Concept has no
- * validity interval to be outside of.
+ * — never the engine sequence, which says when this Brain recorded it (§36). A
+ * row is kept unless its written interval lies outside the instant (§25.5): a
+ * missing `from` is {latest: asserted_at} (§25.2), and an indeterminate
+ * interval may hold. Succession is a projection rule over a slot's line and
+ * does not narrow a raw row. A solution binding no Assertion is untouched.
  */
 function restrictToValidTime(
   cx: Context,
@@ -336,18 +338,10 @@ function restrictToValidTime(
       if (binding.kind !== 'element' || binding.id.kind !== 'Assertion') return true
       const view = cx.view(binding.id)
       if (view === null) return true
-      const validTime = view.valid_time
-      const from = readInterval(validTime, 'from')
-      const until = readInterval(validTime, 'until')
-      return (from === '' || from <= at) && (until === '' || at < until)
+      const assertedAt = typeof view.asserted_at === 'string' ? view.asserted_at : ''
+      return placeWritten(view.valid_time, assertedAt, at) !== 'outside'
     }),
   )
-}
-
-function readInterval(value: unknown, member: 'from' | 'until'): string {
-  if (value === null || typeof value !== 'object') return ''
-  const found = (value as Record<string, unknown>)[member]
-  return typeof found === 'string' ? found : ''
 }
 
 /**

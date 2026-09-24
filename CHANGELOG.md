@@ -7,9 +7,11 @@ All notable changes to this workspace are documented in this file.
 This release aligns every AndaDB Rust package, the Python binding and
 `@ldclabs/kip-do` at **0.14.0**. It is breaking for KIP clients, for Spaces
 activated under the earlier CognitiveMemory draft and for two storage-crate
-APIs. The protocol version remains `2.0`, now following KIP `3251912`; the
+APIs. The protocol version remains `2.0`, now following KIP `597db44`; the
 bundled CognitiveMemory Schema Package is the rewritten `2.0.0` draft, and the
-TypeScript parser dependency is `@ldclabs/kip-lang@^2.4.0`. The standalone
+TypeScript parser dependency is `@ldclabs/kip-lang@^2.4.1` (resolved from a
+sibling KIP checkout through `pnpm-workspace.yaml` `overrides` until 2.4.1 is on
+npm; drop the override before publishing). The standalone
 `cf-tokenizer` service keeps its independent `1.0.0` version and the private
 fuzz harness keeps `0.0.0`.
 
@@ -22,48 +24,61 @@ fuzz harness keeps `0.0.0`.
    [v1 migration guide](docs/kip-v1-migration.md); a 1.x `Preference` now
    stays an open type in the generated legacy package instead of being adopted.
 3. Port KIP clients: `SEARCH COGNITION` becomes the KQL Search Pattern, ASSERT
-   takes `context`, projections drop `temporal`, and hosts that called
-   `expire_lapsed_assertions` remove the call (`expired` is computed on read).
-   Check `DESCRIBE CAPABILITIES`: both engines claim `KIP-Core` only.
+   takes `context`, a projection and a `BELIEF SLOT` report their policy,
+   `valid_at` and snapshot only in `basis` (read `?b.basis.policy.id`), and
+   hosts that called `expire_lapsed_assertions` remove the call (`expired` is
+   computed on read). A correction that supersedes across actors or context
+   sets now fails `SupersessionMismatch`. Check `DESCRIBE CAPABILITIES`: both
+   engines claim `KIP-Core` and advertise `draft_vocabulary`.
 4. Callers of `FieldType::normalize` / `prune_undeclared` (`anda_db_schema`)
    or `Pipe` / `CountingWriter` (`anda_db_utils`) remove them; see below.
 5. 0.14 keeps reading the checked-in 0.8, 0.11 and 0.13 format fixtures, and
    the `v0_14` fixture is added beside them.
 
-### KIP, Cognitive Nexus and kip-do (KIP `3251912`)
+### KIP, Cognitive Nexus and kip-do (KIP `597db44`)
 
-Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..3251912`). Breaking
+Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..597db44`). Breaking
 for the parser, the executable AST and stored draft Spaces.
 
 - **Breaking — draft Spaces:** the bundled package is the rewritten
   `kip://profiles/cognitive-memory@2.0.0`, content digest
-  `sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9`.
+  `sha256:734aa0fd93b6258d433a6f71915d9d5118552e2ea0458a3050d368dcfcc1d1b3`.
   The 2.0 draft rewrote 2.0.0 in place, so only the digest tells revisions
   apart. Spaces activated under the 2.1.0 draft are not migrated; start a new
   Space. The legacy 2.0.0 copy is removed. `kip://domains/general@1.0.0`
-  (`sha256:affede50…`) is bundled as optional vocabulary (installed, not
-  activated), and the `kip:memory-default` policy artifact (`sha256:b70ae00c…`)
-  ships beside it.
+  (`sha256:454f59b9…`) is bundled as optional vocabulary (installed, not
+  activated), and the `kip:memory-default` policy (`sha256:b70ae00c…`) and the
+  standard strength policy `kip:strength-half-life-30d` (`sha256:a50a89b8…`)
+  ship beside it.
 - **Breaking — Profile content:** no `Preference` type and no `TrialState` /
   `DerivationState` facets. A Skill's lifecycle points at its records through
   `current_trial` / `current_evaluation`; `GradingState`, `effective_strength`
   and the `derived_from` / `compiled_from` / `compiled_by` / `consolidated_to`
   fields are computed members (§18.2) and every write to one fails
-  `ConstraintViolation`. The 1.x migration keeps a 1.x `Preference` as an open
+  `ConstraintViolation`. `effective_strength` is computed on every read from
+  `memory_strength`, `last_metabolized_at` and a `strength_policy` pinned to
+  `kip:strength-half-life-30d` (the read's own instant, never `FOR TIME`); any
+  missing input or a digest mismatch reads `null`, and exports strip it. The 1.x migration keeps a 1.x `Preference` as an open
   type in its legacy package instead of adopting it.
 - **Breaking — language:** `DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` parse
   and lower to a standalone `Define` clause (rejected inside `MUTATE`); the KQL
   Search Pattern `?x SEARCH <KIND> <term> … LIMIT k` lowers to a `Search`
   where-clause (never inside `NOT`, never in a mutation or export selection);
   `SEARCH COGNITION` is removed; ASSERT takes `context`, and `context_refs` is
-  immutable Assertion payload. The AST matches `@ldclabs/kip-lang` 2.4.0 and
-  the WASM oracle is rebuilt.
+  immutable Assertion payload. The AST matches `@ldclabs/kip-lang` 2.4.1 and
+  the WASM oracle is rebuilt. A fully written `DEFINE` body is checked at parse
+  time (`anda_kip::check_draft_definition`, the same rules the engines apply
+  after binding), and an ASSERT that cites evidence without `at` or `valid.from`
+  draws a warning (kip-lang `KIP_2103`).
 - **Breaking — SDK:** `ConformanceProfile` has the two §89 levels (`KIP-Core`,
   `KIP-CognitiveMemory`); the eight areas are `ConformanceArea` and
   `PROTOCOL_SURFACE` lists areas. `ValidTime` endpoints are `TimePoint`
-  (instant or `{earliest, latest}` bound). `Projection` drops `temporal`
-  (the basis carries `valid_at` and the snapshot) and gains `leading` and
-  `precedence`. New `SchemaSymbolConflict` error. `COGNITIVE_CONSISTENCY` is
+  (instant or `{earliest, latest}` bound). `Projection` drops `temporal` and
+  `policy` (the basis carries the policy, `valid_at` and the snapshot) and
+  gains `leading` and `precedence`; a side's `score` and `score_semantics` are
+  `null` under a structural policy, and `assertion_ids` / `root_groups` are
+  always present. New `anda_kip::draft` module (`DRAFT_PACKAGE_REF`,
+  `check_draft_definition`). New `SchemaSymbolConflict` error. `COGNITIVE_CONSISTENCY` is
   kept as the upstream redirect text; new `BRAIN_RUNTIME`,
   `VALIDATED_LEARNING` and `COMMON_SCHEMA` constants. Memory bundles are the
   three levels with `nexus_level`; `memory_interface` no longer implies
@@ -84,18 +99,50 @@ for the parser, the executable AST and stored draft Spaces.
   `precedence` disclosed). `uncertainty.reasons` carries machine codes only.
   The baseline (now version 3) weighs an unstated confidence by stance alone.
   A value-only correction may supersede an Assertion about another value of
-  the same slot.
+  the same slot; supersession keeps the actor, the canonical context set and
+  the slot (merge-resolved), or fails `SupersessionMismatch` (§14.2). A
+  `BELIEF SLOT` has no `leading`, `contested`, `policy` or `temporal` member
+  (each candidate carries its own `leading`, now decided by independent roots)
+  and unions its candidates' uncertainty reasons; `temporal_indeterminate` is
+  reported only when indeterminate material alone made a candidate uncertain.
+  The engine-private `kip:policy:structural` runs the §21.10 baseline (no
+  weights, no precedence) by name. Succession lines compare merge-resolved
+  actors and contexts. `FIND … FOR TIME` reads time bounds the way projection
+  does, and kip-do's `?a ACTIVITY {status: …}` matches the top-level status.
+- **New — draft vocabulary (§20.16):** `DEFINE PREDICATE` / `DEFINE CONCEPT
+  TYPE` add to the Space-local `kip://local/draft@0.0.0` under the new
+  `propose_schema` permission, as their own governance transaction answering
+  `{ref, schema_environment_version}` with a `schema` control change. The
+  draft package is synthesized per Space from the Schema Lock (new `draft`
+  member, absent until the first `DEFINE`), reported by `LIST SCHEMA PACKAGES`
+  and `DESCRIBE PACKAGE` with a computed digest, and kept by every later
+  activation. A name of the same kind anywhere in the lock, a reserved Core
+  kind or an alias fails `SchemaSymbolConflict`. `promote_draft_symbol` /
+  `promoteDraftSymbol` (`manage_schema`) record `lineage_maps` (`[{kind, from,
+  to}]`, shown by `DESCRIBE SCHEMA ENVIRONMENT`), after which type and
+  predicate matching read the draft and the target as one lineage. Rust
+  Capsule import maps source draft symbols through
+  `Session::import_capsule_mapped` and refuses unmapped ones. Activating a
+  Schema Lock now also publishes a `schema` control change.
 - **Capabilities:** the §67.4 registry follows the Specification (29 names);
   `belief_slot`, `ingestion_context`, `dependency_validity` and
   `materialized_projection` are engine-local names. Both engines claim
-  `KIP-Core`; `draft_vocabulary`, `recording_repair`, `exposure_log`,
-  `receiver_fencing` and `prospective_trials` answer `false`, so neither
-  claims `KIP-CognitiveMemory`. `recording` is a Change Envelope control kind.
+  `KIP-Core` and advertise `draft_vocabulary`; `recording_repair`,
+  `exposure_log`, `receiver_fencing` and `prospective_trials` answer `false`,
+  so neither claims `KIP-CognitiveMemory`. `recording` is a Change Envelope
+  control kind. kip-do's `LIST SCHEMA PACKAGES` rows now match the Rust engine
+  (`package_ref`, `package_id`, `version`, `status`, `name`, `description`,
+  from the Schema Lock), and `DESCRIBE <symbol>` adds `local_name` and
+  `package_ref`.
 - **Conformance:** `fixtures/kip-conformance-2.0/` is now a byte copy of KIP's
   `conformance/engine-suite/` (`make sync-kip-conformance`), and both
   harnesses follow KIP's runner (captures, `result_contains`,
   `pending_engine`, SKIP for unexpected `UnsupportedCapability`). Both
-  engines: 384 passed, 4 skipped (DEFINE), 0 failed of 388.
+  engines pass all 423 cases of KIP `597db44`, including the pending
+  `draft-vocabulary`, `supersession-scope` and `mnemonic-strength` fixtures.
+- **Storage:** new stores no longer index `assertions.valid_until` (existing
+  indexes stay, unread); a Capsule import keeps time-bound `valid_time`
+  endpoints instead of dropping them.
 
 ### Storage and index crates
 

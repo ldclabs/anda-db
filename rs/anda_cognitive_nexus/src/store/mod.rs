@@ -353,9 +353,10 @@ async fn init_assertions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["status"]).await?;
     c.create_btree_index_nx(&["mode"]).await?;
     c.create_btree_index_nx(&["stance"]).await?;
-    // Kept for range reads over closed validity windows; projection decides
-    // world time on the Assertions fetched by proposition_id (§25.4).
-    c.create_btree_index_nx(&["valid_until"]).await?;
+    // No index on validity: world time is decided on the Assertions fetched by
+    // proposition_id (§25.4), and an endpoint may be a time bound rather than
+    // a sortable instant (§25.5). Stores created before this keep their
+    // `valid_until` index, which nothing reads.
     Ok(())
 }
 

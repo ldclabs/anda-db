@@ -9,8 +9,11 @@ import { validatePackageContracts } from './contracts.js'
  */
 
 import { errors, KipError } from '../errors.js'
-import type { JsonMap } from '../json.js'
+import { canonicalJson, type Json, type JsonMap } from '../json.js'
+import { sha256Text } from '../digest.js'
+import { DRAFT_PACKAGE_ID, DRAFT_PACKAGE_REF, DRAFT_PACKAGE_VERSION } from './draft.js'
 import {
+  CORE_ELEMENT_KINDS,
   defines,
   symbolRefOf,
   type SchemaPackage,
@@ -20,6 +23,7 @@ import {
   formatSymbolRef,
   isQualified,
   KIND_NAMES,
+  lineageText,
   parseSymbolRef,
   type SymbolKind,
   type SymbolRef,
@@ -182,10 +186,101 @@ export interface SchemaLock {
   write_defaults: Record<string, string>
   /** Model-friendly aliases: alias → canonical symbol reference (§21). */
   aliases: Record<string, string>
+  /**
+   * The Space's draft vocabulary (§20.16): every symbol `DEFINE` added, as
+   * package definitions. Absent until the first `DEFINE`, so a lock written
+   * before it is unchanged byte for byte.
+   */
+  draft?: DraftVocabulary
+  /**
+   * Promotions (§20.16): each draft symbol mapped onto a symbol of the same
+   * kind in an installed package. Absent until the first promotion.
+   */
+  lineage_maps?: LineageMap[]
+}
+
+/** The definitions of a Space's draft package (§20.16). */
+export interface DraftVocabulary {
+  concept_types?: Record<string, JsonMap>
+  predicates?: Record<string, JsonMap>
+}
+
+/**
+ * One promotion of a draft symbol: `from` is the draft lineage
+ * (`kip://local/draft/<name>`), `to` the target lineage, and `kind` names the
+ * symbol kind, because kinds are separate namespaces and a lineage is not.
+ */
+export interface LineageMap {
+  kind: 'ConceptType' | 'PredicateType'
+  from: string
+  to: string
 }
 
 export function emptyLock(): SchemaLock {
   return { packages: {}, states: {}, write_defaults: {}, aliases: {} }
+}
+
+/** Whether a draft vocabulary defines nothing. */
+export function draftIsEmpty(draft: DraftVocabulary | undefined): boolean {
+  return Object.keys(draft?.concept_types ?? {}).length === 0 &&
+    Object.keys(draft?.predicates ?? {}).length === 0
+}
+
+/**
+ * The artifact the Schema Environment resolves `kip://local/draft@0.0.0` to:
+ * its definitions so far, with an `integrity.content_digest` computed under
+ * `kip-jcs-safe-v1`, so the digest changes with every `DEFINE` while the
+ * reference does not. Byte for byte the artifact `anda_cognitive_nexus`
+ * synthesizes, so both engines report one digest.
+ */
+export function draftPackage(draft: DraftVocabulary | undefined): SchemaPackage {
+  const covered = {
+    format: 'KIP-Schema-Package',
+    format_version: '2.0-draft',
+    manifest: {
+      package_id: DRAFT_PACKAGE_ID,
+      version: DRAFT_PACKAGE_VERSION,
+      package_ref: DRAFT_PACKAGE_REF,
+      name: 'Space draft vocabulary',
+      description:
+        'Symbols this Space added with DEFINE (Spec §20.16): open, additive and never changed once defined.',
+    },
+    definitions: {
+      concept_types: draft?.concept_types ?? {},
+      predicates: draft?.predicates ?? {},
+    },
+  }
+  return {
+    ...covered,
+    integrity: {
+      digest_profile: 'kip-jcs-safe-v1',
+      content_digest: 'sha256:' + sha256Text(canonicalJson(covered as unknown as Json)),
+      covers: 'all top-level fields except integrity',
+      signatures: [],
+    },
+  } as unknown as SchemaPackage
+}
+
+/**
+ * Carries the Space-local parts of `current` into a lock being activated
+ * (§20.16): the draft package, its definitions and its promotions. Activating
+ * or migrating other packages never removes them; a lock that writes them
+ * explicitly keeps what it wrote.
+ */
+export function retainSpaceLocal(lock: SchemaLock, current: SchemaLock | null): SchemaLock {
+  if (current === null || draftIsEmpty(current.draft)) return lock
+  const out: SchemaLock = {
+    ...lock,
+    packages: { ...lock.packages },
+    states: { ...lock.states },
+  }
+  out.packages[DRAFT_PACKAGE_ID] ??= DRAFT_PACKAGE_VERSION
+  out.states[DRAFT_PACKAGE_ID] ??= 'active'
+  if (draftIsEmpty(out.draft)) out.draft = current.draft
+  if ((out.lineage_maps ?? []).length === 0 && (current.lineage_maps ?? []).length > 0) {
+    out.lineage_maps = current.lineage_maps
+  }
+  return out
 }
 
 /** Reads a stored lock, filling in the members an older one may not carry. */
@@ -240,9 +335,12 @@ export class SchemaEnvironment {
     const artifacts = new Map<string, SchemaPackage>()
     for (const [packageId, packageVersion] of Object.entries(lock.packages)) {
       const packageRef = `${packageId}@${packageVersion}`
-      const artifact =
-        available.get(packageRef) ??
-        (packageRef === CORE_PACKAGE_REF ? CORE_PACKAGE : undefined)
+      // The draft package is Space-local and synthesized, never installed
+      // (§20.16).
+      const artifact = packageRef === DRAFT_PACKAGE_REF
+        ? draftPackage(lock.draft)
+        : available.get(packageRef) ??
+          (packageRef === CORE_PACKAGE_REF ? CORE_PACKAGE : undefined)
       if (artifact === undefined) {
         throw errors.schemaPackageUnavailable(
           `the Schema Lock names ${packageRef} but its artifact is not ` +
@@ -327,7 +425,12 @@ export class SchemaEnvironment {
       const artifact = this.artifacts.get(packageRef)
       if (artifact === undefined) continue
       if (defines(artifact, kind, name)) {
-        candidates.push(symbolRefOf(artifact, name))
+        const symbol = symbolRefOf(artifact, name)
+        // A promoted draft symbol answers through its target (§20.16): its
+        // local name stops competing with it.
+        const text = formatSymbolRef(symbol)
+        if (packageRef === DRAFT_PACKAGE_REF && this.lineage(kind, text) !== lineageText(text)) continue
+        candidates.push(symbol)
       }
     }
 
@@ -390,6 +493,51 @@ export class SchemaEnvironment {
   /** The definition behind a resolved symbol, when the caller needs it. */
   definitionPackage(symbol: SymbolRef): SchemaPackage | undefined {
     return this.artifacts.get(formatPackageRef(symbol.package))
+  }
+
+  /**
+   * What already names `name` as a `kind` here, when something does
+   * (§20.16): a reserved Core element kind, an alias, or a symbol of that kind
+   * in any package of the lock whatever its state — the draft package and its
+   * earlier symbols included. Kinds are separate namespaces.
+   */
+  nameTaken(kind: SymbolKind, name: string): string | null {
+    if (CORE_ELEMENT_KINDS.includes(name)) return `${CORE_PACKAGE_REF}/${name}`
+    const alias = this.lock.aliases[name]
+    if (alias !== undefined) return `the alias ${JSON.stringify(name)} for ${alias}`
+    for (const [packageRef, artifact] of [...this.artifacts.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      if (defines(artifact, kind, name)) return `${packageRef}/${name}`
+    }
+    return null
+  }
+
+  /**
+   * The lineage a symbol reference belongs to here (§20.14), after
+   * promotions: a promoted draft symbol's lineage is its target's (§20.16).
+   */
+  lineage(kind: SymbolKind, reference: string): string {
+    const lineage = lineageText(reference)
+    const map = (this.lock.lineage_maps ?? []).find((m) => m.kind === kind && m.from === lineage)
+    return map === undefined ? lineage : map.to
+  }
+
+  /** Whether two references are one lineage here, promotions included. */
+  sameLineage(kind: SymbolKind, a: string, b: string): boolean {
+    return a === b || this.lineage(kind, a) === this.lineage(kind, b)
+  }
+
+  /**
+   * Every stored lineage that reads as `lineage` here: itself, and each draft
+   * lineage promoted into it (§20.16). What an index seek on a lineage column
+   * widens to.
+   */
+  lineagesOf(kind: SymbolKind, lineage: string): string[] {
+    const target = (this.lock.lineage_maps ?? []).find((m) => m.kind === kind && m.from === lineage)?.to ?? lineage
+    const out = new Set([lineage, target])
+    for (const map of this.lock.lineage_maps ?? []) {
+      if (map.kind === kind && map.to === target) out.add(map.from)
+    }
+    return [...out].sort()
   }
 
   /**

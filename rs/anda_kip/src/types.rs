@@ -714,9 +714,6 @@ pub struct Projection {
     /// one did (§21.13): `{rule, prevailed_over}` or `{rule, outranked_by}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precedence: Option<Json>,
-    /// Which policy decided it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<crate::request::PolicyIdentity>,
     /// The Epistemic Ledger, when one was requested and authorized (§27.4).
     ///
     /// Open by construction: what a ledger contains is the projection
@@ -729,20 +726,22 @@ pub struct Projection {
 /// One side — supporting or opposing — of a projection (Spec §27.2).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ProjectionSide {
-    /// The strength of this side, in whatever `score_semantics` declares.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The strength of this side, in whatever `score_semantics` declares;
+    /// `null` under a structural policy, which weighs nothing (§21.10).
+    #[serde(default)]
     pub score: Option<f64>,
-    /// What the score means. Required alongside a score (§27.3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What the score means. Required alongside a score (§27.3); `null`
+    /// with it.
+    #[serde(default)]
     pub score_semantics: Option<String>,
-    /// The Assertions on this side.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The Assertions on this side; empty when the ledger was not disclosed.
+    #[serde(default)]
     pub assertion_ids: Vec<String>,
     /// The corroboration groups they collapse into.
     ///
     /// Two actors repeating one observation are one root, not two: this is
     /// where independent support is distinguished from repetition (§23).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub root_groups: Vec<Json>,
 }
 
@@ -1151,7 +1150,6 @@ mod tests {
                 reasons: vec!["temporal_indeterminate".into()],
             }),
             leading: Some("support".into()),
-            policy: Some(crate::request::PolicyIdentity::new("kip:policy:baseline")),
             explanation: None,
             ..Default::default()
         };
@@ -1164,8 +1162,10 @@ mod tests {
         assert_eq!(json["opposition"]["score"], 0.7);
         assert_eq!(json["support"]["score_semantics"], "ordinal_strength");
         assert_eq!(json["leading"], "support");
-        // The world time and snapshot live in `basis`; there is no second copy.
+        // The policy, world time and snapshot live in `basis`; there is no
+        // second copy (§27.2).
         assert!(json.get("temporal").is_none());
+        assert!(json.get("policy").is_none());
         assert_eq!(
             serde_json::from_value::<Projection>(json).unwrap(),
             projection

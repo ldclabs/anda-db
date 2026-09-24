@@ -214,6 +214,8 @@ permissions! {
         "confer part of one's own authority on another Principal";
     ManagePolicy => "manage_policy", Governance,
         "publish a new version of the Space's Governance Policy";
+    ProposeSchema => "propose_schema", Governance,
+        "add a symbol to the Space's draft vocabulary with DEFINE (§20.16); never installs, activates or changes an existing symbol";
     ManageSchema => "manage_schema", Governance,
         "install a Schema Package or activate a Schema Lock";
 

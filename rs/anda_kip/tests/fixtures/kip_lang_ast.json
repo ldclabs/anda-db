@@ -1,5 +1,5 @@
 {
- "source": "@ldclabs/kip-lang 2.4.0 — lower(parse(command).ast)",
+ "source": "@ldclabs/kip-lang 2.4.1 — lower(parse(command).ast)",
  "note": "Regenerate with tests/fixtures/README.md; every entry must decode to the same anda_kip AST.",
  "cases": [
   {
@@ -3624,7 +3624,7 @@
    }
   },
   {
-   "command": "DEFINE CONCEPT TYPE \"Instrument\" { description: \"A musical instrument.\", attributes: { family: { type: \"string\" } } }",
+   "command": "DEFINE CONCEPT TYPE \"Instrument\" { description: \"A musical instrument.\", attributes: { open: true, fields: { family: { type: \"string\" } } } }",
    "ast": {
     "Kml": {
      "explicit_transaction": false,
@@ -3644,10 +3644,17 @@
          "attributes": {
           "Value": {
            "Object": {
-            "family": {
+            "open": {
+             "Bool": true
+            },
+            "fields": {
              "Object": {
-              "type": {
-               "String": "string"
+              "family": {
+               "Object": {
+                "type": {
+                 "String": "string"
+                }
+               }
               }
              }
             }

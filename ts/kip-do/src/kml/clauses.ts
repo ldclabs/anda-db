@@ -101,6 +101,7 @@ import {
   endpointFromJson,
   endpointKey,
   endpointToJson,
+  referencedElement,
   tupleKey,
   type Endpoint,
 } from '../term.js'
@@ -1333,14 +1334,38 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
   tx.authorizeElement(by, 'supersede_own')
   const newer = requireKind(tx, by, 'Assertion')
   requireStanding(tx, id, older.row, 'TRANSITION TO "superseded"')
+  // Supersession stays inside the actor and the scope that were wrong
+  // (§14.2): it never moves a claim to another actor, nor widens or narrows
+  // what that actor said. A claim wrong only in its scope is withdrawn and the
+  // scoped claim asserted anew. Compared merge-resolved, so a claim recorded
+  // before a merge compares equal to one recorded after it.
+  const canonical = (value: Json): string => {
+    const element = referencedElement(value)
+    if (element === null) return endpointKey(endpointFromJson(value))
+    const resolved = element.kind === 'Concept' ? canonicalChain(tx, element).at(-1)! : element
+    return endpointKey({ kind: 'local', id: resolved })
+  }
+  const scope = (row: AssertionRow): string =>
+    [...new Set(row.context_refs.map((ref) => canonical(ref as Json)))].sort().join('\u001f')
+  if (canonical(older.row.asserted_by as Json) !== canonical(newer.row.asserted_by as Json)) {
+    throw errors.supersessionMismatch(
+      `${newerId} is another actor's claim; ${olderId} can be superseded only by its own actor`,
+    )
+  }
+  if (scope(older.row) !== scope(newer.row)) {
+    throw errors.supersessionMismatch(
+      `${newerId} holds in another context set than ${olderId}; a claim wrong only in ` +
+        `its scope is retracted and asserted anew (§14.2)`,
+    )
+  }
   if (older.row.proposition_id !== newer.row.proposition_id) {
     // A value-only correction replaces the claim with another value of the
-    // same slot (§14.2): the same subject and predicate lineage. Anything
-    // wider would silently retire a claim nobody revised.
+    // same slot (§14.2): the same canonical subject and predicate lineage.
+    // Anything wider would silently retire a claim nobody revised.
     const slotOf = (reference: string): string | null => {
       const element = tx.load(parseElementIdOfKind(reference, 'Proposition'))
       return element.kind === 'Proposition'
-        ? `${element.row.subject_key}\u001f${lineageText(element.row.predicate_ref)}`
+        ? `${canonical(element.row.subject as Json)}\u001f${lineageText(element.row.predicate_ref)}`
         : null
     }
     const olderSlot = slotOf(older.row.proposition_id)

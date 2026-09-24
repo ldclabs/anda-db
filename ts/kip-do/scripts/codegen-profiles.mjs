@@ -42,6 +42,14 @@ const artifacts = readdirSync(source)
 
 if (artifacts.length === 0) throw new Error(`${source}: no artifacts found`)
 
+// The mnemonic strength policies an engine computes `effective_strength` for
+// (Spec §59.1, Profile §6.1): data, not packages, but bundled the same way.
+const strengthPolicies = readdirSync(source)
+  .filter((name) => name.endsWith('.json'))
+  .sort()
+  .map((name) => JSON.parse(readFileSync(join(source, name), 'utf8')))
+  .filter((artifact) => artifact.format === 'KIP-Strength-Policy')
+
 /**
  * `kip://profiles/cognitive-memory` → `COGNITIVE_MEMORY`.
  *
@@ -91,9 +99,16 @@ const out = `/**
  * which Space may resolve symbols through them.
  */
 
+import type { JsonMap } from '../json.js'
 import type { SchemaPackage } from './package.js'
 
 ${bodies.join('\n')}
+/**
+ * The bundled mnemonic strength policies (Spec §59.1, Profile §6.1), verbatim
+ * from \`rs/anda_cognitive_nexus/profiles/\`.
+ */
+export const STRENGTH_POLICIES: readonly JsonMap[] = ${JSON.stringify(strengthPolicies, null, 2)}
+
 /** Every bundled artifact, in package-id order. */
 export const BUNDLED_PACKAGES: readonly SchemaPackage[] = [
 ${artifacts.map(({ id }) => `  ${constantName(id)},`).join('\n')}

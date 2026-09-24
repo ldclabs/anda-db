@@ -376,9 +376,10 @@ async fn an_empty_slot_reports_the_coordinates_it_ran_under() {
     assert_eq!(slot["status"], "insufficient");
     assert_eq!(slot["accepted_values"], json!([]));
     // §47.4 is exactly the empty case, so the policy and the coordinate have
-    // to come from the slot rather than from a candidate that is not there.
-    assert!(slot["policy"]["id"].is_string(), "{slot}");
-    assert!(slot["temporal"]["valid_at"].is_string(), "{slot}");
+    // to come from the slot's own basis rather than from a candidate that is
+    // not there (§47.3).
+    assert!(slot["basis"]["policy"]["id"].is_string(), "{slot}");
+    assert!(slot["basis"]["valid_at"].is_string(), "{slot}");
     assert!(slot["explanation"].is_object(), "{slot}");
     // §8: the reference shape, never the engine's internal endpoint key.
     assert_eq!(slot["subject"], json!({"id": handle(&created, "alice")}));
@@ -421,14 +422,16 @@ async fn an_explanation_level_decides_what_comes_back() {
     .await;
     assert!(quiet[0]["explanation"].is_null(), "{}", quiet[0]);
     // The Assertion ids *are* the ledger; withholding the ledger and handing
-    // them over under another key would be no withholding at all. Absent
-    // rather than empty, because an empty list would read as "nothing
-    // supports this" — which is a claim, and a false one.
-    assert!(
-        quiet[0]["support"]["assertion_ids"].is_null(),
+    // them over under another key would be no withholding at all. The wire
+    // contract requires the member (`kip-projection.schema.json`), so it is
+    // empty, and the score still says the side is supported.
+    assert_eq!(
+        quiet[0]["support"]["assertion_ids"],
+        json!([]),
         "{}",
         quiet[0]
     );
+    assert!(quiet[0]["support"]["score"].as_f64().unwrap() > 0.0);
     assert_eq!(quiet[0]["status"], "accepted", "the answer still answers");
 }
 

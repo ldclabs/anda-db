@@ -251,6 +251,11 @@ export const PERMISSIONS = {
     family: 'governance',
     description: "publish a new version of the Space's Governance Policy",
   },
+  propose_schema: {
+    family: 'governance',
+    description:
+      "add a symbol to the Space's draft vocabulary with DEFINE (§20.16); never installs, activates or changes an existing symbol",
+  },
   manage_schema: {
     family: 'governance',
     description: 'install a Schema Package or activate a Schema Lock',

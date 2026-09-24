@@ -473,8 +473,8 @@ fn build(
                 mode: core_registry(view, "mode", ASSERTION_MODES)?,
                 confidence: confidence_of(view)?,
                 asserted_at: text(view, "asserted_at"),
-                valid_from: nested_text(view, "valid_time", "from"),
-                valid_until: nested_text(view, "valid_time", "until"),
+                valid_from: stored_point(view, "from")?,
+                valid_until: stored_point(view, "until")?,
                 evidence_refs,
                 evidence_ids,
                 context_refs: rewrite_refs(view.get("context_refs"), mapping, "context")?,
@@ -757,6 +757,16 @@ fn confidence_of(view: &Json) -> Result<f64, KipError> {
             "an imported Assertion's `confidence` must be a number in [0, 1], got {other}"
         ))),
     }
+}
+
+/// A `valid_time` endpoint in its stored form: an exact Timestamp as is, a
+/// time bound (§25.5) as its canonical JSON, a missing one empty.
+fn stored_point(view: &Json, field: &str) -> Result<String, KipError> {
+    Ok(
+        crate::time::Point::read(view["valid_time"].get(field), field)?
+            .map(|point| point.store())
+            .unwrap_or_default(),
+    )
 }
 
 fn nested_text(view: &Json, container: &str, field: &str) -> String {

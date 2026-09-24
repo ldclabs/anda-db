@@ -331,6 +331,7 @@ impl CognitiveNexus {
         let current = self.store.schema_environment(space_id).await?;
         let mut lock = lock;
         crate::migrate::retain_legacy_package(&current.lock, &mut lock);
+        lock.retain_space_local(&current.lock);
         if current.lock == lock {
             return Ok(current);
         }
@@ -354,7 +355,16 @@ impl CognitiveNexus {
     ) -> Result<crate::capsule::ImportReport, KipError> {
         let _guard = self.lock.write().await;
         self.store.reopen_if_poisoned().await?;
-        crate::capsule::import(self, capsule, space_id, false, AuthContext::system(), false).await
+        crate::capsule::import(
+            self,
+            capsule,
+            space_id,
+            false,
+            AuthContext::system(),
+            false,
+            &[],
+        )
+        .await
     }
 
     /// Imports a Capsule into quarantine rather than into recall (§39.2).
@@ -372,7 +382,16 @@ impl CognitiveNexus {
     ) -> Result<crate::capsule::ImportReport, KipError> {
         let _guard = self.lock.write().await;
         self.store.reopen_if_poisoned().await?;
-        crate::capsule::import(self, capsule, space_id, false, AuthContext::system(), true).await
+        crate::capsule::import(
+            self,
+            capsule,
+            space_id,
+            false,
+            AuthContext::system(),
+            true,
+            &[],
+        )
+        .await
     }
 
     /// The Space a request runs against.
@@ -1154,6 +1173,35 @@ impl Session {
         .await
     }
 
+    /// Promotes a draft symbol onto a symbol of the same kind in an installed
+    /// package (§20.16, `manage_schema`): a Schema migration recorded as a
+    /// lineage mapping in the Space's Schema Environment. `from` is the draft
+    /// symbol's local name or exact reference, `to` the target's. Returns the
+    /// new environment version. Nothing is ever promoted implicitly.
+    pub async fn promote_draft_symbol(
+        &self,
+        space_id: &str,
+        kind: crate::schema::SymbolKind,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, KipError> {
+        let origin = serde_json::to_value(anda_kip::ReceiptOrigin {
+            principal_id: self.auth.principal_id.clone(),
+            actor_binding_id: None,
+            delegation_digest: crate::tx::delegation_digest(&self.auth.delegation_chain),
+        })
+        .unwrap_or(Json::Null);
+        self.governed(space_id, Permission::ManageSchema, async || {
+            let row = self
+                .nexus
+                .store
+                .promote_draft_symbol(space_id, kind, from, to, origin)
+                .await?;
+            Ok(row.schema_environment_version)
+        })
+        .await
+    }
+
     /// Accepts another Brain's cognition into a Space (§29, `import`).
     ///
     /// Its own permission, and not `create`: the difference between writing
@@ -1168,6 +1216,21 @@ impl Session {
         capsule: &anda_kip::Capsule,
         isolate: bool,
     ) -> Result<crate::capsule::ImportReport, KipError> {
+        self.import_capsule_mapped(space_id, capsule, isolate, &[])
+            .await
+    }
+
+    /// [`Self::import_capsule`], mapping the source draft symbols the
+    /// Capsule's records use onto destination symbols of the same kind
+    /// (§20.16, Capsule §41.7). A used source draft symbol without an entry
+    /// fails `SchemaPackageUnavailable`; nothing is ever mapped by name.
+    pub async fn import_capsule_mapped(
+        &self,
+        space_id: &str,
+        capsule: &anda_kip::Capsule,
+        isolate: bool,
+        symbols: &[crate::capsule::SymbolMapping],
+    ) -> Result<crate::capsule::ImportReport, KipError> {
         self.governed(space_id, Permission::Import, async || {
             crate::capsule::import(
                 &self.nexus,
@@ -1176,6 +1239,7 @@ impl Session {
                 false,
                 (*self.auth).clone(),
                 isolate,
+                symbols,
             )
             .await
         })
@@ -1252,9 +1316,6 @@ impl Session {
     /// The write lane (§32): one exclusive lock, the replay a retried key is
     /// owed, the gate, and the reopen a poisoned handle needs afterwards.
     async fn run_write(&self, call: &Call<'_>, statement: &anda_kip::KmlStatement) -> Response {
-        if let Some(err) = crate::kml::unsupported_clause(statement) {
-            return Response::from(err);
-        }
         let _guard = self.nexus.lock.write().await;
         if let Err(err) = self.nexus.store.reopen_if_poisoned().await {
             return Response::from(err);

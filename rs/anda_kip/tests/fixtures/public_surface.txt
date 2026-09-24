@@ -105,6 +105,14 @@ cognitive.rs: trait EvaluationRule
 conformance.rs: const PROTOCOL_SURFACE
 conformance.rs: fn capability_engine_names
 conformance.rs: fn capability_registry_names
+draft.rs: const DRAFT_ATTRIBUTE_TYPES
+draft.rs: const DRAFT_PACKAGE_ID
+draft.rs: const DRAFT_PACKAGE_REF
+draft.rs: const DRAFT_PACKAGE_VERSION
+draft.rs: const DRAFT_PREDICATE_MEMBERS
+draft.rs: const DRAFT_TYPE_MEMBERS
+draft.rs: fn check_draft_definition
+draft.rs: fn draft_symbol_ref
 error.rs: struct ErrorObject
 error.rs: struct KipError
 error.rs: struct RetryInfo
@@ -121,6 +129,7 @@ json.rs: fn validate_json
 lib.rs: mod ast
 lib.rs: mod capsule
 lib.rs: mod conformance
+lib.rs: mod draft
 lib.rs: mod error
 lib.rs: mod executor
 lib.rs: mod json
@@ -139,6 +148,7 @@ lib.rs: static SYSTEM_INSTRUCTIONS
 lib.rs: use ast::*;
 lib.rs: use capsule::*;
 lib.rs: use conformance::*;
+lib.rs: use draft::*;
 lib.rs: use error::*;
 lib.rs: use executor::*;
 lib.rs: use json::{MAX_SAFE_INTEGER, parse_canonical_json, validate_json};

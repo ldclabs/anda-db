@@ -267,6 +267,7 @@ pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer,
             policy(cx, &Policy::baseline().id).await?,
             policy(cx, &Policy::forecast().id).await?,
             policy(cx, &Policy::memory_default().id).await?,
+            policy(cx, &Policy::structural().id).await?,
         ],
         ListTarget::Dependents => {
             let (rows, cut) = dependents(cx, command).await?;
@@ -763,6 +764,8 @@ fn schema_environment_of(env: &crate::schema::SchemaEnvironment) -> Json {
         "states": env.lock.states,
         "write_defaults": env.lock.write_defaults,
         "aliases": env.lock.aliases,
+        // Promotions of draft symbols (§20.16), `[{kind, from, to}]`.
+        "lineage_maps": env.lock.lineage_maps,
     })
 }
 
@@ -805,18 +808,28 @@ fn package(cx: &Context<'_>, reference: &str) -> Result<Json, KipError> {
             format!("{reference} is not part of this Space's Schema Environment"),
         )
     })?;
-    Ok(serde_json::json!({
+    let mut described = serde_json::json!({
         "package_ref": reference,
         "manifest": artifact.manifest,
         "dependencies": artifact.dependencies,
         "status": cx.env.state(&artifact.manifest.package_id),
+        "integrity": artifact.integrity,
         "symbols": {
             "concept_types": artifact.symbols(SymbolKind::ConceptType),
             "predicates": artifact.symbols(SymbolKind::PredicateType),
             "facets": artifact.symbols(SymbolKind::Facet),
             "structural_fields": artifact.symbols(SymbolKind::StructuralField),
         },
-    }))
+    });
+    // The draft package has no artifact to fetch elsewhere, so it reports its
+    // definitions so far (§20.16).
+    if reference == anda_kip::DRAFT_PACKAGE_REF {
+        described["definitions"] = serde_json::json!({
+            "concept_types": cx.env.lock.draft.concept_types,
+            "predicates": cx.env.lock.draft.predicates,
+        });
+    }
+    Ok(described)
 }
 
 /// Describes one schema symbol, always by its canonical identity (§65).

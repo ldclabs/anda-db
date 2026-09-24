@@ -14,6 +14,7 @@
 use crate::id::ElementId;
 use crate::store::rows::AssertionRow;
 use crate::time::{Point, TIME_MAX, TIME_MIN};
+use anda_kip::Json;
 
 /// A closed range of possible instants.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,29 +64,57 @@ pub(crate) struct Timed {
     pub end: Span,
 }
 
+/// The written interval as spans: a missing `from` is the bound
+/// {latest: asserted_at} (§25.2), a missing `until` is open.
+fn written(from: Option<&Point>, until: Option<&Point>, asserted_at: &str) -> (Span, Span) {
+    let start = match from {
+        Some(point) => Span::of(point),
+        None => Span {
+            lo: TIME_MIN.to_string(),
+            hi: if asserted_at.is_empty() {
+                TIME_MAX.to_string()
+            } else {
+                asserted_at.to_string()
+            },
+        },
+    };
+    let end = until.map_or_else(
+        || Span {
+            lo: TIME_MAX.to_string(),
+            hi: TIME_MAX.to_string(),
+        },
+        Span::of,
+    );
+    (start, end)
+}
+
+/// Where an interval lies at `at` (§25.5).
+fn place(start: &Span, end: &Span, at: &str) -> Placement {
+    if start.lo.as_str() > at || end.hi.as_str() <= at {
+        Placement::Outside
+    } else if start.hi.as_str() <= at && end.lo.as_str() > at {
+        Placement::Inside
+    } else {
+        Placement::Indeterminate
+    }
+}
+
+/// Where one Assertion's *written* interval lies at `at`, without
+/// succession: what `FIND … FOR TIME` restricts a row by, since a row is one
+/// Assertion rather than a slot's line. `valid_time` is the wire object, its
+/// endpoints exact Timestamps or time bounds (§25.5).
+pub(crate) fn place_written(valid_time: &Json, asserted_at: &str, at: &str) -> Placement {
+    let endpoint = |name: &str| Point::read(valid_time.get(name), name).ok().flatten();
+    let (from, until) = (endpoint("from"), endpoint("until"));
+    let (start, end) = written(from.as_ref(), until.as_ref(), asserted_at);
+    place(&start, &end, at)
+}
+
 impl Timed {
     pub fn new(row: &AssertionRow, proposition: ElementId, partition: String) -> Self {
         let from = Point::load(&row.valid_from);
         let until = Point::load(&row.valid_until);
-        // A missing `from` is the bound {latest: asserted_at} (§25.2).
-        let start = match &from {
-            Some(point) => Span::of(point),
-            None => Span {
-                lo: TIME_MIN.to_string(),
-                hi: if row.asserted_at.is_empty() {
-                    TIME_MAX.to_string()
-                } else {
-                    row.asserted_at.clone()
-                },
-            },
-        };
-        let end = until.as_ref().map_or_else(
-            || Span {
-                lo: TIME_MAX.to_string(),
-                hi: TIME_MAX.to_string(),
-            },
-            Span::of,
-        );
+        let (start, end) = written(from.as_ref(), until.as_ref(), &row.asserted_at);
         let start_key = match &from {
             Some(Point::Exact(at)) => at.clone(),
             Some(Point::Bound {
@@ -93,6 +122,7 @@ impl Timed {
             }) => at.clone(),
             _ => row.asserted_at.clone(),
         };
+        // The written set; projection replaces it with the merge-resolved one.
         let mut context: Vec<String> = row.context_refs.iter().map(|v| v.to_string()).collect();
         context.sort();
         context.dedup();
@@ -113,13 +143,7 @@ impl Timed {
 
     /// Where the effective interval lies at `at` (§25.5).
     pub fn place(&self, at: &str) -> Placement {
-        if self.start.lo.as_str() > at || self.end.hi.as_str() <= at {
-            Placement::Outside
-        } else if self.start.hi.as_str() <= at && self.end.lo.as_str() > at {
-            Placement::Inside
-        } else {
-            Placement::Indeterminate
-        }
+        place(&self.start, &self.end, at)
     }
 
     /// The finite instants after `at` at which this interval's placement can

@@ -1663,7 +1663,7 @@ pub(crate) fn receipt_digest(receipt: &Receipt) -> String {
 }
 
 /// The digest of a delegation chain, when the request ran under one (§28.5).
-fn delegation_digest(chain: &[String]) -> Option<String> {
+pub(crate) fn delegation_digest(chain: &[String]) -> Option<String> {
     if chain.is_empty() {
         return None;
     }

@@ -63,7 +63,7 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Json>> = {
   filtered_delivery: true, // §36.3: CHANGES is unfiltered
   watch_evaluation: true, // Cognitive Memory Profile §5.11
   exposure_log: false, // §66.8: reads are not logged
-  draft_vocabulary: false, // §20.16: DEFINE is refused before authorization
+  draft_vocabulary: true, // §20.16: DEFINE adds to the Space's draft package
   identity_repair: true,
   recording_repair: false, // §57.8: so KIP-CognitiveMemory is not claimed
   derive_permission: true, // §29.6: derived outputs and dependency contracts are gated
@@ -233,10 +233,10 @@ export function capabilities(): Json {
     },
     // §89's conformance levels, claimed rather than wished for: the KIP
     // engine suite runs against this engine in `test/conformance.test.ts`,
-    // world time, `functional_by`, `kip:memory-default` and the Search Pattern
-    // included. DEFINE is the optional `draft_vocabulary` capability, skipped
-    // rather than failed. `KIP-CognitiveMemory` also needs recording repair
-    // (§57.8) and computed mnemonic strength, which this engine lacks.
+    // world time, `functional_by`, `kip:memory-default`, the Search Pattern
+    // and the optional draft vocabulary (`DEFINE`) included.
+    // `KIP-CognitiveMemory` also needs recording repair (§57.8), which this
+    // engine lacks.
     profiles: ['KIP-Core'],
     languages: ['KQL', 'KML', 'META'],
     supported: {
@@ -1005,14 +1005,6 @@ export function capabilities(): Json {
         reason:
           'every BELIEF is computed at read time; nothing is cached, so there ' +
           'is no stale result to disclose',
-      },
-      {
-        capability: 'draft_vocabulary',
-        detail: 'DEFINE PREDICATE / DEFINE CONCEPT TYPE and the propose_schema permission (§20.16)',
-        reason:
-          'the Space-local draft package is not built; DEFINE is refused before ' +
-          'authorization. Install a Schema Package that declares the symbol ' +
-          'instead. rs/anda_cognitive_nexus has the same gap',
       },
       {
         capability: 'recording_repair',

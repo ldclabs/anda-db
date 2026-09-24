@@ -2,7 +2,7 @@
 
 [English](anda_kip.md)
 
-追踪 KIP 提交 `3251912`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:3ea9e459…`）以及严格的 UTC 毫秒时间戳契约（§6.5）。有关已实现的契约和能力边界，请参阅 [Cognitive Nexus 文档](anda_cognitive_nexus.zh.md)。
+追踪 KIP 提交 `597db44`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`）以及严格的 UTC 毫秒时间戳契约（§6.5）。有关已实现的契约和能力边界，请参阅 [Cognitive Nexus 文档](anda_cognitive_nexus.zh.md)。
 
 `anda_kip` 是 AndaDB 工作区的协议层：负责将 KIP 2.0 命令文本解析为闭合的、可执行的 AST，建模运行时信封（envelope），并定义执行引擎需要实现的接口边界。本 crate 本身不持有状态，也不做任何存储决策。
 

@@ -126,6 +126,7 @@ pub async fn export(
             object.remove("canonical_subject");
             object.remove("canonical_object");
         }
+        crate::projection::strength::strip(&mut rendered);
         if let Some(governance) = rendered["governance"].as_object_mut() {
             let extra: Map<String, Json> = governance
                 .iter()
@@ -471,11 +472,80 @@ pub fn verify(capsule: &Capsule) -> Result<Json, KipError> {
     }))
 }
 
+/// One source draft symbol an import maps (Capsule companion §41.7, Spec
+/// §20.16): `from` is the source's exact reference, `to` a destination symbol
+/// of the same `kind` (`ConceptType` or `PredicateType`) — one of the
+/// destination's own draft symbols or an installed package's.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SymbolMapping {
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Rewrites the source draft symbols a Capsule's records use onto the
+/// destination symbols `symbols` maps them to, or `None` when it uses none.
+///
+/// A source's `kip://local/...` vocabulary stays source-namespaced: it is
+/// never matched by name against the destination's draft symbols, and an
+/// unmapped one fails `SchemaPackageUnavailable` naming every unmapped symbol.
+fn map_draft_symbols(
+    env: &crate::schema::SchemaEnvironment,
+    capsule: &Capsule,
+    symbols: &[SymbolMapping],
+) -> Result<Option<Capsule>, KipError> {
+    use crate::schema::symbol::SymbolKind;
+    let prefix = format!("{}/", anda_kip::DRAFT_PACKAGE_REF);
+    let slots = [
+        ("schema_ref", SymbolKind::ConceptType),
+        ("predicate_ref", SymbolKind::PredicateType),
+    ];
+    let mut mapped = capsule.clone();
+    let mut changed = false;
+    let mut unmapped: BTreeSet<String> = BTreeSet::new();
+    for record in &mut mapped.payload.records.0 {
+        for (field, kind) in slots {
+            let Some(from) = record.get(field).and_then(Json::as_str) else {
+                continue;
+            };
+            if !from.starts_with(&prefix) {
+                continue;
+            }
+            let kind_name = crate::schema::env::draft_kind_name(kind);
+            let Some(entry) = symbols
+                .iter()
+                .find(|entry| entry.kind == kind_name && entry.from == from)
+            else {
+                unmapped.insert(format!("{kind_name} {from}"));
+                continue;
+            };
+            let to = env
+                .resolve_symbol(kind, &entry.to, crate::schema::Intent::Write)?
+                .to_string();
+            record[field] = Json::String(to);
+            changed = true;
+        }
+    }
+    if !unmapped.is_empty() {
+        return Err(KipError::new(
+            KipErrorCode::SchemaPackageUnavailable,
+            format!(
+                "this Capsule uses source draft symbols the import does not map: {}; a source's \
+                 draft vocabulary is never matched by name, so map each to a destination symbol \
+                 of the same kind (§20.16, §41.7)",
+                unmapped.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+    Ok(changed.then_some(mapped))
+}
+
 /// Imports a Capsule into a Space.
 ///
 /// Two-phase by necessity: every schema reference is resolved before anything
 /// is written (§41.2), because a half-imported graph bound to types the
 /// destination cannot resolve is cognition with no recoverable meaning.
+/// `symbols` maps the source draft symbols the records use (§41.7).
 pub async fn import(
     nexus: &crate::CognitiveNexus,
     capsule: &Capsule,
@@ -483,6 +553,7 @@ pub async fn import(
     dry_run: bool,
     auth: crate::governance::AuthContext,
     isolate: bool,
+    symbols: &[SymbolMapping],
 ) -> Result<ImportReport, KipError> {
     capsule.validate_frame()?;
     let mut report = ImportReport::default();
@@ -506,6 +577,11 @@ pub async fn import(
 
     let env = nexus.store.schema_environment(space_id).await?;
     for dependency in &capsule.payload.schema {
+        // The source's draft vocabulary is its own, whatever this Space's
+        // draft holds; the records using it are mapped below (§20.16).
+        if dependency.package == anda_kip::DRAFT_PACKAGE_ID {
+            continue;
+        }
         let package_ref = format!("{}@{}", dependency.package, dependency.version);
         let Some(artifact) = env.artifact(&package_ref) else {
             // Refused, not downgraded: importing records whose types cannot be
@@ -534,6 +610,9 @@ pub async fn import(
             ));
         }
     }
+
+    let mapped = map_draft_symbols(&env, capsule, symbols)?;
+    let capsule = mapped.as_ref().unwrap_or(capsule);
 
     if capsule.integrity.proofs.is_empty() {
         report.warnings.push(

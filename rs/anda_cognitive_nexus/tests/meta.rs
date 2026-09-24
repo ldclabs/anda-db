@@ -738,8 +738,9 @@ async fn trust_refuses_rather_than_reporting_an_empty_judgement() {
 async fn the_epistemic_policy_is_introspectable_before_it_is_used() {
     let nexus = fresh("policies").await;
     let policies = ok(&nexus, "LIST EPISTEMIC POLICIES").await;
-    // The baseline, the forecast and the standard memory policy (§21.13).
-    assert_eq!(policies.as_array().unwrap().len(), 3);
+    // The baseline, the forecast, the standard memory policy (§21.13) and
+    // the structural baseline (§21.10).
+    assert_eq!(policies.as_array().unwrap().len(), 4);
     assert!(
         policies
             .as_array()

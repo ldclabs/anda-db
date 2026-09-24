@@ -196,6 +196,12 @@ export interface Outcome {
    */
   request_digest: string
   /**
+   * The operation's result, for the statements that answer with one rather
+   * than with handles: `DEFINE` answers `{ref, schema_environment_version}`
+   * (§20.16).
+   */
+  result?: Json
+  /**
    * The access decision that authorized this statement (§33.1).
    *
    * Present only on high-impact statements — an erasure, an export, a

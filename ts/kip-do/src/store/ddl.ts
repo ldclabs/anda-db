@@ -219,10 +219,9 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
      ON assertions(space, proposition_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_assertions_actor
      ON assertions(space, asserted_by_key)`,
-  // Validity is a range query over two fixed-width UTC strings, which is why
-  // `valid_until` uses '' for "still applies" and is read through TIME_MAX.
-  `CREATE INDEX IF NOT EXISTS idx_assertions_valid
-     ON assertions(space, valid_from, valid_until)`,
+  // No index on validity: world time is decided on the Assertions fetched by
+  // proposition, and an endpoint may be a time bound rather than a sortable
+  // instant (§25.4, §25.5).
   // Asserting the same thing twice is a repetition, not a duplicate, so an
   // Assertion cannot be deduplicated structurally — the client key is the only
   // thing that makes creation retry-safe (§72).

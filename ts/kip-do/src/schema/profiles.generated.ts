@@ -9,6 +9,7 @@
  * which Space may resolve symbols through them.
  */
 
+import type { JsonMap } from '../json.js'
 import type { SchemaPackage } from './package.js'
 
 /**
@@ -33,11 +34,11 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
     "validation_schemas": [
       {
         "id": "urn:kip:2.0:schema:projection",
-        "content_digest": "sha256:a4faae39c8cb0d41b28ed84e13c37d6cf604b054dde94746ccbe61a01ccca13f"
+        "content_digest": "sha256:e6db68772133abd5f5685b710d407a88cf11155c323db798378309f18fdfee68"
       },
       {
         "id": "urn:kip:2.0:schema:cognitive-records",
-        "content_digest": "sha256:82d2ce4801c1e689a31836375a731e780e1d6c4d8ca52925956f674c6d3ca4d1"
+        "content_digest": "sha256:3a844f410f19f7cae6c81253d46260f0e17d7c4a097d1f40ed79cb2f95b7c8c1"
       },
       {
         "id": "urn:kip:2.0:schema:element",
@@ -453,7 +454,8 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
         },
         "model_hints": {
           "temporal_invariant": "due_at != retention.expires_at",
-          "authority_invariant": "Commitment does not automatically schedule or authorize an external action."
+          "authority_invariant": "Commitment does not automatically schedule or authorize an external action.",
+          "attention_invariant": "Without a Watch, a due pending or blocked Commitment reaches attention through one commitment_review Activity keyed commitment_review:<id>:<due_at>; a replayed key raises nothing, a new due_at raises it again."
         }
       },
       "Skill": {
@@ -604,7 +606,8 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
           }
         },
         "model_hints": {
-          "authority_invariant": "Semantic assignment, including to $system, does not grant Principal permission."
+          "authority_invariant": "Semantic assignment, including to $system, does not grant Principal permission.",
+          "review_schema_invariant": "review_schema identifies one draft vocabulary symbol by kind (ConceptType or PredicateType) and exact ref, and is keyed review_schema:<kind>:<exact symbol ref>; review may propose a promotion, only manage_schema performs one."
         }
       },
       "Watch": {
@@ -1009,7 +1012,8 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
             "utility is the admission bet, revised by outcomes; not truth, salience, or permission",
             "Facet state cannot override Core/Governance fields",
             "Skills carry it too: a Skill's expected usefulness is MnemonicState.utility; its graded record is the computed GradingState view",
-            "memory_strength is the last written base; decay is computed (effective_strength), never swept"
+            "memory_strength is the last written base; decay is computed (effective_strength), never swept",
+            "the standard strength_policy is kip:strength-half-life-30d; an unknown policy or a digest mismatch leaves effective_strength null, never another policy"
           ]
         }
       },
@@ -2965,7 +2969,7 @@ export const COGNITIVE_MEMORY: SchemaPackage = {
   },
   "integrity": {
     "digest_profile": "kip-jcs-safe-v1",
-    "content_digest": "sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9",
+    "content_digest": "sha256:734aa0fd93b6258d433a6f71915d9d5118552e2ea0458a3050d368dcfcc1d1b3",
     "covers": "all top-level fields except integrity",
     "signatures": []
   }
@@ -3009,7 +3013,7 @@ export const GENERAL: SchemaPackage = {
       "version": "2.0.0",
       "package_ref": "kip://profiles/cognitive-memory@2.0.0",
       "required": true,
-      "content_digest": "sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9"
+      "content_digest": "sha256:734aa0fd93b6258d433a6f71915d9d5118552e2ea0458a3050d368dcfcc1d1b3"
     }
   ],
   "definitions": {
@@ -3234,7 +3238,7 @@ export const GENERAL: SchemaPackage = {
   },
   "integrity": {
     "digest_profile": "kip-jcs-safe-v1",
-    "content_digest": "sha256:affede508363c623f019a035641299724eb5de888db76e84dea09be682c894f9"
+    "content_digest": "sha256:454f59b9d54dbeded59a24e167e5c5cbf880e015622ba7b713d43ab521e55b87"
   }
 } as SchemaPackage
 
@@ -3243,6 +3247,44 @@ export const GENERAL_ID = "kip://domains/general"
 
 /** The version GENERAL declares. */
 export const GENERAL_VERSION = "1.0.0"
+
+/**
+ * The bundled mnemonic strength policies (Spec §59.1, Profile §6.1), verbatim
+ * from `rs/anda_cognitive_nexus/profiles/`.
+ */
+export const STRENGTH_POLICIES: readonly JsonMap[] = [
+  {
+    "format": "KIP-Strength-Policy",
+    "format_version": "2.0-draft",
+    "policy_id": "kip:strength-half-life-30d",
+    "version": 1,
+    "name": "KIP Standard Strength Policy",
+    "description": "The standard mnemonic strength policy (Profile §6.1, Spec §59.1): effective_strength = memory_strength × 2^(−max(0, t − last_metabolized_at) / half_life_ms), where t is the instant the read is evaluated, never FOR TIME. Before its anchor the value is the base. A missing base, anchor or pin, an unknown policy or a digest mismatch leaves effective_strength null.",
+    "method": {
+      "kind": "half_life",
+      "half_life_ms": 2592000000,
+      "before_anchor": "base",
+      "range": "[0,1]"
+    },
+    "non_effects": [
+      "is_computed_on_read_and_never_written_back",
+      "does_not_mutate_assertion_confidence",
+      "does_not_invalidate_projection_basis",
+      "does_not_produce_change_envelopes"
+    ],
+    "canonicalization": {
+      "profile": "kip-jcs-safe-v1",
+      "status": "normative-draft",
+      "description": "RFC 8785 JCS, narrowed to KIP portable safe integral values; no nonzero underflow; strict decoded-key/Unicode validation; integrity excluded from its own digest."
+    },
+    "integrity": {
+      "digest_profile": "kip-jcs-safe-v1",
+      "content_digest": "sha256:a50a89b83f937c97cabf0f8371cccfd326f4fdd438b6d7b9ead507d77927b227",
+      "covers": "all top-level fields except integrity",
+      "signatures": []
+    }
+  }
+]
 
 /** Every bundled artifact, in package-id order. */
 export const BUNDLED_PACKAGES: readonly SchemaPackage[] = [

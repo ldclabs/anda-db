@@ -41,7 +41,7 @@ pub const COGNITIVE_MEMORY_REF: &str = cognitive_memory!();
 
 /// The content digest of the bundled [`COGNITIVE_MEMORY`] revision.
 pub const COGNITIVE_MEMORY_DIGEST: &str =
-    "sha256:3ea9e4591b403dfc196b611c3e5844be95524987ec3cf80664572e780770d8d9";
+    "sha256:734aa0fd93b6258d433a6f71915d9d5118552e2ea0458a3050d368dcfcc1d1b3";
 
 /// The minimal general domain package, `kip://domains/general@1.0.0`: places,
 /// organizations, topics and everyday relations. Optional; a host installs it
@@ -56,6 +56,12 @@ pub const GENERAL_DOMAIN_VERSION: &str = "1.0.0";
 
 /// The machine-readable `kip:memory-default` policy artifact (Spec §21.13).
 pub const MEMORY_DEFAULT_POLICY: &str = include_str!("../profiles/policy-memory-default.json");
+
+/// The standard mnemonic strength policy, `kip:strength-half-life-30d`
+/// (Spec §59.1, Profile §6.1): the one `strength_policy` pin this engine
+/// computes `effective_strength` for.
+pub const STRENGTH_HALF_LIFE_30D: &str =
+    include_str!("../profiles/policy-strength-half-life-30d.json");
 
 #[cfg(test)]
 mod tests {
@@ -86,6 +92,10 @@ mod tests {
 
         let policy: anda_kip::Json = serde_json::from_str(MEMORY_DEFAULT_POLICY).unwrap();
         assert_eq!(policy["policy_id"], "kip:memory-default");
+
+        let strength: anda_kip::Json = serde_json::from_str(STRENGTH_HALF_LIFE_30D).unwrap();
+        assert_eq!(strength["policy_id"], "kip:strength-half-life-30d");
+        crate::schema::contracts::verify_artifact(&strength).expect("its digest covers the bytes");
     }
 
     /// The syntax card a model reads must name everything this Profile declares.

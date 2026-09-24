@@ -15,6 +15,7 @@ pub fn initial_projection() -> Json {
         "baseline": Policy::baseline(),
         "forecast": Policy::forecast(),
         "memory-default": Policy::memory_default(),
+        "structural": Policy::structural(),
     })
 }
 
@@ -229,15 +230,22 @@ impl Store {
             .starts_with(crate::projection::policy::MEMORY_DEFAULT_ID)
         {
             "memory-default"
+        } else if requested
+            .id
+            .starts_with(crate::projection::policy::STRUCTURAL_ID)
+        {
+            "structural"
         } else {
             "baseline"
         };
-        // The standard memory policy is fixed by its artifact (§21.13), so a
-        // Space created before it was bundled still resolves it.
+        // The standard memory policy is fixed by its artifact (§21.13) and the
+        // structural baseline by §21.10, so a Space created before either was
+        // bundled still resolves it.
         let mut policy: Policy = match control.value.get(name) {
             Some(stored) => serde_json::from_value(stored.clone())
                 .map_err(|e| KipError::internal_error(e.to_string()))?,
             None if name == "memory-default" => Policy::memory_default(),
+            None if name == "structural" => Policy::structural(),
             None => {
                 return Err(KipError::internal_error(format!(
                     "projection control has no {name} policy"

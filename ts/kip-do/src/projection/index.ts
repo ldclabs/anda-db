@@ -47,7 +47,7 @@ import {
   predicateRules,
   type PredicateRules,
 } from '../schema/index.js'
-import { endpointFromJson } from '../term.js'
+import { endpointFromJson, endpointKey, referencedElement } from '../term.js'
 import {
   State,
   type AssertionRow,
@@ -183,7 +183,7 @@ function frameOf(cx: Context, target: ElementId): Frame {
   const slot = rules.functional || rules.functional_by
   if (!slot && !rules.boolean_completeness) return frame
   const row = element.row
-  frame.members = slotPropositions(cx, [row.subject_key], lineageText(row.predicate_ref))
+  frame.members = slotPropositions(cx, [row.subject_key], cx.env.lineage('PredicateType', row.predicate_ref))
   if (!frame.members.some((id) => id.seq === target.seq)) frame.members.push(target)
   frame.subjectKeys = [row.subject_key]
   frame.slotLines = slot
@@ -202,7 +202,7 @@ function frameOf(cx: Context, target: ElementId): Frame {
       const object = endpointFromJson(value.row.object as Json)
       if (object.kind === 'local') {
         const concept = cx.load(object.id)
-        if (concept !== null && concept.kind === 'Concept') partition = lineageText(concept.row.schema_ref)
+        if (concept !== null && concept.kind === 'Concept') partition = cx.env.lineage('ConceptType', concept.row.schema_ref)
       }
       frame.partitions.set(formatElementId(member), partition)
     }
@@ -327,11 +327,22 @@ function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string
         excluded.set(key, list)
         continue
       }
+      // Lines and precedence compare the actor and the context set as they
+      // are now, merge-resolved: a context merged after the claim was written
+      // is still the same scope (§25.4).
+      const contexts = [...new Set(row.context_refs.map((ref) =>
+        endpointKey(endpointFromJson(cx.canonicalEndpoint(ref as Json)))))].sort()
+      const line = timed(row, key, partitionOf(frame, member))
+      line.context = contexts.join('\u001f')
+      const actor = referencedElement(row.asserted_by as Json)
+      if (actor !== null && actor.kind === 'Concept') {
+        line.actor = endpointKey({ kind: 'local', id: cx.canonicalOf(actor) })
+      }
       rows.push({
-        timed: timed(row, key, partitionOf(frame, member)),
+        timed: line,
         candidate: admitted,
         source: row,
-        contexts: [...new Set(row.context_refs.map((ref) => JSON.stringify(ref)))].sort(),
+        contexts,
         placement: 'outside',
       })
     }
@@ -377,8 +388,13 @@ function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string
     const [localSupport, localGroups] = aggregate(candidates, false)
     const [localOpposition, localOpposingGroups] = aggregate(candidates, true)
     let candidateStatus = classify(localSupport, localOpposition, ledger, policy)
-    if (candidateStatus === 'insufficient' && ledger.indeterminate.length > 0) candidateStatus = 'uncertain'
-    if (ledger.indeterminate.length > 0) ledger.reasons.push('temporal_indeterminate')
+    // A candidate whose only material at the instant is indeterminate is
+    // `uncertain`, and says why (§25.5); beside material that is inside it
+    // decides nothing and is only listed.
+    if (candidateStatus === 'insufficient' && ledger.indeterminate.length > 0) {
+      candidateStatus = 'uncertain'
+      ledger.reasons.push('temporal_indeterminate')
+    }
     ledger.supportGroups = localGroups
     ledger.oppositionGroups = localOpposingGroups
 
@@ -460,7 +476,9 @@ function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string
       }
       const winner = policy.precedence === true ? precedence(supported, supportRows) : null
       const ids = supported.map((i) => formatElementId(frame.members[i]!))
-      const supports = beliefs.map((b) => b.support)
+      // Leading compares eligible independent roots (§27.2), never the numeric
+      // support a structural policy does not have.
+      const roots = beliefs.map((b) => b.ledger.supportGroups.length)
       for (const i of supported) {
         const me = formatElementId(frame.members[i]!)
         const belief = beliefs[i]!
@@ -473,8 +491,9 @@ function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string
         } else {
           // Leading over the final conflict set: a tie between the values is
           // `none` (§21.11).
-          const best = Math.max(...supported.filter((j) => j !== i).map((j) => supports[j]!))
-          belief.slotLeading = belief.support > best ? 'support' : belief.support < best ? 'opposition' : 'none'
+          const best = Math.max(...supported.filter((j) => j !== i).map((j) => roots[j]!))
+          const mine = roots[i]!
+          belief.slotLeading = mine > best ? 'support' : mine < best ? 'opposition' : 'none'
           belief.status = 'contested'
           belief.conflictRefs = ids.filter((id) => id !== me)
           belief.conflictReasons = [frame.reason]
@@ -754,7 +773,6 @@ export function beliefToJson(belief: Belief): JsonMap {
       reasons: uncertaintyReasons(belief),
     },
     ...(belief.precedence === null ? {} : { precedence: belief.precedence }),
-    policy: { id: belief.policy.id, version: belief.policy.version },
     // §49.1, §49.2: `none` returns no ledger at all rather than an empty one.
     // An empty object reads as "we looked and found nothing to explain", and
     // what happened is that the caller declined to be told.
@@ -787,11 +805,13 @@ function side(
   groups: Group[],
 ): JsonMap {
   const disclosed = belief.policy.explanation === 'ledger'
+  // A structural policy weighs nothing and outputs no number (§21.10).
+  const weighted = belief.policy.structural !== true
   return {
-    score,
+    score: weighted ? score : null,
     // Said out loud, because a number between 0 and 1 looks like a probability
     // and this one is not calibrated as one.
-    score_semantics: 'normalized_support_not_probability',
+    score_semantics: weighted ? 'normalized_support_not_probability' : null,
     assertion_ids: disclosed ? assertionIds : [],
     root_groups: (disclosed ? groups : []) as unknown as Json,
   }
@@ -829,15 +849,9 @@ function uncertaintyReasons(belief: Belief): string[] {
  * `insufficient` with an empty `accepted_values` rather than force the Agent
  * to infer unknown from zero raw rows — and an Agent that has to derive the
  * slot's state by scanning `candidate_projections` is doing exactly that.
- * `subject`, `predicate_ref`, `leading` and `contested` are additive: they
- * name what the slot was about and which side is ahead *without* claiming it
- * settled anything.
- *
- * The slot reports its own `policy` and `temporal`, from the coordinates it
- * *ran* under rather than from whichever candidate happened to come first.
- * Reading them off a candidate leaves them null exactly when the slot is
- * empty — which is the case §47.4 is about, and the one where a caller most
- * needs to know the answer was computed rather than skipped.
+ * The slot's `basis` carries the policy, `valid_at` and snapshot it *ran* under
+ * (§47.3), so an empty slot still says what it was computed against. Which
+ * side leads is each candidate projection's own `leading`.
  */
 export function slotToJson(
   subject: Json,
@@ -847,7 +861,6 @@ export function slotToJson(
   const beliefs = slot.candidates
   const accepted = beliefs.filter((belief) => belief.status === 'accepted')
   const engaged = beliefs.filter((belief) => belief.status !== 'insufficient')
-  const leading = [...engaged].sort((a, b) => b.support - a.support)[0]
   // Two accepted values in one slot is a contradiction the caller has to see,
   // even though each candidate was accepted on its own.
   const contested =
@@ -872,11 +885,6 @@ export function slotToJson(
       belief.proposition === null ? [] : [formatElementId(belief.proposition)],
     ),
     candidate_projections: beliefs.map(beliefToJson) as unknown as Json,
-    leading:
-      leading === undefined || leading.proposition === null
-        ? null
-        : formatElementId(leading.proposition),
-    contested,
     uncertainty: {
       level:
         status === 'insufficient'
@@ -884,10 +892,8 @@ export function slotToJson(
           : status === 'contested' || status === 'uncertain'
             ? 'high'
             : 'low',
-      reasons: leading === undefined ? [] : uncertaintyReasons(leading),
+      reasons: [...new Set(beliefs.flatMap(uncertaintyReasons))].sort(),
     },
-    temporal: { valid_at: slot.validAt, as_of_seq: slot.asOf },
-    policy: { id: slot.policy.id, version: slot.policy.version },
     // §47.3 lists an explanation on the slot too. A slot's own explanation is
     // about the *set*: how many candidates competed for it, and what this
     // engine could not weigh between them.
@@ -906,11 +912,9 @@ export function slotToJson(
  * them whether or not any candidate exists.
  */
 export interface Slot {
+  /** The coordinates it ran under, reported whether or not any candidate exists. */
   basis: JsonMap
   candidates: Belief[]
-  policy: Policy
-  validAt: string
-  asOf: number | null
   warnings: string[]
 }
 
@@ -997,7 +1001,7 @@ export function slotPropositions(
         return (
           row.state === State.ACTIVE &&
           subjectKeys.includes(row.subject_key) &&
-          (row.predicate_lineage === '' ? lineageText(row.predicate_ref) : row.predicate_lineage) ===
+          cx.env.lineage('PredicateType', row.predicate_lineage === '' ? lineageText(row.predicate_ref) : row.predicate_lineage) ===
             predicateLineage
         )
       })
@@ -1013,12 +1017,13 @@ export function slotPropositions(
     `SELECT * FROM propositions
        WHERE space = ? AND state = ?
          AND subject_key IN (SELECT value FROM json_each(?))
-         AND predicate_lineage = ?
+         AND predicate_lineage IN (SELECT value FROM json_each(?))
        ORDER BY id`,
     cx.space,
     State.ACTIVE,
     JSON.stringify(subjectKeys),
-    predicateLineage,
+    // A draft symbol promoted into the lineage is read as it (§20.16).
+    JSON.stringify(cx.env.lineagesOf('PredicateType', predicateLineage)),
   )
   cx.spend('scans', rows.length)
   const visible: ElementId[] = []

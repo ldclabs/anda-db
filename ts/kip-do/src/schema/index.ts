@@ -91,12 +91,26 @@ export {
   allowsRead,
   allowsWrite,
   answersLocalNames,
+  draftIsEmpty,
+  draftPackage,
   emptyLock,
   lockFromJson,
+  retainSpaceLocal,
+  type DraftVocabulary,
   type Intent,
+  type LineageMap,
   type PackageState,
   type SchemaLock,
 } from './env.js'
+
+export {
+  DRAFT_PACKAGE_ID,
+  DRAFT_PACKAGE_REF,
+  DRAFT_PACKAGE_VERSION,
+  checkDraftDefinition,
+  draftSymbolRef,
+  type DraftKind,
+} from './draft.js'
 
 export {
   Validation,

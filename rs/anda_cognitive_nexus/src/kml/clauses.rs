@@ -146,7 +146,11 @@ pub async fn apply(
         MutationClause::CreateActivity(c) => {
             create_record(store, tx, c, ElementKind::Activity, request, operation).await
         }
-        MutationClause::Define(_) => Err(crate::kml::define_unsupported()),
+        // Routed before any plan runs (`kml::execute`); the parser never puts
+        // it beside another clause.
+        MutationClause::Define(_) => Err(KipError::invalid_syntax(
+            "DEFINE is a standalone operation, never a clause of MUTATE (§20.16)",
+        )),
         MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
         MutationClause::Transition(c) => transition(store, tx, c, request, operation).await,
         MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
@@ -1915,27 +1919,33 @@ async fn supersede(
         return Ok(());
     };
     require_representation(tx, id, "TRANSITION ... TO \"superseded\"").await?;
-    let proposition = row_mut::<AssertionRow>(tx, id)
-        .await?
-        .proposition_id
-        .clone();
-    let replacement = row_mut::<AssertionRow>(tx, new)
-        .await?
-        .proposition_id
-        .clone();
+    let (proposition, old_actor, old_scope) = claim_scope(tx, id).await?;
+    let (replacement, new_actor, new_scope) = claim_scope(tx, new).await?;
+    // Supersession stays inside the actor and the scope that were wrong
+    // (§14.2): it never moves a claim to another actor, nor widens or narrows
+    // what that actor said. A claim wrong only in its scope is withdrawn and
+    // the scoped claim asserted anew.
+    if old_actor != new_actor {
+        return Err(KipError::new(
+            KipErrorCode::SupersessionMismatch,
+            format!("{new} is another actor's claim; {id} can be superseded only by its own actor"),
+        ));
+    }
+    if old_scope != new_scope {
+        return Err(KipError::new(
+            KipErrorCode::SupersessionMismatch,
+            format!(
+                "{new} holds in another context set than {id}; a claim wrong only in its scope \
+                 is retracted and asserted anew (§14.2)"
+            ),
+        ));
+    }
     // A value-only correction replaces the claim with another value of the
-    // same slot (§14.2): the same subject and predicate lineage. Anything
-    // wider is a different claim, never a revision of this one.
+    // same slot (§14.2): the same canonical subject and predicate lineage.
+    // Anything wider is a different claim, never a revision of this one.
     if replacement != proposition {
-        let slot_of = |element: Element| match element {
-            Element::Proposition(row) => Some((
-                row.subject_key,
-                crate::schema::lineage_of(&row.predicate_ref),
-            )),
-            _ => None,
-        };
-        let old_slot = slot_of(tx.final_element(proposition.parse()?).await?);
-        let new_slot = slot_of(tx.final_element(replacement.parse()?).await?);
+        let old_slot = slot_of(tx, proposition.parse()?).await?;
+        let new_slot = slot_of(tx, replacement.parse()?).await?;
         if old_slot.is_none() || old_slot != new_slot {
             return Err(KipError::new(
                 KipErrorCode::SupersessionMismatch,
@@ -1947,6 +1957,70 @@ async fn supersede(
         }
     }
     link_revision::<AssertionRow>(tx, id, new, REVISION.state).await
+}
+
+/// What a revision must keep (§14.2): the Proposition, and the canonical
+/// actor and context set, merge-resolved so a claim recorded before a merge
+/// compares equal to one recorded after it.
+async fn claim_scope(
+    tx: &mut Transaction,
+    id: ElementId,
+) -> Result<(String, String, Vec<String>), KipError> {
+    let (proposition, actor, contexts) = {
+        let row = row_mut::<AssertionRow>(tx, id).await?;
+        (
+            row.proposition_id.clone(),
+            row.asserted_by.clone(),
+            row.context_refs.clone(),
+        )
+    };
+    let actor = canonical_key(tx, &actor).await?;
+    let mut scope = Vec::with_capacity(contexts.len());
+    for context in &contexts {
+        scope.push(canonical_key(tx, context).await?);
+    }
+    scope.sort();
+    scope.dedup();
+    Ok((proposition, actor, scope))
+}
+
+/// A Proposition's slot: its canonical subject and its predicate lineage.
+async fn slot_of(
+    tx: &mut Transaction,
+    proposition: ElementId,
+) -> Result<Option<(String, String)>, KipError> {
+    Ok(match tx.final_element(proposition).await? {
+        Element::Proposition(row) => Some((
+            canonical_key(tx, &row.subject).await?,
+            crate::schema::lineage_of(&row.predicate_ref),
+        )),
+        _ => None,
+    })
+}
+
+/// The endpoint key of a stored reference, after following merges.
+///
+/// For comparison only: unlike [`canonicalize_reference`] it records no
+/// reference binding, because nothing is being written under it.
+async fn canonical_key(tx: &mut Transaction, value: &Json) -> Result<String, KipError> {
+    match element_reference(value) {
+        Some(id) if id.kind == ElementKind::Concept => {
+            let chain = canonical_chain(tx, id).await?;
+            Ok(Endpoint::Local(*chain.last().unwrap_or(&id)).key())
+        }
+        Some(id) => Ok(Endpoint::Local(id).key()),
+        None => Ok(endpoint_key(value)),
+    }
+}
+
+/// The element a stored reference names, written as an id string or as
+/// `{"id": ...}` — the two spellings a reference field accepts.
+pub(crate) fn element_reference(value: &Json) -> Option<ElementId> {
+    match value {
+        Json::String(text) => text.parse().ok(),
+        Json::Object(map) => map.get("id")?.as_str()?.parse().ok(),
+        _ => None,
+    }
 }
 
 /// `corrected` (§57.2): the record was wrong, and a new Evidence record

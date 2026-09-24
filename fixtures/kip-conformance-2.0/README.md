@@ -4,7 +4,7 @@ These fixtures are KIP's executable engine suite —
 [`conformance/engine-suite/`](https://github.com/ldclabs/KIP/tree/main/conformance/engine-suite)
 in the KIP repository — copied **byte for byte**. KIP owns them; this
 directory is a pinned copy, not a second suite. The copy was taken at KIP
-`3251912`, and `manifest.json` records its provenance and every revision made
+`597db44`, and `manifest.json` records its provenance and every revision made
 on import.
 
 ```bash

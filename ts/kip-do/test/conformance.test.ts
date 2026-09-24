@@ -252,13 +252,7 @@ describe('KIP 2.0 conformance', () => {
     expect(PENDING, 'pending-engine fixtures this engine does not pass yet').toEqual([])
 
     // The list rather than a count, so a *new* gap cannot hide inside a number
-    // that happens to match. DEFINE is the optional `draft_vocabulary`
-    // capability (§20.16), which this engine does not advertise.
-    expect(UNBUILT).toEqual([
-      'world-time / DEFINE adds a Predicate to the draft vocabulary',
-      'world-time / the draft symbol resolves for the next operation',
-      'world-time / a name that already resolves fails SchemaSymbolConflict',
-      'world-time / a draft Predicate cannot claim a closed world',
-    ])
+    // that happens to match.
+    expect(UNBUILT).toEqual([])
   })
 })

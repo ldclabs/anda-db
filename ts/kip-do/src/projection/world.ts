@@ -16,7 +16,7 @@
  */
 
 import type { AssertionRow } from '../store/index.js'
-import { TIME_MAX, TIME_MIN, loadTimePoint, timePointRange } from '../time.js'
+import { TIME_MAX, TIME_MIN, loadTimePoint, readTimePoint, timePointRange, type TimePoint } from '../time.js'
 
 /** A closed range of possible instants. */
 export interface Span {
@@ -49,14 +49,47 @@ export interface Timed {
   end: Span
 }
 
+/**
+ * The written interval as spans: a missing `from` is the bound
+ * {latest: asserted_at} (§25.2), a missing `until` is open.
+ */
+function written(from: TimePoint | null, until: TimePoint | null, assertedAt: string): [Span, Span] {
+  const start: Span = from === null
+    ? { lo: TIME_MIN, hi: assertedAt === '' ? TIME_MAX : assertedAt }
+    : timePointRange(from)
+  const end: Span = until === null ? { lo: TIME_MAX, hi: TIME_MAX } : timePointRange(until)
+  return [start, end]
+}
+
+/**
+ * Where one Assertion's *written* interval lies at `at`, without succession:
+ * what `FIND … FOR TIME` restricts a row by, since a row is one Assertion
+ * rather than a slot's line. `validTime` is the wire object, its endpoints
+ * exact Timestamps or time bounds (§25.5).
+ */
+export function placeWritten(validTime: unknown, assertedAt: string, at: string): Placement {
+  const endpoint = (name: 'from' | 'until'): TimePoint | null => {
+    if (validTime === null || typeof validTime !== 'object') return null
+    try {
+      return readTimePoint((validTime as Record<string, unknown>)[name], name)
+    } catch {
+      return null
+    }
+  }
+  const [start, end] = written(endpoint('from'), endpoint('until'), assertedAt)
+  return placeSpans(start, end, at)
+}
+
+function placeSpans(start: Span, end: Span, at: string): Placement {
+  if (start.lo > at || end.hi <= at) return 'outside'
+  if (start.hi <= at && end.lo > at) return 'inside'
+  return 'indeterminate'
+}
+
 export function timed(row: AssertionRow, proposition: string, partition: string): Timed {
   const from = loadTimePoint(row.valid_from)
   const until = loadTimePoint(row.valid_until)
-  // A missing `from` is the bound {latest: asserted_at} (§25.2).
-  const start: Span = from === null
-    ? { lo: TIME_MIN, hi: row.asserted_at === '' ? TIME_MAX : row.asserted_at }
-    : timePointRange(from)
-  const end: Span = until === null ? { lo: TIME_MAX, hi: TIME_MAX } : timePointRange(until)
+  const [start, end] = written(from, until, row.asserted_at)
   const startKey = from === null
     ? row.asserted_at
     : 'exact' in from
@@ -80,9 +113,7 @@ export function timed(row: AssertionRow, proposition: string, partition: string)
 
 /** Where the effective interval lies at `at` (§25.5). */
 export function place(row: Timed, at: string): Placement {
-  if (row.start.lo > at || row.end.hi <= at) return 'outside'
-  if (row.start.hi <= at && row.end.lo > at) return 'inside'
-  return 'indeterminate'
+  return placeSpans(row.start, row.end, at)
 }
 
 /**

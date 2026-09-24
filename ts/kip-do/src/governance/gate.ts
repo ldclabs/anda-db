@@ -186,11 +186,9 @@ export function clausePermissions(clause: MutationClause): Permission[] {
   // approval, not through a second permission name.
   if ('Purge' in clause || 'PurgePayload' in clause) return ['purge']
   if ('MergeConcept' in clause) return ['merge_identity', 'maintain']
-  // `propose_schema` exists only where `draft_vocabulary` is advertised
-  // (§29, §20.16), and this engine does not advertise it: `mutate` refuses
-  // DEFINE as UnsupportedCapability before any authorization, so a caller is
-  // never told it lacks a permission nothing grants.
-  if ('Define' in clause) return []
+  // Adds to the draft vocabulary and nothing else (§20.16): it confers no
+  // `manage_schema` and no authority over existing symbols.
+  if ('Define' in clause) return ['propose_schema']
   return FALLBACK
 }
 

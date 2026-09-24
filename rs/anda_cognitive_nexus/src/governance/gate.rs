@@ -143,11 +143,9 @@ pub fn clause_permissions(clause: &MutationClause) -> Vec<Permission> {
         MutationClause::SetRetention(_) => vec![Permission::ManageRetention],
         MutationClause::Purge(_) | MutationClause::PurgePayload(_) => vec![Permission::Purge],
         MutationClause::MergeConcept(_) => vec![Permission::MergeIdentity, Permission::Maintain],
-        // `propose_schema` exists only where `draft_vocabulary` is advertised
-        // (§29, §20.16), and this engine does not advertise it: the write lane
-        // refuses DEFINE as UnsupportedCapability before any authorization,
-        // so a caller is never told it lacks a permission nothing grants.
-        MutationClause::Define(_) => Vec::new(),
+        // Adds to the draft vocabulary and nothing else (§20.16): it confers
+        // no `manage_schema` and no authority over existing symbols.
+        MutationClause::Define(_) => vec![Permission::ProposeSchema],
     }
 }
 

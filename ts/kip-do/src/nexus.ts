@@ -111,20 +111,35 @@ import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
 import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
 import { executeKml, type IngestContext, type KmlContext } from './kml/index.js'
+import { boundValue, parameter } from './kml/value.js'
 import { executeKqlPage, type KqlAnswer, type KqlContext } from './kql/index.js'
 import { executeMeta, type MetaContext } from './meta/index.js'
 import {
   BUNDLED_PACKAGES,
   CORE_PACKAGE,
   CORE_PACKAGE_REF,
+  DRAFT_PACKAGE_ID,
+  DRAFT_PACKAGE_REF,
+  DRAFT_PACKAGE_VERSION,
+  KIND_NAMES,
   SchemaEnvironment,
+  answersLocalNames,
+  checkDraftDefinition,
+  defines,
+  draftIsEmpty,
+  draftPackage,
+  draftSymbolRef,
   emptyLock,
+  isQualified,
   lockFromJson,
   packageRefOf,
   formatPackageRef,
   parsePackage,
+  parseSymbolRef,
   rejectCoreShadowing,
+  retainSpaceLocal,
   checkFunctionalBy,
+  type DraftKind,
   type SchemaLock,
   type SchemaPackage,
 } from './schema/index.js'
@@ -292,6 +307,14 @@ export class CognitiveNexus {
   ensureSchema(lock: SchemaLock, space = this.space): SchemaEnvironment {
     return this.storage.transactionSync(() => {
       const current = this.store.schemaEnv(space)
+      // The draft package and its promotions are Space history, not a host's
+      // to drop (§20.16): an activation carries them forward.
+      lock = retainSpaceLocal(lock, current === null ? null : lockFromJson(current.lock))
+      if (!draftIsEmpty(lock.draft) && lock.states[DRAFT_PACKAGE_ID] !== 'active') {
+        throw errors.constraintViolation(
+          `${DRAFT_PACKAGE_REF} is the Space's draft vocabulary and stays active once defined (§20.16)`,
+        )
+      }
       if (
         current !== null &&
         canonicalJson(current.lock) === canonicalJson(lock)
@@ -333,11 +356,223 @@ export class CognitiveNexus {
           semantic_plan_digest: '',
           result_digest: '',
           schema_environment_version: version,
-          result: { schema_environment_version: version },
+          // A new environment is a `schema` control change (§36.1).
+          result: {
+            schema_environment_version: version,
+            control_changes: [{ kind: 'schema', version: String(seq) }],
+          },
           changes: [],
         })
       }
       return env
+    })
+  }
+
+  /**
+   * Adds one symbol to the Space's draft vocabulary (§20.16).
+   *
+   * `definition` is the `DEFINE` body with its parameters bound. Only adds: a
+   * name that already names a symbol of this kind anywhere in the environment
+   * fails `SchemaSymbolConflict`, even when the definition is identical — a
+   * retry is deduplicated by its idempotency key, never by content. The
+   * definition persists with its endpoint types resolved to exact references,
+   * and commits as its own governance transaction that advances
+   * `schema_environment_version` and publishes a `schema` control change.
+   *
+   * @see rs/anda_cognitive_nexus/src/store/schema.rs — `define_draft_symbol`
+   */
+  defineDraftSymbol(
+    space: string,
+    kind: DraftKind,
+    name: string,
+    definition: Json,
+    journal: { idempotencyKey?: string; requestDigest?: string } = {},
+  ): Outcome {
+    const symbolKind = kind === 'Predicate' ? 'PredicateType' : 'ConceptType'
+    const reference = draftSymbolRef(name)
+    let parsedName: string | null = null
+    try {
+      parsedName = parseSymbolRef(reference).name
+    } catch {
+      parsedName = null
+    }
+    if (name === '' || isQualified(name) || parsedName !== name) {
+      throw errors.invalidIdentifier(
+        `${JSON.stringify(name)} is not a symbol name DEFINE can add; a draft symbol is named ` +
+          'by a bare local name, without a package or `/` (§20.16)',
+      )
+    }
+    checkDraftDefinition(kind, definition)
+    const env = this.environment(space)
+    const existing = env.nameTaken(symbolKind, name)
+    if (existing !== null) {
+      throw errors.schemaSymbolConflict(
+        `${JSON.stringify(name)} already names ${existing}; DEFINE only adds, and a draft ` +
+          'symbol never shadows another (§20.16)',
+      )
+    }
+    // Endpoint types persist as exact references, like any package's.
+    const body = structuredClone(definition) as JsonMap
+    if (symbolKind === 'PredicateType') {
+      for (const side of ['subject', 'object']) {
+        const endpoint = body[side]
+        if (!isJsonMap(endpoint) || !Array.isArray(endpoint.concept_types)) continue
+        endpoint.concept_types = endpoint.concept_types.map((local) => {
+          if (typeof local !== 'string') {
+            throw errors.constraintViolation(`${side}.concept_types names Concept Types as strings`)
+          }
+          return env.resolveSymbolText('ConceptType', local, 'read')
+        })
+      }
+    } else {
+      const attributes = isJsonMap(body.attributes) ? body.attributes : {}
+      attributes.open = true
+      attributes.fields ??= {}
+      body.attributes = attributes
+    }
+    body.ref = reference
+    body.kind = symbolKind
+
+    const lock = structuredClone(env.lock) as SchemaLock
+    const draft = lock.draft ?? {}
+    const section = symbolKind === 'PredicateType' ? 'predicates' : 'concept_types'
+    draft[section] = { ...(draft[section] ?? {}), [name]: body }
+    lock.draft = draft
+    lock.packages[DRAFT_PACKAGE_ID] = DRAFT_PACKAGE_VERSION
+    lock.states[DRAFT_PACKAGE_ID] = 'active'
+    checkFunctionalBy(draftPackage(lock.draft))
+    const version = env.version + 1
+    SchemaEnvironment.resolve(version, lock, this.artifacts())
+    return this.commitEnvironment(space, lock, {
+      ref: reference,
+      schema_environment_version: version,
+    }, journal)
+  }
+
+  /**
+   * Promotes a draft symbol (§20.16): a Schema migration that maps its lineage
+   * onto a symbol of the same kind in an installed package, with the rename
+   * semantics of §20.14. Elements written under the draft keep their exact
+   * reference and are read through the target's lineage from the new
+   * environment version on. A draft symbol is promoted at most once.
+   */
+  promoteDraftSymbol(
+    space: string,
+    kind: 'ConceptType' | 'PredicateType',
+    from: string,
+    to: string,
+  ): Outcome {
+    const env = this.environment(space)
+    const prefix = `${DRAFT_PACKAGE_REF}/`
+    const name = from.startsWith(prefix) ? from.slice(prefix.length) : from
+    const section = kind === 'PredicateType' ? 'predicates' : 'concept_types'
+    if (!Object.hasOwn(env.lock.draft?.[section] ?? {}, name)) {
+      throw errors.schemaSymbolNotFound(
+        `this Space's draft vocabulary defines no ${KIND_NAMES[kind]} named ${JSON.stringify(name)}`,
+      )
+    }
+    const fromRef = draftSymbolRef(name)
+    const fromLineage = lineageOf(fromRef)
+    if ((env.lock.lineage_maps ?? []).some((m) => m.kind === kind && m.from === fromLineage)) {
+      throw errors.constraintViolation(
+        `${fromRef} was already promoted; a draft symbol is promoted at most once (§20.16)`,
+      )
+    }
+    let target: string
+    if (isQualified(to)) {
+      target = to
+    } else {
+      // The draft's own local name would resolve to itself.
+      const candidates: string[] = []
+      for (const [packageId, version] of Object.entries(env.lock.packages).sort()) {
+        const packageRef = `${packageId}@${version}`
+        if (packageRef === DRAFT_PACKAGE_REF) continue
+        const artifact = env.artifact(packageRef)
+        if (artifact !== undefined && answersLocalNames(env.state(packageId)) && defines(artifact, kind, to)) {
+          candidates.push(`${packageRef}/${to}`)
+        }
+      }
+      if (candidates.length === 0) {
+        throw errors.schemaSymbolNotFound(
+          `no installed package defines the ${KIND_NAMES[kind]} ${JSON.stringify(to)} in this Space`,
+        )
+      }
+      if (candidates.length > 1) {
+        throw errors.schemaSymbolAmbiguous(
+          `the ${KIND_NAMES[kind]} ${JSON.stringify(to)} is defined by more than one package; ` +
+            'name the target by its exact reference',
+        )
+      }
+      target = candidates[0]!
+    }
+    if (parseSymbolRef(target).package.packageId === DRAFT_PACKAGE_ID) {
+      throw errors.constraintViolation(
+        'a draft symbol is promoted to a symbol of an installed package, never to another draft ' +
+          'symbol (§20.16)',
+      )
+    }
+    const resolved = env.resolveSymbolText(kind, target, 'read')
+    const lock = structuredClone(env.lock) as SchemaLock
+    const promoted = { kind, from: fromLineage, to: lineageOf(resolved) }
+    lock.lineage_maps = [...(lock.lineage_maps ?? []), promoted]
+    const version = env.version + 1
+    SchemaEnvironment.resolve(version, lock, this.artifacts())
+    return this.commitEnvironment(space, lock, {
+      promoted,
+      schema_environment_version: version,
+    })
+  }
+
+  /**
+   * Commits a new Schema Environment version as its own governance
+   * transaction: the environment row, the Space's version, and a journal
+   * entry whose result carries the `schema` control change (§36.1).
+   */
+  private commitEnvironment(
+    space: string,
+    lock: SchemaLock,
+    result: JsonMap,
+    journal: { idempotencyKey?: string; requestDigest?: string } = {},
+  ): Outcome {
+    return this.storage.transactionSync(() => {
+      const current = this.store.schemaEnv(space)
+      const version = (current?.version ?? 0) + 1
+      const snapshotSeq = this.store.currentSeq(space)
+      const seq = this.store.nextSeq(space)
+      const committedAt = nowTime()
+      const txId = `tx-${space}-${seq}-${committedAt}`
+      this.store.appendSchemaEnv({
+        space,
+        version,
+        lock: lock as unknown as JsonMap,
+        created_at: committedAt,
+        tx_id: txId,
+        seq,
+      })
+      const row = this.spaceRow(space)
+      row.schema_environment_version = version
+      this.store.putSpace(row)
+      const recorded: Omit<TransactionRow, 'id'> = {
+        tx_id: txId,
+        space,
+        seq,
+        snapshot_seq: snapshotSeq,
+        committed_at: committedAt,
+        status: 'committed',
+        transaction_class: 'governance',
+        idempotency_key: journal.idempotencyKey ?? '',
+        request_digest: journal.requestDigest ?? '',
+        semantic_plan_digest: '',
+        result_digest: '',
+        schema_environment_version: version,
+        result: {
+          ...result,
+          control_changes: [{ kind: 'schema', version: String(seq) }],
+        } as Json,
+        changes: [],
+      }
+      this.store.putTransaction(recorded)
+      return { ...replay(recorded as TransactionRow), warnings: [] }
     })
   }
 
@@ -749,14 +984,6 @@ export class Session {
       operation: options.operation,
       ingest: options.ingest,
     })
-    // §20.16: without `draft_vocabulary` a DEFINE is refused before any
-    // authorization, replay or write.
-    if (statement.clauses.some((clause) => 'Define' in clause)) {
-      throw errors.unsupportedCapability(
-        'DEFINE needs the draft_vocabulary capability, which this engine does not ' +
-          'advertise; install a Schema Package that declares the symbol instead',
-      )
-    }
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     const needed = kmlPermissions(statement)
@@ -806,6 +1033,37 @@ export class Session {
     }
 
     const decisions = this.gate(authority, needed)
+    // §20.16: a standalone DEFINE is its own governance transaction, never a
+    // clause of a mutation plan. Parameters bind before any check.
+    const only = statement.clauses.length === 1 ? statement.clauses[0]! : null
+    if (only !== null && 'Define' in only) {
+      if (options.dryRun === true) {
+        throw errors.unsupportedCapability('a dry-run DEFINE is not supported; use DESCRIBE to inspect the draft vocabulary')
+      }
+      const define = only.Define
+      const b = { tx: null as never, request: params, operation: options.operation ?? {} }
+      const name = 'Param' in define.name ? parameter(b, define.name.Param) : define.name.Name
+      if (typeof name !== 'string') {
+        throw errors.typeMismatch(`DEFINE names its symbol with a string, got ${JSON.stringify(name)}`)
+      }
+      const definition = Object.fromEntries(
+        Object.entries(define.definition).map(([member, value]) => [member, boundValue(b, value)]),
+      )
+      return this.nexus.transact(() => {
+        const outcome = this.nexus.defineDraftSymbol(space, define.kind, name, definition, {
+          idempotencyKey:
+            options.idempotencyKey === undefined
+              ? undefined
+              : scopedIdempotencyKey(this.auth.principal_id, options.idempotencyKey),
+          requestDigest:
+            options.idempotencyKey === undefined
+              ? undefined
+              : requestDigest(statement, params, options.operation),
+        })
+        this.consume(decisions)
+        return outcome
+      })
+    }
     const provenance = accessProvenance(statement, authority, this.auth)
     const cx: KmlContext = {
       store: this.nexus.store,
@@ -2028,6 +2286,27 @@ export class Session {
     })
   }
 
+  /**
+   * Promotes a draft symbol onto a symbol of the same kind in an installed
+   * package (§20.16, `manage_schema`): a Schema migration recorded as a lineage
+   * mapping in the Space's Schema Environment. `from` is the draft symbol's
+   * local name or exact reference, `to` the target's. Returns the new
+   * environment version. Nothing is ever promoted implicitly.
+   */
+  promoteDraftSymbol(
+    kind: 'ConceptType' | 'PredicateType',
+    from: string,
+    to: string,
+    space = this.nexus.space,
+  ): number {
+    return this.nexus.transact(() => {
+      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
+      const outcome = this.nexus.promoteDraftSymbol(space, kind, from, to)
+      this.consume(approvals)
+      return outcome.schema_environment_version
+    })
+  }
+
   private governanceContext(space: string): ElementGovernanceContext {
     return {
       store: this.nexus.store,
@@ -2189,6 +2468,11 @@ function replay(row: TransactionRow): Outcome {
     handles: result.handles ?? {},
     changes: row.changes,
     actor_binding_id: result.actor_binding_id ?? null,
+    // A schema operation answers with its result, and a replay answers the
+    // same (§20.16, §34).
+    ...(isJsonMap(row.result) && ('ref' in row.result || 'promoted' in row.result)
+      ? { result: row.result }
+      : {}),
     warnings: [
       `this is the recorded outcome of transaction ${row.tx_id}, replayed ` +
         `under the idempotency key it committed with: nothing ran a second ` +

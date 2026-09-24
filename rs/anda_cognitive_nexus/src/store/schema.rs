@@ -294,6 +294,22 @@ impl Store {
         lock: SchemaLock,
     ) -> Result<SchemaEnvironment, KipError> {
         let space = self.get_space(space_id).await?;
+        let mut lock = lock;
+        // The draft package and its promotions are Space history, not a host's
+        // to drop (§20.16): an activation carries them forward.
+        let current = self
+            .schema_environment_at(space_id, space.schema_environment_version)
+            .await?;
+        lock.retain_space_local(&current.lock);
+        if !lock.draft.is_empty()
+            && lock.states.get(anda_kip::DRAFT_PACKAGE_ID)
+                != Some(&crate::schema::PackageState::Active)
+        {
+            return Err(KipError::constraint_violation(format!(
+                "{} is the Space's draft vocabulary and stays active once defined (§20.16)",
+                anda_kip::DRAFT_PACKAGE_REF
+            )));
+        }
         let available = self.installed_packages().await?;
         let version = space.schema_environment_version.saturating_add(1);
         // Resolve first: an environment that cannot be resolved must not
@@ -337,7 +353,11 @@ impl Store {
                     status: "committed".to_string(),
                     transaction_class: "governance".to_string(),
                     schema_environment_version: version,
-                    result: serde_json::json!({"schema_environment_version": version}),
+                    // A new environment is a `schema` control change (§36.1).
+                    result: serde_json::json!({
+                        "schema_environment_version": version,
+                        "control_changes": [{"kind": "schema", "version": cx.seq.to_string()}],
+                    }),
                     ..Default::default()
                 },
             )
@@ -345,6 +365,303 @@ impl Store {
         }
 
         Ok(environment)
+    }
+
+    /// Adds one symbol to the Space's draft vocabulary (§20.16).
+    ///
+    /// `definition` is the `DEFINE` body with its parameters bound. Only
+    /// adds: a name that already names a symbol of this kind anywhere in the
+    /// environment fails `SchemaSymbolConflict`, even when the definition is
+    /// identical — a retry is deduplicated by its idempotency key, never by
+    /// content. The definition persists with its endpoint types resolved to
+    /// exact references, and commits as its own governance transaction that
+    /// advances `schema_environment_version` and publishes a `schema` control
+    /// change. A dry run checks everything and writes nothing.
+    ///
+    /// Returns the result `{ref, schema_environment_version}` and, unless it
+    /// was a dry run, the journalled transaction.
+    pub async fn define_draft_symbol(
+        &self,
+        space_id: &str,
+        kind: anda_kip::DefineKind,
+        name: &str,
+        definition: Json,
+        entry: super::space::JournalEntry,
+        dry_run: bool,
+    ) -> Result<(Json, Option<TransactionRow>), KipError> {
+        use crate::schema::symbol::{SymbolKind, SymbolRef};
+        use crate::schema::{Intent, PackageState};
+
+        let symbol_kind = match kind {
+            anda_kip::DefineKind::Predicate => SymbolKind::PredicateType,
+            anda_kip::DefineKind::ConceptType => SymbolKind::ConceptType,
+        };
+        let reference = anda_kip::draft_symbol_ref(name);
+        if name.is_empty()
+            || crate::schema::symbol::is_qualified(name)
+            || reference
+                .parse::<SymbolRef>()
+                .map(|s| s.name)
+                .ok()
+                .as_deref()
+                != Some(name)
+        {
+            return Err(KipError::invalid_identifier(format!(
+                "{name:?} is not a symbol name DEFINE can add; a draft symbol is named by a bare \
+                 local name, without a package or `/` (§20.16)"
+            )));
+        }
+        anda_kip::check_draft_definition(kind, &definition)?;
+        let env = self.schema_environment(space_id).await?;
+        if let Some(existing) = env.name_taken(symbol_kind, name) {
+            return Err(KipError::new(
+                KipErrorCode::SchemaSymbolConflict,
+                format!(
+                    "{name:?} already names {existing}; DEFINE only adds, and a draft symbol never \
+                     shadows another (§20.16)"
+                ),
+            )
+            .with_hint(
+                "use the existing symbol, or define the new meaning under another name".to_string(),
+            ));
+        }
+
+        // Endpoint types persist as exact references, like any package's.
+        let mut definition = definition;
+        if symbol_kind == SymbolKind::PredicateType {
+            for side in ["subject", "object"] {
+                let Some(types) = definition
+                    .get_mut(side)
+                    .and_then(|endpoint| endpoint.get_mut("concept_types"))
+                    .and_then(Json::as_array_mut)
+                else {
+                    continue;
+                };
+                for ty in types.iter_mut() {
+                    let local = ty.as_str().ok_or_else(|| {
+                        KipError::constraint_violation(format!(
+                            "{side}.concept_types names Concept Types as strings"
+                        ))
+                    })?;
+                    *ty = Json::String(
+                        env.resolve_symbol(SymbolKind::ConceptType, local, Intent::Read)?
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            let attributes = definition
+                .as_object_mut()
+                .map(|members| {
+                    members
+                        .entry("attributes")
+                        .or_insert_with(|| serde_json::json!({}))
+                })
+                .and_then(Json::as_object_mut);
+            if let Some(attributes) = attributes {
+                attributes.insert("open".into(), Json::Bool(true));
+                attributes
+                    .entry("fields")
+                    .or_insert_with(|| serde_json::json!({}));
+            }
+        }
+        if let Some(members) = definition.as_object_mut() {
+            members.insert("ref".into(), Json::String(reference.clone()));
+            members.insert(
+                "kind".into(),
+                Json::from(crate::schema::env::draft_kind_name(symbol_kind)),
+            );
+        }
+
+        let mut lock = env.lock.clone();
+        match symbol_kind {
+            SymbolKind::PredicateType => lock.draft.predicates.insert(name.into(), definition),
+            _ => lock.draft.concept_types.insert(name.into(), definition),
+        };
+        lock.packages.insert(
+            anda_kip::DRAFT_PACKAGE_ID.into(),
+            anda_kip::DRAFT_PACKAGE_VERSION.into(),
+        );
+        lock.states
+            .insert(anda_kip::DRAFT_PACKAGE_ID.into(), PackageState::Active);
+        let package = lock.draft.package().map_err(|err| {
+            KipError::constraint_violation(format!(
+                "the definition is not a valid {symbol_kind} definition: {}",
+                err.message
+            ))
+        })?;
+        check_functional_by(&package)?;
+        let version = env.version.saturating_add(1);
+        SchemaEnvironment::resolve(version, lock.clone(), &self.installed_packages().await?)?;
+
+        let result = serde_json::json!({"ref": reference, "schema_environment_version": version});
+        if dry_run {
+            return Ok((result, None));
+        }
+        let row = self
+            .commit_environment(space_id, lock, entry, result)
+            .await?;
+        Ok((row.result.clone(), Some(row)))
+    }
+
+    /// Promotes a draft symbol (§20.16): a Schema migration that maps its
+    /// lineage onto a symbol of the same kind in an installed package, with
+    /// the rename semantics of §20.14. Elements written under the draft keep
+    /// their exact reference and are read through the target's lineage from
+    /// the new environment version on; an `AS OF` read before it does not see
+    /// the mapping. A draft symbol is promoted at most once.
+    pub async fn promote_draft_symbol(
+        &self,
+        space_id: &str,
+        kind: crate::schema::symbol::SymbolKind,
+        from: &str,
+        to: &str,
+        origin: Json,
+    ) -> Result<TransactionRow, KipError> {
+        use crate::schema::symbol::SymbolKind;
+        use crate::schema::{Intent, lineage_of};
+
+        if !matches!(kind, SymbolKind::ConceptType | SymbolKind::PredicateType) {
+            return Err(KipError::constraint_violation(
+                "only Concept Types and Predicates are drafted, and so promoted (§20.16)",
+            ));
+        }
+        let env = self.schema_environment(space_id).await?;
+        let prefix = format!("{}/", anda_kip::DRAFT_PACKAGE_REF);
+        let name = from.strip_prefix(&prefix).unwrap_or(from);
+        let drafted = match kind {
+            SymbolKind::PredicateType => env.lock.draft.predicates.contains_key(name),
+            _ => env.lock.draft.concept_types.contains_key(name),
+        };
+        if !drafted {
+            return Err(KipError::new(
+                KipErrorCode::SchemaSymbolNotFound,
+                format!("this Space's draft vocabulary defines no {kind} named {name:?}"),
+            ));
+        }
+        let from_ref = anda_kip::draft_symbol_ref(name);
+        let kind_name = crate::schema::env::draft_kind_name(kind);
+        let from_lineage = lineage_of(&from_ref);
+        if env
+            .lock
+            .lineage_maps
+            .iter()
+            .any(|map| map.kind == kind_name && map.from == from_lineage)
+        {
+            return Err(KipError::constraint_violation(format!(
+                "{from_ref} was already promoted; a draft symbol is promoted at most once (§20.16)"
+            )));
+        }
+        let target = if crate::schema::symbol::is_qualified(to) {
+            to.parse::<crate::schema::SymbolRef>()?
+        } else {
+            // The draft's own local name would resolve to itself.
+            let mut candidates = Vec::new();
+            for (package_id, version) in &env.lock.packages {
+                let package_ref = format!("{package_id}@{version}");
+                if package_ref == anda_kip::DRAFT_PACKAGE_REF {
+                    continue;
+                }
+                if let Some(artifact) = env.artifact(&package_ref)
+                    && env.state(package_id).answers_local_names()
+                    && artifact.defines(kind, to)
+                {
+                    candidates.push(artifact.symbol_ref(to)?);
+                }
+            }
+            match candidates.len() {
+                1 => candidates.remove(0),
+                0 => {
+                    return Err(KipError::new(
+                        KipErrorCode::SchemaSymbolNotFound,
+                        format!("no installed package defines the {kind} {to:?} in this Space"),
+                    ));
+                }
+                _ => {
+                    return Err(KipError::new(
+                        KipErrorCode::SchemaSymbolAmbiguous,
+                        format!(
+                            "the {kind} {to:?} is defined by more than one package; name the \
+                             target by its exact reference"
+                        ),
+                    ));
+                }
+            }
+        };
+        if target.package.package_id == anda_kip::DRAFT_PACKAGE_ID {
+            return Err(KipError::constraint_violation(
+                "a draft symbol is promoted to a symbol of an installed package, never to another \
+                 draft symbol (§20.16)",
+            ));
+        }
+        let target = env.resolve_symbol(kind, &target.to_string(), Intent::Read)?;
+        let mut lock = env.lock.clone();
+        lock.lineage_maps.push(crate::schema::env::LineageMap {
+            kind: kind_name.to_string(),
+            from: from_lineage.clone(),
+            to: lineage_of(&target.to_string()),
+        });
+        let version = env.version.saturating_add(1);
+        SchemaEnvironment::resolve(version, lock.clone(), &self.installed_packages().await?)?;
+        self.commit_environment(
+            space_id,
+            lock,
+            super::space::JournalEntry {
+                origin,
+                ..Default::default()
+            },
+            serde_json::json!({
+                "promoted": {"kind": kind_name, "from": from_lineage, "to": lineage_of(&target.to_string())},
+                "schema_environment_version": version,
+            }),
+        )
+        .await
+    }
+
+    /// Commits a new Schema Environment version as its own governance
+    /// transaction: the environment row, the Space's version, and a journal
+    /// entry whose result carries the `schema` control change (§36.1). It
+    /// writes no element, so the entry's Receipt origin is all the origin it
+    /// records.
+    pub(crate) async fn commit_environment(
+        &self,
+        space_id: &str,
+        lock: SchemaLock,
+        entry: super::space::JournalEntry,
+        mut result: Json,
+    ) -> Result<TransactionRow, KipError> {
+        let space = self.get_space(space_id).await?;
+        let version = space.schema_environment_version.saturating_add(1);
+        let cx = self
+            .begin_transaction(space_id, entry.origin.clone())
+            .await?;
+        let row = SchemaEnvRow {
+            _id: 0,
+            space: space_id.to_string(),
+            version,
+            lock: serde_json::to_value(&lock).map_err(|err| {
+                KipError::internal_error(format!("a Schema Lock failed to encode: {err}"))
+            })?,
+            created_at: cx.at.clone(),
+            tx_id: cx.tx_id.clone(),
+        };
+        self.schema_envs().add_from(&row).await.map_err(db_error)?;
+        let mut updated_space = self.get_space(space_id).await?;
+        updated_space.schema_environment_version = version;
+        self.put_space(&updated_space).await?;
+        result["control_changes"] =
+            serde_json::json!([{"kind": "schema", "version": cx.seq.to_string()}]);
+        self.journal(
+            &cx,
+            super::space::JournalEntry {
+                status: "committed".to_string(),
+                transaction_class: "governance".to_string(),
+                schema_environment_version: version,
+                result,
+                ..entry
+            },
+        )
+        .await
     }
 
     /// The Space's current Schema Environment.

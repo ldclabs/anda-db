@@ -477,7 +477,9 @@ async fn optional_element_indexes_stay_sparse_through_crud_and_recovery() {
                 .insert(&cx, &mut AssertionRow::default())
                 .await
                 .unwrap(),
-            &["expires_at", "client_key", "valid_until"],
+            // No `valid_until` index: world time is decided per slot, and an
+            // endpoint may be a time bound (§25.5).
+            &["expires_at", "client_key"],
             &[
                 "seq",
                 "asserted_by_key",

@@ -2,8 +2,8 @@
 
 [中文版](anda_kip.zh.md)
 
-Tracks KIP at `3251912`, including the draft memory package
-`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`) and the strict
+Tracks KIP at `597db44`, including the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`) and the strict
 UTC millisecond timestamp contract (§6.5). See the
 [Cognitive Nexus documentation](anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 

@@ -37,8 +37,12 @@
  */
 
 import { KipError } from '../errors.js'
+import type { Json, JsonMap } from '../json.js'
+import { kipValue } from '../kml/value.js'
+import { checkDraftDefinition } from '../schema/draft.js'
 import type {
   Assignments,
+  BoundValue,
   Command,
   KmlStatement,
   KqlQuery,
@@ -255,6 +259,32 @@ function analyzeKml(statement: KmlStatement, out: Diagnostic[]): void {
   for (const clause of statement.clauses) analyzeClause(clause, out)
 }
 
+/**
+ * A bound object as JSON, when every value in it is written; `undefined` when
+ * a `:parameter` anywhere leaves it for the engine.
+ */
+function literalObject(object: Record<string, BoundValue>): JsonMap | undefined {
+  const value = (bound: BoundValue): Json | undefined => {
+    if ('Value' in bound) return kipValue(bound.Value)
+    if ('Array' in bound) {
+      const items = bound.Array.map(value)
+      return items.includes(undefined) ? undefined : (items as Json[])
+    }
+    if ('Object' in bound) return fields(bound.Object)
+    return undefined
+  }
+  const fields = (entries: [string, BoundValue][]): JsonMap | undefined => {
+    const out: JsonMap = {}
+    for (const [key, item] of entries) {
+      const json = value(item)
+      if (json === undefined) return undefined
+      out[key] = json
+    }
+    return out
+  }
+  return fields(Object.entries(object))
+}
+
 function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
   // `ASSERT` has already been desugared into `CreateAssertion` by `lower`, so
   // checking the created Assertion covers the sugar form too.
@@ -265,6 +295,20 @@ function analyzeClause(clause: MutationClause, out: Diagnostic[]): void {
       analyzeAssertionShape(record.set_fields, record.set_structural, out)
     }
     analyzeStructural(record.set_structural, out)
+    return
+  }
+  // A fully written DEFINE body is judged here (§20.16); a body with a
+  // parameter is judged by the engine once it is bound, and whether the name
+  // already resolves depends on the Schema Environment.
+  if ('Define' in clause) {
+    const body = literalObject(clause.Define.definition)
+    if (body !== undefined) {
+      try {
+        checkDraftDefinition(clause.Define.kind, body)
+      } catch (err) {
+        out.push({ severity: 'error', code: 'ConstraintViolation', message: (err as Error).message })
+      }
+    }
     return
   }
   if ('Update' in clause) {
@@ -373,14 +417,41 @@ function analyzeAssertionShape(
   structural: StructuralEdge[] | null | undefined,
   out: Diagnostic[],
 ): void {
-  const observed = fields.some(
-    ([name, value]) => name === 'mode' && literalStr(value) === 'observed',
-  )
-  if (!observed) return
   const citesEvidence = (structural ?? []).some(
     (edge) => 'Name' in edge.field && edge.field.Name === 'evidence',
   )
-  if (!citesEvidence) {
+  // A claim taken from captured material was made when the source says, not
+  // when this write runs. Without `at` or a written `valid.from` it takes the
+  // transaction time as its start key (§13.2, §25.4), so an old claim recorded
+  // late would end a current value it predates. A parameter may carry either,
+  // so it is given the benefit of the doubt.
+  const isNull = (value: MutationValue): boolean => 'Value' in value && value.Value === 'Null'
+  const written = (name: string): boolean =>
+    fields.some(([field, value]) => field === name && !isNull(value))
+  const writesFrom = fields.some(([field, value]) => {
+    if (field !== 'valid_time') return false
+    if ('Value' in value) {
+      const inner = value.Value
+      return typeof inner === 'object' && 'Object' in inner &&
+        inner.Object.from !== undefined && inner.Object.from !== 'Null'
+    }
+    if ('Object' in value) {
+      return value.Object.some(([key, item]) => key === 'from' && !('Value' in item && item.Value === 'Null'))
+    }
+    return true
+  })
+  if (citesEvidence && !written('asserted_at') && !writesFrom) {
+    out.push({
+      severity: 'warning',
+      code: 'ConstraintViolation',
+      message:
+        "ASSERT cites evidence but gives no at: asserted_at defaults to the transaction time, which is the claim's start key; a claim recorded later than it was made should carry at: <the source's observed time> (§13.2, §25.4)",
+    })
+  }
+  const observed = fields.some(
+    ([name, value]) => name === 'mode' && literalStr(value) === 'observed',
+  )
+  if (observed && !citesEvidence) {
     out.push({
       severity: 'warning',
       code: 'ConstraintViolation',

@@ -260,6 +260,8 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
           ...(outcome.warnings.length === 0
             ? {}
             : { warnings: outcome.warnings }),
+          // `DEFINE` answers `{ref, schema_environment_version}` (§20.16).
+          ...(outcome.result === undefined ? {} : { result: outcome.result }),
           // §75: the operation's own Receipt, in the shape §33.2 fixes.
           receipt: receiptOf(outcome, auth),
           extensions: { 'kip-do/outcome': outcome },

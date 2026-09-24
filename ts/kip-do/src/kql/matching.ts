@@ -43,7 +43,6 @@ import { rank } from './search.js'
 import { kipValue as kipLiteral } from '../kml/value.js'
 import {
   formatSymbolRef,
-  lineageOfSymbol,
   lineageText,
   structuralFieldDef,
 } from '../schema/index.js'
@@ -123,11 +122,20 @@ const REFERENCE_FIELDS: Readonly<Record<ElementKind, readonly string[]>> = {
  * reads the same slot the pattern matched on.
  */
 const FIELD_PATHS: Readonly<Record<string, string[]>> = {
-  status: ['lifecycle', 'status'],
   state: ['_system', 'state'],
   version: ['_system', 'version'],
   type: ['schema_ref'],
   predicate: ['predicate_ref'],
+}
+
+/**
+ * `status` is a lifecycle member on an Assertion and on Evidence, and a
+ * top-level field on an Activity (§16) — the Activity view has no
+ * `lifecycle` block, so reading it there would match nothing.
+ */
+function fieldPath(kind: ElementKind, field: string): string[] | undefined {
+  if (field === 'status' && (kind === 'Assertion' || kind === 'Evidence')) return ['lifecycle', 'status']
+  return FIELD_PATHS[field]
 }
 
 /**
@@ -397,6 +405,14 @@ function scan(
     if (column === undefined) continue
     const literal = literalOf(value, solution, b)
     if (typeof literal !== 'string') continue
+    if (LINEAGE_FIELDS.has(field)) {
+      // Every stored lineage that reads as this one: a draft symbol promoted
+      // into it included (§20.16).
+      const kind = field === 'predicate' ? 'PredicateType' : 'ConceptType'
+      wheres.push(`"${column}" IN (SELECT value FROM json_each(?))`)
+      values.push(JSON.stringify(cx.env.lineagesOf(kind, resolveSymbol(cx, field, literal))))
+      continue
+    }
     wheres.push(`"${column}" = ?`)
     values.push(SYMBOL_FIELDS.has(field) ? resolveSymbol(cx, field, literal) : literal)
   }
@@ -457,14 +473,15 @@ export function matchObject(cx: Context, actual: Json, matcher: ObjectMatcher, s
   for (const [field, expected] of Object.entries(matcher)) {
     const key = symbolMap === undefined || (symbolMap === 'StructuralField' && Object.hasOwn(CORE_STRUCTURAL_FIELDS, field))
       ? field : formatSymbolRef(cx.env.resolveSymbol(symbolMap, field, 'read'))
-    const path = kind === undefined ? [key] : FIELD_PATHS[field] ?? [key]
+    const path = kind === undefined ? [key] : fieldPath(kind, field) ?? [key]
     const value = readField(actual, path)
     if (value === undefined) return null
     if (kind !== undefined && SYMBOL_FIELDS.has(field) && !('Variable' in expected)) {
       const wanted = literalOf(expected, current, b)
       if (typeof wanted === 'string') {
         const resolved = resolveSymbol(cx, field, wanted)
-        if (typeof value !== 'string' || (LINEAGE_FIELDS.has(field) ? lineageText(value) : value) !== resolved) return null
+        const symbolKind = field === 'predicate' ? 'PredicateType' : 'ConceptType'
+        if (typeof value !== 'string' || (LINEAGE_FIELDS.has(field) ? cx.env.lineage(symbolKind, value) : value) !== resolved) return null
         continue
       }
     }
@@ -561,12 +578,13 @@ function literalOf(
  * Resolves a schema symbol a matcher wrote as a local name.
  *
  * `type` and `predicate` resolve to the lineage the pattern matches over
- * (§20.14); `schema_ref` to the exact reference it names.
+ * (§20.14), after promotions (§20.16); `schema_ref` to the exact reference it
+ * names.
  */
 function resolveSymbol(cx: Context, field: string, name: string): string {
   const kind = field === 'predicate' ? 'PredicateType' : 'ConceptType'
   const symbol = cx.env.resolveSymbol(kind, name, 'read')
-  return LINEAGE_FIELDS.has(field) ? lineageOfSymbol(symbol) : formatSymbolRef(symbol)
+  return LINEAGE_FIELDS.has(field) ? cx.env.lineage(kind, formatSymbolRef(symbol)) : formatSymbolRef(symbol)
 }
 
 // --- Proposition patterns ---------------------------------------------------
@@ -681,7 +699,7 @@ function tupleCandidates(
           (subjectKeys === null || subjectKeys.includes(row.subject_key)) &&
           (objectKeys === null || objectKeys.includes(row.object_key)) &&
           (predicateLineage === null ||
-            lineageOfRow(row) === predicateLineage),
+            cx.env.lineage('PredicateType', lineageOfRow(row)) === predicateLineage),
       )
       .map((row) => ({
         seq: row.id,
@@ -702,8 +720,8 @@ function tupleCandidates(
     values.push(JSON.stringify(objectKeys))
   }
   if (predicateLineage !== null) {
-    wheres.push('predicate_lineage = ?')
-    values.push(predicateLineage)
+    wheres.push('predicate_lineage IN (SELECT value FROM json_each(?))')
+    values.push(JSON.stringify(cx.env.lineagesOf('PredicateType', predicateLineage)))
   }
 
   // The whole row rather than the four columns the tuple needs, so the element
@@ -1323,9 +1341,6 @@ function beliefSlot(
       // Proposition was created under and whichever merged spelling of the
       // subject it was recorded on.
       candidates: projectSlot(cx, slotPropositions(cx, keys, predicateLineage), b.policy, validAt),
-      policy: b.policy,
-      validAt,
-      asOf: cx.asOf ?? null,
       warnings: [
         'protected actor trust weights are applied; evidence quality is not automatically graded',
         'no evidence-quality evaluation is applied: a cited Evidence record is ' +

@@ -60,11 +60,6 @@
     "reason": "every BELIEF is computed at read time; nothing is cached, so there is no stale result to disclose"
   },
   {
-    "capability": "draft_vocabulary",
-    "detail": "DEFINE PREDICATE / DEFINE CONCEPT TYPE and the propose_schema permission (\u00a720.16)",
-    "reason": "the Space-local draft package is not built; DEFINE is refused before authorization. Install a Schema Package that declares the symbol instead. ts/kip-do has the same gap"
-  },
-  {
     "capability": "recording_repair",
     "detail": "the protected RecordingRepair operation and the repair_recording permission (\u00a757.8)",
     "reason": "a misrecorded claim can be retracted or quarantined, but the repair operation that keeps it apart from the actor's own history is not built, so this engine does not claim KIP-CognitiveMemory"

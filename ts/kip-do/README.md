@@ -1,7 +1,7 @@
 # @ldclabs/kip-do
 
-Tracks KIP at `3251912`, with the draft memory package
-`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
+Tracks KIP at `597db44`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
 
 A [KIP](https://github.com/ldclabs/KIP) Cognitive Nexus running inside a

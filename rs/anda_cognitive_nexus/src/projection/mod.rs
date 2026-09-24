@@ -28,7 +28,8 @@
 
 mod dependency;
 pub mod policy;
-mod world;
+pub(crate) mod strength;
+pub(crate) mod world;
 
 use anda_kip::{
     AssertionMode, BeliefStatus, Json, KipError, Map, Projection, ProjectionSide,
@@ -321,7 +322,6 @@ impl Belief {
             // never changes `status` (§21.6).
             leading: Some(self.leading().to_string()),
             precedence: self.precedence.clone(),
-            policy: Some(self.policy.identity()),
             explanation: self.explanation(),
         };
         serde_json::to_value(projection).unwrap_or(Json::Null)
@@ -362,12 +362,15 @@ impl Belief {
     /// (§49.2).
     fn side(&self, assertion_ids: &[String], score: f64, groups: &[Group]) -> ProjectionSide {
         let disclosed = self.policy.explanation == Explanation::Ledger;
+        // A structural policy weighs nothing and outputs no number (§21.10):
+        // `score: null`, with no semantics to declare for it.
+        let weighted = !self.policy.structural;
         ProjectionSide {
-            score: Some(score),
+            score: weighted.then_some(score),
             // §27.3: an implementation MUST declare what its scores mean, and
             // MUST NOT present a normalized strength as a calibrated
             // probability. These combine self-reported commitments.
-            score_semantics: Some("normalized_support_not_probability".to_string()),
+            score_semantics: weighted.then(|| "normalized_support_not_probability".to_string()),
             assertion_ids: if disclosed {
                 assertion_ids.to_vec()
             } else {
@@ -578,9 +581,6 @@ impl Context<'_> {
         Ok(Slot {
             basis: self.projection_basis(policy, at, next),
             candidates,
-            policy: policy.clone(),
-            valid_at: at.to_string(),
-            as_of: self.as_of,
             warnings: vec![
                 "protected actor trust weights are applied; evidence quality is not automatically graded"
                     .to_string(),
@@ -642,9 +642,9 @@ impl Context<'_> {
                 // The partition is the object's Concept Type lineage.
                 let partition = match Endpoint::from_json(&value.object) {
                     Ok(Endpoint::Local(id)) => match self.load(id).await? {
-                        Some(Element::Concept(concept)) => {
-                            crate::schema::lineage_of(&concept.schema_ref)
-                        }
+                        Some(Element::Concept(concept)) => self
+                            .env
+                            .lineage(crate::schema::SymbolKind::ConceptType, &concept.schema_ref),
                         _ => String::new(),
                     },
                     _ => String::new(),
@@ -710,12 +710,28 @@ impl Context<'_> {
             for row in self.assertions_about(*member).await? {
                 match self.eligible(&row, policy).await? {
                     Ok(candidate) => {
-                        let mut contexts: Vec<String> =
-                            row.context_refs.iter().map(Json::to_string).collect();
+                        // Lines and precedence compare the actor and the
+                        // context set as they are now, merge-resolved: a
+                        // context merged after the claim was written is still
+                        // the same scope (§25.4).
+                        let mut contexts = Vec::with_capacity(row.context_refs.len());
+                        for reference in &row.context_refs {
+                            let canonical = self.canonical_endpoint(reference).await?;
+                            contexts.push(crate::kml::clauses::endpoint_key(&canonical));
+                        }
                         contexts.sort();
                         contexts.dedup();
+                        let mut timed = world::Timed::new(&row, *member, frame.partition(*member));
+                        timed.context = contexts.join("\u{1f}");
+                        if let Some(actor) =
+                            crate::kml::clauses::element_reference(&row.asserted_by)
+                            && actor.kind == anda_kip::ElementKind::Concept
+                        {
+                            let canonical = self.canonical_of(actor).await?;
+                            timed.actor = crate::term::Endpoint::Local(canonical).key();
+                        }
                         rows.push(Row {
-                            timed: world::Timed::new(&row, *member, frame.partition(*member)),
+                            timed,
                             candidate,
                             mode: row.mode.clone(),
                             contexts,
@@ -819,12 +835,13 @@ impl Context<'_> {
             ledger.support_groups = local_groups;
             ledger.opposition_groups = opposing_groups;
             ledger.candidate_status = classify(local_support, local_opposition, &ledger, policy);
+            // A candidate whose only material at the instant is indeterminate
+            // is `uncertain`, and says why (§25.5). Indeterminate rows beside
+            // material that is inside decide nothing and are only listed.
             if ledger.candidate_status == BeliefStatus::Insufficient
                 && !ledger.indeterminate.is_empty()
             {
                 ledger.candidate_status = BeliefStatus::Uncertain;
-            }
-            if !ledger.indeterminate.is_empty() {
                 ledger.reasons.push("temporal_indeterminate");
             }
             // Exclusive values (§25, `complete`, exclusive groups, boolean
@@ -940,7 +957,12 @@ impl Context<'_> {
                     .iter()
                     .map(|&i| frame.members[i].to_string())
                     .collect();
-                let supports: Vec<f64> = beliefs.iter().map(|b| b.support).collect();
+                // Leading compares eligible independent roots (§27.2), never
+                // the numeric support a structural policy does not have.
+                let roots: Vec<usize> = beliefs
+                    .iter()
+                    .map(|b| b.ledger.support_groups.len())
+                    .collect();
                 for &i in &supported {
                     let me = frame.members[i].to_string();
                     match winner {
@@ -965,15 +987,14 @@ impl Context<'_> {
                             let best_rival = supported
                                 .iter()
                                 .filter(|&&j| j != i)
-                                .map(|&j| supports[j])
-                                .fold(f64::MIN, f64::max);
+                                .map(|&j| roots[j])
+                                .max()
+                                .unwrap_or(0);
                             let belief = &mut beliefs[i];
-                            belief.slot_leading = Some(if belief.support > best_rival {
-                                "support"
-                            } else if belief.support < best_rival {
-                                "opposition"
-                            } else {
-                                "none"
+                            belief.slot_leading = Some(match roots[i].cmp(&best_rival) {
+                                std::cmp::Ordering::Greater => "support",
+                                std::cmp::Ordering::Less => "opposition",
+                                std::cmp::Ordering::Equal => "none",
                             });
                             belief.status = BeliefStatus::Contested;
                             belief.ledger.conflict_refs =
@@ -1140,18 +1161,29 @@ impl Context<'_> {
         predicate_ref: &str,
     ) -> Result<Vec<ElementId>, KipError> {
         let subject_keys = self.endpoint_keys(subject).await?;
-        let predicate = match crate::schema::lineage_range(predicate_ref) {
-            Some((low, high)) => anda_db::query::Filter::Field((
-                "predicate_ref".to_string(),
-                anda_db::query::RangeQuery::Between(
-                    anda_db_schema::Fv::Text(low),
-                    anda_db_schema::Fv::Text(high),
-                ),
-            )),
-            None => crate::store::eq_field(
+        // Every version of the lineage, and a draft symbol promoted into it
+        // (§20.14, §20.16).
+        let mut ranges: Vec<Box<anda_db::query::Filter>> = self
+            .env
+            .lineage_ranges(crate::schema::SymbolKind::PredicateType, predicate_ref)
+            .into_iter()
+            .map(|(low, high)| {
+                Box::new(anda_db::query::Filter::Field((
+                    "predicate_ref".to_string(),
+                    anda_db::query::RangeQuery::Between(
+                        anda_db_schema::Fv::Text(low),
+                        anda_db_schema::Fv::Text(high),
+                    ),
+                )))
+            })
+            .collect();
+        let predicate = match ranges.len() {
+            0 => crate::store::eq_field(
                 "predicate_ref",
                 anda_db_schema::Fv::Text(predicate_ref.to_string()),
             ),
+            1 => *ranges.pop().expect("one range"),
+            _ => anda_db::query::Filter::Or(ranges),
         };
         let ids = self
             .candidates(
@@ -1179,7 +1211,11 @@ impl Context<'_> {
         let mut slot = Vec::new();
         for id in ids {
             if let Some(Element::Proposition(row)) = self.load(id).await?
-                && crate::schema::same_lineage(&row.predicate_ref, predicate_ref)
+                && self.env.same_lineage(
+                    crate::schema::SymbolKind::PredicateType,
+                    &row.predicate_ref,
+                    predicate_ref,
+                )
                 && (!historical
                     || (row.state == "active" && subject_keys.contains(&row.subject_key)))
             {
@@ -1368,15 +1404,10 @@ fn classify(support: f64, opposition: f64, ledger: &Ledger, policy: &Policy) -> 
 /// `insufficient` with an empty `accepted_values` rather than force the Agent
 /// to infer unknown from zero raw rows — and an Agent that has to derive the
 /// slot's state by scanning `candidate_projections` is doing exactly that.
-/// `subject`, `predicate_ref`, `leading` and `contested` are additive: they
-/// name what the slot was about and which side is ahead *without* claiming it
-/// settled anything.
 ///
-/// The slot reports its own `policy` and `temporal`, from the coordinates it
-/// *ran* under rather than from whichever candidate happened to come first.
-/// Reading them off a candidate leaves them null exactly when the slot is
-/// empty — which is the case §47.4 is about, and the one where a caller most
-/// needs to know the answer was computed rather than skipped.
+/// The slot's `basis` carries the policy, `valid_at` and snapshot it *ran*
+/// under (§47.3), so an empty slot still says what it was computed against.
+/// Which side leads is each candidate projection's own `leading`.
 pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
     let beliefs = &slot.candidates;
     let accepted: Vec<String> = beliefs
@@ -1384,14 +1415,6 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
         .filter(|belief| belief.status == BeliefStatus::Accepted)
         .filter_map(|belief| belief.proposition.map(|id| id.to_string()))
         .collect();
-    let leading = beliefs
-        .iter()
-        .filter(|belief| belief.status != BeliefStatus::Insufficient)
-        .max_by(|a, b| {
-            a.support
-                .partial_cmp(&b.support)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     let contested = beliefs
         .iter()
         .any(|belief| belief.status == BeliefStatus::Contested);
@@ -1411,6 +1434,12 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
     } else {
         BeliefStatus::Insufficient
     };
+    let mut reasons: Vec<String> = beliefs
+        .iter()
+        .flat_map(Belief::uncertainty_reasons)
+        .collect();
+    reasons.sort();
+    reasons.dedup();
 
     serde_json::json!({
         "status": status,
@@ -1423,21 +1452,14 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
         "predicate_ref": predicate,
         "accepted_values": accepted,
         "candidate_projections": beliefs.iter().map(Belief::to_json).collect::<Vec<_>>(),
-        // A leading side is not a settled answer, so it is named as leading.
-        "leading": leading.and_then(|belief| belief.proposition.map(|id| id.to_string())),
-        "contested": contested,
         "uncertainty": {
             "level": match status {
                 BeliefStatus::Insufficient => "total",
                 BeliefStatus::Contested | BeliefStatus::Uncertain => "high",
                 _ => "low",
             },
-            "reasons": leading
-                .map(|belief| belief.uncertainty_reasons())
-                .unwrap_or_default(),
+            "reasons": reasons,
         },
-        "temporal": {"valid_at": slot.valid_at, "as_of_seq": slot.as_of},
-        "policy": slot.policy.identity(),
         // §47.3 lists an explanation on the slot too. A slot's own explanation
         // is about the *set*: how many candidates competed for it, and what
         // this engine could not weigh between them.
@@ -1450,19 +1472,12 @@ pub fn slot_to_json(subject: &Endpoint, predicate: &str, slot: &Slot) -> Json {
 }
 
 /// One subject-predicate slot, projected (§47.2).
-///
-/// Carries the coordinates the projection ran under, so the slot can report
-/// them whether or not any candidate exists.
 pub struct Slot {
+    /// The coordinates it ran under, reported whether or not any candidate
+    /// exists.
     pub basis: anda_kip::ProjectionBasis,
     /// Every Proposition competing for the slot, each projected.
     pub candidates: Vec<Belief>,
-    /// The policy it ran under.
-    pub policy: Policy,
-    /// The world time it evaluated for.
-    pub valid_at: String,
-    /// The cognitive coordinate it read, when bound to one.
-    pub as_of: Option<u64>,
     /// What this engine could not do while deciding the slot.
     pub warnings: Vec<String>,
 }

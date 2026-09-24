@@ -181,6 +181,109 @@ pub struct SchemaLock {
     /// Model-friendly aliases: alias → canonical symbol reference (§21).
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
+    /// The Space's draft vocabulary (§20.16): every symbol `DEFINE` added,
+    /// as package definitions. The draft package `kip://local/draft@0.0.0` is
+    /// synthesized from it, per Space, and never installed Nexus-wide.
+    #[serde(default, skip_serializing_if = "DraftVocabulary::is_empty")]
+    pub draft: DraftVocabulary,
+    /// Promotions (§20.16): each draft symbol mapped onto a symbol of the
+    /// same kind in an installed package, with rename semantics (§20.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage_maps: Vec<LineageMap>,
+}
+
+impl SchemaLock {
+    /// Carries the Space-local parts of `current` into a lock a host or an
+    /// operator is activating (§20.16): the draft package, its definitions and
+    /// its promotions. Activating or migrating other packages never removes
+    /// them; a lock that writes them explicitly keeps what it wrote.
+    pub fn retain_space_local(&mut self, current: &SchemaLock) {
+        if current.draft.is_empty() {
+            return;
+        }
+        self.packages
+            .entry(anda_kip::DRAFT_PACKAGE_ID.to_string())
+            .or_insert_with(|| anda_kip::DRAFT_PACKAGE_VERSION.to_string());
+        self.states
+            .entry(anda_kip::DRAFT_PACKAGE_ID.to_string())
+            .or_insert(PackageState::Active);
+        if self.draft.is_empty() {
+            self.draft = current.draft.clone();
+        }
+        if self.lineage_maps.is_empty() {
+            self.lineage_maps = current.lineage_maps.clone();
+        }
+    }
+}
+
+/// The definitions of a Space's draft package (§20.16).
+///
+/// Each value is the package definition of its kind — `ref`, `kind` and the
+/// body `DEFINE` wrote — so the synthesized artifact reads like any other.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct DraftVocabulary {
+    #[serde(default, skip_serializing_if = "anda_kip::Map::is_empty")]
+    pub concept_types: anda_kip::Map<String, Json>,
+    #[serde(default, skip_serializing_if = "anda_kip::Map::is_empty")]
+    pub predicates: anda_kip::Map<String, Json>,
+}
+
+impl DraftVocabulary {
+    /// Whether no symbol was ever defined.
+    pub fn is_empty(&self) -> bool {
+        self.concept_types.is_empty() && self.predicates.is_empty()
+    }
+
+    /// The artifact the Schema Environment resolves `kip://local/draft@0.0.0`
+    /// to: its definitions so far, with an `integrity.content_digest` computed
+    /// under `kip-jcs-safe-v1`, so the digest changes with every `DEFINE`
+    /// while the reference does not.
+    pub fn package(&self) -> Result<SchemaPackage, KipError> {
+        let mut artifact = serde_json::json!({
+            "format": "KIP-Schema-Package",
+            "format_version": "2.0-draft",
+            "manifest": {
+                "package_id": anda_kip::DRAFT_PACKAGE_ID,
+                "version": anda_kip::DRAFT_PACKAGE_VERSION,
+                "package_ref": anda_kip::DRAFT_PACKAGE_REF,
+                "name": "Space draft vocabulary",
+                "description": "Symbols this Space added with DEFINE (Spec §20.16): open, \
+                                additive and never changed once defined.",
+            },
+            "definitions": {
+                "concept_types": self.concept_types,
+                "predicates": self.predicates,
+            },
+        });
+        let digest = super::contracts::digest(&artifact)?;
+        artifact["integrity"] = serde_json::json!({
+            "digest_profile": "kip-jcs-safe-v1",
+            "content_digest": digest,
+            "covers": "all top-level fields except integrity",
+            "signatures": [],
+        });
+        SchemaPackage::parse(&artifact.to_string())
+    }
+}
+
+/// One promotion of a draft symbol (§20.16): `from` is the draft lineage
+/// (`kip://local/draft/<name>`), `to` the target lineage, and `kind` names the
+/// symbol kind, because kinds are separate namespaces and a lineage is not.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LineageMap {
+    /// `ConceptType` or `PredicateType`.
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// The wire name of a symbol kind a draft may define: `ConceptType` or
+/// `PredicateType`, as package definitions spell their `kind`.
+pub fn draft_kind_name(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::PredicateType => "PredicateType",
+        _ => "ConceptType",
+    }
 }
 
 /// A resolved Schema Environment, ready to answer symbol questions.
@@ -229,7 +332,10 @@ impl SchemaEnvironment {
         let mut artifacts = BTreeMap::new();
         for (package_id, package_version) in &lock.packages {
             let package_ref = format!("{package_id}@{package_version}");
-            let artifact = if package_ref == CORE_PACKAGE_REF.to_string() {
+            let artifact = if package_ref == anda_kip::DRAFT_PACKAGE_REF {
+                // Space-local and synthesized, never installed (§20.16).
+                Arc::new(lock.draft.package()?)
+            } else if package_ref == CORE_PACKAGE_REF.to_string() {
                 available
                     .get(&package_ref)
                     .cloned()
@@ -330,7 +436,16 @@ impl SchemaEnvironment {
                 continue;
             };
             if artifact.defines(kind, name) {
-                candidates.push(artifact.symbol_ref(name)?);
+                let symbol = artifact.symbol_ref(name)?;
+                // A promoted draft symbol answers through its target
+                // (§20.16): its local name stops competing with it.
+                if package_ref == anda_kip::DRAFT_PACKAGE_REF
+                    && self.lineage(kind, &symbol.to_string())
+                        != super::lineage_of(&symbol.to_string())
+                {
+                    continue;
+                }
+                candidates.push(symbol);
             }
         }
 
@@ -416,6 +531,73 @@ impl SchemaEnvironment {
     /// The definition behind a resolved symbol, when the caller needs it.
     pub fn definition_package(&self, symbol: &SymbolRef) -> Option<&Arc<SchemaPackage>> {
         self.artifacts.get(&symbol.package.to_string())
+    }
+
+    /// What already names `name` as a `kind` here, when something does
+    /// (§20.16): a reserved Core element kind, an alias, or a symbol of that
+    /// kind in any package of the lock whatever its state — the draft package
+    /// and its earlier symbols included. Kinds are separate namespaces.
+    pub fn name_taken(&self, kind: SymbolKind, name: &str) -> Option<String> {
+        if anda_kip::CORE_ELEMENT_KINDS.contains(&name) {
+            return Some(format!("{}/{name}", *CORE_PACKAGE_REF));
+        }
+        if let Some(target) = self.lock.aliases.get(name) {
+            return Some(format!("the alias {name:?} for {target}"));
+        }
+        self.artifacts
+            .iter()
+            .find(|(_, artifact)| artifact.defines(kind, name))
+            .map(|(package_ref, _)| format!("{package_ref}/{name}"))
+    }
+
+    /// The lineage a symbol reference belongs to here (§20.14), after
+    /// promotions: a promoted draft symbol's lineage is its target's (§20.16).
+    pub fn lineage(&self, kind: SymbolKind, reference: &str) -> String {
+        let lineage = super::lineage_of(reference);
+        let kind = draft_kind_name(kind);
+        self.lock
+            .lineage_maps
+            .iter()
+            .find(|map| map.kind == kind && map.from == lineage)
+            .map_or(lineage, |map| map.to.clone())
+    }
+
+    /// Whether two references are one lineage here, promotions included.
+    pub fn same_lineage(&self, kind: SymbolKind, a: &str, b: &str) -> bool {
+        a == b || self.lineage(kind, a) == self.lineage(kind, b)
+    }
+
+    /// The index ranges every reference of one lineage falls in, promotions
+    /// included: the reference's own package range, and the draft package's
+    /// when a draft symbol was promoted into this lineage. A range is a
+    /// superset; [`Self::same_lineage`] settles each row it returns.
+    pub fn lineage_ranges(&self, kind: SymbolKind, reference: &str) -> Vec<(String, String)> {
+        let mut ranges: Vec<(String, String)> =
+            super::lineage_range(reference).into_iter().collect();
+        let lineage = self.lineage(kind, reference);
+        let kind = draft_kind_name(kind);
+        let promoted = self
+            .lock
+            .lineage_maps
+            .iter()
+            .any(|map| map.kind == kind && (map.to == lineage || map.from == lineage));
+        if promoted {
+            for map in &self.lock.lineage_maps {
+                if map.kind != kind || map.to != lineage {
+                    continue;
+                }
+                for side in [&map.from, &map.to] {
+                    let Some((package, name)) = side.rsplit_once('/') else {
+                        continue;
+                    };
+                    let range = super::lineage_range(&format!("{package}@0.0.0/{name}"));
+                    ranges.extend(range);
+                }
+            }
+        }
+        ranges.sort();
+        ranges.dedup();
+        ranges
     }
 }
 

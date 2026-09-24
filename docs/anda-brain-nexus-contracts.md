@@ -2,7 +2,7 @@
 
 [中文版](anda-brain-nexus-contracts.zh.md)
 
-This implementation corresponds to KIP commit `3251912`. The protocol version remains KIP 2.0, with standard package `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`; the draft rewrote 2.0.0 in place, so Spaces activated under the earlier 2.1.0 draft are not migrated). Both the Rust and SQLite/Durable Object engines provide the interfaces below. Retrieval policies, scheduling loops, tool adapters, and the 5-intent Memory Interface are integrated by Anda Brain; the database enforces permissions, references, versions, transactions, and record validity.
+This implementation corresponds to KIP commit `597db44`. The protocol version remains KIP 2.0, with standard package `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`; the draft rewrote 2.0.0 in place, so Spaces activated under the earlier 2.1.0 draft are not migrated). Both the Rust and SQLite/Durable Object engines provide the interfaces below. Retrieval policies, scheduling loops, tool adapters, and the 5-intent Memory Interface are integrated by Anda Brain; the database enforces permissions, references, versions, transactions, and record validity.
 
 All protocol timestamp inputs must adhere strictly to `YYYY-MM-DDTHH:mm:ss.SSSZ`, where whole seconds must include `.000Z`. Non-canonical strings (including timezone offsets and invalid calendar dates) yield `ConstraintViolation`; non-string values like numbers return `TypeMismatch`. Omission or `null` is allowed only when permitted by the field contract. Host interfaces, profile fields, and query time arguments follow the exact same rules. Engine-generated timestamps are truncated to milliseconds and never coerce client input; commit ordering is governed by `space_seq` and must not rely on timestamp uniqueness.
 
@@ -31,6 +31,10 @@ The Rust `anda_kip::cognitive` module and TypeScript package root export `Artifa
 | Pre-dispatch check | `begin_dispatch(space, attempt_id, expected_intent_version, fencing_token)` | `beginDispatch(attemptId, expected, fencingToken, space?)` |
 | Validate erasure plan | `validate_erasure_plan(space, plan)` | `validateErasurePlan(plan, space?)` |
 | Reconcile dispatch with outcome | `reconcile_dispatch(space, attempt_id, expected, outcome_ref)` | `reconcileDispatch(attemptId, expected, outcomeRef, space?)` |
+| Promote a draft symbol (`manage_schema`) | `promote_draft_symbol(space, kind, from, to)` | `promoteDraftSymbol(kind, from, to, space?)` |
+| Import a Capsule mapping source draft symbols (Rust only) | `import_capsule_mapped(space, capsule, isolate, symbols)` | — |
+
+Draft vocabulary (§20.16): grant the Brain's agent Principal `propose_schema` and it can run `DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` as standalone commands; each answers `{ref, schema_environment_version}` and a taken name fails `SchemaSymbolConflict` (retry with an idempotency key, never by redefining). `propose_schema` confers no `manage_schema`: queue a `review_schema` SleepTask keyed `review_schema:<kind>:<exact ref>`, and let the owner promote through the host API above. The draft package survives every `ensure_schema` / `activatePackages` call.
 
 The attention/trust host APIs below are implemented in both Rust and kip-do. In the TypeScript table, all methods take an optional trailing `space?`; corresponding Rust methods take `space` as the first argument in `snake_case`.
 

@@ -248,10 +248,10 @@ describe('META', () => {
       // does not resolve.
       const packages = nexus.describe('LIST SCHEMA PACKAGES') as {
         package_ref: string
-        state: string
+        status: string
       }[]
       const core = packages.find((p) => p.package_ref === 'kip://core@2.0.0')
-      expect(core?.state).toBe('active')
+      expect(core?.status).toBe('active')
       // A `LIST` row names the symbol both ways — what a command may write,
       // and what it resolves to — and says which package answers, which is the
       // same row the reference engine returns.
@@ -268,7 +268,7 @@ describe('META', () => {
         (nexus.describe('LIST EPISTEMIC POLICIES') as { id: string }[]).map(
           (policy) => policy.id,
         ),
-      ).toEqual(['kip:policy:baseline', 'kip:policy:forecast', 'kip:memory-default'])
+      ).toEqual(['kip:policy:baseline', 'kip:policy:forecast', 'kip:memory-default', 'kip:policy:structural'])
     })
   })
 

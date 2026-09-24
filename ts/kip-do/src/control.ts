@@ -14,6 +14,8 @@ import {
   memoryDefault,
   MEMORY_DEFAULT_ID,
   policyFromSettings,
+  structural,
+  STRUCTURAL_ID,
   type Policy,
 } from './projection/policy.js'
 import { nowTime } from './time.js'
@@ -35,6 +37,7 @@ export const initialProjection = (): JsonMap => ({
   baseline: baseline() as unknown as Json,
   forecast: forecast() as unknown as Json,
   'memory-default': memoryDefault() as unknown as Json,
+  structural: structural() as unknown as Json,
 })
 
 export function publishControl(
@@ -108,14 +111,19 @@ export function projectionPolicyAt(
     ? 'forecast'
     : requested.id.startsWith(MEMORY_DEFAULT_ID)
       ? 'memory-default'
-      : 'baseline'
-  // The standard memory policy is fixed by its artifact (§21.13), so a Space
-  // created before it was bundled still resolves it.
+      : requested.id.startsWith(STRUCTURAL_ID)
+        ? 'structural'
+        : 'baseline'
+  // The standard memory policy is fixed by its artifact (§21.13) and the
+  // structural baseline by §21.10, so a Space created before either was
+  // bundled still resolves it.
   const stored = (saved.value as JsonMap)[name]
   const policy = (
     stored === undefined && name === 'memory-default'
       ? memoryDefault()
-      : structuredClone(stored)
+      : stored === undefined && name === 'structural'
+        ? structural()
+        : structuredClone(stored)
   ) as unknown as Policy
   if ('accept' in settings) policy.accept = requested.accept
   if ('material' in settings) policy.material = requested.material

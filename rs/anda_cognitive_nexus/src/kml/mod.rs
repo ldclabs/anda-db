@@ -16,6 +16,7 @@
 //! transaction.
 
 pub mod clauses;
+pub mod define;
 pub mod select;
 pub mod update;
 pub mod value;
@@ -31,23 +32,13 @@ use crate::store::Store;
 use crate::store::space::JournalEntry;
 use crate::tx::{Outcome, Transaction};
 
-/// The refusal for `DEFINE` while this engine advertises no draft vocabulary
-/// (§20.16, §67.4 `draft_vocabulary`).
-pub(crate) fn define_unsupported() -> KipError {
-    KipError::unsupported_capability(
-        "DEFINE needs the draft_vocabulary capability, which this engine does not advertise; \
-         install a Schema Package that declares the symbol instead",
-    )
-}
-
-/// A clause this engine refuses before any authorization or replay, so the
-/// caller learns the feature is missing rather than that a permission is.
-pub(crate) fn unsupported_clause(statement: &KmlStatement) -> Option<KipError> {
-    statement
-        .clauses
-        .iter()
-        .any(|clause| matches!(clause, anda_kip::MutationClause::Define(_)))
-        .then(define_unsupported)
+/// The `DEFINE` a statement consists of, when it is one (§20.16). The parser
+/// admits `DEFINE` only as a standalone statement.
+fn standalone_define(statement: &KmlStatement) -> Option<&anda_kip::DefineCommand> {
+    match statement.clauses.as_slice() {
+        [anda_kip::MutationClause::Define(define)] => Some(define),
+        _ => None,
+    }
 }
 
 /// Runs one KML statement as a transaction.
@@ -87,6 +78,9 @@ pub(crate) async fn execute_at_evaluation_time(
         return Response::from(KipError::not_authorized(
             "simulated evaluation time requires an engine system session",
         ));
+    }
+    if let Some(define) = standalone_define(statement) {
+        return define::execute(store, space_id, define, statement, request, operation, auth).await;
     }
     let dry_run = request.is_dry_run();
     let origin = origin_of(request, auth);
@@ -528,6 +522,19 @@ async fn resolve_source_actor(
 /// purge and every tombstone would replay under a digest that did not match
 /// the one it committed with.
 pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
+    let mut response = journal_response(row);
+    response.warnings = vec![Warning::Message(format!(
+        "this is the recorded outcome of transaction {}, replayed under the idempotency key \
+         it committed with: nothing ran a second time, and any warnings the first attempt \
+         reported are not kept",
+        row.tx_id
+    ))];
+    response
+}
+
+/// The response a journalled transaction answers with, receipt and result
+/// rebuilt from the journal row.
+pub(crate) fn journal_response(row: &crate::store::rows::TransactionRow) -> Response {
     let committed = row.status == "committed";
     let receipt = crate::tx::seal_receipt(Receipt {
         status: if committed {
@@ -554,19 +561,12 @@ pub(crate) fn replay(row: &crate::store::rows::TransactionRow) -> Response {
         origin: serde_json::from_value(row.origin.clone()).unwrap_or(None),
         extensions: None,
     });
-    let mut response = operation_response(
+    operation_response(
         row.result.clone(),
         &row.space,
         row.schema_environment_version,
         receipt,
-    );
-    response.warnings = vec![Warning::Message(format!(
-        "this is the recorded outcome of transaction {}, replayed under the idempotency key \
-         it committed with: nothing ran a second time, and any warnings the first attempt \
-         reported are not kept",
-        row.tx_id
-    ))];
-    response
+    )
 }
 
 fn success(
@@ -597,7 +597,7 @@ fn success(
 /// and the top-level `receipt` is reserved for an `atomic` transaction, which
 /// this engine does not run. A transaction that changed nothing reports its
 /// operation as `no_effect` (§32.8).
-fn operation_response(
+pub(crate) fn operation_response(
     result: Json,
     space_id: &str,
     schema_environment_version: u64,

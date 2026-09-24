@@ -2,8 +2,8 @@
 
 [English](anda-brain-nexus-contracts.md)
 
-本次实现对应 KIP `3251912`。协议版本仍是 KIP 2.0，标准包是
-`kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:3ea9e459…`；草案原地重写了 2.0.0，用 2.1.0 草案激活过的 Space 不迁移）。Rust 与 SQLite/Durable Object 引擎均已提供
+本次实现对应 KIP `597db44`。协议版本仍是 KIP 2.0，标准包是
+`kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`；草案原地重写了 2.0.0，用 2.1.0 草案激活过的 Space 不迁移）。Rust 与 SQLite/Durable Object 引擎均已提供
 下列接口。Brain 的检索策略、调度循环、工具适配器与五意图 Memory Interface
 由 Anda Brain 接入；数据库负责权限、引用、版本、事务和记录有效性。
 
@@ -44,6 +44,10 @@ Rust 的 `anda_kip::cognitive` 和 TypeScript 包根导出 `ArtifactPin`、
 | 派发前检查 | `begin_dispatch(space, attempt_id, expected_intent_version, fencing_token)` | `beginDispatch(attemptId, expected, fencingToken, space?)` |
 | 验证清除报告 | `validate_erasure_plan(space, plan)` | `validateErasurePlan(plan, space?)` |
 | 用观察结果完成对账 | `reconcile_dispatch(space, attempt_id, expected, outcome_ref)` | `reconcileDispatch(attemptId, expected, outcomeRef, space?)` |
+| 晋升草稿符号（`manage_schema`） | `promote_draft_symbol(space, kind, from, to)` | `promoteDraftSymbol(kind, from, to, space?)` |
+| 导入 Capsule 并映射源草稿符号（仅 Rust） | `import_capsule_mapped(space, capsule, isolate, symbols)` | — |
+
+草稿词汇（§20.16）：给 Brain 的 agent Principal 授予 `propose_schema` 后，它可以把 `DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` 作为独立命令执行；结果为 `{ref, schema_environment_version}`，名称已被占用时报 `SchemaSymbolConflict`（重试靠幂等键，不要重新定义）。`propose_schema` 不包含 `manage_schema`：排一个 `review_schema` SleepTask（键为 `review_schema:<kind>:<确切引用>`），由 owner 通过上表的宿主 API 执行晋升。草稿包在每次 `ensure_schema` / `activatePackages` 后都会保留。
 
 以下 attention/trust 宿主 API 在 Rust 与 kip-do 均已实现。表中的 TypeScript 方法
 最后均可传 `space?`；Rust 对应方法以 `space` 为第一个参数，使用 snake_case。

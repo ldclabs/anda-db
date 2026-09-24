@@ -12,3 +12,8 @@ minimumReleaseAgeExclude:
   - '@ldclabs/kip-lang'
   - '@cloudflare/workers-types@5.20260924.1'
   - wrangler@4.137.0
+# @ldclabs/kip-lang 2.4.1 is not on npm yet: resolve it from a sibling KIP
+# checkout (github.com/ldclabs/KIP, packages/kip-lang built with `pnpm build`).
+# Drop this override once 2.4.1 is published.
+overrides:
+  '@ldclabs/kip-lang': 'link:../KIP/packages/kip-lang'

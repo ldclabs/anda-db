@@ -446,7 +446,8 @@ pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<A
         // unreadable there.
         let nexus = crate::CognitiveNexus::attach(cx.store.clone());
         let report =
-            crate::capsule::import(&nexus, &parsed, &into, true, cx.auth.clone(), false).await?;
+            crate::capsule::import(&nexus, &parsed, &into, true, cx.auth.clone(), false, &[])
+                .await?;
         return Ok(Answer::whole(report.to_json(true)));
     };
     let source = scalar_str(cx, scalar, "PREVIEW KML")?;

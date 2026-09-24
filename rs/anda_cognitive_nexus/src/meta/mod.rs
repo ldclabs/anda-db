@@ -651,13 +651,12 @@ fn unsupported_prose() -> Json {
 /// A claim, not a wish: §89 makes a level rest on the engine suite run against
 /// the engine itself, and `tests/conformance.rs` runs KIP's suite here — world
 /// time, `functional_by`, `kip:memory-default` and the Search Pattern
-/// included. `DEFINE` is the optional `draft_vocabulary` capability and is
-/// skipped, not failed. Several operations in one transaction is the
-/// `atomic_batch` capability, not a level requirement.
+/// included, and the optional draft vocabulary (`DEFINE`). Several operations
+/// in one transaction is the `atomic_batch` capability, not a level
+/// requirement.
 ///
-/// `KIP-CognitiveMemory` is not claimed: it adds recording repair (§57.8) and
-/// computed mnemonic strength (Profile §18), which this engine lacks and
-/// lists in `unsupported`.
+/// `KIP-CognitiveMemory` is not claimed: it adds recording repair (§57.8),
+/// which this engine lacks and lists in `unsupported`.
 pub const CONFORMANCE_PROFILES: &[anda_kip::ConformanceProfile] =
     &[anda_kip::ConformanceProfile::Core];
 
@@ -747,7 +746,7 @@ const REGISTRY: &[(&str, bool, Option<&str>)] = &[
     ("filtered_delivery", true, None),
     ("watch_evaluation", true, None),
     ("exposure_log", false, None),
-    ("draft_vocabulary", false, None),
+    ("draft_vocabulary", true, None),
     ("identity_repair", true, None),
     ("recording_repair", false, None),
     ("derive_permission", true, None),

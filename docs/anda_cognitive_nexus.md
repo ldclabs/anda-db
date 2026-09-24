@@ -28,8 +28,8 @@ Queries also have a 100,000 intermediate-row/candidate-pair work budget; LIMIT
 does not bypass it. Historical reconstruction charges scanned versions and is
 reused per kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
 
-Tracks KIP at `3251912`, with the draft memory package
-`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
+Tracks KIP at `597db44`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
 
@@ -44,8 +44,20 @@ that was wrong. `functional` slots hold a conflict set, `functional_by:
 `WITH EPISTEMIC {policy: "kip:memory-default"}` resolves conflicts by context
 specificity, first-person testimony and recency. `expired` is computed, never
 stored. `?x SEARCH <KIND> "term" LIMIT k` joins keyword retrieval into a
-`FIND`. `DEFINE` (draft vocabulary) and recording repair are not built, so the
-engine claims `KIP-Core` and not `KIP-CognitiveMemory`.
+`FIND`. A projection reports its policy, `valid_at` and snapshot only in
+`basis`; structural policies (`kip:memory-default`, the engine-private
+`kip:policy:structural`) output `score: null`. A supersession keeps the actor,
+the context set and the slot, or fails `SupersessionMismatch`.
+`MnemonicState.effective_strength` is computed on read from a
+`kip:strength-half-life-30d` pin, and `null` without one.
+
+`DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` add to the Space's draft vocabulary
+`kip://local/draft@0.0.0` (§20.16) under `propose_schema`: each is its own
+governance transaction, the draft package is synthesized from the Schema Lock
+and kept by every later activation, and `Session::promote_draft_symbol`
+(`manage_schema`) maps a draft symbol onto an installed package's symbol so
+both read as one lineage. Recording repair is not built, so the engine claims
+`KIP-Core` and not `KIP-CognitiveMemory`.
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI
 > agents, built on Anda DB.

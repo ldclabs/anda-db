@@ -377,7 +377,7 @@ async fn a_hypothetical_is_excluded_from_a_factual_projection() {
     assert_eq!(belief(&predicted, "").await["status"], "insufficient");
     let forecast = belief(&predicted, r#" WITH EPISTEMIC {policy: "forecast"}"#).await;
     assert_eq!(forecast["status"], "accepted");
-    assert_eq!(forecast["policy"]["id"], "kip:policy:forecast");
+    assert_eq!(forecast["basis"]["policy"]["id"], "kip:policy:forecast");
 }
 
 #[tokio::test]
@@ -391,18 +391,19 @@ async fn the_policy_travels_with_the_answer() {
     )
     .await;
 
+    // The basis is where a projection reports its policy (§27.2).
     let default = belief(&nexus, "").await;
-    assert_eq!(default["policy"]["id"], "kip:policy:baseline");
-    assert_eq!(default["policy"]["version"], 3);
+    assert_eq!(default["basis"]["policy"]["id"], "kip:policy:baseline");
+    assert!(default.get("policy").is_none());
     assert_eq!(default["status"], "accepted");
 
     // Raising the bar changes the answer — and changes the reported identity,
     // so the two answers cannot be confused for each other.
     let strict = belief(&nexus, r#" WITH EPISTEMIC {accept: 0.95}"#).await;
     assert_eq!(strict["status"], "uncertain");
-    assert_ne!(strict["policy"]["id"], "kip:policy:baseline");
+    assert_ne!(strict["basis"]["policy"]["id"], "kip:policy:baseline");
     assert!(
-        strict["policy"]["id"]
+        strict["basis"]["policy"]["id"]
             .as_str()
             .unwrap()
             .starts_with("kip:policy:baseline")
@@ -465,8 +466,9 @@ async fn a_functional_predicate_makes_rival_values_conflict() {
     assert_eq!(projected["candidate_status"], "accepted");
     assert_eq!(projected["conflict_reasons"], json!(["functional_value"]));
     assert_eq!(projected["conflict_refs"].as_array().unwrap().len(), 1);
-    assert!(
-        projected["opposition"].get("root_groups").is_none(),
+    assert_eq!(
+        projected["opposition"]["root_groups"],
+        json!([]),
         "a rival value conflicts; nobody opposed this one"
     );
 
@@ -556,22 +558,25 @@ async fn a_belief_slot_reports_the_conflict_set_not_a_winner() {
 
     let slot = &response.first_result().unwrap().as_array().unwrap()[0];
     assert_eq!(slot["candidate_projections"].as_array().unwrap().len(), 2);
-    assert_eq!(slot["contested"], true);
     // §47.3: the slot states its own status, so the Agent does not have to
     // derive it by scanning the candidates. Two candidates opposing each
     // other through a functional predicate is a contested slot.
     assert_eq!(slot["status"], "contested");
-    // And it names the policy and coordinate it ran under (§47.3), which is
-    // what an empty slot would otherwise have nowhere to report.
-    assert!(slot["policy"]["id"].is_string());
-    assert!(slot.get("temporal").is_some());
+    // And its basis names the policy and coordinate it ran under (§47.3),
+    // which is what an empty slot would otherwise have nowhere to report.
+    assert!(slot["basis"]["policy"]["id"].is_string());
+    assert!(slot["basis"]["valid_at"].is_string());
+    assert!(slot.get("policy").is_none() && slot.get("temporal").is_none());
     assert_eq!(slot["uncertainty"]["level"], "high");
     // Neither candidate is accepted: they conflict through the functional
     // predicate, so the slot has no settled value at all.
     assert!(slot["accepted_values"].as_array().unwrap().is_empty());
-    // A leading side exists and is named as *leading*, not as the value.
-    assert!(slot["leading"].is_string());
-    assert!(slot.get("value").is_none());
+    // Which side leads is each candidate's own disclosure, never the slot's
+    // value.
+    for candidate in slot["candidate_projections"].as_array().unwrap() {
+        assert!(candidate["leading"].is_string());
+    }
+    assert!(slot.get("leading").is_none() && slot.get("value").is_none());
 }
 
 #[tokio::test]
@@ -653,5 +658,119 @@ async fn a_projection_never_claims_a_trust_judgement_it_did_not_make() {
             .unwrap()
             .contains("evidence quality is not automatically graded")),
         "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_structural_policy_outputs_no_score_and_leads_by_roots() {
+    // §21.10: no confidence arithmetic and no numeric output; a slot's
+    // `leading` then compares independent roots, never numeric support.
+    let nexus = fresh("structural_leading").await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?svc { TYPE "Service" NAME "api" }
+            CREATE CONCEPT ?up { TYPE "Status" NAME "up" }
+            CREATE CONCEPT ?down { TYPE "Status" NAME "down" }
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            CREATE CONCEPT ?bob { TYPE "Person" NAME "Bob" }
+            CREATE CONCEPT ?carol { TYPE "Person" NAME "Carol" }
+            ASSERT (?svc, "status", ?up) { by: ?alice, mode: "observed", at: "2026-01-01T00:00:00.000Z" }
+            ASSERT (?svc, "status", ?up) { by: ?bob, mode: "observed", at: "2026-01-01T00:00:00.000Z" }
+            ASSERT (?svc, "status", ?down) { by: ?carol, mode: "observed", at: "2026-01-01T00:00:00.000Z" }
+        }"#,
+    )
+    .await;
+    for policy in ["kip:policy:structural", "kip:memory-default"] {
+        let rows = ok(
+            &nexus,
+            &format!(
+                r#"FIND(?v.name, ?b.status, ?b.leading, ?b.support.score, ?b.support.score_semantics) WHERE {{
+                     ?s CONCEPT {{name: "api"}}
+                     ?p PROPOSITION (?s, "status", ?v)
+                     ?b BELIEF (?p)
+                   }} WITH EPISTEMIC {{policy: "{policy}"}} ORDER BY ?v.name ASC"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            json!([
+                ["down", "contested", "opposition", null, null],
+                ["up", "contested", "support", null, null]
+            ]),
+            "{policy}"
+        );
+    }
+    // A weighted policy still says what its number means.
+    let weighted = ok(
+        &nexus,
+        r#"FIND(?b.support.score_semantics) WHERE {
+             ?s CONCEPT {name: "api"}
+             ?v CONCEPT {name: "up"}
+             ?p PROPOSITION (?s, "status", ?v)
+             ?b BELIEF (?p)
+           }"#,
+    )
+    .await;
+    assert_eq!(weighted, json!(["normalized_support_not_probability"]));
+}
+
+#[tokio::test]
+async fn find_for_time_reads_time_bounds_like_a_projection() {
+    // §25.2, §25.5: a bound whose earliest is after the instant is outside it,
+    // and FIND … FOR TIME and BELIEF … FOR TIME agree on one Assertion.
+    let nexus = fresh("for_time_bounds").await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?svc { TYPE "Service" NAME "api" }
+            CREATE CONCEPT ?up { TYPE "Status" NAME "up" }
+            CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+            ASSERT (?svc, "status", ?up) {
+                by: ?alice, mode: "observed", at: "2026-01-01T00:00:00.000Z",
+                valid: {from: {earliest: "2030-01-01T00:00:00.000Z"}, until: {latest: "2031-01-01T00:00:00.000Z"}}
+            }
+        }"#,
+    )
+    .await;
+    let find =
+        |at: &'static str| format!(r#"FIND(?a.id) WHERE {{ ?a ASSERTION {{}} }} FOR TIME "{at}""#);
+    assert_eq!(
+        ok(&nexus, &find("2026-06-01T00:00:00.000Z")).await,
+        json!([])
+    );
+    assert_eq!(
+        ok(&nexus, &find("2030-06-01T00:00:00.000Z"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ok(&nexus, &find("2031-06-01T00:00:00.000Z")).await,
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn an_activity_pattern_matches_its_status() {
+    // An Activity's status is a top-level field (§16), not a lifecycle member.
+    let nexus = fresh("activity_status").await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            CREATE ACTIVITY ?run { SET FIELDS { activity_class: "inference", status: "completed" } }
+        }"#,
+    )
+    .await;
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?a.status) WHERE { ?a ACTIVITY {status: "completed"} }"#
+        )
+        .await,
+        json!(["completed"])
     );
 }

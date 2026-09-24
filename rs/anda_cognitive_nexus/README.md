@@ -1,7 +1,7 @@
 # anda_cognitive_nexus
 
-Tracks KIP at `3251912`, with the draft memory package
-`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:3ea9e459…`). See the
+Tracks KIP at `597db44`, with the draft memory package
+`kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
 The reference **KIP 2.0** Cognitive Nexus — a persistent memory brain for AI

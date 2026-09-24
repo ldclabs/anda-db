@@ -68,6 +68,9 @@ pub struct Context<'a> {
     pub policy: crate::projection::Policy,
     /// The world time a projection is evaluated at.
     pub at: String,
+    /// The wall-clock instant this read is evaluated at: what read-time
+    /// computed members use, never `FOR TIME` (Profile §6.1).
+    evaluated_at: String,
     /// Whether any clause actually projected, so the answer can report the
     /// policy it ran under — and stay silent about one it never used.
     pub projected: bool,
@@ -130,6 +133,7 @@ impl<'a> Context<'a> {
                 .projection_policy_at(space, u64::MAX, &Map::new())
                 .await?,
             at: crate::time::now(),
+            evaluated_at: crate::time::now(),
             projected: false,
             as_of: None,
             pinned_seq: store.get_space(space).await?.seq,
@@ -473,6 +477,9 @@ impl<'a> Context<'a> {
             );
         }
         let mut view = crate::view::render(&element);
+        // Computed members exist only on a read (§18.2): decay is evaluated
+        // now and never written back (§59.1).
+        crate::projection::strength::compute(&mut view, &self.evaluated_at);
         if crate::schema::contracts::is_derived(&element) {
             view["_system"]["dependency_validity"] = serde_json::json!({
                 "status": "unverifiable", "action_eligible": false,
@@ -1210,8 +1217,10 @@ async fn run(
 /// `FOR TIME` is world-valid time, an axis independent of `AS OF` (Spec §36.1):
 /// it asks what was *applicable* then, not what the Brain contained then.
 /// Only Assertions carry validity, so only Assertion-bound columns are
-/// restricted; an element with no validity window is unaffected rather than
-/// excluded, because having no window means "always", not "never".
+/// restricted. A row is kept unless its written interval lies outside the
+/// instant (§25.5): a missing `from` is {latest: asserted_at} (§25.2), and an
+/// indeterminate interval may hold, so it is not excluded. Succession is a
+/// projection rule over a slot's line and does not narrow a raw row.
 fn restrict_to_valid_time(cx: &mut Context<'_>, solutions: &mut Solutions, at: &str) {
     let assertion_vars: Vec<String> = solutions
         .vars
@@ -1245,9 +1254,11 @@ fn restrict_to_valid_time(cx: &mut Context<'_>, solutions: &mut Solutions, at: &
             let Some(view) = views.get(&id) else {
                 return true;
             };
-            let from = view["valid_time"]["from"].as_str().unwrap_or("");
-            let until = view["valid_time"]["until"].as_str().unwrap_or("");
-            (from.is_empty() || from <= at) && (until.is_empty() || at < until)
+            crate::projection::world::place_written(
+                &view["valid_time"],
+                view["asserted_at"].as_str().unwrap_or(""),
+                at,
+            ) != crate::projection::world::Placement::Outside
         })
     });
 }

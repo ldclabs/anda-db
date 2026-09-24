@@ -28,6 +28,10 @@ pub const BASELINE_ID: &str = "kip:policy:baseline";
 /// confidence is not 0.5), and world time follows temporal succession and
 /// time bounds (§25.4, §25.5).
 pub const BASELINE_VERSION: u64 = 3;
+/// The structural projection baseline (§21.10): no weights, no precedence.
+pub const STRUCTURAL_ID: &str = "kip:policy:structural";
+/// Its version.
+pub const STRUCTURAL_VERSION: u64 = 1;
 /// The standard memory policy (§21.13, `profiles/policy-memory-default.json`).
 pub const MEMORY_DEFAULT_ID: &str = "kip:memory-default";
 /// Its version, as the artifact states it.
@@ -149,6 +153,20 @@ impl Policy {
         }
     }
 
+    /// The structural projection baseline (§21.10): Assertion lifecycle,
+    /// world time, visibility, mode, stance and root independence, and
+    /// nothing weighed — every eligible root group counts once, no score is
+    /// output, and a slot conflict stands. The floor every other policy here
+    /// builds on, runnable by name so a caller can ask for it.
+    pub fn structural() -> Self {
+        Self {
+            id: STRUCTURAL_ID.to_string(),
+            version: STRUCTURAL_VERSION,
+            structural: true,
+            ..Self::baseline()
+        }
+    }
+
     /// `kip:memory-default` (§21.13): the structural baseline plus three
     /// ordered precedence rules. Deterministic and unweighted, so two engines
     /// given the same visible state answer the same.
@@ -193,12 +211,14 @@ impl Policy {
                 BASELINE_ID | "baseline" => Policy::baseline(),
                 "forecast" | "kip:policy:forecast" => Policy::forecast(),
                 MEMORY_DEFAULT_ID | "memory-default" => Policy::memory_default(),
+                STRUCTURAL_ID | "structural" => Policy::structural(),
                 other => {
                     return Err(KipError::new(
                         anda_kip::KipErrorCode::ProjectionPolicyUnavailable,
                         format!(
                             "this Nexus knows the epistemic policies \"baseline\", \
-                             \"forecast\" and \"kip:memory-default\"; it has no {other:?}"
+                             \"forecast\", \"structural\" and \"kip:memory-default\"; it has \
+                             no {other:?}"
                         ),
                     ));
                 }

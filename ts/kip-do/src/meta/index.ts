@@ -77,6 +77,7 @@ import {
 import { baseline, type Policy } from '../projection/policy.js'
 import { endpointFromJson, endpointLocal } from '../term.js'
 import {
+  DRAFT_PACKAGE_REF,
   conceptTypeDef,
   facetDef,
   formatSymbolRef,
@@ -238,10 +239,29 @@ function describe(
       version: env.version,
       lock: env.lock as unknown as Json,
       packages: env.packageRefs(),
+      // Promotions of draft symbols (§20.16), `[{kind, from, to}]`.
+      lineage_maps: (env.lock.lineage_maps ?? []) as unknown as Json,
     } as Json
   }
   if ('Package' in target) {
     const reference = readText(target.Package, b, 'DESCRIBE PACKAGE')
+    // The draft package is synthesized per Space and never installed, so it
+    // reports its definitions so far and its computed digest (§20.16).
+    if (reference === DRAFT_PACKAGE_REF) {
+      const artifact = cx.env.artifact(reference)
+      if (artifact === undefined) {
+        throw errors.schemaPackageUnavailable(`${reference} is not part of this Space's Schema Environment`)
+      }
+      return {
+        package_ref: reference,
+        status: 'active',
+        active: true,
+        content_digest: artifact.integrity?.content_digest ?? '',
+        integrity: artifact.integrity as unknown as Json,
+        definitions: artifact.definitions as unknown as Json,
+        artifact: artifact as unknown as Json,
+      } as Json
+    }
     const row = cx.store.packageByRef(reference)
     if (row === null) {
       throw errors.schemaPackageUnavailable(`${reference} is not installed here`)
@@ -667,6 +687,8 @@ function symbol(cx: MetaContext, kind: SymbolKind, name: string): Json {
     // a local name means nothing outside the environment that resolved it.
     ref: formatSymbolRef(resolved),
     kind,
+    local_name: resolved.name,
+    package_ref: formatPackageRef(resolved.package),
     definition: (definition ?? null) as Json,
   } as Json
 }
@@ -784,17 +806,30 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
   switch (command.target) {
     case 'Spaces':
       return page(cx.store.spaces().map((row) => row.space_id))
-    case 'SchemaPackages':
+    case 'SchemaPackages': {
+      // The Space's Schema Lock, as `rs/anda_cognitive_nexus` reports it: one
+      // row per package with its activation state, the Space-local draft
+      // package included (§20.16). Installed is not active, and a list that
+      // conflated them would let a caller write against a package the Space
+      // does not resolve.
+      const wanted = command.status === null ? null : readText(command.status, b, 'STATUS')
       return page(
-        cx.store.packages().map((row) => ({
-          package_ref: row.package_ref,
-          // Installed is not active, and a list that conflated them would let
-          // a caller write against a package the Space does not resolve.
-          state: cx.env.packageRefs().includes(row.package_ref)
-            ? 'active'
-            : 'installed',
-        })),
+        Object.entries(cx.env.lock.packages)
+          .sort(([a], [b2]) => compareCodePoints(a, b2))
+          .filter(([id]) => wanted === null || cx.env.state(id) === wanted)
+          .map(([id, version]) => {
+            const artifact = cx.env.artifact(`${id}@${version}`)
+            return {
+              package_ref: `${id}@${version}`,
+              package_id: id,
+              version,
+              status: cx.env.state(id),
+              name: artifact?.manifest?.name ?? '',
+              description: artifact?.manifest?.description ?? '',
+            }
+          }),
       )
+    }
     case 'Types':
       return page(symbolList(cx.env, 'ConceptType'))
     case 'Predicates':
@@ -804,7 +839,7 @@ function list(command: ListCommand, cx: MetaContext, b: ReadBindings): Json {
     case 'StructuralFields':
       return page(symbolList(cx.env, 'StructuralField'))
     case 'EpistemicPolicies':
-      return page(['baseline', 'forecast', 'kip:memory-default'].map((policy) =>
+      return page(['baseline', 'forecast', 'kip:memory-default', 'kip:policy:structural'].map((policy) =>
         policyJson(projectionPolicyAt(cx.store, cx.space, cx.store.currentSeq(cx.space), { policy }))))
     case 'Dependents': {
       // §63.5: the result carries `truncated: true` when traversal was cut

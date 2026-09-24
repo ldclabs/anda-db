@@ -3,6 +3,7 @@ import { dependencyValidity, isDerived } from '../projection/dependency.js'
 import { baseline } from '../projection/policy.js'
 import { projectionBasis } from '../projection/index.js'
 import { nowTime } from '../time.js'
+import { computeStrength } from '../projection/strength.js'
 /**
  * The one place a read reaches an element.
  *
@@ -65,6 +66,11 @@ export const LIMITS = {
 
 export class Context {
   validAt = nowTime()
+  /**
+   * The wall-clock instant this read is evaluated at: what read-time computed
+   * members use, never `FOR TIME` (Profile §6.1).
+   */
+  readonly evaluatedAt = nowTime()
   projectionPolicy = baseline()
   readonly store: Store
   readonly env: SchemaEnvironment
@@ -286,6 +292,9 @@ export class Context {
           : Math.min(this.governedResultLimit, constraints.max_results)
     }
     const view = render(element)
+    // Computed members exist only on a read (§18.2): decay is evaluated now
+    // and never written back (§59.1).
+    computeStrength(view, this.evaluatedAt)
     if ((element.kind === 'Assertion' && element.row.mode === 'inferred') ||
         (element.kind === 'Concept' && (['SkillRevision', 'Insight', 'WorkingState'].some((name) => element.row.schema_ref.endsWith('/' + name)) || Object.keys(element.row.structural).some((name) => name.endsWith('/derived_from'))))) {
       (view._system as JsonMap).dependency_validity = {

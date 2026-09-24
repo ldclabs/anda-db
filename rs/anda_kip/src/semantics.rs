@@ -294,6 +294,31 @@ fn bound_str(value: &BoundValue) -> Option<&str> {
     }
 }
 
+/// A bound object as JSON, when every value in it is written; `None` when a
+/// `:parameter` anywhere leaves it for the engine.
+fn literal_object(object: &crate::ast::BoundObject) -> Option<crate::ast::Json> {
+    fn value(bound: &BoundValue) -> Option<crate::ast::Json> {
+        Some(match bound {
+            BoundValue::Value(literal) => crate::ast::Json::from(literal.clone()),
+            BoundValue::Param(_) | BoundValue::Handle(_) | BoundValue::Variable(_) => return None,
+            BoundValue::Array(items) => {
+                crate::ast::Json::Array(items.iter().map(value).collect::<Option<_>>()?)
+            }
+            BoundValue::Object(fields) => fields_of(fields.iter().map(|(k, v)| (k, v)))?,
+        })
+    }
+    fn fields_of<'a>(
+        fields: impl Iterator<Item = (&'a String, &'a BoundValue)>,
+    ) -> Option<crate::ast::Json> {
+        let mut map = crate::ast::Map::new();
+        for (key, item) in fields {
+            map.insert(key.clone(), value(item)?);
+        }
+        Some(crate::ast::Json::Object(map))
+    }
+    fields_of(object.iter())
+}
+
 fn check_enum(written: Option<&str>, allowed: &[&str], label: &str, out: &mut Vec<Diagnostic>) {
     let Some(written) = written else { return };
     if allowed.contains(&written) {
@@ -396,11 +421,17 @@ fn analyze_clause(clause: &MutationClause, out: &mut Vec<Diagnostic>) {
             purge.limit.is_some(),
             out,
         ),
-        // DEFINE's draft rules (§20.16) depend on the Schema Environment the
-        // symbol joins, so the engine owns them.
-        MutationClause::EnsureProposition(_)
-        | MutationClause::MergeConcept(_)
-        | MutationClause::Define(_) => {}
+        // A fully written DEFINE body is judged here (§20.16); a body with a
+        // parameter is judged by the engine once it is bound, and whether the
+        // name already resolves depends on the Schema Environment.
+        MutationClause::Define(define) => {
+            if let Some(body) = literal_object(&define.definition)
+                && let Err(error) = crate::draft::check_draft_definition(define.kind, &body)
+            {
+                out.push(Diagnostic::error(error.code, error.message));
+            }
+        }
+        MutationClause::EnsureProposition(_) | MutationClause::MergeConcept(_) => {}
     }
 }
 
@@ -449,16 +480,44 @@ fn analyze_assertion_shape(
     structural: Option<&[StructuralEdge]>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let observed = fields
-        .iter()
-        .any(|(name, value)| name == "mode" && literal_str(value) == Some("observed"));
-    if !observed {
-        return;
-    }
     let cites_evidence = structural.into_iter().flatten().any(
         |edge| matches!(&edge.field, crate::ast::SymbolRef::Name(field) if field == "evidence"),
     );
-    if !cites_evidence {
+    // A claim taken from captured material was made when the source says,
+    // not when this write runs. Without `at` or a written `valid.from` it
+    // takes the transaction time as its start key (§13.2, §25.4), so an old
+    // claim recorded late would end a current value it predates. A parameter
+    // may carry either, so it is given the benefit of the doubt.
+    let written = |name: &str| {
+        fields.iter().any(|(field, value)| {
+            field == name && !matches!(value, MutationValue::Value(KipValue::Null))
+        })
+    };
+    let writes_from = fields.iter().any(|(field, value)| {
+        field == "valid_time"
+            && match value {
+                MutationValue::Value(KipValue::Object(members)) => members
+                    .iter()
+                    .any(|(key, v)| key == "from" && !matches!(v, KipValue::Null)),
+                MutationValue::Value(_) => false,
+                MutationValue::Object(members) => members.iter().any(|(key, v)| {
+                    key == "from" && !matches!(v, BoundValue::Value(KipValue::Null))
+                }),
+                _ => true,
+            }
+    });
+    if cites_evidence && !written("asserted_at") && !writes_from {
+        out.push(Diagnostic::warning(
+            KipErrorCode::ConstraintViolation,
+            "ASSERT cites evidence but gives no at: asserted_at defaults to the transaction \
+             time, which is the claim's start key; a claim recorded later than it was made \
+             should carry at: <the source's observed time> (§13.2, §25.4)",
+        ));
+    }
+    let observed = fields
+        .iter()
+        .any(|(name, value)| name == "mode" && literal_str(value) == Some("observed"));
+    if observed && !cites_evidence {
         out.push(Diagnostic::warning(
             KipErrorCode::ConstraintViolation,
             "mode: \"observed\" without evidence: an observation normally cites the artifact it \
@@ -672,11 +731,34 @@ mod tests {
         assert!(diagnostics.iter().all(|d| d.severity == Severity::Warning));
         assert!(diagnostics.iter().any(|d| d.message.contains("observed")));
 
-        // Citing one clears it.
-        let cited =
-            parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "observed", evidence: :e }"#)
-                .expect("legal");
+        // Citing one clears it — with the source's time, since a cited claim
+        // without `at` would start at the transaction time.
+        let cited = parse_kip(
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "observed", evidence: :e, at: :observed_at }"#,
+        )
+        .expect("legal");
         assert!(analyze(&cited).is_empty());
+    }
+
+    #[test]
+    fn a_cited_claim_without_its_time_is_a_warning() {
+        let late = parse_kip(r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", evidence: :e }"#)
+            .expect("legal");
+        let diagnostics = analyze(&late);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("no at")),
+            "{diagnostics:?}"
+        );
+        for timed in [
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", evidence: :e, at: "2026-01-01T00:00:00.000Z" }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", evidence: :e, valid: {from: "2026-01-01T00:00:00.000Z"} }"#,
+            r#"ASSERT (:a, "p", :b) { by: :me, mode: "stated", evidence: :e, valid: :valid }"#,
+        ] {
+            let command = parse_kip(timed).expect("legal");
+            assert!(analyze(&command).is_empty(), "{timed}");
+        }
     }
 
     #[test]

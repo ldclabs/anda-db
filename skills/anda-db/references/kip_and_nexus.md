@@ -2,7 +2,7 @@
 
 Use this reference for KIP/Brain work, not ordinary document CRUD. KIP protocol
 versions and Cargo package versions are different: the current Rust crates
-are in the 0.14 family, implementing KIP 2.0 (KIP `3251912`) with the vendored
+are in the 0.14 family, implementing KIP 2.0 (KIP `597db44`) with the vendored
 `cognitive-memory@2.0.0` draft package. Check the checked-out specifications and runtime capabilities
 rather than inferring support from a package version.
 
@@ -68,7 +68,7 @@ KIP 1.x data needs the explicit
 not sufficient to migrate the old graph model; collection replacement is
 one-way and should be rehearsed on a backup.
 
-World time (KIP `3251912`): record a changed value as one `ASSERT` with the
+World time (KIP `597db44`): record a changed value as one `ASSERT` with the
 source's `at` and, when known, `valid: {from: ...}` — the new value ends the
 same actor's older open value (§25.4). Use `SUPERSEDING` only when the old
 claim was wrong; a value-only correction may name another value of the same
@@ -77,8 +77,17 @@ Type preference options by their kind (`prefers` is `functional_by:
 "object_type"`); there is no `Preference` type. Use
 `WITH EPISTEMIC {policy: "kip:memory-default"}` for recall that should resolve
 conflicts deterministically, and read `uncertainty.reasons` as codes
-(`temporal_indeterminate`, `outranked`). `DEFINE` answers
-`UnsupportedCapability` on both engines.
+(`temporal_indeterminate`, `outranked`); the policy and `valid_at` are in
+`?b.basis`. A correction supersedes only the same actor's claim in the same
+context set.
+
+Draft vocabulary (§20.16): a Principal with `propose_schema` runs
+`DEFINE PREDICATE "name" {description: ...}` or
+`DEFINE CONCEPT TYPE "Name" {description: ..., attributes: {open: true, fields: {...}}}`
+as a standalone command; it answers `{ref, schema_environment_version}` with
+the exact `kip://local/draft@0.0.0/<name>` reference, and a taken name fails
+`SchemaSymbolConflict`. Only a `manage_schema` holder promotes a draft symbol
+(Rust `Session::promote_draft_symbol`, kip-do `Session.promoteDraftSymbol`).
 
 ## SDK wire handling
 

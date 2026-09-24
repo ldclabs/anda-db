@@ -27,6 +27,7 @@ import {
   type Json,
   type JsonMap,
 } from '../json.js'
+import { stripStrength } from '../projection/strength.js'
 import type { ExportCapsuleCommand } from '../kip/ast.js'
 import { boundValue } from '../kml/value.js'
 import { Context } from '../kql/context.js'
@@ -133,6 +134,11 @@ export function exportCapsule(
     if (element === null || view === null) continue
     collectSchemaRefs(view, schemaRefs)
     const { canonical_subject: _subject, canonical_object: _object, ...record } = view
+    // A computed member never leaves the read that evaluated it (§18.2).
+    if (isJsonMap(record.facets)) {
+      record.facets = structuredClone(record.facets)
+      stripStrength(record)
+    }
     if (isJsonMap(record.governance)) {
       const known = new Set(['classification', 'authority_class', 'policy_ref'])
       const extra = Object.fromEntries(Object.entries(record.governance).filter(([k]) => !known.has(k)))

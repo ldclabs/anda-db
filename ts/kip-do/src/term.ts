@@ -23,7 +23,7 @@
 
 import { digestParts } from './digest.js'
 import { errors } from './errors.js'
-import { formatElementId, parseElementId, type ElementId } from './id.js'
+import { formatElementId, parseElementId, tryParseElementId, type ElementId } from './id.js'
 import { isJsonMap, type Json, type JsonMap } from './json.js'
 
 /** The Core datatype of a string Literal. */
@@ -303,4 +303,15 @@ export function localRef(value: Json, field: string): ElementId {
     )
   }
   return local
+}
+
+/**
+ * The element a stored reference names, written as an id string or as
+ * `{id: ...}` — the two spellings a reference field accepts; `null` for
+ * anything else.
+ */
+export function referencedElement(value: Json): ElementId | null {
+  if (typeof value === 'string') return tryParseElementId(value)
+  if (isJsonMap(value) && typeof value.id === 'string') return tryParseElementId(value.id)
+  return null
 }

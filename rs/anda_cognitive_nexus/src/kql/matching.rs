@@ -255,11 +255,23 @@ impl Context<'_> {
             };
             if is_symbol_key(kind, key) {
                 let symbol = self.matcher_text(kind, key, &value)?;
-                if !historical && let Some((low, high)) = crate::schema::lineage_range(&symbol) {
-                    filters.push(Filter::Field((
-                        "schema_ref".into(),
-                        RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
-                    )));
+                if !historical {
+                    let ranges: Vec<Box<Filter>> = self
+                        .env
+                        .lineage_ranges(crate::schema::SymbolKind::ConceptType, &symbol)
+                        .into_iter()
+                        .map(|(low, high)| {
+                            Box::new(Filter::Field((
+                                "schema_ref".into(),
+                                RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+                            )))
+                        })
+                        .collect();
+                    match ranges.len() {
+                        0 => {}
+                        1 => filters.extend(ranges.into_iter().map(|range| *range)),
+                        _ => filters.push(Filter::Or(ranges)),
+                    }
                 }
                 type_lineages.push(symbol);
             } else if key == "id" {
@@ -299,10 +311,13 @@ impl Context<'_> {
             if element.space() != self.space || (!constrains_state && !element.is_active()) {
                 continue;
             }
-            if !type_lineages
-                .iter()
-                .all(|symbol| crate::schema::same_lineage(element.schema_ref(), symbol))
-            {
+            if !type_lineages.iter().all(|symbol| {
+                self.env.same_lineage(
+                    crate::schema::SymbolKind::ConceptType,
+                    element.schema_ref(),
+                    symbol,
+                )
+            }) {
                 continue;
             }
             let rendered = self.view_of(id);
@@ -355,10 +370,10 @@ impl Context<'_> {
                 && let Slot::Value(expected) = self.classify(matcher)?
             {
                 let symbol = self.matcher_text(kind, key, &expected)?;
-                if !value
-                    .as_str()
-                    .is_some_and(|stored| crate::schema::same_lineage(stored, &symbol))
-                {
+                if !value.as_str().is_some_and(|stored| {
+                    self.env
+                        .same_lineage(crate::schema::SymbolKind::ConceptType, stored, &symbol)
+                }) {
                     return Ok(false);
                 }
             } else if !self.match_field_value(
@@ -601,7 +616,7 @@ impl Context<'_> {
             filters.push(key_filter("object_key", keys));
         }
         if let PredicateSlot::Fixed(symbols) = &predicates {
-            filters.push(predicate_filter(symbols));
+            filters.push(predicate_filter(&self.env, symbols));
         }
 
         let historical = self.is_historical();
@@ -642,6 +657,7 @@ impl Context<'_> {
             // checked here; at a past coordinate no filter could be pushed
             // down at all, so the whole tuple is.
             if !tuple_matches(
+                &self.env,
                 &row,
                 subject_keys.as_deref(),
                 object_keys.as_deref(),
@@ -1303,7 +1319,7 @@ impl Context<'_> {
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
                     Box::new(eq_field("state", Fv::Text("active".to_string()))),
                     Box::new(key_filter(anchor, &anchor_keys)),
-                    Box::new(predicate_filter(symbols)),
+                    Box::new(predicate_filter(&self.env, symbols)),
                 ])),
             )
             .await?;
@@ -1318,7 +1334,7 @@ impl Context<'_> {
             if !self.readable_tuple(id) {
                 continue;
             }
-            if !predicate_matches(&row.predicate_ref, symbols) {
+            if !predicate_matches(&self.env, &row.predicate_ref, symbols) {
                 continue;
             }
             if historical {
@@ -1353,7 +1369,7 @@ impl Context<'_> {
                 Some(Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
                     Box::new(eq_field("state", Fv::Text("active".to_string()))),
-                    Box::new(predicate_filter(symbols)),
+                    Box::new(predicate_filter(&self.env, symbols)),
                 ])),
             )
             .await?;
@@ -1368,7 +1384,7 @@ impl Context<'_> {
             if !self.readable_tuple(id) {
                 continue;
             }
-            if !predicate_matches(&row.predicate_ref, symbols)
+            if !predicate_matches(&self.env, &row.predicate_ref, symbols)
                 || (historical && row.state != "active")
             {
                 continue;
@@ -1467,6 +1483,7 @@ enum EndpointSlot {
 /// its lineage rather than its exact symbol; the endpoints and the state only
 /// at a past coordinate, where nothing could be pushed into the index.
 fn tuple_matches(
+    env: &crate::schema::SchemaEnvironment,
     row: &crate::store::rows::PropositionRow,
     subject_keys: Option<&[String]>,
     object_keys: Option<&[String]>,
@@ -1474,7 +1491,7 @@ fn tuple_matches(
     historical: bool,
 ) -> bool {
     if let PredicateSlot::Fixed(symbols) = predicates
-        && !predicate_matches(&row.predicate_ref, symbols)
+        && !predicate_matches(env, &row.predicate_ref, symbols)
     {
         return false;
     }
@@ -1500,16 +1517,25 @@ fn tuple_matches(
 /// An index filter over `predicate_ref` for every version of each lineage
 /// (§20.14): the package is ranged over, and [`predicate_matches`] settles
 /// the symbol afterwards.
-fn predicate_filter(symbols: &[String]) -> Filter {
+///
+/// A promoted draft symbol (§20.16) adds the draft package's range, so the
+/// lineage a promotion joined is read as one.
+fn predicate_filter(env: &crate::schema::SchemaEnvironment, symbols: &[String]) -> Filter {
     let mut ranges: Vec<Box<Filter>> = Vec::with_capacity(symbols.len());
     for symbol in symbols {
-        ranges.push(Box::new(match crate::schema::lineage_range(symbol) {
-            Some((low, high)) => Filter::Field((
+        let lineage = env.lineage_ranges(crate::schema::SymbolKind::PredicateType, symbol);
+        if lineage.is_empty() {
+            ranges.push(Box::new(eq_field(
+                "predicate_ref",
+                Fv::Text(symbol.clone()),
+            )));
+        }
+        for (low, high) in lineage {
+            ranges.push(Box::new(Filter::Field((
                 "predicate_ref".to_string(),
                 RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
-            )),
-            None => eq_field("predicate_ref", Fv::Text(symbol.clone())),
-        }));
+            ))));
+        }
     }
     match ranges.len() {
         1 => *ranges.pop().expect("one range"),
@@ -1517,11 +1543,16 @@ fn predicate_filter(symbols: &[String]) -> Filter {
     }
 }
 
-/// Whether a stored predicate belongs to one of the lineages a pattern named.
-fn predicate_matches(stored: &str, symbols: &[String]) -> bool {
+/// Whether a stored predicate belongs to one of the lineages a pattern named,
+/// promotions included.
+fn predicate_matches(
+    env: &crate::schema::SchemaEnvironment,
+    stored: &str,
+    symbols: &[String],
+) -> bool {
     symbols
         .iter()
-        .any(|symbol| crate::schema::same_lineage(stored, symbol))
+        .any(|symbol| env.same_lineage(crate::schema::SymbolKind::PredicateType, stored, symbol))
 }
 
 /// One quantified alternative of a raw predicate path.

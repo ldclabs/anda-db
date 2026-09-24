@@ -152,11 +152,14 @@ describe('the Epistemic Projection', () => {
 
   it('reports the policy it ran under', async () => {
     await withNexus('policy', (nexus) => {
-      // "accepted" with no policy attached is not an auditable statement.
-      expect(nexus.query(`FIND(?b.policy.id) ${BELIEF('Quiet')}`)).toEqual([
+      // "accepted" with no policy attached is not an auditable statement. The
+      // basis is where a projection reports it (§27.2).
+      expect(nexus.query(`FIND(?b.basis.policy.id) ${BELIEF('Quiet')}`)).toEqual([
         'kip:policy:baseline',
       ])
-      expect(nexus.query(`FIND(?b.policy.version) ${BELIEF('Quiet')}`)).toEqual([3])
+      expect(nexus.query(`FIND(?b.policy) ${BELIEF('Quiet')}`)).toEqual([null])
+      const [version] = nexus.query(`FIND(?b.basis.policy.version) ${BELIEF('Quiet')}`)
+      expect(String(version)).toMatch(/^sha256:/)
     })
   })
 
@@ -277,7 +280,7 @@ describe('the Epistemic Projection', () => {
       // by carrying a different identity.
       expect(
         nexus.query(
-          `FIND(?b.policy.id) ${BELIEF('Loud')} WITH EPISTEMIC {policy: "forecast"}`,
+          `FIND(?b.basis.policy.id) ${BELIEF('Loud')} WITH EPISTEMIC {policy: "forecast"}`,
         ),
       ).toEqual(['kip:policy:forecast'])
     })
@@ -292,7 +295,7 @@ describe('the Epistemic Projection', () => {
       // looks like one.
       expect(
         nexus.query(
-          `FIND(?b.status, ?b.policy.id) ${BELIEF('Loud')} WITH EPISTEMIC {accept: 0.5}`,
+          `FIND(?b.status, ?b.basis.policy.id) ${BELIEF('Loud')} WITH EPISTEMIC {accept: 0.5}`,
         ),
       ).toEqual([['accepted', 'kip:policy:baseline+custom']])
     })
@@ -367,21 +370,85 @@ describe('the Epistemic Projection', () => {
         status: string
         candidate_projections: unknown[]
         accepted_values: string[]
-        contested: boolean
-        policy: { id: string }
+        basis: { policy: { id: string } }
         uncertainty: { level: string }
       }[]
       expect(slot?.candidate_projections).toHaveLength(2)
       expect(slot?.accepted_values).toEqual([])
-      expect(slot?.contested).toBe(true)
       // §47.3: the slot states its own status, so the Agent does not have to
       // derive it by scanning the candidates. Two candidates opposing each
       // other through a functional predicate is a contested slot.
       expect(slot?.status).toBe('contested')
-      // And it names the policy and coordinate it ran under (§47.3), which is
-      // what an empty slot would otherwise have nowhere to report.
-      expect(typeof slot?.policy.id).toBe('string')
+      // And its basis names the policy and coordinate it ran under (§47.3),
+      // which is what an empty slot would otherwise have nowhere to report.
+      expect(typeof slot?.basis.policy.id).toBe('string')
+      expect(slot).not.toHaveProperty('policy')
+      expect(slot).not.toHaveProperty('temporal')
       expect(slot?.uncertainty.level).toBe('high')
+    })
+  })
+
+  it('outputs no score under a structural policy and leads a slot by roots', async () => {
+    await withNexus('structural-leading', (nexus) => {
+      // §21.10: no confidence arithmetic and no numeric output; a slot's
+      // `leading` compares independent roots, never numeric support.
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?up { TYPE "Status" NAME "up" }
+        CREATE CONCEPT ?down { TYPE "Status" NAME "down" }
+      }`)
+      for (const [by, value] of [['Alice', 'up'], ['Bob', 'up'], ['Carol', 'down']] as const) {
+        nexus.execute(`MUTATE {
+          ASSERT (:svc, "status", :value) { by: :by, mode: "observed", at: "2026-01-01T00:00:00.000Z" }
+        }`, {
+          svc: String(nexus.query('FIND(?s.id) WHERE { ?s CONCEPT {name: "api"} }')[0]),
+          value: String(nexus.query(`FIND(?v.id) WHERE { ?v CONCEPT {name: "${value}"} }`)[0]),
+          by: String(nexus.query(`FIND(?p.id) WHERE { ?p CONCEPT {name: "${by}"} }`)[0]),
+        })
+      }
+      for (const policy of ['kip:policy:structural', 'kip:memory-default']) {
+        expect(
+          nexus.query(`FIND(?v.name, ?b.status, ?b.leading, ?b.support.score, ?b.support.score_semantics) WHERE {
+            ?s CONCEPT {name: "api"}
+            ?v CONCEPT {type: "Status"}
+            FILTER(?v.name == "up" || ?v.name == "down")
+            ?p PROPOSITION (?s, "status", ?v)
+            ?b BELIEF (?p)
+          } WITH EPISTEMIC {policy: "${policy}"} ORDER BY ?v.name ASC`),
+        ).toEqual([
+          ['down', 'contested', 'opposition', null, null],
+          ['up', 'contested', 'support', null, null],
+        ])
+      }
+    })
+  })
+
+  it('reads time bounds in FIND … FOR TIME as a projection does', async () => {
+    await withNexus('for-time-bounds', (nexus) => {
+      // §25.2, §25.5: a bound whose earliest is after the instant is outside it.
+      nexus.execute(`MUTATE {
+        CREATE CONCEPT ?up { TYPE "Status" NAME "later" }
+        ASSERT (:svc, "status", ?up) {
+          by: :svc, mode: "observed", at: "2026-01-01T00:00:00.000Z",
+          valid: {from: {earliest: "2030-01-01T00:00:00.000Z"}, until: {latest: "2031-01-01T00:00:00.000Z"}}
+        }
+      }`, { svc: String(nexus.query('FIND(?s.id) WHERE { ?s CONCEPT {name: "api"} }')[0]) })
+      const find = (at: string) =>
+        nexus.query(`FIND(?a.id) WHERE { ?a ASSERTION {} } FOR TIME "${at}"`)
+      expect(find('2026-06-01T00:00:00.000Z')).toEqual([])
+      expect(find('2030-06-01T00:00:00.000Z')).toHaveLength(1)
+      expect(find('2031-06-01T00:00:00.000Z')).toEqual([])
+    })
+  })
+
+  it('matches an Activity by its top-level status', async () => {
+    await withNexus('activity-status', (nexus) => {
+      // An Activity's status is a top-level field (§16), not a lifecycle member.
+      nexus.execute(`MUTATE {
+        CREATE ACTIVITY ?run { SET FIELDS { activity_class: "inference", status: "completed" } }
+      }`)
+      expect(
+        nexus.query('FIND(?a.status) WHERE { ?a ACTIVITY {status: "completed"} }'),
+      ).toEqual(['completed'])
     })
   })
 })

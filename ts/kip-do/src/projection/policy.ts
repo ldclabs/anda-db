@@ -28,6 +28,9 @@ export const BASELINE_ID = 'kip:policy:baseline'
 export const BASELINE_VERSION = 3
 
 /** The standard memory policy (§21.13, `profiles/policy-memory-default.json`). */
+/** The structural projection baseline (§21.10): no weights, no precedence. */
+export const STRUCTURAL_ID = 'kip:policy:structural'
+export const STRUCTURAL_VERSION = 1
 export const MEMORY_DEFAULT_ID = 'kip:memory-default'
 export const MEMORY_DEFAULT_VERSION = 1
 
@@ -123,6 +126,16 @@ export function baseline(): Policy {
 }
 
 /**
+ * The structural projection baseline (§21.10): lifecycle, world time,
+ * visibility, mode, stance and root independence, and nothing weighed — every
+ * eligible root group counts once, no score is output, and a slot conflict
+ * stands. Runnable by name so a caller can ask for the floor.
+ */
+export function structural(): Policy {
+  return { ...baseline(), id: STRUCTURAL_ID, version: STRUCTURAL_VERSION, structural: true }
+}
+
+/**
  * `kip:memory-default` (§21.13): the structural baseline plus three ordered
  * precedence rules. Deterministic and unweighted, so two engines given the
  * same visible state answer the same.
@@ -163,6 +176,8 @@ export function policyFromSettings(settings: JsonMap): Policy {
     policy = forecast()
   } else if (named === MEMORY_DEFAULT_ID || named === 'memory-default') {
     policy = memoryDefault()
+  } else if (named === STRUCTURAL_ID || named === 'structural') {
+    policy = structural()
   } else {
     // Naming the policy rather than defaulting to the baseline: a caller that
     // asked for a stricter reading and silently got the ordinary one would act

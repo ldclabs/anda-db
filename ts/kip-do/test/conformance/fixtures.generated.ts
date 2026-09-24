@@ -1063,6 +1063,465 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "draft-vocabulary",
+    "status": "pending_engine",
+    "description": "The Space's draft vocabulary (§20.16), for an engine that advertises draft_vocabulary. DEFINE adds a Predicate or a Concept Type at the fixed reference kip://local/draft@0.0.0, and the symbol resolves for the next operation: it is listed and described with its package, elements persist its exact reference, and a draft Predicate projects like any other. DEFINE only adds — a name of the same kind that already resolves fails SchemaSymbolConflict — never runs inside MUTATE, needs a description, and never claims authority over the data: no closed world, no exclusive-value completeness, no required attribute or Facet, no member outside its definition. Parameters bind before the checks. Every case requires draft_vocabulary through the request envelope (§71), so an engine without it skips the whole chain.",
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?ada { TYPE \"Person\" NAME \"Ada\" }\n  CREATE CONCEPT ?grace { TYPE \"Person\" NAME \"Grace\" }\n}",
+      {
+        "command": "FIND(?ada.id) WHERE { ?ada CONCEPT {name: \"Ada\"} }",
+        "capture": {
+          "ada": "/0"
+        }
+      }
+    ],
+    "cases": [
+      {
+        "name": "DEFINE adds a Predicate to the draft vocabulary",
+        "command": "DEFINE PREDICATE \"mentors\" {\n  description: \"The subject mentors the object.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Person\"]}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/mentors"
+          }
+        },
+        "vectors": [
+          "SCHEMA-022",
+          "GOV-031"
+        ]
+      },
+      {
+        "name": "the draft symbol resolves for the next operation",
+        "command": "FIND(?p) WHERE { ?p (?x, \"mentors\", ?y) }",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result": []
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "the draft Predicate is listed under the draft package",
+        "command": "LIST PREDICATES",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": [
+            {
+              "ref": "kip://local/draft@0.0.0/mentors",
+              "local_name": "mentors",
+              "package_ref": "kip://local/draft@0.0.0",
+              "status": "active"
+            }
+          ]
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "the draft package is an active package of the Space",
+        "command": "LIST SCHEMA PACKAGES",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": [
+            {
+              "package_ref": "kip://local/draft@0.0.0",
+              "package_id": "kip://local/draft",
+              "version": "0.0.0",
+              "status": "active"
+            }
+          ]
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "DESCRIBE names the exact draft reference",
+        "command": "DESCRIBE PREDICATE \"mentors\"",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/mentors",
+            "local_name": "mentors",
+            "package_ref": "kip://local/draft@0.0.0",
+            "definition": {
+              "description": "The subject mentors the object."
+            }
+          }
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "DEFINE adds a Concept Type",
+        "command": "DEFINE CONCEPT TYPE \"Instrument\" {\n  description: \"A musical instrument.\",\n  attributes: {open: true, fields: {family: {type: \"string\", description: \"strings, brass, percussion ...\"}}}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/Instrument"
+          }
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "an element of a draft type is written at once",
+        "command": "MUTATE {\n  CREATE CONCEPT ?violin { TYPE \"Instrument\" NAME \"Violin\" SET ATTRIBUTES {family: \"strings\"} }\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {},
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "the element persists the exact draft reference",
+        "command": "FIND(?c.schema_ref) WHERE { ?c CONCEPT {type: \"Instrument\"} }",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result": [
+            "kip://local/draft@0.0.0/Instrument"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Predicate can name a draft Concept Type",
+        "command": "DEFINE PREDICATE \"main_instrument\" {\n  description: \"The instrument the subject mainly plays.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Instrument\"]},\n  functional: true\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/main_instrument"
+          }
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a claim over a draft Predicate is an ordinary Assertion",
+        "command": "MUTATE {\n  CREATE CONCEPT ?cello { TYPE \"Instrument\" NAME \"Cello\" }\n  ASSERT (:ada, \"main_instrument\", ?cello) {\n    by: :ada, mode: \"stated\", at: \"2026-09-01T00:00:00.000Z\"\n  }\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {},
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "and projects like any other",
+        "command": "FIND(?b.status) WHERE { ?s CONCEPT {name: \"Ada\"} ?o CONCEPT {name: \"Cello\"} ?b BELIEF (?s, \"main_instrument\", ?o) } FOR TIME \"2026-09-20T00:00:00.000Z\"",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result": [
+            "accepted"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a name that already resolves fails SchemaSymbolConflict",
+        "command": "DEFINE PREDICATE \"prefers\" {\n  description: \"already a Profile Predicate\"\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "SchemaSymbolConflict"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft symbol is defined once, even identically",
+        "command": "DEFINE PREDICATE \"mentors\" {\n  description: \"The subject mentors the object.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Person\"]}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "SchemaSymbolConflict"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a Concept Type an installed package names conflicts",
+        "command": "DEFINE CONCEPT TYPE \"Person\" {\n  description: \"another person\"\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "SchemaSymbolConflict"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Predicate cannot claim a closed world",
+        "command": "DEFINE PREDICATE \"closed_relation\" {\n  description: \"authority over the data belongs to installed packages\",\n  open_world: false\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Predicate cannot claim exclusive-value completeness",
+        "command": "DEFINE PREDICATE \"exclusive_relation\" {\n  description: \"one value excludes the others\",\n  functional: true,\n  complete: true\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a definition needs a description",
+        "command": "DEFINE PREDICATE \"unexplained\" {\n  subject: {concept_types: [\"Person\"]}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a member outside the definition is refused",
+        "command": "DEFINE PREDICATE \"tagged\" {\n  description: \"carries an unknown member\",\n  cardinality: 3\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Concept Type declares no required attribute",
+        "command": "DEFINE CONCEPT TYPE \"Genre\" {\n  description: \"A musical genre.\",\n  attributes: {fields: {label: {type: \"string\", required: true}}}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a draft Concept Type declares no Facets",
+        "command": "DEFINE CONCEPT TYPE \"Venue\" {\n  description: \"A concert venue.\",\n  facets: {MnemonicState: {}}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "DEFINE is never a clause of MUTATE",
+        "command": "MUTATE {\n  DEFINE PREDICATE \"inside\" {description: \"not a clause\"}\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "InvalidSyntax"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a parameterized definition binds before it is checked",
+        "command": "DEFINE PREDICATE :name {description: :description}",
+        "params": {
+          "name": "admires",
+          "description": "The subject admires the object."
+        },
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/admires"
+          }
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a parameter cannot smuggle in a closed world",
+        "command": "DEFINE PREDICATE \"closed_by_parameter\" {description: \"bound later\", open_world: :open_world}",
+        "params": {
+          "open_world": false
+        },
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "a Predicate and a Concept Type may share a name and exact reference",
+        "command": "DEFINE PREDICATE \"Instrument\" {description: \"The subject uses the object as an instrument.\"}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result_contains": {
+            "ref": "kip://local/draft@0.0.0/Instrument"
+          }
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "same-named symbols queue separate reviews by kind and exact reference",
+        "command": "MUTATE {\n  CREATE CONCEPT ?type_review {\n    TYPE \"SleepTask\" NAME \"Review ConceptType Instrument\"\n    CLIENT KEY \"review_schema:ConceptType:kip://local/draft@0.0.0/Instrument\"\n    SET ATTRIBUTES {task_class: \"review_schema\", summary: \"ConceptType kip://local/draft@0.0.0/Instrument\", status: \"pending\"}\n  }\n  CREATE CONCEPT ?predicate_review {\n    TYPE \"SleepTask\" NAME \"Review PredicateType Instrument\"\n    CLIENT KEY \"review_schema:PredicateType:kip://local/draft@0.0.0/Instrument\"\n    SET ATTRIBUTES {task_class: \"review_schema\", summary: \"PredicateType kip://local/draft@0.0.0/Instrument\", status: \"pending\"}\n  }\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {},
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "retrying both reviews replays each creation independently",
+        "command": "MUTATE {\n  CREATE CONCEPT ?type_review {\n    TYPE \"SleepTask\" NAME \"Review ConceptType Instrument\"\n    CLIENT KEY \"review_schema:ConceptType:kip://local/draft@0.0.0/Instrument\"\n    SET ATTRIBUTES {task_class: \"review_schema\", summary: \"ConceptType kip://local/draft@0.0.0/Instrument\", status: \"pending\"}\n  }\n  CREATE CONCEPT ?predicate_review {\n    TYPE \"SleepTask\" NAME \"Review PredicateType Instrument\"\n    CLIENT KEY \"review_schema:PredicateType:kip://local/draft@0.0.0/Instrument\"\n    SET ATTRIBUTES {task_class: \"review_schema\", summary: \"PredicateType kip://local/draft@0.0.0/Instrument\", status: \"pending\"}\n  }\n}",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {},
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      },
+      {
+        "name": "two reviews remain after retry, each identifying its symbol kind",
+        "command": "FIND(?task.attributes.summary) WHERE { ?task CONCEPT {type: \"SleepTask\"} FILTER(?task.attributes.task_class == \"review_schema\") }",
+        "envelope": {
+          "requires": {
+            "draft_vocabulary": true
+          }
+        },
+        "expect": {
+          "result": [
+            "ConceptType kip://local/draft@0.0.0/Instrument",
+            "PredicateType kip://local/draft@0.0.0/Instrument"
+          ]
+        },
+        "vectors": [
+          "SCHEMA-022"
+        ]
+      }
+    ]
+  },
+  {
     "name": "epistemic-projection",
     "description": "Belief is projected from the Assertions on record. Silence is insufficient and never rejection; repetition is not corroboration; material disagreement is contested rather than decided.",
     "packages": [
@@ -1153,10 +1612,10 @@ export const FIXTURES: readonly Fixture[] = [
       },
       {
         "name": "a projection reports the policy it ran under",
-        "command": "FIND(?b.policy.id) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}",
+        "command": "FIND(?b.basis.policy.id) WHERE {\n  ?s CONCEPT {name: \"Alice\"}\n  ?o CONCEPT {name: \"Quiet\"}\n  ?p PROPOSITION (?s, \"prefers\", ?o)\n  ?b BELIEF (?p)\n}\nWITH EPISTEMIC {policy: \"kip:memory-default\"}",
         "expect": {
           "result": [
-            "kip:policy:baseline"
+            "kip:memory-default"
           ]
         }
       },
@@ -2165,6 +2624,113 @@ export const FIXTURES: readonly Fixture[] = [
             "id": "kip:memory-default"
           }
         }
+      }
+    ]
+  },
+  {
+    "name": "mnemonic-strength",
+    "status": "pending_engine",
+    "description": "Decay is computed, not written (§59.1, Profile §6.1): effective_strength is derived at read time from the base memory_strength, its anchor last_metabolized_at and the pinned strength_policy — here the standard kip:strength-half-life-30d. A missing base, anchor or pin, or a pin whose digest does not match, leaves it null, never a default; before its anchor it is the base; far past its anchor it has decayed. Reading never writes it back, and writing it fails like any computed member (§18.2). Results that depend on the read's wall-clock instant are pinned only by bounds far from any test date.",
+    "setup": [
+      {
+        "command": "MUTATE {\n  CREATE CONCEPT ?old { TYPE \"Person\" NAME \"Old\" SET FACET \"MnemonicState\" {memory_strength: 0.8, last_metabolized_at: \"2000-01-01T00:00:00.000Z\", strength_policy: :policy} }\n  CREATE CONCEPT ?ahead { TYPE \"Person\" NAME \"Ahead\" SET FACET \"MnemonicState\" {memory_strength: 0.8, last_metabolized_at: \"2999-01-01T00:00:00.000Z\", strength_policy: :policy} }\n  CREATE CONCEPT ?unpinned { TYPE \"Person\" NAME \"Unpinned\" SET FACET \"MnemonicState\" {memory_strength: 0.8, last_metabolized_at: \"2026-01-01T00:00:00.000Z\"} }\n  CREATE CONCEPT ?unanchored { TYPE \"Person\" NAME \"Unanchored\" SET FACET \"MnemonicState\" {memory_strength: 0.8, strength_policy: :policy} }\n  CREATE CONCEPT ?mismatched { TYPE \"Person\" NAME \"Mismatched\" SET FACET \"MnemonicState\" {memory_strength: 0.8, last_metabolized_at: \"2026-01-01T00:00:00.000Z\", strength_policy: :mismatched_policy} }\n}",
+        "params": {
+          "policy": {
+            "artifact_ref": "kip:strength-half-life-30d",
+            "content_digest": "sha256:a50a89b83f937c97cabf0f8371cccfd326f4fdd438b6d7b9ead507d77927b227"
+          },
+          "mismatched_policy": {
+            "artifact_ref": "kip:strength-half-life-30d",
+            "content_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+          }
+        }
+      }
+    ],
+    "cases": [
+      {
+        "name": "no pinned policy leaves effective strength unknown, never a default",
+        "command": "FIND(?c.facets[\"MnemonicState\"].effective_strength) WHERE { ?c CONCEPT {name: \"Unpinned\"} }",
+        "expect": {
+          "result": [
+            null
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "no anchor leaves it unknown",
+        "command": "FIND(?c.facets[\"MnemonicState\"].effective_strength) WHERE { ?c CONCEPT {name: \"Unanchored\"} }",
+        "expect": {
+          "result": [
+            null
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "a pin whose digest does not match leaves it unknown",
+        "command": "FIND(?c.facets[\"MnemonicState\"].effective_strength) WHERE { ?c CONCEPT {name: \"Mismatched\"} }",
+        "expect": {
+          "result": [
+            null
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "before its anchor the effective strength is the base",
+        "command": "FIND(?c.facets[\"MnemonicState\"].effective_strength) WHERE { ?c CONCEPT {name: \"Ahead\"} }",
+        "expect": {
+          "result": [
+            0.8
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "far past its anchor the half-life has decayed it",
+        "command": "FIND(?c.name) WHERE { ?c CONCEPT {name: \"Old\"} FILTER(?c.facets[\"MnemonicState\"].effective_strength < 0.001) }",
+        "expect": {
+          "result": [
+            "Old"
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "a read never writes strength back",
+        "command": "FIND(?c.facets[\"MnemonicState\"].memory_strength, ?c.facets[\"MnemonicState\"].last_metabolized_at) WHERE { ?c CONCEPT {name: \"Old\"} }",
+        "expect": {
+          "result": [
+            [
+              0.8,
+              "2000-01-01T00:00:00.000Z"
+            ]
+          ]
+        },
+        "vectors": [
+          "MEM-030"
+        ]
+      },
+      {
+        "name": "effective strength is computed, never written",
+        "command": "UPDATE ?c SET FACET \"MnemonicState\" { effective_strength: 0.9 } WHERE { ?c CONCEPT {name: \"Old\"} }",
+        "expect": {
+          "error": "ConstraintViolation"
+        },
+        "vectors": [
+          "MEM-030"
+        ]
       }
     ]
   },
@@ -3925,6 +4491,120 @@ export const FIXTURES: readonly Fixture[] = [
     ]
   },
   {
+    "name": "supersession-scope",
+    "status": "pending_engine",
+    "description": "Supersession stays inside its actor and its scope (§14.2): the replacement has the same canonical actor, the same Proposition or one of the same subject and Predicate lineage, and the same canonical context set. A correction cannot move a general claim into a context or a scoped claim out of one — that would widen or narrow what the actor said — and fails SupersessionMismatch without writing anything; a same-scope correction commits and supersedes.",
+    "packages": [
+      {
+        "format": "KIP-Schema-Package",
+        "manifest": {
+          "package_id": "kip://conformance/supersession-scope",
+          "version": "1.0.0"
+        },
+        "definitions": {
+          "predicates": {
+            "timezone": {
+              "kind": "PredicateType",
+              "description": "Current timezone as a UTC offset string.",
+              "functional": true,
+              "object": {
+                "literal_types": [
+                  "string"
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "setup": [
+      "MUTATE {\n  CREATE CONCEPT ?alice { TYPE \"Person\" NAME \"Alice\" }\n  CREATE CONCEPT ?work { TYPE \"Person\" NAME \"work\" }\n  ENSURE PROPOSITION ?p_general (?alice, \"timezone\", \"+08:00\")\n  ENSURE PROPOSITION ?p_work (?alice, \"timezone\", \"+09:00\")\n  CREATE ASSERTION ?general { SET FIELDS { proposition: ?p_general, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-01T00:00:00.000Z\" } }\n  CREATE ASSERTION ?scoped { SET FIELDS { proposition: ?p_work, asserted_by: ?alice, stance: \"support\", mode: \"stated\", asserted_at: \"2026-01-01T00:00:00.000Z\", context_refs: [?work] } }\n}",
+      {
+        "command": "FIND(?alice.id, ?work.id, ?general.id, ?scoped.id) WHERE {\n  ?alice CONCEPT {name: \"Alice\"}\n  ?work CONCEPT {name: \"work\"}\n  ?pg PROPOSITION (?alice, \"timezone\", \"+08:00\")\n  ?pw PROPOSITION (?alice, \"timezone\", \"+09:00\")\n  ?general ASSERTION {proposition: ?pg}\n  ?scoped ASSERTION {proposition: ?pw}\n}",
+        "capture": {
+          "alice": "/0/0",
+          "work": "/0/1",
+          "general": "/0/2",
+          "scoped": "/0/3"
+        }
+      }
+    ],
+    "cases": [
+      {
+        "name": "a correction cannot move a general claim into a context",
+        "command": "MUTATE {\n  ASSERT (:alice, \"timezone\", \"+07:00\") {\n    by: :alice, mode: \"stated\", at: \"2026-09-21T00:00:00.000Z\", context: [:work],\n    valid: {from: {latest: \"2026-01-01T00:00:00.000Z\"}}\n  } SUPERSEDING :general\n}",
+        "expect": {
+          "error": "SupersessionMismatch"
+        },
+        "vectors": [
+          "KML-036"
+        ]
+      },
+      {
+        "name": "nor a scoped claim out of its context",
+        "command": "MUTATE {\n  ASSERT (:alice, \"timezone\", \"+07:00\") {\n    by: :alice, mode: \"stated\", at: \"2026-09-21T00:00:00.000Z\",\n    valid: {from: {latest: \"2026-01-01T00:00:00.000Z\"}}\n  } SUPERSEDING :scoped\n}",
+        "expect": {
+          "error": "SupersessionMismatch"
+        },
+        "vectors": [
+          "KML-036"
+        ]
+      },
+      {
+        "name": "a refused supersession writes nothing",
+        "command": "FIND(?v, ?a.lifecycle.status) WHERE {\n  ?alice CONCEPT {name: \"Alice\"}\n  ?p PROPOSITION (?alice, \"timezone\", ?v)\n  ?a ASSERTION {proposition: ?p}\n}",
+        "expect": {
+          "result": [
+            [
+              "+08:00",
+              "active"
+            ],
+            [
+              "+09:00",
+              "active"
+            ]
+          ]
+        },
+        "vectors": [
+          "KML-036"
+        ]
+      },
+      {
+        "name": "a correction within the same scope supersedes",
+        "command": "MUTATE {\n  ASSERT (:alice, \"timezone\", \"+07:00\") {\n    by: :alice, mode: \"stated\", at: \"2026-09-21T00:00:00.000Z\", context: [:work],\n    valid: {from: {latest: \"2026-01-01T00:00:00.000Z\"}}\n  } SUPERSEDING :scoped\n}",
+        "expect": {},
+        "vectors": [
+          "KML-018",
+          "KML-036"
+        ]
+      },
+      {
+        "name": "only the scoped claim was superseded",
+        "command": "FIND(?v, ?a.lifecycle.status) WHERE {\n  ?alice CONCEPT {name: \"Alice\"}\n  ?p PROPOSITION (?alice, \"timezone\", ?v)\n  ?a ASSERTION {proposition: ?p}\n}",
+        "expect": {
+          "result": [
+            [
+              "+07:00",
+              "active"
+            ],
+            [
+              "+08:00",
+              "active"
+            ],
+            [
+              "+09:00",
+              "superseded"
+            ]
+          ]
+        },
+        "vectors": [
+          "KML-018",
+          "KML-036"
+        ]
+      }
+    ]
+  },
+  {
     "name": "timestamps",
     "description": "KIP dcde1de §6.5: strict UTC millisecond inputs, exact error classes, calendar validation and preserved values.",
     "packages": [
@@ -4811,8 +5491,7 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "world-time",
-    "status": "pending_engine",
-    "description": "This revision's memory behavior, written before an engine implements it (Specification Status: a case may enter marked pending_engine; the release requires every case verified). Temporal succession (§25.4): a world change is one Assertion, the old value answers for its time, nothing is superseded; a claim with no stated start is indeterminate before it was made (§25.2); time bounds are three-valued (§25.5); functional_by partitions preferences by option kind (§20.15); kip:memory-default decides by context specificity, first-person testimony and recency, and discloses the rule (§21.13); two inferences without a written start never succeed one another; DEFINE adds to the draft vocabulary (§20.16); the Search Pattern is bounded and never inside NOT (§43.8).",
+    "description": "This revision's memory behavior. Temporal succession (§25.4): a world change is one Assertion, the old value answers for its time, nothing is superseded; a claim with no stated start is indeterminate before it was made (§25.2); time bounds are three-valued (§25.5); functional_by partitions preferences by option kind (§20.15); kip:memory-default decides by context specificity, first-person testimony and recency, and discloses the rule (§21.13); two inferences without a written start never succeed one another; the Search Pattern is bounded and never inside NOT (§43.8); a value-only correction keeps its world interval (§14.2). The DEFINE cases moved to draft-vocabulary.json.",
     "packages": [
       {
         "format": "KIP-Schema-Package",
@@ -5126,65 +5805,6 @@ export const FIXTURES: readonly Fixture[] = [
         ]
       },
       {
-        "name": "DEFINE adds a Predicate to the draft vocabulary",
-        "command": "DEFINE PREDICATE \"mentors\" {\n  description: \"The subject mentors the object.\",\n  subject: {concept_types: [\"Person\"]},\n  object: {concept_types: [\"Person\"]}\n}",
-        "envelope": {
-          "requires": {
-            "draft_vocabulary": true
-          }
-        },
-        "expect": {},
-        "vectors": [
-          "SCHEMA-022",
-          "GOV-031"
-        ]
-      },
-      {
-        "name": "the draft symbol resolves for the next operation",
-        "command": "FIND(?p) WHERE { ?p (?x, \"mentors\", ?y) }",
-        "envelope": {
-          "requires": {
-            "draft_vocabulary": true
-          }
-        },
-        "expect": {
-          "result": []
-        },
-        "vectors": [
-          "SCHEMA-022"
-        ]
-      },
-      {
-        "name": "a name that already resolves fails SchemaSymbolConflict",
-        "command": "DEFINE PREDICATE \"prefers\" {\n  description: \"already a Profile Predicate\"\n}",
-        "envelope": {
-          "requires": {
-            "draft_vocabulary": true
-          }
-        },
-        "expect": {
-          "error": "SchemaSymbolConflict"
-        },
-        "vectors": [
-          "SCHEMA-022"
-        ]
-      },
-      {
-        "name": "a draft Predicate cannot claim a closed world",
-        "command": "DEFINE PREDICATE \"closed_relation\" {\n  description: \"authority over the data belongs to installed packages\",\n  open_world: false\n}",
-        "envelope": {
-          "requires": {
-            "draft_vocabulary": true
-          }
-        },
-        "expect": {
-          "error": "ConstraintViolation"
-        },
-        "vectors": [
-          "SCHEMA-022"
-        ]
-      },
-      {
         "name": "a Search Pattern binds hits with a bounded candidate set",
         "command": "FIND(?x.name) WHERE { ?x SEARCH CONCEPT \"Alice\" WITH TYPE \"Person\" MODE \"keyword\" LIMIT 5 }",
         "expect": {
@@ -5241,4 +5861,4 @@ export const FIXTURES: readonly Fixture[] = [
 ] as unknown as Fixture[]
 
 /** The total number of cases, so a silent shrink is visible. */
-export const CASE_COUNT = 388
+export const CASE_COUNT = 423

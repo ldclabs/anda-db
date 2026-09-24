@@ -167,7 +167,7 @@ STRUCTURAL (?experience, "has_step", ?step)          // the edge binding is opti
 
 **Time and policy**: an open `until` means "no end stated", not "forever": a later same-actor value in a functional slot ends it at its own start (temporal succession) when both are that actor's own account — `stated`/`observed`, or with a written `from` — so the old value still answers `FOR TIME` before the change; two `inferred` claims without a written start never succeed one another. Recall uses the standard policy `kip:memory-default` unless told otherwise: among conflicting values a task-scoped one prevails in its task, a person's own statement about themselves prevails over hearsay (never over an observation), and otherwise the value most recently claimed to hold prevails (by start key, never by recording order); the outranked value is `uncertain` with reason `outranked`.
 
-**BELIEF output**: `status` ∈ `accepted | rejected | contested | uncertain | insufficient`, `leading` ∈ `support | opposition | none` (the heavier side under `contested`; disclosure, never a verdict), plus support/opposition, uncertainty, policy identity, temporal basis. A fully grounded BELIEF over a never-stored Proposition returns `insufficient` (not zero rows). BELIEF SLOT returns `accepted_values` + `candidate_projections`. Support and opposition scores don't sum to 1. `BELIEF` / `BELIEF SLOT` are `FIND`-only: never inside a mutation's `WHERE` or an `EXPORT` selection, and their predicate is exact (no path operators).
+**BELIEF output**: `status` ∈ `accepted | rejected | contested | uncertain | insufficient`, `leading` ∈ `support | opposition | none` (the heavier side under `contested`; disclosure, never a verdict), plus support/opposition, uncertainty, and `basis` — the policy identity (`?b.basis.policy.id`), `valid_at` and snapshot live there, not in separate members. A fully grounded BELIEF over a never-stored Proposition returns `insufficient` (not zero rows). BELIEF SLOT returns `accepted_values` + `candidate_projections`. Support and opposition scores don't sum to 1. `BELIEF` / `BELIEF SLOT` are `FIND`-only: never inside a mutation's `WHERE` or an `EXPORT` selection, and their predicate is exact (no path operators).
 
 **Merges**: raw Proposition patterns match through `merged_into` — a term naming `B` finds tuples recorded on an `A` merged into `B`, and naming `A` finds them too. `?p.subject` / `?p.object` are the stored endpoints, `?p.canonical_subject` / `?p.canonical_object` the merge-resolved ones; the tuple itself is never rewritten.
 
@@ -258,7 +258,7 @@ End — the value simply stopped (left a job, no new one): the same actor's oppo
 ASSERT (:alice, "works_for", :acme) {by: :alice, mode: "stated", stance: "reject", valid: {from: :left_at}, evidence: :msg}
 ```
 
-Misrecording — the Brain wrote down what the actor never said ("you misheard me"): not a correction and not a change. It is a protected recording repair (Spec §57.8, Memory Interface `revise` with `change_kind: "misrecorded"`); never supersede or retract on the actor's behalf.
+Misrecording — the Brain wrote down what the actor never said ("you misheard me"): not a correction and not a change. It is a protected recording repair (Spec §57.8, Memory Interface `revise` with `change_kind: "misrecorded"`); never supersede or retract on the actor's behalf. A replacement keeps the original source's claim time, never the repair request's time.
 
 Desugars exactly to `ENSURE PROPOSITION` + `CREATE ASSERTION` (+ `TRANSITION ... TO "superseded" BY` the new Assertion). Never fabricates extra state. The tuple must be a structural `(s, "p", o)`: the `(id: …)` form is match-only and rejected here. The long form — needed for `challenge` / `context` citations or fine control:
 
@@ -402,7 +402,7 @@ DEFINE PREDICATE "mentors" {
 }
 ```
 
-`DEFINE CONCEPT TYPE "Instrument" {description: "..."}` adds a type (never one an installed package already names: `Place` comes from `kip://domains/general@1.0.0`). Draft Predicates are open-world, and may be `functional` or `functional_by: "object_type"`; they cannot be closed-world or `complete`. A name that already resolves fails `SchemaSymbolConflict`. Promotion into an installed package is an owner's Schema migration.
+`DEFINE CONCEPT TYPE "Instrument" {description: "..."}` adds a type (never one an installed package already names: `Place` comes from `kip://domains/general@1.0.0`); its optional `attributes: {fields: {family: {type: "string"}}}` are open, never required. Every definition needs a `description` and only the members of its kind. Draft Predicates are open-world, and may be `functional` or `functional_by: "object_type"` (with a Concept object); they cannot be closed-world or `complete`. A name that already resolves as that kind fails `SchemaSymbolConflict` — treat it as "already there", never redefine. The result is `{ref, schema_environment_version}`; queue one `review_schema` SleepTask with `CLIENT KEY "review_schema:<kind>:<ref>"`, identifying the kind (`ConceptType` or `PredicateType`) and exact reference. Promotion into an installed package is an owner's Schema migration.
 
 `MERGE CONCEPT` is non-destructive: source stays addressable as merged history; future writes canonicalize to target. Cycle-creating merges (target already resolves back to source) are rejected.
 
