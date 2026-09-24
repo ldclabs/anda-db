@@ -289,7 +289,19 @@ export function lockFromJson(value: JsonMap): SchemaLock {
   return { ...lock, ...(value as unknown as SchemaLock) }
 }
 
-/** A resolved Schema Environment, ready to answer symbol questions. */
+/** Freeze a schema JSON tree, including nested maps and arrays. */
+function freezeTree<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const child of Object.values(value)) freezeTree(child)
+  }
+  return value
+}
+
+/**
+ * An immutable resolved Schema Environment, shared between commands.
+ * Clone its lock or artifacts with `structuredClone` before preparing edits.
+ */
 export class SchemaEnvironment {
   /** The environment version. Every activation mints a new one (§20.8). */
   readonly version: number
@@ -304,9 +316,15 @@ export class SchemaEnvironment {
     lock: SchemaLock,
     artifacts: Map<string, SchemaPackage>,
   ) {
+    // Own the whole snapshot: draft definitions can be shared between the
+    // lock and its synthesized artifact. Neither may retain a host reference,
+    // and callers of lock/artifact/definitionPackage may not edit the cache.
+    const snapshot = structuredClone({ lock, artifacts })
     this.version = version
-    this.lock = lock
-    this.artifacts = artifacts
+    this.lock = freezeTree(snapshot.lock)
+    this.artifacts = snapshot.artifacts
+    for (const artifact of this.artifacts.values()) freezeTree(artifact)
+    Object.freeze(this)
   }
 
   /** The environment a Space starts with: Core, active, and nothing else. */
@@ -369,7 +387,7 @@ export class SchemaEnvironment {
     return this.lock.states[packageId] ?? 'installed'
   }
 
-  /** An installed artifact by exact reference. */
+  /** An immutable installed artifact by exact reference. */
   artifact(packageRef: string): SchemaPackage | undefined {
     return this.artifacts.get(packageRef)
   }
@@ -391,7 +409,7 @@ export class SchemaEnvironment {
     const key = `${kind}\u0000${intent}\u0000${name}`
     let symbol = this.resolved.get(key)
     if (symbol === undefined) {
-      symbol = this.resolveUncached(kind, name, intent)
+      symbol = freezeTree(this.resolveUncached(kind, name, intent))
       this.resolved.set(key, symbol)
     }
     return symbol
@@ -504,7 +522,7 @@ export class SchemaEnvironment {
     return symbol
   }
 
-  /** The definition behind a resolved symbol, when the caller needs it. */
+  /** The immutable package behind a resolved symbol, when the caller needs it. */
   definitionPackage(symbol: SymbolRef): SchemaPackage | undefined {
     return this.artifacts.get(formatPackageRef(symbol.package))
   }
@@ -588,4 +606,3 @@ export class SchemaEnvironment {
     return values
   }
 }
-

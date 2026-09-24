@@ -280,6 +280,11 @@ for the parser, the executable AST and stored draft Spaces.
   `Store.installedPackages()` and `Store.activitiesWithOutput()` are added and
   `Store.packages()` / `Store.appendVersion()` removed; `KipReceipt` declares
   `request_digest`.
+- **Fixed — kip-do Schema Environment ownership:** resolved environments own
+  deep copies of their locks and package artifacts, and expose frozen locks,
+  artifacts and symbol references. Editing a host's previously activated lock
+  no longer changes cached queries without a schema commit. Clone an environment's
+  lock with `structuredClone` before editing and activating a new version.
 
 ### Storage and index crates
 

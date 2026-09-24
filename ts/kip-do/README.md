@@ -27,6 +27,15 @@ strings return `ConstraintViolation`; non-string timestamps return
 validate inputs without padding fractions or converting offsets; generated
 clock values truncate to milliseconds. Use `space_seq` for commit order.
 
+## Schema Environment ownership
+
+Resolved `SchemaEnvironment` instances are cached and immutable. Their locks,
+package artifacts and resolved symbol references are deeply frozen. To prepare
+a new configuration, clone `nexus.environment().lock` with `structuredClone`,
+edit the copy, then activate it with `nexus.ensureSchema(lock)`. Activation takes
+its own snapshot, so subsequent edits to that input do not affect current or
+historical queries. META responses remain independent, mutable copies.
+
 ## Status
 
 The 1.x executor was **deleted, not ported**. KIP 2.0 is a different data model
