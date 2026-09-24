@@ -51,6 +51,8 @@ let hits = index.search_f32_with_options(
 `search_f32_with_options` 支持为单次查询动态配置 ef。默认方法复用线程局部工作区，在重入调用时安全回退。
 `search_f32_with_workspace` 接收独占借用的 `SearchWorkspace`，适用于希望自主管理内存分配的应用。
 
+`search_f32_in_ids` 对调用方给定的有界 ID 集合（例如元数据预过滤的结果）做精确打分，不遍历图。它使用与图搜索相同的查询检查和距离计算，跳过不存在的 ID，按距离再按 ID 排序，不递增搜索计数器。
+
 ## 距离语义与数值边界
 
 | 度量类型 | 距离计算公式 |

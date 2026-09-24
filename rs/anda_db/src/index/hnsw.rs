@@ -71,27 +71,7 @@ impl Hnsw {
         top_k: usize,
         ids: &[u64],
     ) -> Result<Vec<(u64, f32)>, DBError> {
-        if query.len() != self.dimension() || query.iter().any(|v| !v.is_finite()) {
-            return Err(DBError::Index {
-                name: self.name.clone(),
-                source: "invalid query vector dimension or non-finite value".into(),
-            });
-        }
-        let metric = self.index.metadata().config.distance_metric;
-        let mut results = Vec::with_capacity(ids.len());
-        for &id in ids {
-            match self
-                .index
-                .get_vector_with(id, |vector| metric.compute_mixed(query, vector))
-            {
-                Ok(distance) => results.push((id, distance?)),
-                Err(HnswError::NotFound { .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        results.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        results.truncate(top_k);
-        Ok(results)
+        Ok(self.index.search_f32_in_ids(query, top_k, ids)?)
     }
 
     pub(crate) fn dir_path(name: &str) -> String {

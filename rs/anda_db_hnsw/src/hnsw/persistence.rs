@@ -303,8 +303,8 @@ impl HnswIndex {
             log::warn!(index = self.name.as_str(), missing_nodes = missing, rebuilt;
                 "Repaired HNSW bootstrap state; repaired nodes and metadata will be persisted");
         }
-        if let Some(rng) = self.layer_rng.get_mut().take() {
-            *replacement.layer_rng.get_mut() = Some(rng);
+        if let Some(rng) = self.structural_lock.get_mut().layer_rng.take() {
+            replacement.structural_lock.get_mut().layer_rng = Some(rng);
         }
         *self = replacement;
         Ok(())

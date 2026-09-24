@@ -20,11 +20,11 @@ use half::bf16;
 use ordered_float::OrderedFloat;
 use papaya::HashMap as CoHashMap;
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::{
-    cmp::{self, Reverse},
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap, hash_map::Entry},
     future::Future,
     io::{Read, Write},
@@ -68,12 +68,12 @@ pub struct HnswIndex {
     /// Layer generator that assigns a layer to each new node.
     layer_gen: LayerGen,
 
-    /// Serializes structural graph mutations.
+    /// Serializes structural graph mutations and owns writer-only state.
     ///
     /// Search does not acquire this mutex, but insert/remove both clone
     /// and rewrite adjacency lists. Without this mutex, concurrent writers can
     /// overwrite each other's neighbor-list updates.
-    structural_lock: Mutex<ConstructionWorkspace>,
+    structural_lock: Mutex<WriterState>,
 
     /// Lock-free id → node map backing the graph.
     ///
@@ -81,13 +81,7 @@ pub struct HnswIndex {
     /// Updates are performed with clone-then-`insert` (papaya has no in-place
     /// update API). The returned pin guard is `!Send` and must **not** be held
     /// across `.await` points.
-    nodes: CoHashMap<u64, Arc<GraphNode>>,
-
-    /// Exact incoming references, including asymmetric edges; writers hold structural_lock.
-    incoming: Mutex<FxHashMap<(u64, u8), FxHashSet<u64>>>,
-
-    /// Optional deterministic construction stream. Not part of the wire configuration.
-    layer_rng: Mutex<Option<rand::rngs::StdRng>>,
+    nodes: CoHashMap<u64, Arc<GraphNode>, FxBuildHasher>,
 
     pending_ids: Option<Treemap>,
     full_saved_version: AtomicU64,
@@ -193,7 +187,9 @@ struct HnswIndexRef<'a> {
     removed_nodes: Vec<u64>,
 }
 
-type Neighbor = (u64, f32, u8);
+type Neighbor = (u64, f32);
+/// Exact incoming references per `(target, layer)`, including asymmetric edges.
+type IncomingEdges = FxHashMap<(u64, u8), FxHashSet<u64>>;
 type PairDistanceCache = FxHashMap<(u64, u64), f32>;
 type NeighborUpdates = FxHashMap<u64, SmallVec<[(u8, (u64, bf16)); 8]>>;
 
@@ -216,9 +212,17 @@ struct ConstructionWorkspace {
     updates: NeighborUpdates,
 }
 
+/// State that only structural writers (or exclusive bootstrap) may touch.
+#[derive(Default)]
+struct WriterState {
+    incoming: IncomingEdges,
+    /// Optional deterministic construction stream. Not part of the wire configuration.
+    layer_rng: Option<rand::rngs::StdRng>,
+    scratch: ConstructionWorkspace,
+}
+
 impl ConstructionWorkspace {
     fn reset(&mut self) {
-        self.search.reset();
         self.vector.clear();
         self.candidates.clear();
         self.distances.clear();
@@ -279,10 +283,8 @@ impl HnswIndex {
             name: name.clone(),
             config: config.clone(),
             layer_gen,
-            structural_lock: Mutex::new(ConstructionWorkspace::default()),
-            nodes: CoHashMap::new(),
-            incoming: Mutex::new(FxHashMap::default()),
-            layer_rng: Mutex::new(None),
+            structural_lock: Mutex::new(WriterState::default()),
+            nodes: CoHashMap::with_hasher(FxBuildHasher),
             pending_ids: None,
             full_saved_version: AtomicU64::new(0),
             recovery: RecoveryReport::default(),
@@ -426,20 +428,20 @@ impl HnswIndex {
             .distance_metric
             .validate_stored(&vector, &self.name)?;
 
-        let mut workspace = self.structural_lock.lock();
-        workspace.reset();
-        let result = self.insert_locked(id, vector, now_ms, &mut workspace);
-        workspace.trim();
+        let mut writer = self.structural_lock.lock();
+        writer.scratch.reset();
+        let result = self.insert_locked(id, vector, now_ms, &mut writer);
+        writer.scratch.trim();
         result
     }
 
-    /// Called only while holding the structural lock and its reusable scratch.
+    /// Called only while holding the structural lock.
     fn insert_locked(
         &self,
         id: u64,
         vector: Vec<bf16>,
         now_ms: u64,
-        workspace: &mut ConstructionWorkspace,
+        writer: &mut WriterState,
     ) -> Result<(), HnswError> {
         let nodes = self.nodes.pin();
         // Check if ID already exists.
@@ -450,126 +452,40 @@ impl HnswIndex {
             });
         }
 
-        let (initial_entry_point_node, current_max_layer) = { *self.entry_point.read() };
+        let first = nodes.is_empty();
+        let mut entry_point = *self.entry_point.read();
         // Self-heal a stale entry point (e.g. left behind by interrupted
         // bootstrap or external state corruption). Without this, every insert
         // and search would keep failing with `NotFound`. Safe here because the
         // structural lock is held.
-        let (initial_entry_point_node, current_max_layer) =
-            if !nodes.is_empty() && !nodes.contains_key(&initial_entry_point_node) {
-                self.repair_entry_point();
-                *self.entry_point.read()
-            } else {
-                (initial_entry_point_node, current_max_layer)
-            };
+        if !first && !nodes.contains_key(&entry_point.0) {
+            self.repair_entry_point();
+            entry_point = *self.entry_point.read();
+        }
         // Randomly determine the node's layer
-        let layer = match self.layer_rng.lock().as_mut() {
-            Some(rng) => self.layer_gen.generate_with(current_max_layer, rng),
-            None => self.layer_gen.generate(current_max_layer),
+        let layer = match writer.layer_rng.as_mut() {
+            Some(rng) => self.layer_gen.generate_with(entry_point.1, rng),
+            None => self.layer_gen.generate(entry_point.1),
         };
         let mut node_neighbors: Vec<Vec<(u64, bf16)>> = (0..=layer)
             .map(|layer| Vec::with_capacity(self.config.layer_limit(layer) + 1))
             .collect();
-
-        // If this is the first node, set it as the entry point
-        if nodes.is_empty() {
-            self.put_node(GraphNode::new(id, layer, vector, node_neighbors));
-            self.ids.write().add(id);
-            *self.entry_point.write() = (id, layer);
-            self.dirty_nodes.write().insert(id); // Mark the node as dirty for persistence
-            // A re-inserted id must not have its (new) blob purged by a
-            // pending tombstone from an earlier remove().
-            self.removed_nodes.write().remove(&id);
-
-            self.update_metadata(|m| {
-                m.stats.version += 1;
-                m.stats.last_inserted = now_ms;
-                m.stats.max_layer = layer;
-                m.stats.insert_count += 1;
-            });
-
-            return Ok(());
-        }
-
-        // --- Phase 1: descend the layers to gather search state ---
-        // The new vector is exactly representable in f32, so searching with the
-        // f32 copy yields bit-identical distances while skipping the per-element
-        // bf16 promotion of the query inside every distance computation.
-        let ConstructionWorkspace {
-            search,
-            vector: vector_f32,
-            candidates,
-            distances,
-            selection,
-            updates,
-        } = workspace;
-        vector_f32.extend(vector.iter().map(|v| v.to_f32()));
-        let query = crate::distance::PreparedQuery::new(self.config.distance_metric, vector_f32);
-        let mut entry_point_node = initial_entry_point_node;
-        let mut entry_point_dist = f32::MAX;
-
-        for current_layer in (layer + 1..=current_max_layer).rev() {
-            let nearest = self.greedy_search(&query, entry_point_node, current_layer, search)?;
-            entry_point_node = nearest.0;
-            entry_point_dist = nearest.1;
-        }
-
-        // Build connections
-        for current_layer_build in (0..=layer.min(current_max_layer)).rev() {
-            let max_connections = self.config.layer_capacity(current_layer_build);
-
-            self.search_layer_into(
-                &query,
-                entry_point_node,
-                current_layer_build,
-                self.config.ef_construction,
-                search,
-                candidates,
+        if !first {
+            self.link_new_node(
+                id,
+                &vector,
+                layer,
+                entry_point,
+                &mut writer.scratch,
+                &mut node_neighbors,
             )?;
-            self.select_neighbors_in_place(
-                candidates,
-                max_connections,
-                self.config.select_neighbors_strategy,
-                distances,
-                selection,
-                true,
-            )?;
-
-            // Use the best candidate on this layer as the entry point for the next
-            // iteration if it improves on the running minimum distance.
-            if let Some(closest_in_layer) = candidates
-                .iter()
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal))
-                && closest_in_layer.1 < entry_point_dist
-            {
-                entry_point_node = closest_in_layer.0;
-                entry_point_dist = closest_in_layer.1;
-            }
-
-            // Record forward edges on the new node and queue reverse edges.
-            for (neighbor_id, dist, neighbor_layer) in candidates.drain(..) {
-                if neighbor_id == id {
-                    // Skip self-loops.
-                    continue;
-                }
-
-                debug_assert!(neighbor_layer >= current_layer_build);
-
-                let dist_bf16 = bf16::from_f32(dist);
-                // (1) Forward edge on the new node.
-                node_neighbors[current_layer_build as usize].push((neighbor_id, dist_bf16));
-
-                // (2) Reverse edge on the existing node; guaranteed valid here
-                //     because the target exists at this layer.
-                updates
-                    .entry(neighbor_id)
-                    .or_default()
-                    .push((current_layer_build, (id, dist_bf16)));
-            }
         }
 
         // --- Phase 2: publish the new node ---
-        self.put_node(GraphNode::new(id, layer, vector, node_neighbors));
+        let WriterState {
+            incoming, scratch, ..
+        } = writer;
+        self.put_node(incoming, GraphNode::new(id, layer, vector, node_neighbors));
         self.ids.write().add(id);
         // A re-inserted id must not have its (new) blob purged by a pending
         // tombstone from an earlier remove().
@@ -579,9 +495,9 @@ impl HnswIndex {
         local_dirty_nodes.insert(id);
 
         {
-            // Promote the new node if it raises the graph's maximum layer.
+            // Promote the first node, or one that raises the maximum layer.
             let mut entry_point_guard = self.entry_point.write();
-            if layer > entry_point_guard.1 || !nodes.contains_key(&entry_point_guard.0) {
+            if first || layer > entry_point_guard.1 || !nodes.contains_key(&entry_point_guard.0) {
                 *entry_point_guard = (id, layer);
             }
             // The guard is dropped here to avoid holding two locks at once.
@@ -590,7 +506,7 @@ impl HnswIndex {
         self.update_metadata(|m| {
             m.stats.version += 1; // Increment index version
             m.stats.last_inserted = now_ms;
-            if layer > m.stats.max_layer {
+            if first || layer > m.stats.max_layer {
                 m.stats.max_layer = layer;
             }
             m.stats.insert_count += 1;
@@ -601,6 +517,13 @@ impl HnswIndex {
         // Each affected neighbor is cloned exactly once: reverse-edge inserts and
         // (if needed) pruning via `select_neighbors` both mutate the local copy
         // before a single `nodes.insert` writes it back.
+        let ConstructionWorkspace {
+            candidates,
+            distances,
+            selection,
+            updates,
+            ..
+        } = scratch;
         for (neighbor_id, updates) in updates.drain() {
             // Clone only adjacency; immutable vector storage remains shared.
             let Some(neighbor) = nodes.get(&neighbor_id) else {
@@ -630,7 +553,7 @@ impl HnswIndex {
                             // Select using fresh f32 distances, not bf16-rounded
                             // edge weights. Legacy unrepresentable edges are dropped.
                             if let Ok(distance) = self.node_distance(neighbor, target, distances) {
-                                candidates.push((cid, distance, target.layer));
+                                candidates.push((cid, distance));
                             }
                         }
                     }
@@ -649,7 +572,7 @@ impl HnswIndex {
                         n_layer_list.extend(
                             candidates
                                 .drain(..)
-                                .map(|(id, dist, _)| (id, bf16::from_f32(dist))),
+                                .map(|(id, dist)| (id, bf16::from_f32(dist))),
                         );
                     }
                 }
@@ -657,12 +580,83 @@ impl HnswIndex {
 
             neighbor_node.version += 1;
             local_dirty_nodes.insert(neighbor_id);
-            self.put_node(neighbor_node);
+            self.put_node(incoming, neighbor_node);
         }
 
         // --- Phase 4: commit the dirty set ---
-        self.dirty_nodes.write().append(&mut local_dirty_nodes);
+        self.dirty_nodes.write().extend(local_dirty_nodes);
 
+        Ok(())
+    }
+
+    /// Phase 1 of insert: descends from `entry`, selects the new node's
+    /// forward edges into `node_neighbors` and queues the matching reverse
+    /// edges in `scratch.updates`. Does not mutate the graph.
+    fn link_new_node(
+        &self,
+        id: u64,
+        vector: &[bf16],
+        layer: u8,
+        (mut entry, current_max_layer): (u64, u8),
+        scratch: &mut ConstructionWorkspace,
+        node_neighbors: &mut [Vec<(u64, bf16)>],
+    ) -> Result<(), HnswError> {
+        let ConstructionWorkspace {
+            search,
+            vector: vector_f32,
+            candidates,
+            distances,
+            selection,
+            updates,
+        } = scratch;
+        // The new vector is exactly representable in f32, so searching with the
+        // f32 copy yields bit-identical distances while skipping the per-element
+        // bf16 promotion of the query inside every distance computation.
+        vector_f32.extend(vector.iter().map(|v| v.to_f32()));
+        let query = crate::distance::PreparedQuery::new(self.config.distance_metric, vector_f32);
+        let mut entry_dist = f32::MAX;
+        for current_layer in (layer + 1..=current_max_layer).rev() {
+            (entry, entry_dist) = self.greedy_search(&query, entry, current_layer)?;
+        }
+
+        for current_layer in (0..=layer.min(current_max_layer)).rev() {
+            self.search_layer_into(
+                &query,
+                entry,
+                current_layer,
+                self.config.ef_construction,
+                search,
+                candidates,
+            )?;
+            self.select_neighbors_in_place(
+                candidates,
+                self.config.layer_capacity(current_layer),
+                self.config.select_neighbors_strategy,
+                distances,
+                selection,
+                true,
+            )?;
+
+            // Selection keeps the nearest candidate first. Use it as the next
+            // layer's entry point if it improves on the running minimum.
+            if let Some(&(closest, dist)) = candidates.first()
+                && dist < entry_dist
+            {
+                entry = closest;
+                entry_dist = dist;
+            }
+
+            // Record forward edges on the new node and queue reverse edges;
+            // every candidate is an existing node at this layer.
+            for (neighbor_id, dist) in candidates.drain(..) {
+                let dist = bf16::from_f32(dist);
+                node_neighbors[current_layer as usize].push((neighbor_id, dist));
+                updates
+                    .entry(neighbor_id)
+                    .or_default()
+                    .push((current_layer, (id, dist)));
+            }
+        }
         Ok(())
     }
 
@@ -712,8 +706,11 @@ impl HnswIndex {
     /// * `true` if a node with `id` existed and was removed.
     /// * `false` otherwise.
     pub fn remove(&self, id: u64, now_ms: u64) -> bool {
-        let mut workspace = self.structural_lock.lock();
-        workspace.reset();
+        let mut writer = self.structural_lock.lock();
+        let WriterState {
+            incoming, scratch, ..
+        } = &mut *writer;
+        scratch.reset();
         let nodes = self.nodes.pin();
         let Some(node) = nodes.get(&id).cloned() else {
             return false;
@@ -782,7 +779,6 @@ impl HnswIndex {
         // Track incoming references independently of outgoing edges. Pruning
         // makes the graph asymmetric, so walking node.neighbors is insufficient.
         let neighbor_ids = {
-            let mut incoming = self.incoming.lock();
             let mut affected = FxHashSet::default();
             for layer in 0..=node.layer {
                 if let Some(sources) = incoming.remove(&(id, layer)) {
@@ -807,19 +803,19 @@ impl HnswIndex {
             selection,
             candidates,
             ..
-        } = &mut *workspace;
+        } = &mut *scratch;
         let mut dirty_nodes = BTreeSet::new();
         for &neighbor_id in &neighbor_ids {
             if let Some(n) = nodes.get(&neighbor_id) {
                 let mut updated = false;
                 let mut o = (**n).clone();
                 for layer in 0..=(n.layer as usize) {
-                    let Some(pos) = n.neighbors[layer].iter().position(|&(idx, _)| idx == id)
-                    else {
+                    let edges = &mut o.neighbors[layer];
+                    let before = edges.len();
+                    edges.retain(|&(target, _)| target != id);
+                    if edges.len() == before {
                         continue;
-                    };
-                    o.neighbors[layer].swap_remove(pos);
-                    o.neighbors[layer].retain(|&(target, _)| target != id);
+                    }
                     updated = true;
 
                     // Fast path: with reconnect_on_delete disabled, deletion
@@ -845,7 +841,7 @@ impl HnswIndex {
                         if let Some(target) = nodes.get(&cid)
                             && let Ok(distance) = self.node_distance(n, target, pair_distance_cache)
                         {
-                            candidates.push((cid, distance, target.layer));
+                            candidates.push((cid, distance));
                         }
                     }
                     let existing_len = candidates.len();
@@ -863,7 +859,7 @@ impl HnswIndex {
                         let Ok(dist) = self.node_distance(n, peer_node, pair_distance_cache) else {
                             continue;
                         };
-                        candidates.push((peer, dist, 0));
+                        candidates.push((peer, dist));
                     }
 
                     if candidates.len() > existing_len {
@@ -884,7 +880,7 @@ impl HnswIndex {
                             layer_list.extend(
                                 candidates
                                     .drain(..)
-                                    .map(|(cid, dist, _)| (cid, bf16::from_f32(dist))),
+                                    .map(|(cid, dist)| (cid, bf16::from_f32(dist))),
                             );
                         }
                     }
@@ -892,7 +888,7 @@ impl HnswIndex {
                 if updated {
                     o.version += 1;
                     dirty_nodes.insert(neighbor_id);
-                    self.put_node(o);
+                    self.put_node(incoming, o);
                 }
             }
         }
@@ -901,7 +897,7 @@ impl HnswIndex {
             self.dirty_nodes.write().extend(dirty_nodes);
         }
 
-        workspace.trim();
+        scratch.trim();
         true
     }
 
@@ -946,7 +942,7 @@ impl HnswIndex {
         }
         let nodes = self.nodes.pin();
         scratch.seen.clear();
-        candidates.retain(|(id, distance, _)| {
+        candidates.retain(|(id, distance)| {
             distance.is_finite() && nodes.contains_key(id) && scratch.seen.insert(*id)
         });
         if candidates.len() <= m {
@@ -970,7 +966,7 @@ impl HnswIndex {
                 continue;
             };
             let mut keep = true;
-            for &(selected_id, _, _) in &scratch.selected {
+            for &(selected_id, _) in &scratch.selected {
                 let Some(selected) = nodes.get(&selected_id) else {
                     continue;
                 };
@@ -1094,7 +1090,7 @@ impl HnswIndex {
         seed: u64,
     ) -> Result<Self, HnswError> {
         let mut index = Self::try_new(name, config)?;
-        *index.layer_rng.get_mut() = Some(rand::rngs::StdRng::seed_from_u64(seed));
+        index.structural_lock.get_mut().layer_rng = Some(rand::rngs::StdRng::seed_from_u64(seed));
         Ok(index)
     }
 
@@ -1104,8 +1100,8 @@ impl HnswIndex {
     }
 
     /// Publishes one immutable node and maintains the exact reverse references.
-    /// The caller holds structural_lock (or exclusive bootstrap ownership).
-    fn put_node(&self, mut node: GraphNode) {
+    /// `incoming` comes from the held structural lock (or exclusive bootstrap).
+    fn put_node(&self, incoming: &mut IncomingEdges, mut node: GraphNode) {
         for (layer, neighbors) in node.neighbors.iter_mut().enumerate() {
             neighbors.sort_unstable_by_key(|edge| edge.0);
             neighbors.dedup_by_key(|edge| edge.0);
@@ -1113,7 +1109,6 @@ impl HnswIndex {
         }
         let nodes = self.nodes.pin();
         let previous = nodes.get(&node.id);
-        let mut incoming = self.incoming.lock();
         for layer in 0..node
             .neighbors
             .len()
@@ -1155,8 +1150,8 @@ impl HnswIndex {
         nodes.insert(node.id, Arc::new(node));
     }
 
-    fn rebuild_incoming(&self) {
-        let mut incoming = self.incoming.lock();
+    fn rebuild_incoming(&mut self) {
+        let incoming = &mut self.structural_lock.get_mut().incoming;
         incoming.clear();
         for (id, node) in self.nodes.pin().iter() {
             for (layer, neighbors) in node.neighbors.iter().enumerate() {

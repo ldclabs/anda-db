@@ -63,6 +63,11 @@ thread-local scratch storage with a safe fallback for reentrant calls.
 `search_f32_with_workspace` accepts an exclusively borrowed `SearchWorkspace`
 for applications that want to own those allocations.
 
+`search_f32_in_ids` exactly scores a caller-bounded id set, such as the
+result of a metadata prefilter, without walking the graph. It applies the
+same query checks and distances as graph search, skips missing ids, sorts by
+distance then id, and does not increment the search counter.
+
 ## Distance semantics and numeric bounds
 
 | Metric | Distance |

@@ -1,0 +1,43 @@
+{
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "baseline_commit": "16e90f4",
+  "opt_level": 3,
+  "lto": false,
+  "codegen_units": 16,
+  "debuginfo": "line-tables-only",
+  "counting_allocator": true,
+  "common_arguments": [
+    "--run",
+    "--recall-queries",
+    "40",
+    "--seed",
+    "42"
+  ],
+  "cases": {
+    "euclidean-128": [
+      "--n",
+      "5000",
+      "--dim",
+      "128",
+      "--metric",
+      "euclidean",
+      "--queries",
+      "3000"
+    ],
+    "cosine-384": [
+      "--n",
+      "3000",
+      "--dim",
+      "384",
+      "--metric",
+      "cosine",
+      "--queries",
+      "2000"
+    ]
+  },
+  "trials": 3,
+  "comparison": "Same benchmark executable source, dependencies, parameters and seeds, run alternately. Baseline binary built from 16e90f4; current binary adds branchless bf16 widening in distance kernels, no per-query distance map, FxHash for the node map, and dirty-set extend instead of append.",
+  "scope": "Synthetic uniform vectors; macOS arm64; machine not isolated (load average about 8-12 during the runs). Profile overrides kept debug line tables for sampling, so LTO was off. Report medians, not universal speedups. No RSS measurement. Recall@10 was identical in every phase."
+}

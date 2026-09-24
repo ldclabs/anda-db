@@ -116,3 +116,33 @@ instrumentation. The original and loaded graphs coexist during the load phase;
 its process-wide peak includes both graphs and serialized data. The table is
 not a standalone index RSS estimate. Wider datasets and production hardware
 need separate measurements.
+
+## September 24, 2026 comparison
+
+[Raw phase measurements](results/review-20260924.csv) and
+[environment / parameters](results/review-20260924.json) compare the HNSW source
+at `16e90f4` with branchless bf16 widening in the distance kernels, no
+per-query distance map, FxHash for the node map and an extended (not rebuilt)
+dirty-node set. Both binaries use opt-level 3, the same dependencies and the
+counting allocator; debug line tables were kept for profiling, so LTO was off.
+The table shows medians of three alternating trials with M=32,
+efConstruction=200, efSearch=50, 16 maximum layers, seed 42 and 40 exact recall
+queries. Deletion removes 20% of the nodes.
+
+| Case | Build ms | Query ms | Query P50 µs | Delete ms | Reinsert ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Euclidean, N=5,000, D=128, 3,000 queries | 5727.1 → 2536.2 | 981.4 → 421.3 | 300.2 → 132.0 | 78.2 → 58.8 | 1290.4 → 591.7 |
+| Cosine, N=3,000, D=384, 2,000 queries | 6182.8 → 2107.5 | 1016.1 → 384.7 | 483.3 → 178.1 | 43.3 → 28.8 | 1036.5 → 385.4 |
+
+Recall@10 was identical in every phase (Euclidean 0.965 initially, Cosine
+0.9375): finite distances are bit-identical, so both binaries build the same
+graph. Flush and load times, allocation counts and live heap deltas were
+unchanged within noise.
+
+Sampling showed the `half` crate's NaN-quieting branch in `bf16::to_f32`
+blocked vectorization. Before the change, distance kernels took about 60% of
+build and 67% of query samples; afterwards they took about 30% of build
+samples. The largest remaining build cost is the per-layer visited set (about
+28%), which is inherent to sparse u64 node ids.
+The machine was not isolated (load average about 8–12), so compare ratios
+rather than absolute times.

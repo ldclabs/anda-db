@@ -1424,12 +1424,13 @@ fn test_select_neighbors_invalid_bf16_and_pending_metadata_flush() {
 
     let mut layer_cache = SearchWorkspace::default();
     assert!(matches!(
-        index.search_layer(
+        index.search_layer_into(
             &crate::distance::PreparedQuery::new(DistanceMetric::Euclidean, &[0.0, 0.0]),
             u64::MAX,
             0,
             0,
-            &mut layer_cache
+            &mut layer_cache,
+            &mut Vec::new(),
         ),
         Err(HnswError::NotFound { id: u64::MAX, .. })
     ));
@@ -1437,13 +1438,13 @@ fn test_select_neighbors_invalid_bf16_and_pending_metadata_flush() {
     let mut pair_cache = FxHashMap::default();
     let simple = index
         .select_neighbors(
-            vec![(3, 0.3, 0), (1, 0.1, 0), (2, 0.2, 0)],
+            vec![(3, 0.3), (1, 0.1), (2, 0.2)],
             2,
             SelectNeighborsStrategy::Simple,
             &mut pair_cache,
         )
         .unwrap();
-    assert_eq!(simple, vec![(1, 0.1, 0), (2, 0.2, 0)]);
+    assert_eq!(simple, vec![(1, 0.1), (2, 0.2)]);
 
     let empty_index = HnswIndex::new(
         "empty_hnsw".to_string(),
@@ -1473,7 +1474,7 @@ fn test_select_neighbors_heuristic_diversity_and_backfill() {
     index.insert_f32(3, vec![0.0, 1.4], 0).unwrap();
     index.insert_f32(4, vec![-1.6, 0.0], 0).unwrap();
 
-    let candidates = vec![(1, 1.0, 0), (2, 1.2, 0), (3, 1.4, 0), (4, 1.6, 0)];
+    let candidates = vec![(1, 1.0), (2, 1.2), (3, 1.4), (4, 1.6)];
 
     // With m = 2, the diversity rule must skip node 2 (dist(2, 1) = 0.2 <
     // dist(2, query) = 1.2) and pick node 3 instead.
@@ -1519,7 +1520,7 @@ fn test_select_neighbors_heuristic_diversity_and_backfill() {
     // All shadowed by node 1: backfill must still deliver exactly m edges,
     // closest pruned candidates first.
     index.insert_f32(5, vec![1.1, 0.1], 0).unwrap();
-    let clustered = vec![(1, 1.0, 0), (2, 1.2, 0), (5, 1.3, 0)];
+    let clustered = vec![(1, 1.0), (2, 1.2), (5, 1.3)];
     let selected = index
         .select_neighbors(clustered, 2, SelectNeighborsStrategy::Heuristic, &mut cache)
         .unwrap();
@@ -1531,7 +1532,7 @@ fn test_select_neighbors_heuristic_diversity_and_backfill() {
     // m == 0 yields no neighbors.
     let empty = index
         .select_neighbors(
-            vec![(1, 1.0, 0), (2, 1.2, 0)],
+            vec![(1, 1.0), (2, 1.2)],
             0,
             SelectNeighborsStrategy::Heuristic,
             &mut cache,
@@ -2097,4 +2098,39 @@ async fn test_store_metadata_ids_dirty_nodes_and_flush_error_paths() {
         .await
         .unwrap();
     assert!(!stale_dirty.has_dirty_nodes());
+}
+
+#[test]
+fn test_search_f32_in_ids_scores_exactly_like_graph_search() {
+    let index = HnswIndex::new(
+        "in_ids".to_string(),
+        Some(HnswConfig {
+            distance_metric: DistanceMetric::Cosine,
+            ..test_config()
+        }),
+    );
+    for (id, vector) in [(1, [1.0, 0.0]), (2, [0.0, 1.0]), (3, [1.0, 1.0])] {
+        index.insert_f32(id, vector.to_vec(), 0).unwrap();
+    }
+    let query = [1.0, 0.2];
+    let graph = index.search_f32(&query, 3).unwrap();
+
+    // Missing ids are skipped; hits are sorted and match graph distances.
+    let exact = index.search_f32_in_ids(&query, 3, &[2, 99, 3, 1]).unwrap();
+    assert_eq!(exact, graph);
+    assert_eq!(
+        index.search_f32_in_ids(&query, 1, &[2, 3]).unwrap(),
+        vec![graph[1]]
+    );
+    assert!(index.search_f32_in_ids(&query, 0, &[1]).unwrap().is_empty());
+    assert_eq!(index.stats().search_count, 1);
+
+    assert!(matches!(
+        index.search_f32_in_ids(&[1.0], 1, &[1]),
+        Err(HnswError::DimensionMismatch { .. })
+    ));
+    assert!(matches!(
+        index.search_f32_in_ids(&[f32::NAN, 0.0], 1, &[1]),
+        Err(HnswError::Generic { .. })
+    ));
 }

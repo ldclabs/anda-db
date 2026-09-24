@@ -12,10 +12,9 @@ pub struct SearchOptions {
 /// The default APIs use one workspace per thread, with a reentrant fallback.
 #[derive(Default)]
 pub struct SearchWorkspace {
-    distances: FxHashMap<u64, f32>,
     visited: FxHashSet<u64>,
-    candidates: BinaryHeap<(Reverse<OrderedFloat<f32>>, u64, u8)>,
-    results: BinaryHeap<(OrderedFloat<f32>, u64, u8)>,
+    candidates: BinaryHeap<(Reverse<OrderedFloat<f32>>, u64)>,
+    results: BinaryHeap<(OrderedFloat<f32>, u64)>,
 }
 
 thread_local! {
@@ -36,7 +35,6 @@ fn with_workspace<R>(f: impl FnOnce(&mut SearchWorkspace) -> R) -> R {
 
 impl SearchWorkspace {
     pub(super) fn reset(&mut self) {
-        self.distances.clear();
         self.visited.clear();
         self.candidates.clear();
         self.results.clear();
@@ -44,10 +42,7 @@ impl SearchWorkspace {
     pub(super) fn trim(&mut self) {
         // A single unusually expensive traversal must not permanently retain
         // an unbounded allocation on every worker thread.
-        if self.distances.capacity() > 131_072
-            || self.visited.capacity() > 131_072
-            || self.candidates.capacity() > 131_072
-        {
+        if self.visited.capacity() > 131_072 || self.candidates.capacity() > 131_072 {
             *self = Self::default();
         }
     }
@@ -107,6 +102,38 @@ impl HnswIndex {
         self.search_validated(query, top_k, ef, workspace)
     }
 
+    /// Exactly scores a caller-bounded candidate set, such as ids selected by
+    /// a metadata prefilter, without walking the graph. Missing ids are
+    /// skipped. Returns at most top_k hits sorted by distance, then id, using
+    /// the same distances as graph search. Not counted in `search_count`.
+    pub fn search_f32_in_ids(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, f32)>, HnswError> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        self.validate_query(
+            query.len(),
+            query.iter().all(|v| v.is_finite()),
+            top_k,
+            SearchOptions::default(),
+        )?;
+        let query = PreparedQuery::new(self.config.distance_metric, query);
+        let nodes = self.nodes.pin();
+        let mut results = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(node) = nodes.get(&id) {
+                results.push((id, self.search_distance(&query, node)?));
+            }
+        }
+        results.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        results.truncate(top_k);
+        Ok(results)
+    }
+
     fn search_validated(
         &self,
         query: &[f32],
@@ -116,7 +143,6 @@ impl HnswIndex {
     ) -> Result<Vec<(u64, f32)>, HnswError> {
         let query = PreparedQuery::new(self.config.distance_metric, query);
         for attempt in 0..Self::SEARCH_MAX_ATTEMPTS {
-            workspace.reset();
             if self.is_empty() {
                 return Ok(Vec::new());
             }
@@ -166,15 +192,12 @@ impl HnswIndex {
     ) -> Result<Vec<(u64, f32)>, HnswError> {
         let (mut id, level) = *self.entry_point.read();
         for layer in (1..=level).rev() {
-            let candidate = self.greedy_search(query, id, layer, workspace)?;
-            id = candidate.0;
+            id = self.greedy_search(query, id, layer)?.0;
         }
-        let mut results = self.search_layer(query, id, 0, ef, workspace)?;
+        let mut results = Vec::new();
+        self.search_layer_into(query, id, 0, ef, workspace, &mut results)?;
         results.truncate(top_k);
-        Ok(results
-            .into_iter()
-            .map(|(id, distance, _)| (id, distance))
-            .collect())
+        Ok(results)
     }
 
     /// Allocation-free ef=1 descent. No visited set or heap is needed because
@@ -184,15 +207,10 @@ impl HnswIndex {
         query: &PreparedQuery<'_>,
         entry: u64,
         layer: u8,
-        workspace: &mut SearchWorkspace,
-    ) -> Result<(u64, f32, u8), HnswError> {
+    ) -> Result<Neighbor, HnswError> {
         let nodes = self.nodes.pin();
         let node = nodes.get(&entry).ok_or_else(|| self.missing_node(entry))?;
-        let mut best = (
-            entry,
-            self.search_distance(query, node, workspace)?,
-            node.layer,
-        );
+        let mut best = (entry, self.search_distance(query, node)?);
         loop {
             let previous = best.0;
             let Some(node) = nodes.get(&previous) else {
@@ -203,9 +221,9 @@ impl HnswIndex {
                     if let Some(node) = nodes.get(&id)
                         && node.layer >= layer
                     {
-                        let distance = self.search_distance(query, node, workspace)?;
+                        let distance = self.search_distance(query, node)?;
                         if distance < best.1 {
-                            best = (id, distance, node.layer);
+                            best = (id, distance);
                         }
                     }
                 }
@@ -216,19 +234,8 @@ impl HnswIndex {
         }
     }
 
-    pub(super) fn search_layer(
-        &self,
-        query: &PreparedQuery<'_>,
-        entry: u64,
-        layer: u8,
-        ef: usize,
-        workspace: &mut SearchWorkspace,
-    ) -> Result<Vec<(u64, f32, u8)>, HnswError> {
-        let mut output = Vec::new();
-        self.search_layer_into(query, entry, layer, ef, workspace, &mut output)?;
-        Ok(output)
-    }
-
+    /// Beam search within one layer; output is sorted by ascending distance.
+    /// The per-layer visited set already computes each distance at most once.
     pub(super) fn search_layer_into(
         &self,
         query: &PreparedQuery<'_>,
@@ -240,24 +247,20 @@ impl HnswIndex {
     ) -> Result<(), HnswError> {
         output.clear();
         if ef <= 1 {
-            output.push(self.greedy_search(query, entry, layer, workspace)?);
+            output.push(self.greedy_search(query, entry, layer)?);
             return Ok(());
         }
-        workspace.visited.clear();
-        workspace.candidates.clear();
-        workspace.results.clear();
+        workspace.reset();
         let nodes = self.nodes.pin();
         let node = nodes.get(&entry).ok_or_else(|| self.missing_node(entry))?;
-        let distance = self.search_distance(query, node, workspace)?;
+        let distance = self.search_distance(query, node)?;
         workspace.visited.insert(entry);
         workspace
             .candidates
-            .push((Reverse(OrderedFloat(distance)), entry, node.layer));
-        workspace
-            .results
-            .push((OrderedFloat(distance), entry, node.layer));
+            .push((Reverse(OrderedFloat(distance)), entry));
+        workspace.results.push((OrderedFloat(distance), entry));
 
-        while let Some((Reverse(OrderedFloat(distance)), id, _)) = workspace.candidates.pop() {
+        while let Some((Reverse(OrderedFloat(distance)), id)) = workspace.candidates.pop() {
             if workspace.results.len() >= ef
                 && workspace.results.peek().is_some_and(|r| distance > r.0.0)
             {
@@ -271,18 +274,14 @@ impl HnswIndex {
                         && let Some(node) = nodes.get(&id)
                         && node.layer >= layer
                     {
-                        let distance = self.search_distance(query, node, workspace)?;
+                        let distance = self.search_distance(query, node)?;
                         if workspace.results.len() < ef
                             || workspace.results.peek().is_some_and(|r| distance < r.0.0)
                         {
-                            workspace.candidates.push((
-                                Reverse(OrderedFloat(distance)),
-                                id,
-                                node.layer,
-                            ));
                             workspace
-                                .results
-                                .push((OrderedFloat(distance), id, node.layer));
+                                .candidates
+                                .push((Reverse(OrderedFloat(distance)), id));
+                            workspace.results.push((OrderedFloat(distance), id));
                             if workspace.results.len() > ef {
                                 workspace.results.pop();
                             }
@@ -292,8 +291,8 @@ impl HnswIndex {
             }
         }
         output.reserve(workspace.results.len());
-        while let Some((distance, id, layer)) = workspace.results.pop() {
-            output.push((id, distance.0, layer));
+        while let Some((distance, id)) = workspace.results.pop() {
+            output.push((id, distance.0));
         }
         output.reverse();
         Ok(())
@@ -303,22 +302,13 @@ impl HnswIndex {
         &self,
         query: &PreparedQuery<'_>,
         node: &GraphNode,
-        workspace: &mut SearchWorkspace,
     ) -> Result<f32, HnswError> {
-        match workspace.distances.entry(node.id) {
-            Entry::Occupied(entry) => Ok(*entry.get()),
-            Entry::Vacant(entry) => {
-                let distance =
-                    query
-                        .compute(&node.vector, node.norm)
-                        .map_err(|err| HnswError::Generic {
-                            name: self.name.clone(),
-                            source: err.into(),
-                        })?;
-                entry.insert(distance);
-                Ok(distance)
-            }
-        }
+        query
+            .compute(&node.vector, node.norm)
+            .map_err(|err| HnswError::Generic {
+                name: self.name.clone(),
+                source: err.into(),
+            })
     }
 
     fn missing_node(&self, id: u64) -> HnswError {

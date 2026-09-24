@@ -2,7 +2,21 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree
+## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw
+
+- anda_db_hnsw: distance kernels widen `bf16` to `f32` without the
+  NaN-quieting branch in `half`, so the compiler can vectorize them. Each
+  distance is 3.5–4× faster, and results are unchanged for the finite values
+  the index accepts. Together with the changes below, index builds and queries
+  are 2–3× faster with unchanged recall (see the crate benchmark README).
+- anda_db_hnsw: search drops its per-query distance map (the per-layer visited
+  set already computes each distance once), and the node map hashes ids with
+  FxHash instead of SipHash. Inserts extend the pending dirty-node set instead
+  of rebuilding it, which made bulk imports without flushes quadratic.
+- anda_db_hnsw: new `HnswIndex::search_f32_in_ids(query, top_k, ids)` scores a
+  caller-bounded id set exactly, using the same distances and query limits as
+  graph search. Prefiltered vector search in anda_db now uses it, so cosine
+  scores for prefiltered and graph results agree.
 
 - **Breaking (anda_db_schema):** remove `FieldType::normalize` and
   `FieldType::prune_undeclared`. Nothing called them any more: reading a

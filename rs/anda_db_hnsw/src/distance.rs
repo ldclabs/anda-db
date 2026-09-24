@@ -281,7 +281,8 @@ impl AsF32 for f32 {
 impl AsF32 for bf16 {
     #[inline(always)]
     fn as_f32(self) -> f32 {
-        self.to_f32()
+        // Branchless widening; half's NaN-quieting branch blocks vectorization.
+        f32::from_bits((self.to_bits() as u32) << 16)
     }
 }
 
