@@ -31,7 +31,7 @@ pub struct BM25 {
     name: String,
     fields: Vec<String>,
     index: BM25Index<TokenizerChain>,
-    storage: Storage, // 与 Collection 共享同一个 Storage 实例
+    storage: Storage, // shared with the owning collection
     metadata_version: RwLock<ObjectVersion>,
     /// Serializes complete object-store flushes for this wrapper. Collection
     /// excludes mutations and compaction with its exclusive operation lease;
@@ -88,14 +88,7 @@ impl BM25 {
     /// (pre-manifest) un-suffixed object and is only ever read, never
     /// written; the manifest protocol writes generation-suffixed objects.
     fn bucket_path(name: &str, object: BucketObject) -> String {
-        if object.generation == 0 {
-            format!("bm25_indexes/{name}/b_{}.cbor", object.bucket_id)
-        } else {
-            format!(
-                "bm25_indexes/{name}/b_{}_{}.cbor",
-                object.bucket_id, object.generation
-            )
-        }
+        super::persistence::bucket_path(&BM25::dir_path(name), object.bucket_id, object.generation)
     }
 
     /// Tokenizes `text` with `tokenizer` and returns the unique indexed terms.
@@ -163,15 +156,15 @@ impl BM25 {
         let (metadata, ver) = storage
             .fetch_internal_bytes(&BM25::metadata_path(&name))
             .await?;
-        let n = Arc::new(name.clone());
-        let s = Arc::new(storage.clone());
+        let bucket_storage = storage.clone();
+        let bucket_name = name.clone();
         let index = BM25Index::load_all_strict(tokenizer, &metadata[..], async move |object| {
-            let path = BM25::bucket_path(n.clone().as_str(), object);
-            match s.clone().fetch_internal_bytes(&path).await {
-                Ok((data, _)) => Ok(Some(data.into())),
-                Err(DBError::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
+            // Hold owned copies across the await: a future that borrows the
+            // closure's captures trips the "Send is not general enough"
+            // limitation for async closures.
+            let path = BM25::bucket_path(&bucket_name, object);
+            let storage = bucket_storage.clone();
+            super::persistence::load_object(&storage, &path).await
         })
         .await?;
 

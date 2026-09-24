@@ -169,6 +169,9 @@ Database metadata changes can still be persisted by `db.flush()`. Thus
 `set_extension` and `set_extension_from` stage small metadata values for a
 later flush. `save_extension` / `save_extension_from` are async immediate
 metadata writes; `remove_extension` is async and returns the removed value.
+A value that would push the metadata object past `max_small_object_size` is
+rejected before anything changes: `save_*` returns `PayloadTooLarge`, while
+the staging setters drop it with a warning.
 Collection and database expose these families, with lifecycle/read-only
 details documented on each method. Do not use extensions for bulk blobs or
 assume they create multi-document transactions.

@@ -137,30 +137,7 @@ impl Collection {
     /// `data/` listing [`Self::reconcile_storage`] already performs.
     pub(super) fn purge_dead_ids_from_indexes(&self, dead_ids: &BTreeSet<DocumentId>, now_ms: u64) {
         for index in &self.btree_indexes {
-            // `Not(Include([]))` excludes nothing, i.e. it walks every key.
-            // The scan holds the index read lock while `f` runs, so the
-            // matching keys are only collected here and removed afterwards.
-            let stale: Vec<(Fv, Vec<DocumentId>)> = index.range_query_with(
-                RangeQuery::Not(Box::new(RangeQuery::Include(Vec::new()))),
-                |key, ids| {
-                    let hits: Vec<DocumentId> = ids
-                        .iter()
-                        .copied()
-                        .filter(|id| dead_ids.contains(id))
-                        .collect();
-                    if hits.is_empty() {
-                        (true, Vec::new())
-                    } else {
-                        (true, vec![(key, hits)])
-                    }
-                },
-            );
-
-            for (key, ids) in stale {
-                for id in ids {
-                    index.remove(id, &key, now_ms);
-                }
-            }
+            index.purge_ids(dead_ids, now_ms);
         }
 
         for index in &self.hnsw_indexes {
@@ -263,16 +240,25 @@ impl Collection {
             .collect();
         if let Some(vector) = &params.vector
             && matching_hnsw.is_empty()
-            && params.text.is_none()
         {
-            return Err(DBError::Index {
-                name: self.name.clone(),
-                source: format!(
-                    "no HNSW index matches the query vector dimension {}",
-                    vector.len()
-                )
-                .into(),
-            });
+            if params.text.is_none() {
+                return Err(DBError::Index {
+                    name: self.name.clone(),
+                    source: format!(
+                        "no HNSW index matches the query vector dimension {}",
+                        vector.len()
+                    )
+                    .into(),
+                });
+            }
+            // A hybrid query keeps its BM25 hits, but the dropped vector half
+            // must stay visible: it usually means an embedding-model change.
+            log::warn!(
+                action = "Collection::search_ids",
+                collection = self.name,
+                dimension = vector.len();
+                "No HNSW index matches the query vector dimension; returning text-only results",
+            );
         }
         let prefilter_limit = options.prefilter_limit.min(4096);
         let selected = if let Some(filter) = &query.filter
@@ -474,10 +460,7 @@ impl Collection {
         let limit = limit
             .unwrap_or(Self::MAX_SEARCH_LIMIT)
             .min(Self::MAX_SEARCH_LIMIT);
-
-        let mut rt = self.filter_by_field(filter, &[], limit, order)?;
-        order.truncate(&mut rt, limit);
-        Ok(rt)
+        self.filter_by_field(filter, &[], limit, order)
     }
 
     /// Queries **every** document ID matching a filter, with no result bound.
@@ -508,8 +491,7 @@ impl Collection {
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
         // The internal scan uses `0` for "unbounded".
-        let rt = self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)?;
-        Ok(rt)
+        self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)
     }
 
     /// Gets a document by its ID.
@@ -668,13 +650,22 @@ impl Collection {
                     // a non-unique index (array field, or plain duplicates)
                     // maps under several keys, so `search` never returns the
                     // same document twice. `limit == 0` (composite operands,
-                    // `query_all_ids`) still collects everything.
+                    // `query_all_ids`) collects everything, and sorting one
+                    // vector once is far cheaper than a set insert per id.
+                    let keep = |id: &&DocumentId| candidates.is_none_or(|s| s.contains(*id));
+                    if limit == 0 {
+                        let mut rt = Vec::new();
+                        index.try_range_query_ids(filter, false, |ids| {
+                            rt.extend(ids.iter().filter(keep));
+                            true
+                        })?;
+                        rt.sort_unstable();
+                        rt.dedup();
+                        return Ok(rt);
+                    }
                     let mut rt: BTreeSet<DocumentId> = BTreeSet::new();
                     index.try_range_query_ids(filter, false, |ids| {
-                        for id in ids
-                            .iter()
-                            .filter(|id| candidates.is_none_or(|s| s.contains(id)))
-                        {
+                        for id in ids.iter().filter(keep) {
                             order.retain_id(&mut rt, *id, limit);
                         }
                         true
@@ -724,8 +715,8 @@ impl Collection {
                     }
                 }
 
-                // 每个操作数都以 limit = 0 求值，得到的是完整交集，
-                // 由调用方按 `order` 截断长度
+                // Every operand ran unbounded, so this is the complete
+                // intersection; trim it to the requested end.
                 let mut result: Vec<_> = rt.into_iter().collect();
                 result.sort_unstable();
                 order.truncate(&mut result, limit);
@@ -807,147 +798,53 @@ impl Collection {
         limit: usize,
         order: ScanOrder,
     ) -> Vec<DocumentId> {
-        if matches!(
+        normalize_id_query(&mut query);
+        let live = self.doc_ids.read();
+        let composite = matches!(
             query,
             RangeQuery::And(_) | RangeQuery::Or(_) | RangeQuery::Not(_)
-        ) {
-            normalize_id_query(&mut query);
-            let live = self.doc_ids.read();
-            if let Some(candidates) = candidates {
-                let mut result: Vec<_> = candidates
-                    .iter()
-                    .copied()
-                    .filter(|id| live.contains(id) && matches_id_query(&query, *id))
-                    .collect();
-                result.sort_unstable();
-                order.truncate(&mut result, limit);
-                return result;
-            }
-            let Some((lo, hi)) = id_envelope(&query) else {
-                return Vec::new();
-            };
-            return Self::collect_ids(
-                live.range(lo..=hi)
-                    .copied()
-                    .filter(|id| matches_id_query(&query, *id)),
-                None,
-                None,
-                limit,
-                order,
-            );
-        }
-        // 遍历方向由调用方的 `order` 决定，两端都能提前终止；
-        // 结果始终按 id 升序返回。
+        );
+        // Test each candidate when that is cheaper than walking the id set,
+        // and always for composites, whose envelope may span every id.
         if let Some(candidates) = candidates
-            && candidates.len() < self.doc_ids.read().len()
-            && !matches!(
-                query,
-                RangeQuery::And(_) | RangeQuery::Or(_) | RangeQuery::Not(_)
-            )
+            && (composite || candidates.len() < live.len())
         {
-            let live = self.doc_ids.read();
             let mut result: Vec<_> = candidates
                 .iter()
                 .copied()
-                .filter(|id| {
-                    live.contains(id)
-                        && match &query {
-                            RangeQuery::Eq(key) => id == key,
-                            RangeQuery::Gt(key) => id > key,
-                            RangeQuery::Ge(key) => id >= key,
-                            RangeQuery::Lt(key) => id < key,
-                            RangeQuery::Le(key) => id <= key,
-                            RangeQuery::Between(lo, hi) => lo <= id && id <= hi,
-                            RangeQuery::Include(ids) => ids.contains(id),
-                            _ => unreachable!(),
-                        }
-                })
+                .filter(|id| live.contains(id) && matches_id_query(&query, *id))
                 .collect();
             result.sort_unstable();
             order.truncate(&mut result, limit);
             return result;
         }
-        match query {
-            RangeQuery::Eq(id) => {
-                if self.doc_ids.read().contains(&id) && candidates.is_none_or(|s| s.contains(&id)) {
-                    vec![id]
-                } else {
-                    Vec::new()
-                }
-            }
-            RangeQuery::Gt(start_key) => {
-                let doc_ids = self.doc_ids.read();
-                let range = doc_ids.range((
-                    std::ops::Bound::Excluded(start_key),
-                    std::ops::Bound::Unbounded,
-                ));
-                Self::collect_ids(range.copied(), candidates, None, limit, order)
-            }
-            RangeQuery::Ge(start_key) => {
-                let doc_ids = self.doc_ids.read();
-                Self::collect_ids(
-                    doc_ids.range(start_key..).copied(),
-                    candidates,
-                    None,
-                    limit,
-                    order,
-                )
-            }
-            RangeQuery::Lt(end_key) => {
-                let doc_ids = self.doc_ids.read();
-                Self::collect_ids(
-                    doc_ids.range(..end_key).copied(),
-                    candidates,
-                    None,
-                    limit,
-                    order,
-                )
-            }
-            RangeQuery::Le(end_key) => {
-                let doc_ids = self.doc_ids.read();
-                Self::collect_ids(
-                    doc_ids.range(..=end_key).copied(),
-                    candidates,
-                    None,
-                    limit,
-                    order,
-                )
-            }
-            RangeQuery::Between(start_key, end_key) => {
-                if start_key > end_key {
-                    // 与 anda_db_btree 的语义一致：区间反转匹配空集，
-                    // 而不是让 BTreeSet::range 直接 panic
-                    return Vec::new();
-                }
-
-                let doc_ids = self.doc_ids.read();
-                Self::collect_ids(
-                    doc_ids.range(start_key..=end_key).copied(),
-                    candidates,
-                    None,
-                    limit,
-                    order,
-                )
-            }
-            RangeQuery::Include(mut ids) => {
-                // 与 anda_db_btree 的 Include 一致：重复的 key 只产出一次
-                // （那边用 BTreeSet 去重）。否则调用方传入的重复 id 会让同一个
-                // 文档重复出现，并且提前占满 limit。
-                ids.sort_unstable();
-                ids.dedup();
-                let doc_ids = self.doc_ids.read();
-                Self::collect_ids(
-                    ids.into_iter().filter(|id| doc_ids.contains(id)),
-                    candidates,
-                    None,
-                    limit,
-                    order,
-                )
-            }
-            RangeQuery::And(_) | RangeQuery::Or(_) | RangeQuery::Not(_) => {
-                unreachable!("composite id queries are evaluated above")
-            }
+        // Walks run in the caller's `order` and stop after `limit` hits;
+        // the result is ascending either way.
+        if let RangeQuery::Include(ids) = &query {
+            // Sorted and deduplicated above, like the B-tree's Include: a
+            // repeated id must not appear twice or fill the limit early.
+            return Self::collect_ids(
+                ids.iter().copied().filter(|id| live.contains(id)),
+                candidates,
+                None,
+                limit,
+                order,
+            );
         }
+        // An inverted `Between` has no envelope and matches nothing, as in
+        // anda_db_btree, instead of panicking in `BTreeSet::range`.
+        let Some((lo, hi)) = id_envelope(&query) else {
+            return Vec::new();
+        };
+        Self::collect_ids(
+            live.range(lo..=hi)
+                .copied()
+                .filter(|id| matches_id_query(&query, *id)),
+            candidates,
+            None,
+            limit,
+            order,
+        )
     }
 
     /// Walks the whole id set from the end `order` asks for and returns the

@@ -2,6 +2,25 @@
 use super::*;
 
 impl Collection {
+    /// Fetches the stored documents of `ids` in order, `io_concurrency` at a
+    /// time, bypassing the read cache: recovery and backfill scans must not
+    /// evict the hot working set.
+    pub(super) fn fetch_documents<I>(
+        &self,
+        ids: I,
+    ) -> impl futures::Stream<Item = (DocumentId, Result<DocumentOwned, DBError>)> + '_
+    where
+        I: IntoIterator<Item = DocumentId>,
+        I::IntoIter: 'static,
+    {
+        futures::stream::iter(ids)
+            .map(move |id| async move {
+                let result = self.storage.fetch(&Self::doc_path(id)).await;
+                (id, result.map(|(doc, _)| doc))
+            })
+            .buffered(self.io_concurrency())
+    }
+
     pub(super) fn remove_document_from_indexes(&self, id: DocumentId, doc: &Document, now_ms: u64) {
         for index in &self.btree_indexes {
             if let Some(value) = self.index_hooks.btree_index_value(index, doc)
@@ -44,7 +63,6 @@ impl Collection {
         id: DocumentId,
         doc: &Document,
         now_ms: u64,
-        _action: &'static str,
     ) -> Result<(), DBError> {
         for index in &self.btree_indexes {
             if let Some(value) = self.index_hooks.btree_index_value(index, doc)
@@ -79,12 +97,12 @@ impl Collection {
     ) -> Result<(), DBError> {
         loop {
             let sequence = self.next_mutation_sequence.fetch_add(1, Ordering::AcqRel);
-            let intent = MutationIntent {
-                purge_by_id: previous.is_none() && proposed.is_none(),
+            let intent = MutationIntentRef {
                 sequence,
                 document_id: id,
-                previous: previous.map(|document| document.clone().into()),
-                proposed: proposed.map(|document| document.clone().into()),
+                previous,
+                proposed,
+                purge_by_id: previous.is_none() && proposed.is_none(),
             };
             let path = Self::mutation_intent_path(sequence);
             match self.storage.create_intent(&path, &intent).await {
@@ -248,19 +266,10 @@ impl Collection {
 
         // Prefetch reads only. Apply recovered documents in id order, after
         // all historical postings have been removed, just as the serial path.
-        let mut current_documents = futures::stream::iter(affected_ids)
-            .map(|id| async move {
-                (
-                    id,
-                    self.storage
-                        .fetch::<DocumentOwned>(&Self::doc_path(id))
-                        .await,
-                )
-            })
-            .buffered(self.io_concurrency());
+        let mut current_documents = self.fetch_documents(affected_ids);
         while let Some((id, current)) = current_documents.next().await {
             match current {
-                Ok((current, _)) => {
+                Ok(current) => {
                     // Same tolerance as `repair_document`: a stored document
                     // that does not match the schema is skipped (leaving the
                     // bitmap untouched) instead of bricking every open.
@@ -281,12 +290,7 @@ impl Collection {
                     // objects during a partial flush; `reindex_document`
                     // removes it before the insert so unique indexes cannot
                     // reject their own surviving posting.
-                    self.reindex_document(
-                        id,
-                        &current,
-                        now_ms,
-                        "Collection::reconcile_mutation_intents",
-                    )?;
+                    self.reindex_document(id, &current, now_ms)?;
                     self.max_document_id.fetch_max(id, Ordering::AcqRel);
                     self.register_doc_id(id);
                 }
@@ -396,13 +400,10 @@ impl Collection {
                 .collect()
         };
         let mut recovered = 0usize;
-        for id in missing_in_bitmap {
-            match self
-                .storage
-                .fetch::<DocumentOwned>(&Self::doc_path(id))
-                .await
-            {
-                Ok((doc, _)) => {
+        let mut documents = self.fetch_documents(missing_in_bitmap);
+        while let Some((id, result)) = documents.next().await {
+            match result {
+                Ok(doc) => {
                     if self.repair_document(id, doc, now_ms)? {
                         recovered += 1;
                     }
@@ -458,21 +459,12 @@ impl Collection {
 
         let now_ms = unix_ms();
         let mut fixed = 0;
-        let mut documents = futures::stream::iter(
+        let mut documents = self.fetch_documents(
             check_point
                 .checked_add(1)
                 .into_iter()
-                .flat_map(|start| start..=scan_max),
-        )
-        .map(|id| async move {
-            (
-                id,
-                self.storage
-                    .fetch::<DocumentOwned>(&Self::doc_path(id))
-                    .await,
-            )
-        })
-        .buffered(self.io_concurrency());
+                .flat_map(move |start| start..=scan_max),
+        );
         while let Some((id, result)) = documents.next().await {
             match result {
                 Err(DBError::NotFound { .. }) => {}
@@ -487,7 +479,7 @@ impl Collection {
                 // A transient failure cannot be certified as recovered by a
                 // later checkpoint. Abort, leaving all durable recovery data.
                 Err(err) => return Err(err),
-                Ok((doc, _)) => {
+                Ok(doc) => {
                     if self.repair_document(id, doc, now_ms)? {
                         fixed += 1;
                     }
@@ -539,7 +531,7 @@ impl Collection {
             }
         };
 
-        self.reindex_document(id, &doc, now_ms, "Collection::repair_document")?;
+        self.reindex_document(id, &doc, now_ms)?;
         let is_new = self.register_doc_id(id);
 
         if is_new {

@@ -187,9 +187,9 @@ let results: Vec<Article> = collection.search_as(query).await?;
   without any BM25 index returns an error.
 - Vector search visits every HNSW index matching the query vector length.
   Vector-only search errors if none matches. In a mixed text/vector query,
-  the current implementation can return text results if no vector index
-  matches; explicitly check the intended index/dimension when vector recall
-  is required.
+  the current implementation returns text results and logs a warning if no
+  vector index matches; explicitly check the intended index/dimension when
+  vector recall is required.
 - Rankings are fused with `RRFReranker::default()` (`k = 60`) even when the
   `reranker` field is omitted. Use `RRFReranker::new(k)` for a positive custom
   value. Raw HNSW scores are distances (smaller is closer); RRF scores are

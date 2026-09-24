@@ -44,6 +44,9 @@ pub const DEFAULT_STREAM_LIMIT: u64 = 256 * 1024 * 1024;
 /// bytes and decoded reads under the same budget without changing the format.
 const INTERNAL_OBJECT_LIMIT: usize = 256 * 1024 * 1024;
 
+/// Objects fetched concurrently by [`Storage::list`].
+const LIST_FETCH_CONCURRENCY: usize = 8;
+
 /// Cached object bytes bound to the write generation observed by their fetch.
 struct CachedObject {
     bytes: Bytes,
@@ -73,12 +76,6 @@ struct InnerStorage {
     cache: Option<Cache<Path, Arc<CachedObject>>>,
     /// Per-path-hash generations stored alongside cache values.
     cache_write_seqs: [AtomicU64; CACHE_WRITE_SEQ_STRIPES],
-    /// Monotonic counter bumped on every `put` / `delete`.
-    ///
-    /// Retained as a storage-wide write counter for diagnostics and tests;
-    /// cache coherency uses the path-hash generations above so an unrelated
-    /// write does not invalidate every cached object.
-    write_seq: AtomicU64,
 }
 
 /// Only large owned codec buffers cross a blocking-task boundary. No storage
@@ -339,7 +336,7 @@ impl Storage {
     const METADATA_PATH: &'static str = "storage_meta.cbor";
 
     /// Constructs the full object store path for a given document path.
-    fn full_path(&self, path: &str) -> Path {
+    pub(crate) fn full_path(&self, path: &str) -> Path {
         // don't use Path::join to avoid percent encoded
         Path::from(format!("{}/{}", self.inner.base_path, path))
     }
@@ -531,7 +528,6 @@ impl Storage {
                 metadata,
                 cache,
                 cache_write_seqs: std::array::from_fn(|_| AtomicU64::new(0)),
-                write_seq: AtomicU64::new(0),
             }),
         })
     }
@@ -553,6 +549,12 @@ impl Storage {
     /// Returns the configured bucket overload size.
     pub fn bucket_overload_size(&self) -> usize {
         self.inner.metadata.config.bucket_overload_size
+    }
+
+    /// Returns the pre-compression byte budget of one document or metadata
+    /// object written through [`Storage::put`] / [`Storage::put_bytes`].
+    pub fn max_small_object_size(&self) -> usize {
+        self.inner.metadata.config.max_small_object_size
     }
 
     /// Returns a copy of the current storage statistics.
@@ -1099,17 +1101,7 @@ impl Storage {
             .delete(&path)
             .await
             .map_err(DBError::from)?;
-
-        self.inner.write_seq.fetch_add(1, Ordering::AcqRel);
-        self.inner.bump_cache_write_seq(&path);
-        if let Some(cache) = &self.inner.cache {
-            cache.remove(&path).await;
-        }
-
-        self.inner
-            .stats
-            .total_delete_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.published_delete(&path).await;
         Ok(())
     }
 
@@ -1151,21 +1143,23 @@ impl Storage {
         };
 
         // Use inner_fetch (bypassing cache) to avoid polluting the cache
-        // with every listed object during large scans.
+        // with every listed object during large scans. Fetches overlap but
+        // results keep the listing order.
         let storage = Storage::clone(self);
         (stream
-            .map_err(DBError::from)
-            .try_filter_map(move |meta| {
+            .map(move |meta| {
                 let this = storage.clone();
                 async move {
+                    let meta = meta.map_err(DBError::from)?;
                     let (bytes, version) = this.inner_fetch(&meta.location).await?;
                     let doc: T = from_reader(&bytes[..]).map_err(|err| DBError::Serialization {
                         name: this.inner.base_path.to_string(),
                         source: err.into(),
                     })?;
-                    Ok(Some((doc, version)))
+                    Ok((doc, version))
                 }
             })
+            .buffered(LIST_FETCH_CONCURRENCY)
             .boxed()) as _
     }
 
@@ -1195,6 +1189,8 @@ impl Storage {
     }
 
     /// Drops all objects under the storage's base path, effectively deleting the entire storage.
+    /// Successful deletions invalidate cached entries even if another deletion
+    /// fails; the first error is returned after the deletion stream finishes.
     pub async fn drop_data(&self) -> Result<(), DBError> {
         self.inner_drop_prefix(self.inner.base_path.clone()).await
     }
@@ -1202,41 +1198,34 @@ impl Storage {
     /// Drops all objects under the given path prefix (relative to the base path).
     ///
     /// Used to remove derived data such as a whole index directory. Cached
-    /// entries for the deleted objects are invalidated as well.
+    /// entries for the deleted objects are invalidated as well, even if another
+    /// deletion fails. The first error is returned after the stream finishes.
     pub async fn drop_prefix(&self, prefix: &str) -> Result<(), DBError> {
         self.inner_drop_prefix(self.full_path(prefix)).await
     }
 
+    /// Deletes every object under `prefix` through the store's bulk delete
+    /// stream (batched requests on cloud backends). Drain every result before
+    /// returning the first failure: later successes may already be durable
+    /// and need their caches invalidated like [`Storage::delete`].
     async fn inner_drop_prefix(&self, prefix: Path) -> Result<(), DBError> {
-        // 并发删除 prefix 下的所有对象，失败立即返回
-        self.inner
+        let locations = self
+            .inner
             .object_store
             .list(Some(&prefix))
-            .map_err(DBError::from)
-            .try_for_each_concurrent(16, move |meta| {
-                let inner = self.inner.clone();
-                async move {
-                    // 删除对象
-                    inner.object_store.delete(&meta.location).await?;
-                    // Bump the write sequence before invalidating the cache,
-                    // mirroring `Storage::delete`: a concurrent `inner_get`
-                    // that fetched the pre-delete bytes must not re-populate
-                    // the cache after our removal, or the deleted object would
-                    // keep being served from the cache.
-                    inner.write_seq.fetch_add(1, Ordering::AcqRel);
-                    inner.bump_cache_write_seq(&meta.location);
-                    if let Some(cache) = &inner.cache {
-                        cache.remove(&meta.location).await;
-                    }
-                    inner
-                        .stats
-                        .total_delete_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    Ok(())
+            .map_ok(|meta| meta.location)
+            .boxed();
+        let mut deleted = self.inner.object_store.delete_stream(locations);
+        let mut first_error = None;
+        while let Some(result) = deleted.next().await {
+            match result {
+                Ok(path) => self.inner.published_delete(&path).await,
+                Err(err) => {
+                    first_error.get_or_insert_with(|| DBError::from(err));
                 }
-            })
-            .await?;
-        Ok(())
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1253,6 +1242,19 @@ impl InnerStorage {
 
     fn bump_cache_write_seq(&self, path: &Path) {
         self.cache_write_seqs[Self::cache_write_seq_index(path)].fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a deletion that just became visible: bumps the generation
+    /// before evicting, so a concurrent `inner_get` that fetched the
+    /// pre-delete bytes cannot re-populate the cache afterwards.
+    async fn published_delete(&self, path: &Path) {
+        self.bump_cache_write_seq(path);
+        if let Some(cache) = &self.cache {
+            cache.remove(path).await;
+        }
+        self.stats
+            .total_delete_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Internal helper to put bytes, handling compression, size checks, cache invalidation, and stats updates.
@@ -1317,7 +1319,6 @@ impl InnerStorage {
     /// not served, and `inner_get` refuses to insert an entry across a
     /// concurrent bump); the eviction only reclaims memory earlier.
     async fn published_write(&self, path: &Path, bytes: u64) {
-        self.write_seq.fetch_add(1, Ordering::AcqRel);
         self.bump_cache_write_seq(path);
         if let Some(cache) = &self.cache {
             cache.remove(path).await;
@@ -1575,10 +1576,9 @@ impl futures::io::AsyncWrite for SingleWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 获取 self 的可变引用
         let this = self.as_mut().get_mut();
 
-        // 如果没有正在进行的 flush 操作且 buffer 不为空，则创建一个
+        // Start one PUT for the buffered bytes unless one is already running.
         if this.flushing.is_none() && !this.buf.is_empty() {
             let buf = std::mem::take(&mut this.buf);
             let inner = this.inner.clone();
@@ -1590,7 +1590,6 @@ impl futures::io::AsyncWrite for SingleWriter {
             ));
         }
 
-        // 如果有正在进行的 flush 操作，轮询它
         if let Some(fut) = &mut this.flushing {
             match fut.poll_unpin(cx) {
                 Poll::Ready(Ok(v)) => {
@@ -1605,7 +1604,7 @@ impl futures::io::AsyncWrite for SingleWriter {
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            // 没有需要 flush 的数据
+            // Nothing buffered.
             Poll::Ready(Ok(()))
         }
     }
@@ -1803,113 +1802,9 @@ mod tests {
 
     use super::*;
     use crate::unix_ms;
-    use async_trait::async_trait;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, memory::InMemory,
-    };
-    use std::{
-        fmt,
-        sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
-    };
+    use anda_object_store::{FaultGate, FaultKind, FaultOp, FaultRule, FaultStore};
+    use object_store::memory::InMemory;
     use tokio::io::AsyncReadExt;
-
-    #[derive(Debug)]
-    struct FailMetadataPutStore {
-        inner: Arc<InMemory>,
-        metadata_path: Path,
-        fail_next: AtomicBool,
-    }
-
-    impl FailMetadataPutStore {
-        fn new(metadata_path: Path) -> Self {
-            Self {
-                inner: Arc::new(InMemory::new()),
-                metadata_path,
-                fail_next: AtomicBool::new(false),
-            }
-        }
-
-        fn fail_next_metadata_put(&self) {
-            self.fail_next.store(true, AtomicOrdering::Release);
-        }
-    }
-
-    impl fmt::Display for FailMetadataPutStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("FailMetadataPutStore")
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for FailMetadataPutStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> ObjectStoreResult<PutResult> {
-            if location == &self.metadata_path && self.fail_next.swap(false, AtomicOrdering::AcqRel)
-            {
-                return Err(object_store::Error::Generic {
-                    store: "fail_metadata_put",
-                    source: "injected metadata put failure".into(),
-                });
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> ObjectStoreResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, ObjectStoreResult<Path>>,
-        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> ObjectStoreResult<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> ObjectStoreResult<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
 
     // 创建一个测试用的存储实例
     async fn create_test_storage() -> Storage {
@@ -1963,10 +1858,8 @@ mod tests {
     #[tokio::test]
     async fn test_storage_metadata_failed_put_can_retry_same_checkpoint_and_timestamp() {
         let path = "metadata_retry";
-        let object_store = Arc::new(FailMetadataPutStore::new(Path::from(format!(
-            "{path}/{}",
-            Storage::METADATA_PATH
-        ))));
+        let (store, faults) = FaultStore::wrap(InMemory::new());
+        let object_store = Arc::new(store);
         let config = StorageConfig {
             compress_level: 0,
             ..Default::default()
@@ -1975,7 +1868,10 @@ mod tests {
             .await
             .unwrap();
 
-        object_store.fail_next_metadata_put();
+        faults.push_rule(FaultRule::fail_once(
+            FaultOp::Put,
+            format!("{path}/{}", Storage::METADATA_PATH),
+        ));
         assert!(storage.store_metadata(42, 123_456).await.is_err());
         let failed_stats = storage.stats();
         assert_eq!(failed_stats.check_point, 0);
@@ -2501,7 +2397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drop_prefix_updates_write_seq_and_delete_count() {
+    async fn test_drop_prefix_updates_cache_generation_and_delete_count() {
         let storage = create_test_storage().await;
 
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2513,19 +2409,75 @@ mod tests {
         storage.create("del/b", &T { k: 2 }).await.unwrap();
         let _ = storage.get::<T>("del/a").await.unwrap();
 
-        let seq_before = storage.inner.write_seq.load(Ordering::Acquire);
+        let path = storage.full_path("del/a");
+        let seq_before = storage.inner.cache_write_seq(&path);
         let deletes_before = storage.stats().total_delete_count;
         storage.drop_prefix("del/").await.unwrap();
 
-        // Each deleted object bumps the write sequence (so a racing get
+        // Each deleted object bumps its cache generation (so a racing get
         // cannot re-populate the cache with pre-delete bytes) and the delete
         // counter.
-        assert!(storage.inner.write_seq.load(Ordering::Acquire) >= seq_before + 2);
+        assert!(storage.inner.cache_write_seq(&path) > seq_before);
         assert_eq!(storage.stats().total_delete_count, deletes_before + 2);
         assert!(matches!(
             storage.get::<T>("del/a").await,
             Err(DBError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_drop_prefix_invalidates_successful_deletes_after_an_error() {
+        let backing = Arc::new(InMemory::new());
+        let (inner, inner_faults) = FaultStore::wrap(backing.clone());
+        let (store, faults) = FaultStore::wrap(inner);
+        let storage = Storage::connect(
+            "partial_delete".into(),
+            Arc::new(store),
+            StorageConfig {
+                compress_level: 0,
+                ..StorageConfig::default().with_cache_max_bytes(1024 * 1024)
+            },
+        )
+        .await
+        .unwrap();
+        storage.create("del/a", &1_u64).await.unwrap();
+        storage.create("del/b", &2_u64).await.unwrap();
+        assert_eq!(storage.get::<u64>("del/b").await.unwrap().0, 2);
+        let deletes_before = storage.stats().total_delete_count;
+
+        // Hold A before its failure so B is deleted while the ordered bulk
+        // stream still waits for A. B's success is yielded after A's error.
+        let gate = FaultGate::new();
+        faults.push_rule(FaultRule {
+            kind: FaultKind::PauseBefore(gate.clone()),
+            ..FaultRule::fail_once(FaultOp::Delete, "del/a")
+        });
+        inner_faults.push_rule(FaultRule::fail_once(FaultOp::Delete, "del/a"));
+        let mut deleting = Box::pin(storage.drop_prefix("del/"));
+        assert!(futures::poll!(deleting.as_mut()).is_pending());
+        assert!(matches!(
+            backing.head(&storage.full_path("del/b")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        gate.release();
+        assert!(matches!(deleting.await, Err(DBError::Storage { .. })));
+
+        assert_eq!(storage.get::<u64>("del/a").await.unwrap().0, 1);
+        assert!(matches!(
+            storage.get::<u64>("del/b").await,
+            Err(DBError::NotFound { .. })
+        ));
+        assert_eq!(storage.stats().total_delete_count, deletes_before + 1);
+
+        // A retry cannot invalidate B by listing it: B is already gone.
+        storage.drop_prefix("del/").await.unwrap();
+        assert_eq!(storage.stats().total_delete_count, deletes_before + 2);
+        for path in ["del/a", "del/b"] {
+            assert!(matches!(
+                storage.get::<u64>(path).await,
+                Err(DBError::NotFound { .. })
+            ));
+        }
     }
 
     #[tokio::test]

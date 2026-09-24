@@ -10,26 +10,13 @@ use anda_db::{
     },
     storage::{PutMode, Storage, StorageConfig, StorageStats},
 };
-use async_trait::async_trait;
+use anda_object_store::{FaultOp, FaultRule, FaultStore};
 use bytes::Bytes;
 use croaring::{Portable, Treemap};
-use futures::{StreamExt, io::AsyncWriteExt as FuturesAsyncWriteExt, stream::BoxStream};
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as ObjectStoreResult, memory::InMemory, path::Path,
-};
+use futures::{StreamExt, io::AsyncWriteExt as FuturesAsyncWriteExt};
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    fmt,
-    io::IoSlice,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::BTreeMap, io::IoSlice, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -138,97 +125,6 @@ fn schema_v2() -> Result<Schema, SchemaError> {
         FieldType::Option(Box::new(FieldType::Text)),
     )?)?;
     builder.build()
-}
-
-#[derive(Debug)]
-struct FailPutStore {
-    inner: Arc<InMemory>,
-    fail_suffix: String,
-    fail_next_put: Arc<AtomicBool>,
-}
-
-impl FailPutStore {
-    fn new(fail_suffix: impl Into<String>) -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()),
-            fail_suffix: fail_suffix.into(),
-            fail_next_put: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn fail_next_put(&self) {
-        self.fail_next_put.store(true, Ordering::Release);
-    }
-}
-
-impl fmt::Display for FailPutStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FailPutStore")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for FailPutStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        if location.to_string().ends_with(&self.fail_suffix)
-            && self.fail_next_put.swap(false, Ordering::AcqRel)
-        {
-            return Err(object_store::Error::Generic {
-                store: "fail_put",
-                source: "injected put failure".into(),
-            });
-        }
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
 }
 
 async fn create_indexed_collection(db: &AndaDB, name: &str) -> Result<Arc<Collection>, DBError> {
@@ -914,7 +810,8 @@ async fn collection_handles_corrupt_and_stale_ids_metadata() -> Result<(), DBErr
 
 #[tokio::test]
 async fn collection_rolls_back_indexes_when_document_put_fails() -> Result<(), DBError> {
-    let add_store = Arc::new(FailPutStore::new("data/1.cbor"));
+    let (add_store, add_store_faults) = FaultStore::wrap(InMemory::new());
+    let add_store = Arc::new(add_store);
     let add_db =
         AndaDB::create(add_store.clone(), db_config("coverage_add_rollback", None)).await?;
     let add_collection = add_db
@@ -937,7 +834,7 @@ async fn collection_rolls_back_indexes_when_document_put_fails() -> Result<(), D
             },
         )
         .await?;
-    add_store.fail_next_put();
+    add_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "data/1.cbor"));
     assert!(matches!(
         add_collection
             .add_from(&named_doc(
@@ -973,7 +870,8 @@ async fn collection_rolls_back_indexes_when_document_put_fails() -> Result<(), D
             .is_empty()
     );
 
-    let update_store = Arc::new(FailPutStore::new("data/1.cbor"));
+    let (update_store, update_store_faults) = FaultStore::wrap(InMemory::new());
+    let update_store = Arc::new(update_store);
     let update_db = AndaDB::create(
         update_store.clone(),
         db_config("coverage_update_rollback", None),
@@ -1007,7 +905,7 @@ async fn collection_rolls_back_indexes_when_document_put_fails() -> Result<(), D
             &[0.1, 0.2, 0.3, 0.4],
         ))
         .await?;
-    update_store.fail_next_put();
+    update_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "data/1.cbor"));
     assert!(matches!(
         update_collection
             .update(
@@ -1186,7 +1084,8 @@ async fn database_metadata_and_close_edge_paths() -> Result<(), DBError> {
     stats_collection.add_from(&doc(0, "stats", 1)).await?;
     assert!(stats_db.stats().total_put_count > 0);
 
-    let close_store = Arc::new(FailPutStore::new("docs/meta.cbor"));
+    let (close_store, close_store_faults) = FaultStore::wrap(InMemory::new());
+    let close_store = Arc::new(close_store);
     let close_db = AndaDB::create(
         close_store.clone(),
         db_config("coverage_close_first_err", None),
@@ -1200,7 +1099,7 @@ async fn database_metadata_and_close_edge_paths() -> Result<(), DBError> {
         )
         .await?;
     close_collection.add_from(&doc(0, "close", 1)).await?;
-    close_store.fail_next_put();
+    close_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "docs/meta.cbor"));
     assert!(matches!(
         close_db.close().await,
         Err(DBError::Storage { .. })
@@ -1363,7 +1262,8 @@ async fn database_lock_schema_autoflush_and_extension_paths() -> Result<(), DBEr
 
 #[tokio::test]
 async fn database_and_collection_failed_put_paths_are_reported() -> Result<(), DBError> {
-    let close_store = Arc::new(FailPutStore::new("db_meta.cbor"));
+    let (close_store, close_store_faults) = FaultStore::wrap(InMemory::new());
+    let close_store = Arc::new(close_store);
     let close_db = AndaDB::create(
         close_store.clone(),
         db_config("coverage_fail_db_close", None),
@@ -1372,13 +1272,14 @@ async fn database_and_collection_failed_put_paths_are_reported() -> Result<(), D
     // `flush_metadata` writes `db_meta.cbor` only when the metadata changed,
     // so give the close something to persist before failing that write.
     close_db.set_extension("marker".to_string(), Fv::U64(1));
-    close_store.fail_next_put();
+    close_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "db_meta.cbor"));
     assert!(matches!(
         close_db.close().await,
         Err(DBError::Storage { .. })
     ));
 
-    let collection_close_store = Arc::new(FailPutStore::new("docs/meta.cbor"));
+    let (collection_close_store, collection_close_store_faults) = FaultStore::wrap(InMemory::new());
+    let collection_close_store = Arc::new(collection_close_store);
     let collection_close_db = AndaDB::create(
         collection_close_store.clone(),
         db_config("coverage_fail_collection_close", None),
@@ -1392,13 +1293,14 @@ async fn database_and_collection_failed_put_paths_are_reported() -> Result<(), D
         )
         .await?;
     collection.add_from(&doc(0, "close-fail", 1)).await?;
-    collection_close_store.fail_next_put();
+    collection_close_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "docs/meta.cbor"));
     assert!(matches!(
         collection.close().await,
         Err(DBError::Storage { .. })
     ));
 
-    let flush_store = Arc::new(FailPutStore::new("docs/meta.cbor"));
+    let (flush_store, flush_store_faults) = FaultStore::wrap(InMemory::new());
+    let flush_store = Arc::new(flush_store);
     let flush_db = AndaDB::create(
         flush_store.clone(),
         db_config("coverage_fail_db_flush", None),
@@ -1412,19 +1314,20 @@ async fn database_and_collection_failed_put_paths_are_reported() -> Result<(), D
         )
         .await?;
     flush_collection.add_from(&doc(0, "flush-fail", 2)).await?;
-    flush_store.fail_next_put();
+    flush_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "docs/meta.cbor"));
     assert!(matches!(
         flush_db.flush().await,
         Err(DBError::Storage { .. })
     ));
 
-    let auto_store = Arc::new(FailPutStore::new("db_meta.cbor"));
+    let (auto_store, auto_store_faults) = FaultStore::wrap(InMemory::new());
+    let auto_store = Arc::new(auto_store);
     let auto_db = AndaDB::create(
         auto_store.clone(),
         db_config("coverage_fail_auto_flush", None),
     )
     .await?;
-    auto_store.fail_next_put();
+    auto_store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "db_meta.cbor"));
     let cancel = CancellationToken::new();
     let auto_task_db = auto_db.clone();
     let auto_task_cancel = cancel.clone();
@@ -1878,12 +1781,13 @@ async fn flush_is_a_no_op_in_read_only_mode() -> Result<(), DBError> {
 /// unspent), and the next flush that does carry a change must hit it.
 #[tokio::test]
 async fn database_flush_skips_unchanged_metadata() -> Result<(), DBError> {
-    let store = Arc::new(FailPutStore::new("db_meta.cbor"));
+    let (store, store_faults) = FaultStore::wrap(InMemory::new());
+    let store = Arc::new(store);
     let db = AndaDB::create(store.clone(), db_config("db_meta_skip", None)).await?;
     db.set_extension("marker".to_string(), Fv::U64(1));
     db.flush().await?;
 
-    store.fail_next_put();
+    store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "db_meta.cbor"));
     db.flush().await?;
     db.flush().await?;
 
@@ -1899,7 +1803,7 @@ async fn database_flush_skips_unchanged_metadata() -> Result<(), DBError> {
         db.set_extension_with("marker".to_string(), |_| None)
             .is_none()
     );
-    store.fail_next_put();
+    store_faults.push_rule(FaultRule::fail_once(FaultOp::Put, "db_meta.cbor"));
     db.flush().await?;
     Ok(())
 }

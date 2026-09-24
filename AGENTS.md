@@ -1,9 +1,3 @@
-<!--
-  CLAUDE.md and AGENTS.md are the same document, kept byte-identical so every
-  agent harness reads the same instructions. CLAUDE.md is the source: edit it,
-  then run `make sync-agents-doc`. `make lint` fails if the two drift apart.
--->
-
 # AndaDB - AI Agent Database
 
 AndaDB is a modular Rust workspace for embedded AI memory systems. The core
@@ -12,6 +6,21 @@ retrieval, backed by `object_store`. `anda_kip` is the protocol SDK;
 `anda_cognitive_nexus` is the stateful KIP executor over AndaDB. The independent
 TypeScript engine in `ts/kip-do` uses SQLite-backed Cloudflare Durable Objects.
 
+## Agent Workflow
+
+- Work independently as the current agent. Do not spawn or delegate work to
+  subagents.
+- Before editing, run `git status --short`, confirm the current branch, and
+  inspect existing diffs in the files you intend to change. Preserve the user's
+  existing work; do not overwrite or revert unrelated files or changes.
+- Use `rg` for search and focused reads before editing. Do not assume module
+  boundaries from filenames alone.
+- Before committing, review the final diff and stage only the files or hunks
+  belonging to the requested task.
+- At completion, briefly summarize the changes, the checks actually run and
+  their results, and any checks not run or blocked. Never report an unrun check
+  as passing. When committing, include the branch and commit ID in the summary.
+
 ## Start with the local skill
 
 Before writing Rust code that uses AndaDB, or changing its API examples, read
@@ -19,12 +28,12 @@ Before writing Rust code that uses AndaDB, or changing its API examples, read
 template and runnable quick start; keep examples there instead of duplicating
 them in this document. Read supporting references only as needed:
 
-| Task | Reference |
-| --- | --- |
-| Lifecycle, CRUD, indexes, search, pagination | [Core API](skills/anda-db/references/anda_db_quick_ref.md) |
-| Derives, type mapping, schema upgrades, serialization | [Schemas and CBOR](skills/anda-db/references/schema_and_cbor.md) |
+| Task                                                    | Reference                                                                 |
+| ------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Lifecycle, CRUD, indexes, search, pagination            | [Core API](skills/anda-db/references/anda_db_quick_ref.md)                |
+| Derives, type mapping, schema upgrades, serialization   | [Schemas and CBOR](skills/anda-db/references/schema_and_cbor.md)          |
 | Backends, encryption, cache budgets, recovery, shutdown | [Storage and recovery](skills/anda-db/references/storage_and_recovery.md) |
-| KIP, Nexus, Brain host integration, cross-engine checks | [KIP and Cognitive Nexus](skills/anda-db/references/kip_and_nexus.md) |
+| KIP, Nexus, Brain host integration, cross-engine checks | [KIP and Cognitive Nexus](skills/anda-db/references/kip_and_nexus.md)     |
 
 Use the checked-out implementations and manifests as the authority when prose
 or older examples disagree. Update affected documentation alongside public API
@@ -118,16 +127,16 @@ Run commands from the repository root unless stated otherwise. Choose checks
 for the changed behavior; documentation-only edits need link/consistency
 checks and compilation of changed runnable examples, not unrelated full suites.
 
-| Scope | Command |
-| --- | --- |
-| Rust workspace compile | `cargo check --workspace --all-features` |
-| Rust workspace tests | `cargo test --workspace --all-features` |
-| Core database unit and integration tests | `cargo test -p anda_db --all-features` |
+| Scope                                        | Command                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------ |
+| Rust workspace compile                       | `cargo check --workspace --all-features`                           |
+| Rust workspace tests                         | `cargo test --workspace --all-features`                            |
+| Core database unit and integration tests     | `cargo test -p anda_db --all-features`                             |
 | Core crash recovery and format compatibility | `cargo test -p anda_db --test crash_recovery --test format_compat` |
-| Schema and derive changes | `cargo test -p anda_db_schema -p anda_db_derive` |
-| KIP SDK and Rust executor | `cargo test -p anda_kip -p anda_cognitive_nexus` |
-| TypeScript typecheck and tests | `make test-ts` |
-| Formatting, Clippy, agent-doc consistency | `make lint` |
+| Schema and derive changes                    | `cargo test -p anda_db_schema -p anda_db_derive`                   |
+| KIP SDK and Rust executor                    | `cargo test -p anda_kip -p anda_cognitive_nexus`                   |
+| TypeScript typecheck and tests               | `make test-ts`                                                     |
+| Formatting, Clippy, agent-doc consistency    | `make lint`                                                        |
 
 `make lint` runs `cargo fmt` and can change files. For a formatting check
 without edits, use `cargo fmt --all -- --check`.
@@ -170,16 +179,3 @@ When the Rust KIP parser changes, also run `pnpm run build:oracle-wasm` from
 requires wasm-pack and the WASM target toolchain. `pnpm run codegen` does not
 rebuild the oracle. Then run `make test-ts` from the repository root. CI
 regenerates the TypeScript files and rejects drift.
-
-## Maintaining these instructions
-
-Edit `CLAUDE.md`, then run:
-
-```bash
-make sync-agents-doc
-make check-agents-doc
-```
-
-Keep `AGENTS.md` byte-identical. For detailed API examples, update the local
-skill; for design and implementation details, use the
-[technical documentation index](docs/README.md).

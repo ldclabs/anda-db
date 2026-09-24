@@ -15,33 +15,58 @@ impl Collection {
         self.get_extension(key).and_then(|v| v.deserialized().ok())
     }
 
+    /// Inserts an extension only if the persisted metadata snapshot still
+    /// fits the storage object budget, and bumps the version so the next
+    /// flush persists it. An oversized value left in memory would fail that
+    /// flush and poison the handle.
+    fn insert_extension(
+        &self,
+        meta: &mut CollectionMetadata,
+        key: String,
+        value: FieldValue,
+    ) -> Result<Option<FieldValue>, DBError> {
+        // Flush overlays live counters (ids, hit counts, save time) on the
+        // snapshot; each CBOR u64 can grow by at most 8 bytes.
+        const LIVE_STATS_SLACK: u64 = 64;
+        value.validate_complexity()?;
+        let limit = self.storage.max_small_object_size();
+        let old = meta.extensions.insert(key.clone(), value);
+        let size = cbor2::serialized_size(&*meta).map_err(|source| DBError::Serialization {
+            name: self.name.clone(),
+            source: source.into(),
+        })?;
+        if size.saturating_add(LIVE_STATS_SLACK) > limit as u64 {
+            match old {
+                Some(old) => meta.extensions.insert(key, old),
+                None => meta.extensions.remove(&key),
+            };
+            return Err(DBError::PayloadTooLarge {
+                path: self.storage.full_path(Self::METADATA_PATH).to_string(),
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+                limit,
+            });
+        }
+        meta.stats.version += 1;
+        Ok(old)
+    }
+
     /// Sets a user-defined extension key-value pair.
     /// The change is persisted on the next `flush()`.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
-    /// Values that fail [`FieldValue::validate_complexity`] are dropped with a warning.
+    /// Values that fail [`FieldValue::validate_complexity`] or would push the
+    /// metadata past the storage object budget are dropped with a warning.
     pub fn set_extension(&self, key: String, value: FieldValue) {
-        if let Err(err) = value.validate_complexity() {
-            log::warn!(
-                action = "Collection::set_extension",
-                collection = self.name,
-                key = key;
-                "Dropping extension value that exceeds complexity limits: {err:?}",
-            );
-            return;
-        }
         let mut meta = self.metadata.write();
-        if let Err(err) = self.ensure_mutable() {
+        let result = self
+            .ensure_mutable()
+            .and_then(|()| self.insert_extension(&mut meta, key, value));
+        if let Err(err) = result {
             log::warn!(
                 action = "Collection::set_extension",
                 collection = self.name;
-                "Ignoring extension mutation on inactive handle: {err:?}",
+                "Dropping extension value: {err:?}",
             );
-            return;
         }
-        meta.extensions.insert(key, value);
-        // Bump the version so the next `flush()` persists the change;
-        // `store_metadata` skips the write when the version is unchanged.
-        meta.stats.version += 1;
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value.
@@ -79,7 +104,7 @@ impl Collection {
     ///
     /// # Notes
     /// The change is persisted to storage on the next `flush()` call.
-    /// Values that fail [`FieldValue::validate_complexity`] are dropped with a warning.
+    /// Values rejected like in [`Collection::set_extension`] are dropped with a warning.
     pub fn set_extension_with<F>(&self, key: String, f: F) -> Option<FieldValue>
     where
         F: FnOnce(Option<&FieldValue>) -> Option<FieldValue>,
@@ -88,22 +113,17 @@ impl Collection {
         if self.ensure_mutable().is_err() {
             return None;
         }
-        let old_value = meta.extensions.get(&key);
-        let new_value = f(old_value);
-        if let Some(value) = new_value {
-            if let Err(err) = value.validate_complexity() {
+        let value = f(meta.extensions.get(&key))?;
+        match self.insert_extension(&mut meta, key, value) {
+            Ok(old) => old,
+            Err(err) => {
                 log::warn!(
                     action = "Collection::set_extension_with",
-                    collection = self.name,
-                    key = key;
-                    "Dropping extension value that exceeds complexity limits: {err:?}",
+                    collection = self.name;
+                    "Dropping extension value: {err:?}",
                 );
-                return None;
+                None
             }
-            meta.stats.version += 1;
-            meta.extensions.insert(key, value)
-        } else {
-            None
         }
     }
 
@@ -119,44 +139,30 @@ impl Collection {
         }
         let old_value = meta.extensions.get(&key);
         let value = f(old_value.and_then(|v| v.clone().deserialized().ok()))?;
-        let value = match FieldValue::serialized(&value, None) {
-            Ok(value) => value,
+        let inserted = FieldValue::serialized(&value, None)
+            .map_err(DBError::from)
+            .and_then(|value| self.insert_extension(&mut meta, key, value));
+        match inserted {
+            Ok(old) => old.and_then(|v| v.deserialized().ok()),
             Err(err) => {
                 log::warn!(
                     action = "Collection::set_extension_from_with",
-                    collection = self.name,
-                    key = key;
-                    "Dropping extension value that failed to serialize: {err:?}",
+                    collection = self.name;
+                    "Dropping extension value: {err:?}",
                 );
-                return None;
+                None
             }
-        };
-        if let Err(err) = value.validate_complexity() {
-            log::warn!(
-                action = "Collection::set_extension_from_with",
-                collection = self.name,
-                key = key;
-                "Dropping extension value that exceeds complexity limits: {err:?}",
-            );
-            return None;
         }
-        meta.stats.version += 1;
-        meta.extensions
-            .insert(key, value)
-            .and_then(|v| v.deserialized().ok())
     }
 
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    /// Returns [`DBError::PayloadTooLarge`] without changing anything when
+    /// the value would push the metadata past the storage object budget.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
         let _operation_lease = self.mutation_lease().await?;
-        value.validate_complexity()?;
-
         self.guarded("Collection::save_extension", async {
-            self.update_metadata(|meta| {
-                meta.extensions.insert(key, value);
-                meta.stats.version += 1;
-            });
+            self.update_metadata(|meta| self.insert_extension(meta, key, value))?;
             // Persist the metadata object directly (a single small put)
             // instead of running a full flush: extensions live only in the
             // metadata object, and the full flush caused write amplification

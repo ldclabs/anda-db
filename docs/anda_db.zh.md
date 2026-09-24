@@ -591,7 +591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 控制扩展字段体积
 
-数据库与集合的 extensions 应始终保持轻量，因为它们驻留在会被高频读取的元数据对象中。
+数据库与集合的 extensions 应始终保持轻量，因为它们驻留在会被高频读取的元数据对象中。若某个值会让该对象超过 `max_small_object_size`，写入会在任何改动之前被拒绝（`save_extension` 返回 `PayloadTooLarge`，`set_extension` 记录警告后丢弃），而不是让之后的每次刷盘都失败。
 
 ### 制定明确的刷盘策略
 

@@ -193,6 +193,19 @@ struct MutationIntent {
     purge_by_id: bool,
 }
 
+/// The write-side form of [`MutationIntent`]: identical fields in the same
+/// order, borrowing the documents instead of cloning them. `Document`
+/// serializes exactly like `DocumentOwned`, so the encoded bytes match.
+#[derive(Serialize)]
+struct MutationIntentRef<'a> {
+    sequence: u64,
+    document_id: DocumentId,
+    previous: Option<&'a Document>,
+    proposed: Option<&'a Document>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    purge_by_id: bool,
+}
+
 /// Durable index references, independent from staged index creation. A
 /// metadata-only write can remove references but cannot publish new ones.
 #[derive(Default)]
@@ -878,26 +891,25 @@ impl Collection {
     /// This includes up-to-date statistics about the collection.
     pub fn metadata(&self) -> CollectionMetadata {
         let mut metadata = self.metadata.read().clone();
-        metadata.stats.max_document_id = self.max_document_id.load(Ordering::Relaxed);
-        metadata.stats.num_documents = self.doc_ids.read().len() as u64;
-        metadata.stats.search_count = self.search_count.load(Ordering::Relaxed);
-        metadata.stats.get_count = self.get_count.load(Ordering::Relaxed);
-        metadata.stats.read_only = self.read_only.load(Ordering::Relaxed)
-            || self.database_read_only.load(Ordering::Relaxed);
+        self.overlay_live_stats(&mut metadata.stats);
         metadata
     }
 
     /// Gets current statistics about the collection
     pub fn stats(&self) -> CollectionStats {
-        let mut stats = { self.metadata.read().stats.clone() };
+        let mut stats = self.metadata.read().stats.clone();
+        self.overlay_live_stats(&mut stats);
+        stats
+    }
+
+    /// Replaces the counters kept outside the metadata lock with their live
+    /// values.
+    fn overlay_live_stats(&self, stats: &mut CollectionStats) {
         stats.max_document_id = self.max_document_id.load(Ordering::Relaxed);
         stats.num_documents = self.doc_ids.read().len() as u64;
         stats.search_count = self.search_count.load(Ordering::Relaxed);
         stats.get_count = self.get_count.load(Ordering::Relaxed);
-        stats.read_only = self.read_only.load(Ordering::Relaxed)
-            || self.database_read_only.load(Ordering::Relaxed);
-
-        stats
+        stats.read_only = self.is_read_only();
     }
 
     /// Returns the storage-level I/O statistics for this collection.

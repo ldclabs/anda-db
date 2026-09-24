@@ -1,4 +1,4 @@
-//! Regression coverage for the 2026-09-06 core review.
+//! Regression coverage for the 2026-09-06 and 2026-09-24 core reviews.
 use anda_db::{
     collection::{Collection, CollectionConfig},
     database::{AndaDB, DBConfig},
@@ -12,7 +12,7 @@ use anda_db::{
 use anda_object_store::{FaultGate, FaultKind, FaultOp, FaultRule, FaultStore};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone, Serialize, Deserialize, AndaDBSchema)]
@@ -1087,4 +1087,141 @@ async fn document_mapping_ignores_non_encoding_schema_metadata() {
         c.get(id).await.unwrap().get_field("value"),
         Some(&Fv::Text("same bytes".into()))
     );
+}
+
+// 2026-09-24 review.
+
+fn small_object_cfg(name: &str) -> DBConfig {
+    DBConfig {
+        name: name.into(),
+        storage: StorageConfig {
+            compress_level: 0,
+            max_small_object_size: 64 * 1024,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn oversized_value() -> Fv {
+    Fv::Bytes(vec![7; 128 * 1024])
+}
+
+/// An extension that cannot fit the metadata object used to stay in memory,
+/// failing every later `flush`/`close` of the whole database.
+#[tokio::test]
+async fn oversized_database_extension_is_rejected_without_blocking_flush() {
+    let db = AndaDB::connect(Arc::new(InMemory::new()), small_object_cfg("extdb"))
+        .await
+        .unwrap();
+    let err = db
+        .save_extension("big".into(), oversized_value())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DBError::PayloadTooLarge { .. }), "{err:?}");
+    db.set_extension("big".into(), oversized_value());
+    assert!(
+        db.set_extension_with("big".into(), |_| Some(oversized_value()))
+            .is_none()
+    );
+    assert!(db.get_extension("big").is_none());
+
+    db.save_extension("small".into(), Fv::U64(1)).await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+}
+
+/// The collection-level variant poisoned the handle on its next flush.
+#[tokio::test]
+async fn oversized_collection_extension_is_rejected_without_poisoning() {
+    let db = AndaDB::connect(Arc::new(InMemory::new()), small_object_cfg("extcol"))
+        .await
+        .unwrap();
+    let c = plain(&db).await;
+    let err = c
+        .save_extension("big".into(), oversized_value())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DBError::PayloadTooLarge { .. }), "{err:?}");
+    c.set_extension("big".into(), oversized_value());
+    assert!(c.get_extension("big").is_none());
+
+    c.add_from(&doc("k", "body")).await.unwrap();
+    c.flush(unix_ms()).await.unwrap();
+    assert!(!c.is_poisoned());
+    db.close().await.unwrap();
+}
+
+/// Every database flush used to rewrite `storage_meta.cbor`, even with
+/// nothing changed and even while the database was read-only. Changed
+/// database metadata is still persisted by a read-only flush.
+#[tokio::test]
+async fn idle_database_flushes_write_nothing() {
+    let db = AndaDB::connect(Arc::new(InMemory::new()), cfg())
+        .await
+        .unwrap();
+    let c = plain(&db).await;
+    c.add_from(&doc("k", "body")).await.unwrap();
+    db.flush().await.unwrap();
+
+    let puts = db.stats().total_put_count;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        db.flush().await.unwrap();
+    }
+    assert_eq!(db.stats().total_put_count, puts);
+
+    db.set_read_only(true);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    db.flush().await.unwrap();
+    assert_eq!(db.stats().total_put_count, puts);
+
+    db.set_extension("pending".into(), Fv::U64(1));
+    db.flush().await.unwrap();
+    assert!(db.stats().total_put_count > puts);
+    db.close().await.unwrap();
+}
+
+/// A second remove of the same id that waited on the document lock used to
+/// read the deleted object as a dead id: one more intent and a purge sweep.
+#[tokio::test]
+async fn concurrent_duplicate_remove_skips_the_dead_id_path() {
+    let (store, faults) = FaultStore::wrap(InMemory::new());
+    let db = AndaDB::connect(Arc::new(store), cfg()).await.unwrap();
+    let c = plain(&db).await;
+    let id = c.add_from(&doc("k", "body")).await.unwrap();
+    c.flush(unix_ms()).await.unwrap();
+
+    let gate = FaultGate::new();
+    faults.push_rule(FaultRule {
+        op: FaultOp::Delete,
+        path_contains: Some(format!("data/{id}.cbor")),
+        skip: 0,
+        times: 1,
+        kind: FaultKind::PauseBefore(gate.clone()),
+    });
+    let first = tokio::spawn({
+        let c = c.clone();
+        async move { c.remove(id).await }
+    });
+    gate.wait_entered().await;
+    let second = tokio::spawn({
+        let c = c.clone();
+        async move { c.remove(id).await }
+    });
+    // Let the second remove pass admission and queue on the document lock.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    gate.release();
+
+    assert!(first.await.unwrap().unwrap().is_some());
+    assert!(second.await.unwrap().unwrap().is_none());
+    let intents = faults
+        .mutation_log()
+        .iter()
+        .filter(|(op, path)| *op == FaultOp::Put && path.contains("mutation_intents/"))
+        .count();
+    assert_eq!(intents, 1);
+    assert!(!c.is_poisoned());
 }

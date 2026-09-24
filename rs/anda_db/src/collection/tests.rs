@@ -7,26 +7,14 @@ use crate::{
     schema::{AndaDBSchema, Document, Fv, Json, Schema, Vector},
     storage::{PutMode, StorageConfig},
 };
-use async_trait::async_trait;
+use anda_object_store::{FaultGate, FaultHandle, FaultKind, FaultOp, FaultRule, FaultStore};
 use bytes::Bytes;
-use futures::{StreamExt, stream::BoxStream};
 use ic_auth_types::ByteArrayB64;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as ObjectStoreResult, memory::InMemory, path::Path,
+    ObjectStore, ObjectStoreExt, PutOptions, PutPayload, memory::InMemory, path::Path,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
-    },
-    time::Duration,
-};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Duration};
 
 // 测试用的文档结构
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, AndaDBSchema)]
@@ -351,6 +339,24 @@ where
 }
 
 // 创建测试文档的辅助函数
+/// An in-memory store with deterministic fault injection.
+fn fault_store() -> (Arc<dyn ObjectStore>, FaultHandle) {
+    let (store, faults) = FaultStore::wrap(InMemory::new());
+    (Arc::new(store), faults)
+}
+
+/// Holds every PUT whose path contains `path` at `kind`'s point until
+/// the kind's gate is released.
+fn pause_puts(faults: &FaultHandle, path: &str, kind: FaultKind) {
+    faults.push_rule(FaultRule {
+        op: FaultOp::Put,
+        path_contains: Some(path.to_string()),
+        skip: 0,
+        times: u64::MAX,
+        kind,
+    });
+}
+
 fn create_test_doc(_id: u64, name: &str, age: u32, tags: Vec<&str>) -> TestDoc {
     TestDoc {
         _id,
@@ -464,113 +470,6 @@ impl IndexHooks for RecoveryCustomHooks {
             return Some(Cow::Borrowed("hooktoken"));
         }
         IndexHooks::bm25_index_value(&DefaultIndexHooks, index, doc)
-    }
-}
-
-#[derive(Debug)]
-struct FailDeleteStore {
-    inner: Arc<InMemory>,
-    fail_delete_suffix: String,
-    fail_next_delete: Arc<TestAtomicBool>,
-}
-
-impl FailDeleteStore {
-    fn new(fail_delete_suffix: impl Into<String>) -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()),
-            fail_delete_suffix: fail_delete_suffix.into(),
-            fail_next_delete: Arc::new(TestAtomicBool::new(false)),
-        }
-    }
-
-    fn fail_next_delete(&self) {
-        self.fail_next_delete.store(true, TestOrdering::Release);
-    }
-}
-
-impl fmt::Display for FailDeleteStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FailDeleteStore")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for FailDeleteStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        let inner = self.inner.clone();
-        let fail_delete_suffix = self.fail_delete_suffix.clone();
-        let fail_next_delete = self.fail_next_delete.clone();
-
-        locations
-            .then(move |location| {
-                let inner = inner.clone();
-                let fail_delete_suffix = fail_delete_suffix.clone();
-                let fail_next_delete = fail_next_delete.clone();
-                async move {
-                    let location = location?;
-                    if location.to_string().ends_with(&fail_delete_suffix)
-                        && fail_next_delete.swap(false, TestOrdering::AcqRel)
-                    {
-                        return Err(object_store::Error::Generic {
-                            store: "fail_delete",
-                            source: "injected delete failure".into(),
-                        });
-                    }
-
-                    inner.delete(&location).await?;
-                    Ok(location)
-                }
-            })
-            .boxed()
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -744,7 +643,7 @@ async fn test_document_operations() -> Result<(), DBError> {
 
 #[tokio::test]
 async fn test_remove_rolls_back_indexes_when_storage_delete_fails() -> Result<(), DBError> {
-    let object_store = Arc::new(FailDeleteStore::new("data/1.cbor"));
+    let (object_store, faults) = fault_store();
     let db_config = DBConfig {
         name: "test_db".to_string(),
         description: "Test database".to_string(),
@@ -778,7 +677,7 @@ async fn test_remove_rolls_back_indexes_when_storage_delete_fails() -> Result<()
     let id = collection.add(doc_obj).await?;
     assert_eq!(id, 1);
 
-    object_store.fail_next_delete();
+    faults.push_rule(FaultRule::fail_once(FaultOp::Delete, "data/1.cbor"));
     let err = collection.remove(id).await.unwrap_err();
     assert!(matches!(err, DBError::Storage { .. }));
 
@@ -3207,197 +3106,6 @@ async fn test_open_repair_scan_skips_unreadable_and_mismatched_documents() -> Re
     Ok(())
 }
 
-/// An object store that blocks `put` for paths ending in `gate_suffix`
-/// until the watch gate is opened, to deterministically hold an `add`
-/// in flight while a flush runs.
-#[derive(Debug)]
-struct GatedPutStore {
-    inner: Arc<InMemory>,
-    gate_suffix: String,
-    gate: tokio::sync::watch::Receiver<bool>,
-    blocked: Arc<TestAtomicBool>,
-}
-
-impl fmt::Display for GatedPutStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("GatedPutStore")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for GatedPutStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        if location.to_string().ends_with(&self.gate_suffix) {
-            let mut rx = self.gate.clone();
-            while !*rx.borrow() {
-                self.blocked.store(true, TestOrdering::Release);
-                rx.changed()
-                    .await
-                    .map_err(|_| object_store::Error::Generic {
-                        store: "gated_put",
-                        source: "gate sender dropped".into(),
-                    })?;
-            }
-        }
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
-#[derive(Debug)]
-enum PutFault {
-    FailOnce {
-        armed: Arc<TestAtomicBool>,
-    },
-    BlockAfterCommit {
-        gate: tokio::sync::watch::Receiver<bool>,
-        blocked: Arc<TestAtomicBool>,
-    },
-}
-
-/// Injects one path-specific PUT failure, or blocks after the delegated
-/// PUT is already durable but before success is returned to the caller.
-#[derive(Debug)]
-struct FaultPutStore {
-    inner: Arc<InMemory>,
-    suffix: String,
-    fault: PutFault,
-}
-
-impl fmt::Display for FaultPutStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FaultPutStore")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for FaultPutStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        let matches = location.to_string().ends_with(&self.suffix);
-        if matches
-            && let PutFault::FailOnce { armed } = &self.fault
-            && armed.swap(false, TestOrdering::AcqRel)
-        {
-            return Err(object_store::Error::Generic {
-                store: "fault_put",
-                source: "injected one-shot PUT failure".into(),
-            });
-        }
-
-        let result = self.inner.put_opts(location, payload, opts).await?;
-        if matches && let PutFault::BlockAfterCommit { gate, blocked } = &self.fault {
-            let mut rx = gate.clone();
-            while !*rx.borrow() {
-                blocked.store(true, TestOrdering::Release);
-                rx.changed()
-                    .await
-                    .map_err(|_| object_store::Error::Generic {
-                        store: "fault_put",
-                        source: "gate sender dropped".into(),
-                    })?;
-            }
-        }
-        Ok(result)
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
 /// Regression (P0-04): F1 is held after serializing its old ids snapshot
 /// but before the conditional ids PUT completes. An add and F2 queue
 /// behind the collection-wide gate in that order. Once released, F1 must
@@ -3406,14 +3114,9 @@ impl ObjectStore for FaultPutStore {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_flushes_bind_checkpoint_to_serialized_ids_generation()
 -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
-        inner: Arc::new(InMemory::new()),
-        gate_suffix: "test_collection/ids.cbor".to_string(),
-        gate: gate_rx,
-        blocked: blocked.clone(),
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    let gated = "test_collection/ids.cbor";
     let db_config = || DBConfig {
         name: "test_db".to_string(),
         description: String::new(),
@@ -3432,14 +3135,12 @@ async fn test_concurrent_flushes_bind_checkpoint_to_serialized_ids_generation()
         1
     );
 
-    gate_tx.send(false).expect("gate receiver dropped");
+    pause_puts(&faults, gated, FaultKind::PauseBefore(gate.clone()));
     let first_flush = {
         let collection = collection.clone();
         tokio::spawn(async move { collection.flush(unix_ms()).await })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
 
     // Queue the mutation before F2. Tokio's fair RwLock makes F2 observe
     // the completed mutation instead of overtaking it with a stale ids
@@ -3460,7 +3161,7 @@ async fn test_concurrent_flushes_bind_checkpoint_to_serialized_ids_generation()
     assert!(!adding.is_finished());
     assert!(!second_flush.is_finished());
 
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     assert!(first_flush.await.expect("first flush panicked")?);
     assert_eq!(adding.await.expect("add task panicked")?, 2);
     assert!(second_flush.await.expect("second flush panicked")?);
@@ -3483,14 +3184,7 @@ async fn test_concurrent_flushes_bind_checkpoint_to_serialized_ids_generation()
 /// converges from the WAL and the repair scan; no document is lost.
 #[tokio::test]
 async fn test_failed_ids_phase_poisons_handle_and_reopen_converges() -> Result<(), DBError> {
-    let armed = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
-        inner: Arc::new(InMemory::new()),
-        suffix: "test_collection/ids.cbor".to_string(),
-        fault: PutFault::FailOnce {
-            armed: armed.clone(),
-        },
-    });
+    let (object_store, faults) = fault_store();
     let config = DBConfig {
         name: "test_db".to_string(),
         description: String::new(),
@@ -3511,7 +3205,10 @@ async fn test_failed_ids_phase_poisons_handle_and_reopen_converges() -> Result<(
         .await?;
 
     let same_ms = unix_ms();
-    armed.store(true, TestOrdering::Release);
+    faults.push_rule(FaultRule::fail_once(
+        FaultOp::Put,
+        "test_collection/ids.cbor",
+    ));
     assert!(collection.flush(same_ms).await.is_err());
     assert!(collection.is_poisoned());
     // Every further operation on the poisoned handle is rejected.
@@ -3560,16 +3257,9 @@ async fn test_failed_ids_phase_poisons_handle_and_reopen_converges() -> Result<(
 /// retained WAL converges ids and indexes without losing the document.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
-        inner: Arc::new(InMemory::new()),
-        suffix: "test_collection/meta.cbor".to_string(),
-        fault: PutFault::BlockAfterCommit {
-            gate: gate_rx,
-            blocked: blocked.clone(),
-        },
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    let gated = "test_collection/meta.cbor";
     let config = DBConfig {
         name: "test_db".to_string(),
         description: String::new(),
@@ -3589,15 +3279,13 @@ async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges() -> Re
         .await?;
     assert_eq!(id, 1);
 
-    gate_tx.send(false).expect("gate receiver dropped");
+    pause_puts(&faults, gated, FaultKind::PauseAfter(gate.clone()));
     let first_now = unix_ms();
     let flushing = {
         let collection = collection.clone();
         tokio::spawn(async move { collection.flush(first_now).await })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
 
     flushing.abort();
     assert!(
@@ -3606,7 +3294,7 @@ async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges() -> Re
             .expect_err("flush should be cancelled")
             .is_cancelled()
     );
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     assert!(collection.is_poisoned());
 
     // Every further operation on the poisoned handle is rejected.
@@ -3652,16 +3340,9 @@ async fn test_cancelled_metadata_put_poisons_handle_and_reopen_converges() -> Re
 /// write never publishes the full-flush watermark.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancelled_unclaimed_metadata_put_poisons_handle() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
-        inner: Arc::new(InMemory::new()),
-        suffix: "test_collection/meta.cbor".to_string(),
-        fault: PutFault::BlockAfterCommit {
-            gate: gate_rx,
-            blocked: blocked.clone(),
-        },
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    let gated = "test_collection/meta.cbor";
     let config = DBConfig {
         name: "test_db".to_string(),
         description: String::new(),
@@ -3675,7 +3356,7 @@ async fn test_cancelled_unclaimed_metadata_put_poisons_handle() -> Result<(), DB
     let collection = create_test_collection(&db, async |_| Ok(())).await?;
     let saved_before = collection.last_saved_version.load(Ordering::Acquire);
 
-    gate_tx.send(false).expect("gate receiver dropped");
+    pause_puts(&faults, gated, FaultKind::PauseAfter(gate.clone()));
     let saving = {
         let collection = collection.clone();
         tokio::spawn(async move {
@@ -3684,9 +3365,7 @@ async fn test_cancelled_unclaimed_metadata_put_poisons_handle() -> Result<(), DB
                 .await
         })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
     saving.abort();
     assert!(
         saving
@@ -3694,7 +3373,7 @@ async fn test_cancelled_unclaimed_metadata_put_poisons_handle() -> Result<(), DB
             .expect_err("metadata-only writer should be cancelled after commit")
             .is_cancelled()
     );
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     assert!(collection.is_poisoned());
     assert_eq!(
         collection.last_saved_version.load(Ordering::Acquire),
@@ -3796,16 +3475,9 @@ async fn test_foreign_metadata_writer_poisons_handle() -> Result<(), DBError> {
 /// instead of skipping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancelled_add_poisons_handle_and_reopen_recovers_document() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(FaultPutStore {
-        inner: Arc::new(InMemory::new()),
-        suffix: "data/1.cbor".to_string(),
-        fault: PutFault::BlockAfterCommit {
-            gate: gate_rx,
-            blocked: blocked.clone(),
-        },
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    pause_puts(&faults, "data/1.cbor", FaultKind::PauseAfter(gate.clone()));
     let config = DBConfig {
         name: "test_db".to_string(),
         description: String::new(),
@@ -3829,9 +3501,7 @@ async fn test_cancelled_add_poisons_handle_and_reopen_recovers_document() -> Res
                 .await
         })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
     adding.abort();
     assert!(
         adding
@@ -3839,7 +3509,7 @@ async fn test_cancelled_add_poisons_handle_and_reopen_recovers_document() -> Res
             .expect_err("add should be cancelled")
             .is_cancelled()
     );
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     assert!(collection.is_poisoned());
     assert!(
         collection
@@ -3893,14 +3563,9 @@ async fn test_cancelled_add_poisons_handle_and_reopen_recovers_document() -> Res
 /// generation removes that phantom.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
-        inner: Arc::new(InMemory::new()),
-        gate_suffix: "data/1.cbor".to_string(),
-        gate: gate_rx,
-        blocked: blocked.clone(),
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    let gated = "data/1.cbor";
     let db = AndaDB::connect(
         object_store,
         DBConfig {
@@ -3923,7 +3588,7 @@ async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom() -> Re
         .await?;
     collection.flush(unix_ms()).await?;
 
-    gate_tx.send(false).expect("gate receiver dropped");
+    pause_puts(&faults, gated, FaultKind::PauseBefore(gate.clone()));
     let updating = {
         let collection = collection.clone();
         tokio::spawn(async move {
@@ -3935,9 +3600,7 @@ async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom() -> Re
                 .await
         })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
     updating.abort();
     assert!(
         updating
@@ -3945,7 +3608,7 @@ async fn test_cancelled_update_poisons_handle_and_reopen_removes_phantom() -> Re
             .expect_err("update should be cancelled")
             .is_cancelled()
     );
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     assert!(collection.is_poisoned());
     assert!(
         collection.flush(unix_ms()).await.is_err(),
@@ -4068,13 +3731,9 @@ async fn test_mutation_replay_uses_custom_hooks_before_clearing_intent() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_flush_drains_in_flight_add_before_checkpoint() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
-    let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
-        inner: Arc::new(InMemory::new()),
-        gate_suffix: "data/2.cbor".to_string(),
-        gate: gate_rx,
-        blocked: Arc::new(TestAtomicBool::new(false)),
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    pause_puts(&faults, "data/2.cbor", FaultKind::PauseBefore(gate.clone()));
     let db_config = || DBConfig {
         name: "test_db".to_string(),
         description: "Test database".to_string(),
@@ -4127,7 +3786,7 @@ async fn test_flush_drains_in_flight_add_before_checkpoint() -> Result<(), DBErr
 
     // Unblock the in-flight add, let the serialized flush checkpoint the
     // complete state, then simulate a crash and reopen.
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     let id2 = blocked.await.expect("add task panicked")?;
     assert_eq!(id2, 2);
     assert!(flushing.await.expect("flush task panicked")?);
@@ -4309,14 +3968,9 @@ async fn test_mutation_intents_replay_update_and_remove_after_crash() -> Result<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
-    let blocked = Arc::new(TestAtomicBool::new(false));
-    let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
-        inner: Arc::new(InMemory::new()),
-        gate_suffix: "data/1.cbor".to_string(),
-        gate: gate_rx,
-        blocked: blocked.clone(),
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    let gated = "data/1.cbor";
     let config = DBConfig {
         name: "close_drain_db".to_string(),
         description: String::new(),
@@ -4341,7 +3995,7 @@ async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(),
     let id = old
         .add_from(&create_test_doc(0, "before", 20, vec!["x"]))
         .await?;
-    gate_tx.send(false).expect("gate receiver dropped");
+    pause_puts(&faults, gated, FaultKind::PauseBefore(gate.clone()));
     let updating = {
         let collection = old.clone();
         tokio::spawn(async move {
@@ -4353,9 +4007,7 @@ async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(),
                 .await
         })
     };
-    while !blocked.load(TestOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
+    gate.wait_entered().await;
 
     let closing = {
         let db = db.clone();
@@ -4397,7 +4049,7 @@ async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(),
         "open must finish the cancelled close before loading a fresh handle"
     );
 
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     let updated = updating.await.expect("update task panicked")?;
     assert_eq!(updated.get_field("name"), Some(&Fv::Text("after".into())));
     let fresh = opening.await.expect("open task panicked")?;
@@ -4430,13 +4082,9 @@ async fn test_close_drains_update_and_old_handle_cannot_reenable() -> Result<(),
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_delete_drains_add_before_prefix_removal() -> Result<(), DBError> {
-    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
-    let object_store: Arc<dyn ObjectStore> = Arc::new(GatedPutStore {
-        inner: Arc::new(InMemory::new()),
-        gate_suffix: "data/1.cbor".to_string(),
-        gate: gate_rx,
-        blocked: Arc::new(TestAtomicBool::new(false)),
-    });
+    let (object_store, faults) = fault_store();
+    let gate = FaultGate::new();
+    pause_puts(&faults, "data/1.cbor", FaultKind::PauseBefore(gate.clone()));
     let db = AndaDB::connect(
         object_store,
         DBConfig {
@@ -4503,7 +4151,7 @@ async fn test_delete_drains_add_before_prefix_removal() -> Result<(), DBError> {
         !deleting.is_finished(),
         "retry must take over and continue draining the retained handle"
     );
-    gate_tx.send(true).expect("gate receiver dropped");
+    gate.release();
     adding.await.expect("add task panicked")?;
     deleting.await.expect("delete task panicked")?;
 
@@ -4552,99 +4200,6 @@ async fn connect_test_db(object_store: Arc<dyn ObjectStore>) -> Result<AndaDB, D
     AndaDB::connect(object_store, test_db_config()).await
 }
 
-/// An `InMemory` store that rejects `put` for every location containing a
-/// configured substring while armed.
-#[derive(Debug)]
-struct FailPutStore {
-    inner: Arc<InMemory>,
-    fail_put_substr: String,
-    armed: Arc<TestAtomicBool>,
-}
-
-impl FailPutStore {
-    fn new(fail_put_substr: impl Into<String>) -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()),
-            fail_put_substr: fail_put_substr.into(),
-            armed: Arc::new(TestAtomicBool::new(false)),
-        }
-    }
-
-    fn arm(&self, armed: bool) {
-        self.armed.store(armed, TestOrdering::Release);
-    }
-}
-
-impl fmt::Display for FailPutStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("FailPutStore")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for FailPutStore {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> ObjectStoreResult<PutResult> {
-        if self.armed.load(TestOrdering::Acquire)
-            && location.as_ref().contains(&self.fail_put_substr)
-        {
-            return Err(object_store::Error::Generic {
-                store: "fail_put",
-                source: "injected put failure".into(),
-            });
-        }
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, ObjectStoreResult<Path>>,
-    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        offset: &Path,
-    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> ObjectStoreResult<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
 /// A newly created index must be durable **before** the collection
 /// metadata that registers it. Publishing the registration first left the
 /// index permanently empty on the next start: bootstrap loaded the empty
@@ -4652,8 +4207,7 @@ impl ObjectStore for FailPutStore {
 /// repair scan only covers ids above the storage checkpoint.
 #[tokio::test]
 async fn test_flush_persists_index_before_registering_it() -> Result<(), DBError> {
-    let store = Arc::new(FailPutStore::new("bm25_indexes/name/b_"));
-    let object_store: Arc<dyn ObjectStore> = store.clone();
+    let (object_store, faults) = fault_store();
 
     let db = connect_test_db(object_store.clone()).await?;
     let collection = create_test_collection(&db, async |_| Ok(())).await?;
@@ -4668,7 +4222,10 @@ async fn test_flush_persists_index_before_registering_it() -> Result<(), DBError
 
     // Reopen and create the BM25 index: the backfill only exists in
     // memory until a flush persists it. The index bucket write fails.
-    store.arm(true);
+    faults.push_rule(FaultRule {
+        times: u64::MAX,
+        ..FaultRule::fail_once(FaultOp::Put, "bm25_indexes/name/b_")
+    });
     let db = connect_test_db(object_store.clone()).await?;
     let opened = db
         .open_collection("test_collection".to_string(), async |c| {
@@ -4683,7 +4240,7 @@ async fn test_flush_persists_index_before_registering_it() -> Result<(), DBError
     drop(db);
 
     // Next start: whatever is durable must not claim to be a usable index.
-    store.arm(false);
+    faults.reset();
     let db = connect_test_db(object_store.clone()).await?;
     let collection = db
         .open_collection("test_collection".to_string(), async |c| {
@@ -4962,6 +4519,64 @@ async fn test_query_all_ids_is_unbounded() -> Result<(), DBError> {
 
     db.close().await?;
     Ok(())
+}
+
+/// The unbounded field scan collects into a sorted vector: an id posted
+/// under several keys of an array index must still come back once.
+#[tokio::test]
+async fn test_query_all_ids_dedups_array_postings() -> Result<(), DBError> {
+    let db = setup_test_db().await?;
+    let collection =
+        create_test_collection(&db, async |c| c.create_btree_index_nx(&["tags"]).await).await?;
+    let a = collection
+        .add_from(&create_test_doc(0, "a", 1, vec!["x", "y", "z"]))
+        .await?;
+    let b = collection
+        .add_from(&create_test_doc(0, "b", 1, vec!["y"]))
+        .await?;
+
+    let filter = Filter::Field(("tags".to_string(), RangeQuery::Ge(Fv::Text("x".into()))));
+    assert_eq!(collection.query_all_ids(filter.clone()).await?, vec![a, b]);
+    assert_eq!(
+        collection.query_ids(filter.clone(), Some(1)).await?,
+        vec![a]
+    );
+    assert_eq!(collection.query_last_ids(filter, Some(1)).await?, vec![b]);
+
+    db.close().await?;
+    Ok(())
+}
+
+/// Intents are written from borrowed documents and read back as
+/// `MutationIntent`; both forms must produce identical bytes.
+#[test]
+fn test_mutation_intent_ref_encodes_like_the_owned_intent() {
+    let doc = Document::try_from(
+        Arc::new(TestDoc::schema().unwrap()),
+        &create_test_doc(7, "a", 1, vec!["x"]),
+    )
+    .unwrap();
+    for (previous, proposed) in [(Some(&doc), Some(&doc)), (Some(&doc), None), (None, None)] {
+        let purge_by_id = previous.is_none() && proposed.is_none();
+        let owned = MutationIntent {
+            sequence: 3,
+            document_id: 7,
+            previous: previous.map(|d| d.clone().into()),
+            proposed: proposed.map(|d| d.clone().into()),
+            purge_by_id,
+        };
+        let borrowed = MutationIntentRef {
+            sequence: 3,
+            document_id: 7,
+            previous,
+            proposed,
+            purge_by_id,
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        cbor2::to_writer(&owned, &mut a).unwrap();
+        cbor2::to_writer(&borrowed, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
 }
 
 /// Legacy data a later validation tightening rejects must stay

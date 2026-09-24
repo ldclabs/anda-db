@@ -438,34 +438,13 @@ impl AndaDB {
     /// A Result indicating success or an error
     pub async fn close(&self) -> Result<(), DBError> {
         self.set_read_only(true);
+        // A collection failure does not stop the database metadata flush;
+        // the first such failure is surfaced after it.
         let collections = self
-            .inner
-            .collections
-            .read()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let results: Vec<Result<(), DBError>> = stream::iter(collections)
-            .map(|collection| async move { collection.close().await })
-            .buffer_unordered(8) // 限制最多 8 个并发
-            .collect()
+            .for_each_collection("AndaDB::close", |collection| async move {
+                collection.close().await
+            })
             .await;
-        // Log per-collection failures but continue closing the database to flush
-        // metadata for the remaining successful collections, then surface the
-        // first error so callers can react.
-        let mut first_err: Option<DBError> = None;
-        for r in results {
-            if let Err(err) = r {
-                log::error!(
-                    action = "AndaDB::close",
-                    database = self.inner.name;
-                    "Collection close failed: {err:?}",
-                );
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-            }
-        }
 
         let start = Instant::now();
         match self.flush_metadata(unix_ms()).await {
@@ -489,14 +468,34 @@ impl AndaDB {
                 return Err(err);
             }
         }
-        if let Some(err) = first_err {
-            return Err(err);
-        }
-        Ok(())
+        collections
     }
 
     /// Flushes the database, ensuring all data is written to storage.
+    ///
+    /// Collections persist nothing while read-only, but changed database
+    /// metadata is still written; an unchanged database writes nothing.
     pub async fn flush(&self) -> Result<(), DBError> {
+        let collections = self
+            .for_each_collection("AndaDB::flush", |collection| async move {
+                collection.flush(unix_ms()).await
+            })
+            .await;
+        self.flush_metadata(unix_ms()).await?;
+        collections
+    }
+
+    /// Runs `op` on every registered collection, 8 at a time, logging each
+    /// failure and returning the first one after all of them finished.
+    async fn for_each_collection<F, Fut, T>(
+        &self,
+        action: &'static str,
+        op: F,
+    ) -> Result<(), DBError>
+    where
+        F: FnMut(Arc<Collection>) -> Fut,
+        Fut: Future<Output = Result<T, DBError>>,
+    {
         let collections = self
             .inner
             .collections
@@ -504,30 +503,66 @@ impl AndaDB {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-
-        let results: Vec<Result<bool, DBError>> = stream::iter(collections)
-            .map(|collection| async move { collection.flush(unix_ms()).await })
-            .buffer_unordered(8) // 限制最多 8 个并发
-            .collect()
-            .await;
-
-        let mut first_err: Option<DBError> = None;
-        for r in results {
-            if let Err(err) = r {
+        let mut results = stream::iter(collections).map(op).buffer_unordered(8);
+        let mut first_err = None;
+        while let Some(result) = results.next().await {
+            if let Err(err) = result {
                 log::error!(
-                    action = "AndaDB::flush",
+                    action = action,
                     database = self.inner.name;
-                    "Collection flush failed: {err:?}",
+                    "Collection operation failed: {err:?}",
                 );
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
+                first_err.get_or_insert(err);
             }
         }
+        first_err.map_or(Ok(()), Err)
+    }
 
-        self.flush_metadata(unix_ms()).await?;
-        if let Some(err) = first_err {
-            return Err(err);
+    fn ensure_writable(&self) -> Result<(), DBError> {
+        if self.is_read_only() {
+            return Err(DBError::Generic {
+                name: self.inner.name.clone(),
+                source: "database is read-only".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// A pending delete tombstone wins over every create/open of the name.
+    fn ensure_not_dropping(&self, name: &str) -> Result<(), DBError> {
+        if self.inner.dropping_collections.read().contains(name) {
+            return Err(DBError::AlreadyExists {
+                name: name.to_string(),
+                path: self.inner.name.clone(),
+                source: "collection is being dropped".into(),
+                _id: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Creation checks: no pending delete and no registered handle.
+    fn ensure_creatable(&self, name: &str) -> Result<(), DBError> {
+        self.ensure_not_dropping(name)?;
+        if self.inner.collections.read().contains_key(name) {
+            return Err(DBError::AlreadyExists {
+                name: name.to_string(),
+                path: self.inner.name.clone(),
+                source: "collection already exists".into(),
+                _id: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_registered(&self, name: &str) -> Result<(), DBError> {
+        if !self.contains_collection(name) {
+            return Err(DBError::NotFound {
+                name: name.to_string(),
+                path: self.inner.name.clone(),
+                source: "collection not found".into(),
+                _id: 0,
+            });
         }
         Ok(())
     }
@@ -638,39 +673,8 @@ impl AndaDB {
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.inner.name.clone(),
-                source: "database is read-only".into(),
-            });
-        }
-
-        {
-            if self.inner.collections.read().contains_key(&config.name) {
-                return Err(DBError::AlreadyExists {
-                    name: config.name,
-                    path: self.inner.name.clone(),
-                    source: "collection already exists".into(),
-                    _id: 0,
-                });
-            }
-        }
-
-        {
-            if self
-                .inner
-                .dropping_collections
-                .read()
-                .contains(&config.name)
-            {
-                return Err(DBError::AlreadyExists {
-                    name: config.name,
-                    path: self.inner.name.clone(),
-                    source: "collection is being dropped".to_string().into(),
-                    _id: 0,
-                });
-            }
-        }
+        self.ensure_writable()?;
+        self.ensure_creatable(&config.name)?;
 
         // Serialize with other lifecycle operations on the same name, so a
         // concurrent creator is observed through its registration rather
@@ -680,27 +684,7 @@ impl AndaDB {
         // Re-check the states that may have changed while waiting for the
         // lock: a concurrent delete may have started (and not finished), or
         // a concurrent creator may have registered the name.
-        if self
-            .inner
-            .dropping_collections
-            .read()
-            .contains(&config.name)
-        {
-            return Err(DBError::AlreadyExists {
-                name: config.name,
-                path: self.inner.name.clone(),
-                source: "collection is being dropped".to_string().into(),
-                _id: 0,
-            });
-        }
-        if self.inner.collections.read().contains_key(&config.name) {
-            return Err(DBError::AlreadyExists {
-                name: config.name,
-                path: self.inner.name.clone(),
-                source: "collection already exists".into(),
-                _id: 0,
-            });
-        }
+        self.ensure_creatable(&config.name)?;
         // self.metadata.collections will check it exists again in Collection::create
         let collection = Collection::create(self.clone(), schema, config).await?;
         self.register_created_collection(collection, f).await
@@ -784,32 +768,12 @@ impl AndaDB {
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.inner.name.clone(),
-                source: "database is read-only".into(),
-            });
-        }
-
+        self.ensure_writable()?;
         // A delete tombstone always wins over a cached handle: a cancelled
         // delete deliberately keeps both until a retry finishes the prefix
         // removal. Returning the handle first would resurrect an object that
         // has already entered its irreversible deleting state.
-        {
-            if self
-                .inner
-                .dropping_collections
-                .read()
-                .contains(&config.name)
-            {
-                return Err(DBError::AlreadyExists {
-                    name: config.name,
-                    path: self.inner.name.clone(),
-                    source: "collection is being dropped".to_string().into(),
-                    _id: 0,
-                });
-            }
-        }
+        self.ensure_not_dropping(&config.name)?;
 
         {
             if let Some(collection) = self.inner.collections.read().get(&config.name)
@@ -820,13 +784,7 @@ impl AndaDB {
             }
         }
 
-        if !self
-            .inner
-            .metadata
-            .read()
-            .collections
-            .contains(&config.name)
-        {
+        if !self.contains_collection(&config.name) {
             // Serialize with other lifecycle operations on this name: when a
             // concurrent `open_or_create_collection` of the same name wins
             // the race, we observe its registration after acquiring the lock
@@ -835,26 +793,9 @@ impl AndaDB {
             let name_guard = self.lock_collection_name(&config.name).await;
             // A delete of this name may have started while we were waiting
             // for the lock; creating now would resurrect it mid-drop.
-            if self
-                .inner
-                .dropping_collections
-                .read()
-                .contains(&config.name)
-            {
-                return Err(DBError::AlreadyExists {
-                    name: config.name,
-                    path: self.inner.name.clone(),
-                    source: "collection is being dropped".to_string().into(),
-                    _id: 0,
-                });
-            }
+            self.ensure_not_dropping(&config.name)?;
             let exists_now = self.inner.collections.read().contains_key(&config.name)
-                || self
-                    .inner
-                    .metadata
-                    .read()
-                    .collections
-                    .contains(&config.name);
+                || self.contains_collection(&config.name);
             if !exists_now {
                 match Collection::create(self.clone(), schema.clone(), config.clone()).await {
                     Ok(collection) => {
@@ -924,17 +865,7 @@ impl AndaDB {
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        {
-            if self.inner.dropping_collections.read().contains(&name) {
-                return Err(DBError::AlreadyExists {
-                    name: name.clone(),
-                    path: self.inner.name.clone(),
-                    source: "collection is being dropped".to_string().into(),
-                    _id: 0,
-                });
-            }
-        }
-
+        self.ensure_not_dropping(&name)?;
         {
             if let Some(collection) = self.inner.collections.read().get(&name)
                 && collection.is_active_handle()
@@ -943,17 +874,7 @@ impl AndaDB {
                 return Ok(collection.clone());
             }
         }
-
-        {
-            if !self.inner.metadata.read().collections.contains(&name) {
-                return Err(DBError::NotFound {
-                    name,
-                    path: self.inner.name.clone(),
-                    source: "collection not found".into(),
-                    _id: 0,
-                });
-            }
-        }
+        self.ensure_registered(&name)?;
 
         // Load from storage under the per-name lifecycle lock: a concurrent
         // `close_collection` may still be flushing this collection's state
@@ -964,16 +885,7 @@ impl AndaDB {
         // Re-check the fast paths after acquiring the lock: a concurrent
         // open may have registered the collection while we waited, or a
         // delete may have started/completed.
-        {
-            if self.inner.dropping_collections.read().contains(&name) {
-                return Err(DBError::AlreadyExists {
-                    name: name.clone(),
-                    path: self.inner.name.clone(),
-                    source: "collection is being dropped".to_string().into(),
-                    _id: 0,
-                });
-            }
-        }
+        self.ensure_not_dropping(&name)?;
 
         // A cancelled close deliberately leaves its retiring handle in the
         // registry. Finish its drain/flush under the same per-name lock before
@@ -1002,16 +914,7 @@ impl AndaDB {
                 collections.remove(&name);
             }
         }
-        {
-            if !self.inner.metadata.read().collections.contains(&name) {
-                return Err(DBError::NotFound {
-                    name,
-                    path: self.inner.name.clone(),
-                    source: "collection not found".into(),
-                    _id: 0,
-                });
-            }
-        }
+        self.ensure_registered(&name)?;
 
         let collection = Collection::open(self.clone(), name, schema, f).await?;
         let collection = Arc::new(collection);
@@ -1034,12 +937,7 @@ impl AndaDB {
                 .dropping_collections
                 .read()
                 .contains(collection.name())
-                || !self
-                    .inner
-                    .metadata
-                    .read()
-                    .collections
-                    .contains(collection.name())
+                || !self.contains_collection(collection.name())
             {
                 return Err(DBError::NotFound {
                     name: collection.name().to_string(),
@@ -1053,7 +951,7 @@ impl AndaDB {
         let now = unix_ms();
         // A read-only open may replay recovery state in memory for correct
         // reads, but must not persist it or let the callback mutate storage.
-        if !self.inner.read_only.load(Ordering::Acquire) {
+        if !self.is_read_only() {
             collection.flush(now).await?;
         }
         Ok(collection)
@@ -1115,12 +1013,7 @@ impl AndaDB {
     /// already passed admission are drained, so an old `Arc<Collection>`
     /// cannot recreate residual objects after deletion returns.
     pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.inner.name.clone(),
-                source: "database is read-only".into(),
-            });
-        }
+        self.ensure_writable()?;
 
         // The name is used to build the storage prefix below.
         validate_field_name(name)?;
@@ -1196,8 +1089,10 @@ impl AndaDB {
 
     /// Flushes database metadata to storage.
     ///
-    /// This method writes the current database metadata to storage and
-    /// updates the storage metadata with the current timestamp.
+    /// Writes the database metadata object only when it changed since the
+    /// last successful write, and refreshes the storage metadata alongside
+    /// it. The database storage has no document checkpoint, so an unchanged
+    /// flush writes nothing.
     ///
     /// # Arguments
     /// * `now_ms` - The current timestamp in milliseconds
@@ -1221,20 +1116,55 @@ impl AndaDB {
             )
         };
 
-        if self.inner.saved_metadata_version.load(Ordering::Acquire) < version {
-            self.inner
-                .storage
-                .put(Self::METADATA_PATH, &metadata, None)
-                .await?;
-            // Claimed only after the PUT succeeded: a failed or cancelled
-            // write leaves the version unclaimed, so the next flush (or a
-            // `delete_collection` retry) writes the snapshot again.
-            self.inner
-                .saved_metadata_version
-                .fetch_max(version, Ordering::AcqRel);
+        if self.inner.saved_metadata_version.load(Ordering::Acquire) >= version {
+            return Ok(());
         }
-        self.inner.storage.store_metadata(0, now_ms).await?;
-        Ok(())
+        self.inner
+            .storage
+            .put(Self::METADATA_PATH, &metadata, None)
+            .await?;
+        // Claimed only after the PUT succeeded: a failed or cancelled write
+        // leaves the version unclaimed, so the next flush (or a
+        // `delete_collection` retry) writes the snapshot again.
+        self.inner
+            .saved_metadata_version
+            .fetch_max(version, Ordering::AcqRel);
+        self.inner.storage.store_metadata(0, now_ms).await
+    }
+
+    /// Inserts an extension only if the metadata still fits the budget
+    /// [`AndaDB::flush_metadata`] writes it under. An oversized value left in
+    /// memory would make every later metadata flush — and with it `flush`,
+    /// `close`, collection creation and deletion — fail.
+    fn insert_extension(
+        &self,
+        metadata: &mut DBMetadata,
+        key: String,
+        value: FieldValue,
+    ) -> Result<Option<FieldValue>, DBError> {
+        value.validate_complexity()?;
+        let limit = self.inner.storage.max_small_object_size();
+        let old = metadata.extensions.insert(key.clone(), value);
+        let size = cbor2::serialized_size(&*metadata).map_err(|source| DBError::Serialization {
+            name: self.inner.name.clone(),
+            source: source.into(),
+        })?;
+        if size > limit as u64 {
+            match old {
+                Some(old) => metadata.extensions.insert(key, old),
+                None => metadata.extensions.remove(&key),
+            };
+            return Err(DBError::PayloadTooLarge {
+                path: self
+                    .inner
+                    .storage
+                    .full_path(Self::METADATA_PATH)
+                    .to_string(),
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+                limit,
+            });
+        }
+        Ok(old)
     }
 
     /// Gets the value of a user-defined extension key.
@@ -1253,19 +1183,19 @@ impl AndaDB {
     /// Sets a user-defined extension key-value pair.
     /// The change is persisted on the next `flush()` or `flush_metadata()`.
     /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
-    /// Values that fail [`FieldValue::validate_complexity`] are dropped with a warning.
+    /// Values that fail [`FieldValue::validate_complexity`] or would push the
+    /// metadata past the storage object budget are dropped with a warning.
     pub fn set_extension(&self, key: String, value: FieldValue) {
-        if let Err(err) = value.validate_complexity() {
-            log::warn!(
-                action = "AndaDB::set_extension",
-                database = self.inner.name,
-                key = key;
-                "Dropping extension value that exceeds complexity limits: {err:?}",
-            );
-            return;
-        }
-        self.update_metadata(|metadata| {
-            metadata.extensions.insert(key, value);
+        self.update_metadata_if(|metadata| {
+            let rejected = self.insert_extension(metadata, key, value).err();
+            if let Some(err) = &rejected {
+                log::warn!(
+                    action = "AndaDB::set_extension",
+                    database = self.inner.name;
+                    "Dropping extension value: {err:?}",
+                );
+            }
+            ((), rejected.is_none())
         });
     }
 
@@ -1313,16 +1243,17 @@ impl AndaDB {
             let Some(value) = f(meta.extensions.get(&key)) else {
                 return (None, false);
             };
-            if let Err(err) = value.validate_complexity() {
-                log::warn!(
-                    action = "AndaDB::set_extension_with",
-                    database = self.inner.name,
-                    key = key;
-                    "Dropping extension value that exceeds complexity limits: {err:?}",
-                );
-                return (None, false);
+            match self.insert_extension(meta, key, value) {
+                Ok(old) => (old, true),
+                Err(err) => {
+                    log::warn!(
+                        action = "AndaDB::set_extension_with",
+                        database = self.inner.name;
+                        "Dropping extension value: {err:?}",
+                    );
+                    (None, false)
+                }
             }
-            (meta.extensions.insert(key, value), true)
         })
     }
 
@@ -1337,50 +1268,34 @@ impl AndaDB {
             let Some(value) = f(old_value.and_then(|v| v.clone().deserialized().ok())) else {
                 return (None, false);
             };
-            let value = match FieldValue::serialized(&value, None) {
-                Ok(value) => value,
+            let inserted = FieldValue::serialized(&value, None)
+                .map_err(DBError::from)
+                .and_then(|value| self.insert_extension(meta, key, value));
+            match inserted {
+                Ok(old) => (old.and_then(|v| v.deserialized().ok()), true),
                 Err(err) => {
                     log::warn!(
                         action = "AndaDB::set_extension_from_with",
-                        database = self.inner.name,
-                        key = key;
-                        "Dropping extension value that failed to serialize: {err:?}",
+                        database = self.inner.name;
+                        "Dropping extension value: {err:?}",
                     );
-                    return (None, false);
+                    (None, false)
                 }
-            };
-            if let Err(err) = value.validate_complexity() {
-                log::warn!(
-                    action = "AndaDB::set_extension_from_with",
-                    database = self.inner.name,
-                    key = key;
-                    "Dropping extension value that exceeds complexity limits: {err:?}",
-                );
-                return (None, false);
             }
-            (
-                meta.extensions
-                    .insert(key, value)
-                    .and_then(|v| v.deserialized().ok()),
-                true,
-            )
         })
     }
 
     /// Sets a user-defined extension key-value pair and immediately persists the change.
     /// The extensions should not be large, as they are stored in the same object as database metadata which size is expected to be small (<= 1MB) and loaded frequently.
+    /// Returns [`DBError::PayloadTooLarge`] without changing anything when
+    /// the value would push the metadata past the storage object budget.
     pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.inner.name.clone(),
-                source: "database is read-only".into(),
-            });
-        }
-        value.validate_complexity()?;
-
-        self.update_metadata(|metadata| {
-            metadata.extensions.insert(key, value);
-        });
+        self.ensure_writable()?;
+        self.update_metadata_if(|metadata| {
+            let inserted = self.insert_extension(metadata, key, value);
+            let changed = inserted.is_ok();
+            (inserted, changed)
+        })?;
         self.flush_metadata(unix_ms()).await
     }
 
@@ -1396,12 +1311,7 @@ impl AndaDB {
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
     pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
-        if self.inner.read_only.load(Ordering::Relaxed) {
-            return Err(DBError::Generic {
-                name: self.inner.name.clone(),
-                source: "database is read-only".into(),
-            });
-        }
+        self.ensure_writable()?;
 
         let old = self.update_metadata_if(|metadata| {
             let old = metadata.extensions.remove(key);
@@ -1434,152 +1344,9 @@ impl AndaDB {
 mod tests {
     use super::*;
     use crate::schema::{ByteBufB64, Fe, FieldValue, Ft, Schema};
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
-        memory::InMemory, path::Path,
-    };
-    use std::{
-        fmt,
-        sync::{
-            Mutex as StdMutex,
-            atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
-        },
-        task::Poll,
-    };
-
-    /// An object store that holds the first armed database-metadata PUT before
-    /// it reaches the backing store. A second PUT is allowed through, so an
-    /// implementation without a metadata serialization gate deterministically
-    /// produces the harmful order "new snapshot, then old snapshot".
-    #[derive(Debug)]
-    struct ReverseMetadataPutStore {
-        inner: Arc<InMemory>,
-        metadata_path: Path,
-        armed: TestAtomicBool,
-        release_first: tokio::sync::watch::Receiver<bool>,
-        snapshots: StdMutex<Vec<BTreeSet<String>>>,
-    }
-
-    impl ReverseMetadataPutStore {
-        fn new(metadata_path: Path, release_first: tokio::sync::watch::Receiver<bool>) -> Self {
-            Self {
-                inner: Arc::new(InMemory::new()),
-                metadata_path,
-                armed: TestAtomicBool::new(false),
-                release_first,
-                snapshots: StdMutex::new(Vec::new()),
-            }
-        }
-
-        fn arm(&self) {
-            assert!(self.snapshots.lock().unwrap().is_empty());
-            self.armed.store(true, TestOrdering::Release);
-        }
-
-        fn snapshots(&self) -> Vec<BTreeSet<String>> {
-            self.snapshots.lock().unwrap().clone()
-        }
-    }
-
-    impl fmt::Display for ReverseMetadataPutStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("ReverseMetadataPutStore")
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for ReverseMetadataPutStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> ObjectStoreResult<PutResult> {
-            if self.armed.load(TestOrdering::Acquire) && location == &self.metadata_path {
-                let bytes: bytes::Bytes = payload.clone().into();
-                let metadata: DBMetadata =
-                    cbor2::from_reader(&bytes[..]).map_err(|err| object_store::Error::Generic {
-                        store: "reverse_metadata_put",
-                        source: err.into(),
-                    })?;
-                let put_index = {
-                    let mut snapshots = self.snapshots.lock().unwrap();
-                    let put_index = snapshots.len();
-                    snapshots.push(metadata.collections);
-                    put_index
-                };
-
-                if put_index == 0 {
-                    let mut release = self.release_first.clone();
-                    while !*release.borrow() {
-                        release
-                            .changed()
-                            .await
-                            .map_err(|_| object_store::Error::Generic {
-                                store: "reverse_metadata_put",
-                                source: "release sender dropped".into(),
-                            })?;
-                    }
-                }
-            }
-
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> ObjectStoreResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, ObjectStoreResult<Path>>,
-        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> ObjectStoreResult<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> ObjectStoreResult<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
+    use anda_object_store::{FaultGate, FaultKind, FaultOp, FaultOutcome, FaultRule, FaultStore};
+    use object_store::memory::InMemory;
+    use std::task::Poll;
 
     #[tokio::test]
     async fn test_database_creation() {
@@ -2208,12 +1975,20 @@ mod tests {
     async fn test_different_collection_registrations_serialize_db_metadata_puts() {
         const DB_NAME: &str = "metadata_race_db";
 
-        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
-        let store = Arc::new(ReverseMetadataPutStore::new(
-            Path::from(format!("{DB_NAME}/{}", AndaDB::METADATA_PATH)),
-            release_rx,
-        ));
-        let object_store: Arc<dyn ObjectStore> = store.clone();
+        let (store, faults) = FaultStore::wrap(InMemory::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(store);
+        let metadata_path = format!("{DB_NAME}/{}", AndaDB::METADATA_PATH);
+        let metadata_puts = || {
+            faults
+                .event_log()
+                .iter()
+                .filter(|e| {
+                    e.op == FaultOp::Put
+                        && e.outcome == FaultOutcome::Attempted
+                        && e.path == metadata_path
+                })
+                .count()
+        };
         let config = DBConfig {
             name: DB_NAME.to_string(),
             description: "metadata race regression".to_string(),
@@ -2255,7 +2030,12 @@ mod tests {
         .unwrap();
         y.flush(unix_ms()).await.unwrap();
 
-        store.arm();
+        faults.reset();
+        let gate = FaultGate::new();
+        faults.push_rule(FaultRule {
+            kind: FaultKind::PauseBefore(gate.clone()),
+            ..FaultRule::fail_once(FaultOp::Put, metadata_path.clone())
+        });
 
         // Register x and poll through to its blocked db_meta PUT. The payload
         // has already been serialized here, so it is permanently the old
@@ -2265,8 +2045,7 @@ mod tests {
             futures::poll!(x_registration.as_mut()),
             Poll::Pending
         ));
-        let x_only = BTreeSet::from(["x".to_string()]);
-        assert_eq!(store.snapshots(), vec![x_only.clone()]);
+        assert_eq!(metadata_puts(), 1);
 
         // Registration of another name reaches flush_metadata in the same
         // poll, but must wait on x's gate instead of issuing an overtaking PUT.
@@ -2278,18 +2057,15 @@ mod tests {
         let both = BTreeSet::from(["x".to_string(), "y".to_string()]);
         assert_eq!(db.metadata().collections, both);
         assert_eq!(
-            store.snapshots(),
-            vec![x_only],
+            metadata_puts(),
+            1,
             "y must wait for the metadata lock before taking or PUTting its snapshot",
         );
 
-        release_tx.send(true).unwrap();
+        gate.release();
         let x = x_registration.await.unwrap();
         let y = y_registration.await.unwrap();
-        assert_eq!(
-            store.snapshots(),
-            vec![BTreeSet::from(["x".into()]), both.clone()]
-        );
+        assert_eq!(metadata_puts(), 2);
 
         // Simulate a crash: do not call close/flush on the original instance.
         // A fresh instance must recover both registered collection names from

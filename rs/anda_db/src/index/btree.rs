@@ -4,7 +4,7 @@ use cbor2::{from_reader, to_canonical_vec};
 use ic_auth_types::ByteBufB64;
 use parking_lot::RwLock;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt::Debug, hash::Hash, str::FromStr, sync::Arc};
+use std::{collections::BTreeSet, fmt::Debug, hash::Hash, str::FromStr, sync::Arc};
 
 pub use anda_db_btree::{BTreeConfig, BTreeMetadata, BTreeStats, RangeQuery};
 
@@ -142,7 +142,7 @@ where
     name: String,
     fields: Vec<String>,
     index: BTreeIndex<u64, FV>,
-    storage: Storage, // 与 Collection 共享同一个 Storage 实例
+    storage: Storage, // shared with the owning collection
     /// CAS token of the last observed metadata object: the remaining defense
     /// against a second writer. A `Precondition` conflict is never
     /// reconciled in place — the error propagates, the collection poisons
@@ -188,14 +188,7 @@ impl BTree {
     /// (pre-manifest) un-suffixed object and is only ever read, never
     /// written; the manifest protocol writes generation-suffixed objects.
     fn bucket_path(name: &str, object: BucketObject) -> String {
-        if object.generation == 0 {
-            format!("btree_indexes/{name}/b_{}.cbor", object.bucket_id)
-        } else {
-            format!(
-                "btree_indexes/{name}/b_{}_{}.cbor",
-                object.bucket_id, object.generation
-            )
-        }
+        super::persistence::bucket_path(&BTree::dir_path(name), object.bucket_id, object.generation)
     }
 
     /// Decodes an optional pagination cursor from base64url deterministic CBOR.
@@ -672,86 +665,67 @@ impl BTree {
     /// A query value type that does not match the index key type yields an
     /// empty result; use [`BTree::try_range_query_ids`] to surface the
     /// mismatch as an error.
+    // The body is instantiated for Copy (`u64`/`i64`) and owned keys alike.
+    #[allow(clippy::clone_on_copy)]
     pub fn range_query_with<F, R>(&self, query: RangeQuery<Fv>, mut f: F) -> Vec<R>
     where
         F: FnMut(Fv, &Vec<DocumentId>) -> (bool, Vec<R>),
     {
-        match self {
-            BTree::I64(btree) => match RangeQuery::<i64>::try_convert_from(query) {
+        with_typed_inner!(self, |btree, Key| {
+            match RangeQuery::<Key>::try_convert_from(query) {
                 Ok(q) => btree
                     .index
-                    .range_query_with(q, |fv, pks| f(Fv::I64(*fv), pks)),
-                Err(_) => {
-                    vec![]
+                    .range_query_with(q, |key, pks| f(Fv::from(key.clone()), pks)),
+                Err(_) => Vec::new(),
+            }
+        })
+    }
+
+    /// Removes every posting of `ids` without knowing their keys, in one
+    /// sweep over the key space. Only keys that reference a purged id are
+    /// cloned; returns the number of removed postings.
+    // The body is instantiated for Copy (`u64`/`i64`) and owned keys alike.
+    #[allow(clippy::clone_on_copy)]
+    pub fn purge_ids(&self, ids: &BTreeSet<DocumentId>, now_ms: u64) -> usize {
+        with_inner!(self, |btree| {
+            // `Not(Include([]))` excludes nothing, i.e. it walks every key.
+            // The scan holds the index read lock while the callback runs, so
+            // stale postings are only collected here and removed afterwards.
+            let stale = btree.index.range_query_with(
+                RangeQuery::Not(Box::new(RangeQuery::Include(Vec::new()))),
+                |key, pks| {
+                    let hits: Vec<DocumentId> =
+                        pks.iter().copied().filter(|id| ids.contains(id)).collect();
+                    if hits.is_empty() {
+                        (true, Vec::new())
+                    } else {
+                        (true, vec![(key.clone(), hits)])
+                    }
+                },
+            );
+            let mut removed = 0;
+            for (key, hits) in stale {
+                for id in hits {
+                    removed += usize::from(btree.index.remove(id, key.clone(), now_ms));
                 }
-            },
-            BTree::U64(btree) => match RangeQuery::<u64>::try_convert_from(query) {
-                Ok(q) => btree
-                    .index
-                    .range_query_with(q, |fv, pks| f(Fv::U64(*fv), pks)),
-                Err(_) => {
-                    vec![]
-                }
-            },
-            BTree::String(btree) => match RangeQuery::<String>::try_convert_from(query) {
-                Ok(q) => btree
-                    .index
-                    .range_query_with(q, |fv, pks| f(Fv::Text(fv.to_owned()), pks)),
-                Err(_) => {
-                    vec![]
-                }
-            },
-            BTree::Bytes(btree) => match RangeQuery::<Vec<u8>>::try_convert_from(query) {
-                Ok(q) => btree
-                    .index
-                    .range_query_with(q, |fv, pks| f(Fv::Bytes(fv.clone()), pks)),
-                Err(_) => {
-                    vec![]
-                }
-            },
-        }
+            }
+            removed
+        })
     }
 
     /// Returns index keys after `cursor`, limited by `limit` when provided.
     pub fn keys(&self, cursor: Option<String>, limit: Option<usize>) -> Vec<Fv> {
-        match self {
-            BTree::I64(btree) => match Self::from_cursor(&cursor) {
-                Err(_) => vec![],
+        with_typed_inner!(self, |btree, Key| {
+            match Self::from_cursor::<Key>(&cursor) {
                 Ok(cursor) => btree
                     .index
                     .keys(cursor, limit)
                     .into_iter()
-                    .map(Fv::I64)
+                    .map(Fv::from)
                     .collect(),
-            },
-            BTree::U64(btree) => match Self::from_cursor(&cursor) {
-                Err(_) => vec![],
-                Ok(cursor) => btree
-                    .index
-                    .keys(cursor, limit)
-                    .into_iter()
-                    .map(Fv::U64)
-                    .collect(),
-            },
-            BTree::String(btree) => match Self::from_cursor(&cursor) {
-                Err(_) => vec![],
-                Ok(cursor) => btree
-                    .index
-                    .keys(cursor, limit)
-                    .into_iter()
-                    .map(Fv::Text)
-                    .collect(),
-            },
-            BTree::Bytes(btree) => match Self::from_cursor(&cursor) {
-                Err(_) => vec![],
-                Ok(cursor) => btree
-                    .index
-                    .keys(cursor, limit)
-                    .into_iter()
-                    .map(Fv::Bytes)
-                    .collect(),
-            },
-        }
+                Err(_) => Vec::new(),
+            }
+        })
     }
 
     /// Compacts bucket layout and persists any changes, including a rebuild
@@ -835,15 +809,15 @@ where
         let fields: Vec<String> = from_virtual_field_name(&name);
         let path = BTree::metadata_path(&name);
         let (metadata, ver) = storage.fetch_internal_bytes(&path).await?;
-        let n = Arc::new(name.clone());
-        let s = Arc::new(storage.clone());
+        let bucket_storage = storage.clone();
+        let bucket_name = name.clone();
         let index = BTreeIndex::<DocumentId, FV>::load_all(&metadata[..], async move |object| {
-            let path = BTree::bucket_path(n.clone().as_str(), object);
-            match s.clone().fetch_internal_bytes(&path).await {
-                Ok((data, _)) => Ok(Some(data.into())),
-                Err(DBError::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
+            // Hold owned copies across the await: a future that borrows the
+            // closure's captures trips the "Send is not general enough"
+            // limitation for async closures.
+            let path = BTree::bucket_path(&bucket_name, object);
+            let storage = bucket_storage.clone();
+            super::persistence::load_object(&storage, &path).await
         })
         .await?;
 
@@ -988,136 +962,38 @@ mod tests {
         assert!(!tree.has_pending_flush());
     }
 
+    #[tokio::test]
+    async fn purge_ids_removes_postings_without_known_keys() {
+        let now = unix_ms();
+        let tree = BTree::new(
+            field("tags", Ft::Array(vec![Ft::Text])),
+            test_storage().await,
+            now,
+        )
+        .await
+        .unwrap();
+        let text = |s: &str| Fv::Text(s.into());
+        tree.insert(1, &Fv::Array(vec![text("a"), text("b")]), now)
+            .unwrap();
+        tree.insert(2, &Fv::Array(vec![text("b")]), now).unwrap();
+        tree.insert(3, &Fv::Array(vec![text("c")]), now).unwrap();
+
+        assert_eq!(tree.purge_ids(&BTreeSet::from([1, 3]), now), 3);
+        let ids = |key: &str| {
+            tree.query_with(&text(key), |ids| Some(ids.clone()))
+                .unwrap_or_default()
+        };
+        assert!(ids("a").is_empty());
+        assert_eq!(ids("b"), vec![2]);
+        assert!(ids("c").is_empty());
+        assert_eq!(tree.purge_ids(&BTreeSet::from([1, 3]), now), 0);
+    }
+
     use super::*;
     use crate::storage::StorageConfig;
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
-        memory::InMemory, path::Path,
-    };
-    use parking_lot::Mutex as ParkingMutex;
-    use std::{
-        collections::BTreeMap,
-        fmt,
-        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-
-    /// Delegating in-memory store with a deterministic bucket-PUT failpoint.
-    /// Metadata writes are recorded too, so tests can assert the exact
-    /// production-wrapper ordering around the injected crash boundary.
-    #[derive(Debug)]
-    struct FailNthBucketPutStore {
-        inner: Arc<InMemory>,
-        armed: AtomicBool,
-        bucket_puts: AtomicUsize,
-        fail_at: usize,
-        events: ParkingMutex<Vec<String>>,
-    }
-
-    impl FailNthBucketPutStore {
-        fn new(fail_at: usize) -> Self {
-            Self {
-                inner: Arc::new(InMemory::new()),
-                armed: AtomicBool::new(false),
-                bucket_puts: AtomicUsize::new(0),
-                fail_at,
-                events: ParkingMutex::new(Vec::new()),
-            }
-        }
-
-        fn arm(&self) {
-            self.bucket_puts.store(0, Ordering::Release);
-            self.events.lock().clear();
-            self.armed.store(true, Ordering::Release);
-        }
-
-        fn events(&self) -> Vec<String> {
-            self.events.lock().clone()
-        }
-    }
-
-    impl fmt::Display for FailNthBucketPutStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("FailNthBucketPutStore")
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for FailNthBucketPutStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> ObjectStoreResult<PutResult> {
-            let path = location.to_string();
-            if self.armed.load(Ordering::Acquire) && path.contains("btree_indexes/fault_tree/") {
-                self.events.lock().push(path.clone());
-                if path.contains("/b_")
-                    && self.bucket_puts.fetch_add(1, Ordering::AcqRel) + 1 == self.fail_at
-                {
-                    return Err(object_store::Error::Generic {
-                        store: "fail_nth_btree_bucket_put",
-                        source: "injected bucket PUT failure".into(),
-                    });
-                }
-            }
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> ObjectStoreResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, ObjectStoreResult<Path>>,
-        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> ObjectStoreResult<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> ObjectStoreResult<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
+    use anda_object_store::{FaultOp, FaultOutcome, FaultRule, FaultStore};
+    use object_store::memory::InMemory;
+    use std::collections::BTreeMap;
 
     async fn test_storage() -> Storage {
         Storage::connect(
@@ -1641,7 +1517,8 @@ mod tests {
     /// previous complete snapshot; a retry then converges.
     #[tokio::test]
     async fn wrapper_fault_mid_bucket_puts_keeps_previous_snapshot() {
-        let object_store = Arc::new(FailNthBucketPutStore::new(2));
+        let (object_store, faults) = FaultStore::wrap(InMemory::new());
+        let object_store = Arc::new(object_store);
         let storage = Storage::connect(
             "btree_wrapper_fault".to_string(),
             object_store.clone(),
@@ -1675,10 +1552,20 @@ mod tests {
         // Fail the second bucket PUT: one new-generation object becomes a
         // durable orphan, the other is never written, the manifest commit
         // must not happen.
-        object_store.arm();
+        faults.reset();
+        faults.push_rule(FaultRule {
+            skip: 1,
+            ..FaultRule::fail_once(FaultOp::Put, "btree_indexes/fault_tree/b_")
+        });
         assert!(tree.flush(now + 3).await.is_err());
 
-        let events = object_store.events();
+        let events: Vec<_> = faults
+            .event_log()
+            .into_iter()
+            .filter(|e| e.op == FaultOp::Put && e.outcome == FaultOutcome::Attempted)
+            .map(|e| e.path)
+            .filter(|path| path.contains("btree_indexes/fault_tree/"))
+            .collect();
         assert!(
             events.iter().filter(|path| path.contains("/b_")).count() >= 2,
             "expected at least two bucket PUT attempts: {events:?}"

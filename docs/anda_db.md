@@ -697,7 +697,7 @@ Use B-Tree indexes for fields you filter on frequently. Use BM25 only for fields
 
 ### Keep Extensions Small
 
-Database and collection extensions should stay lightweight because they are persisted in hot metadata objects.
+Database and collection extensions should stay lightweight because they are persisted in hot metadata objects. A value that would push that object past `max_small_object_size` is rejected up front (`save_extension` returns `PayloadTooLarge`; `set_extension` drops it with a warning) instead of failing every later flush.
 
 ### Flush on a Policy, Not by Accident
 

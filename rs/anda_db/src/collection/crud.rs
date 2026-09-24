@@ -468,6 +468,12 @@ impl Collection {
         // Serialize mutations of the same document (see `doc_locks`).
         let _doc_guard = self.doc_lock(id).lock().await;
         self.ensure_mutable()?;
+        // A concurrent remove of the same id may have finished while we
+        // waited. Without this re-check its deleted object would read as a
+        // dead id and trigger a whole-index purge sweep for nothing.
+        if !self.doc_ids.read().contains(&id) {
+            return Ok(None);
+        }
 
         let now_ms = unix_ms();
         let path = Self::doc_path(id);

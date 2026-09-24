@@ -7,48 +7,31 @@ impl Collection {
     /// # Returns
     /// Ok(()) if successful, or an error if loading fails
     pub(super) async fn load_indexes(&mut self) -> Result<(), DBError> {
-        let meta = { self.metadata.read().clone() };
-        let (btree_indexes, bm25_indexes, hnsw_indexes) = try_join_await!(
-            async {
-                let mut btree_indexes = Vec::new();
-                for (name, field) in meta.btree_indexes.iter() {
-                    let index =
-                        BTree::bootstrap(name.clone(), field.r#type(), self.storage.clone())
-                            .await?;
-                    if field.unique() {
-                        btree_indexes.insert(0, index);
-                    } else {
-                        btree_indexes.push(index);
-                    }
-                }
-                Ok::<Vec<BTree>, DBError>(btree_indexes)
-            },
-            async {
-                let mut bm25_indexes = Vec::new();
-                for name in meta.bm25_indexes.keys() {
-                    let index =
-                        BM25::bootstrap(name.clone(), self.tokenizer.clone(), self.storage.clone())
-                            .await?;
-
-                    bm25_indexes.push(index);
-                }
-                Ok::<Vec<BM25>, DBError>(bm25_indexes)
-            },
-            async {
-                let mut hnsw_indexes = Vec::new();
-                for name in meta.hnsw_indexes.keys() {
-                    let index = Hnsw::bootstrap_with_cleanup(
-                        name.clone(),
-                        self.storage.clone(),
-                        !self.is_read_only(),
-                    )
-                    .await?;
-
-                    hnsw_indexes.push(index);
-                }
-                Ok::<Vec<Hnsw>, DBError>(hnsw_indexes)
-            },
+        let (btree_meta, bm25_names, hnsw_names) = {
+            let meta = self.metadata.read();
+            (
+                meta.btree_indexes.clone(),
+                meta.bm25_indexes.keys().cloned().collect::<Vec<_>>(),
+                meta.hnsw_indexes.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let cleanup = !self.is_read_only();
+        let (mut btree_indexes, bm25_indexes, hnsw_indexes) = try_join_await!(
+            try_join_all(btree_meta.iter().map(|(name, field)| {
+                BTree::bootstrap(name.clone(), field.r#type(), self.storage.clone())
+            })),
+            try_join_all(bm25_names.into_iter().map(|name| {
+                BM25::bootstrap(name, self.tokenizer.clone(), self.storage.clone())
+            })),
+            try_join_all(
+                hnsw_names
+                    .into_iter()
+                    .map(|name| Hnsw::bootstrap_with_cleanup(name, self.storage.clone(), cleanup))
+            ),
         )?;
+        // Unique indexes first, so a conflicting write fails before any
+        // non-unique index changes (the same order index creation keeps).
+        btree_indexes.sort_by_key(BTree::allow_duplicates);
 
         self.btree_indexes = btree_indexes;
         self.bm25_indexes = bm25_indexes;
@@ -66,23 +49,11 @@ impl Collection {
     where
         F: FnMut(DocumentId, Document) -> Result<(), DBError>,
     {
-        let ids = self.ids();
         let schema = self.schema();
-        let mut stream = futures::stream::iter(ids)
-            .map(|id| {
-                let storage = self.storage.clone();
-                async move {
-                    (
-                        id,
-                        storage.fetch::<DocumentOwned>(&Self::doc_path(id)).await,
-                    )
-                }
-            })
-            .buffered(self.io_concurrency());
-
+        let mut stream = self.fetch_documents(self.ids());
         while let Some((id, result)) = stream.next().await {
             match result {
-                Ok((doc, _)) => {
+                Ok(doc) => {
                     f(id, Document::try_from_doc(schema.clone(), doc)?)?;
                 }
                 Err(DBError::NotFound { .. }) => {}

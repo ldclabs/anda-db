@@ -34,9 +34,9 @@ use crate::{
 pub struct Hnsw {
     name: String,
     index: HnswIndex,
-    storage: Storage, // 与 Collection 共享同一个 Storage 实例
-    metadata_version: Arc<RwLock<ObjectVersion>>,
-    ids_version: Arc<RwLock<ObjectVersion>>,
+    storage: Storage, // shared with the owning collection
+    metadata_version: RwLock<ObjectVersion>,
+    ids_version: RwLock<ObjectVersion>,
     node_versions: Arc<RwLock<FxHashMap<u64, ObjectVersion>>>,
     /// A read-only bootstrap defers its storage-mutating orphan sweep until
     /// the first writable flush.
@@ -124,8 +124,8 @@ impl Hnsw {
             name,
             index,
             storage,
-            metadata_version: Arc::new(RwLock::new(metadata_version)),
-            ids_version: Arc::new(RwLock::new(ids_version)),
+            metadata_version: RwLock::new(metadata_version),
+            ids_version: RwLock::new(ids_version),
             node_versions: Arc::new(RwLock::new(FxHashMap::default())),
             orphan_cleanup_pending: AtomicBool::new(false),
         })
@@ -156,13 +156,15 @@ impl Hnsw {
             .fetch_internal_bytes(&Hnsw::metadata_path(&name))
             .await?;
         let (ids, ids_version) = storage.fetch_internal_bytes(&Hnsw::ids_path(&name)).await?;
-        let n = Arc::new(name.clone());
-        let s = Arc::new(storage.clone());
+        let node_storage = storage.clone();
+        let node_name = name.clone();
         let node_versions = Arc::new(RwLock::new(FxHashMap::default()));
         let loaded_node_versions = node_versions.clone();
         let index = HnswIndex::load_all(&metadata[..], &ids[..], async move |id: u64| {
-            let path = Hnsw::node_path(n.clone().as_str(), id);
-            match s.clone().fetch_internal_bytes(&path).await {
+            // Owned copies across the await; see `BTree::bootstrap`.
+            let path = Hnsw::node_path(&node_name, id);
+            let storage = node_storage.clone();
+            match storage.fetch_internal_bytes(&path).await {
                 Ok((data, version)) => {
                     loaded_node_versions.write().insert(id, version);
                     Ok(Some(data.into()))
@@ -177,8 +179,8 @@ impl Hnsw {
             name,
             index,
             storage,
-            metadata_version: Arc::new(RwLock::new(metadata_version)),
-            ids_version: Arc::new(RwLock::new(ids_version)),
+            metadata_version: RwLock::new(metadata_version),
+            ids_version: RwLock::new(ids_version),
             node_versions,
             orphan_cleanup_pending: AtomicBool::new(!cleanup),
         };
@@ -198,24 +200,16 @@ impl Hnsw {
     /// are collected by the load callback above. A missing tombstone blob is
     /// valid (a previous purge may already have deleted it).
     async fn load_tombstone_versions(&self) -> Result<(), DBError> {
-        let name = Arc::new(self.name.clone());
-        let storage = Arc::new(self.storage.clone());
-        let versions = self.node_versions.clone();
         let mut stream = futures::stream::iter(self.index.removed_node_ids())
-            .map(move |id| {
-                let name = name.clone();
-                let storage = storage.clone();
-                let versions = versions.clone();
-                async move {
-                    let path = Hnsw::node_path(name.as_str(), id);
-                    match storage.fetch_internal_bytes(&path).await {
-                        Ok((_, version)) => {
-                            versions.write().insert(id, version);
-                            Ok(())
-                        }
-                        Err(DBError::NotFound { .. }) => Ok(()),
-                        Err(error) => Err(error),
+            .map(|id| async move {
+                let path = Hnsw::node_path(&self.name, id);
+                match self.storage.fetch_internal_bytes(&path).await {
+                    Ok((_, version)) => {
+                        self.node_versions.write().insert(id, version);
+                        Ok(())
                     }
+                    Err(DBError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error),
                 }
             })
             .buffer_unordered(16);
@@ -295,48 +289,23 @@ impl Hnsw {
         (complete, deleted)
     }
 
-    /// Persists one versioned artifact with a single conditional PUT: the
-    /// remaining second-writer defense. A `Precondition` conflict is not
-    /// reconciled in place — it propagates, the collection poisons its handle
-    /// and recovery happens on reopen.
-    async fn persist_versioned(
-        storage: Storage,
-        path: String,
-        object_version: Arc<RwLock<ObjectVersion>>,
-        data: Vec<u8>,
-    ) -> Result<(), BoxError> {
-        let expected = { object_version.read().clone() };
-        let version = storage
-            .put_internal_bytes(&path, Bytes::from(data), PutMode::Update(expected.into()))
-            .await
-            .map_err(BoxError::from)?;
-        *object_version.write() = version;
-        Ok(())
-    }
-
     /// Persists a fixed-key node with an object-store precondition. `Create`
     /// protects the first publication and `Update` protects every replacement.
     /// If the backend committed but the result was lost, the local token stays
     /// stale and a retry conflicts instead of overwriting newer durable bytes.
-    async fn persist_node(
-        storage: Storage,
-        name: Arc<String>,
-        versions: Arc<RwLock<FxHashMap<u64, ObjectVersion>>>,
-        id: u64,
-        data: Vec<u8>,
-    ) -> Result<bool, BoxError> {
-        let mode = versions
+    async fn persist_node(&self, id: u64, data: Vec<u8>) -> Result<bool, BoxError> {
+        let mode = self
+            .node_versions
             .read()
             .get(&id)
             .cloned()
             .map(|version| PutMode::Update(version.into()))
             .unwrap_or(PutMode::Create);
-        let path = Hnsw::node_path(name.as_str(), id);
-        let version = storage
-            .put_internal_bytes(&path, Bytes::from(data), mode)
-            .await
-            .map_err(BoxError::from)?;
-        versions.write().insert(id, version);
+        let version = self
+            .storage
+            .put_internal_bytes(&Hnsw::node_path(&self.name, id), Bytes::from(data), mode)
+            .await?;
+        self.node_versions.write().insert(id, version);
         Ok(true)
     }
 
@@ -361,15 +330,12 @@ impl Hnsw {
             false
         };
         let had_removed = self.index.has_removed_nodes();
-        let node_name = Arc::new(self.name.clone());
-        let node_storage = Arc::new(self.storage.clone());
-        let node_versions = self.node_versions.clone();
         let ids_path = Hnsw::ids_path(&self.name);
-        let ids_storage = self.storage.clone();
-        let ids_version = self.ids_version.clone();
         let metadata_path = Hnsw::metadata_path(&self.name);
-        let metadata_storage = self.storage.clone();
-        let metadata_version = self.metadata_version.clone();
+        // The ids and metadata objects are each one conditional PUT: the
+        // remaining second-writer defense. A `Precondition` conflict is not
+        // reconciled in place — it propagates, the collection poisons its
+        // handle and recovery happens on reopen.
         let saved = self
             .index
             .flush_with_options(
@@ -378,15 +344,22 @@ impl Hnsw {
                     node_concurrency: 8,
                     ..Default::default()
                 },
-                move |id, data| {
-                    let name = node_name.clone();
-                    let storage = node_storage.clone();
-                    let versions = node_versions.clone();
-                    Self::persist_node((*storage).clone(), name, versions, id, data)
+                |id, data| self.persist_node(id, data),
+                |data| {
+                    super::persistence::commit_metadata(
+                        &self.storage,
+                        &ids_path,
+                        &self.ids_version,
+                        data,
+                    )
                 },
-                move |data| Self::persist_versioned(ids_storage, ids_path, ids_version, data),
-                move |data| {
-                    Self::persist_versioned(metadata_storage, metadata_path, metadata_version, data)
+                |data| {
+                    super::persistence::commit_metadata(
+                        &self.storage,
+                        &metadata_path,
+                        &self.metadata_version,
+                        data,
+                    )
                 },
             )
             .await?;
@@ -405,13 +378,14 @@ impl Hnsw {
 
         // Delete the persisted blobs of removed nodes; without this they
         // would leak forever. "Not found" is success (already deleted).
-        let n = Arc::new(self.name.clone());
-        let s = Arc::new(self.storage.clone());
+        let storage = self.storage.clone();
+        let name = self.name.clone();
         let versions = self.node_versions.clone();
         self.index
             .purge_removed_nodes(async move |id| {
-                let path = Hnsw::node_path(n.clone().as_str(), id);
-                match s.clone().delete(&path).await {
+                let path = Hnsw::node_path(&name, id);
+                let storage = storage.clone();
+                match storage.delete(&path).await {
                     Ok(()) | Err(DBError::NotFound { .. }) => {
                         versions.write().remove(&id);
                         Ok(true)
@@ -491,146 +465,39 @@ mod tests {
         schema::{Ft, bf16},
         storage::StorageConfig,
     };
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
-        memory::InMemory, path::Path,
-    };
-    use parking_lot::Mutex;
-    use std::fmt;
+    use anda_object_store::{FaultHandle, FaultKind, FaultOp, FaultOutcome, FaultRule, FaultStore};
+    use object_store::memory::InMemory;
 
-    /// In-memory object store with a one-shot path-targeted PUT failure and a
-    /// write log, used to assert both failure retryability and durable order.
-    #[derive(Debug, Default)]
-    struct FailPutStore {
-        inner: Arc<InMemory>,
-        fault: Mutex<Option<(String, bool)>>,
-        puts: Mutex<Vec<String>>,
+    /// Rejects the next PUT whose path contains `path` before it reaches the
+    /// store.
+    fn fail_next_put(faults: &FaultHandle, path: &str) {
+        faults.push_rule(FaultRule::fail_once(FaultOp::Put, path));
     }
 
-    impl FailPutStore {
-        fn fail_next_put(&self, suffix: impl Into<String>) {
-            *self.fault.lock() = Some((suffix.into(), false));
-        }
-
-        /// Persists the target object and then reports an injected error. The
-        /// caller is dropped after the error, modeling a crash immediately
-        /// after that atomic PUT became durable.
-        fn crash_after_next_put(&self, suffix: impl Into<String>) {
-            *self.fault.lock() = Some((suffix.into(), true));
-        }
-
-        fn clear_puts(&self) {
-            self.puts.lock().clear();
-        }
-
-        fn put_suffixes(&self) -> Vec<String> {
-            self.puts.lock().clone()
-        }
+    /// Lets the next matching PUT become durable, then reports an error:
+    /// a crash immediately after that atomic PUT.
+    fn crash_after_next_put(faults: &FaultHandle, path: &str) {
+        faults.push_rule(FaultRule {
+            kind: FaultKind::ErrorAfter,
+            ..FaultRule::fail_once(FaultOp::Put, path)
+        });
     }
 
-    impl fmt::Display for FailPutStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("FailPutStore")
-        }
+    /// Every attempted PUT since the last reset, rejected ones included.
+    fn put_paths(faults: &FaultHandle) -> Vec<String> {
+        faults
+            .event_log()
+            .into_iter()
+            .filter(|e| e.op == FaultOp::Put && e.outcome == FaultOutcome::Attempted)
+            .map(|e| e.path)
+            .collect()
     }
 
-    #[async_trait]
-    impl ObjectStore for FailPutStore {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> ObjectStoreResult<PutResult> {
-            let path = location.to_string();
-            self.puts.lock().push(path.clone());
-            let fault = {
-                let mut fault = self.fault.lock();
-                if fault
-                    .as_ref()
-                    .is_some_and(|(suffix, _)| path.ends_with(suffix))
-                {
-                    fault.take()
-                } else {
-                    None
-                }
-            };
-            if matches!(fault.as_ref(), Some((_, false))) {
-                return Err(object_store::Error::Generic {
-                    store: "fail_put",
-                    source: "injected put failure".into(),
-                });
-            }
-            let result = self.inner.put_opts(location, payload, opts).await?;
-            if matches!(fault.as_ref(), Some((_, true))) {
-                return Err(object_store::Error::Generic {
-                    store: "fail_put",
-                    source: "injected crash after durable put".into(),
-                });
-            }
-            Ok(result)
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> ObjectStoreResult<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, ObjectStoreResult<Path>>,
-        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> ObjectStoreResult<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> ObjectStoreResult<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    async fn fault_index() -> (Hnsw, Storage, Arc<FailPutStore>) {
-        let object_store = Arc::new(FailPutStore::default());
+    async fn fault_index() -> (Hnsw, Storage, FaultHandle) {
+        let (object_store, faults) = FaultStore::wrap(InMemory::new());
         let storage = Storage::connect(
             "hnsw_fault_tests".to_string(),
-            object_store.clone(),
+            Arc::new(object_store),
             StorageConfig {
                 compress_level: 0,
                 ..Default::default()
@@ -650,11 +517,11 @@ mod tests {
         )
         .await
         .unwrap();
-        object_store.clear_puts();
+        faults.reset();
         index
             .insert(1, vec![bf16::from_f32(1.0), bf16::from_f32(1.0)], 2)
             .unwrap();
-        (index, storage, object_store)
+        (index, storage, faults)
     }
 
     /// A crash between the ids PUT (node already excluded) and the metadata
@@ -663,7 +530,7 @@ mod tests {
     /// keeping every referenced blob.
     #[tokio::test]
     async fn bootstrap_sweeps_orphan_node_blobs() {
-        let (index, storage, _object_store) = fault_index().await;
+        let (index, storage, _faults) = fault_index().await;
         assert!(index.flush(3).await.unwrap());
 
         // Simulate the crash leftover: a blob at an id that neither the ids
@@ -713,11 +580,11 @@ mod tests {
         expected_puts: &[&str],
         visible: bool,
     ) -> (Hnsw, Storage) {
-        let (index, storage, object_store) = fault_index().await;
-        object_store.crash_after_next_put(suffix);
+        let (index, storage, faults) = fault_index().await;
+        crash_after_next_put(&faults, suffix);
         assert!(index.flush(3).await.is_err());
 
-        let puts = object_store.put_suffixes();
+        let puts = put_paths(&faults);
         assert_eq!(puts.len(), expected_puts.len());
         for (actual, expected) in puts.iter().zip(expected_puts) {
             assert!(actual.ends_with(expected), "unexpected PUT path: {actual}");
@@ -734,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_put_failure_does_not_publish_ids_or_metadata() {
-        let (index, storage, object_store) = fault_index().await;
+        let (index, storage, faults) = fault_index().await;
         let old_ids = storage
             .fetch_bytes(&Hnsw::ids_path("embedding"))
             .await
@@ -746,10 +613,10 @@ mod tests {
             .unwrap()
             .0;
 
-        object_store.fail_next_put("n_1.cbor");
+        fail_next_put(&faults, "n_1.cbor");
         assert!(index.flush(3).await.is_err());
-        assert_eq!(object_store.put_suffixes().len(), 1);
-        assert!(object_store.put_suffixes()[0].ends_with("n_1.cbor"));
+        assert_eq!(put_paths(&faults).len(), 1);
+        assert!(put_paths(&faults)[0].ends_with("n_1.cbor"));
         assert_eq!(
             storage
                 .fetch_bytes(&Hnsw::ids_path("embedding"))
@@ -776,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn ids_put_failure_leaves_metadata_at_previous_commit() {
-        let (index, storage, object_store) = fault_index().await;
+        let (index, storage, faults) = fault_index().await;
         let old_ids = storage
             .fetch_bytes(&Hnsw::ids_path("embedding"))
             .await
@@ -788,9 +655,9 @@ mod tests {
             .unwrap()
             .0;
 
-        object_store.fail_next_put("ids.cbor");
+        fail_next_put(&faults, "ids.cbor");
         assert!(index.flush(3).await.is_err());
-        let puts = object_store.put_suffixes();
+        let puts = put_paths(&faults);
         assert_eq!(puts.len(), 2);
         assert!(puts[0].ends_with("n_1.cbor"));
         assert!(puts[1].ends_with("ids.cbor"));
@@ -817,16 +684,16 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_put_failure_is_last_and_retryable() {
-        let (index, storage, object_store) = fault_index().await;
+        let (index, storage, faults) = fault_index().await;
         let old_metadata = storage
             .fetch_bytes(&Hnsw::metadata_path("embedding"))
             .await
             .unwrap()
             .0;
 
-        object_store.fail_next_put("meta.cbor");
+        fail_next_put(&faults, "meta.cbor");
         assert!(index.flush(3).await.is_err());
-        let puts = object_store.put_suffixes();
+        let puts = put_paths(&faults);
         assert_eq!(puts.len(), 3);
         assert!(puts[0].ends_with("n_1.cbor"));
         assert!(puts[1].ends_with("ids.cbor"));
@@ -853,11 +720,11 @@ mod tests {
 
     #[tokio::test]
     async fn crash_after_node_put_reopens_previous_commit() {
-        let (index, storage, object_store) = fault_index().await;
-        object_store.crash_after_next_put("n_1.cbor");
+        let (index, storage, faults) = fault_index().await;
+        crash_after_next_put(&faults, "n_1.cbor");
         assert!(index.flush(3).await.is_err());
-        assert_eq!(object_store.put_suffixes().len(), 1);
-        assert!(object_store.put_suffixes()[0].ends_with("n_1.cbor"));
+        assert_eq!(put_paths(&faults).len(), 1);
+        assert!(put_paths(&faults)[0].ends_with("n_1.cbor"));
 
         // The create became durable but its result was lost. The writer did
         // not learn a token, so retry must conflict instead of overwriting it.
@@ -874,15 +741,15 @@ mod tests {
 
     #[tokio::test]
     async fn crash_after_node_update_cannot_be_overwritten_by_a_stale_retry() {
-        let (index, storage, object_store) = fault_index().await;
+        let (index, storage, faults) = fault_index().await;
         assert!(index.flush(3).await.unwrap());
-        object_store.clear_puts();
+        faults.reset();
         assert!(index.remove(1, 4));
         index
             .insert(1, vec![bf16::from_f32(9.0), bf16::from_f32(9.0)], 5)
             .unwrap();
 
-        object_store.crash_after_next_put("n_1.cbor");
+        crash_after_next_put(&faults, "n_1.cbor");
         assert!(index.flush(6).await.is_err());
         assert!(
             index.flush(7).await.is_err(),

@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs, anda_object_store
+## [Unreleased] — anda_db, anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs, anda_object_store
 
 - anda_object_store: a read that raced a delete of its key, or any failed
   metadata refresh, cleared the whole metadata cache. The deleted key is now
@@ -115,6 +115,40 @@ All notable changes to this workspace are documented in this file.
   key); the persisted triple writes `0` in its place, so the bucket format
   and older readers are unaffected. New `BTreeKey` trait names the shared
   `PK`/`FV` bounds.
+
+- **Behavior change (anda_db):** extension writes are checked against the
+  metadata object budget (`max_small_object_size`) before anything changes:
+  `save_extension` returns `PayloadTooLarge` and the staging setters drop the
+  value with a warning. An oversized database extension used to stay in
+  memory and fail every later `flush` and `close`, and collection creation
+  and deletion with them; on a collection it poisoned the handle at the next
+  flush.
+- anda_db: a database flush writes `storage_meta.cbor` only together with a
+  changed `db_meta.cbor`, so an idle `auto_flush` tick, read-only or not, no
+  longer issues a PUT.
+- anda_db: a hybrid text+vector search whose vector matches no HNSW index
+  logs a warning when it falls back to text-only results, and the
+  `Search::vector` docs now describe that fallback instead of an error.
+- anda_db: a `remove` that waited behind a concurrent remove of the same id
+  returns `Ok(None)` instead of treating the id as dead, which wrote an extra
+  intent and swept every index.
+- anda_db: unbounded B-tree field scans (`query_all_ids`, `AND` operands,
+  `NOT` sets, post-filters) collect into a sorted vector instead of a
+  `BTreeSet`; `query_all_ids` over 100k matches goes from 12.8 to 0.26 ms.
+- anda_db: dead-id purges sweep each B-tree through the new
+  `BTree::purge_ids`, cloning only keys that reference a purged id. Dropping a
+  collection or index directory uses the store's bulk `delete_stream`
+  (batched requests on cloud backends).
+- anda_db: prefix and storage deletion drain bulk-delete results before
+  returning the first error, so successful deletions still invalidate cached
+  objects and update delete counts after a partial failure.
+- anda_db: update and remove intents serialize the borrowed documents (same
+  bytes) instead of cloning them; indexes of one kind load concurrently on
+  open; `reconcile_storage` and `Storage::list` fetch documents concurrently
+  in order. New `Storage::max_small_object_size()`.
+- anda_db: simplify id filtering, B-tree key conversions, database lifecycle
+  checks and HNSW version bookkeeping; tests use
+  `anda_object_store::FaultStore` instead of nine hand-written stores.
 
 ## [@ldclabs/kip-do 0.13.2] — 2026-09-22
 

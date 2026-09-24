@@ -1,5 +1,5 @@
 use anda_db_schema::{Document, Fv, Json, Vector, bf16};
-use cbor2::to_canonical_vec;
+use cbor2::to_canonical_writer;
 use std::borrow::Cow;
 
 mod bm25;
@@ -105,7 +105,7 @@ pub fn virtual_field_value(vals: &[Option<&Fv>]) -> Option<Fv> {
     }
     let mut data = Vec::new();
     for val in vals {
-        data.extend(to_canonical_vec(val).ok()?);
+        to_canonical_writer(val, &mut data).ok()?;
     }
     Some(Fv::Bytes(data))
 }
@@ -152,20 +152,14 @@ fn extract_text<'a>(texts: &mut Vec<&'a str>, val: &'a Fv) {
                 stack.extend(vals.iter().rev().map(|val| Item::Field(val, depth + 1)));
             }
             Item::Field(Fv::Map(vals), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
-                let values: Vec<_> = vals.values().collect();
-                for val in values.into_iter().rev() {
-                    stack.push(Item::Field(val, depth + 1));
-                }
+                stack.extend(vals.values().rev().map(|val| Item::Field(val, depth + 1)));
             }
             Item::Field(Fv::Json(json), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
                 stack.push(Item::Json(json, depth + 1));
             }
             Item::Json(Json::String(s), _) => texts.push(s),
             Item::Json(Json::Object(obj), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
-                let values: Vec<_> = obj.values().collect();
-                for val in values.into_iter().rev() {
-                    stack.push(Item::Json(val, depth + 1));
-                }
+                stack.extend(obj.values().rev().map(|val| Item::Json(val, depth + 1)));
             }
             Item::Json(Json::Array(arr), depth) if depth < MAX_SEARCHABLE_TEXT_DEPTH => {
                 stack.extend(arr.iter().rev().map(|val| Item::Json(val, depth + 1)));

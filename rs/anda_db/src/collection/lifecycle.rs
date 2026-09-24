@@ -415,7 +415,8 @@ impl Collection {
         let start = Instant::now();
         let total = self.len();
 
-        // 并发删除集合存储下的全部对象（文档、元数据、ids 和索引）
+        // Delete every object under the collection prefix: documents,
+        // metadata, ids and indexes.
         self.storage.drop_data().await?;
         self.lifecycle.store(LIFECYCLE_DELETED, Ordering::Release);
         let elapsed = start.elapsed();
