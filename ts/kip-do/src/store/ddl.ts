@@ -785,6 +785,7 @@ export function applySchema(sql: SqlStorage): void {
   // §66.8: the exposure log — not cognitive state, erased with its element.
   sql.exec(`CREATE TABLE IF NOT EXISTS kip_exposures (id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT NOT NULL, element TEXT NOT NULL, exposure TEXT NOT NULL, snapshot_seq INTEGER NOT NULL, recorded_at TEXT NOT NULL, principal_id TEXT NOT NULL, decision_ref TEXT NOT NULL, recall_ref TEXT NOT NULL)`)
   sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_exposures_element ON kip_exposures(space, element, id)`)
+  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_exposures_space ON kip_exposures(space, id)`)
   // Before the `CREATE`s, which would otherwise skip the stale definition.
   dropRedefinedIndexes(sql)
   // The tables first, then any column a later revision added, then the

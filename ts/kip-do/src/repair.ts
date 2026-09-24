@@ -31,6 +31,8 @@ import { requirePermitted, resourceOfElement } from './governance/index.js'
 import { errors, KipError } from './errors.js'
 import { canonicalJson, isJsonMap, type Json, type JsonMap } from './json.js'
 import { formatElementId, tryParseElementId } from './id.js'
+import { endpointFromJson, endpointKey, referencedElement } from './term.js'
+import { parseTime } from './time.js'
 import { parseKip } from './kip/parser.js'
 import { planKml } from './kml/index.js'
 import { digest } from './schema/contracts.js'
@@ -169,6 +171,22 @@ function stale(ref: string, actual: number, expected: number): KipError {
   return errors.versionConflict(`${ref} is at version ${actual}, not the expected ${expected}`)
 }
 
+/** Compare actors after merges, keeping the original Assertion untouched. */
+function actorKey(host: RepairHost, space: string, actor: Json): string {
+  let id = referencedElement(actor)
+  if (id === null) return endpointKey(endpointFromJson(actor))
+  for (let hop = 0; hop < 64; hop++) {
+    if (id.kind !== 'Concept') return endpointKey({ kind: 'local', id })
+    const element = host.store.load(id)
+    if (!element || element.row.space !== space) throw errors.notFoundOrNotVisible('actor is unavailable')
+    if (element.kind !== 'Concept' || element.row.merged_into === '') return endpointKey({ kind: 'local', id })
+    const next = tryParseElementId(element.row.merged_into)
+    if (next === null) throw errors.internalError('invalid actor merge target')
+    id = next
+  }
+  throw errors.internalError('actor merge chain exceeds 64 hops')
+}
+
 /** Everything §57.8 asks the engine to verify, against current state. */
 function check(host: RepairHost, space: string, repair: RecordingRepair): void {
   const source = visible(host, space, repair.source_ref)
@@ -176,6 +194,7 @@ function check(host: RepairHost, space: string, repair: RecordingRepair): void {
     throw errors.constraintViolation('a recording repair names captured Evidence as its source')
   }
   verifySource(source.row, repair)
+  const sourceTime = timestampAtLocator(source.row.payload_inline as Json, repair.source_locator)
 
   const principal = host.auth.principal_id
   const actors = new Set<string>()
@@ -203,7 +222,9 @@ function check(host: RepairHost, space: string, repair: RecordingRepair): void {
     }
     const expected = repair.expected_versions[ref]!
     if (expected !== row.version) throw stale(ref, row.version, expected)
-    actors.add(row.asserted_by_key)
+    if (repair.reason === 'extraction_error' && repair.replacement_refs.length > 0) {
+      actors.add(actorKey(host, space, row.asserted_by as Json))
+    }
     times.add(row.asserted_at)
   }
 
@@ -227,7 +248,7 @@ function check(host: RepairHost, space: string, repair: RecordingRepair): void {
     if (!cites(row, repair.source_ref)) {
       throw errors.constraintViolation(`replacement ${ref} does not cite ${repair.source_ref}`)
     }
-    if (repair.reason === 'extraction_error' && !actors.has(row.asserted_by_key)) {
+    if (repair.reason === 'extraction_error' && !actors.has(actorKey(host, space, row.asserted_by as Json))) {
       throw errors.constraintViolation(
         `replacement ${ref} names another actor; an extraction error keeps the actor, ` +
           `and a wrong actor is an attribution_error`,
@@ -235,7 +256,10 @@ function check(host: RepairHost, space: string, repair: RecordingRepair): void {
     }
     // §57.8: a replacement describes the original claim, so its claim time is
     // recovered from the original source — never the repair's time.
-    const claimed = observedAt === '' ? times.has(row.asserted_at) : row.asserted_at === observedAt
+    // A historical message can already have supplied its own claim time,
+    // earlier than observed_at (§13.2). Capture time does not override it.
+    const preserved = times.has(row.asserted_at) && (observedAt === '' || row.asserted_at <= observedAt)
+    const claimed = preserved || row.asserted_at === observedAt || row.asserted_at === sourceTime
     if (!claimed) {
       throw errors.constraintViolation(
         `replacement ${ref} is asserted at ${row.asserted_at}, not at the original source's time; ` +
@@ -297,6 +321,27 @@ export function verifyLocator(payload: Json, locator: string): void {
   throw errors.constraintViolation(
     `unsupported source locator ${JSON.stringify(locator)}: use a JSON Pointer or bytes=<start>-<end>`,
   )
+}
+
+/** Recover only a timestamp the locator explicitly selects; never guess date fields. */
+function timestampAtLocator(payload: Json, locator: string): string | undefined {
+  let selected: Json | undefined
+  if (locator.startsWith('/')) {
+    selected = payload
+    for (const raw of locator.slice(1).split('/')) {
+      const token = raw.replace(/~1/g, '/').replace(/~0/g, '~')
+      selected = Array.isArray(selected) ? selected[Number(token)]
+        : isJsonMap(selected) ? selected[token] : undefined
+    }
+  } else {
+    const range = /^bytes=(\d+)-(\d+)$/.exec(locator)
+    if (range) {
+      const text = typeof payload === 'string' ? payload : canonicalJson(payload)
+      selected = new TextDecoder().decode(new TextEncoder().encode(text).slice(Number(range[1]), Number(range[2]) + 1))
+    }
+  }
+  if (typeof selected !== 'string') return undefined
+  try { parseTime(selected); return selected } catch { return undefined }
 }
 
 /** Plans the repair Activity, the invalidations and the `recording` control coordinate (§36.1). */

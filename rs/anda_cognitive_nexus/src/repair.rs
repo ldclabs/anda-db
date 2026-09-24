@@ -76,6 +76,52 @@ pub fn validity(governance: &Json) -> RecordingValidity {
     }
 }
 
+/// Discloses the repair only after the read path has checked discovery of
+/// the Activity. Both wire spellings must obey the same decision.
+pub(crate) fn set_visible_reference(view: &mut Json, reference: Option<&str>) {
+    let value = reference.map_or(Json::Null, Json::from);
+    if let Some(slot) = view
+        .get_mut("_system")
+        .and_then(|system| system.get_mut("recording_validity"))
+        .and_then(|validity| validity.get_mut("repair_ref"))
+    {
+        *slot = value.clone();
+    }
+    if let Some(slot) = view
+        .get_mut("governance")
+        .and_then(|governance| governance.get_mut(REPAIR_KEY))
+    {
+        *slot = value;
+    }
+}
+
+/// Compares recorded actors by their current identity, without rewriting the
+/// old Assertion or requiring a new attribution after an identity merge.
+async fn actor_key(store: &Store, space: &str, actor: &Json) -> Result<String, KipError> {
+    let Some(mut id) = crate::kml::clauses::element_reference(actor) else {
+        return Ok(crate::kml::clauses::endpoint_key(actor));
+    };
+    for _ in 0..64 {
+        if id.kind != anda_kip::ElementKind::Concept {
+            return Ok(crate::term::Endpoint::Local(id).key());
+        }
+        let element = store.get_element(id).await?;
+        if element.space() != space {
+            return Err(KipError::not_found_or_not_visible("actor is unavailable"));
+        }
+        let Element::Concept(row) = element else {
+            unreachable!()
+        };
+        if row.merged_into.is_empty() {
+            return Ok(crate::term::Endpoint::Local(id).key());
+        }
+        id = row.merged_into.parse()?;
+    }
+    Err(KipError::internal_error(
+        "actor merge chain exceeds 64 hops",
+    ))
+}
+
 impl Session {
     /// Repairs an extraction the recorder got wrong (§57.8).
     ///
@@ -269,6 +315,7 @@ async fn check(
         ));
     };
     verify_source(evidence, repair)?;
+    let source_time = timestamp_at_locator(&evidence.payload_inline, &repair.source_locator)?;
 
     let principal = auth.principal_id.as_str();
     let mut invalidated_actors = BTreeSet::new();
@@ -314,7 +361,9 @@ async fn check(
             )));
         }
         expect_version(repair, reference, row.version)?;
-        invalidated_actors.insert(row.asserted_by_key.clone());
+        if repair.reason == RepairReason::ExtractionError && !repair.replacement_refs.is_empty() {
+            invalidated_actors.insert(actor_key(store, space, &row.asserted_by).await?);
+        }
         invalidated_times.insert(row.asserted_at.clone());
     }
 
@@ -359,7 +408,7 @@ async fn check(
             )));
         }
         if repair.reason == RepairReason::ExtractionError
-            && !invalidated_actors.contains(&row.asserted_by_key)
+            && !invalidated_actors.contains(&actor_key(store, space, &row.asserted_by).await?)
         {
             return Err(KipError::constraint_violation(format!(
                 "replacement {reference} names another actor; an extraction error keeps the \
@@ -368,11 +417,14 @@ async fn check(
         }
         // §57.8: a replacement describes the original claim, so its claim time
         // is recovered from the original source — never the repair's time.
-        let claimed = if evidence.observed_at.is_empty() {
-            invalidated_times.contains(&row.asserted_at)
-        } else {
-            row.asserted_at == evidence.observed_at
-        };
+        // A captured historical message may already have supplied its own
+        // claim time, earlier than observed_at (§13.2). Preserve that time;
+        // the capture timestamp is an alternative, not an override.
+        let preserved = invalidated_times.contains(&row.asserted_at)
+            && (evidence.observed_at.is_empty() || row.asserted_at <= evidence.observed_at);
+        let claimed = preserved
+            || row.asserted_at == evidence.observed_at
+            || source_time.as_deref() == Some(row.asserted_at.as_str());
         if !claimed {
             return Err(KipError::constraint_violation(format!(
                 "replacement {reference} is asserted at {}, not at the original source's time; \
@@ -446,6 +498,30 @@ fn verify_locator(payload: &Json, locator: &str) -> Result<(), KipError> {
     Err(KipError::constraint_violation(format!(
         "unsupported source locator {locator:?}: use a JSON Pointer or bytes=<start>-<end>"
     )))
+}
+
+/// A host can recover a misrecorded claim time by pointing at its exact
+/// canonical timestamp in the source. No field names or dates are guessed.
+fn timestamp_at_locator(payload: &Json, locator: &str) -> Result<Option<String>, KipError> {
+    let text = if locator.starts_with('/') {
+        payload
+            .pointer(locator)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+    } else if let Some(range) = locator.strip_prefix("bytes=") {
+        let text = match payload {
+            Json::String(text) => text.clone(),
+            other => anda_kip::try_canonical_json(other)?,
+        };
+        range.split_once('-').and_then(|(start, end)| {
+            let start = start.parse::<usize>().ok()?;
+            let end = end.parse::<usize>().ok()?;
+            text.get(start..=end).map(str::to_string)
+        })
+    } else {
+        None
+    };
+    Ok(text.filter(|text| crate::time::parse(text).is_ok()))
 }
 
 fn cites(evidence_ids: &[String], source: &str) -> bool {
@@ -588,6 +664,24 @@ mod tests {
         assert!(verify_locator(&text, "bytes=0-20").is_err());
         assert!(verify_locator(&text, "bytes=5-2").is_err());
         assert!(verify_locator(&text, "line 1").is_err());
+        let at = "2026-01-01T00:00:00.000Z";
+        assert_eq!(
+            timestamp_at_locator(&json!({"time": at}), "/time")
+                .unwrap()
+                .as_deref(),
+            Some(at)
+        );
+        assert_eq!(
+            timestamp_at_locator(&json!(format!("记录:{at}")), "bytes=7-30")
+                .unwrap()
+                .as_deref(),
+            Some(at)
+        );
+        assert!(
+            timestamp_at_locator(&json!({"time": "2026-01-01T00:00:00Z"}), "/time")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

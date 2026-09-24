@@ -24,8 +24,9 @@ use crate::{
     governance::{AuthContext, EffectiveAuthority, Permission, ResourceContext},
     id::ElementId,
     nexus::Session,
-    store::{Element, Store, eq_field, eq_fields, rows::ExposureRow, rows::state},
+    store::{Element, Store, eq_field, rows::ExposureRow, rows::state},
 };
+use anda_db::query::{Filter, RangeQuery};
 use anda_db_schema::Fv;
 use anda_kip::{
     Json, KipError,
@@ -36,6 +37,7 @@ use serde_json::json;
 
 /// The most entries one call records or returns.
 pub const MAX_EXPOSURES: usize = 1000;
+const READ_BATCH: usize = 256;
 
 /// One exposure a host records. The Space, the time and the Principal are the
 /// engine's, never the caller's.
@@ -210,58 +212,73 @@ impl Session {
             )
             .into_result()?;
         let store = &self.nexus.store;
-        let filter = match &query.element_id {
-            Some(element) => eq_fields(&[
-                ("space", Fv::Text(space.into())),
-                ("element", Fv::Text(element.clone())),
-            ]),
-            None => eq_field("space", Fv::Text(space.into())),
-        };
-        let mut ids = store
-            .exposures()
-            .query_all_ids(filter)
-            .await
-            .map_err(db_error)?;
-        ids.retain(|id| *id > after);
-        ids.sort_unstable();
+        let table = store.exposures();
+        let mut scanned = after;
         let mut records = Vec::new();
         let mut last = None;
         let mut more = false;
-        for id in ids {
-            if records.len() == limit {
-                more = true;
+        'pages: loop {
+            // Scan the id range directly: combining multiple equality indexes
+            // would materialize their full intersection before applying a limit.
+            // Each batch starts after the last scanned id, including hidden rows.
+            let ids = table
+                .query_ids(
+                    Filter::Field(("_id".into(), RangeQuery::Gt(Fv::U64(scanned)))),
+                    Some(READ_BATCH),
+                )
+                .await
+                .map_err(db_error)?;
+            let exhausted = ids.len() < READ_BATCH;
+            for id in ids {
+                scanned = id;
+                let row: ExposureRow = table.get_as(id).await.map_err(db_error)?;
+                if row.space != space
+                    || query
+                        .element_id
+                        .as_ref()
+                        .is_some_and(|element| *element != row.element)
+                {
+                    continue;
+                }
+                let discoverable = match row.element.parse::<ElementId>() {
+                    Ok(element) => store
+                        .get_element(element)
+                        .await
+                        .ok()
+                        .is_some_and(|element| {
+                            element.state() != state::PURGED
+                                && authority.may_read(&element, &self.auth).is_some()
+                        }),
+                    Err(_) => false,
+                };
+                if !discoverable {
+                    continue;
+                }
+                // Look ahead to a visible entry, so hidden trailing rows never
+                // produce a cursor or an extra empty page.
+                if records.len() == limit {
+                    more = true;
+                    break 'pages;
+                }
+                last = Some(id);
+                records.push(ExposureRecord {
+                    space_id: row.space,
+                    element_id: row.element,
+                    exposure: if row.exposure == "used" {
+                        Exposure::Used
+                    } else {
+                        Exposure::Retrieved
+                    },
+                    snapshot_seq: row.snapshot_seq,
+                    recorded_at: row.recorded_at,
+                    principal_id: row.principal_id,
+                    decision_ref: Some(row.decision_ref).filter(|r| !r.is_empty()),
+                    recall_ref: Some(row.recall_ref).filter(|r| !r.is_empty()),
+                });
+            }
+            if exhausted {
                 break;
             }
-            last = Some(id);
-            let row: ExposureRow = store.exposures().get_as(id).await.map_err(db_error)?;
-            let discoverable = match row.element.parse::<ElementId>() {
-                Ok(element) => store
-                    .get_element(element)
-                    .await
-                    .ok()
-                    .is_some_and(|element| {
-                        element.state() != state::PURGED
-                            && authority.may_read(&element, &self.auth).is_some()
-                    }),
-                Err(_) => false,
-            };
-            if !discoverable {
-                continue;
-            }
-            records.push(ExposureRecord {
-                space_id: row.space,
-                element_id: row.element,
-                exposure: if row.exposure == "used" {
-                    Exposure::Used
-                } else {
-                    Exposure::Retrieved
-                },
-                snapshot_seq: row.snapshot_seq,
-                recorded_at: row.recorded_at,
-                principal_id: row.principal_id,
-                decision_ref: Some(row.decision_ref).filter(|r| !r.is_empty()),
-                recall_ref: Some(row.recall_ref).filter(|r| !r.is_empty()),
-            });
         }
         Ok(json!({
             "records": records,

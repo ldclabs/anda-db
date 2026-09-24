@@ -187,6 +187,28 @@ impl<'a> Context<'a> {
     /// new pattern had to remember to apply it.
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
         let element = self.load_unattached(id).await?;
+        if let Some(reference) = element
+            .as_ref()
+            .and_then(|row| crate::repair::repair_ref(row.governance()))
+        {
+            // Current discovery governs the reference, even for a historical
+            // Assertion. Admission leaves it null until this check succeeds.
+            let repair = match reference.parse::<ElementId>() {
+                Ok(id) if id.kind == ElementKind::Activity => self.store.get_element(id).await.ok(),
+                _ => None,
+            };
+            let discoverable = repair.as_ref().is_some_and(|row| {
+                row.space() == self.space
+                    && row.state() != crate::store::rows::state::PURGED
+                    && self.authority.may_read(row, self.auth).is_some()
+            });
+            if let Some(view) = self.views.get_mut(&id) {
+                crate::repair::set_visible_reference(
+                    Arc::make_mut(view),
+                    discoverable.then_some(reference),
+                );
+            }
+        }
         if let Some(row) = &element
             && (crate::schema::contracts::is_derived(row)
                 || self
@@ -477,6 +499,8 @@ impl<'a> Context<'a> {
             );
         }
         let mut view = crate::view::render(&element);
+        // Cached/seeded views must never expose an unchecked repair Activity.
+        crate::repair::set_visible_reference(&mut view, None);
         // Computed members exist only on a read (§18.2): decay is evaluated
         // now and never written back (§59.1).
         crate::projection::strength::compute(&mut view, &self.evaluated_at);

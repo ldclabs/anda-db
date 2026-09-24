@@ -292,6 +292,20 @@ export class Context {
           : Math.min(this.governedResultLimit, constraints.max_results)
     }
     const view = render(element)
+    // The Assertion may be readable while its repair Activity is hidden.
+    // Apply discovery to both wire spellings, under current authorization.
+    const reference = element.row.governance.recording_repair
+    if (typeof reference === 'string' && reference !== '') {
+      const id = tryParseElementId(reference)
+      const repair = id?.kind === 'Activity' ? this.store.load(id) : null
+      const discoverable = repair !== null && repair.row.space === this.space &&
+        repair.row.state !== State.PURGED && this.authority.mayRead(repair, this.auth) !== null
+      if (!discoverable) {
+        const system = view._system
+        if (isJsonMap(system) && isJsonMap(system.recording_validity)) system.recording_validity.repair_ref = null
+        if (isJsonMap(view.governance)) view.governance.recording_repair = null
+      }
+    }
     // Computed members exist only on a read (§18.2): decay is evaluated now
     // and never written back (§59.1).
     computeStrength(view, this.evaluatedAt)

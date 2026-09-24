@@ -28,6 +28,7 @@ import { nowTime } from './time.js'
 
 /** The most entries one call records or returns. */
 export const MAX_EXPOSURES = 1000
+const READ_BATCH = 256
 
 export type Exposure = 'retrieved' | 'used'
 
@@ -154,29 +155,36 @@ export function readExposures(host: ExposureHost, space: string, query: Exposure
     after = Number(match[1])
   }
   requirePermitted(host.authority.authorize('read_audit', spaceResource(), host.auth))
-  const rows = (query.element_id === undefined
-    ? host.store.sql.exec('SELECT * FROM kip_exposures WHERE space = ? AND id > ? ORDER BY id', space, after)
-    : host.store.sql.exec('SELECT * FROM kip_exposures WHERE space = ? AND element = ? AND id > ? ORDER BY id', space, query.element_id, after)
-  ).toArray() as unknown as ExposureRow[]
+  let scanned = after
   const records: ExposureRecord[] = []
   let last: number | null = null
   let more = false
-  for (const row of rows) {
-    if (records.length === limit) { more = true; break }
-    last = row.id
-    const id = tryParseElementId(row.element)
-    const element = id === null ? null : host.store.load(id)
-    if (!element || element.row.state === State.PURGED || !host.authority.mayRead(element, host.auth)) continue
-    records.push({
-      space_id: row.space,
-      element_id: row.element,
-      exposure: row.exposure === 'used' ? 'used' : 'retrieved',
-      snapshot_seq: row.snapshot_seq,
-      recorded_at: row.recorded_at,
-      principal_id: row.principal_id,
-      ...(row.decision_ref ? { decision_ref: row.decision_ref } : {}),
-      ...(row.recall_ref ? { recall_ref: row.recall_ref } : {}),
-    })
+  pages: while (true) {
+    const rows = (query.element_id === undefined
+      ? host.store.sql.exec('SELECT * FROM kip_exposures WHERE space = ? AND id > ? ORDER BY id LIMIT ?', space, scanned, READ_BATCH)
+      : host.store.sql.exec('SELECT * FROM kip_exposures WHERE space = ? AND element = ? AND id > ? ORDER BY id LIMIT ?', space, query.element_id, scanned, READ_BATCH)
+    ).toArray() as unknown as ExposureRow[]
+    for (const row of rows) {
+      scanned = row.id
+      const id = tryParseElementId(row.element)
+      const element = id === null ? null : host.store.load(id)
+      if (!element || element.row.state === State.PURGED || !host.authority.mayRead(element, host.auth)) continue
+      // Only a visible lookahead earns a cursor; hidden trailing rows do not
+      // disclose their existence through an extra empty page.
+      if (records.length === limit) { more = true; break pages }
+      last = row.id
+      records.push({
+        space_id: row.space,
+        element_id: row.element,
+        exposure: row.exposure === 'used' ? 'used' : 'retrieved',
+        snapshot_seq: row.snapshot_seq,
+        recorded_at: row.recorded_at,
+        principal_id: row.principal_id,
+        ...(row.decision_ref ? { decision_ref: row.decision_ref } : {}),
+        ...(row.recall_ref ? { recall_ref: row.recall_ref } : {}),
+      })
+    }
+    if (rows.length < READ_BATCH) break
   }
   return {
     records: records as unknown as JsonMap[],

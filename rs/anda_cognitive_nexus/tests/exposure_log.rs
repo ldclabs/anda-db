@@ -117,6 +117,120 @@ fn retrieved(element: &str, seq: u64) -> ExposureInput {
 }
 
 #[tokio::test]
+async fn exposure_pages_cross_batches_without_skipping_visible_entries() {
+    let nexus = fresh("exposure_pages").await;
+    let seeded = ok(
+        &nexus,
+        r#"MUTATE {
+        CREATE CONCEPT ?visible { TYPE "Person" NAME "Visible" }
+        CREATE CONCEPT ?hidden { TYPE "Person" NAME "Hidden" }
+    }"#,
+        json!({}),
+    )
+    .await;
+    let visible = seeded["handles"]["visible"].as_str().unwrap();
+    let hidden = seeded["handles"]["hidden"].as_str().unwrap();
+    let seq = space_seq(&nexus).await;
+    let mut entries = Vec::new();
+    for i in 0..1100 {
+        let mut entry = retrieved(
+            if [270, 541, 812].contains(&i) {
+                visible
+            } else {
+                hidden
+            },
+            seq,
+        );
+        entry.recall_ref = Some(format!("recall-{i}"));
+        entries.push(entry);
+    }
+    let session = nexus.system_session();
+    for batch in entries.chunks(1000) {
+        session
+            .record_exposures(DEFAULT_SPACE, batch.to_vec())
+            .await
+            .unwrap();
+    }
+    let auditor = principal(
+        &nexus,
+        "kip:principal:page-reader",
+        vec![
+            (vec!["read_audit"], AuthorityScope::default()),
+            (
+                vec!["discover"],
+                AuthorityScope {
+                    elements: vec![visible.into()],
+                    ..Default::default()
+                },
+            ),
+        ],
+    )
+    .await;
+    let mut cursor = None;
+    for (index, wanted) in [270, 541, 812].into_iter().enumerate() {
+        let page = auditor
+            .read_exposures(
+                DEFAULT_SPACE,
+                ExposureQuery {
+                    cursor,
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["records"].as_array().unwrap().len(), 1);
+        assert_eq!(page["records"][0]["recall_ref"], format!("recall-{wanted}"));
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+        assert_eq!(
+            cursor.is_some(),
+            index < 2,
+            "hidden tail must not create another page"
+        );
+    }
+    let filtered = session
+        .read_exposures(
+            DEFAULT_SPACE,
+            ExposureQuery {
+                element_id: Some(visible.into()),
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered["records"].as_array().unwrap().len(), 3);
+    assert!(filtered["next_cursor"].is_null());
+    // A large visible page spans storage batches too, and its continuation
+    // neither repeats nor loses an entry at the 1000-row API boundary.
+    let first = session
+        .read_exposures(
+            DEFAULT_SPACE,
+            ExposureQuery {
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["records"].as_array().unwrap().len(), 1000);
+    let rest = session
+        .read_exposures(
+            DEFAULT_SPACE,
+            ExposureQuery {
+                cursor: first["next_cursor"].as_str().map(str::to_string),
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rest["records"].as_array().unwrap().len(), 100);
+    assert_eq!(rest["records"][0]["recall_ref"], "recall-1000");
+    assert!(rest["next_cursor"].is_null());
+}
+
+#[tokio::test]
 async fn exposure_is_never_cognition() {
     let nexus = fresh("exposure").await;
     let seeded = ok(

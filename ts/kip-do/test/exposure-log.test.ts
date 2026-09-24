@@ -37,6 +37,46 @@ function codeOf(run: () => unknown): string {
 const seqOf = (nexus: CognitiveNexus): number => (nexus.describe('DESCRIBE SPACE') as JsonMap).seq as number
 
 describe('the exposure log', () => {
+  it('crosses storage batches without skipping visible entries or paging a hidden tail', async () => {
+    await withNexus('pages', (nexus) => {
+      const { handles } = nexus.execute(`MUTATE {
+        CREATE CONCEPT ?visible { TYPE "Person" NAME "Visible" }
+        CREATE CONCEPT ?hidden { TYPE "Person" NAME "Hidden" }
+      }`)
+      const [visible, hidden] = [handles.visible!, handles.hidden!]
+      const seq = seqOf(nexus)
+      const entries = Array.from({ length: 1100 }, (_, i) => ({
+        element_id: [270, 541, 812].includes(i) ? visible : hidden,
+        exposure: 'retrieved' as const, snapshot_seq: seq, recall_ref: `recall-${i}`,
+      }))
+      const session = nexus.systemSession()
+      session.recordExposures(entries.slice(0, 1000))
+      session.recordExposures(entries.slice(1000))
+      const principal = 'kip:principal:page-reader'
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: principal })
+      gov.createGrant({ space_id: nexus.space, grantee_principal: principal, actions: ['read_audit'] }, SYSTEM_PRINCIPAL)
+      gov.createGrant({ space_id: nexus.space, grantee_principal: principal, actions: ['discover'], scope: { elements: [visible] } }, SYSTEM_PRINCIPAL)
+      const auditor = nexus.session(principalAuth(principal))
+      let cursor: string | undefined
+      for (const [index, wanted] of [270, 541, 812].entries()) {
+        const page = auditor.readExposures({ cursor, limit: 1 })
+        expect((page.records as JsonMap[]).map((r) => r.recall_ref)).toEqual([`recall-${wanted}`])
+        cursor = typeof page.next_cursor === 'string' ? page.next_cursor : undefined
+        expect(cursor !== undefined).toBe(index < 2)
+      }
+      const filtered = session.readExposures({ element_id: visible, limit: 1000 })
+      expect((filtered.records as JsonMap[]).length).toBe(3)
+      expect(filtered.next_cursor).toBeNull()
+      const first = session.readExposures({ limit: 1000 })
+      expect((first.records as JsonMap[]).length).toBe(1000)
+      const rest = session.readExposures({ cursor: first.next_cursor as string, limit: 1000 })
+      expect((rest.records as JsonMap[]).length).toBe(100)
+      expect((rest.records as JsonMap[])[0]!.recall_ref).toBe('recall-1000')
+      expect(rest.next_cursor).toBeNull()
+    })
+  })
+
   it('is never cognition', async () => {
     await withNexus('never-cognition', (nexus) => {
       const { handles } = nexus.execute(`MUTATE {

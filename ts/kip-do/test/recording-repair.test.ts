@@ -81,6 +81,75 @@ function slot(nexus: CognitiveNexus, subject: string, predicate: string, at?: st
 }
 
 describe('recording repair', () => {
+  it('discloses repair references only when the Activity is discoverable', async () => {
+    await withNexus('visibility', (nexus) => {
+      const { source, wrong } = misrecord(nexus)
+      const before = (nexus.describe('DESCRIBE SPACE') as JsonMap).seq as number
+      const result = nexus.systemSession().repairRecording(repair(source, wrong, version(nexus, wrong)))
+      const repairRef = result.repair_ref as string
+      const repairedAt = (nexus.describe('DESCRIBE SPACE') as JsonMap).seq as number
+      const principal = 'kip:principal:assertion-reader'
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: principal })
+      gov.createGrant({ space_id: nexus.space, grantee_principal: principal, actions: ['read_history'] }, SYSTEM_PRINCIPAL)
+      gov.createGrant({ space_id: nexus.space, grantee_principal: principal, actions: ['read'], scope: { kinds: ['assertion'] } }, SYSTEM_PRINCIPAL)
+      const reader = nexus.session(principalAuth(principal))
+      const command = 'FIND(?a._system.recording_validity, ?a.governance.recording_repair) WHERE { ?a ASSERTION {id: :id} }'
+      for (const suffix of ['', ` AS OF SEQ ${repairedAt}`]) {
+        expect(reader.query(command + suffix, { id: wrong })).toEqual([[{ status: 'invalidated', repair_ref: null }, null]])
+      }
+      expect(reader.query(`${command} AS OF SEQ ${before}`, { id: wrong })).toEqual([[{ status: 'valid', repair_ref: null }, null]])
+      expect(reader.query('FIND(?x.id) WHERE { ?x ACTIVITY {id: :id} }', { id: repairRef })).toEqual([])
+      expect(reader.query('FIND(?a.id) WHERE { ?a ASSERTION {id: :id} FILTER(?a._system.recording_validity.repair_ref == :repair) }', { id: wrong, repair: repairRef })).toEqual([])
+      gov.createGrant({ space_id: nexus.space, grantee_principal: principal, actions: ['discover'], scope: { kinds: ['activity'] } }, SYSTEM_PRINCIPAL)
+      expect(reader.query(command, { id: wrong })).toEqual([[{ status: 'invalidated', repair_ref: repairRef }, repairRef]])
+    })
+  })
+
+  it('preserves a claim time recovered from historical source material', async () => {
+    await withNexus('historical-source-time', (nexus) => {
+      const { handles: h } = nexus.execute(`MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE EVIDENCE ?source { SET FIELDS {
+          evidence_class: "message", content_digest: :digest,
+          payload: {timestamp: "2026-01-01T00:00:00.000Z", content: "I eat meat."},
+          observed_at: "2026-09-01T00:00:00.000Z"
+        } }
+        ASSERT ?wrong (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?right (?alice, "diet", "omnivore") { by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?wrong_time (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-09-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?late_wrong (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-09-24T00:00:00.000Z", evidence: ?source }
+        ASSERT ?late_copy (?alice, "diet", "omnivore") { by: ?alice, mode: "stated", at: "2026-09-24T00:00:00.000Z", evidence: ?source }
+      }`, { digest: DIGEST })
+      const session = nexus.systemSession()
+      expect(codeOf(() => session.repairRecording(repair(h.source!, h.late_wrong!, version(nexus, h.late_wrong!), [h.late_copy!])))).toBe('ConstraintViolation')
+      const recoverTime = repair(h.source!, h.wrong_time!, version(nexus, h.wrong_time!), [h.right!])
+      expect(codeOf(() => session.repairRecording(recoverTime))).toBe('ConstraintViolation')
+      session.repairRecording({ ...recoverTime, source_locator: '/timestamp' })
+      nexus.systemSession().repairRecording(repair(h.source!, h.wrong!, version(nexus, h.wrong!), [h.right!]))
+      expect(nexus.query('FIND(?a.asserted_at) WHERE { ?a ASSERTION {id: :id} }', { id: h.right! })).toEqual(['2026-01-01T00:00:00.000Z'])
+    })
+  })
+
+  it('compares actor identities after a merge while refusing a different actor', async () => {
+    await withNexus('merged-actor', (nexus) => {
+      const { alice, source, wrong } = misrecord(nexus)
+      const { handles: people } = nexus.execute(`MUTATE {
+        CREATE CONCEPT ?canonical { TYPE "Person" NAME "Alice canonical" }
+        CREATE CONCEPT ?other { TYPE "Person" NAME "Bob" }
+      }`)
+      nexus.execute('MERGE CONCEPT :from INTO :into', { from: alice, into: people.canonical! })
+      const { handles: h } = nexus.execute(`MUTATE {
+        ASSERT ?right (:alice, "diet", "omnivore") { by: :alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: :source }
+        ASSERT ?other (:alice, "diet", "omnivore") { by: :other, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: :source }
+      }`, { alice: { id: people.canonical! }, other: { id: people.other! }, source })
+      const current = version(nexus, wrong)
+      const session = nexus.systemSession()
+      expect(codeOf(() => session.repairRecording(repair(source, wrong, current, [h.other!])))).toBe('ConstraintViolation')
+      session.repairRecording(repair(source, wrong, current, [h.right!]))
+    })
+  })
+
   it('repairs a misrecording without an actor withdrawal', async () => {
     await withNexus('repair', (nexus) => {
       const { alice, source, wrong } = misrecord(nexus)

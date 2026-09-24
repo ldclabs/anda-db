@@ -7,7 +7,7 @@ use anda_cognitive_nexus::{
     CognitiveNexus,
     governance::{
         AuthContext, SYSTEM_PRINCIPAL,
-        rows::principal_class,
+        rows::{AuthorityScope, principal_class},
         store::{GrantDraft, PrincipalDraft},
     },
     nexus::DEFAULT_SPACE,
@@ -459,6 +459,220 @@ async fn a_recorder_repairs_its_own_extraction() {
     // never "no".
     let slot = diet(&nexus, &alice, None).await;
     assert_eq!(slot["status"], "insufficient", "{slot:#}");
+}
+
+#[tokio::test]
+async fn repair_references_require_discovery_of_the_activity() {
+    let nexus = fresh("repair_visibility").await;
+    let (_, source, wrong) = misrecord(&nexus, "alice").await;
+    let before = space_seq(&nexus).await;
+    let result = nexus
+        .system_session()
+        .repair_recording(
+            DEFAULT_SPACE,
+            repair(&source, &wrong, version(&nexus, &wrong).await, &[]),
+        )
+        .await
+        .unwrap();
+    let repair_ref = result["repair_ref"].as_str().unwrap();
+    let repaired_at = space_seq(&nexus).await;
+    let reader = agent(&nexus, "kip:principal:assertion-reader", &["read_history"]).await;
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: "kip:principal:assertion-reader".into(),
+                actions: vec!["read".into()],
+                scope: AuthorityScope {
+                    kinds: vec!["assertion".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    let command = r#"FIND(?a._system.recording_validity, ?a.governance.recording_repair) WHERE { ?a ASSERTION {id: :id} }"#;
+    for suffix in [String::new(), format!(" AS OF SEQ {repaired_at}")] {
+        assert_eq!(
+            ok(&reader, &format!("{command}{suffix}"), json!({"id": wrong})).await,
+            json!([[{"status": "invalidated", "repair_ref": null}, null]])
+        );
+    }
+    assert_eq!(
+        ok(
+            &reader,
+            &format!("{command} AS OF SEQ {before}"),
+            json!({"id": wrong})
+        )
+        .await,
+        json!([[{"status": "valid", "repair_ref": null}, null]])
+    );
+    assert_eq!(
+        ok(
+            &reader,
+            r#"FIND(?x.id) WHERE { ?x ACTIVITY {id: :id} }"#,
+            json!({"id": repair_ref})
+        )
+        .await,
+        json!([])
+    );
+    assert_eq!(ok(&reader, r#"FIND(?a.id) WHERE { ?a ASSERTION {id: :id} FILTER(?a._system.recording_validity.repair_ref == :repair) }"#,
+        json!({"id": wrong, "repair": repair_ref})).await, json!([]));
+
+    // Discovery alone is sufficient to disclose a reference; content remains hidden.
+    nexus
+        .governance()
+        .create_grant(
+            GrantDraft {
+                space_id: DEFAULT_SPACE.into(),
+                grantee_principal: "kip:principal:assertion-reader".into(),
+                actions: vec!["discover".into()],
+                scope: AuthorityScope {
+                    kinds: vec!["activity".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            SYSTEM_PRINCIPAL,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ok(&reader, command, json!({"id": wrong})).await,
+        json!([[{"status": "invalidated", "repair_ref": repair_ref}, repair_ref]])
+    );
+}
+
+#[tokio::test]
+async fn a_repair_preserves_a_claim_time_from_historical_source_material() {
+    let nexus = fresh("historical_source_time").await;
+    let seeded = ok(&nexus, r#"MUTATE {
+        CREATE CONCEPT ?alice { TYPE "Person" NAME "Alice" }
+        CREATE EVIDENCE ?source { SET FIELDS {
+            evidence_class: "message", content_digest: :digest,
+            payload: {timestamp: "2026-01-01T00:00:00.000Z", content: "I eat meat."},
+            observed_at: "2026-09-01T00:00:00.000Z"
+        } }
+        ASSERT ?wrong (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?right (?alice, "diet", "omnivore") { by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?wrong_time (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-09-01T00:00:00.000Z", evidence: ?source }
+        ASSERT ?late_wrong (?alice, "diet", "vegetarian") { by: ?alice, mode: "stated", at: "2026-09-24T00:00:00.000Z", evidence: ?source }
+        ASSERT ?late_copy (?alice, "diet", "omnivore") { by: ?alice, mode: "stated", at: "2026-09-24T00:00:00.000Z", evidence: ?source }
+    }"#, json!({"digest": SOURCE_DIGEST})).await;
+    let h = &seeded["handles"];
+    let wrong = h["wrong"].as_str().unwrap();
+    let session = nexus.system_session();
+    let source = h["source"].as_str().unwrap();
+    let late = h["late_wrong"].as_str().unwrap();
+    assert_eq!(
+        session
+            .repair_recording(
+                DEFAULT_SPACE,
+                repair(
+                    source,
+                    late,
+                    version(&nexus, late).await,
+                    &[h["late_copy"].as_str().unwrap()]
+                )
+            )
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation",
+        "copying an old extraction's recording time must not make it a new claim"
+    );
+    let wrong_time = h["wrong_time"].as_str().unwrap();
+    let mut recover_time = repair(
+        source,
+        wrong_time,
+        version(&nexus, wrong_time).await,
+        &[h["right"].as_str().unwrap()],
+    );
+    assert_eq!(
+        session
+            .repair_recording(DEFAULT_SPACE, recover_time.clone())
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    recover_time.source_locator = "/timestamp".into();
+    session
+        .repair_recording(DEFAULT_SPACE, recover_time)
+        .await
+        .unwrap();
+    nexus
+        .system_session()
+        .repair_recording(
+            DEFAULT_SPACE,
+            repair(
+                h["source"].as_str().unwrap(),
+                wrong,
+                version(&nexus, wrong).await,
+                &[h["right"].as_str().unwrap()],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(?a.asserted_at) WHERE { ?a ASSERTION {id: :id} }"#,
+            json!({"id": h["right"]})
+        )
+        .await,
+        json!(["2026-01-01T00:00:00.000Z"])
+    );
+}
+
+#[tokio::test]
+async fn an_extraction_repair_compares_merged_actor_identities() {
+    let nexus = fresh("repair_merged_actor").await;
+    let (alice, source, wrong) = misrecord(&nexus, "alice").await;
+    let created = ok(
+        &nexus,
+        r#"MUTATE {
+        CREATE CONCEPT ?canonical { TYPE "Person" NAME "Alice canonical" }
+        CREATE CONCEPT ?other { TYPE "Person" NAME "Bob" }
+    }"#,
+        json!({}),
+    )
+    .await;
+    let canonical = &created["handles"]["canonical"];
+    ok(
+        &nexus,
+        "MERGE CONCEPT :from INTO :into",
+        json!({"from": alice, "into": canonical}),
+    )
+    .await;
+    let assertions = ok(&nexus, r#"MUTATE {
+        ASSERT ?right (:alice, "diet", "omnivore") { by: :alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: :source }
+        ASSERT ?other (:alice, "diet", "omnivore") { by: :other, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: :source }
+    }"#, json!({"alice": {"id": canonical}, "other": {"id": created["handles"]["other"]}, "source": source})).await;
+    let current = version(&nexus, &wrong).await;
+    let h = &assertions["handles"];
+    let session = nexus.system_session();
+    assert_eq!(
+        session
+            .repair_recording(
+                DEFAULT_SPACE,
+                repair(&source, &wrong, current, &[h["other"].as_str().unwrap()])
+            )
+            .await
+            .unwrap_err()
+            .name(),
+        "ConstraintViolation"
+    );
+    session
+        .repair_recording(
+            DEFAULT_SPACE,
+            repair(&source, &wrong, current, &[h["right"].as_str().unwrap()]),
+        )
+        .await
+        .unwrap();
 }
 
 /// MIF-017's replacement variant: January's misextraction is repaired in

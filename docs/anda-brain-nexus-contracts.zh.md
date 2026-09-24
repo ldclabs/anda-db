@@ -236,11 +236,15 @@ Rust 宿主用 `anda_kip::memory::binding` 构造描述符与线上形状，其�
 宿主传入 `RecordingRepair`：已捕获的来源 Evidence、它的 `content_digest`、指向内联载荷的定位器
 （JSON Pointer，或针对载荷文本的 `bytes=<start>-<end>`）、错误断言及其当前 `_system.version`，
 以及可选的替换断言。调用者需要对每条被失效的断言持有 `repair_recording`，且必须是记录它的 Principal；
-替换断言必须已由调用者写入、引用同一来源，`asserted_at` 等于来源的 `observed_at`（原主张时间，
-绝不是修复时间）；`extraction_error` 不改 actor，`attribution_error` 可以改。修复在一个事务里提交
+替换断言必须已由调用者写入、引用同一来源，`asserted_at` 可以保留不晚于来源 `observed_at` 的原主张时间，
+或使用 `observed_at` 本身；来源没有 `observed_at` 时仍可保留原时间。若原时间也被误记，
+`source_locator` 可明确选中来源中的规范时间戳（JSON 字符串值或字节范围）。引擎不根据字段名猜时间，
+也不使用修复时间；历史消息的主张时间可以早于采集时间。`extraction_error` 比较身份合并后的
+规范 actor，`attribution_error` 可以改变 actor。修复在一个事务里提交
 终态 `recording_repair` Activity（inputs 为来源与被失效断言，`RecordingRepair` Facet 列出替换断言）、
 `recording` 控制变更，以及每条错误断言上的受保护失效标记。每条断言都带
-`_system.recording_validity`（`{status, repair_ref}`）；投影排除被失效的抽取，依赖它的派生读为
+`_system.recording_validity`（`{status, repair_ref}`）；若读者当前无权发现修复 Activity，`repair_ref` 及治理块中的
+对应引用均返回 `null`。投影排除被失效的抽取，依赖它的派生读为
 `needs_review`，历史读取取快照当时的状态。同一修复重试返回 `replayed: true`，不再写入。
 两个引擎都不会把误记映射成更正或撤回。
 
@@ -248,6 +252,7 @@ Rust 宿主用 `anda_kip::memory::binding` 构造描述符与线上形状，其�
 `retrieved`，为 DecisionRecord 的 `used_refs` 记录 `used`（附决策 Activity）。条目不占 Space 序号、
 不产生 Change Envelope、不改任何元素；Space、时间与 Principal 由引擎填写，调用者必须能读取每个元素。
 `read_exposures` / `readExposures` 在 `read_audit` 下分页读取，读者看不到的元素直接省略。
+底层每批最多读取 256 条记录或 ID，只有确实存在下一条可见记录时才返回续页游标。
 Maintenance 只能通过显式、带守卫的 `MnemonicState` 写入把使用折算进强度。
 
 ## 保留与清除

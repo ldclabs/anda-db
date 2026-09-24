@@ -159,13 +159,16 @@ for the parser, the executable AST and stored draft Spaces.
   new `repair_recording` permission on each invalidated Assertion and reaches
   only the caller's own source-backed outputs; replacements must be the
   caller's existing Assertions citing the same source, with `asserted_at`
-  taken from the source's `observed_at`, and an extraction error keeps the
-  actor. One transaction appends a terminal `recording_repair` Activity
+  preserving the original claim time no later than `observed_at`, taken from
+  `observed_at`, or recovered from an exact timestamp selected by the source
+  locator; an extraction error keeps the canonical actor after
+  identity merges. One transaction appends a terminal `recording_repair` Activity
   (inputs: the source and the invalidated Assertions; `RecordingRepair`
   Facet) and a `recording` control change, and marks each invalidated
   Assertion in its protected governance block: a new version, payload and
   lifecycle untouched. Every Assertion view carries
   `_system.recording_validity` (`{status: valid | invalidated, repair_ref}`),
+  repair references are null when the reader cannot discover the Activity;
   historical reads see the state at their snapshot, projection excludes an
   invalidated extraction (`recording_invalidated`) and dependent derivations
   read `needs_review`. A retried repair answers from the recorded Activity
@@ -182,7 +185,8 @@ for the parser, the executable AST and stored draft Spaces.
   cognitive store: no Space sequence, no Change Envelope entry, no element.
   The Space, time and Principal are the engine's; the caller must be able to
   read each element. `read_exposures` / `readExposures` pages the log oldest
-  first under `read_audit` and omits elements the reader may not discover.
+  first under `read_audit`, fetches bounded storage batches, and omits elements
+  the reader may not discover without generating cursors for hidden tails.
   Purging an element removes its entries, and an ErasurePlan target with
   surface `exposure` is verified against them.
 - **New — host capabilities (§67.4, Memory Interface §2):**
