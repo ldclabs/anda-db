@@ -6,7 +6,7 @@
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -55,31 +55,47 @@ fn doc_entry_size(doc_id: u64, token_count: usize) -> usize {
     cbor_serialized_size(&(doc_id, token_count))
 }
 
-/// Removes posting entries and returns the same size estimate charged on insert.
-/// Shared by text deletion, bulk purge and load-time stale-entry cleanup.
-fn retain_posting(
-    token: &str,
-    posting: &mut PostingValue,
-    mut keep: impl FnMut(u64) -> bool,
-) -> usize {
-    let mut removed = Vec::new();
-    posting.1.retain(|entry| {
-        if keep(entry.0) {
-            true
-        } else {
-            removed.push(*entry);
-            false
+/// Posting entries dropped while posting guards are held, settled against the
+/// bucket map afterwards by `BM25Index::settle_removals`. Shared by text
+/// deletion, id sweeps and load-time stale-entry cleanup.
+#[derive(Default)]
+struct Removals {
+    bucket_size_decrease: FxHashMap<u32, usize>,
+    emptied_tokens: Vec<(u32, String)>,
+}
+
+impl Removals {
+    /// Drops the entries `keep` rejects, records the size estimate that
+    /// `insert` charged for them, and returns the sum of their frequencies.
+    /// `keep` should stay a plain predicate: side effects in it slow the scan
+    /// over long postings.
+    fn retain(
+        &mut self,
+        token: &str,
+        posting: &mut PostingValue,
+        mut keep: impl FnMut(&(u64, usize)) -> bool,
+    ) -> usize {
+        let mut removed = Vec::new();
+        posting.1.retain(|entry| {
+            keep(entry) || {
+                removed.push(*entry);
+                false
+            }
+        });
+        if removed.is_empty() {
+            return 0;
         }
-    });
-    if removed.is_empty() {
-        0
-    } else if posting.1.is_empty() {
-        cbor_serialized_size(&(token, (posting.0, &removed))) + 2
-    } else {
-        removed
-            .iter()
-            .map(|entry| cbor_serialized_size(entry) + 2)
-            .sum()
+        let size = if posting.1.is_empty() {
+            self.emptied_tokens.push((posting.0, token.to_string()));
+            cbor_serialized_size(&(token, (posting.0, &removed))) + 2
+        } else {
+            removed
+                .iter()
+                .map(|entry| cbor_serialized_size(entry) + 2)
+                .sum()
+        };
+        *self.bucket_size_decrease.entry(posting.0).or_default() += size;
+        removed.iter().map(|(_, freq)| freq).sum()
     }
 }
 
@@ -161,8 +177,10 @@ pub struct BM25Index<T: Tokenizer> {
     /// BM25 algorithm parameters
     config: BM25Config,
 
-    /// Maps document IDs to their token counts
-    doc_tokens: DashMap<u64, usize>,
+    /// Maps document IDs to their token counts. Scoring looks up one length
+    /// per posting entry, so the map hashes the caller-assigned ids with
+    /// FxHash rather than SipHash.
+    doc_tokens: DashMap<u64, usize, FxBuildHasher>,
 
     /// Buckets store information about where posting entries are stored and their current state
     buckets: DashMap<u32, Bucket>,
@@ -353,19 +371,12 @@ impl Default for BM25Config {
 /// - bucket_id: The bucket where this posting is stored
 /// - Vec<(document_id, token_frequency)>: List of documents and their term frequencies
 ///
-/// The list is a plain `Vec`: one entry per `insert`, with no uniqueness
-/// enforced on it. A document can appear more than once only after a
-/// [`BM25Index::remove`] with non-original text followed by a re-insert of
-/// the same id; scoring keys by document id so such a duplicate is scored
-/// once, [`BM25Index::remove`] drops every entry of the id, and a reload
-/// prunes entries whose document is gone.
-///
-/// Duplicates of a *live* document are not pruned, though: repeating that
-/// cycle appends one entry per round, for good. Nothing de-duplicates them
-/// because the only cheap place to do so is the `insert` hot path, where the
-/// scan would be linear in the posting length — the cost `UniqueVec` used to
-/// pay, in storage, on every posting. Callers that cannot supply the original
-/// text should use [`BM25Index::purge_ids`], which needs none.
+/// The list is a plain `Vec` with one entry per indexed document, so its
+/// length is the term's document frequency. [`BM25Index::remove`] keeps it
+/// that way: when the supplied text does not account for all of a document's
+/// entries, it sweeps the rest by id, so a later re-insert of the id cannot
+/// leave a duplicate behind. Entries whose document is gone (possible only in
+/// data written by releases before this rule) are pruned on load.
 pub type PostingValue = (u32, Vec<(u64, usize)>);
 
 /// Index metadata.
@@ -496,7 +507,7 @@ impl<T: Tokenizer> BM25Index<T> {
             name: name.clone(),
             tokenizer,
             config: config.clone(),
-            doc_tokens: DashMap::new(),
+            doc_tokens: DashMap::default(),
             postings: DashMap::new(),
             buckets: DashMap::from_iter([(0, Bucket::default())]),
             metadata: RwLock::new(BM25Metadata {

@@ -404,7 +404,10 @@ async fn test_remove_with_wrong_text_does_not_resurrect_after_reload() {
     let mut store = MemStore::default();
     flush_to(&index, &mut store, 1).await;
 
+    // The text accounts for none of the entries, so remove sweeps them by id.
     assert!(index.remove(1, "wrong text", 2));
+    assert!(index.postings.is_empty());
+    assert!(index.buckets.iter().all(|bucket| bucket.tokens.is_empty()));
     flush_to(&index, &mut store, 3).await;
 
     let loaded_index = load_from(&store).await;
@@ -416,16 +419,11 @@ async fn test_remove_with_wrong_text_does_not_resurrect_after_reload() {
             "removed document was found after reload for term '{term}'"
         );
     }
+    assert!(loaded_index.postings.is_empty());
+    assert!(!loaded_index.has_dirty_buckets());
 
-    // Loading prunes stale posting entries of deleted documents entirely,
-    // and the resulting cleanup is flushed on the next store.
-    assert!(
-        loaded_index.postings.is_empty(),
-        "stale postings must be pruned on load"
-    );
-    assert!(loaded_index.has_dirty_buckets());
-
-    flush_to(&loaded_index, &mut store, 4).await;
+    // Emptied buckets left the manifest; only the empty tail remains.
+    assert_eq!(store.buckets.len(), 1);
     for data in store.buckets.values() {
         let bucket: BucketOwned = cbor2::from_reader(&data[..]).unwrap();
         assert!(bucket.postings.is_empty());
@@ -868,8 +866,11 @@ fn test_remove_replay_cleans_postings_after_doc_tokens_are_already_gone() {
     index.insert(42, text, 1).unwrap();
 
     // Model a crash after the logical document membership was removed but
-    // before the original-text postings were all cleaned.
-    assert!(index.remove(42, "unrelated text", 2));
+    // before the original-text postings were cleaned.
+    let tokens = index.doc_tokens.remove(&42).unwrap().1;
+    index
+        .total_tokens
+        .fetch_sub(tokens as u64, Ordering::Relaxed);
     assert!(
         index
             .postings
@@ -898,6 +899,92 @@ fn test_remove_replay_cleans_postings_after_doc_tokens_are_already_gone() {
             .iter()
             .all(|bucket| !bucket.doc_ids.contains(&42))
     );
+}
+
+/// Buckets without tokens other than the tail leave the manifest, including
+/// empty objects written by earlier releases; a metadata-only shell, whose
+/// placeholders have no tokens yet, keeps them.
+#[tokio::test]
+async fn test_flush_drops_empty_non_tail_buckets_but_shell_keeps_placeholders() {
+    let index = BM25Index::new(
+        "empty_buckets".to_string(),
+        default_tokenizer(),
+        Some(BM25Config {
+            bucket_overload_size: 1,
+            ..Default::default()
+        }),
+    );
+    index.insert(1, "alpha", 0).unwrap();
+    index.insert(2, "bravo", 0).unwrap();
+    index.insert(3, "charlie", 0).unwrap();
+    let mut store = MemStore::default();
+    flush_to(&index, &mut store, 1).await;
+    assert_eq!(store.buckets.len(), 3);
+
+    // An earlier release removed document 1 and wrote bucket 0 back empty.
+    let bucket0 = *store.buckets.keys().find(|o| o.bucket_id == 0).unwrap();
+    store.buckets.insert(
+        bucket0,
+        encode_bucket_owned(FxHashMap::default(), FxHashMap::default()),
+    );
+
+    // A shell flushing only metadata keeps every committed object.
+    let shell = BM25Index::load_metadata(default_tokenizer(), &store.metadata[..]).unwrap();
+    shell.update_metadata(|m| m.stats.version += 1);
+    let outcome = flush_to(&shell, &mut store, 2).await;
+    assert!(outcome.saved && outcome.obsolete.is_empty());
+    assert_eq!(store.buckets.len(), 3);
+
+    // A fully loaded index drops the empty bucket at its next flush.
+    let loaded = load_from(&store).await;
+    assert_eq!(loaded.len(), 2);
+    loaded.insert(4, "charlie delta", 3).unwrap();
+    let outcome = flush_to(&loaded, &mut store, 4).await;
+    assert!(outcome.obsolete.contains(&bucket0));
+    assert!(!loaded.buckets.contains_key(&0));
+    assert!(store.buckets.keys().all(|o| o.bucket_id != 0));
+
+    // Emptying a non-tail bucket drops it; the tail stays even when empty.
+    let tail = loaded.max_bucket_id.load(Ordering::Relaxed);
+    assert!(loaded.remove(2, "bravo", 5));
+    assert!(loaded.remove(4, "charlie delta", 5));
+    flush_to(&loaded, &mut store, 6).await;
+    let reloaded = load_from(&store).await;
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded.search("charlie", 10, None).len(), 1);
+    let ids: BTreeSet<u32> = store.buckets.keys().map(|o| o.bucket_id).collect();
+    assert!(ids.contains(&tail));
+    assert!(!ids.contains(&1));
+    reloaded.insert(5, "echo", 7).unwrap();
+    assert_eq!(reloaded.search("echo", 10, None).len(), 1);
+}
+
+#[test]
+fn test_remove_with_wrong_text_sweeps_so_reinsert_does_not_duplicate() {
+    let index = BM25Index::new("sweep".to_string(), default_tokenizer(), None);
+    let text = "alpha bravo charlie";
+    index.insert(7, text, 1).unwrap();
+    index.insert(8, "alpha delta", 1).unwrap();
+    let expected = index.search("alpha bravo", 10, None);
+
+    // Partly matching text: `alpha` is removed by text, the rest by sweep.
+    assert!(index.remove(7, "alpha", 2));
+    assert!(
+        index
+            .postings
+            .iter()
+            .all(|posting| posting.1.iter().all(|(doc_id, _)| *doc_id != 7))
+    );
+    assert!(
+        index
+            .buckets
+            .iter()
+            .all(|bucket| !bucket.doc_ids.contains(&7))
+    );
+
+    index.insert(7, text, 3).unwrap();
+    assert_eq!(index.postings.get("alpha").unwrap().1.len(), 2);
+    assert_eq!(index.search("alpha bravo", 10, None), expected);
 }
 
 /// Compaction needs no special write ordering under the manifest

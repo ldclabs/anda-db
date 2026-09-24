@@ -2,6 +2,11 @@
 
 [中文版](anda_db_tfs_review.zh.md)
 
+> **Superseded in part (2026-09-24):** NOT complements are now limited only
+> when they span the whole index; candidate-relative complements are no longer
+> guarded, `NOT NOT x` is planned as `x`, and scoring takes DF from the posting
+> length. See [anda_db_tfs.md](anda_db_tfs.md) for the current rules.
+
 The correctness checklist F01–F10 is implemented. The existing CBOR metadata and bucket formats are retained. Baseline source: `63973ca276465f7d480a7fc2176d609f22a96fa7`.
 
 ## Completed correctness work

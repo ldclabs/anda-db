@@ -9,11 +9,13 @@
 /// or_expr := and_expr ( " OR " and_expr )*
 /// and_expr := not_expr ( " AND " not_expr )*
 /// not_expr := "NOT " not_expr | term
-/// term    := "(" or_expr ")" | word ( whitespace word )*
+/// term    := chunk ( whitespace chunk )*
+/// chunk   := "(" or_expr ")" | word
 /// ```
 ///
-/// Whitespace-separated words at the `term` level default to an implicit `OR`
-/// between them, matching the behaviour of [`BM25Index::search`].
+/// Whitespace-separated chunks at the `term` level default to an implicit
+/// `OR` between them, matching the behaviour of [`BM25Index::search`]:
+/// `rust (async AND tokio)` is `rust OR (async AND tokio)`.
 ///
 /// The operators are case-sensitive and must stand between spaces (`NOT`
 /// followed by a space): `a and b` is three search words. Each `NOT` nests
@@ -200,6 +202,19 @@ impl QueryType {
     fn parse_term(query: &str, depth: usize, budget_exhausted: &mut bool) -> Self {
         let query = query.trim();
 
+        // A group next to other words (`(a AND b) c`) is an implicit OR of
+        // its chunks. Stripping the outer characters of the whole string
+        // instead would glue the group's operators to the neighbouring words.
+        let chunks = Self::split_top_level_whitespace(query);
+        if chunks.len() > 1 {
+            return QueryType::Or(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Self::parse_term(chunk, depth, budget_exhausted))
+                    .collect(),
+            );
+        }
+
         if depth >= MAX_LOGICAL_QUERY_DEPTH && (query.starts_with('(') || query.ends_with(')')) {
             *budget_exhausted = true;
         }
@@ -339,6 +354,32 @@ impl QueryType {
 
         result.push(s[start..].trim());
         result
+    }
+
+    /// Splits at whitespace outside parentheses. An unclosed `(` keeps the
+    /// rest of the input in one chunk; an unmatched `)` is ordinary text.
+    fn split_top_level_whitespace(s: &str) -> Vec<&str> {
+        let mut chunks = Vec::new();
+        let mut start = None;
+        let mut paren_count: u32 = 0;
+        for (i, ch) in s.char_indices() {
+            match ch {
+                '(' => paren_count += 1,
+                ')' => paren_count = paren_count.saturating_sub(1),
+                _ if paren_count == 0 && ch.is_whitespace() => {
+                    if let Some(begin) = start.take() {
+                        chunks.push(&s[begin..i]);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            start.get_or_insert(i);
+        }
+        if let Some(begin) = start {
+            chunks.push(&s[begin..]);
+        }
+        chunks
     }
 }
 
@@ -520,6 +561,36 @@ mod tests {
                     QueryType::Term("rust".to_string())
                 ])
             ])
+        );
+    }
+
+    #[test]
+    fn groups_next_to_words_are_or_chunks() {
+        let term = |text: &str| QueryType::Term(text.to_string());
+        let and = |a: &str, b: &str| QueryType::And(vec![term(a), term(b)]);
+        assert_eq!(
+            QueryType::parse("(a AND b) c"),
+            QueryType::Or(vec![and("a", "b"), term("c")])
+        );
+        assert_eq!(
+            QueryType::parse("x (a AND b)"),
+            QueryType::Or(vec![term("x"), and("a", "b")])
+        );
+        assert_eq!(
+            QueryType::parse("(a AND b) (c AND d)"),
+            QueryType::Or(vec![and("a", "b"), and("c", "d")])
+        );
+        assert_eq!(
+            QueryType::parse("NOT (a OR b) c"),
+            QueryType::Not(Box::new(QueryType::Or(vec![
+                QueryType::Or(vec![term("a"), term("b")]),
+                term("c"),
+            ])))
+        );
+        // An unclosed group still swallows the rest of the input.
+        assert_eq!(
+            QueryType::parse("x (a AND b"),
+            QueryType::Or(vec![term("x"), and("a", "b")])
         );
     }
 

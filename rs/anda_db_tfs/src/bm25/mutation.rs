@@ -159,16 +159,33 @@ impl<T: Tokenizer> BM25Index<T> {
         }
     }
 
+    /// Unlists the emptied postings, then shrinks and dirties every bucket
+    /// that lost entries. `doc` also refunds that document's token-count
+    /// entry, `(id, estimated size)`, from each of those buckets.
+    pub(super) fn settle_removals(&self, removals: Removals, doc: Option<(u64, usize)>) {
+        self.remove_empty_postings(removals.emptied_tokens);
+        for (bucket_id, size) in removals.bucket_size_decrease {
+            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
+                bucket.size = bucket.size.saturating_sub(size);
+                if let Some((id, doc_entry)) = doc
+                    && bucket.doc_ids.remove(&id)
+                {
+                    bucket.size = bucket.size.saturating_sub(doc_entry);
+                }
+                bucket.mark_dirty();
+            }
+        }
+    }
+
     /// Removes a document from the index.
     ///
-    /// The caller must provide the *original text* that was used on
+    /// The caller should provide the *original text* that was used on
     /// [`insert`](Self::insert); it is re-tokenized to identify which posting
-    /// lists should drop this document. If the text does not match, postings
-    /// may retain stale entries — searches still skip them because scoring
-    /// filters by `doc_tokens` membership, and the stale entries are pruned
-    /// the next time the index is loaded via
-    /// [`load_buckets`](Self::load_buckets). For idempotent recovery, cleanup
-    /// by `text` still runs when `id` is already absent from `doc_tokens`; in
+    /// lists should drop this document. If the text does not account for all
+    /// of the document's entries, the rest are found by sweeping every
+    /// posting list — correct, but linear in the index size, like
+    /// [`purge_ids`](Self::purge_ids). For idempotent recovery, cleanup by
+    /// `text` still runs when `id` is already absent from `doc_tokens`; in
     /// that case the method returns `false` and deletion statistics are not
     /// incremented again.
     ///
@@ -205,54 +222,28 @@ impl<T: Tokenizer> BM25Index<T> {
             self.total_tokens
                 .fetch_sub(removed_tokens as u64, Ordering::Relaxed);
         }
-        // Refund of the document's token-count entry from every bucket that
-        // listed it. On a replay the count is unknown; the few bytes of
+
+        let mut removals = Removals::default();
+        let mut removed_freqs = 0usize;
+        for token in token_freqs.keys() {
+            if let Some(mut posting) = self.postings.get_mut(token) {
+                removed_freqs += removals.retain(token, &mut posting, |(doc_id, _)| *doc_id != id);
+            }
+        }
+        // A document's entries add up to its token count. Any other total
+        // means `text` is not what was indexed (or the tokenizer changed):
+        // sweep the remaining entries by id instead of leaving them behind.
+        if removed_tokens.is_some_and(|tokens| tokens != removed_freqs) {
+            for mut entry in self.postings.iter_mut() {
+                let (token, posting) = entry.pair_mut();
+                removals.retain(token, posting, |(doc_id, _)| *doc_id != id);
+            }
+        }
+        // Every bucket holding one of the document's entries also carries its
+        // token count. On a replay the count is unknown; the few bytes of
         // difference are within the estimate's tolerance.
         let doc_entry = doc_entry_size(id, removed_tokens.unwrap_or(0));
-
-        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
-        let mut emptied_tokens = Vec::new();
-        for (token, _) in token_freqs {
-            if let Some(mut posting) = self.postings.get_mut(&token) {
-                let size = retain_posting(&token, &mut posting, |doc_id| doc_id != id);
-                if size > 0 {
-                    *bucket_size_decrease.entry(posting.0).or_default() += size;
-                    if posting.1.is_empty() {
-                        emptied_tokens.push((posting.0, token));
-                    }
-                }
-            }
-        }
-
-        self.remove_empty_postings(emptied_tokens);
-        for (bucket_id, size) in bucket_size_decrease {
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.mark_dirty();
-                bucket.size = bucket.size.saturating_sub(size);
-                if bucket.doc_ids.remove(&id) {
-                    bucket.size = bucket.size.saturating_sub(doc_entry);
-                }
-            }
-        }
-
-        // Other buckets may still reference this document in their serialized
-        // doc_tokens (e.g. stale postings left by a remove() with non-original
-        // text); mark them dirty so the next flush drops the reference.
-        // Read-scan first to avoid write-locking every shard on each remove.
-        let stale_buckets: Vec<u32> = self
-            .buckets
-            .iter()
-            .filter(|bucket| bucket.doc_ids.contains(&id))
-            .map(|bucket| *bucket.key())
-            .collect();
-        for bucket_id in stale_buckets {
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id)
-                && bucket.doc_ids.remove(&id)
-            {
-                bucket.size = bucket.size.saturating_sub(doc_entry);
-                bucket.mark_dirty();
-            }
-        }
+        self.settle_removals(removals, Some((id, doc_entry)));
 
         if was_present {
             self.update_metadata(|m| {
@@ -278,14 +269,10 @@ impl<T: Tokenizer> BM25Index<T> {
     ///
     /// One pass over every posting list: `O(distinct tokens + posting
     /// entries)`. The per-bucket `doc_ids` sets look like a document → bucket
-    /// index that could narrow the sweep, but they are a best-effort
-    /// dirty-tracking hint, not a reverse index: a [`remove`](Self::remove)
-    /// given non-original text clears a document from `doc_ids` while leaving
-    /// its posting entries behind (that is exactly the state
-    /// [`load_buckets`](Self::load_buckets) self-heals), so `doc_ids` can
-    /// *under*-report. A repair path must not trust the bookkeeping it exists
-    /// to repair, hence the full sweep. That is acceptable here because this
-    /// is a maintenance operation whose caller already enumerates the
+    /// index that could narrow the sweep, but they are dirty-tracking
+    /// bookkeeping, and a repair path must not trust the bookkeeping it
+    /// exists to repair, hence the full sweep. That is acceptable here
+    /// because this is a maintenance operation whose caller already enumerates the
     /// collection's entire document prefix — and because it takes a *set*, so
     /// N dead ids cost one pass rather than N.
     ///
@@ -353,74 +340,38 @@ impl<T: Tokenizer> BM25Index<T> {
         // Phase 2: sweep every posting list once, collecting bucket updates
         // instead of applying them, so no `postings` shard guard is held while
         // the `buckets` map is touched.
-        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
-        let mut emptied_tokens: Vec<(u32, String)> = Vec::new();
+        let mut removals = Removals::default();
         for mut entry in self.postings.iter_mut() {
             let (token, posting) = entry.pair_mut();
-            let size = retain_posting(token, posting, |id| !dead.contains(&id));
-            if size > 0 {
-                *bucket_size_decrease.entry(posting.0).or_default() += size;
-                if posting.1.is_empty() {
-                    emptied_tokens.push((posting.0, token.clone()));
-                }
-            }
+            removals.retain(token, posting, |(id, _)| !dead.contains(id));
         }
 
-        // Recheck emptiness and ownership before applying deferred accounting.
-        self.remove_empty_postings(emptied_tokens);
+        // Phase 3: unlist emptied postings; resize and dirty every bucket
+        // that owned an affected token.
+        let mut purged_postings = !removals.bucket_size_decrease.is_empty();
+        self.settle_removals(removals, None);
 
-        // Phase 3: resize and dirty every bucket that owned an affected token.
-        let mut purged_postings = !bucket_size_decrease.is_empty();
-        for (bucket_id, size_decrease) in bucket_size_decrease {
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.mark_dirty();
-                bucket.size = bucket.size.saturating_sub(size_decrease);
-            }
-        }
-
-        // Phase 4: drop the purged ids from every bucket's doc-id set. A
-        // bucket can still list one without owning a posting for it, and its
-        // serialized `doc_tokens` would resurrect the id on reload. Read-scan
-        // first so a purge that touches nothing does not write-lock every
-        // shard; probe by `ids` (the dead set is small) rather than by
-        // `doc_ids` (which can hold the whole collection).
+        // Phase 4: drop the purged ids from every bucket's doc-id set. This
+        // repair path does not assume that only the buckets swept above list
+        // them: a serialized `doc_tokens` entry would resurrect the id on
+        // reload. Read-scan first so a purge that touches nothing does not
+        // write-lock every shard.
         let stale_buckets: Vec<u32> = self
             .buckets
             .iter()
-            .filter(|bucket| {
-                if dead.len() <= bucket.doc_ids.len() {
-                    dead.iter().any(|id| bucket.doc_ids.contains(id))
-                } else {
-                    bucket.doc_ids.iter().any(|id| dead.contains(id))
-                }
-            })
+            .filter(|bucket| ids.iter().any(|id| bucket.doc_ids.contains(id)))
             .map(|bucket| *bucket.key())
             .collect();
         purged_postings |= !stale_buckets.is_empty();
         for bucket_id in stale_buckets {
             if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                let removed: Vec<_> = if dead.len() <= bucket.doc_ids.len() {
-                    dead.iter()
-                        .filter(|id| bucket.doc_ids.contains(id))
-                        .copied()
-                        .collect()
-                } else {
-                    bucket
-                        .doc_ids
-                        .iter()
-                        .filter(|id| dead.contains(id))
-                        .copied()
-                        .collect()
-                };
-                let changed = !removed.is_empty();
-                for id in removed {
-                    bucket.doc_ids.remove(&id);
-                    let count = token_counts.get(&id).copied().unwrap_or(0);
-                    bucket.size = bucket.size.saturating_sub(doc_entry_size(id, count));
+                for id in ids {
+                    if bucket.doc_ids.remove(id) {
+                        let count = token_counts.get(id).copied().unwrap_or(0);
+                        bucket.size = bucket.size.saturating_sub(doc_entry_size(*id, count));
+                    }
                 }
-                if changed {
-                    bucket.mark_dirty();
-                }
+                bucket.mark_dirty();
             }
         }
 

@@ -47,7 +47,7 @@ BM25Index
 └── atomic counters  max_bucket_id, max_document_id, total_tokens, ...
 ```
 
-- **Posting `(bucket_id, Vec<(doc_id, tf)>)`**: `bucket_id` identifies the bucket currently owning the token; the list holds one entry per `insert`. A document appears twice only after a `remove` with non-original text followed by a re-insert of the same id — scoring keys by `doc_id` so the duplicate is scored once, `remove` drops every entry of the id in one pass, and a reload prunes entries whose document is gone. Duplicates of a *live* document are kept: de-duplicating them would put a scan linear in the posting length on the `insert` hot path. Callers without the original text should use `purge_ids`, which needs none.
+- **Posting `(bucket_id, Vec<(doc_id, tf)>)`**: `bucket_id` identifies the bucket currently owning the token; the list holds one entry per indexed document, so its length is the token's document frequency. `remove` keeps it that way: when the supplied text does not account for all of a document's entries, it sweeps the rest by id. Entries of absent documents, possible only in data written by earlier releases, are pruned on load.
 - **Bucket**: a serializable unit containing a group of tokens and the `doc_ids` they cover. A bucket tracks dirty state with dual version counters:
 
   | Field           | Meaning                                           |
@@ -161,7 +161,7 @@ for object in &outcome.obsolete {
 }
 ```
 
-- `flush` captures dirty versions and the next manifest, then serializes/uploads dirty buckets one at a time. Only postings owned by that bucket are written; document lengths are derived from those postings.
+- `flush` captures dirty versions and the next manifest, then serializes/uploads dirty buckets one at a time. Only postings owned by that bucket are written; document lengths are derived from those postings. Buckets without tokens, other than the tail (`max_bucket_id`), are left out of the manifest instead of being written as empty objects, and their previous objects — including empty ones written by earlier releases — are reported obsolete. New tokens only go to the tail, so such buckets would otherwise stay empty and be fetched on every open. The tail is kept so the manifest never becomes empty.
 - Each dirty bucket is written to a **new** object keyed by `(bucket_id, generation)`; the generation is this flush's metadata version, so committed objects are never mutated in place.
 - The metadata — whose manifest maps every live bucket id to its current generation — is written **last**. That single write is the atomic commit point: a crash or error before it leaves the previous snapshot fully intact (the new objects are unreferenced garbage); after it, the replaced objects are garbage and are returned in `FlushOutcome::obsolete` for best-effort deletion.
 - `compact_buckets` needs no special ordering: the repacked layout becomes visible atomically with the next manifest commit, and every pre-compaction object is reported obsolete.
@@ -191,17 +191,18 @@ expr     := or_expr
 or_expr  := and_expr ( " OR " and_expr )*
 and_expr := not_expr ( " AND " not_expr )*
 not_expr := "NOT " not_expr | term
-term     := "(" or_expr ")" | word ( whitespace word )*
+term     := chunk ( whitespace chunk )*
+chunk    := "(" or_expr ")" | word
 ```
 
-Precedence is `OR < AND < NOT`. The operators are case-sensitive and must stand between spaces (`NOT` followed by a space): `a and b` is three search words, and `NOT NOT a` nests two negations. Key properties:
+Precedence is `OR < AND < NOT`. The operators are case-sensitive and must stand between spaces (`NOT` followed by a space): `a and b` is three search words, and `NOT NOT a` nests two negations (evaluated as `a`). Key properties:
 
-- **Multi-term queries default to OR**: `"quick fox"` and `"quick OR fox"` return the same results in `search` and `search_advanced`.
+- **Multi-term queries default to OR**: `"quick fox"` and `"quick OR fox"` return the same results in `search` and `search_advanced`. A group next to words is one more OR operand: `rust (async AND tokio)` is `rust OR (async AND tokio)`.
 - **Score merging**: `AND` sums the BM25 scores of its subqueries; `OR` does the same; `NOT` produces a zero-scored placeholder set used only for filtering, and in an `AND` context it **removes** matching items from the result set.
 - **Robust parsing**: unbalanced parentheses do not panic. They are treated as ordinary characters, which makes direct forwarding of user input safe. An empty group is an empty `OR` that matches nothing, so `a AND ()` returns nothing.
 - **Tokenization belongs to the tokenizer**: the parser preserves operand case. Every boolean operand is tokenized independently with one tokenizer clone per query. An OR of terms merges and deduplicates the resulting tokens, never the raw text. Custom context-sensitive tokenizers may therefore distinguish plain text search from boolean word expressions.
-- **Candidate execution**: AND evaluates selective operands first, retains global DF/IDF for scoring, and restricts later work to the surviving candidates. NOT filters use set membership without computing discarded BM25 scores. IDFs are cached within the query and computed using `ln_1p` for numerical stability.
-- **`NOT` complement guard**: every materialized complement is limited to 10 000 documents, including candidate-relative complements. Simple `AND NOT term` and `AND NOT (a OR b)` filters remove ids directly from the relevant posting lists without copying the candidate set. Leading NOT pairs are cancelled, so `hello AND NOT (NOT world)` is evaluated as a positive filter and remains accepted for larger result sets. Mixed-polarity expressions that really need a candidate universe return an error above the limit. `try_search_advanced` exposes resource errors; `search_advanced` returns an empty result on error. Strict parsing rejects combined parentheses/NOT budget exhaustion instead of silently changing query meaning.
+- **Candidate execution**: AND evaluates selective operands first and restricts later work to the surviving candidates. Each posting is scored in one pass; DF is the posting length, so candidate-restricted scoring keeps global DF/IDF. NOT filters use set membership without computing discarded BM25 scores. IDFs are cached within the query and computed using `ln_1p` for numerical stability.
+- **`NOT` complement guard**: a complement of the whole index (`NOT a`, `a OR NOT b`, `NOT a AND NOT b`) is limited to 10 000 documents. Inside an `AND` with a positive operand, or under `try_search_in_ids`, a NOT is taken relative to the documents already matched, which are in memory anyway, so `a AND NOT (b AND NOT c)` has no limit. Leading NOT pairs cancel at planning time: `hello AND NOT (NOT world)` is `hello AND world`, scored. `try_search_advanced` exposes resource errors; `search_advanced` returns an empty result on error. Strict parsing rejects combined parentheses/NOT budget exhaustion instead of silently changing query meaning.
 - **Multi-byte safe**: the delimiters `" AND "` and `" OR "` are ASCII, so byte-wise scanning remains safe under UTF-8. Mixed CJK text does not require extra handling.
 
 Example:
@@ -365,7 +366,7 @@ Never open the committed metadata with `File::create` before flush: a clean flus
 
 ## 13. Usage Notes
 
-1. **Removal requires the original text**: `remove(id, text, now_ms)` relies on re-tokenizing the original text to locate postings. A wrong-text removal hides an absent document but leaves stale posting entries; reusing that id can expose old terms. Always use the original text or purge before reuse. Stale entries of absent documents are pruned the next time the index is loaded (`load_buckets`), not by `compact_buckets()`, which repacks buckets without inspecting their entries. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)` instead: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. It is a maintenance-path `O(index size)` operation, so pass all the dead ids in one call rather than looping.
+1. **Removal wants the original text**: `remove(id, text, now_ms)` re-tokenizes the text to find the document's postings. If those entries do not add up to the document's token count (wrong text, or a changed tokenizer), `remove` sweeps every posting list for the id: still correct, but `O(index size)`. When the text is genuinely unrecoverable — a repair path whose document bodies are gone — use `purge_ids(&BTreeSet<u64>, now_ms)`: it sweeps every posting list once for the whole set, drops the ids from `doc_tokens` and `total_tokens`, and marks the affected buckets dirty. Pass all the dead ids in one call rather than looping.
 2. **`top_k = 0`**: kept for API compatibility. It returns an empty set and does not trigger sorting.
 3. **Flush coordination**: the crate does not serialize flushes internally. The caller must ensure a flush never overlaps mutations, compaction, or another flush (`anda_db`'s `Collection` already guarantees this); a single writer per durable index is a deployment contract.
 4. **Search semantics under partial loading**: if `load_buckets` skips a posting bucket, terms owned by that bucket are unavailable. Loaded buckets also carry the document lengths needed to score their postings, so `len()` may include every document touched by those loaded terms even when other buckets are skipped. Search results remain the natural subset of the loaded postings.

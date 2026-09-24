@@ -81,7 +81,7 @@ impl<T: Tokenizer> BM25Index<T> {
             name: index.metadata.name.clone(),
             tokenizer,
             config: index.metadata.config.clone(),
-            doc_tokens: DashMap::new(),
+            doc_tokens: DashMap::default(),
             postings: DashMap::new(),
             buckets,
             metadata: RwLock::new(index.metadata),
@@ -145,11 +145,6 @@ impl<T: Tokenizer> BM25Index<T> {
     {
         // A failed/cancelled load cannot leave a writable half-populated index.
         self.load_state = LoadState::Partial;
-        let mut doc_token_lengths: FxHashMap<u64, usize> = self
-            .doc_tokens
-            .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
-            .collect();
 
         let manifest = { self.metadata.read().buckets.clone() };
         let legacy = manifest.is_empty();
@@ -210,7 +205,6 @@ impl<T: Tokenizer> BM25Index<T> {
                 if !bucket.doc_tokens.is_empty() {
                     b.doc_ids = bucket.doc_tokens.keys().copied().collect();
                     for (doc_id, token_count) in bucket.doc_tokens {
-                        doc_token_lengths.insert(doc_id, token_count);
                         // Keep lengths alongside published postings even if a
                         // later read fails or is cancelled. An incremental
                         // retry may skip this already loaded bucket.
@@ -251,54 +245,29 @@ impl<T: Tokenizer> BM25Index<T> {
         }
 
         let mut doc_ids_by_bucket: FxHashMap<u32, FxHashSet<u64>> = FxHashMap::default();
-        let mut loaded_doc_tokens: FxHashMap<u64, usize> = FxHashMap::default();
-        let mut empty_tokens: Vec<(u32, String)> = Vec::new();
-        let mut bucket_size_decrease: FxHashMap<u32, usize> = FxHashMap::default();
-
+        let mut referenced: FxHashSet<u64> = FxHashSet::default();
+        let mut removals = Removals::default();
         for mut entry in self.postings.iter_mut() {
             let (token, posting) = entry.pair_mut();
-            let bucket_id = posting.0;
-            let doc_ids = doc_ids_by_bucket.entry(bucket_id).or_default();
+            let doc_ids = doc_ids_by_bucket.entry(posting.0).or_default();
             // Prune entries whose document has no token length anywhere.
             // Buckets are self-contained (a bucket's doc_tokens cover every
             // document referenced by its postings), so after loading, an entry
-            // without a token length can only be a stale leftover from a
-            // remove() that was given non-original text. Dropping it here makes
-            // the index self-healing on reload. Documents from buckets that
-            // were intentionally skipped (partial load) are not affected.
-            let size = retain_posting(token, posting, |id| {
-                if let Some(token_count) = doc_token_lengths.get(&id) {
-                    loaded_doc_tokens.insert(id, *token_count);
-                    doc_ids.insert(id);
-                    true
-                } else {
-                    false
+            // without a token length can only be a stale leftover of an older
+            // release. Dropping it here makes the index self-healing on
+            // reload. Documents from buckets that were intentionally skipped
+            // (partial load) are not affected.
+            removals.retain(token, posting, |(id, _)| {
+                let live = self.doc_tokens.contains_key(id);
+                if live {
+                    referenced.insert(*id);
+                    doc_ids.insert(*id);
                 }
+                live
             });
-            if size > 0 {
-                *bucket_size_decrease.entry(bucket_id).or_default() += size;
-                if posting.1.is_empty() {
-                    empty_tokens.push((bucket_id, token.clone()));
-                }
-            }
         }
-
-        for (bucket_id, token) in empty_tokens {
-            self.postings.remove(&token);
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.tokens.remove(&token);
-            }
-        }
-
-        for (bucket_id, size_decrease) in bucket_size_decrease {
-            if let Some(mut bucket) = self.buckets.get_mut(&bucket_id) {
-                bucket.size = bucket.size.saturating_sub(size_decrease);
-                bucket.mark_dirty();
-            }
-        }
-
-        self.doc_tokens.clear();
-        self.doc_tokens.extend(loaded_doc_tokens);
+        self.settle_removals(removals, None);
+        self.doc_tokens.retain(|id, _| referenced.contains(id));
 
         let bucket_ids: Vec<u32> = self.buckets.iter().map(|b| *b.key()).collect();
         for bucket_id in bucket_ids {
@@ -442,15 +411,12 @@ impl<T: Tokenizer> BM25Index<T> {
         F: FnMut(BucketObject, Vec<u8>) -> FFut,
         FFut: Future<Output = Result<(), BoxError>>,
     {
-        if self.load_state == LoadState::Partial {
+        let has_dirty = self.has_dirty_buckets();
+        if has_dirty || self.load_state == LoadState::Partial {
             self.require_loaded()?;
         }
-        let has_dirty = self.has_dirty_buckets();
         if !has_dirty && !self.has_pending_metadata_flush() {
             return Ok(FlushOutcome::default());
-        }
-        if has_dirty {
-            self.require_loaded()?;
         }
 
         // A bucket object only becomes reachable through the manifest, so
@@ -461,12 +427,6 @@ impl<T: Tokenizer> BM25Index<T> {
             self.update_metadata(|m| m.stats.version += 1);
         }
 
-        // Freeze only the small version list. The caller excludes mutations
-        // across the entire flush; each payload is serialized just before its
-        // upload, bounding extra payload memory to the largest dirty bucket.
-        let mut dirty = self.collect_dirty_buckets();
-        dirty.sort_unstable_by_key(|(id, _)| *id);
-
         let mut meta = self.metadata();
         meta.stats.last_saved = now_ms.max(meta.stats.last_saved);
         // This flush's generation: unique per committed manifest because the
@@ -475,18 +435,39 @@ impl<T: Tokenizer> BM25Index<T> {
 
         // Build the new manifest: dirty buckets move to this generation,
         // clean buckets keep their committed object. In-memory buckets that
-        // were never persisted (e.g. the empty initial bucket) stay out.
+        // were never persisted (e.g. the empty initial bucket) stay out, and
+        // so do buckets without tokens other than the tail — including empty
+        // objects written by earlier releases: new tokens only go to the
+        // tail, so they would stay empty objects fetched on every open. The
+        // tail is kept so a manifest never becomes empty, which would select
+        // the legacy load path. A metadata-only shell's placeholders have no
+        // tokens yet either, so only a fully loaded index drops clean ones.
+        //
+        // Freeze only the small version list. The caller excludes mutations
+        // across the entire flush; each payload is serialized just before its
+        // upload, bounding extra payload memory to the largest dirty bucket.
+        let tail = self.max_bucket_id.load(Ordering::Relaxed);
         let committed = meta.buckets.clone();
-        let dirty_ids: FxHashSet<u32> = dirty.iter().map(|(id, _)| *id).collect();
+        let mut dirty = Vec::new();
+        let mut emptied = Vec::new();
         let mut manifest = BTreeMap::new();
-        for entry in self.buckets.iter() {
-            let id = *entry.key();
-            if dirty_ids.contains(&id) {
+        for bucket in self.buckets.iter() {
+            let id = *bucket.key();
+            if bucket.tokens.is_empty()
+                && id != tail
+                && (bucket.is_dirty() || self.load_state == LoadState::Complete)
+            {
+                emptied.push(id);
+            } else if !bucket.is_dirty() {
+                if let Some(committed_generation) = committed.get(&id) {
+                    manifest.insert(id, *committed_generation);
+                }
+            } else {
+                dirty.push((id, bucket.dirty_version));
                 manifest.insert(id, generation);
-            } else if let Some(committed_generation) = committed.get(&id) {
-                manifest.insert(id, *committed_generation);
             }
         }
+        dirty.sort_unstable_by_key(|(id, _)| *id);
         meta.buckets = manifest.clone();
 
         let mut meta_buf = Vec::with_capacity(256);
@@ -558,6 +539,10 @@ impl<T: Tokenizer> BM25Index<T> {
         for (bucket_id, version) in dirty {
             self.mark_bucket_saved(bucket_id, version);
         }
+        for bucket_id in emptied {
+            self.buckets
+                .remove_if(&bucket_id, |_, bucket| bucket.tokens.is_empty());
+        }
 
         Ok(FlushOutcome {
             saved: true,
@@ -575,17 +560,6 @@ impl<T: Tokenizer> BM25Index<T> {
     pub fn has_pending_metadata_flush(&self) -> bool {
         let current_version = { self.metadata.read().stats.version };
         self.last_saved_version.load(Ordering::Acquire) < current_version
-    }
-
-    /// Collects the ids and dirty-version snapshots of dirty buckets,
-    /// releasing all DashMap iter locks before the caller starts making async
-    /// persistence calls.
-    fn collect_dirty_buckets(&self) -> Vec<(u32, u64)> {
-        self.buckets
-            .iter()
-            .filter(|b| b.is_dirty())
-            .map(|b| (*b.key(), b.dirty_version))
-            .collect()
     }
 
     /// Serializes one bucket, dropping every DashMap guard before returning

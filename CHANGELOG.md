@@ -2,7 +2,35 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw
+## [Unreleased] — anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs
+
+- anda_db_tfs: fix boolean queries that put a parenthesized group next to
+  other words. `(a AND b) c` parsed as `a AND (b OR c)`, and in
+  `x (a AND b)` the `AND` became a search word. A group is now one more
+  implicit-OR operand: `x OR (a AND b)`.
+- anda_db_tfs: scoring reads each posting once and takes DF from its length,
+  instead of building an intermediate map and, for candidate-restricted
+  scoring, re-deriving DF from every entry. Document lengths are hashed with
+  FxHash instead of SipHash. In the crate benchmark (10,000 documents)
+  `AND` search goes from 338 to 35 µs, scoring 100 candidates from 358 to
+  41 µs, mixed `OR` from 372 to 66 µs and a common term from 622 to 372 µs;
+  Chinese search over 1,000 documents from 180 to 122 µs. Prefiltered text
+  search and `AND` queries in anda_db benefit directly.
+- **Behavior change (anda_db_tfs):** a `NOT` next to a positive operand
+  (`a AND NOT (b AND NOT c)`, or any `NOT` under `try_search_in_ids`) is taken
+  relative to the documents already matched and no longer fails above 10,000
+  documents; only complements of the whole index (`NOT a`, `a OR NOT b`) keep
+  that limit. `NOT NOT x` is planned as `x` and now contributes `x`'s score.
+  The boolean evaluator shrank to one set-matching routine.
+- **Behavior change (anda_db_tfs):** `remove` given text that does not account
+  for all of a document's posting entries (wrong text, changed tokenizer)
+  sweeps the remaining entries by id, like `purge_ids`, instead of leaving
+  stale entries that a later re-insert of the id would duplicate. Removal with
+  the original text no longer scans every bucket.
+- anda_db_tfs: flush leaves buckets without tokens, other than the tail, out
+  of the manifest and reports their objects, including empty ones written by
+  earlier releases, as obsolete. Loading no longer builds two temporary copies
+  of the document-length table.
 
 - anda_db_hnsw: distance kernels widen `bf16` to `f32` without the
   NaN-quieting branch in `half`, so the compiler can vectorize them. Each

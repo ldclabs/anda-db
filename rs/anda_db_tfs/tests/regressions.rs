@@ -356,7 +356,7 @@ fn candidate_scoring_keeps_global_idf_and_nested_boolean_semantics() {
 }
 
 #[test]
-fn large_candidate_not_queries_keep_the_complement_budget() {
+fn not_complements_are_budgeted_only_over_the_whole_index() {
     const DOCUMENTS: u64 = 10_001;
     let index = BM25Index::new(
         "not-budget".into(),
@@ -367,8 +367,8 @@ fn large_candidate_not_queries_keep_the_complement_budget() {
         index.insert(id, "common present", 0).unwrap();
     }
 
-    // Simple negative postings are applied directly. Missing terms therefore
-    // do not copy or scan the full candidate set once per NOT clause.
+    // Negative clauses remove only the ids in their postings, so absent terms
+    // cost nothing per clause.
     let query = format!(
         "common{}",
         (0..64)
@@ -380,29 +380,38 @@ fn large_candidate_not_queries_keep_the_complement_budget() {
         10
     );
 
-    // Leading pairs cancel without constructing a complement, even when they
-    // occur inside another boolean branch.
-    assert_eq!(
+    // `NOT NOT x` is `x`, even inside another boolean branch.
+    for query in [
+        "common AND (present OR NOT NOT present)",
+        "NOT NOT common AND NOT missing",
+    ] {
+        assert_eq!(
+            index.try_search_advanced(query, 10, None).unwrap().len(),
+            10
+        );
+    }
+
+    // Next to a positive operand, a complement is taken relative to the
+    // documents that operand already matched: no new universe, no limit.
+    assert!(
         index
-            .try_search_advanced("common AND (present OR NOT NOT present)", 10, None)
+            .try_search_advanced("common AND NOT (present AND NOT missing)", 10, None)
             .unwrap()
-            .len(),
-        10
+            .is_empty()
     );
     assert_eq!(
         index
-            .try_search_advanced("NOT NOT common AND NOT missing", 10, None)
+            .try_search_advanced("common AND (present OR NOT missing)", 10, None)
             .unwrap()
             .len(),
         10
     );
 
-    // These shapes really do need a candidate-relative complement. A common
-    // positive clause can be the whole corpus, so it must not bypass the same
-    // 10,000-document guard that protects top-level NOT.
+    // Without one, the complement is the whole index, which is guarded.
     for query in [
-        "common AND NOT (present AND NOT missing)",
-        "common AND (present OR NOT missing)",
+        "NOT present",
+        "common OR NOT present",
+        "NOT common AND NOT missing",
     ] {
         let err = index.try_search_advanced(query, 10, None).unwrap_err();
         assert!(err.to_string().contains("logical NOT complement"), "{err}");

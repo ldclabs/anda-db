@@ -104,10 +104,12 @@ impl<T: Tokenizer> BM25Index<T> {
     ///
     /// * the query exceeds the parser's size or complexity budget (see
     ///   [`QueryType::try_parse`]);
-    /// * a `NOT` operand needs to materialize a complement over more than
-    ///   10 000 documents, including a candidate-relative complement. Simple
-    ///   negative postings and even NOT chains avoid that materialization and
-    ///   remain accepted for larger candidate sets.
+    /// * a `NOT` needs the complement of the whole index (`NOT a`,
+    ///   `a OR NOT b`, `NOT a AND NOT b`) and the index holds more than
+    ///   10 000 documents. Inside an `AND` with a positive operand
+    ///   (`a AND NOT b`, `a AND (b OR NOT c)`) the complement is taken
+    ///   relative to the documents already matched and has no such limit.
+    ///   `NOT NOT x` is evaluated as `x`.
     pub fn try_search_advanced(
         &self,
         query: &str,
@@ -124,8 +126,8 @@ impl<T: Tokenizer> BM25Index<T> {
         })?;
 
         let params = params.as_ref().unwrap_or(&self.config.bm25);
-        // Complement guards live at the point where an unrestricted universe
-        // is materialized; candidate-scoped filters need no full-index scan.
+        // The complement guard lives where the whole index is materialized
+        // (`universe`); candidate-scoped complements need no full-index scan.
         let mut context = QueryContext::new(self, params);
         let plan = QueryPlan::prepare(&query_expr, &mut self.tokenizer.clone());
         let scored_docs = self.execute_query(&plan, &mut context, None)?;
@@ -195,12 +197,18 @@ impl<T: Tokenizer> BM25Index<T> {
                 Ok(result)
             }
             QueryPlan::And(queries) => self.score_and(queries, context, candidates),
-            QueryPlan::Not(query) => self.score_boolean_not(query, candidates),
+            QueryPlan::Not(inner) => {
+                let mut result = self.universe(candidates)?;
+                for id in self.match_ids(inner, &result) {
+                    result.remove(&id);
+                }
+                Ok(result)
+            }
         }
     }
 
-    /// DF remains global even when the scoring work is restricted to candidates.
-    /// Last duplicate wins, preserving recovery behavior for historical stale entries.
+    /// Scores each posting entry in one pass. DF is the posting length, so it
+    /// stays global when the scoring work is restricted to candidates.
     fn score_tokens(
         &self,
         tokens: &[String],
@@ -211,106 +219,38 @@ impl<T: Tokenizer> BM25Index<T> {
             return Scores::default();
         }
         let mut scores = Scores::default();
-        let mut valid: FxHashMap<u64, (f32, f32)> = FxHashMap::default();
-        let mut live_ids = FxHashSet::default();
         // Factor the document-length normalization once. In particular, do
         // not divide every matching document's length by the same average.
         let norm_base = context.k1 * (1.0 - context.b);
         let norm_length = context.k1 * context.b / context.avg_length;
         let tf_gain = context.k1 + 1.0;
-        // Length caching pays for overlapping lists. Sparse/disjoint OR lists
-        // otherwise add a second map with essentially no cache hits.
-        let cache_lengths = candidates.is_none()
-            && tokens.len() > 1
-            && tokens.iter().fold(0usize, |count, token| {
-                count.saturating_add(
-                    self.postings
-                        .get(token)
-                        .map_or(0, |posting| posting.1.len()),
-                )
-            }) >= context.doc_count.saturating_mul(2);
         for token in tokens {
-            let cached_idf = context.idfs.get(token).copied();
-            let df;
-            {
-                let Some(posting) = self.postings.get(token) else {
-                    continue;
-                };
-                valid.clear();
-                if let Some(candidates) = candidates {
-                    valid.reserve(candidates.len().min(posting.1.len()));
-                    live_ids.clear();
-                    if cached_idf.is_none() {
-                        live_ids.reserve(posting.1.len());
-                    }
-                    for &(id, tf) in &posting.1 {
-                        let selected = candidates.contains_key(&id);
-                        if !selected && cached_idf.is_some() {
-                            continue;
-                        }
-                        if let Some(length) = self.doc_tokens.get(&id) {
-                            if cached_idf.is_none() {
-                                live_ids.insert(id);
-                            }
-                            if selected {
-                                valid.insert(id, (tf as f32, *length as f32));
-                            }
-                        }
-                    }
-                    df = live_ids.len();
-                } else {
-                    // Keep the common unfiltered path branch-free per posting,
-                    // and allocate once instead of growing/rehashing the buffer.
-                    valid.reserve(posting.1.len());
-                    if cache_lengths {
-                        if context.doc_lengths.is_empty() {
-                            context.doc_lengths.reserve(posting.1.len());
-                        }
-                        for (id, tf) in &posting.1 {
-                            let length = match context.doc_lengths.entry(*id) {
-                                std::collections::hash_map::Entry::Occupied(entry) => {
-                                    Some(*entry.get())
-                                }
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    self.doc_tokens.get(id).map(|length| *entry.insert(*length))
-                                }
-                            };
-                            if let Some(length) = length {
-                                valid.insert(*id, (*tf as f32, length as f32));
-                            }
-                        }
-                    } else {
-                        for (id, tf) in &posting.1 {
-                            if let Some(length) = self.doc_tokens.get(id) {
-                                valid.insert(*id, (*tf as f32, *length as f32));
-                            }
-                        }
-                    }
-                    df = valid.len();
-                }
-            } // Release the posting shard before floating-point scoring.
-            let idf = cached_idf.unwrap_or_else(|| {
-                // ln_1p preserves tiny IDFs for common terms in large corpora.
-                // Concurrent inserts may increase DF beyond the query's count snapshot.
-                let n = context.doc_count.max(df) as f64;
-                let idf = ((n - df as f64 + 0.5) / (df as f64 + 0.5)).ln_1p() as f32;
-                context.idfs.insert(token.clone(), idf);
-                idf
-            });
-            let weight = idf * tf_gain;
+            let Some(posting) = self.postings.get(token) else {
+                continue;
+            };
+            let weight = context.idf(token, posting.1.len()) * tf_gain;
             // Allocate from actual matches, not a fixed minimum: missing and
             // rare terms should not reserve room for a thousand documents.
             if scores.is_empty() {
-                scores.reserve(valid.len());
+                scores
+                    .reserve(candidates.map_or(posting.1.len(), |c| c.len().min(posting.1.len())));
             }
-            for (id, (tf, length)) in valid.drain() {
-                *scores.entry(id).or_default() +=
-                    tf * weight / (tf + norm_base + norm_length * length);
+            for &(id, tf) in &posting.1 {
+                if candidates.is_some_and(|candidates| !candidates.contains_key(&id)) {
+                    continue;
+                }
+                if let Some(length) = self.doc_tokens.get(&id) {
+                    let tf = tf as f32;
+                    *scores.entry(id).or_default() +=
+                        tf * weight / (tf + norm_base + norm_length * *length as f32);
+                }
             }
         }
         scores
     }
 
+    /// Intersects the positive operands, cheapest first, then drops the
+    /// matches of each NOT operand from the intersection.
     fn score_and(
         &self,
         queries: &[QueryPlan],
@@ -320,30 +260,13 @@ impl<T: Tokenizer> BM25Index<T> {
         if queries.is_empty() {
             return Ok(Scores::default());
         }
-        let mut positives: Vec<_> = queries
+        let (negatives, mut positives): (Vec<_>, Vec<_>) = queries
             .iter()
-            .filter(|q| !matches!(q, QueryPlan::Not(_)))
-            .collect();
+            .partition(|query| matches!(query, QueryPlan::Not(_)));
         positives.sort_by_cached_key(|query| self.estimate_matches(query, context.doc_count));
-        // An AND made only from syntactic NOT nodes may still contain a
-        // logically positive even-NOT filter. Seed from such a posting-derived
-        // set instead of materializing the whole document universe.
-        let seed_filter = if positives.is_empty() {
-            queries
-                .iter()
-                .find(|query| Self::matches_without_complement(query))
-        } else {
-            None
-        };
-        let mut result = if let Some(first) = positives.first() {
-            self.execute_query(first, context, candidates)?
-        } else if let Some(seed) = seed_filter {
-            self.execute_query(seed, context, candidates)?
-        } else {
-            self.candidate_ids(candidates)?
-                .into_iter()
-                .map(|id| (id, 0.0))
-                .collect()
+        let mut result = match positives.first() {
+            Some(first) => self.execute_query(first, context, candidates)?,
+            None => self.universe(candidates)?,
         };
         for query in positives.into_iter().skip(1) {
             if result.is_empty() {
@@ -359,259 +282,90 @@ impl<T: Tokenizer> BM25Index<T> {
                 }
             });
         }
-        for query in queries {
+        for query in negatives {
             if result.is_empty() {
                 break;
             }
-            if seed_filter.is_some_and(|seed| std::ptr::eq(query, seed)) {
-                continue;
-            }
-            if let QueryPlan::Not(operand) = query {
-                self.apply_boolean_filter(&mut result, operand, false)?;
+            if let QueryPlan::Not(inner) = query {
+                for id in self.match_ids(inner, &result) {
+                    result.remove(&id);
+                }
             }
         }
         Ok(result)
     }
 
-    /// Keeps or removes documents matching `query` without copying the entire
-    /// candidate set for the common AND-NOT cases.
-    ///
-    /// Negation polarity is pushed through leading NOT nodes. Positive ANDs
-    /// and negative ORs can then filter in place, while a negative term removes
-    /// only ids present in its posting lists. The remaining mixed-polarity
-    /// shapes require a materialized candidate universe and are guarded by the
-    /// same complement budget as a top-level NOT.
-    fn apply_boolean_filter(
-        &self,
-        result: &mut Scores,
-        query: &QueryPlan,
-        keep_matches: bool,
-    ) -> Result<(), BM25Error> {
-        if result.is_empty() {
-            return Ok(());
-        }
-
-        match query {
-            QueryPlan::Not(inner) => {
-                return self.apply_boolean_filter(result, inner, !keep_matches);
-            }
-            QueryPlan::And(queries) if keep_matches => {
-                for query in queries {
-                    self.apply_boolean_filter(result, query, true)?;
-                    if result.is_empty() {
-                        break;
-                    }
-                }
-                return Ok(());
-            }
-            QueryPlan::Or(queries) if !keep_matches => {
-                for query in queries {
-                    self.apply_boolean_filter(result, query, false)?;
-                    if result.is_empty() {
-                        break;
-                    }
-                }
-                return Ok(());
-            }
-            QueryPlan::Terms(tokens) if !keep_matches => {
-                for token in tokens {
-                    if let Some(posting) = self.postings.get(token) {
-                        for (id, _) in &posting.1 {
-                            result.remove(id);
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-
-        // An expression without NOT can be matched from its posting lists;
-        // this avoids materializing the complement even for `NOT (a AND b)`.
-        if let Some(matched) = self.match_positive_query(query, result) {
-            result.retain(|id, _| matched.contains(id) == keep_matches);
-            return Ok(());
-        }
-
-        self.ensure_complement_budget(result.len())?;
-        let scope: FxHashSet<u64> = result.keys().copied().collect();
-        let matched = self.match_query(query, &scope);
-        result.retain(|id, _| matched.contains(id) == keep_matches);
-        Ok(())
-    }
-
-    /// Returns matches for a query containing no NOT nodes. `None` signals
-    /// that complement semantics are required and the caller must enforce the
-    /// complement budget before constructing a candidate universe.
-    fn match_positive_query<C: CandidateLookup>(
-        &self,
-        query: &QueryPlan,
-        candidates: &C,
-    ) -> Option<FxHashSet<u64>> {
+    /// Ids matching `query` inside `scope`, without TF, IDF or scores. A NOT
+    /// takes its complement relative to `scope`, which is already in memory,
+    /// so only [`Self::universe`] needs a budget.
+    fn match_ids<C: CandidateLookup>(&self, query: &QueryPlan, scope: &C) -> FxHashSet<u64> {
         match query {
             QueryPlan::Terms(tokens) => {
                 let mut result = FxHashSet::default();
                 for token in tokens {
                     if let Some(posting) = self.postings.get(token) {
                         for (id, _) in &posting.1 {
-                            if candidates.contains_doc(id) && self.doc_tokens.contains_key(id) {
+                            if scope.contains_doc(id) && self.doc_tokens.contains_key(id) {
                                 result.insert(*id);
                             }
                         }
                     }
                 }
-                Some(result)
+                result
             }
             QueryPlan::Or(queries) => {
                 let mut result = FxHashSet::default();
                 for query in queries {
-                    result.extend(self.match_positive_query(query, candidates)?);
+                    result.extend(self.match_ids(query, scope));
                 }
-                Some(result)
+                result
             }
             QueryPlan::And(queries) => {
-                if queries.is_empty() {
-                    return Some(FxHashSet::default());
-                }
                 let mut ordered: Vec<_> = queries.iter().collect();
                 ordered.sort_by_cached_key(|query| {
-                    self.estimate_matches(query, candidates.candidate_len())
+                    self.estimate_matches(query, scope.candidate_len())
                 });
-                let mut result = self.match_positive_query(ordered[0], candidates)?;
-                for query in ordered.into_iter().skip(1) {
-                    if result.is_empty() {
-                        break;
-                    }
-                    result = self.match_positive_query(query, &result)?;
-                }
-                Some(result)
-            }
-            // Eliminate double negation without materializing a universe. Four,
-            // six, ... leading NOTs collapse through the same recursive case;
-            // an odd number still signals that complement semantics are needed.
-            QueryPlan::Not(inner) => match inner.as_ref() {
-                QueryPlan::Not(inner) => self.match_positive_query(inner, candidates),
-                _ => None,
-            },
-        }
-    }
-
-    fn matches_without_complement(query: &QueryPlan) -> bool {
-        match query {
-            QueryPlan::Terms(_) => true,
-            QueryPlan::And(queries) | QueryPlan::Or(queries) => {
-                queries.iter().all(Self::matches_without_complement)
-            }
-            QueryPlan::Not(inner) => match inner.as_ref() {
-                QueryPlan::Not(inner) => Self::matches_without_complement(inner),
-                _ => false,
-            },
-        }
-    }
-
-    /// Executes a NOT node with zero scores. Leading NOT pairs are cancelled
-    /// before deciding whether a candidate universe is needed; an even chain
-    /// over a positive expression can be answered directly from postings.
-    fn score_boolean_not(
-        &self,
-        query: &QueryPlan,
-        candidates: Option<&Scores>,
-    ) -> Result<Scores, BM25Error> {
-        let mut base = query;
-        let mut negated = true; // The outer QueryPlan::Not matched by the caller.
-        while let QueryPlan::Not(inner) = base {
-            negated = !negated;
-            base = inner;
-        }
-
-        if !negated {
-            let direct = match candidates {
-                Some(candidates) => self.match_positive_query(base, candidates),
-                None => self.match_positive_query(base, &self.doc_tokens),
-            };
-            if let Some(matched) = direct {
-                return Ok(matched.into_iter().map(|id| (id, 0.0)).collect());
-            }
-        }
-
-        let scope = self.candidate_ids(candidates)?;
-        let matched = self.match_query(base, &scope);
-        let ids: FxHashSet<u64> = if negated {
-            scope.difference(&matched).copied().collect()
-        } else {
-            matched
-        };
-        Ok(ids.into_iter().map(|id| (id, 0.0)).collect())
-    }
-
-    /// Boolean filters never need TF, IDF or a score map. This general set
-    /// evaluator is called only after its candidate scope passed the complement
-    /// budget; common AND-NOT forms use `apply_boolean_filter` instead.
-    fn match_query(&self, query: &QueryPlan, scope: &FxHashSet<u64>) -> FxHashSet<u64> {
-        if scope.is_empty() {
-            return FxHashSet::default();
-        }
-        match query {
-            QueryPlan::Terms(tokens) => {
-                let mut result = FxHashSet::default();
-                for token in tokens {
-                    if let Some(posting) = self.postings.get(token) {
-                        for (id, _) in &posting.1 {
-                            if scope.contains(id) && self.doc_tokens.contains_key(id) {
-                                result.insert(*id);
-                            }
-                        }
-                    }
-                }
-                result
-            }
-            QueryPlan::Or(queries) => {
-                let mut result = FxHashSet::default();
-                for query in queries {
-                    result.extend(self.match_query(query, scope));
-                }
-                result
-            }
-            QueryPlan::And(queries) => {
-                if queries.is_empty() {
+                let Some((first, rest)) = ordered.split_first() else {
                     return FxHashSet::default();
-                }
-                let mut ordered: Vec<_> = queries.iter().collect();
-                ordered.sort_by_cached_key(|query| self.estimate_matches(query, scope.len()));
-                let mut result = scope.clone();
-                for query in ordered {
-                    result = self.match_query(query, &result);
+                };
+                let mut result = self.match_ids(first, scope);
+                for query in rest {
                     if result.is_empty() {
                         break;
                     }
+                    result = self.match_ids(query, &result);
                 }
                 result
             }
-            QueryPlan::Not(query) => {
-                let excluded = self.match_query(query, scope);
-                scope.difference(&excluded).copied().collect()
+            QueryPlan::Not(inner) => {
+                let mut result = scope.ids();
+                for id in self.match_ids(inner, &result) {
+                    result.remove(&id);
+                }
+                result
             }
         }
     }
 
-    fn candidate_ids(&self, candidates: Option<&Scores>) -> Result<FxHashSet<u64>, BM25Error> {
-        let count = candidates.map_or_else(|| self.doc_tokens.len(), Scores::len);
-        self.ensure_complement_budget(count)?;
-
-        Ok(match candidates {
-            Some(candidates) => candidates.keys().copied().collect(),
-            None => self.doc_tokens.iter().map(|entry| *entry.key()).collect(),
-        })
-    }
-
-    fn ensure_complement_budget(&self, count: usize) -> Result<(), BM25Error> {
+    /// The zero-scored documents a complement starts from: the candidates,
+    /// or every document when there are none. Only the latter materializes
+    /// something new, so only it is subject to the complement budget.
+    fn universe(&self, candidates: Option<&Scores>) -> Result<Scores, BM25Error> {
+        if let Some(candidates) = candidates {
+            return Ok(candidates.keys().map(|id| (*id, 0.0)).collect());
+        }
+        let count = self.doc_tokens.len();
         if count > MAX_NOT_COMPLEMENT_DOCS {
             return Err(BM25Error::Generic {
                 name: self.name.clone(),
                 source: format!("logical NOT complement over {count} documents exceeds maximum {MAX_NOT_COMPLEMENT_DOCS}").into(),
             });
         }
-        Ok(())
+        Ok(self
+            .doc_tokens
+            .iter()
+            .map(|entry| (*entry.key(), 0.0))
+            .collect())
     }
 
     fn estimate_matches(&self, query: &QueryPlan, ceiling: usize) -> usize {
@@ -643,6 +397,7 @@ type Scores = FxHashMap<u64, f32>;
 trait CandidateLookup {
     fn contains_doc(&self, id: &u64) -> bool;
     fn candidate_len(&self) -> usize;
+    fn ids(&self) -> FxHashSet<u64>;
 }
 
 impl CandidateLookup for Scores {
@@ -652,6 +407,10 @@ impl CandidateLookup for Scores {
 
     fn candidate_len(&self) -> usize {
         self.len()
+    }
+
+    fn ids(&self) -> FxHashSet<u64> {
+        self.keys().copied().collect()
     }
 }
 
@@ -663,15 +422,9 @@ impl CandidateLookup for FxHashSet<u64> {
     fn candidate_len(&self) -> usize {
         self.len()
     }
-}
 
-impl CandidateLookup for DashMap<u64, usize> {
-    fn contains_doc(&self, id: &u64) -> bool {
-        self.contains_key(id)
-    }
-
-    fn candidate_len(&self) -> usize {
-        self.len()
+    fn ids(&self) -> FxHashSet<u64> {
+        self.clone()
     }
 }
 
@@ -681,9 +434,6 @@ struct QueryContext {
     k1: f32,
     b: f32,
     idfs: FxHashMap<String, f32>,
-    /// Reuse first-observed lengths across multi-token scoring; searches are
-    /// best-effort concurrent views, not transactional snapshots.
-    doc_lengths: FxHashMap<u64, usize>,
 }
 
 impl QueryContext {
@@ -701,8 +451,21 @@ impl QueryContext {
             k1,
             b,
             idfs: FxHashMap::default(),
-            doc_lengths: FxHashMap::default(),
         }
+    }
+
+    /// The first DF seen for a token fixes its IDF for the whole query, so
+    /// every branch of one boolean query scores the token alike.
+    fn idf(&mut self, token: &str, df: usize) -> f32 {
+        if let Some(idf) = self.idfs.get(token) {
+            return *idf;
+        }
+        // ln_1p preserves tiny IDFs for common terms in large corpora.
+        // Concurrent inserts may increase DF beyond the query's count snapshot.
+        let n = self.doc_count.max(df) as f64;
+        let idf = ((n - df as f64 + 0.5) / (df as f64 + 0.5)).ln_1p() as f32;
+        self.idfs.insert(token.to_string(), idf);
+        idf
     }
 }
 
@@ -723,7 +486,11 @@ impl QueryPlan {
     fn prepare<T: Tokenizer>(query: &QueryType, tokenizer: &mut T) -> Self {
         match query {
             QueryType::Term(text) => Self::Terms(query_tokens(tokenizer, text)),
-            QueryType::Not(query) => Self::Not(Box::new(Self::prepare(query, tokenizer))),
+            // `NOT NOT x` is `x`: a plan's NOT always needs a complement.
+            QueryType::Not(query) => match Self::prepare(query, tokenizer) {
+                Self::Not(inner) => *inner,
+                inner => Self::Not(Box::new(inner)),
+            },
             QueryType::And(queries) => Self::And(
                 queries
                     .iter()
