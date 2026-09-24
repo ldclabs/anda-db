@@ -1064,7 +1064,6 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "draft-vocabulary",
-    "status": "pending_engine",
     "description": "The Space's draft vocabulary (§20.16), for an engine that advertises draft_vocabulary. DEFINE adds a Predicate or a Concept Type at the fixed reference kip://local/draft@0.0.0, and the symbol resolves for the next operation: it is listed and described with its package, elements persist its exact reference, and a draft Predicate projects like any other. DEFINE only adds — a name of the same kind that already resolves fails SchemaSymbolConflict — never runs inside MUTATE, needs a description, and never claims authority over the data: no closed world, no exclusive-value completeness, no required attribute or Facet, no member outside its definition. Parameters bind before the checks. Every case requires draft_vocabulary through the request envelope (§71), so an engine without it skips the whole chain.",
     "setup": [
       "MUTATE {\n  CREATE CONCEPT ?ada { TYPE \"Person\" NAME \"Ada\" }\n  CREATE CONCEPT ?grace { TYPE \"Person\" NAME \"Grace\" }\n}",
@@ -2629,7 +2628,6 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "mnemonic-strength",
-    "status": "pending_engine",
     "description": "Decay is computed, not written (§59.1, Profile §6.1): effective_strength is derived at read time from the base memory_strength, its anchor last_metabolized_at and the pinned strength_policy — here the standard kip:strength-half-life-30d. A missing base, anchor or pin, or a pin whose digest does not match, leaves it null, never a default; before its anchor it is the base; far past its anchor it has decayed. Reading never writes it back, and writing it fails like any computed member (§18.2). Results that depend on the read's wall-clock instant are pinned only by bounds far from any test date.",
     "setup": [
       {
@@ -4492,7 +4490,6 @@ export const FIXTURES: readonly Fixture[] = [
   },
   {
     "name": "supersession-scope",
-    "status": "pending_engine",
     "description": "Supersession stays inside its actor and its scope (§14.2): the replacement has the same canonical actor, the same Proposition or one of the same subject and Predicate lineage, and the same canonical context set. A correction cannot move a general claim into a context or a scoped claim out of one — that would widen or narrow what the actor said — and fails SupersessionMismatch without writing anything; a same-scope correction commits and supersedes.",
     "packages": [
       {
