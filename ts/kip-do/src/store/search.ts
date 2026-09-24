@@ -20,7 +20,7 @@
  * claim" to every question.
  */
 
-import type { JsonMap } from '../json.js'
+import { jsonEquals, type Json, type JsonMap } from '../json.js'
 import { ftsQuote } from '../sql.js'
 import { extractJsonText, segment, segmentToText } from '../tokenizer.js'
 import type { ElementKind } from '../id.js'
@@ -98,9 +98,20 @@ export const SEARCH_TABLES: readonly SearchableKind[] = [CONCEPT, PROPOSITION, E
  * for free: a purged stub carries no text, so recomputing from it removes the
  * text from the index rather than leaving it findable.
  */
-export function indexElement(sql: SqlStorage, element: Element): void {
+export function indexElement(
+  sql: SqlStorage,
+  element: Element,
+  before: Element | null = null,
+): void {
   const kind = SEARCHABLE[element.kind]
   if (kind === undefined) return
+  // The indexed columns are the row columns of the same names, so a write
+  // that changed none of them has nothing to re-index.
+  if (before !== null) {
+    const was = before.row as unknown as Record<string, Json>
+    const now = element.row as unknown as Record<string, Json>
+    if (kind.columns.every((column) => jsonEquals(was[column] ?? null, now[column] ?? null))) return
+  }
   const rowid = element.row.id
   sql.exec(`DELETE FROM ${kind.fts} WHERE rowid = ?`, rowid)
 

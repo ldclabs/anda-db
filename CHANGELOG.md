@@ -249,6 +249,37 @@ for the parser, the executable AST and stored draft Spaces.
   are copied a run at a time instead of a character at a time (~11× on a
   250 KB literal); a request carrying a pre-parsed `ast` serializes it for its
   number check once instead of three times (about half the preparation time).
+- **Fixed — kip-do `no_effect` on an identical resend:** `UPDATE` and
+  `UPSERT` compared the row before and after in insertion order. A stored row
+  decodes with canonical key order, so resending the same command with a
+  nested object written in any other order committed again — a new version, a
+  Space sequence and a change entry with an empty `touched`. The comparison is
+  canonical now, as in the Rust engine.
+- **Fixed — kip-do reads and sweeps:** an element reached by a scan hides the
+  `input_references` spellings its reader may not see even when it is never
+  reloaded (the filter runs when the element is admitted, not on each load).
+  `sweepExpired` counts only Governance refusals and not-visible elements as
+  `refused` and rethrows anything else instead of reporting a fault as a
+  refusal.
+- **Performance — kip-do:** a Nexus reuses a resolved Schema Environment for
+  the same lock and installed artifacts (it was re-resolved on every command,
+  about 1.5 ms, and the bundled artifacts are now checked once per isolate). A
+  read computes an element's dependency validity once and finds its producers
+  through `element_refs` instead of reading every Activity in the Space (20
+  inferred Assertions over 4000 Activities took 1.5 s); a candidate scan a
+  pattern repeats for every incoming solution runs once per read; the
+  identity-review lookup runs per element only in a Space that has reviews.
+  Construction skips the DDL when the stored schema fingerprint matches this
+  build (about 25 statements instead of 123). A version row is encoded once;
+  the full-text and reverse indexes are left alone when their inputs did not
+  change; learning-record uniqueness looks up the values a transaction writes
+  rather than reading every Activity and Evidence; `ORDER BY` reads each sort
+  key once per row.
+- **Changed — kip-do API:** `Session.metaPage(meta, params)` runs a parsed
+  META command; `Store.put` takes the element as it was stored;
+  `Store.installedPackages()` and `Store.activitiesWithOutput()` are added and
+  `Store.packages()` / `Store.appendVersion()` removed; `KipReceipt` declares
+  `request_digest`.
 
 ### Storage and index crates
 

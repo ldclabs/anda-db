@@ -1,5 +1,5 @@
 import { formatSymbolRef } from './schema/symbol.js'
-import { elementReferences } from './store/references.js'
+import { elementReferences, referenceText } from './store/references.js'
 import { ELEMENT_KINDS } from './id.js'
 import { TABLES } from './store/rows.js'
 import type { ControlRecord } from './control.js'
@@ -9,10 +9,10 @@ import { dependencyValidity } from './projection/dependency.js'
 import { pinnedPlane } from './schema/contracts.js'
 /** Durable state and change coverage; the host owns scheduling and external I/O. */
 import { errors } from './errors.js'
-import { canonicalJson, isJsonMap, type Json, type JsonMap } from './json.js'
+import { asJsonMap, canonicalJson, isJsonMap, type Json, type JsonMap } from './json.js'
 import { digest, validateValue } from './schema/contracts.js'
 import { parseElementId, formatElementId } from './id.js'
-import { Transaction, diffPlanes } from './tx.js'
+import { Transaction, baseElement, diffPlanes } from './tx.js'
 import {
   requirePermitted,
   resourceOfElement,
@@ -27,10 +27,9 @@ import { exposureCount } from './exposure.js'
 import type { Element, TransactionRow } from './store/rows.js'
 import type { Session } from './nexus.js'
 
-import { PROFILE_PREFIX as PROFILE } from './schema/profile-ref.js'
-const obj = (v: Json | undefined): JsonMap => (isJsonMap(v) ? v : {})
-const facet = (e: Element, n: string): JsonMap | undefined =>
-  e.row.facets[PROFILE + n] as JsonMap | undefined
+import { PROFILE_PREFIX as PROFILE, profileFacet } from './schema/profile-ref.js'
+const obj = asJsonMap
+const facet = profileFacet
 const fail = (s: string): never => {
   throw errors.constraintViolation(s)
 }
@@ -56,9 +55,9 @@ function erasureEdges(tx: Transaction): [string, string][] {
     if (facet(e, 'ErasurePlan')) continue
     if (e.kind === 'Activity') {
       for (const r of e.row.inputs)
-        add(typeof r === 'string' ? r : String(obj(r as Json).id), id)
+        add(referenceText(r), id)
       for (const r of e.row.outputs)
-        add(id, typeof r === 'string' ? r : String(obj(r as Json).id))
+        add(id, referenceText(r))
       const basis = facet(e, 'DependencyBasis')
       for (const g of (basis?.groups ?? []) as JsonMap[])
         for (const pin of g.pins as JsonMap[]) add(String(pin.id), id)
@@ -223,7 +222,7 @@ export function validateDurable(tx: Transaction): void {
       throw errors.versionConflict(
         'every changed task/watch plane requires a version guard',
       )
-    const before = s.baseRow ? tx.store.load(parseElementId(id)) : null
+    const before = baseElement(s)
     if (e.row.schema_ref === PROFILE + 'SleepTask') {
       const old = before ? facet(before, 'LeaseState') : undefined,
         lease = facet(e, 'LeaseState')
@@ -726,7 +725,7 @@ export function checkAttentionAttempt(
     if (
       !family ||
       !(family.row.structural[PROFILE + 'current_revision'] as Json[]).some(
-        (r) => (typeof r === 'string' ? r : obj(r).id) === reference,
+        (r) => referenceText(r) === reference,
       )
     )
       throw errors.versionConflict('selected revision no longer current')

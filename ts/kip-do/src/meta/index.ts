@@ -235,12 +235,14 @@ function describe(
               bindCoordinate(target.SchemaEnvironment, readContext(cx), b) ?? 0,
             ),
           )
+    // Copies: the environment is shared by every command that resolves it,
+    // and an answer is the caller's to keep and change.
     return {
       version: env.version,
-      lock: env.lock as unknown as Json,
+      lock: structuredClone(env.lock) as unknown as Json,
       packages: env.packageRefs(),
       // Promotions of draft symbols (§20.16), `[{kind, from, to}]`.
-      lineage_maps: (env.lock.lineage_maps ?? []) as unknown as Json,
+      lineage_maps: structuredClone(env.lock.lineage_maps ?? []) as unknown as Json,
     } as Json
   }
   if ('Package' in target) {
@@ -252,14 +254,15 @@ function describe(
       if (artifact === undefined) {
         throw errors.schemaPackageUnavailable(`${reference} is not part of this Space's Schema Environment`)
       }
+      const copy = structuredClone(artifact)
       return {
         package_ref: reference,
         status: 'active',
         active: true,
-        content_digest: artifact.integrity?.content_digest ?? '',
-        integrity: artifact.integrity as unknown as Json,
-        definitions: artifact.definitions as unknown as Json,
-        artifact: artifact as unknown as Json,
+        content_digest: copy.integrity?.content_digest ?? '',
+        integrity: copy.integrity as unknown as Json,
+        definitions: copy.definitions as unknown as Json,
+        artifact: copy as unknown as Json,
       } as Json
     }
     const row = cx.store.packageByRef(reference)
@@ -695,7 +698,7 @@ function symbol(cx: MetaContext, kind: SymbolKind, name: string): Json {
     kind,
     local_name: resolved.name,
     package_ref: formatPackageRef(resolved.package),
-    definition: (definition ?? null) as Json,
+    definition: structuredClone(definition ?? null) as Json,
   } as Json
 }
 

@@ -281,7 +281,11 @@ export function apply(
     ).authorized(tx)) {
       tx.expectVersions(id, guards)
       const element = tx.load(id)
-      const before = JSON.stringify(element.row)
+      // Canonical, not `JSON.stringify`: a stored row decodes with its keys in
+      // canonical order and a command writes them in whatever order it likes,
+      // so an insertion-order comparison reads an identical resend as a change
+      // and burns a version on it.
+      const before = canonicalJson(element.row)
       const attributesBefore =
         element.kind === 'Concept' ? { ...element.row.attributes } : {}
       // Rendered once: every action of one UPDATE reads the element as it was
@@ -292,7 +296,7 @@ export function apply(
         checkAttributes(tx, element, attributesBefore)
       }
       if (touchesStructural(actions)) checkStructural(tx, element)
-      if (JSON.stringify(element.row) !== before) tx.markChanged(id, 'update')
+      if (canonicalJson(element.row) !== before) tx.markChanged(id, 'update')
     }
     return
   }
@@ -912,7 +916,7 @@ function upsertConcept(
   } else {
     tx.authorizeElement(existing, 'update')
   }
-  const before = JSON.stringify(element.row)
+  const before = canonicalJson(element.row)
   const attributesBefore = { ...element.row.attributes }
 
   const upsertView = structuredClone(render(element))
@@ -945,7 +949,7 @@ function upsertConcept(
   // A clause that computes the state an element is already in changes nothing:
   // no version bump, no change record, and a receipt that says `no_effect`
   // rather than claiming a transition that did not happen (§44).
-  if (JSON.stringify(element.row) !== before) tx.markChanged(existing, 'update')
+  if (canonicalJson(element.row) !== before) tx.markChanged(existing, 'update')
 }
 
 /**

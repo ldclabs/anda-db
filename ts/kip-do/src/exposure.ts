@@ -195,11 +195,6 @@ export function readExposures(host: ExposureHost, space: string, query: Exposure
   }
 }
 
-/** Removes an erased element's entries (§60.7). */
-export function removeExposures(store: Store, space: string, element: string): void {
-  store.sql.exec('DELETE FROM kip_exposures WHERE space = ? AND element = ?', space, element)
-}
-
 /** How many entries an element still has, for erasure verification. */
 export function exposureCount(store: Store, space: string, element: string): number {
   return Number(

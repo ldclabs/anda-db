@@ -28,6 +28,11 @@ export function isJsonMap(value: unknown): value is JsonMap {
   )
 }
 
+/** The value as a JSON object, or an empty one when it is anything else. */
+export function asJsonMap(value: unknown): JsonMap {
+  return isJsonMap(value) ? value : {}
+}
+
 export function isJsonArray(value: unknown): value is Json[] {
   return Array.isArray(value)
 }
@@ -106,13 +111,24 @@ export function jsonEquals(a: Json, b: Json): boolean {
  * listing), so an order only one engine produces reads as tampering or drift.
  */
 export function compareCodePoints(left: string, right: string): number {
-  const a = [...left]
-  const b = [...right]
-  const shared = Math.min(a.length, b.length)
+  const shared = Math.min(left.length, right.length)
   for (let i = 0; i < shared; i += 1) {
-    const x = a[i]!.codePointAt(0)!
-    const y = b[i]!.codePointAt(0)!
-    if (x !== y) return x < y ? -1 : 1
+    const x = left.charCodeAt(i)
+    const y = right.charCodeAt(i)
+    if (x !== y) return codePointRank(x) < codePointRank(y) ? -1 : 1
   }
-  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1
+  return left.length === right.length ? 0 : left.length < right.length ? -1 : 1
+}
+
+/**
+ * Where a UTF-16 code unit falls in code-point order at the first difference.
+ *
+ * Code-unit order already agrees with code-point order except that surrogates
+ * (`D800`–`DFFF`, the halves of everything past the BMP) sort below
+ * `E000`–`FFFF`. Lifting them above is the whole correction, and it saves
+ * splitting both strings into code points on every comparison.
+ */
+function codePointRank(unit: number): number {
+  if (unit < 0xd800) return unit
+  return unit < 0xe000 ? unit + 0x2000 : unit - 0x800
 }

@@ -20,6 +20,7 @@ import type {
   FilterOperand,
 } from '../kip/ast.js'
 import { tryParseElementId } from '../id.js'
+import { referenceText } from '../store/references.js'
 import type { Context } from './context.js'
 import { kipLiteral, parameterValue, readVariable, type ReadBindings } from './matching.js'
 import type { Solution } from './solution.js'
@@ -208,9 +209,7 @@ function callFunction(
       const value = first as Json
       const kind = text(second as Json)
       if (!argumentIsElement(call.args[0]!, value, solution) || kind === null) return false
-      const id = tryParseElementId(
-        typeof value === 'string' ? value : String((value as { id: string }).id),
-      )
+      const id = tryParseElementId(referenceText(value))
       return id !== null && id.kind.toLowerCase() === kind.toLowerCase()
     }
     case 'LiteralType':

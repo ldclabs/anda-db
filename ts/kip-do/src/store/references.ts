@@ -131,6 +131,19 @@ export function elementReferences(element: Element): ElementReference[] {
 }
 
 /** The distinct elements one element points at. */
+/**
+ * The element id a stored reference names, or `''` when it names none.
+ *
+ * A reference arrives either as a bare id string or as `{id: "C-1"}`, and both
+ * spellings are on disk: reading only one would make a link vanish for
+ * whichever form the writer happened to use.
+ */
+export function referenceText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (isJsonMap(value) && typeof value.id === 'string') return value.id
+  return ''
+}
+
 export function referencedIds(element: Element): string[] {
   const seen = new Set<string>()
   for (const reference of elementReferences(element)) {

@@ -31,6 +31,26 @@ function row(n: CognitiveNexus, id: string) {
 }
 
 describe('KML specification details', () => {
+  it('reads an identical resend as no_effect whatever order its nested keys were written in', async () => {
+    await withNexus('resend-no-effect', (n) => {
+      // Stored rows decode with canonical key order; the command writes
+      // `theme` before `lang`. An insertion-order comparison saw a change here
+      // on every resend and bumped the version each time.
+      const upsert = `UPSERT CONCEPT ?c { MATCH {type: "Counter", key: "ada"}
+        SET ATTRIBUTES { prefs: {theme: "dark", lang: "en"} } }`
+      expect(n.execute(upsert).status).toBe('committed')
+      const version = row(n, 'C-1').version
+      expect(n.execute(upsert).status).toBe('no_effect')
+      expect(n.execute(`UPDATE "C-1" SET ATTRIBUTES { prefs: {theme: "dark", lang: "en"} }`).status)
+        .toBe('no_effect')
+      expect(n.execute(`UPDATE "C-1" SET FACET "Numeric" {count: 1}`).status).toBe('committed')
+      expect(n.execute(`UPDATE "C-1" SET FACET "Numeric" {count: 1}`).status).toBe('no_effect')
+      expect(row(n, 'C-1').version).toBe(version + 1)
+      expect(n.execute(`UPDATE "C-1" SET ATTRIBUTES { prefs: {theme: "light", lang: "en"} }`).status)
+        .toBe('committed')
+    })
+  })
+
   it('skips null/non-numeric numeric-expression keys and shallow-merges literal values', async () => {
     await withNexus('skip', (n) => {
       n.execute(`CREATE CONCEPT ?c { TYPE "Counter" SET ATTRIBUTES {

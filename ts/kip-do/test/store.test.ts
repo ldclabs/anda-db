@@ -518,11 +518,13 @@ describe('the store', () => {
     await runInDurableObject(stub, (_instance, state) => {
       const sql = state.storage.sql
       new Store(sql)
-      // Put the pre-2.0 index back, exactly as an older build left it.
+      // Put the pre-2.0 index back, exactly as an older build left it — one
+      // that did not write this build's schema fingerprint either.
       sql.exec('DROP INDEX idx_concepts_key')
       sql.exec(
         `CREATE UNIQUE INDEX idx_concepts_key ON concepts(space, "key") WHERE "key" <> ''`,
       )
+      sql.exec(`DELETE FROM kip_meta WHERE k = 'schema_fingerprint'`)
 
       const store = new Store(sql)
       expect(
@@ -554,7 +556,9 @@ describe('the store', () => {
 
       // Re-applying converges rather than dropping the index it just built —
       // the property `REDEFINED_INDEXES` is keyed on columns for, so that a
-      // database interrupted mid-migration can simply retry.
+      // database interrupted mid-migration can simply retry. Without the
+      // fingerprint, as such a database would be.
+      sql.exec(`DELETE FROM kip_meta WHERE k = 'schema_fingerprint'`)
       new Store(sql)
       expect(
         sql
@@ -570,6 +574,27 @@ describe('the store', () => {
           't',
         ),
       ).toThrowError(/UNIQUE/)
+    })
+  })
+
+  it('skips the migration only for a database this build finished migrating', async () => {
+    await runInDurableObject(env.KIP_DB.getByName('schema-fingerprint'), (_instance, state) => {
+      const sql = state.storage.sql
+      const indexed = () =>
+        sql
+          .exec(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_concepts_name'`)
+          .toArray().length > 0
+      new Store(sql)
+      expect(indexed()).toBe(true)
+      // A wake of a database this build migrated runs none of the DDL.
+      sql.exec('DROP INDEX idx_concepts_name')
+      new Store(sql)
+      expect(indexed()).toBe(false)
+      // Without the mark — an older build's database, or a migration that was
+      // interrupted before it finished — the full path runs and converges.
+      sql.exec(`DELETE FROM kip_meta WHERE k = 'schema_fingerprint'`)
+      new Store(sql)
+      expect(indexed()).toBe(true)
     })
   })
 

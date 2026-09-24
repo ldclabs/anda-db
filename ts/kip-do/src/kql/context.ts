@@ -1,9 +1,3 @@
-import { projectionPolicyAt } from '../control.js'
-import { dependencyValidity, isDerived } from '../projection/dependency.js'
-import { baseline } from '../projection/policy.js'
-import { projectionBasis } from '../projection/index.js'
-import { nowTime } from '../time.js'
-import { computeStrength } from '../projection/strength.js'
 /**
  * The one place a read reaches an element.
  *
@@ -26,6 +20,12 @@ import { computeStrength } from '../projection/strength.js'
  * reasonable.
  */
 
+import { projectionPolicyAt } from '../control.js'
+import { dependencyValidity, isDerived } from '../projection/dependency.js'
+import { baseline } from '../projection/policy.js'
+import { projectionBasis } from '../projection/index.js'
+import { nowTime } from '../time.js'
+import { computeStrength } from '../projection/strength.js'
 import { errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import {
@@ -98,9 +98,20 @@ export class Context {
    */
   readonly readOrigin: boolean
 
+  /**
+   * The Space coordinate this read answers at: `asOf`, or the sequence the
+   * Space stood at when the read began. Read once — a Context lives inside
+   * one operation, and nothing commits while it runs.
+   */
+  readonly snapshotSeq: number
+
   private readonly elements = new Map<string, Element | null>()
   private readonly views = new Map<string, JsonMap>()
+  /** Elements whose read-time validity has been computed into their view. */
+  private readonly validated = new Set<string>()
   private readonly reconstructed = new Map<ElementKind, Element[]>()
+  /** Results of repeated work within this read; see {@link Context.memo}. */
+  private readonly memos = new Map<string, unknown>()
   private governedResultLimit: number | null
 
   constructor(
@@ -117,7 +128,12 @@ export class Context {
     this.authority = authority
     this.auth = auth
     this.asOf = asOf
-    try { this.projectionPolicy = projectionPolicyAt(store, space, asOf ?? store.currentSeq(space), {}) } catch { /* Raw history remains readable; derived status is unavailable. */ }
+    this.snapshotSeq = asOf ?? store.currentSeq(space)
+    try {
+      this.projectionPolicy = projectionPolicyAt(store, space, this.snapshotSeq, {})
+    } catch {
+      // Raw history remains readable; derived status is unavailable.
+    }
     this.governedResultLimit = authority.authorize(
       'read',
       spaceResource(),
@@ -141,12 +157,54 @@ export class Context {
       element = this.admit(key, found)
       this.elements.set(key, element)
     }
-    if (validate && element && (isDerived(element) || this.store.controlAt(this.space, `identity_review/${key}`, this.asOf ?? this.store.currentSeq(this.space)))) {
-      const view = this.views.get(key)
-      if (view && isJsonMap(view._system)) view._system.dependency_validity = dependencyValidity(this, element, this.projectionPolicy, this.validAt)
+    // Once per element per read: validity depends on the element, this read's
+    // coordinate and its policy, none of which move while it runs — and
+    // computing it walks the element's producers.
+    if (validate && element !== null && !this.validated.has(key)) {
+      this.validated.add(key)
+      if (isDerived(element) || this.underIdentityReview(key)) {
+        const view = this.views.get(key)
+        if (view && isJsonMap(view._system)) view._system.dependency_validity = dependencyValidity(this, element, this.projectionPolicy, this.validAt)
+      }
     }
-    this.filterReferenceAudit(key)
     return element
+  }
+
+  /**
+   * Whether an identity withdrawal left this element to be reviewed (§11),
+   * at this read's coordinate.
+   *
+   * Reviews are rare, so whether the Space has any at all is asked once per
+   * read; only a Space that has some pays a lookup per element.
+   */
+  underIdentityReview(key: string): boolean {
+    const any = this.memo('identity-reviews', () =>
+      this.store.sql
+        .exec(
+          `SELECT 1 FROM kip_control_records
+             WHERE space = ? AND key >= 'identity_review/' AND key < 'identity_review0' AND seq <= ?
+             LIMIT 1`,
+          this.space,
+          this.snapshotSeq,
+        )
+        .toArray().length > 0,
+    )
+    return any && this.store.controlAt(this.space, `identity_review/${key}`, this.snapshotSeq) !== null
+  }
+
+  /**
+   * The result of `compute` for `key`, computed once per read.
+   *
+   * For work a query repeats with identical inputs — the same candidate scan
+   * for every incoming solution of a pattern that shares no variable with
+   * them. A read sees one coordinate and nothing writes while it runs, so the
+   * first answer is every later one. Keys are namespaced by the caller.
+   */
+  memo<T>(key: string, compute: () => T): T {
+    if (this.memos.has(key)) return this.memos.get(key) as T
+    const value = compute()
+    this.memos.set(key, value)
+    return value
   }
 
   /** Hide both spellings of an audited reference unless both are readable. */
@@ -173,7 +231,6 @@ export class Context {
     })
   }
 
-  /** The rendered Core view of an element, computed once per query. */
   /**
    * Adds a transient, read-scoped member to an admitted element's view — the
    * `retrieval` a Search Pattern hit carries (§43.8). Never stored.
@@ -183,6 +240,7 @@ export class Context {
     if (view !== null) this.views.set(formatElementId(id), { ...view, [member]: value })
   }
 
+  /** The rendered Core view of an element, computed once per query. */
   view(id: ElementId): JsonMap | null {
     const key = formatElementId(id)
     const cached = this.views.get(key)
@@ -208,6 +266,7 @@ export class Context {
     // once its fields are resolved. Only this private read copy is activated.
     if (copy.row.state === State.PENDING) copy.row.state = State.ACTIVE
     this.views.delete(key)
+    this.validated.delete(key)
     this.elements.set(key, this.admit(key, copy))
   }
 
@@ -309,8 +368,7 @@ export class Context {
     // Computed members exist only on a read (§18.2): decay is evaluated now
     // and never written back (§59.1).
     computeStrength(view, this.evaluatedAt)
-    if ((element.kind === 'Assertion' && element.row.mode === 'inferred') ||
-        (element.kind === 'Concept' && (['SkillRevision', 'Insight', 'WorkingState'].some((name) => element.row.schema_ref.endsWith('/' + name)) || Object.keys(element.row.structural).some((name) => name.endsWith('/derived_from'))))) {
+    if (isDerived(element)) {
       (view._system as JsonMap).dependency_validity = {
         status: 'unverifiable', action_eligible: false,
         reasons: ['recursive dependency validation is unavailable'],
@@ -332,6 +390,7 @@ export class Context {
       toIdentityOnly(view)
     }
     this.views.set(key, view)
+    this.filterReferenceAudit(key)
     return element
   }
 

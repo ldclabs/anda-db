@@ -139,7 +139,6 @@ const MUST_STAY_INTERNAL = [
   'insertStatement',
   'updateStatement',
   'specOf',
-  'rowToJson',
   'SCHEMA_STATEMENTS',
   'SCHEMA_VERSION',
   'applySchema',

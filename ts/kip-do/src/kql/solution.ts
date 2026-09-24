@@ -130,7 +130,9 @@ export function distinct(solutions: readonly Solution[]): Solution[] {
  * which elements the cap kept.
  */
 export function compareSolutions(a: Solution, b: Solution): number {
-  const names = [...new Set([...a.keys(), ...b.keys()])].sort()
+  const names = [...a.keys()]
+  for (const name of b.keys()) if (!a.has(name)) names.push(name)
+  names.sort()
   for (const name of names) {
     const left = a.get(name)
     const right = b.get(name)

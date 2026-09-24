@@ -36,6 +36,7 @@
  * never-reused id should not rest on "nothing currently does".
  */
 
+import { sha256Text } from '../digest.js'
 import { errors } from '../errors.js'
 import { segmenterMark } from '../tokenizer.js'
 import { rebuildSearch } from './search.js'
@@ -776,16 +777,63 @@ function dropRedefinedIndexes(sql: SqlStorage): void {
   }
 }
 
+/** The control-record and exposure tables, created before everything else. */
+const RUNTIME_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS kip_control_records (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT UNIQUE NOT NULL, space TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, origin TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_kip_control ON kip_control_records(space, key, seq)`,
+  `CREATE INDEX IF NOT EXISTS idx_kip_control_kind ON kip_control_records(space, kind, id, seq)`,
+  // §66.8: the exposure log — not cognitive state, erased with its element.
+  `CREATE TABLE IF NOT EXISTS kip_exposures (id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT NOT NULL, element TEXT NOT NULL, exposure TEXT NOT NULL, snapshot_seq INTEGER NOT NULL, recorded_at TEXT NOT NULL, principal_id TEXT NOT NULL, decision_ref TEXT NOT NULL, recall_ref TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS idx_kip_exposures_element ON kip_exposures(space, element, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_kip_exposures_space ON kip_exposures(space, id)`,
+]
+
+/**
+ * A digest of everything {@link applySchema} would do, stored beside the
+ * schema it built.
+ *
+ * A Durable Object constructs on every wake, and re-running some eighty
+ * idempotent statements to learn that nothing changed is most of what that
+ * costs. A database carrying this build's fingerprint skips them. Every
+ * statement, added column and redefined index is in the digest, so a changed
+ * DDL string is a changed fingerprint by construction — there is no version
+ * number to remember to bump — and a database an older build wrote, or one
+ * whose migration was interrupted before the mark was written, takes the
+ * full path.
+ */
+let fingerprint: string | null = null
+function schemaFingerprint(): string {
+  fingerprint ??= sha256Text(
+    JSON.stringify([
+      SCHEMA_VERSION,
+      RUNTIME_STATEMENTS,
+      SCHEMA_STATEMENTS,
+      ADDED_COLUMNS,
+      REDEFINED_INDEXES,
+    ]),
+  )
+  return fingerprint
+}
+
+/** The fingerprint a database was last migrated under, if it has one. */
+function storedFingerprint(sql: SqlStorage): string | null {
+  const hasMeta =
+    sql
+      .exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kip_meta'`)
+      .toArray().length > 0
+  return hasMeta ? metaGet(sql, 'schema_fingerprint') : null
+}
+
 /** Applies the current schema. Safe to retry after an interrupted migration. */
 export function applySchema(sql: SqlStorage): void {
   configureSql(sql)
-  sql.exec(`CREATE TABLE IF NOT EXISTS kip_control_records (id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT UNIQUE NOT NULL, space TEXT NOT NULL, key TEXT NOT NULL, seq INTEGER NOT NULL, version INTEGER NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, origin TEXT NOT NULL)`)
-  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_control ON kip_control_records(space, key, seq)`)
-  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_control_kind ON kip_control_records(space, kind, id, seq)`)
-  // §66.8: the exposure log — not cognitive state, erased with its element.
-  sql.exec(`CREATE TABLE IF NOT EXISTS kip_exposures (id INTEGER PRIMARY KEY AUTOINCREMENT, space TEXT NOT NULL, element TEXT NOT NULL, exposure TEXT NOT NULL, snapshot_seq INTEGER NOT NULL, recorded_at TEXT NOT NULL, principal_id TEXT NOT NULL, decision_ref TEXT NOT NULL, recall_ref TEXT NOT NULL)`)
-  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_exposures_element ON kip_exposures(space, element, id)`)
-  sql.exec(`CREATE INDEX IF NOT EXISTS idx_kip_exposures_space ON kip_exposures(space, id)`)
+  if (storedFingerprint(sql) === schemaFingerprint()) {
+    // The segmenter is the runtime's, not the build's: it can move under an
+    // unchanged schema, so it is checked on every construction regardless.
+    rebuildSearchIfStale(sql)
+    return
+  }
+  for (const statement of RUNTIME_STATEMENTS) sql.exec(statement)
   // Before the `CREATE`s, which would otherwise skip the stale definition.
   dropRedefinedIndexes(sql)
   // The tables first, then any column a later revision added, then the
@@ -811,6 +859,8 @@ export function applySchema(sql: SqlStorage): void {
     )
   }
   metaSet(sql, 'schema_version', String(SCHEMA_VERSION))
+  // Last, so that only a completed migration lets the next construction skip.
+  metaSet(sql, 'schema_fingerprint', schemaFingerprint())
 }
 
 /**

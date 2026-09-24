@@ -1,3 +1,17 @@
+/**
+ * The Cognitive Nexus: one KIP 2.0 engine over one Durable Object's SQLite.
+ *
+ * This is the seam a host holds. It owns the Space registry, the Schema
+ * Environment, and the transaction boundary — and it is deliberately thin,
+ * because everything interesting lives in the layers below it.
+ *
+ * The transaction boundary is the one thing it cannot delegate.
+ * `ctx.storage.transactionSync` gives real all-or-nothing commit, so a KML
+ * statement either lands whole or leaves nothing behind, shells included. The
+ * Rust engine supplies this property with durable redo plans; this engine
+ * uses the platform transaction.
+ */
+
 import * as attentionWatch from './attention/watch.js'
 import * as attentionWork from './attention/work.js'
 import * as attentionEvaluation from './attention/evaluation.js'
@@ -36,41 +50,9 @@ import type { ConceptRow, ElementVersionRow } from './store/rows.js'
 import { publishControl, type ControlRecord } from './control.js'
 import { policyFromSettings } from './projection/policy.js'
 import { verifyArtifact } from './schema/contracts.js'
-/**
- * The Cognitive Nexus: one KIP 2.0 engine over one Durable Object's SQLite.
- *
- * This is the seam a host holds. It owns the Space registry, the Schema
- * Environment, and the transaction boundary — and it is deliberately thin,
- * because everything interesting lives in the layers below it.
- *
- * The transaction boundary is the one thing it cannot delegate.
- * `ctx.storage.transactionSync` gives real all-or-nothing commit, so a KML
- * statement either lands whole or leaves nothing behind, shells included. The
- * Rust engine supplies this property with durable redo plans; this engine
- * uses the platform transaction.
- */
-
 import { scopedIdempotencyKey } from './idempotency.js'
 import { errors, KipError } from './errors.js'
 import { formatElementId } from './id.js'
-
-/**
- * What one retention sweep did, and what it left alone (§19.1, §60.3).
- *
- * The counts are the point. A sweep that reported only what it touched would
- * read as complete, and "swept 4" when 9 expired is the shape of a compliance
- * failure nobody notices.
- */
-export interface RetentionSweep {
-  /** The elements it acted on. */
-  swept: string[]
-  /** How many were kept because a legal hold blocks removal (§60.3). */
-  held: number
-  /** How many the caller was not authorized to act on. */
-  refused: number
-  /** How many were left for the next sweep by `limit`. */
-  remaining: number
-}
 import {
   EffectiveAuthority,
   archiveExpired,
@@ -109,7 +91,7 @@ import { isAlwaysAudited } from './governance/index.js'
 import type { Json, JsonMap } from './json.js'
 import { parseKip } from './kip/parser.js'
 import type { ElementId } from './id.js'
-import type { Command, KmlStatement, KqlQuery } from './kip/ast.js'
+import type { Command, KmlStatement, KqlQuery, MetaCommand } from './kip/ast.js'
 import { executeKml, type IngestContext, type KmlContext } from './kml/index.js'
 import { boundValue, parameter } from './kml/value.js'
 import { executeKqlPage, type KqlAnswer, type KqlContext } from './kql/index.js'
@@ -167,8 +149,64 @@ import { sha256Text, sha3_256Text } from './digest.js'
 import { normalizeTime, nowTime } from './time.js'
 import type { Outcome } from './tx.js'
 
+/**
+ * What one retention sweep did, and what it left alone (§19.1, §60.3).
+ *
+ * The counts are the point. A sweep that reported only what it touched would
+ * read as complete, and "swept 4" when 9 expired is the shape of a compliance
+ * failure nobody notices.
+ */
+export interface RetentionSweep {
+  /** The elements it acted on. */
+  swept: string[]
+  /** How many were kept because a legal hold blocks removal (§60.3). */
+  held: number
+  /** How many the caller was not authorized to act on. */
+  refused: number
+  /** How many were left for the next sweep by `limit`. */
+  remaining: number
+}
+
 /** The Space a Nexus uses when the caller names none. */
 export const DEFAULT_SPACE = 'kip:space:default'
+
+/**
+ * How many resolved environments a Nexus keeps: the current one of each
+ * Space it serves, plus the few a historical read or a `DEFINE` burst reaches.
+ */
+const ENVIRONMENT_CACHE_SIZE = 16
+
+/** The artifacts this build ships, by exact reference. */
+const BUNDLED_BY_REF = new Map<string, SchemaPackage>(
+  [CORE_PACKAGE, ...BUNDLED_PACKAGES].map((artifact) => [
+    formatPackageRef(packageRefOf(artifact)),
+    artifact,
+  ]),
+)
+
+/** Content digests of the bundled artifacts, each checked once per isolate. */
+const bundledDigests = new Map<SchemaPackage, string>()
+
+/**
+ * Checks an artifact for installation and returns its content digest.
+ *
+ * A bundled artifact is this module's own constant, installed on every
+ * construction and never mutated, so it is checked once. A host's artifact
+ * is checked every time: the same object may have been changed since.
+ */
+function checkedDigest(artifact: SchemaPackage): string {
+  const known = bundledDigests.get(artifact)
+  if (known !== undefined) return known
+  verifyArtifact(artifact)
+  packageRefOf(artifact)
+  rejectCoreShadowing(artifact)
+  checkFunctionalBy(artifact)
+  const digest = sha256Text(canonicalJson(artifact))
+  if (BUNDLED_BY_REF.get(formatPackageRef(packageRefOf(artifact))) === artifact) {
+    bundledDigests.set(artifact, digest)
+  }
+  return digest
+}
 
 /**
  * The Principal a Nexus attributes its own bootstrap writes to.
@@ -233,6 +271,9 @@ export class CognitiveNexus {
   /** Lazily built by {@link CognitiveNexus.systemSession}. */
   private system: Session | null = null
 
+  /** Resolved Schema Environments, oldest first; see `resolveEnvironment`. */
+  private readonly environments = new Map<string, SchemaEnvironment>()
+
   private constructor(
     storage: DurableObjectStorage,
     store: Store,
@@ -296,11 +337,8 @@ export class CognitiveNexus {
    * a re-install of identical bytes is a no-op and a changed one is refused.
    */
   installPackage(artifact: SchemaPackage, source: string): void {
-    verifyArtifact(artifact)
+    const digest = checkedDigest(artifact)
     const ref = formatPackageRef(packageRefOf(artifact))
-    rejectCoreShadowing(artifact)
-    checkFunctionalBy(artifact)
-    const digest = sha256Text(canonicalJson(artifact))
     const existing = this.store.packageByRef(ref)
     if (existing !== null) {
       if (existing.content_digest !== digest) {
@@ -353,7 +391,7 @@ export class CognitiveNexus {
       // from becoming the Space's environment: it fails here, not at the first
       // symbol lookup somewhere unrelated.
       const version = (current?.version ?? 0) + 1
-      const env = SchemaEnvironment.resolve(version, lock, this.artifacts())
+      const env = this.resolveEnvironment(version, lock)
       const snapshotSeq = this.store.currentSeq(space)
       const firstActivation = current === null
       const seq = firstActivation ? snapshotSeq + 1 : this.store.nextSeq(space)
@@ -470,7 +508,7 @@ export class CognitiveNexus {
     lock.states[DRAFT_PACKAGE_ID] = 'active'
     checkFunctionalBy(draftPackage(lock.draft))
     const version = env.version + 1
-    SchemaEnvironment.resolve(version, lock, this.artifacts())
+    this.resolveEnvironment(version, lock)
     return this.commitEnvironment(space, lock, {
       ref: reference,
       schema_environment_version: version,
@@ -544,7 +582,7 @@ export class CognitiveNexus {
     const promoted = { kind, from: fromLineage, to: lineageOf(resolved) }
     lock.lineage_maps = [...(lock.lineage_maps ?? []), promoted]
     const version = env.version + 1
-    SchemaEnvironment.resolve(version, lock, this.artifacts())
+    this.resolveEnvironment(version, lock)
     return this.commitEnvironment(space, lock, {
       promoted,
       schema_environment_version: version,
@@ -627,11 +665,7 @@ export class CognitiveNexus {
   environment(space = this.space): SchemaEnvironment {
     const row = this.store.schemaEnv(space)
     if (row === null) return SchemaEnvironment.coreOnly()
-    return SchemaEnvironment.resolve(
-      row.version,
-      lockFromJson(row.lock),
-      this.artifacts(),
-    )
+    return this.resolveEnvironment(row.version, lockFromJson(row.lock))
   }
 
   /**
@@ -651,19 +685,58 @@ export class CognitiveNexus {
           `cannot be resolved under the schema that was in force at it`,
       )
     }
-    return SchemaEnvironment.resolve(
-      row.version,
-      lockFromJson(row.lock),
-      this.artifacts(),
-    )
+    return this.resolveEnvironment(row.version, lockFromJson(row.lock))
   }
 
+  /**
+   * Resolves a lock over the installed artifacts, reusing an earlier
+   * resolution of the same inputs.
+   *
+   * Every command asks for its Space's environment, and resolving one decodes
+   * and checks every installed artifact — most of a small read's cost. The key
+   * is everything resolution reads: the version, the lock and the digest of
+   * each installed artifact. A package ref names one content forever, so an
+   * install can only add a line to that list, and a resolution made inside a
+   * transaction that rolled back keys on exactly the inputs it read — it is
+   * right for them whenever they recur. Environments are immutable, so one
+   * instance is shared by every caller.
+   */
+  private resolveEnvironment(version: number, lock: SchemaLock): SchemaEnvironment {
+    const installed = this.store
+      .installedPackages()
+      .map((row) => `${row.package_ref}=${row.content_digest}`)
+      .join('\n')
+    const key = `${version}\u0000${canonicalJson(lock)}\u0000${installed}`
+    const cached = this.environments.get(key)
+    if (cached !== undefined) return cached
+    const env = SchemaEnvironment.resolve(version, lock, this.artifacts())
+    if (this.environments.size >= ENVIRONMENT_CACHE_SIZE) {
+      const oldest = this.environments.keys().next()
+      if (oldest.done !== true) this.environments.delete(oldest.value)
+    }
+    this.environments.set(key, env)
+    return env
+  }
+
+  /**
+   * Every installed artifact, by exact reference.
+   *
+   * A bundled artifact installed with the content this build ships is read as
+   * the build's own object rather than decoded from its row: the digest says
+   * the two are the same bytes, and the shipped object is the one whose
+   * contracts are already known to hold.
+   */
   private artifacts(): Map<string, SchemaPackage> {
     const out = new Map<string, SchemaPackage>([
       [CORE_PACKAGE_REF, CORE_PACKAGE],
     ])
-    for (const row of this.store.packages()) {
-      out.set(row.package_ref, row.artifact as unknown as SchemaPackage)
+    for (const { package_ref, content_digest } of this.store.installedPackages()) {
+      const bundled = BUNDLED_BY_REF.get(package_ref)
+      const artifact =
+        bundled !== undefined && checkedDigest(bundled) === content_digest
+          ? bundled
+          : (this.store.packageByRef(package_ref)?.artifact as unknown as SchemaPackage)
+      out.set(package_ref, artifact)
     }
     return out
   }
@@ -816,19 +889,6 @@ export class CognitiveNexus {
 }
 
 /**
- * One authenticated caller's view of a Nexus.
- *
- * Every command runs through {@link Session.gate} first, which asks whether this
- * Principal may do this *here at all*. That is Space scope and deliberately so:
- * at this point no element has been read, and reading one to decide whether it
- * may be read would be the disclosure the check exists to prevent. Per-element
- * authorization happens where the elements are.
- *
- * The session caches identity and nothing else. Authority is resolved from the
- * control plane on every command, which is what makes a revocation take effect
- * for a session that started before it (§28.6).
- */
-/**
  * The `read` block of a request envelope (§85).
  *
  * A snapshot token binds a read to the coordinate a previous `DESCRIBE
@@ -854,6 +914,19 @@ export interface MutationOptions {
   ingest?: IngestContext
 }
 
+/**
+ * One authenticated caller's view of a Nexus.
+ *
+ * Every command runs through {@link Session.gate} first, which asks whether this
+ * Principal may do this *here at all*. That is Space scope and deliberately so:
+ * at this point no element has been read, and reading one to decide whether it
+ * may be read would be the disclosure the check exists to prevent. Per-element
+ * authorization happens where the elements are.
+ *
+ * The session caches identity and nothing else. Authority is resolved from the
+ * control plane on every command, which is what makes a revocation take effect
+ * for a session that started before it (§28.6).
+ */
 export class Session {
   readonly nexus: CognitiveNexus
   readonly auth: AuthContext
@@ -915,14 +988,22 @@ export class Session {
     command: string,
     params: JsonMap = {},
   ): { result: Json; nextCursor: string | null; truncated: boolean } {
-    canonicalJson(params)
     const parsed: Command = parseKip(command)
     if (!('Meta' in parsed)) {
       throw errors.languageMismatch('this command is not a META command')
     }
+    return this.metaPage(parsed.Meta, params)
+  }
+
+  /** Runs one parsed META command, reporting its page cursor. */
+  metaPage(
+    meta: MetaCommand,
+    params: JsonMap = {},
+  ): { result: Json; nextCursor: string | null; truncated: boolean } {
+    canonicalJson(params)
     const space = this.nexus.space
     const authority = this.effectiveAuthority(space)
-    const decisions = this.gate(authority, metaPermissions(parsed.Meta))
+    const decisions = this.gate(authority, metaPermissions(meta))
     const page: { next_cursor?: string; truncated?: boolean } = {}
     const cx: MetaContext = {
       store: this.nexus.store,
@@ -938,7 +1019,7 @@ export class Session {
     // runs inside a transaction like any other mutation path — one that is
     // simply never committed.
     const result = this.nexus.transact(() => {
-      const answer = executeMeta(parsed.Meta, cx)
+      const answer = executeMeta(meta, cx)
       this.consume(decisions)
       return answer
     })
@@ -1015,6 +1096,14 @@ export class Session {
     const space = options.space ?? this.nexus.space
     const authority = this.effectiveAuthority(space)
     const needed = kmlPermissions(statement)
+    // What a supplied key is journaled under, and what it was spent on.
+    const journal =
+      options.idempotencyKey === undefined
+        ? { idempotencyKey: undefined, requestDigest: undefined }
+        : {
+            idempotencyKey: scopedIdempotencyKey(this.auth.principal_id, options.idempotencyKey),
+            requestDigest: requestDigest(statement, params, options.operation),
+          }
 
     // §26, §33: a timeout is not an abort. A client that lost its response
     // resends the same key and gets the outcome its first attempt produced,
@@ -1045,10 +1134,9 @@ export class Session {
       // leave the work it asked for undone — silently, since the response
       // looks ordinary. An empty stored digest is a transaction journaled
       // before this check existed; those replay as they did.
-      const digest = requestDigest(statement, params, options.operation)
       if (
         replayed.request_digest !== '' &&
-        replayed.request_digest !== digest
+        replayed.request_digest !== journal.requestDigest
       ) {
         throw errors.idempotencyConflict(
           `idempotency key ${JSON.stringify(options.idempotencyKey)} already ` +
@@ -1078,21 +1166,12 @@ export class Session {
         Object.entries(define.definition).map(([member, value]) => [member, boundValue(b, value)]),
       )
       return this.nexus.transact(() => {
-        const outcome = this.nexus.defineDraftSymbol(space, define.kind, name, definition, {
-          idempotencyKey:
-            options.idempotencyKey === undefined
-              ? undefined
-              : scopedIdempotencyKey(this.auth.principal_id, options.idempotencyKey),
-          requestDigest:
-            options.idempotencyKey === undefined
-              ? undefined
-              : requestDigest(statement, params, options.operation),
-        })
+        const outcome = this.nexus.defineDraftSymbol(space, define.kind, name, definition, journal)
         this.consume(decisions)
         return outcome
       })
     }
-    const provenance = accessProvenance(statement, authority, this.auth)
+    const provenance = accessProvenance(needed, authority, this.auth)
     const cx: KmlContext = {
       store: this.nexus.store,
       space,
@@ -1104,17 +1183,7 @@ export class Session {
       request: params,
       ingest: options.ingest,
       operation: options.operation,
-      idempotencyKey:
-        options.idempotencyKey === undefined
-          ? undefined
-          : scopedIdempotencyKey(
-              this.auth.principal_id,
-              options.idempotencyKey,
-            ),
-      requestDigest:
-        options.idempotencyKey === undefined
-          ? undefined
-          : requestDigest(statement, params, options.operation),
+      ...journal,
       dryRun: options.dryRun,
       // After the spread, for the same reason as the read path: identity is not
       // one of the knobs an options object may turn.
@@ -1278,9 +1347,7 @@ export class Session {
    * Pass `null` to clear it.
    */
   designateSelf(concept: ElementId | null, space = this.nexus.space): void {
-    this.nexus.transact(() => {
-      const authority = this.effectiveAuthority(space)
-      this.consume(this.gate(authority, ['manage_policy']))
+    this.governed(space, 'manage_policy', () => {
       const row = this.nexus.store.space(space)
       if (row === null) {
         throw errors.notFoundOrNotVisible(`no MemorySpace ${space}`)
@@ -1343,10 +1410,13 @@ export class Session {
     limit = 100,
     space = this.nexus.space,
   ): RetentionSweep {
-    return this.nexus.transact(() => {
-      const authority = this.effectiveAuthority(space)
-      this.consume(this.gate(authority, ['manage_retention']))
-      const cx = this.governanceContext(space)
+    return this.governed(space, 'manage_retention', (authority) => {
+      const cx: ElementGovernanceContext = {
+        store: this.nexus.store,
+        space,
+        authority,
+        auth: this.auth,
+      }
       const report: RetentionSweep = {
         swept: [],
         held: 0,
@@ -1373,7 +1443,16 @@ export class Session {
               ? archiveExpired(cx, id)
               : tombstoneExpired(cx, id)
           if (changed) report.swept.push(formatElementId(id))
-        } catch {
+        } catch (err) {
+          // Refused means refused: a Governance decision against this caller,
+          // or an element it may not see. Anything else is a fault, and
+          // counting it as a refusal would report a broken sweep as a
+          // careful one.
+          if (
+            !(err instanceof KipError) ||
+            (err.category !== 'governance' && err.code !== 'NotFoundOrNotVisible')
+          )
+            throw err
           report.refused += 1
         }
       }
@@ -1404,29 +1483,20 @@ export class Session {
    * and the holder must learn that here rather than during an incident.
    */
   createGrant(draft: GrantDraft, space = this.nexus.space): GrantRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_grants',
-      ])
+    return this.governed(space, 'manage_grants', () => {
       for (const action of draft.actions) parsePermission(action)
-      const row = this.nexus.store.governance.createGrant(
+      return this.nexus.store.governance.createGrant(
         { ...draft, space_id: space },
         this.auth.principal_id,
       )
-      this.consume(approvals)
-      return row
     })
   }
 
   /** Revokes a Grant (§29, `manage_grants`). Revoked, never deleted. */
   revokeGrant(id: number, space = this.nexus.space): void {
-    this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_grants',
-      ])
-      this.nexus.store.governance.revokeGrant(id, this.auth.principal_id)
-      this.consume(approvals)
-    })
+    this.governed(space, 'manage_grants', () =>
+      this.nexus.store.governance.revokeGrant(id, this.auth.principal_id),
+    )
   }
 
   /**
@@ -1443,18 +1513,13 @@ export class Session {
     draft: DelegationDraft,
     space = this.nexus.space,
   ): DelegationRow {
-    return this.nexus.transact(() => {
-      const own = draft.delegator_principal === this.auth.principal_id
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        own ? 'delegate' : 'manage_delegation',
-      ])
+    const own = draft.delegator_principal === this.auth.principal_id
+    return this.governed(space, own ? 'delegate' : 'manage_delegation', () => {
       for (const action of draft.actions) parsePermission(action)
-      const row = this.nexus.store.governance.createDelegation(
+      return this.nexus.store.governance.createDelegation(
         { ...draft, space_id: space },
         this.auth.principal_id,
       )
-      this.consume(approvals)
-      return row
     })
   }
 
@@ -1466,22 +1531,15 @@ export class Session {
    * and a caller who could not reach the record could not withdraw at all.
    */
   revokeDelegation(id: number, space = this.nexus.space): void {
-    this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_delegation',
-      ])
-      this.nexus.store.governance.revokeDelegation(id, this.auth.principal_id)
-      this.consume(approvals)
-    })
+    this.governed(space, 'manage_delegation', () =>
+      this.nexus.store.governance.revokeDelegation(id, this.auth.principal_id),
+    )
   }
 
   enqueueDispatch(request: DispatchRequest, space = this.nexus.space): JsonMap {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['maintain'])
-      const value = runtime.enqueueDispatch(this, space, request)
-      this.consume(approvals)
-      return value
-    })
+    return this.governed(space, 'maintain', () =>
+      runtime.enqueueDispatch(this, space, request),
+    )
   }
   beginDispatch(
     attemptId: string,
@@ -1489,18 +1547,9 @@ export class Session {
     fencingToken: number,
     space = this.nexus.space,
   ): JsonMap {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['maintain'])
-      const value = runtime.beginDispatch(
-        this,
-        space,
-        attemptId,
-        expected,
-        fencingToken,
-      )
-      this.consume(approvals)
-      return value
-    })
+    return this.governed(space, 'maintain', () =>
+      runtime.beginDispatch(this, space, attemptId, expected, fencingToken),
+    )
   }
   reconcileDispatch(
     attemptId: string,
@@ -1508,20 +1557,9 @@ export class Session {
     outcomeRef: string,
     space = this.nexus.space,
   ): Json {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'record_outcome',
-      ])
-      const value = runtime.reconcileDispatch(
-        this,
-        space,
-        attemptId,
-        expected,
-        outcomeRef,
-      )
-      this.consume(approvals)
-      return value
-    })
+    return this.governed(space, 'record_outcome', () =>
+      runtime.reconcileDispatch(this, space, attemptId, expected, outcomeRef),
+    )
   }
   /** Validate actual storage coverage before publishing a Brain erasure report. */
   validateErasurePlan(plan: JsonMap, space = this.nexus.space): void {
@@ -1578,7 +1616,7 @@ export class Session {
     config: AttentionConfig,
     space = this.nexus.space,
   ): JsonMap {
-    return this.attentionGoverned(space, 'manage_policy', () =>
+    return this.governed(space, 'manage_policy', () =>
       attentionCatalog.setAttentionConfig(this, space, expected, config),
     )
   }
@@ -1737,7 +1775,7 @@ export class Session {
     observer: DispatchLookupObserver,
     space = this.nexus.space,
   ): JsonMap {
-    return this.attentionGoverned(space, 'manage_policy', () =>
+    return this.governed(space, 'manage_policy', () =>
       attentionDispatch.setLookupObserver(this, space, expected, observer),
     )
   }
@@ -1763,7 +1801,7 @@ export class Session {
     config: TrustConfiguration,
     space = this.nexus.space,
   ): JsonMap {
-    return this.attentionGoverned(space, 'manage_trust', () =>
+    return this.governed(space, 'manage_trust', () =>
       contextualTrust.setContextualTrust(this, space, expected, config),
     )
   }
@@ -1784,14 +1822,20 @@ export class Session {
       ),
     )
   }
-  private attentionGoverned<T>(
+  /**
+   * Runs one host operation as this Principal: inside the object's
+   * transaction, once `permission` is granted at Space scope, spending any
+   * approval it needed only after the operation succeeded (§40).
+   */
+  private governed<T>(
     space: string,
     permission: Permission,
-    body: () => T,
+    body: (authority: EffectiveAuthority) => T,
   ): T {
     return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [permission])
-      const result = body()
+      const authority = this.effectiveAuthority(space)
+      const approvals = this.gate(authority, [permission])
+      const result = body(authority)
       this.consume(approvals)
       return result
     })
@@ -1824,11 +1868,8 @@ export class Session {
     sourceRefs: string[],
     space = this.nexus.space,
   ): ArtifactPin {
-    return this.nexus.transact(() => {
-      const authority = this.effectiveAuthority(space),
-        approvals = this.gate(authority, [
-          sourceRefs.length ? 'derive' : 'manage_policy',
-        ])
+    const permission = sourceRefs.length ? 'derive' : 'manage_policy'
+    return this.governed(space, permission, (authority) => {
       const sources = [...new Set(sourceRefs)].sort()
       for (const source of sources) {
         const row = this.nexus.store.load(parseElementId(source)),
@@ -1862,7 +1903,6 @@ export class Session {
         publishControl(this.nexus.store, space, key, 'artifact', 0, value, {
           principal_id: this.auth.principal_id,
         })
-      this.consume(approvals)
       return { artifact_ref, content_digest }
     })
   }
@@ -1909,11 +1949,8 @@ export class Session {
       digest(policy.observers as unknown as Json)
     )
       throw errors.digestMismatch('observer control digest mismatch')
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_policy',
-      ])
-      const row = publishControl(
+    return this.governed(space, 'manage_policy', () =>
+      publishControl(
         this.nexus.store,
         space,
         `evaluation_policy/${policy.id}`,
@@ -1921,10 +1958,8 @@ export class Session {
         expected,
         policy as unknown as Json,
         { principal_id: this.auth.principal_id },
-      )
-      this.consume(approvals)
-      return row
-    })
+      ),
+    )
   }
 
   withdrawIdentity(
@@ -1933,10 +1968,8 @@ export class Session {
     reasonEvidence: string[],
     space = this.nexus.space,
   ): JsonMap {
-    return this.nexus.transact(() => {
-      const store = this.nexus.store,
-        authority = this.effectiveAuthority(space),
-        approvals = this.gate(authority, ['merge_identity'])
+    return this.governed(space, 'merge_identity', (authority) => {
+      const store = this.nexus.store
       const decision = store.controlAt(space, decisionId)
       const value =
         decision && isJsonMap(decision.value) ? decision.value : null
@@ -1973,13 +2006,20 @@ export class Session {
         old.row.merged_into !== value.target
       )
         throw errors.versionConflict('resolution no longer current')
-      for (const row of store.all<ConceptRow>(
+      // Only a Concept holding the source's own canonical identity or key
+      // can conflict, so those two are looked up rather than every active
+      // Concept read.
+      const rivals = store.all<ConceptRow>(
         'concepts',
-        'SELECT * FROM concepts WHERE space = ? AND state = ?',
+        `SELECT * FROM concepts
+           WHERE space = ? AND state = 'active' AND id <> ?
+             AND ((canonical_id <> '' AND canonical_id = ?) OR ("key" <> '' AND "key" = ?))`,
         space,
-        'active',
-      )) {
-        if (row.id === source.seq) continue
+        source.seq,
+        old.row.canonical_id,
+        old.row.key,
+      )
+      for (const row of rivals) {
         if (
           (old.row.canonical_id && old.row.canonical_id === row.canonical_id) ||
           (old.row.key &&
@@ -2059,7 +2099,6 @@ export class Session {
           visible.push(review)
         else complete = false
       }
-      this.consume(approvals)
       return {
         decision_id: decisionId,
         identity_version: outcome.space_seq,
@@ -2131,16 +2170,13 @@ export class Session {
     settings: JsonMap,
     space = this.nexus.space,
   ): ControlRecord {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_policy',
-      ])
+    return this.governed(space, 'manage_policy', () => {
       const policy = policyFromSettings({ ...settings, policy: name })
       policy.explicit_selection = false
       const config = this.nexus.store.controlAt(space, 'projection')!
         .value as JsonMap
       config[name] = policy as unknown as Json
-      const row = publishControl(
+      return publishControl(
         this.nexus.store,
         space,
         'projection',
@@ -2149,8 +2185,6 @@ export class Session {
         config,
         { principal_id: this.auth.principal_id },
       )
-      this.consume(approvals)
-      return row
     })
   }
 
@@ -2166,11 +2200,10 @@ export class Session {
       )
     )
       throw errors.constraintViolation('trust weights must be in [0,1]')
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_trust',
-      ])
-      const row = publishControl(
+    return this.governed(space, 'manage_trust', () => {
+      // Contextual rules are set on their own path and survive a reweighting.
+      const rules = (this.nexus.store.controlAt(space, 'trust')?.value as JsonMap | undefined)?.rules
+      return publishControl(
         this.nexus.store,
         space,
         'trust',
@@ -2179,19 +2212,10 @@ export class Session {
         {
           weights,
           default_weight: defaultWeight,
-          ...((this.nexus.store.controlAt(space, 'trust')?.value as JsonMap)
-            ?.rules
-            ? {
-                rules: (
-                  this.nexus.store.controlAt(space, 'trust')!.value as JsonMap
-                ).rules!,
-              }
-            : {}),
+          ...(rules ? { rules } : {}),
         },
         { principal_id: this.auth.principal_id },
       )
-      this.consume(approvals)
-      return row
     })
   }
 
@@ -2218,17 +2242,9 @@ export class Session {
 
   /** Creates or replaces a Principal group (§29, `manage_membership`). */
   putGroup(draft: GroupDraft, space = this.nexus.space): PrincipalGroupRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_membership',
-      ])
-      const row = this.nexus.store.governance.putGroup(
-        draft,
-        this.auth.principal_id,
-      )
-      this.consume(approvals)
-      return row
-    })
+    return this.governed(space, 'manage_membership', () =>
+      this.nexus.store.governance.putGroup(draft, this.auth.principal_id),
+    )
   }
 
   /** Suspends or restores a Principal (§29, `manage_membership`). */
@@ -2237,18 +2253,13 @@ export class Session {
     status: string,
     space = this.nexus.space,
   ): PrincipalRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_membership',
-      ])
-      const row = this.nexus.store.governance.setPrincipalStatus(
+    return this.governed(space, 'manage_membership', () =>
+      this.nexus.store.governance.setPrincipalStatus(
         principalId,
         status,
         this.auth.principal_id,
-      )
-      this.consume(approvals)
-      return row
-    })
+      ),
+    )
   }
 
   /**
@@ -2263,28 +2274,16 @@ export class Session {
     draft: ActorBindingDraft,
     space = this.nexus.space,
   ): ActorBindingRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_actor_binding',
-      ])
-      const row = this.nexus.store.governance.createBinding(
-        draft,
-        this.auth.principal_id,
-      )
-      this.consume(approvals)
-      return row
-    })
+    return this.governed(space, 'manage_actor_binding', () =>
+      this.nexus.store.governance.createBinding(draft, this.auth.principal_id),
+    )
   }
 
   /** Revokes an ActorBinding (§17, `manage_actor_binding`). */
   revokeBinding(id: number, space = this.nexus.space): void {
-    this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_actor_binding',
-      ])
-      this.nexus.store.governance.revokeBinding(id, this.auth.principal_id)
-      this.consume(approvals)
-    })
+    this.governed(space, 'manage_actor_binding', () =>
+      this.nexus.store.governance.revokeBinding(id, this.auth.principal_id),
+    )
   }
 
   /** Publishes a Governance Policy version (§29, `manage_policy`). */
@@ -2292,17 +2291,12 @@ export class Session {
     draft: PolicyDraft,
     space = this.nexus.space,
   ): GovernancePolicyRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_policy',
-      ])
-      const row = this.nexus.store.governance.publishPolicy(
+    return this.governed(space, 'manage_policy', () =>
+      this.nexus.store.governance.publishPolicy(
         { ...draft, space_id: draft.space_id ?? space },
         this.auth.principal_id,
-      )
-      this.consume(approvals)
-      return row
-    })
+      ),
+    )
   }
 
   /**
@@ -2314,18 +2308,9 @@ export class Session {
    * authority to approve cannot be the authority to act.
    */
   approve(id: number, note = '', space = this.nexus.space): ApprovalRow {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'approve_high_risk',
-      ])
-      const row = this.nexus.store.governance.approve(
-        id,
-        this.auth.principal_id,
-        note,
-      )
-      this.consume(approvals)
-      return row
-    })
+    return this.governed(space, 'approve_high_risk', () =>
+      this.nexus.store.governance.approve(id, this.auth.principal_id, note),
+    )
   }
 
   /**
@@ -2340,13 +2325,9 @@ export class Session {
     source: string,
     space = this.nexus.space,
   ): void {
-    this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_schema',
-      ])
-      this.nexus.installPackage(artifact, source)
-      this.consume(approvals)
-    })
+    this.governed(space, 'manage_schema', () =>
+      this.nexus.installPackage(artifact, source),
+    )
   }
 
   /**
@@ -2360,14 +2341,9 @@ export class Session {
     artifacts: readonly (SchemaPackage | string)[],
     space = this.nexus.space,
   ): SchemaEnvironment {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), [
-        'manage_schema',
-      ])
-      const env = this.nexus.activatePackages(artifacts, space)
-      this.consume(approvals)
-      return env
-    })
+    return this.governed(space, 'manage_schema', () =>
+      this.nexus.activatePackages(artifacts, space),
+    )
   }
 
   /**
@@ -2383,12 +2359,11 @@ export class Session {
     to: string,
     space = this.nexus.space,
   ): number {
-    return this.nexus.transact(() => {
-      const approvals = this.gate(this.effectiveAuthority(space), ['manage_schema'])
-      const outcome = this.nexus.promoteDraftSymbol(space, kind, from, to)
-      this.consume(approvals)
-      return outcome.schema_environment_version
-    })
+    return this.governed(
+      space,
+      'manage_schema',
+      () => this.nexus.promoteDraftSymbol(space, kind, from, to).schema_environment_version,
+    )
   }
 
   private governanceContext(space: string): ElementGovernanceContext {
@@ -2477,17 +2452,6 @@ export class Session {
 }
 
 /**
- * Whether this caller may be handed the outcome of a write it already made.
- *
- * The permission is checked exactly as it would be for the write itself, so a
- * caller who could not have run the command cannot learn what it did.
- *
- * An outstanding *approval* obligation deliberately does not block it. An
- * approval authorizes the work, and on a replay the work already happened —
- * demanding a second one to learn the outcome of the first is what would make
- * a lost response unrecoverable, which is the failure §33 exists to prevent.
- */
-/**
  * What the idempotency key was spent on (§33.1, §34.4).
  *
  * The digest covers the work the key committed to: the lowered statement and
@@ -2518,6 +2482,17 @@ export function requestDigest(
   )
 }
 
+/**
+ * Whether this caller may be handed the outcome of a write it already made.
+ *
+ * The permission is checked exactly as it would be for the write itself, so a
+ * caller who could not have run the command cannot learn what it did.
+ *
+ * An outstanding *approval* obligation deliberately does not block it. An
+ * approval authorizes the work, and on a replay the work already happened —
+ * demanding a second one to learn the outcome of the first is what would make
+ * a lost response unrecoverable, which is the failure §33 exists to prevent.
+ */
 function requirePermittedForReplay(decision: Authorization): void {
   if (decision.decision === 'require_approval') return
   requirePermitted(decision)
@@ -2577,11 +2552,10 @@ function replay(row: TransactionRow): Outcome {
  * and deliberately not the Grants of anyone else.
  */
 function accessProvenance(
-  statement: KmlStatement,
+  permissions: readonly Permission[],
   authority: EffectiveAuthority,
   auth: AuthContext,
 ): JsonMap | null {
-  const permissions = kmlPermissions(statement)
   if (!permissions.some(isAlwaysAudited)) return null
   return {
     principal_id: auth.principal_id,
@@ -2592,6 +2566,6 @@ function accessProvenance(
       authority.policy === null
         ? null
         : { id: authority.policy.policy_id, version: authority.policy.version },
-    operations: permissions,
+    operations: [...permissions],
   } as unknown as JsonMap
 }

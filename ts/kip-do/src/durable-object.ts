@@ -137,6 +137,8 @@ export interface KipReceipt {
    * `proofs` (§33.2); a signed Receipt would sign it.
    */
   receipt_digest: string
+  /** What the operation's idempotency key was spent on, when it had one (§33.1). */
+  request_digest?: string
   origin: KipReceiptOrigin
 }
 
@@ -281,7 +283,7 @@ export class KipDatabase<Env = KipDatabaseEnv> extends DurableObject<Env> {
             : { next_cursor: answer.nextCursor }),
         }
       }
-      const answer = session.describePage(command, params)
+      const answer = session.metaPage(parsed.Meta, params)
       return {
         status: 'succeeded',
         result: answer.result,

@@ -374,7 +374,7 @@ function projectFrame(cx: Context, frame: Frame, policy: Policy, validAt: string
       if (row.placement === 'outside') { ledger.excluded.push({ assertion_id: id, reason: 'outside_valid_time' }); continue }
       // Material, but it cannot decide a status (§25.5).
       if (row.placement === 'indeterminate') { ledger.indeterminate.push(id); continue }
-      if (row.source.mode === 'inferred' || cx.store.controlAt(cx.space, `identity_review/A-${row.source.id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) {
+      if (row.source.mode === 'inferred' || cx.underIdentityReview(`A-${row.source.id}`)) {
         const checked = dependencyValidity(cx, { kind: 'Assertion', row: row.source }, policy, validAt)
         if (checked.action_eligible !== true && row.candidate.stance === 'support') unverified = true
         const t = (checked.basis as JsonMap).next_invalid_at
@@ -1051,18 +1051,26 @@ export {
 
 /** Full computation basis. Opaque digests never expose grants or hidden counts. */
 export function projectionBasis(cx: Context, policy: Policy, at: string, next: string | null = null): JsonMap {
-  const contextRefs = policy.context_refs
-  const identityVersions = (cx.authority.space.policies._kip_identity_changes ?? []) as number[]
-  const { _kip_identity_changes: _identity, ...policies } = cx.authority.space.policies
-  const authorization = { ...cx.authority, space: { ...cx.authority.space, seq: 0, schema_environment_version: 0, policies }, auth: cx.auth }
+  // The read's own coordinates are the same for every basis it reports, and
+  // the authorization view digests the whole resolved authority: computed once
+  // per read rather than once per projected element.
+  const read = cx.memo('projection-basis', () => {
+    const identityVersions = (cx.authority.space.policies._kip_identity_changes ?? []) as number[]
+    const { _kip_identity_changes: _identity, ...policies } = cx.authority.space.policies
+    const authorization = { ...cx.authority, space: { ...cx.authority.space, seq: 0, schema_environment_version: 0, policies }, auth: cx.auth }
+    return {
+      identity_version: Math.max(0, ...identityVersions.filter((v) => v <= cx.snapshotSeq)),
+      authorization_view: sha256Text(canonicalJson(authorization)),
+    }
+  })
 
   return {
-    space_id: cx.space, snapshot_seq: cx.asOf ?? cx.store.currentSeq(cx.space),
-    schema_environment_version: cx.env.version, identity_version: Math.max(0, ...identityVersions.filter((v) => v <= (cx.asOf ?? cx.store.currentSeq(cx.space)))),
+    space_id: cx.space, snapshot_seq: cx.snapshotSeq,
+    schema_environment_version: cx.env.version, identity_version: read.identity_version,
     policy: { id: policy.id, version: `sha256:${sha256Text(canonicalJson([policy.version, policy.accept, policy.material, policy.modes, policy.expand_conflicts, policy.unstated_confidence]))}` },
     trust_version: policy.trust_version,
-    authorization_view: sha256Text(canonicalJson(authorization)),
-    context_refs: contextRefs, purpose: policy.purpose || cx.auth.purpose || 'unspecified', risk: policy.risk || cx.auth.risk || 'unspecified',
+    authorization_view: read.authorization_view,
+    context_refs: policy.context_refs, purpose: policy.purpose || cx.auth.purpose || 'unspecified', risk: policy.risk || cx.auth.risk || 'unspecified',
     valid_at: at, next_invalid_at: next,
   }
 }

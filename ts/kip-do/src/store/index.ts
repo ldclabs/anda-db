@@ -55,7 +55,6 @@ export {
   TABLE_SPECS,
   decodeRow,
   insertStatement,
-  rowToJson,
   specOf,
   updateStatement,
   type SqlRow,
@@ -64,6 +63,7 @@ export {
 export {
   elementReferences,
   referencedIds,
+  referenceText,
   type ElementReference,
 } from './references.js'
 

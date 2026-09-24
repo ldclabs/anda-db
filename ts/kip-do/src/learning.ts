@@ -1,29 +1,25 @@
 /** Final-transaction CognitiveMemory invariants. Shared semantics with tx/learning.rs. */
 import { errors } from './errors.js'
-import { canonicalJson, isJsonMap, type Json, type JsonMap } from './json.js'
+import { asJsonMap, canonicalJson, type Json, type JsonMap } from './json.js'
 import { parseElementId, formatElementId, type ElementKind } from './id.js'
 import { State, TABLES, type Element } from './store/rows.js'
+import { referenceText } from './store/references.js'
 import { render } from './view.js'
 import { digest } from './schema/contracts.js'
 import { artifactValue, requireArtifactMaterial } from './control.js'
 import { type EvaluationPolicy, type EvaluationSamples } from './cognitive.js'
-import { diffPlanes } from './tx.js'
+import { baseElement, diffPlanes } from './tx.js'
 import type { Transaction, Staged } from './tx.js'
 
-import { PROFILE_PREFIX as PROFILE } from './schema/profile-ref.js'
-const obj = (v: Json | undefined): JsonMap => (isJsonMap(v) ? v : {})
+import { PROFILE_PREFIX as PROFILE, profileFacet } from './schema/profile-ref.js'
+const obj = asJsonMap
 const refs = (v: Json | undefined): string[] =>
-  Array.isArray(v)
-    ? v.map((r) => (typeof r === 'string' ? r : String(obj(r).id)))
-    : []
+  Array.isArray(v) ? v.map(referenceText) : []
 const same = (a: Json | undefined, b: Json | undefined): boolean =>
   canonicalJson(a ?? null) === canonicalJson(b ?? null)
 const sameRefs = (a: Json | undefined, b: Json | undefined): boolean =>
   same(refs(a).sort(), refs(b).sort())
-const facet = (e: Element, name: string): JsonMap | null =>
-  isJsonMap(e.row.facets[PROFILE + name])
-    ? (e.row.facets[PROFILE + name] as JsonMap)
-    : null
+const facet = profileFacet
 const edge = (e: Element, name: string): string[] =>
   refs(e.row.structural[PROFILE + name])
 const type = (e: Element, name: string): boolean =>
@@ -103,22 +99,66 @@ export function validateLearning(tx: Transaction): void {
       if (s.element.kind === kind) rows.set(id, s.element)
     return [...rows.values()]
   }
-  const activities = universe('Activity'),
-    evidence = universe('Evidence')
-  const attempts = new Set<string>(),
-    observations = new Set<string>()
-  for (const a of activities) {
-    const r = facet(a, 'AttemptRecord')
-    if (r && attempts.has(String(r.attempt_id)))
-      fail('attempt_id must be Space-unique')
-    if (r) attempts.add(String(r.attempt_id))
+  // Read only by the evaluation checks, which reason over a whole trial; an
+  // ordinary attempt or outcome never pays for reading every record.
+  const universes = new Map<ElementKind, Element[]>()
+  const all = (kind: ElementKind): Element[] => {
+    let found = universes.get(kind)
+    if (found === undefined) universes.set(kind, (found = universe(kind)))
+    return found
   }
-  for (const e of evidence) {
-    const r = facet(e, 'OutcomeRecord')
-    if (r && observations.has(String(r.observation_key)))
-      fail('observation_key must deduplicate source events')
-    if (r) observations.add(String(r.observation_key))
+  /** The staged elements this transaction created, in creation order. */
+  const created = [...tx.staged.values()]
+    .filter((s) => s.isNew)
+    .map((s) => s.element)
+  /**
+   * Every Activity that lists `id` among its outputs, as this transaction
+   * would leave it: the stored ones through the reverse index, with the
+   * staged Activities in their place, in id order.
+   */
+  const producers = (id: string): Element[] => {
+    const found = new Map<string, Element>()
+    for (const a of store.activitiesWithOutput(space, parseElementId(id))) found.set(idOf(a), a)
+    for (const [key, s] of tx.staged) if (s.element.kind === 'Activity') found.set(key, s.element)
+    return [...found.values()].sort((a, b) => a.row.id - b.row.id)
   }
+  // Space-unique record identities. Only a value this transaction holds can
+  // be newly duplicated, so each is looked up rather than every record read.
+  const unique = (
+    kind: 'Activity' | 'Evidence',
+    name: string,
+    member: string,
+    message: string,
+  ): void => {
+    const values = new Set<string>()
+    for (const s of tx.staged.values()) {
+      const r = s.element.kind === kind ? facet(s.element, name) : null
+      if (!r) continue
+      const value = String(r[member])
+      if (values.has(value)) fail(message)
+      values.add(value)
+    }
+    for (const value of values) {
+      const rows = store.sql
+        .exec<{ id: number }>(
+          `SELECT id FROM ${TABLES[kind]}
+             WHERE space = ? AND CAST(json_extract(facets, ?) AS TEXT) = ?`,
+          space,
+          `$."${PROFILE}${name}".${member}`,
+          value,
+        )
+        .toArray()
+      if (rows.some((row) => !tx.staged.has(formatElementId({ kind, seq: row.id }))))
+        fail(message)
+    }
+  }
+  unique('Activity', 'AttemptRecord', 'attempt_id', 'attempt_id must be Space-unique')
+  unique(
+    'Evidence',
+    'OutcomeRecord',
+    'observation_key',
+    'observation_key must deduplicate source events',
+  )
   const guarded = (id: string, s: Staged): void => {
     if (!s.baseRow || tx.guarded.get(id)?.has('version')) return
     const required = [...diffPlanes(s.element, s.baseRow).planes]
@@ -397,7 +437,7 @@ export function validateLearning(tx: Transaction): void {
     const excluded = Array.isArray(evaluation.excluded_samples)
       ? evaluation.excluded_samples.map(obj)
       : []
-    for (const a of activities) {
+    for (const a of all('Activity')) {
       const r = facet(a, 'AttemptRecord')
       if (
         r?.trial_ref === trialRef &&
@@ -419,7 +459,7 @@ export function validateLearning(tx: Transaction): void {
       )
         fail('trial attempt omitted without exclusion accounting')
     }
-    for (const e of evidence) {
+    for (const e of all('Evidence')) {
       const r = facet(e, 'OutcomeRecord')
       if (
         r?.terminal === true &&
@@ -498,7 +538,7 @@ export function validateLearning(tx: Transaction): void {
     ) {
       const last = Math.max(
         0,
-        ...activities
+        ...all('Activity')
           .filter(
             (a) =>
               !a.row.origin.import &&
@@ -520,15 +560,14 @@ export function validateLearning(tx: Transaction): void {
       const families = edge(row, 'revision_of')
       if (families.length !== 1 || !type(final(families[0]!), 'Skill'))
         fail('SkillRevision requires one revision_of Skill')
-      const old = store.load(parseElementId(id))
-      if (s.baseRow && old && !same(edge(old, 'revision_of'), families))
+      const old = baseElement(s)
+      if (old && !same(edge(old, 'revision_of'), families))
         throw errors.immutableField('revision cannot change family')
     }
     if (type(row, 'Skill')) {
       if (
-        activities.some(
+        created.some(
           (a) =>
-            tx.staged.get(idOf(a))?.isNew &&
             facet(a, 'EvaluationRecord') &&
             a.kind === 'Activity' &&
             refs(a.row.outputs as Json).includes(id),
@@ -541,7 +580,7 @@ export function validateLearning(tx: Transaction): void {
       const rev = revision(revisions[0]!)
       if (!same(edge(rev, 'revision_of'), [id]))
         fail('current_revision and revision_of must be bidirectional')
-      const before = s.baseRow ? store.load(parseElementId(id)) : null,
+      const before = baseElement(s),
         status = obj(render(row).attributes).status
       const trialPtr = edge(row, 'current_trial'),
         evaluationPtr = edge(row, 'current_evaluation')
@@ -557,10 +596,9 @@ export function validateLearning(tx: Transaction): void {
         !same(edge(before, 'current_evaluation'), evaluationPtr)
       ) {
         guarded(id, s)
-        const evaluation = activities.find((a) => {
+        const evaluation = created.find((a) => {
           const r = facet(a, 'EvaluationRecord')
           return (
-            tx.staged.get(idOf(a))?.isNew &&
             r &&
             r.from_status === obj(render(before).attributes).status &&
             r.to_status === status &&
@@ -654,7 +692,7 @@ export function validateLearning(tx: Transaction): void {
         fail('observation cannot predate its attempt')
       const observer = e.generated_by
         ? final(e.generated_by)
-        : activities.find(
+        : producers(id).find(
             (a) =>
               a.kind === 'Activity' &&
               a.row.activity_class === 'outcome_observation' &&

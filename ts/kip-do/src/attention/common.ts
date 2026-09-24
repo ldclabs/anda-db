@@ -1,6 +1,6 @@
 /** Native attention records share the graph's SQLite transaction and journal. */
 import { errors, KipError } from '../errors.js'
-import { canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
+import { asJsonMap, canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
 import { digest } from '../schema/contracts.js'
 import { Context } from '../kql/context.js'
 import { projectionBasis } from '../projection/index.js'
@@ -26,7 +26,7 @@ export { PROFILE_PREFIX as PROFILE } from '../schema/profile-ref.js'
 export const FORMAT = 'anda-brain:attention-v1'
 export const CONTINUATION = 'anda-brain:attention-continuation-v1'
 export const CONFIG = 'attention/config'
-export const obj = (v: Json | undefined): JsonMap => (isJsonMap(v) ? v : {})
+export const obj = asJsonMap
 export const json = (v: unknown): Json => v as Json
 export const eq = (a: unknown, b: unknown): boolean =>
   canonicalJson(json(a ?? null)) === canonicalJson(json(b ?? null))

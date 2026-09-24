@@ -12,7 +12,6 @@
  */
 
 import { encodeJson } from '../sql.js'
-import { canonicalJson, type Json } from '../json.js'
 
 /** Column sets, per table. `id` is the rowid and is never written explicitly. */
 interface TableSpec {
@@ -433,13 +432,24 @@ export function updateStatement(
  */
 const quote = (column: string): string => `"${column}"`
 
+/**
+ * JSON column text the caller has already encoded with `encodeJson`, bound
+ * as it is: for a value that is expensive to encode and was encoded for
+ * another reason first.
+ */
+export class EncodedJson {
+  constructor(readonly text: string) {}
+}
+
 function bind(
   table: string,
   column: string,
   value: unknown,
 ): SqlStorageValue {
   if (specOf(table).json.has(column)) {
-    return encodeJson(value ?? null, `${table}.${column}`)
+    return value instanceof EncodedJson
+      ? value.text
+      : encodeJson(value ?? null, `${table}.${column}`)
   }
   if (value === undefined || value === null) {
     // Every scalar column is NOT NULL with an empty-string or zero default;
@@ -448,9 +458,4 @@ function bind(
     throw new Error(`${table}.${column} was not set`)
   }
   return value as SqlStorageValue
-}
-
-/** Canonical JSON of a decoded row, for the version log and digests. */
-export function rowToJson(row: unknown): Json {
-  return JSON.parse(canonicalJson(row)) as Json
 }

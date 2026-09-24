@@ -1,13 +1,3 @@
-import { validateCommitLeases } from './attention/common.js'
-import { validateDurable } from './runtime.js'
-import type { ControlRecord } from './control.js'
-import { validateLearning } from './learning.js'
-import { isJsonMap } from './json.js'
-import type { ActivityRow } from './store/rows.js'
-import { isDerived } from './projection/dependency.js'
-import { validateRecord, pinnedPlane } from './schema/contracts.js'
-import { render } from './view.js'
-import { referencedIds } from './store/references.js'
 /**
  * # Transactions
  *
@@ -49,6 +39,16 @@ import { referencedIds } from './store/references.js'
  * observe a half-applied transaction and no lock to hold against one.
  */
 
+import { validateCommitLeases } from './attention/common.js'
+import { validateDurable } from './runtime.js'
+import type { ControlRecord } from './control.js'
+import { validateLearning } from './learning.js'
+import { isJsonMap } from './json.js'
+import type { ActivityRow } from './store/rows.js'
+import { dependencyBasisOf, isDerived } from './projection/dependency.js'
+import { validateRecord, pinnedPlane } from './schema/contracts.js'
+import { render } from './view.js'
+import { referencedIds, referenceText } from './store/references.js'
 import { detailed, errors } from './errors.js'
 import {
   classification,
@@ -65,7 +65,7 @@ import {
   type ElementId,
   type ElementKind,
 } from './id.js'
-import { canonicalJson, jsonEquals, type Json, type JsonMap } from './json.js'
+import { asJsonMap, canonicalJson, jsonEquals, type Json, type JsonMap } from './json.js'
 import type { SchemaEnvironment } from './schema/index.js'
 import {
   State,
@@ -89,22 +89,6 @@ import {
 import { nowTime } from './time.js'
 
 /**
- * The element id a stored reference names, or `''` when it names none.
- *
- * A reference arrives either as a bare id string or as `{id: "C-1"}`, and both
- * spellings are on disk: reading only one would make derivation links vanish for
- * whichever form the writer happened to use.
- */
-function referenceText(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (value !== null && typeof value === 'object') {
-    const id = (value as { id?: unknown }).id
-    if (typeof id === 'string') return id
-  }
-  return ''
-}
-
-/**
  * What an element was derived from, for the authority lineage.
  *
  * The *material* inputs — the ones whose content shaped this element — rather
@@ -114,14 +98,8 @@ function referenceText(value: unknown): string {
 function materialInputs(element: Element): string[] {
   const ids: string[] = []
   const push = (value: unknown) => {
-    if (typeof value === 'string' && value !== '') ids.push(value)
-    else if (
-      value !== null &&
-      typeof value === 'object' &&
-      typeof (value as { id?: unknown }).id === 'string'
-    ) {
-      ids.push((value as { id: string }).id)
-    }
+    const id = referenceText(value)
+    if (id !== '') ids.push(id)
   }
   switch (element.kind) {
     case 'Assertion':
@@ -724,16 +702,8 @@ export class Transaction {
   }
 
   /**
-   * Commits everything staged, or reports what a dry run would have done.
-   *
-   * A dry run never establishes a durable cognitive commit (§69.3): it takes no
-   * Space sequence and journals nothing. The caller runs it inside a
-   * transaction it rolls back, so the shells go with it.
-   *
-   * A `no_effect` outcome under an idempotency key is journaled without a
-   * sequence (§34.3): a client that lost the response to a write that changed
-   * nothing must still be able to learn that it changed nothing, rather than
-   * being told its key was never seen.
+   * Records that a caller-supplied reference resolved to another element
+   * (an identity decision), so the commit can note it on whatever cites it.
    */
   recordReference(supplied: string, resolved: string): void {
     const identity = (this.authority.space.policies._kip_identity_changes ??
@@ -747,6 +717,18 @@ export class Transaction {
     })
   }
 
+  /**
+   * Commits everything staged, or reports what a dry run would have done.
+   *
+   * A dry run never establishes a durable cognitive commit (§69.3): it takes no
+   * Space sequence and journals nothing. The caller runs it inside a
+   * transaction it rolls back, so the shells go with it.
+   *
+   * A `no_effect` outcome under an idempotency key is journaled without a
+   * sequence (§34.3): a client that lost the response to a write that changed
+   * nothing must still be able to learn that it changed nothing, rather than
+   * being told its key was never seen.
+   */
   commit(idempotencyKey: string, requestDigest = ''): Outcome {
     for (const staged of this.staged.values()) {
       if (staged.changed && staged.verb !== 'purge') {
@@ -767,12 +749,7 @@ export class Transaction {
     }
     for (const staged of this.staged.values()) {
       if (staged.changed && staged.verb !== 'purge') {
-        const old = staged.baseRow
-          ? this.store.load({
-              kind: staged.element.kind,
-              seq: staged.element.row.id,
-            })
-          : null
+        const old = baseElement(staged)
         validateRecord(
           this.env,
           render(staged.element),
@@ -896,7 +873,7 @@ export class Transaction {
       if (row.state === '' || row.state === State.PENDING) {
         row.state = State.ACTIVE
       }
-      this.store.put(staged.element, staged.verb, this.cx.tx_id)
+      this.store.put(staged.element, staged.verb, this.cx.tx_id, baseElement(staged))
       changes.push(entry)
       written.add(id)
     }
@@ -911,18 +888,13 @@ export class Transaction {
   }
 
   /**
-   * Assigns the version and plane counters one staged element will commit
-   * with, and builds its Change Envelope entry (§35.5, §6.3, §36.1).
-   *
-   * The counters are advanced on the row itself, so the row the store writes
-   * and the entry the stream reports agree by construction. A preview
-   * computes the same entry without keeping the advance: the row is discarded
-   * with the transaction.
+   * Requires `derive` for a derived element or a DependencyBasis carrier, and
+   * holds a `dependency_validation` Activity to what it may claim: its pins
+   * among its inputs, its outputs exact, and an Assertion's original premises
+   * unchanged.
    */
   private validateRevalidation(element: Element): void {
-    const contract = Object.entries(element.row.facets).find(([name]) =>
-      name.endsWith('/DependencyBasis'),
-    )?.[1] as JsonMap | undefined
+    const contract = dependencyBasisOf(element.row)
     if (isDerived(element) || contract)
       requirePermitted(
         this.authority.authorize(
@@ -986,11 +958,11 @@ export class Transaction {
       )
       if (target.kind !== 'Assertion') continue
       let original: string | null = null
-      for (const producer of this.store.all<ActivityRow>(
-        'activities',
-        'SELECT * FROM activities WHERE space = ?',
-        this.cx.space,
-      )) {
+      // A producer lists the output among its own, so the reverse index names
+      // every candidate.
+      for (const producer of this.store
+        .activitiesWithOutput(this.cx.space, id)
+        .map((activity) => activity.row as ActivityRow)) {
         if (
           producer.activity_class === 'dependency_validation' ||
           producer.status !== 'completed' ||
@@ -1013,10 +985,8 @@ export class Transaction {
             this.auth,
           ),
         )
-        const basis = Object.entries(producer.facets).find(([name]) =>
-          name.endsWith('/DependencyBasis'),
-        )?.[1]
-        if (isJsonMap(basis)) original = premises(basis)
+        const basis = dependencyBasisOf(producer)
+        if (basis !== undefined) original = premises(basis)
       }
       if (original !== premises(contract))
         throw errors.constraintViolation(
@@ -1042,9 +1012,7 @@ export class Transaction {
       )
         continue
       const activity = element.row
-      const contract = Object.entries(activity.facets).find(([name]) =>
-        name.endsWith('/DependencyBasis'),
-      )?.[1] as JsonMap | undefined
+      const contract = dependencyBasisOf(activity)
       const inputs: JsonMap = {}
       if (contract) {
         const seq = Number(contract.basis_seq)
@@ -1156,6 +1124,15 @@ export class Transaction {
     }
   }
 
+  /**
+   * Assigns the version and plane counters one staged element will commit
+   * with, and builds its Change Envelope entry (§35.5, §6.3, §36.1).
+   *
+   * The counters are advanced on the row itself, so the row the store writes
+   * and the entry the stream reports agree by construction. A preview
+   * computes the same entry without keeping the advance: the row is discarded
+   * with the transaction.
+   */
   private entryFor(staged: Staged, preview: boolean): ChangeEntry {
     const row = staged.element.row
     const diff = diffPlanes(staged.element, staged.baseRow)
@@ -1386,6 +1363,17 @@ export class Transaction {
   }
 }
 
+/**
+ * The element as this transaction first loaded it, or `null` for one it
+ * created. Nothing writes an element row before commit, so this is the stored
+ * row, without reading it again.
+ */
+export function baseElement(staged: Staged): Element | null {
+  return staged.baseRow === null
+    ? null
+    : ({ kind: staged.element.kind, row: staged.baseRow } as unknown as Element)
+}
+
 // ---------------------------------------------------------------------------
 // Version planes (§6.3)
 // ---------------------------------------------------------------------------
@@ -1531,8 +1519,8 @@ export function diffPlanes(
     if (differs(column)) touch(path)
   }
   if (element.kind === 'Concept') {
-    const was = before === null ? {} : asMap(before.attributes)
-    const now = asMap(after.attributes)
+    const was = before === null ? {} : asJsonMap(before.attributes)
+    const now = asJsonMap(after.attributes)
     for (const name of memberDiff(was, now))
       touch(`attributes.${name}`, 'attributes')
   }
@@ -1540,8 +1528,8 @@ export function diffPlanes(
     if (differs(column)) touch(path, 'structural')
   }
   {
-    const was = before === null ? {} : asMap(before.structural)
-    const now = asMap(after.structural)
+    const was = before === null ? {} : asJsonMap(before.structural)
+    const now = asJsonMap(after.structural)
     for (const symbol of memberDiff(was, now)) {
       touch(`structural.${symbolLocalName(symbol)}`, 'structural')
     }
@@ -1549,8 +1537,8 @@ export function diffPlanes(
   if (differs('retention') || differs('expires_at'))
     touch('retention', 'retention')
   {
-    const was = before === null ? {} : asMap(before.facets)
-    const now = asMap(after.facets)
+    const was = before === null ? {} : asJsonMap(before.facets)
+    const now = asJsonMap(after.facets)
     for (const symbol of memberDiff(was, now)) {
       const local = symbolLocalName(symbol)
       touch(`facets.${local}`, `facets.${local}`)
@@ -1562,8 +1550,8 @@ export function diffPlanes(
   // without reading payload (§36.1).
   if (differs('state')) touch('state')
   if (before !== null) {
-    const was = asMap(before.governance)
-    const now = asMap(after.governance)
+    const was = asJsonMap(before.governance)
+    const now = asJsonMap(after.governance)
     for (const member of memberDiff(was, now)) touch(`governance.${member}`)
   }
   // Sorted, so the same commit reports the same list whichever order the
@@ -1594,12 +1582,6 @@ export function lifecycleMove(
       return { from: statusBefore, to: row.status }
   }
   return null
-}
-
-function asMap(value: unknown): JsonMap {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as JsonMap)
-    : {}
 }
 
 /** The members whose value differs between two maps, in `after`-then-`before` order. */

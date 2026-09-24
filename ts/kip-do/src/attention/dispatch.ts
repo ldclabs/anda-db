@@ -32,6 +32,7 @@ import {
   commit,
 } from './common.js'
 import { loadWake, live, currentWake } from './work.js'
+import { referenceText } from '../store/references.js'
 
 const observerKey = (pin: RuntimePin): string =>
   runtimeRef('attention-lookup-observer', pin)
@@ -97,7 +98,7 @@ export function beginWakeDispatch(
       decision.kind !== 'Activity' ||
       !decision.row.inputs.some((r) =>
         [wake.fire_activity_ref, wake.fire.watch_ref].includes(
-          typeof r === 'string' ? r : String(obj(json(r)).id),
+          referenceText(r),
         ),
       )
     )

@@ -1,5 +1,3 @@
-import { projectionPolicyAt } from '../control.js'
-import { parseElementId } from '../id.js'
 /**
  * # Executing KQL
  *
@@ -10,6 +8,8 @@ import { parseElementId } from '../id.js'
  * internal field from being a wire change.
  */
 
+import { projectionPolicyAt } from '../control.js'
+import { parseElementId } from '../id.js'
 import { detailed, errors } from '../errors.js'
 import type { AuthContext, EffectiveAuthority } from '../governance/index.js'
 import { canonicalJson, type Json, type JsonMap } from '../json.js'
@@ -106,13 +106,14 @@ export function executeKql(query: KqlQuery, cx: KqlContext): Json[] {
 
 /** Runs one KQL query, reporting its coordinates and page cursor. */
 export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
+  const settings = epistemicSettings(query.epistemic, cx)
   const b: ReadBindings = {
     request: cx.request ?? {},
     operation: cx.operation ?? {},
     // Resolved before anything runs: a query that projected half its beliefs
     // under one policy and then failed on the settings would have reported an
     // answer nobody asked for.
-    policy: policyFromSettings(epistemicSettings(query.epistemic, cx)),
+    policy: policyFromSettings(settings),
   }
 
   // The cursor is read before the coordinate is bound, because it *is* one of
@@ -140,7 +141,14 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   const env =
     asOf === null ? cx.env : cx.environmentAt(cx.store.schemaVersionAt(cx.space, asOf))
   const context = new Context(cx.store, env, cx.space, cx.authority, cx.auth, asOf)
-  try { b.policy = projectionPolicyAt(cx.store,cx.space,pinnedSeq,epistemicSettings(query.epistemic,cx)) } catch (e) { if ((e as {code?:string}).code !== 'HistoricalSnapshotUnavailable') throw e; b.policy.trust_version='unavailable' }
+  try {
+    b.policy = projectionPolicyAt(cx.store, cx.space, pinnedSeq, settings)
+  } catch (e) {
+    // The projection controls of that coordinate are gone; the settings'
+    // own policy stands, and says its trust basis is unavailable.
+    if ((e as { code?: string }).code !== 'HistoricalSnapshotUnavailable') throw e
+    b.policy.trust_version = 'unavailable'
+  }
 
   // `FOR TIME` names the world time a claim has to apply at, so a projection in
   // the same query answers about that instant rather than about now. A different
@@ -183,7 +191,7 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
   return grouped
     ? answer(
         cx,
-        query,
+        traversal,
         pinnedSeq,
         validAt,
         page(
@@ -197,11 +205,11 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
       )
     : answer(
         cx,
-        query,
+        traversal,
         pinnedSeq,
         validAt,
         page(
-          sort(context, solutions, query.order_by, b),
+          sort(context, solutions, query.order_by),
           query,
           b,
           context.resultLimit(),
@@ -225,16 +233,14 @@ export function executeKqlPage(query: KqlQuery, cx: KqlContext): KqlAnswer {
  */
 function answer<T>(
   cx: KqlContext,
-  query: KqlQuery,
+  /** The identity the cursor was read under, so the token issued continues it. */
+  traversal: string,
   pinnedSeq: number,
   validAt: string | null,
   paged: { rows: readonly T[]; total: number; offset: number },
   render: (row: T) => Json,
 ): KqlAnswer {
   const consumed = paged.offset + paged.rows.length
-  // The same identity the cursor was read under, so the token it issues
-  // continues this traversal and no other.
-  const traversal = traversalOf(query, cx.request ?? {}, cx.operation ?? {})
   return {
     rows: paged.rows.map(render),
     snapshotSeq: pinnedSeq,
@@ -273,7 +279,7 @@ export function bindCoordinate(
     cx.snapshotToken === undefined
       ? null
       : coordinateFromToken(cx.snapshotToken, cx.space).seq
-  const fromCommand = query.as_of === null ? null : resolveAsOf(query.as_of, cx, b)
+  const fromCommand = query.as_of === null ? null : resolveAsOf(query.as_of, b)
   if (fromToken !== null && fromCommand !== null && fromToken !== fromCommand) {
     throw errors.invalidRequestEnvelope(
       `this request is bound to snapshot ${fromToken} and its command reads ` +
@@ -302,7 +308,7 @@ export function bindCoordinate(
  * of several sequences an instant means, and a historical read always names
  * the exact coordinate it was served from.
  */
-export function resolveAsOf(asOf: AsOf, _cx: KqlContext, b: ReadBindings): number {
+function resolveAsOf(asOf: AsOf, b: ReadBindings): number {
   const value = scalarValue(asOf.Seq, b)
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw errors.typeMismatch('AS OF SEQ takes a non-negative sequence')
@@ -613,28 +619,32 @@ function sort(
   cx: Context,
   solutions: readonly Solution[],
   orderBy: readonly OrderByItem[] | null,
-  _b: ReadBindings,
 ): Solution[] {
-  const out = [...solutions]
   if (orderBy === null || orderBy.length === 0) {
     // Documented rather than incidental: a bounded read has to be repeatable,
     // so the fallback order is the same total order the mutation sweeps use.
-    return out.sort(compareSolutions)
+    return [...solutions].sort(compareSolutions)
   }
-  return out.sort((a, b) => {
-    for (const item of orderBy) {
-      const left = readVariable(cx, a, item.variable.var, item.variable.path)
-      const right = readVariable(cx, b, item.variable.var, item.variable.path)
+  // Each sort key is read once per solution, not twice per comparison.
+  const keyed = solutions.map((solution) => ({
+    solution,
+    keys: orderBy.map((item) => readVariable(cx, solution, item.variable.var, item.variable.path)),
+  }))
+  keyed.sort((a, b) => {
+    for (let i = 0; i < orderBy.length; i++) {
+      const left = a.keys[i] as Json
+      const right = b.keys[i] as Json
       const nulls = nullOrder(left, right)
       if (nulls !== null) {
         if (nulls !== 0) return nulls
         continue
       }
       const sign = compareValues(left, right)
-      if (sign !== 0) return item.direction === 'Desc' ? -sign : sign
+      if (sign !== 0) return orderBy[i]!.direction === 'Desc' ? -sign : sign
     }
-    return compareSolutions(a, b)
+    return compareSolutions(a.solution, b.solution)
   })
+  return keyed.map((entry) => entry.solution)
 }
 
 /** `null` when neither side is null, otherwise the order between them. */
@@ -692,7 +702,6 @@ function page<T>(
     offset,
   }
 }
-
 
 /** Reads a `CURSOR` slot as the opaque token this engine issues. */
 function readCursor(

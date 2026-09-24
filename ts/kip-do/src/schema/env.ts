@@ -296,6 +296,8 @@ export class SchemaEnvironment {
   readonly lock: SchemaLock
   /** The artifacts, keyed by canonical package reference. */
   private readonly artifacts: Map<string, SchemaPackage>
+  /** Successful resolutions, by kind, intent and name. */
+  private readonly resolved = new Map<string, SymbolRef>()
 
   private constructor(
     version: number,
@@ -384,6 +386,18 @@ export class SchemaEnvironment {
    * that order.
    */
   resolveSymbol(kind: SymbolKind, name: string, intent: Intent): SymbolRef {
+    // An environment never changes, so neither does what a name resolves to
+    // in it; a read resolves the same few names once per element it touches.
+    const key = `${kind}\u0000${intent}\u0000${name}`
+    let symbol = this.resolved.get(key)
+    if (symbol === undefined) {
+      symbol = this.resolveUncached(kind, name, intent)
+      this.resolved.set(key, symbol)
+    }
+    return symbol
+  }
+
+  private resolveUncached(kind: SymbolKind, name: string, intent: Intent): SymbolRef {
     if (isQualified(name)) {
       return this.checkQualified(kind, parseSymbolRef(name), intent)
     }

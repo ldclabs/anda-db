@@ -95,8 +95,11 @@ export function segmentToText(text: string): string {
  * boundaries this module exists to fix or to leave alone.
  */
 export function segmenterMark(): string {
-  return `${LOCALE}:${segment('深色模式東京都に住むAlice-Aurora').join('|')}`
+  // The runtime's ICU cannot change under a live isolate, so once is enough.
+  mark ??= `${LOCALE}:${segment('深色模式東京都に住むAlice-Aurora').join('|')}`
+  return mark
 }
+let mark: string | null = null
 
 /**
  * Collects the searchable text of a JSON value.

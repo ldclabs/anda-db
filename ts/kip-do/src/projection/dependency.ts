@@ -3,10 +3,19 @@ import type { Context } from '../kql/context.js'
 import { isInvalidated } from '../recording.js'
 import { tryParseElementId, formatElementId } from '../id.js'
 import { canonicalJson, isJsonMap, type JsonMap } from '../json.js'
-import { State, type ActivityRow, type Element } from '../store/index.js'
+import { referenceText, State, type ActivityRow, type Element } from '../store/index.js'
 import { validateValue, pinnedPlane } from '../schema/contracts.js'
 import { projectionBasis } from './index.js'
 import type { Policy } from './policy.js'
+
+/**
+ * An element's DependencyBasis Facet, whichever package version declared it,
+ * or `undefined` when it carries none.
+ */
+export function dependencyBasisOf(row: { facets: JsonMap }): JsonMap | undefined {
+  const found = Object.entries(row.facets).find(([name]) => name.endsWith('/DependencyBasis'))?.[1]
+  return isJsonMap(found) ? found : undefined
+}
 
 export function isDerived(element: Element): boolean {
   if (element.kind === 'Assertion') return element.row.mode === 'inferred'
@@ -38,11 +47,18 @@ export function dependencyValidity(cx: Context, element: Element, policy: Policy
       if (row.status !== 'active' || (row.valid_from && row.valid_from > at) || (row.valid_until && row.valid_until <= at)) return issue(1, 'dependency no longer eligible')
       result.next = [row.valid_from, row.valid_until].filter((t) => t > at).sort()[0] ?? null
     }
-    if (cx.store.controlAt(cx.space, `identity_review/${id}`, cx.asOf ?? cx.store.currentSeq(cx.space))) return issue(1, 'identity interpretation requires review')
+    if (cx.underIdentityReview(id)) return issue(1, 'identity interpretation requires review')
     if (!isDerived(element)) return result
+    // Only an Activity that lists this element among its outputs can have
+    // produced it, so the candidates come from the reverse index rather than
+    // from every Activity in the Space.
     const activities = cx.asOf !== null
       ? cx.reconstruct('Activity').map((e) => e.row as ActivityRow)
-      : cx.store.all<ActivityRow>('activities', 'SELECT * FROM activities WHERE space = ? ORDER BY id', cx.space)
+        .filter((a) => a.outputs.some((ref) => referenceText(ref) === id))
+      : cx.store.activitiesWithOutput(cx.space, { kind: element.kind, seq: element.row.id }).map((e) => {
+        cx.remember(e)
+        return e.row as ActivityRow
+      })
     cx.spend('scans', activities.length)
     let producer: { seq: number; contract: JsonMap } | null = null
     for (const activity of activities) {
@@ -52,9 +68,9 @@ export function dependencyValidity(cx: Context, element: Element, policy: Policy
       if (activity.status !== 'completed' || activity.state !== State.ACTIVE) continue
       const runtime = activity.origin._kip_runtime as JsonMap | undefined
       if (!runtime || (runtime.output_versions as JsonMap)?.[id] !== element.row.version) continue
-      if (!activity.outputs.some((ref) => (typeof ref === 'string' ? ref : (ref as JsonMap).id) === id)) continue
-      const contract = Object.entries(activity.facets).find(([name]) => name.endsWith('/DependencyBasis'))?.[1]
-      if (isJsonMap(contract) && (!producer || activity.seq > producer.seq)) producer = { seq: activity.seq, contract }
+      if (!activity.outputs.some((ref) => referenceText(ref) === id)) continue
+      const contract = dependencyBasisOf(activity)
+      if (contract !== undefined && (!producer || activity.seq > producer.seq)) producer = { seq: activity.seq, contract }
     }
     if (!producer) return issue(2, 'exact producing DependencyBasis unavailable')
     const { contract } = producer

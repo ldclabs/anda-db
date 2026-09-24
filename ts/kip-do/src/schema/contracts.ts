@@ -43,10 +43,21 @@ function checkReferences(value: unknown, owner: string, locked: Set<string>): vo
   Object.entries(value).filter(([key]) => !['const', 'enum', 'default', 'examples'].includes(key)).forEach(([, v]) => checkReferences(v, owner, locked))
 }
 
+/**
+ * Packages whose contracts already passed. By identity first: the digest is
+ * what makes a freshly decoded copy of a checked package a hit, and computing
+ * it costs as much as the check it would skip, so an object seen before
+ * never pays for it again.
+ */
+const checkedObjects = new WeakSet<SchemaPackage>()
 const checked = new Set<string>()
 export function validatePackageContracts(package_: SchemaPackage): void {
+  if (checkedObjects.has(package_)) return
   const key = sha256Text(canonicalJson(package_))
-  if (checked.has(key)) return
+  if (checked.has(key)) {
+    checkedObjects.add(package_)
+    return
+  }
   const pins = package_.manifest?.validation_schemas
   const locked = new Set<string>()
   if (pins !== undefined) {
@@ -72,10 +83,20 @@ export function validatePackageContracts(package_: SchemaPackage): void {
   }
   visit(package_.definitions)
   checked.add(key)
+  checkedObjects.add(package_)
+}
+
+/** The catalog entry for a schema object, looked up once per object. */
+const validatorOf = new WeakMap<object, Validator | undefined>()
+
+function validatorFor(schema: Json): Validator | undefined {
+  if (schema === null || typeof schema !== 'object') return validators[canonicalJson(schema)]
+  if (!validatorOf.has(schema)) validatorOf.set(schema, validators[canonicalJson(schema)])
+  return validatorOf.get(schema)
 }
 
 export function validateValue(schema: Json, value: Json): void {
-  const validate = validators[canonicalJson(schema)]
+  const validate = validatorFor(schema)
   if (!validate) throw errors.unsupportedCapability('value_schema is not in the static validator catalog')
   if (!validate(value)) {
     const findings = validate.errors as { keyword: string; parentSchema?: { format?: string }; [key: string]: unknown }[]

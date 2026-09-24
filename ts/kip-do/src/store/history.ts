@@ -139,7 +139,7 @@ export interface PageCursor {
  */
 export function traversalOf(command: unknown, request?: JsonMap, operation?: JsonMap): string {
   const consumed = new Set<string>()
-  const blanked = blankPaging(JSON.parse(JSON.stringify(command ?? null)) as Json, consumed)
+  const blanked = blankPaging((command ?? null) as Json, consumed)
   const strip = (params: JsonMap | undefined): Json => {
     if (params === undefined) return null
     const out: JsonMap = {}
@@ -152,11 +152,19 @@ export function traversalOf(command: unknown, request?: JsonMap, operation?: Jso
   return sha3_256Text(canonicalJson(identity)).slice(0, 16)
 }
 
+/**
+ * A copy of a lowered command with its paging slots removed, read the way
+ * `JSON.stringify` would: an absent member is dropped and an absent array
+ * item is `null`.
+ */
 function blankPaging(value: Json, consumed: Set<string>): Json {
-  if (Array.isArray(value)) return value.map((item) => blankPaging(item, consumed))
+  if (Array.isArray(value)) {
+    return value.map((item) => (item === undefined ? null : blankPaging(item, consumed)))
+  }
   if (value === null || typeof value !== 'object') return value
   const out: JsonMap = {}
   for (const [key, child] of Object.entries(value)) {
+    if (child === undefined) continue
     if (key === 'cursor' || key === 'limit') {
       const param =
         child !== null && typeof child === 'object' && !Array.isArray(child)
@@ -315,7 +323,9 @@ export function elementsAt(
   kind: ElementKind,
   seq: number,
 ): Element[] {
-  const latest = new Map<string, ElementVersionRow>()
+  // Reduced before decoding: only the version in force is parsed, not every
+  // version an element passed through on the way there.
+  const latest = new Map<SqlStorageValue, SqlRow>()
   for (const raw of sql
     .exec<SqlRow>(
       `SELECT * FROM element_versions
@@ -326,10 +336,11 @@ export function elementsAt(
       seq,
     )
     .toArray()) {
-    const row = decodeRow<ElementVersionRow>('element_versions', raw)
-    latest.set(row.element, row)
+    latest.set(raw.element as SqlStorageValue, raw)
   }
-  return [...latest.values()].map(elementOfVersion)
+  return [...latest.values()].map((raw) =>
+    elementOfVersion(decodeRow<ElementVersionRow>('element_versions', raw)),
+  )
 }
 
 /** Resolves `AS OF TX :tx` to the Space sequence that transaction produced. */

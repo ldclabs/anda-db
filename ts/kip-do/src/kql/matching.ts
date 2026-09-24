@@ -426,14 +426,15 @@ function scan(
   wheres.push('state <> ?')
   values.push(State.PENDING)
 
-  const rows = cx.store.all<ElementRow>(
-    table,
-    `SELECT * FROM ${table} WHERE ${wheres.join(' AND ')} ORDER BY id`,
-    ...values,
-  )
-  cx.spend('scans', rows.length)
-
-  return rows.map((row) => cx.remember({ kind, row } as Element))
+  // A matcher that reads nothing from the incoming solution scans the same
+  // rows for every one of them — `?a {type: A} ?b {type: B}` once per `?a` —
+  // so the scan runs once per read and the rest reuse it.
+  const sql = `SELECT * FROM ${table} WHERE ${wheres.join(' AND ')} ORDER BY id`
+  return cx.memo(`scan\u0000${sql}\u0000${JSON.stringify(values)}`, () => {
+    const rows = cx.store.all<ElementRow>(table, sql, ...values)
+    cx.spend('scans', rows.length)
+    return rows.map((row) => cx.remember({ kind, row } as Element))
+  })
 }
 
 /**
@@ -729,21 +730,21 @@ function tupleCandidates(
   // would mean loading the row a second time to ask whether the caller may see
   // it — and skipping the question would let a tuple pattern match a
   // Proposition that is outside this caller's query universe (§104).
-  const rows = cx.store.all<PropositionRow>(
-    'propositions',
-    `SELECT * FROM propositions WHERE ${wheres.join(' AND ')} ORDER BY id`,
-    ...values,
-  )
-  cx.spend('scans', rows.length)
-
-  return rows.map((decoded) => {
-    cx.remember({ kind: 'Proposition', row: decoded })
-    return {
-      seq: decoded.id,
-      subject: decoded.subject as Json,
-      object: decoded.object as Json,
-      predicate_ref: decoded.predicate_ref,
-    }
+  // Reused within the read like an element scan: an unpinned tuple pattern
+  // asks the same question for every incoming solution.
+  const sql = `SELECT * FROM propositions WHERE ${wheres.join(' AND ')} ORDER BY id`
+  return cx.memo(`tuples\u0000${sql}\u0000${JSON.stringify(values)}`, () => {
+    const rows = cx.store.all<PropositionRow>('propositions', sql, ...values)
+    cx.spend('scans', rows.length)
+    return rows.map((decoded) => {
+      cx.remember({ kind: 'Proposition', row: decoded })
+      return {
+        seq: decoded.id,
+        subject: decoded.subject as Json,
+        object: decoded.object as Json,
+        predicate_ref: decoded.predicate_ref,
+      }
+    })
   })
 }
 

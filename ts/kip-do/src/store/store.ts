@@ -1,6 +1,3 @@
-import { EvaluationRules } from '../evaluation.js'
-import type { HostCapabilities } from '../meta/host.js'
-import { initialProjection, type ControlRecord } from '../control.js'
 /**
  * The persistent home of one Cognitive Nexus.
  *
@@ -14,6 +11,9 @@ import { initialProjection, type ControlRecord } from '../control.js'
  * and either commit or roll back as a unit.
  */
 
+import { EvaluationRules } from '../evaluation.js'
+import type { HostCapabilities } from '../meta/host.js'
+import { initialProjection, type ControlRecord } from '../control.js'
 import { scopedIdempotencyKey } from '../idempotency.js'
 import { errors } from '../errors.js'
 import {
@@ -26,9 +26,9 @@ import {
   type ElementKind,
 } from '../id.js'
 import { canonicalJson, isJsonMap, type Json, type JsonMap } from '../json.js'
-import { idSet } from '../sql.js'
+import { encodeJson, idSet } from '../sql.js'
 import { nowTime } from '../time.js'
-import { decodeRow, rowToJson, type SqlRow } from './codec.js'
+import { decodeRow, EncodedJson, type SqlRow } from './codec.js'
 import { applySchema } from './ddl.js'
 import { GovernanceStore } from './governance.js'
 import {
@@ -119,6 +119,13 @@ export function wireOp(verb: ChangeVerb): ChangeOp {
     default:
       return 'lifecycle'
   }
+}
+
+/** An element's outgoing references, as one comparable string. */
+function referencesKey(element: Element): string {
+  return elementReferences(element)
+    .map((ref) => `${ref.field}\u0000${ref.ord}\u0000${formatElementId(ref.to)}`)
+    .join('\n')
 }
 
 export class Store extends RowStore {
@@ -305,7 +312,10 @@ export class Store extends RowStore {
 
   /** The Space's current sequence coordinate, without advancing it. */
   currentSeq(spaceId: string): number {
-    return this.space(spaceId)?.seq ?? 0
+    const row = this.sql
+      .exec<{ seq: number }>('SELECT seq FROM spaces WHERE space_id = ?', spaceId)
+      .toArray()[0]
+    return row?.seq ?? 0
   }
 
   /** Overwrites a Space registry row. */
@@ -541,7 +551,12 @@ export class Store extends RowStore {
    * the row lets a purge conclude nothing points at an element that something
    * does.
    */
-  put(element: Element, verb: ChangeVerb, txId: string): void {
+  put(
+    element: Element,
+    verb: ChangeVerb,
+    txId: string,
+    before: Element | null = null,
+  ): void {
     const table = TABLES[element.kind]
     const { row } = element
     this.updateRow(table, row)
@@ -551,7 +566,7 @@ export class Store extends RowStore {
     if (verb === 'purge') {
       this.sql.exec('DELETE FROM kip_exposures WHERE space = ? AND element = ?', row.space, id)
     }
-    this.appendVersion({
+    this.writeRow('element_versions', {
       space: row.space,
       element: id,
       kind: tagOf(element.kind),
@@ -559,13 +574,20 @@ export class Store extends RowStore {
       seq: row.seq,
       tx_id: txId,
       op: verb,
-      row: rowToJson(row) as JsonMap,
+      // The whole row, canonical: encoded once, here, rather than once to
+      // normalize it and again to store it.
+      row: new EncodedJson(encodeJson(row, 'element_versions.row')),
     })
-    this.reindexReferences(element)
+    // `before` is the row as it was stored, when the caller has it: both
+    // derived indexes already describe it, so a write that left their inputs
+    // alone — a lifecycle move, a Facet — leaves them alone too.
+    if (before === null || referencesKey(before) !== referencesKey(element)) {
+      this.reindexReferences(element)
+    }
     // In the same transaction as the row, which is the whole reason `SEARCH`
     // may report `index_seq` equal to `current_space_seq` (§66.5): a write that
     // rolled back rolled its index entry back with it.
-    indexElement(this.sql, element)
+    indexElement(this.sql, element, before)
   }
 
   /** Replaces the reverse-index entries for one element. */
@@ -612,11 +634,6 @@ export class Store extends RowStore {
   }
 
   // --- the version log ---------------------------------------------------
-
-  /** Appends one historical version. */
-  appendVersion(row: Omit<ElementVersionRow, 'id'>): void {
-    this.writeRow('element_versions', row)
-  }
 
   /**
    * The row an element had at a Space sequence coordinate.
@@ -729,14 +746,16 @@ export class Store extends RowStore {
    * the other order leaves a readable stub with nothing saying to look (§19.3).
    */
   scrubOwnedArtifacts(space: string, ref: string): void {
+    // `artifact/` keys only: a range seek on the control index, since '0'
+    // is the character after '/'.
     for (const row of this.all<ControlRecord>(
       'kip_control_records',
-      'SELECT * FROM kip_control_records WHERE space = ?',
+      `SELECT * FROM kip_control_records
+         WHERE space = ? AND key >= 'artifact/' AND key < 'artifact0'`,
       space,
     )) {
       const value = row.value as JsonMap
       if (
-        row.key.startsWith('artifact/') &&
         value.state === 'available' &&
         Array.isArray(value.source_refs) &&
         value.source_refs.includes(ref)
@@ -780,9 +799,10 @@ export class Store extends RowStore {
     for (const version of rows) {
       const stored = JSON.parse(version.row) as Record<string, unknown>
       erasePayload(stored as unknown as EvidenceRow)
+      // Through the same encoder that wrote it: canonical and size-checked.
       this.sql.exec(
         'UPDATE element_versions SET row = ? WHERE id = ?',
-        JSON.stringify(stored),
+        encodeJson(stored, 'element_versions.row'),
         version.id,
       )
     }
@@ -826,6 +846,26 @@ export class Store extends RowStore {
       .map(parseElementId)
       .filter((r) => r.kind === 'Activity')
       .sort(compareElementId)
+  }
+
+  /**
+   * Every Activity in a Space that names one element among its `outputs`, in
+   * id order: the candidates for the Activity that produced it. An index seek
+   * on `element_refs`, like {@link activitiesWithInput}, rather than a read of
+   * every Activity the Space holds.
+   */
+  activitiesWithOutput(space: string, id: ElementId): Element[] {
+    const seqs = this.sql
+      .exec<{ from_id: string }>(
+        `SELECT DISTINCT from_id FROM element_refs WHERE space = ? AND to_id = ? AND field = 'outputs'`,
+        space,
+        formatElementId(id),
+      )
+      .toArray()
+      .map((row) => parseElementId(row.from_id))
+      .filter((from) => from.kind === 'Activity')
+      .map((from) => from.seq)
+    return this.loadMany('Activity', seqs).sort((a, b) => a.row.id - b.row.id)
   }
 
   // --- the transaction journal -------------------------------------------
@@ -895,12 +935,12 @@ export class Store extends RowStore {
   }
 
   /**
-   * The transaction a caller's idempotency key already committed.
+   * The transaction a caller's idempotency key already committed, for one
+   * Principal (§34.2).
    *
    * This is what makes a lost response recoverable without writing again: the
    * caller replays the key, not the mutation (§80.4).
    */
-  /** The retained transaction a client's key names for one Principal (§34.2). */
   transactionForKey(
     space: string,
     principalId: string,
@@ -955,11 +995,13 @@ export class Store extends RowStore {
     )
   }
 
-  packages(): SchemaPackageRow[] {
-    return this.all<SchemaPackageRow>(
-      'schema_packages',
-      'SELECT * FROM schema_packages ORDER BY package_id, version',
-    )
+  /** What is installed, by reference and digest, without decoding any artifact. */
+  installedPackages(): { package_ref: string; content_digest: string }[] {
+    return this.sql
+      .exec<{ package_ref: string; content_digest: string }>(
+        'SELECT package_ref, content_digest FROM schema_packages ORDER BY package_ref',
+      )
+      .toArray()
   }
 
   /** Appends a Schema Environment version. Existing versions are never edited. */
