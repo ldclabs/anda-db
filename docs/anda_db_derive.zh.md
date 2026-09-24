@@ -2,7 +2,7 @@
 
 [English](anda_db_derive.md)
 
-**Crate 版本**：0.13  
+**Crate 版本**：0.14  
 **更新日期**：2026-09-06  
 
 ---

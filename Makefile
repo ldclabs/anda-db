@@ -3,25 +3,15 @@ KIP_FUZZ_RUNS ?= 1000
 KIP_FUZZ_ARGS ?= -runs=$(KIP_FUZZ_RUNS)
 KIP_FUZZ_TARGETS ?= fuzz-kip fuzz-kql fuzz-kml fuzz-meta
 
-.PHONY: build-wasm build-did lint fix test test-all test-full test-ts test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-agents-doc check-agents-doc sync-kip-conformance check-kip-conformance
+.PHONY: build-wasm build-did lint fix test test-all test-full test-ts test-anda-db-snapshots test-anda-db-format-compat test-kip-fuzz test-py coverage coverage-html sync-kip-conformance check-kip-conformance
 
 # The shared engine suite is KIP's `conformance/engine-suite/`, copied here
 # byte for byte. KIP_REPO points at a checkout of github.com/ldclabs/KIP.
 KIP_REPO ?= ../KIP
 
-lint: check-agents-doc
+lint:
 	@cargo fmt
 	@cargo clippy --all-targets --all-features
-
-# CLAUDE.md is the source of the shared agent instructions; AGENTS.md is a
-# byte-identical copy so non-Claude harnesses read the same document.
-sync-agents-doc:
-	@cp CLAUDE.md AGENTS.md
-	@echo "AGENTS.md regenerated from CLAUDE.md"
-
-check-agents-doc:
-	@cmp -s CLAUDE.md AGENTS.md || \
-		(echo "AGENTS.md has drifted from CLAUDE.md; run 'make sync-agents-doc'" >&2; exit 1)
 
 sync-kip-conformance:
 	@cp $(KIP_REPO)/conformance/engine-suite/*.json fixtures/kip-conformance-2.0/

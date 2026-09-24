@@ -1,6 +1,6 @@
 {
   "name": "@ldclabs/kip-do",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "description": "KIP 2.0 (Knowledge Interaction Protocol) Cognitive Nexus on SQLite-backed Cloudflare Durable Objects \u2014 one Nexus per Durable Object.",
   "keywords": [
     "kip",

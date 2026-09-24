@@ -5,7 +5,7 @@
  * `anda_kip_wasm::error_catalog()`.
  * Regenerate with `pnpm run codegen:errors` after changing the Rust registry.
  *
- * Grammar version: 0.13.0
+ * Grammar version: 0.14.0
  */
 
 /** The coarse family an error belongs to (Spec §86.2). */

@@ -73,7 +73,7 @@ clock values truncate to milliseconds. Use `space_seq` for commit order.
 
 ```toml
 [dependencies]
-anda_kip = "0.13"
+anda_kip = "0.14"
 ```
 
 ```rust

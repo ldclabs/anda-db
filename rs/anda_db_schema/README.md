@@ -30,7 +30,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_schema = "0.13"
+anda_db_schema = "0.14"
 serde = { version = "1", features = ["derive"] }
 ```
 

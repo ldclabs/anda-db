@@ -2,11 +2,38 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased] — anda_kip, anda_cognitive_nexus, @ldclabs/kip-do (KIP `3251912`)
+## [0.14.0] — 2026-09-24
+
+This release aligns every AndaDB Rust package, the Python binding and
+`@ldclabs/kip-do` at **0.14.0**. It is breaking for KIP clients, for Spaces
+activated under the earlier CognitiveMemory draft and for two storage-crate
+APIs. The protocol version remains `2.0`, now following KIP `3251912`; the
+bundled CognitiveMemory Schema Package is the rewritten `2.0.0` draft, and the
+TypeScript parser dependency is `@ldclabs/kip-lang@^2.4.0`. The standalone
+`cf-tokenizer` service keeps its independent `1.0.0` version and the private
+fuzz harness keeps `0.0.0`.
+
+### Upgrading
+
+1. Update AndaDB Rust dependencies together to `0.14`, and `@ldclabs/kip-do`
+   to `0.14.0`.
+2. Spaces activated under the `cognitive-memory` 2.1.0 draft are not
+   migrated; start a new Space. KIP 1.x stores still migrate through the
+   [v1 migration guide](docs/kip-v1-migration.md); a 1.x `Preference` now
+   stays an open type in the generated legacy package instead of being adopted.
+3. Port KIP clients: `SEARCH COGNITION` becomes the KQL Search Pattern, ASSERT
+   takes `context`, projections drop `temporal`, and hosts that called
+   `expire_lapsed_assertions` remove the call (`expired` is computed on read).
+   Check `DESCRIBE CAPABILITIES`: both engines claim `KIP-Core` only.
+4. Callers of `FieldType::normalize` / `prune_undeclared` (`anda_db_schema`)
+   or `Pipe` / `CountingWriter` (`anda_db_utils`) remove them; see below.
+5. 0.14 keeps reading the checked-in 0.8, 0.11 and 0.13 format fixtures, and
+   the `v0_14` fixture is added beside them.
+
+### KIP, Cognitive Nexus and kip-do (KIP `3251912`)
 
 Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..3251912`). Breaking
-for the parser, the executable AST and stored draft Spaces; a 0.14 release is
-suggested, `anda_kip` first.
+for the parser, the executable AST and stored draft Spaces.
 
 - **Breaking — draft Spaces:** the bundled package is the rewritten
   `kip://profiles/cognitive-memory@2.0.0`, content digest
@@ -70,7 +97,10 @@ suggested, `anda_kip` first.
   `pending_engine`, SKIP for unexpected `UnsupportedCapability`). Both
   engines: 384 passed, 4 skipped (DEFINE), 0 failed of 388.
 
-## [Unreleased] — anda_db, anda_db_schema, anda_db_derive, anda_db_utils, anda_db_btree, anda_db_hnsw, anda_db_tfs, anda_object_store
+### Storage and index crates
+
+`anda_db`, `anda_db_schema`, `anda_db_derive`, `anda_db_utils`,
+`anda_db_btree`, `anda_db_hnsw`, `anda_db_tfs` and `anda_object_store`.
 
 - anda_object_store: a read that raced a delete of its key, or any failed
   metadata refresh, cleared the whole metadata cache. The deleted key is now
@@ -217,6 +247,14 @@ suggested, `anda_kip` first.
 - anda_db: simplify id filtering, B-tree key conversions, database lifecycle
   checks and HNSW version bookkeeping; tests use
   `anda_object_store::FaultStore` instead of nine hand-written stores.
+
+### Tooling
+
+- `make lint` no longer runs `check-agents-doc`, and the `sync-agents-doc` /
+  `check-agents-doc` targets are removed: `CLAUDE.md` is gone and `AGENTS.md`
+  is the only agent-instruction file.
+- `make sync-kip-conformance` / `make check-kip-conformance` copy and compare
+  KIP's engine suite (`KIP_REPO`, default `../KIP`).
 
 ## [@ldclabs/kip-do 0.13.2] — 2026-09-22
 

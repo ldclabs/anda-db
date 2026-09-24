@@ -168,9 +168,9 @@ clock values truncate to milliseconds. Use `space_seq` for commit order.
 
 ```toml
 [dependencies]
-anda_cognitive_nexus = "0.13"
-anda_kip = "0.13"
-anda_db = { version = "0.13", features = ["full"] }
+anda_cognitive_nexus = "0.14"
+anda_kip = "0.14"
+anda_db = { version = "0.14", features = ["full"] }
 ```
 
 ```rust
@@ -190,7 +190,7 @@ authorization through the same path, not a bypass.
 The non-default `simulation` feature exposes a Rust host-only session builder:
 
 ```toml
-anda_cognitive_nexus = { version = "0.13", features = ["simulation"] }
+anda_cognitive_nexus = { version = "0.14", features = ["simulation"] }
 ```
 
 ```rust

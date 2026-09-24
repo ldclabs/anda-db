@@ -72,8 +72,8 @@ workspaces, TypeScript, or the Python binding.
 ## Dependencies and implementation constraints
 
 The root workspace uses Rust edition 2024 with MSRV **1.95**. Rust crates are
-in the **0.13** release family, with different patch versions; read each
-`Cargo.toml` instead of assuming a shared patch version. Use workspace
+in the **0.14** release family; patch versions can diverge after a release,
+so read each `Cargo.toml` instead of assuming a shared patch version. Use workspace
 dependencies and existing feature conventions when editing workspace crates.
 
 - `object_store` is on 0.14. `anda_db/full` only enables `object_store/fs`;
@@ -137,7 +137,7 @@ checks and compilation of changed runnable examples, not unrelated full suites.
 | Schema and derive changes                    | `cargo test -p anda_db_schema -p anda_db_derive`                   |
 | KIP SDK and Rust executor                    | `cargo test -p anda_kip -p anda_cognitive_nexus`                   |
 | TypeScript typecheck and tests               | `make test-ts`                                                     |
-| Formatting, Clippy, agent-doc consistency    | `make lint`                                                        |
+| Formatting and Clippy                        | `make lint`                                                        |
 
 `make lint` runs `cargo fmt` and can change files. For a formatting check
 without edits, use `cargo fmt --all -- --check`.

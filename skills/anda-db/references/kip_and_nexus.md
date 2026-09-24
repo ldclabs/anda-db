@@ -2,7 +2,7 @@
 
 Use this reference for KIP/Brain work, not ordinary document CRUD. KIP protocol
 versions and Cargo package versions are different: the current Rust crates
-are in the 0.13 family, implementing KIP 2.0 (KIP `3251912`) with the vendored
+are in the 0.14 family, implementing KIP 2.0 (KIP `3251912`) with the vendored
 `cognitive-memory@2.0.0` draft package. Check the checked-out specifications and runtime capabilities
 rather than inferring support from a package version.
 

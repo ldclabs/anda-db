@@ -793,7 +793,7 @@ non-zero if anything failed.
 This is a breaking rewrite. The 1.x API is gone rather than deprecated, because
 the semantics behind it are gone.
 
-| 0.11 (KIP 1.x) | 0.13 (KIP 2.0) |
+| 0.11 (KIP 1.x) | 0.13+ (KIP 2.0) |
 | --- | --- |
 | `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
 | `DELETE` | `TRANSITION … TO "archived"` / `TO "tombstoned"` / `PURGE` / `TO "retracted"` — classify the intent |

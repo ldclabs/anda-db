@@ -2,7 +2,7 @@
 name = "anda_db_btree"
 description = "A B-tree index library in Rust."
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_btree"
-version = "0.13.1"
+version = "0.14.0"
 publish = true
 edition.workspace = true
 rust-version.workspace = true

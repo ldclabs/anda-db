@@ -1,6 +1,6 @@
 [package]
 name = "anda_db_server"
-version = "0.13.0"
+version = "0.14.0"
 description = "An HTTP server for Anda DB with a CBOR-first RPC API (JSON supported)."
 categories = ["database", "data-structures", "web-programming"]
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_server"
@@ -14,9 +14,9 @@ name = "anda-db-server"
 path = "src/main.rs"
 
 [dependencies]
-anda_db = { version = "0.13", path = "../anda_db", features = ["full"] }
-anda_db_tfs = { version = "0.13", path = "../anda_db_tfs" }
-anda_object_store = { version = "0.13", path = "../anda_object_store" }
+anda_db = { version = "0.14", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.14", path = "../anda_db_tfs" }
+anda_object_store = { version = "0.14", path = "../anda_object_store" }
 axum = { workspace = true }
 cbor2 = { workspace = true }
 clap = { workspace = true }
@@ -35,7 +35,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-anda_db = { version = "0.13", path = "../anda_db", features = ["full"] }
+anda_db = { version = "0.14", path = "../anda_db", features = ["full"] }
 async-trait = { workspace = true }
 http-body-util = { version = "0.1", features = ["channel"] }
 serde_bytes = { workspace = true }

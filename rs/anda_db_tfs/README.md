@@ -28,7 +28,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_tfs = { version = "0.13", features = ["full"] }
+anda_db_tfs = { version = "0.14", features = ["full"] }
 ```
 
 This crate is normally used through `anda_db`, but it can also be used as a

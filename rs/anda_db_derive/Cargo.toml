@@ -2,7 +2,7 @@
 name = "anda_db_derive"
 description = "A Rust procedural macro crate that provides derive macros for AndaDB schema types."
 repository = "https://github.com/ldclabs/anda-db/tree/main/rs/anda_db_derive"
-version = "0.13.0"
+version = "0.14.0"
 publish = true
 edition.workspace = true
 rust-version.workspace = true

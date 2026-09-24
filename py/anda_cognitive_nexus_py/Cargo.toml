@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus_py"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.95"
 
@@ -17,10 +17,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde-pyobject = { version = "0.2" }
 
 # Anda
-anda_cognitive_nexus = { version = "0.13", path = "../../rs/anda_cognitive_nexus" }
-anda_kip = { version = "0.13", path = "../../rs/anda_kip" }
-anda_db = { version = "0.13", path = "../../rs/anda_db", features = ["full"] }
-anda_object_store = { version = "0.13", path = "../../rs/anda_object_store" }
+anda_cognitive_nexus = { version = "0.14", path = "../../rs/anda_cognitive_nexus" }
+anda_kip = { version = "0.14", path = "../../rs/anda_kip" }
+anda_db = { version = "0.14", path = "../../rs/anda_db", features = ["full"] }
+anda_object_store = { version = "0.14", path = "../../rs/anda_object_store" }
 
 # Other Crates
 serde = { workspace = true }

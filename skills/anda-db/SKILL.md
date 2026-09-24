@@ -6,9 +6,9 @@ description: Build and maintain Rust applications using AndaDB, including schema
 # AndaDB
 
 Use the checked-out source as the authority for API signatures and behavior.
-This skill targets the workspace's 0.13 release family (Rust edition 2024,
-MSRV 1.95). Crate patch versions differ; check each `Cargo.toml` when pinning
-versions. Examples use the public `anda_db` re-exports.
+This skill targets the workspace's 0.14 release family (Rust edition 2024,
+MSRV 1.95). Crate patch versions can diverge; check each `Cargo.toml` when
+pinning versions. Examples use the public `anda_db` re-exports.
 
 ## Choose the relevant reference
 
@@ -37,15 +37,15 @@ edition = "2024"
 rust-version = "1.95"
 
 [dependencies]
-anda_db = { version = "0.13", features = ["full"] }
-anda_object_store = "0.13"
+anda_db = { version = "0.14", features = ["full"] }
+anda_object_store = "0.14"
 object_store = { version = "0.14", features = ["fs"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
 `anda_db/full` only enables `object_store/fs`. B-Tree, BM25, HNSW and Jieba
-are already available without it. Add `anda_db_hnsw = "0.13"` only for direct
+are already available without it. Add `anda_db_hnsw = "0.14"` only for direct
 low-level types such as `DistanceMetric`; add `cbor2 = "1"` for direct CBOR
 work and `tokio-util = "0.7"` for `CancellationToken` with `auto_flush`.
 

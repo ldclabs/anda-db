@@ -1,6 +1,6 @@
 [package]
 name = "anda_cognitive_nexus"
-version = "0.13.4"
+version = "0.14.0"
 description = "A Rust implementation of KIP (Knowledge Interaction Protocol) base on Anda DB."
 keywords = [
   "KIP",
@@ -23,10 +23,10 @@ default = []
 simulation = []
 
 [dependencies]
-anda_db_schema = { version = "0.13", path = "../anda_db_schema" }
-anda_kip = { version = "0.13", path = "../anda_kip" }
-anda_db = { version = "0.13", path = "../anda_db", features = ["full"] }
-anda_db_tfs = { version = "0.13", path = "../anda_db_tfs", features = ["full"] }
+anda_db_schema = { version = "0.14", path = "../anda_db_schema" }
+anda_kip = { version = "0.14", path = "../anda_kip" }
+anda_db = { version = "0.14", path = "../anda_db", features = ["full"] }
+anda_db_tfs = { version = "0.14", path = "../anda_db_tfs", features = ["full"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
@@ -49,7 +49,7 @@ tokio = { workspace = true, features = ["sync"] }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
-anda_object_store = { path = "../anda_object_store", version = "0.13" }
+anda_object_store = { path = "../anda_object_store", version = "0.14" }
 tokio = { workspace = true, features = ["full"] }
 object_store = { workspace = true, features = ["fs"] }
 structured-logger = { workspace = true }

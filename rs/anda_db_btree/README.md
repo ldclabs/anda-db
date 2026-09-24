@@ -29,7 +29,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-anda_db_btree = "0.13"
+anda_db_btree = "0.14"
 ```
 
 This crate is normally used through `anda_db`, but it can also be embedded

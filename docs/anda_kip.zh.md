@@ -649,7 +649,7 @@ cargo run -p anda_kip --bin kip-cli -- path/to/file.kip path/to/dir
 
 这是一次破坏性的重构。1.x API 被直接移除而非废弃，因为其背后的底层语义已经彻底改变。
 
-| 0.11 (KIP 1.x) | 0.13 (KIP 2.0) |
+| 0.11 (KIP 1.x) | 0.13+ (KIP 2.0) |
 | --- | --- |
 | `UPSERT { CONCEPT ?c {…} }` | `CREATE CONCEPT` / `UPSERT CONCEPT` / `ASSERT` |
 | `DELETE` | `TRANSITION … TO "archived"` / `TO "tombstoned"` / `PURGE` / `TO "retracted"` — 显式分类变更意图 |

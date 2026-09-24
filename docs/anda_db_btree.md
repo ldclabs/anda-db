@@ -2,7 +2,7 @@
 
 [中文版](anda_db_btree.zh.md)
 
-This reference describes the current 0.13 workspace implementation.
+This reference describes the current 0.14 workspace implementation.
 The index maps an ordered field value (FV) to unique document IDs (PK).
 Exact lookups use a sharded hash map; ranges and string prefixes use a
 separate ordered key set. Storage is supplied by the caller.
