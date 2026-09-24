@@ -446,15 +446,28 @@ async fn check(
     Ok(())
 }
 
+/// The digest a source is verified against: the one it was captured with,
+/// or — for bytes held inline without one, as ingestion mints them (§71.1) —
+/// the canonical digest of those bytes.
+pub fn source_digest(evidence: &EvidenceRow) -> Option<String> {
+    if !evidence.content_digest.is_empty() {
+        return Some(evidence.content_digest.clone());
+    }
+    if evidence.payload_mode == "inline" && !evidence.payload_inline.is_null() {
+        return crate::schema::contracts::digest(&evidence.payload_inline).ok();
+    }
+    None
+}
+
 /// The source is the one the extraction was made from: same digest, and the
 /// locator resolves inside bytes the engine still holds.
 fn verify_source(evidence: &EvidenceRow, repair: &RecordingRepair) -> Result<(), KipError> {
-    if evidence.content_digest.is_empty() {
+    let Some(digest) = source_digest(evidence) else {
         return Err(KipError::constraint_violation(
             "the source carries no digest a repair could be verified against",
         ));
-    }
-    if evidence.content_digest != repair.source_digest {
+    };
+    if digest != repair.source_digest {
         return Err(KipError::new(
             KipErrorCode::DigestMismatch,
             "the source digest does not match the captured source",

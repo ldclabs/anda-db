@@ -6,6 +6,7 @@ import { SYSTEM_PRINCIPAL, principalAuth } from '../src/governance/index.js'
 import { KipError } from '../src/errors.js'
 import type { RecordingRepair } from '../src/repair.js'
 import type { Json, JsonMap } from '../src/json.js'
+import { digest } from '../src/schema/contracts.js'
 
 /**
  * Recording repair (Spec §57.8): what `KIP2-REL-004` and the replacement
@@ -81,6 +82,29 @@ function slot(nexus: CognitiveNexus, subject: string, predicate: string, at?: st
 }
 
 describe('recording repair', () => {
+  it('verifies ingested bytes by their canonical digest', async () => {
+    await withNexus('ingested', (nexus) => {
+      const payload = { role: 'user', content: 'I skipped meat today.' }
+      const { handles } = nexus.execute(
+        `MUTATE {
+          UPSERT CONCEPT ?alice { MATCH {type: "Person", key: "alice"} SET FIELDS {name: "Alice"} }
+          CREATE EVIDENCE ?msg {
+            SET FIELDS { evidence_class: "user_statement", payload: :payload, observed_at: "2026-01-01T00:00:00.000Z" }
+          }
+          ASSERT ?wrong (?alice, "diet", "vegetarian") {
+            by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?msg
+          }
+        }`,
+        { payload },
+      )
+      const [source, wrong] = [handles.msg!, handles.wrong!]
+      const session = nexus.systemSession()
+      expect(codeOf(() => session.repairRecording(repair(source, wrong, version(nexus, wrong))))).toBe('DigestMismatch')
+      const exact = { ...repair(source, wrong, version(nexus, wrong)), source_digest: digest(payload) }
+      expect((session.repairRecording(exact) as JsonMap).repair_ref).toBeTypeOf('string')
+    })
+  })
+
   it('discloses repair references only when the Activity is discoverable', async () => {
     await withNexus('visibility', (nexus) => {
       const { source, wrong } = misrecord(nexus)

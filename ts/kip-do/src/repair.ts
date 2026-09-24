@@ -273,12 +273,26 @@ function check(host: RepairHost, space: string, repair: RecordingRepair): void {
   }
 }
 
+/**
+ * The digest a source is verified against: the one it was captured with, or —
+ * for bytes held inline without one, as ingestion mints them (§71.1) — the
+ * canonical digest of those bytes.
+ */
+export function sourceDigest(evidence: EvidenceRow): string | null {
+  if (evidence.content_digest !== '') return evidence.content_digest
+  if (evidence.payload_mode === 'inline' && evidence.payload_inline !== null && evidence.payload_inline !== undefined) {
+    return digest(evidence.payload_inline)
+  }
+  return null
+}
+
 /** Same digest, and the locator resolves inside bytes the engine still holds. */
 function verifySource(evidence: EvidenceRow, repair: RecordingRepair): void {
-  if (evidence.content_digest === '') {
+  const captured = sourceDigest(evidence)
+  if (captured === null) {
     throw errors.constraintViolation('the source carries no digest a repair could be verified against')
   }
-  if (evidence.content_digest !== repair.source_digest) {
+  if (captured !== repair.source_digest) {
     throw errors.digestMismatch('the source digest does not match the captured source')
   }
   if (evidence.payload_mode !== 'inline' || evidence.payload_inline === null || evidence.payload_inline === undefined) {

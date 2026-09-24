@@ -155,7 +155,9 @@ for the parser, the executable AST and stored draft Spaces.
 - **New — recording repair (§57.8):** `Session::repair_recording` /
   `repairRecording` takes the `RecordingRepair` record (source ref, digest and
   locator — a JSON Pointer or `bytes=<start>-<end>` over the inline payload —
-  invalidated and replacement refs, reason, expected versions). It needs the
+  invalidated and replacement refs, reason, expected versions). The source
+  digest is the one the Evidence was captured with or, for inline bytes minted
+  without one (ingestion stores none), the canonical digest of those bytes. It needs the
   new `repair_recording` permission on each invalidated Assertion and reaches
   only the caller's own source-backed outputs; replacements must be the
   caller's existing Assertions citing the same source, with `asserted_at`

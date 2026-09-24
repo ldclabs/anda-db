@@ -873,3 +873,48 @@ async fn an_exported_repair_imports() {
     assert_eq!(report.counts["activity"], 1);
     assert_eq!(report.counts["assertion"], 1);
 }
+
+/// Ingestion mints inline Evidence without a stored digest (§71.1). A repair
+/// of an extraction from it is verified against the canonical digest of the
+/// bytes the engine holds, and a different digest is still refused.
+#[tokio::test]
+async fn a_repair_verifies_ingested_bytes_by_their_canonical_digest() {
+    let nexus = fresh("repair_ingested").await;
+    let payload = json!({"role": "user", "content": "I skipped meat today."});
+    let created = ok(
+        &nexus,
+        r#"MUTATE {
+            UPSERT CONCEPT ?alice { MATCH {type: "Person", key: "alice"} SET FIELDS {name: "Alice"} }
+            CREATE EVIDENCE ?msg {
+                SET FIELDS { evidence_class: "user_statement", payload: :payload, observed_at: "2026-01-01T00:00:00.000Z" }
+            }
+            ASSERT ?wrong (?alice, "diet", "vegetarian") {
+                by: ?alice, mode: "stated", at: "2026-01-01T00:00:00.000Z", evidence: ?msg
+            }
+        }"#,
+        json!({"payload": payload}),
+    )
+    .await;
+    let source = created["handles"]["msg"].as_str().unwrap().to_string();
+    let wrong = created["handles"]["wrong"].as_str().unwrap().to_string();
+    let v = version(&nexus, &wrong).await;
+    let session = nexus.system_session();
+    let mut mismatched = repair(&source, &wrong, v, &[]);
+    mismatched.source_digest = SOURCE_DIGEST.into();
+    assert_eq!(
+        name(
+            session
+                .repair_recording(DEFAULT_SPACE, mismatched)
+                .await
+                .unwrap_err()
+        ),
+        "DigestMismatch"
+    );
+    let mut exact = repair(&source, &wrong, v, &[]);
+    exact.source_digest = anda_cognitive_nexus::content_digest(&payload).unwrap();
+    let result = session
+        .repair_recording(DEFAULT_SPACE, exact)
+        .await
+        .unwrap();
+    assert!(result["repair_ref"].as_str().is_some());
+}
