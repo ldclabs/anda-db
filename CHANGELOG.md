@@ -189,6 +189,8 @@ for the parser, the executable AST and stored draft Spaces.
   read each element. `read_exposures` / `readExposures` pages the log oldest
   first under `read_audit`, fetches bounded storage batches, and omits elements
   the reader may not discover without generating cursors for hidden tails.
+  Each page also names `cursor`, the position after its last delivered entry
+  (the given one when empty), so a reader keeps its place past a partial page.
   Purging an element removes its entries, and an ErasurePlan target with
   surface `exposure` is verified against them.
 - **New — host capabilities (§67.4, Memory Interface §2):**

@@ -280,9 +280,16 @@ impl Session {
                 break;
             }
         }
+        // `cursor` is the position after the last delivered entry (or the one
+        // given, when nothing was delivered): a reader that keeps it reads only
+        // newer entries next time, full page or not.
+        let position = last
+            .map(|id| format!("exposure:{id}"))
+            .or_else(|| query.cursor.clone());
         Ok(json!({
             "records": records,
-            "next_cursor": if more { last.map(|id| format!("exposure:{id}")) } else { None },
+            "next_cursor": if more { position.clone() } else { None },
+            "cursor": position,
         }))
     }
 }

@@ -189,6 +189,9 @@ export function readExposures(host: ExposureHost, space: string, query: Exposure
   return {
     records: records as unknown as JsonMap[],
     next_cursor: more && last !== null ? `exposure:${last}` : null,
+    // The position after the last delivered entry (or the one given): a
+    // reader that keeps it reads only newer entries next time.
+    cursor: last !== null ? `exposure:${last}` : (query.cursor ?? null),
   }
 }
 

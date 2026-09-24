@@ -228,6 +228,22 @@ async fn exposure_pages_cross_batches_without_skipping_visible_entries() {
     assert_eq!(rest["records"].as_array().unwrap().len(), 100);
     assert_eq!(rest["records"][0]["recall_ref"], "recall-1000");
     assert!(rest["next_cursor"].is_null());
+    // The last page still names its position, so a reader that keeps it
+    // reads only newer entries, and an empty page keeps the position given.
+    let position = rest["cursor"].as_str().unwrap().to_string();
+    let nothing_new = session
+        .read_exposures(
+            DEFAULT_SPACE,
+            ExposureQuery {
+                cursor: Some(position.clone()),
+                limit: Some(1000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(nothing_new["records"].as_array().unwrap().is_empty());
+    assert_eq!(nothing_new["cursor"], position.as_str());
 }
 
 #[tokio::test]

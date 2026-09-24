@@ -74,6 +74,10 @@ describe('the exposure log', () => {
       expect((rest.records as JsonMap[]).length).toBe(100)
       expect((rest.records as JsonMap[])[0]!.recall_ref).toBe('recall-1000')
       expect(rest.next_cursor).toBeNull()
+      // The last page still names its position; an empty page keeps it.
+      const nothingNew = session.readExposures({ cursor: rest.cursor as string, limit: 1000 })
+      expect(nothingNew.records).toEqual([])
+      expect(nothingNew.cursor).toBe(rest.cursor)
     })
   })
 
