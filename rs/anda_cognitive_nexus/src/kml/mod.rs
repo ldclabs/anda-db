@@ -489,7 +489,7 @@ async fn resolve_source_actor(
         crate::schema::Intent::Read,
     )?;
     match store
-        .find_concept_by_key(&tx.cx.space, Some(&symbol.to_string()), key)
+        .find_concept_by_key(&tx.cx.space, &tx.env, Some(&symbol.to_string()), key)
         .await?
     {
         Some(row) => Ok(serde_json::json!({

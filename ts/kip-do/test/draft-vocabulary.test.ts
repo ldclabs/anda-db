@@ -188,4 +188,65 @@ describe('the draft vocabulary', () => {
       expect(past.lineage_maps).toEqual([])
     })
   })
+
+  it('keeps identities written under a draft through its promotion', async () => {
+    await withNexus('identity', (nexus) => {
+      nexus.execute('DEFINE CONCEPT TYPE "Instrument" {description: "A musical instrument."}')
+      nexus.execute(DEFINE_MENTORS)
+      nexus.execute(`MUTATE {
+        UPSERT CONCEPT ?viola { MATCH {type: "Instrument", key: "viola"} SET FIELDS {name: "Viola"} }
+        CREATE CONCEPT ?violin { TYPE "Instrument" NAME "Violin" CLIENT KEY "violin" }
+        CREATE CONCEPT ?ada { TYPE "Person" NAME "Ada" }
+        CREATE CONCEPT ?grace { TYPE "Person" NAME "Grace" }
+        ASSERT (?ada, "mentors", ?grace) { by: ?ada, mode: "stated", at: "2026-01-01T00:00:00.000Z" }
+      }`)
+      const [ada, grace, claim] = nexus.query(`FIND(?ada.id, ?grace.id, ?a.id) WHERE {
+        ?ada CONCEPT {name: "Ada"}
+        ?grace CONCEPT {name: "Grace"}
+        ?p PROPOSITION (?ada, "mentors", ?grace)
+        ?a ASSERTION {proposition: ?p}
+      }`)[0] as [string, string, string]
+      nexus.activatePackages([COGNITIVE_MEMORY, MUSIC])
+      const session = nexus.systemSession()
+      session.promoteDraftSymbol('ConceptType', 'Instrument', 'kip://test/music@1.0.0/Instrument')
+      session.promoteDraftSymbol('PredicateType', 'mentors', 'kip://test/music@1.0.0/mentors')
+
+      // The tuple, written again under the package Predicate, is bound (§12.3).
+      nexus.execute('MUTATE { ENSURE PROPOSITION ?p (:ada, "mentors", :grace) }', { ada, grace })
+      expect(
+        nexus.query('FIND(?p.id) WHERE { ?s CONCEPT {name: "Ada"} ?p PROPOSITION (?s, "mentors", ?o) }'),
+      ).toHaveLength(1)
+
+      // The logical key (§7.3) and the CLIENT KEY retry (§52.1) resolve.
+      nexus.execute(
+        'MUTATE { UPSERT CONCEPT ?v { MATCH {type: "Instrument", key: "viola"} SET FIELDS {name: "Viola da braccio"} } }',
+      )
+      nexus.execute('MUTATE { CREATE CONCEPT ?violin { TYPE "Instrument" NAME "Violin" CLIENT KEY "violin" } }')
+      expect(
+        nexus.query(
+          'FIND(?c.name, ?c.schema_ref) WHERE { ?c CONCEPT {type: "Instrument"} } ORDER BY ?c.name ASC',
+        ),
+      ).toEqual([
+        ['Viola da braccio', 'kip://local/draft@0.0.0/Instrument'],
+        ['Violin', 'kip://local/draft@0.0.0/Instrument'],
+      ] as Json[])
+
+      // Two Concepts across the promotion are one type lineage for a merge.
+      nexus.execute('MUTATE { CREATE CONCEPT ?fiddle { TYPE "Instrument" NAME "Fiddle" } }')
+      const [from, into] = nexus.query(
+        'FIND(?violin.id, ?fiddle.id) WHERE { ?violin CONCEPT {name: "Violin"} ?fiddle CONCEPT {name: "Fiddle"} }',
+      )[0] as [string, string]
+      nexus.execute('MERGE CONCEPT :from INTO :into', { from, into })
+
+      // A value correction under the package Predicate stays in the slot of
+      // the claim made under the draft (§14.2).
+      nexus.execute(
+        `MUTATE {
+          CREATE CONCEPT ?linus { TYPE "Person" NAME "Linus" }
+          ASSERT (:ada, "mentors", ?linus) { by: :ada, mode: "stated", at: "2026-01-01T00:00:00.000Z" } SUPERSEDING :claim
+        }`,
+        { ada, claim },
+      )
+    })
+  })
 })

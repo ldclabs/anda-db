@@ -475,11 +475,14 @@ impl Session {
             if old_row.merged_into != target { return Err(KipError::version_conflict("resolution no longer current")); }
             // Removing an edge cannot introduce a cycle. Reopening a source can
             // expose identity collisions, which must be checked before staging.
+            // Key scope is the type lineage after promotions (§7.3, §20.16).
+            let env=store.schema_environment(space).await?;
+            let concept=crate::schema::SymbolKind::ConceptType;
             for id in store.concepts().query_all_ids(crate::store::eq_field("space",anda_db_schema::Fv::Text(space.into()))).await.map_err(crate::error::db_error)? {
                 let row:ConceptRow=store.concepts().get_as(id).await.map_err(crate::error::db_error)?;
                 if id == source.seq || row.state != state::ACTIVE { continue; }
                 if (!old_row.canonical_id.is_empty() && row.canonical_id==old_row.canonical_id)
-                    || (!old_row.key.is_empty() && row.key==old_row.key && crate::schema::lineage_of(&row.schema_ref)==crate::schema::lineage_of(&old_row.schema_ref)) {
+                    || (!old_row.key.is_empty() && row.key==old_row.key && env.same_lineage(concept,&row.schema_ref,&old_row.schema_ref)) {
                     return Err(KipError::new(KipErrorCode::IdentityConflict,"withdrawal conflicts with an active key or canonical identity"));
                 }
             }

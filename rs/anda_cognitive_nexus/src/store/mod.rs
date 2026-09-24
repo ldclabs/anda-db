@@ -1090,7 +1090,9 @@ impl Store {
     /// `(type, name)` identity into a key collision-free — while a Person
     /// written under an earlier version of the same package is the same
     /// Person, and an upsert by `key` after an upgrade finds it rather than
-    /// minting a duplicate.
+    /// minting a duplicate. Lineage is `env`'s, promotions included, so a
+    /// Concept typed by a draft symbol is found under the symbol it was
+    /// promoted to (§20.16).
     ///
     /// Without a declared type the key alone must still land on one Concept.
     /// Returning the first of several would be the arbitrary winner §54.2
@@ -1098,6 +1100,7 @@ impl Store {
     pub async fn find_concept_by_key(
         &self,
         space: &str,
+        env: &SchemaEnvironment,
         schema_ref: Option<&str>,
         key: &str,
     ) -> Result<Option<rows::ConceptRow>, KipError> {
@@ -1117,14 +1120,25 @@ impl Store {
             ("space", Fv::Text(space.to_string())),
             ("key", Fv::Text(key.to_string())),
         ]);
-        if let Some((low, high)) = schema_ref.and_then(crate::schema::lineage_range) {
-            filter = Filter::And(vec![
-                Box::new(filter),
-                Box::new(Filter::Field((
-                    "schema_ref".to_string(),
-                    RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
-                ))),
-            ]);
+        if let Some(schema_ref) = schema_ref {
+            let mut ranges: Vec<Box<Filter>> = env
+                .lineage_ranges(crate::schema::SymbolKind::ConceptType, schema_ref)
+                .into_iter()
+                .map(|(low, high)| {
+                    Box::new(Filter::Field((
+                        "schema_ref".to_string(),
+                        RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+                    )))
+                })
+                .collect();
+            let range = match ranges.len() {
+                0 => None,
+                1 => ranges.pop(),
+                _ => Some(Box::new(Filter::Or(ranges))),
+            };
+            if let Some(range) = range {
+                filter = Filter::And(vec![Box::new(filter), range]);
+            }
         }
         let ids = collection
             .query_all_ids(filter)
@@ -1137,7 +1151,11 @@ impl Store {
                 .await
                 .map_err(crate::error::db_error)?;
             if let Some(schema_ref) = schema_ref
-                && !crate::schema::same_lineage(&row.schema_ref, schema_ref)
+                && !env.same_lineage(
+                    crate::schema::SymbolKind::ConceptType,
+                    &row.schema_ref,
+                    schema_ref,
+                )
             {
                 continue;
             }

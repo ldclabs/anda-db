@@ -793,8 +793,13 @@ export class Transaction {
       const element = staged.element
       if (element.kind !== 'Concept' || element.row.key === '') continue
       const row = element.row
-      const key = canonicalJson([row.lineage, row.key])
-      const existing = this.store.conceptByKey(this.cx.space, row.lineage, row.key)
+      // Scoped by type lineage after promotions (§7.3, §20.16).
+      const key = canonicalJson([this.env.lineage('ConceptType', row.lineage), row.key])
+      const existing = this.store.conceptByKey(
+        this.cx.space,
+        this.env.lineagesOf('ConceptType', row.lineage),
+        row.key,
+      )
       if (keys.has(key) || (existing !== null && existing.id !== row.id))
         throw errors.identityConflict('a logical Concept key already identifies another element')
       keys.add(key)

@@ -52,9 +52,10 @@ use std::collections::BTreeMap;
 use super::ImportReport;
 use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::id::ElementId;
+use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
 use crate::store::{Element, Store, eq_field};
-use crate::term::{Endpoint, tuple_key};
+use crate::term::{Endpoint, tuple_keys};
 use crate::tx::Transaction;
 
 /// The `client_key` an imported element carries.
@@ -130,7 +131,7 @@ pub async fn merge(
             let id = mapping[&record.source_id];
             if record.kind == ElementKind::Proposition
                 && let Some(existing) =
-                    resolve_tuple(store, space_id, &record.view, &mapping).await?
+                    resolve_tuple(store, &tx.env, space_id, &record.view, &mapping).await?
             {
                 // The minted shell is left unstaged; commit discards it.
                 let _ = id;
@@ -138,7 +139,7 @@ pub async fn merge(
                 reused += 1;
                 continue;
             }
-            let mut element = build(record, id, space_id, digest, &mapping)?;
+            let mut element = build(&tx.env, record, id, space_id, digest, &mapping)?;
             if isolate {
                 // §48.5: an isolate import lands in quarantine rather than in
                 // ordinary recall. The records are durable and auditable and a
@@ -188,6 +189,7 @@ pub async fn merge(
 /// tell those apart is not a preview of this import.
 pub async fn preview(
     store: &Store,
+    env: &SchemaEnvironment,
     capsule: &Capsule,
     space_id: &str,
     digest: &str,
@@ -212,7 +214,8 @@ pub async fn preview(
     }
     for record in &unresolved {
         if record.kind == ElementKind::Proposition
-            && let Some(existing) = resolve_tuple(store, space_id, &record.view, &mapping).await?
+            && let Some(existing) =
+                resolve_tuple(store, env, space_id, &record.view, &mapping).await?
         {
             mapping.insert(record.source_id.clone(), existing);
             reused += 1;
@@ -338,6 +341,7 @@ async fn find_by_client_key(
 /// rewritten.
 async fn resolve_tuple(
     store: &Store,
+    env: &SchemaEnvironment,
     space_id: &str,
     view: &Json,
     mapping: &BTreeMap<String, ElementId>,
@@ -355,17 +359,20 @@ async fn resolve_tuple(
     // is what `build` writes into `tuple_key`. Looking the tuple up under the
     // exact reference instead would miss the Proposition this Space already
     // holds, and the miss would surface as a unique-index collision on insert
-    // rather than as a resolution.
-    let predicate = crate::schema::lineage_of(&text(view, "predicate_ref"));
-    let key = tuple_key(space_id, &subject, &predicate, &object);
-    Ok(store
-        .find_proposition(&key)
-        .await?
-        .map(|row| ElementId::new(ElementKind::Proposition, row._id)))
+    // rather than as a resolution. Each identity lineage is tried, so a tuple
+    // written under a since-promoted draft Predicate is found too (§20.16).
+    let predicate_ref = text(view, "predicate_ref");
+    for key in tuple_keys(env, space_id, &subject, &predicate_ref, &object) {
+        if let Some(row) = store.find_proposition(&key).await? {
+            return Ok(Some(ElementId::new(ElementKind::Proposition, row._id)));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds the destination row for one record.
 fn build(
+    env: &SchemaEnvironment,
     record: &Record,
     id: ElementId,
     space_id: &str,
@@ -425,15 +432,14 @@ fn build(
                 predicate_ref: predicate_ref.clone(),
                 object: object.to_json(),
                 object_key: object.key(),
-                // §12.3, §20.14: tuple identity compares the predicate's
-                // lineage, so an import under a later package version
-                // resolves onto the tuple the Space already holds.
-                tuple_key: tuple_key(
-                    space_id,
-                    &subject,
-                    &crate::schema::lineage_of(&predicate_ref),
-                    &object,
-                ),
+                // §12.3, §20.14, §20.16: tuple identity compares the
+                // predicate's lineage after promotions, so an import under a
+                // later package version resolves onto the tuple the Space
+                // already holds.
+                tuple_key: tuple_keys(env, space_id, &subject, &predicate_ref, &object)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default(),
                 facets,
                 structural,
                 expires_at,

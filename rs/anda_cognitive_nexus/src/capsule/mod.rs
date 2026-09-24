@@ -627,7 +627,7 @@ pub async fn import(
     );
 
     if dry_run {
-        return merge::preview(&nexus.store, capsule, space_id, &digest, report).await;
+        return merge::preview(&nexus.store, &env, capsule, space_id, &digest, report).await;
     }
     merge::merge(
         &nexus.store,

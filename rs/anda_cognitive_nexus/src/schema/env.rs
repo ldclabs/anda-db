@@ -567,6 +567,23 @@ impl SchemaEnvironment {
         a == b || self.lineage(kind, a) == self.lineage(kind, b)
     }
 
+    /// The lineages an identity keyed by `reference` may be stored under
+    /// (§12.3, §7.3): first the one a new element is keyed under — its
+    /// lineage after promotions — then each draft lineage promoted into it,
+    /// under which an element written before that promotion keeps its key
+    /// (§20.16). A lookup tries them in order; nothing is rekeyed.
+    pub fn identity_lineages(&self, kind: SymbolKind, reference: &str) -> Vec<String> {
+        let lineage = self.lineage(kind, reference);
+        let kind = draft_kind_name(kind);
+        let promoted = self
+            .lock
+            .lineage_maps
+            .iter()
+            .filter(|map| map.kind == kind && map.to == lineage)
+            .map(|map| map.from.clone());
+        std::iter::once(lineage.clone()).chain(promoted).collect()
+    }
+
     /// The index ranges every reference of one lineage falls in, promotions
     /// included: the reference's own package range, and the draft package's
     /// when a draft symbol was promoted into this lineage. A range is a

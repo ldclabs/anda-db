@@ -56,7 +56,9 @@ the context set and the slot, or fails `SupersessionMismatch`.
 governance transaction, the draft package is synthesized from the Schema Lock
 and kept by every later activation, and `Session::promote_draft_symbol`
 (`manage_schema`) maps a draft symbol onto an installed package's symbol so
-both read as one lineage. Recording repair is not built, so the engine claims
+both read as one lineage — for matching and for identity, so a tuple, logical
+key or `CLIENT KEY` written under the draft resolves to the same element
+afterwards. Recording repair is not built, so the engine claims
 `KIP-Core` and not `KIP-CognitiveMemory`.
 
 > The reference **KIP 2.0** Cognitive Nexus — an embedded memory brain for AI

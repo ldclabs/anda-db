@@ -36,11 +36,11 @@ use super::update;
 use super::value::{Bindings, assignments_to_json, structural_value};
 use crate::governance::Permission;
 use crate::id::ElementId;
-use crate::schema::{EndpointFacts, Intent, SymbolKind, same_lineage};
+use crate::schema::{EndpointFacts, Intent, SymbolKind};
 use crate::store::planes::{self, PlaneKey};
 use crate::store::rows::*;
 use crate::store::{Element, Store};
-use crate::term::{Endpoint, tuple_key};
+use crate::term::{Endpoint, tuple_keys};
 use crate::time;
 use crate::tx::{Guard, Transaction};
 
@@ -1223,11 +1223,14 @@ async fn ensure_proposition(
     // §12.3, §20.14: identity compares the predicate's lineage, so the same
     // tuple written under a later version of the package resolves to the
     // Proposition the Space already holds; the stored `predicate_ref` stays
-    // the exact reference resolved now.
-    let key = tuple_key(
+    // the exact reference resolved now. After a promotion (§20.16) a tuple
+    // written under the draft keeps the key it was stored under, so it is
+    // looked up under each lineage and a new one takes the first.
+    let keys = tuple_keys(
+        &tx.env,
         &tx.cx.space,
         &subject,
-        &crate::schema::lineage_of(&symbol.to_string()),
+        &symbol.to_string(),
         &object,
     );
 
@@ -1235,13 +1238,16 @@ async fn ensure_proposition(
     // semantic tuple (§12.4), so an existing tuple is bound rather than
     // duplicated — and binding it changes nothing, because the tuple is
     // immutable (§12.5).
-    let existing = match tx.staged_proposition(&key) {
-        Some(id) => Some(id),
-        None => store
-            .find_proposition(&key)
+    let mut existing = keys.iter().find_map(|key| tx.staged_proposition(key));
+    for key in &keys {
+        if existing.is_some() {
+            break;
+        }
+        existing = store
+            .find_proposition(key)
             .await?
-            .map(|row| ElementId::new(ElementKind::Proposition, row._id)),
-    };
+            .map(|row| ElementId::new(ElementKind::Proposition, row._id));
+    }
     if let Some(id) = existing {
         tx.expect_versions(id, &guards).await?;
         if let Some(handle) = &clause.handle {
@@ -1266,7 +1272,7 @@ async fn ensure_proposition(
         predicate_ref: symbol.to_string(),
         object: object.to_json(),
         object_key: object.key(),
-        tuple_key: key,
+        tuple_key: keys.into_iter().next().unwrap_or_default(),
         ..Default::default()
     };
     let element = Element::Proposition(Box::new(row));
@@ -1354,7 +1360,15 @@ async fn upsert_concept(
                 // map the Space by reading the difference (§86.4) — and an
                 // upsert by id may not create, so this still fails loudly.
                 Ok(row) => match &declared_type {
-                    Some(declared) if !same_lineage(&row.schema_ref, declared) => None,
+                    Some(declared)
+                        if !tx.env.same_lineage(
+                            SymbolKind::ConceptType,
+                            &row.schema_ref,
+                            declared,
+                        ) =>
+                    {
+                        None
+                    }
                     _ => Some(id),
                 },
                 // Only absence is "no match". A poisoned collection or a row
@@ -1366,7 +1380,12 @@ async fn upsert_concept(
             }
         }
         _ => store
-            .find_concept_by_key(&tx.cx.space, declared_type.as_deref(), &selector_value)
+            .find_concept_by_key(
+                &tx.cx.space,
+                &tx.env,
+                declared_type.as_deref(),
+                &selector_value,
+            )
             .await?
             .map(|row| ElementId::new(ElementKind::Concept, row._id)),
     };
@@ -1992,7 +2011,8 @@ async fn slot_of(
     Ok(match tx.final_element(proposition).await? {
         Element::Proposition(row) => Some((
             canonical_key(tx, &row.subject).await?,
-            crate::schema::lineage_of(&row.predicate_ref),
+            tx.env
+                .lineage(SymbolKind::PredicateType, &row.predicate_ref),
         )),
         _ => None,
     })
@@ -2379,7 +2399,10 @@ async fn merge_concept(
         Element::Concept(row) => row.schema_ref.clone(),
         _ => unreachable!(),
     };
-    if !same_lineage(&source_type, &target_type) {
+    if !tx
+        .env
+        .same_lineage(SymbolKind::ConceptType, &source_type, &target_type)
+    {
         return Err(KipError::new(
             KipErrorCode::IdentityMergeConflict,
             "MERGE CONCEPT endpoints have incompatible Concept Type lineages",
@@ -2617,14 +2640,15 @@ async fn client_key_retry(
     };
     let staged_creation = tx.is_new_element(existing_id);
     let differing = {
-        let stored = tx.load(existing_id).await?;
+        // Owned, because comparing types needs the environment `tx` holds.
+        let stored = tx.load(existing_id).await?.clone();
         // Whether the stored element still is what its creation made it. Once
         // something has legitimately edited it, its mutable state is no longer
         // evidence about the creation, and comparing it would turn an ordinary
         // rename into a permanent failure for the bootstrap that re-runs the
         // same `CLIENT KEY`.
         let pristine = staged_creation || stored.version() == 1;
-        creation_differs(element, stored, pristine)
+        creation_differs(&tx.env, element, &stored, pristine)
     };
     if let Some(member) = differing {
         return Err(KipError::new(
@@ -2649,12 +2673,17 @@ async fn client_key_retry(
 /// the bootstrap that re-runs the same `CLIENT KEY` would fail forever. An
 /// Activity's topology is the clearest case — a terminal `TRANSITION`
 /// finalizes it (§52.5) — so only its class is compared.
-fn creation_differs(new: &Element, old: &Element, pristine: bool) -> Option<&'static str> {
+fn creation_differs(
+    env: &crate::schema::SchemaEnvironment,
+    new: &Element,
+    old: &Element,
+    pristine: bool,
+) -> Option<&'static str> {
     let differs = |name: &'static str, a: bool| (!a).then_some(name);
     match (new, old) {
         (Element::Concept(new), Element::Concept(old)) => differs(
             "type",
-            crate::schema::symbol::same_lineage(&new.schema_ref, &old.schema_ref),
+            env.same_lineage(SymbolKind::ConceptType, &new.schema_ref, &old.schema_ref),
         )
         .or_else(|| differs("key", new.key == old.key))
         // A Concept's name is mutable grounding state (§7.2), so it is

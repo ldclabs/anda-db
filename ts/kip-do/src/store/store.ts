@@ -437,7 +437,9 @@ export class Store extends RowStore {
    * Person and a Preference both keyed `"alice"` are two identities, not a
    * collision, while a Person written under `Person@1.0.0` and one upserted
    * after the package moved to `1.1.0` are one (§20.14) — which is what keeps
-   * a package upgrade from minting a second `"alice"`.
+   * a package upgrade from minting a second `"alice"`. Several lineages are
+   * one scope when a draft type was promoted (§20.16); the caller passes them
+   * all (`SchemaEnvironment.lineagesOf`).
    *
    * Without a declared type the key alone must still land on one Concept.
    * Returning the first of several would be the arbitrary winner §51 forbids
@@ -445,7 +447,7 @@ export class Store extends RowStore {
    */
   conceptByKey(
     space: string,
-    lineage: string | null,
+    lineage: string | readonly string[] | null,
     key: string,
   ): ConceptRow | null {
     // The empty string stores "no logical key", so it must never match —
@@ -467,9 +469,9 @@ export class Store extends RowStore {
             .toArray()
         : this.sql
             .exec<SqlRow>(
-              'SELECT * FROM concepts WHERE space = ? AND lineage = ? AND "key" = ?',
+              'SELECT * FROM concepts WHERE space = ? AND lineage IN (SELECT value FROM json_each(?)) AND "key" = ?',
               space,
-              lineage,
+              JSON.stringify(typeof lineage === 'string' ? [lineage] : lineage),
               key,
             )
             .toArray()

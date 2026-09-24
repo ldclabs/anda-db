@@ -406,6 +406,24 @@ pub fn tuple_key(
     hex::encode(hasher.finalize())
 }
 
+/// The keys a tuple may be stored under in `env`, the one a new Proposition
+/// takes first: [`tuple_key`] over each of the predicate's identity lineages
+/// ([`crate::schema::SchemaEnvironment::identity_lineages`]), so a tuple
+/// written under a draft Predicate before its promotion still resolves
+/// (§12.3, §20.16).
+pub fn tuple_keys(
+    env: &crate::schema::SchemaEnvironment,
+    space: &str,
+    subject: &Endpoint,
+    predicate_ref: &str,
+    object: &Endpoint,
+) -> Vec<String> {
+    env.identity_lineages(crate::schema::SymbolKind::PredicateType, predicate_ref)
+        .iter()
+        .map(|lineage| tuple_key(space, subject, lineage, object))
+        .collect()
+}
+
 /// Reads a structural reference that must resolve to a local element.
 ///
 /// Core structural references are same-Space by definition; a canonical or

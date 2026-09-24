@@ -120,7 +120,11 @@ for the parser, the executable AST and stored draft Spaces.
   kind or an alias fails `SchemaSymbolConflict`. `promote_draft_symbol` /
   `promoteDraftSymbol` (`manage_schema`) record `lineage_maps` (`[{kind, from,
   to}]`, shown by `DESCRIBE SCHEMA ENVIRONMENT`), after which type and
-  predicate matching read the draft and the target as one lineage. Rust
+  predicate matching read the draft and the target as one lineage, and so
+  does identity: a tuple, a logical key or a `CLIENT KEY` retry written under
+  the draft resolves to the element that exists (nothing is rekeyed), and
+  `MERGE CONCEPT` and value corrections treat the two types or Predicates as
+  one. Rust
   Capsule import maps source draft symbols through
   `Session::import_capsule_mapped` and refuses unmapped ones. Activating a
   Schema Lock now also publishes a `schema` control change.

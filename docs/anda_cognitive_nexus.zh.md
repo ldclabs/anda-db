@@ -16,7 +16,7 @@ KQL/HISTORY 分页保留首个快照；cursor 按 Principal 记录在当前 Stor
 
 世界时间与信念遵循该提交的 2.0 草案：没有 `from` 的主张按 `{latest: asserted_at}` 起算；`valid_time` 端点可以是 `{earliest, latest}` 区间，无法定位的主张投影为 `uncertain`，原因为 `temporal_indeterminate`。同一 actor 后续 stated/observed 的值在其起点结束先前开放的值（时序继承，§25.4），因此世界变化只需一次 `ASSERT`，`SUPERSEDING` 仅用于纠正错误的主张。`functional` 槽位形成冲突集，`functional_by: "object_type"` 按对象的 Concept Type 分区，`WITH EPISTEMIC {policy: "kip:memory-default"}` 依次按上下文特异性、第一人称证言与时间就近解决冲突。`expired` 为计算状态，从不存储。`?x SEARCH <KIND> "term" LIMIT k` 把关键词检索并入 `FIND`。投影只在 `basis` 中报告策略、`valid_at` 与快照；结构化策略（`kip:memory-default` 与引擎私有的 `kip:policy:structural`）输出 `score: null`。修正（supersession）必须保持同一 actor、同一上下文集合与同一槽位，否则报 `SupersessionMismatch`。`MnemonicState.effective_strength` 在读取时按 `kip:strength-half-life-30d` 策略计算，未钉住策略时为 `null`。
 
-`DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` 在 `propose_schema` 权限下向本 Space 的草稿词汇 `kip://local/draft@0.0.0`（§20.16）添加符号：每次都是独立的治理事务，草稿包由 Schema Lock 合成，之后的激活都会保留它；`Session::promote_draft_symbol`（`manage_schema`）把草稿符号映射到已安装包的同类符号，两者按同一血缘读取。recording repair 尚未实现，因此引擎声明 `KIP-Core`，不声明 `KIP-CognitiveMemory`。
+`DEFINE PREDICATE` / `DEFINE CONCEPT TYPE` 在 `propose_schema` 权限下向本 Space 的草稿词汇 `kip://local/draft@0.0.0`（§20.16）添加符号：每次都是独立的治理事务，草稿包由 Schema Lock 合成，之后的激活都会保留它；`Session::promote_draft_symbol`（`manage_schema`）把草稿符号映射到已安装包的同类符号，两者按同一血缘读取——匹配与身份都是如此，在草稿下写入的元组、逻辑键或 `CLIENT KEY` 之后仍解析到同一个元素。recording repair 尚未实现，因此引擎声明 `KIP-Core`，不声明 `KIP-CognitiveMemory`。
 
 > 参考实现 **KIP 2.0** Cognitive Nexus —— 构建在 Anda DB 之上的嵌入式 AI Agent 记忆大脑。
 

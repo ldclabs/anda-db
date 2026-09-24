@@ -87,7 +87,9 @@ Draft vocabulary (§20.16): a Principal with `propose_schema` runs
 as a standalone command; it answers `{ref, schema_environment_version}` with
 the exact `kip://local/draft@0.0.0/<name>` reference, and a taken name fails
 `SchemaSymbolConflict`. Only a `manage_schema` holder promotes a draft symbol
-(Rust `Session::promote_draft_symbol`, kip-do `Session.promoteDraftSymbol`).
+(Rust `Session::promote_draft_symbol`, kip-do `Session.promoteDraftSymbol`);
+afterwards the draft and its target are one lineage for matching and identity,
+and elements keep their exact draft references.
 
 ## SDK wire handling
 

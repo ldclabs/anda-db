@@ -72,7 +72,6 @@ import {
   facetDef,
   formatSymbolRef,
   lineageOfSymbol,
-  lineageText,
   parseSymbolRef,
   predicateDef,
   structuralFieldDef,
@@ -84,6 +83,7 @@ import {
   validateStructural,
   validateStructuralEndpoints,
   type EndpointFacts,
+  type SchemaEnvironment,
   type StructuralFieldDef,
 } from '../schema/index.js'
 import {
@@ -1037,17 +1037,26 @@ function ensureProposition(
   // §12.3, §20.14: identity compares the predicate's *lineage*, so an ENSURE
   // under a later version of the same package resolves to the existing
   // Proposition instead of minting a parallel one. The stored `predicate_ref`
-  // stays exact.
-  const key = tupleKey(tx.cx.space, subject, predicateLineage, object)
+  // stays exact. After a promotion (§20.16) a tuple written under the draft
+  // keeps the key it was stored under, so it is looked up under each lineage
+  // and a new one takes the first.
+  const keys = tx.env
+    .identityLineages('PredicateType', predicateRef)
+    .map((lineage) => tupleKey(tx.cx.space, subject, lineage, object))
+  const key = keys[0] as string
 
-  let found = tx.store.propositionByTuple(key)
+  let found: PropositionRow | null = null
   // Read our own writes: repeated ASSERT sugar must not mint the same tuple
   // twice and discover the collision only when SQLite commits it.
   for (const staged of tx.staged.values()) {
-    if (staged.element.kind === 'Proposition' && staged.element.row.tuple_key === key) {
+    if (staged.element.kind === 'Proposition' && keys.includes(staged.element.row.tuple_key)) {
       found = staged.element.row
       break
     }
+  }
+  for (const candidate of keys) {
+    if (found !== null) break
+    found = tx.store.propositionByTuple(candidate)
   }
   const id =
     found === null
@@ -1365,7 +1374,7 @@ function supersede(tx: Transaction, id: ElementId, by: ElementId): void {
     const slotOf = (reference: string): string | null => {
       const element = tx.load(parseElementIdOfKind(reference, 'Proposition'))
       return element.kind === 'Proposition'
-        ? `${canonical(element.row.subject as Json)}\u001f${lineageText(element.row.predicate_ref)}`
+        ? `${canonical(element.row.subject as Json)}\u001f${tx.env.lineage('PredicateType', element.row.predicate_ref)}`
         : null
     }
     const olderSlot = slotOf(older.row.proposition_id)
@@ -1672,7 +1681,7 @@ function clientKeyRetry(
   // `CLIENT KEY`.
   const pristine = (existing.row as { version: number }).version === 1 ||
     tx.isNewElement({kind: existing.kind, seq: existing.row.id})
-  const member = creationDiffers(element, existing, pristine)
+  const member = creationDiffers(tx.env, element, existing, pristine)
   const existingId = {
     kind: existing.kind,
     seq: (existing.row as { id: number }).id,
@@ -1700,6 +1709,7 @@ function clientKeyRetry(
  * Mirrors `creation_differs` in the reference engine, member for member.
  */
 function creationDiffers(
+  env: SchemaEnvironment,
   next: Element,
   old: Element,
   pristine: boolean,
@@ -1708,7 +1718,7 @@ function creationDiffers(
   if (next.kind !== old.kind) return 'kind'
   if (next.kind === 'Concept' && old.kind === 'Concept') {
     return (
-      differs('type', next.row.lineage === old.row.lineage) ??
+      differs('type', env.sameLineage('ConceptType', next.row.lineage, old.row.lineage)) ??
       differs('key', next.row.key === old.row.key) ??
       // A Concept's name is mutable grounding state (§7.2), so it is evidence
       // about the creation only while nothing has edited the element since.
@@ -1799,7 +1809,7 @@ function merge(
   tx.expectVersions(source, guards)
   const from = requireKind(tx, source, 'Concept')
   const into = requireKind(tx, target, 'Concept')
-  if (lineageText(from.row.schema_ref) !== lineageText(into.row.schema_ref)) {
+  if (!tx.env.sameLineage('ConceptType', from.row.schema_ref, into.row.schema_ref)) {
     throw errors.identityMergeConflict(
       'MERGE CONCEPT endpoints have incompatible Concept Type lineages',
     )
@@ -1957,7 +1967,7 @@ function resolveById(
   // which would let an id probe map the Space by reading the difference
   // (§86.4) — and an upsert by id may not create, so this still fails loudly.
   // Compared by lineage (§20.14): a Person under `1.0.0` is a Person.
-  if (lineage !== null && element.row.lineage !== lineage) return null
+  if (lineage !== null && !tx.env.sameLineage('ConceptType', element.row.lineage, lineage)) return null
   return parsed
 }
 
@@ -1967,7 +1977,11 @@ function resolveByKey(
   key: string,
   lineage: string | null,
 ): ElementId | null {
-  const found = tx.store.conceptByKey(tx.cx.space, lineage, key)
+  const found = tx.store.conceptByKey(
+    tx.cx.space,
+    lineage === null ? null : tx.env.lineagesOf('ConceptType', lineage),
+    key,
+  )
   return found === null ? null : { kind: 'Concept', seq: found.id }
 }
 

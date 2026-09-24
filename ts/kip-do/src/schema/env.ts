@@ -541,6 +541,18 @@ export class SchemaEnvironment {
   }
 
   /**
+   * The lineages an identity keyed by `reference` may be stored under
+   * (§12.3, §7.3): first the one a new element is keyed under — its lineage
+   * after promotions — then each draft lineage promoted into it, under which
+   * an element written before that promotion keeps its key (§20.16). A lookup
+   * tries them in order; nothing is rekeyed.
+   */
+  identityLineages(kind: SymbolKind, reference: string): string[] {
+    const lineage = this.lineage(kind, reference)
+    return [lineage, ...this.lineagesOf(kind, lineage).filter((l) => l !== lineage)]
+  }
+
+  /**
    * The values one of Core's open registries accepts here.
    *
    * Open means a package may add to it, not that anything goes: an unregistered

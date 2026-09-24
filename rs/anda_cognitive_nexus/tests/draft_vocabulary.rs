@@ -433,6 +433,165 @@ async fn a_promotion_joins_the_lineages_and_keeps_exact_references() {
     );
 }
 
+/// Installs and activates [`MUSIC`] next to the Profile.
+async fn activate_music(nexus: &CognitiveNexus) {
+    nexus
+        .install_package(&SchemaPackage::parse(MUSIC).unwrap(), "test")
+        .await
+        .unwrap();
+    let mut lock = profile_lock();
+    lock.packages
+        .insert("kip://test/music".into(), "1.0.0".into());
+    lock.states
+        .insert("kip://test/music".into(), PackageState::Active);
+    nexus.activate_schema(DEFAULT_SPACE, lock).await.unwrap();
+}
+
+/// Promotes the drafted `Instrument` and `mentors` to [`MUSIC`]'s symbols.
+async fn promote_to_music(nexus: &CognitiveNexus) {
+    let session = nexus.system_session();
+    for (kind, name) in [
+        (SymbolKind::ConceptType, "Instrument"),
+        (SymbolKind::PredicateType, "mentors"),
+    ] {
+        session
+            .promote_draft_symbol(
+                DEFAULT_SPACE,
+                kind,
+                name,
+                &format!("kip://test/music@1.0.0/{name}"),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// An identity written under a draft symbol is the same identity under the
+/// symbol it was promoted to (§20.16): the tuple (§12.3), the logical key
+/// (§7.3) and the `CLIENT KEY` retry (§52.1) resolve to the element that
+/// exists, `MERGE CONCEPT` treats the two types as one lineage, and a value
+/// correction stays in its slot (§14.2).
+#[tokio::test]
+async fn identities_written_under_a_draft_survive_its_promotion() {
+    let nexus = fresh("identity").await;
+    ok(
+        &nexus,
+        r#"DEFINE CONCEPT TYPE "Instrument" {description: "A musical instrument."}"#,
+    )
+    .await;
+    ok(&nexus, DEFINE_MENTORS).await;
+    ok(
+        &nexus,
+        r#"MUTATE {
+            UPSERT CONCEPT ?viola { MATCH {type: "Instrument", key: "viola"} SET FIELDS {name: "Viola"} }
+            CREATE CONCEPT ?violin { TYPE "Instrument" NAME "Violin" CLIENT KEY "violin" }
+            CREATE CONCEPT ?ada { TYPE "Person" NAME "Ada" }
+            CREATE CONCEPT ?grace { TYPE "Person" NAME "Grace" }
+            ASSERT (?ada, "mentors", ?grace) { by: ?ada, mode: "stated", at: "2026-01-01T00:00:00.000Z" }
+        }"#,
+    )
+    .await;
+    let ids = ok(
+        &nexus,
+        r#"FIND(?ada.id, ?grace.id, ?a.id) WHERE {
+            ?ada CONCEPT {name: "Ada"}
+            ?grace CONCEPT {name: "Grace"}
+            ?p PROPOSITION (?ada, "mentors", ?grace)
+            ?a ASSERTION {proposition: ?p}
+        }"#,
+    )
+    .await;
+    let (ada, grace, claim) = (ids[0][0].clone(), ids[0][1].clone(), ids[0][2].clone());
+    activate_music(&nexus).await;
+    promote_to_music(&nexus).await;
+
+    let succeeded = |response: &Response, what: &str| {
+        assert_eq!(
+            response.status,
+            TopLevelStatus::Succeeded,
+            "{what}\n{:#?}",
+            response.error
+        );
+    };
+
+    // The tuple, written again under the package Predicate, is bound.
+    let ensured = run(
+        &nexus,
+        r#"MUTATE { ENSURE PROPOSITION ?p (:ada, "mentors", :grace) }"#,
+        json!({"ada": ada, "grace": grace}),
+        None,
+    )
+    .await;
+    succeeded(&ensured, "ENSURE after promotion");
+    let tuples = ok(
+        &nexus,
+        r#"FIND(?p.id) WHERE { ?s CONCEPT {name: "Ada"} ?p PROPOSITION (?s, "mentors", ?o) }"#,
+    )
+    .await;
+    assert_eq!(tuples.as_array().map(Vec::len), Some(1), "{tuples}");
+
+    // The logical key resolves, and so does the CLIENT KEY retry.
+    ok(
+        &nexus,
+        r#"MUTATE { UPSERT CONCEPT ?v { MATCH {type: "Instrument", key: "viola"} SET FIELDS {name: "Viola da braccio"} } }"#,
+    )
+    .await;
+    ok(
+        &nexus,
+        r#"MUTATE { CREATE CONCEPT ?violin { TYPE "Instrument" NAME "Violin" CLIENT KEY "violin" } }"#,
+    )
+    .await;
+    let instruments = ok(
+        &nexus,
+        r#"FIND(?c.name, ?c.schema_ref) WHERE { ?c CONCEPT {type: "Instrument"} } ORDER BY ?c.name ASC"#,
+    )
+    .await;
+    assert_eq!(
+        instruments,
+        json!([
+            ["Viola da braccio", "kip://local/draft@0.0.0/Instrument"],
+            ["Violin", "kip://local/draft@0.0.0/Instrument"]
+        ])
+    );
+
+    // Two Concepts across the promotion are one type lineage for a merge.
+    ok(
+        &nexus,
+        r#"MUTATE { CREATE CONCEPT ?fiddle { TYPE "Instrument" NAME "Fiddle" } }"#,
+    )
+    .await;
+    let pair = ok(
+        &nexus,
+        r#"FIND(?violin.id, ?fiddle.id) WHERE {
+            ?violin CONCEPT {name: "Violin"}
+            ?fiddle CONCEPT {name: "Fiddle"}
+        }"#,
+    )
+    .await;
+    let merged = run(
+        &nexus,
+        "MERGE CONCEPT :from INTO :into",
+        json!({"from": pair[0][0], "into": pair[0][1]}),
+        None,
+    )
+    .await;
+    succeeded(&merged, "MERGE across the promotion");
+
+    // A value correction under the package Predicate stays in the slot of
+    // the claim made under the draft.
+    let corrected = run(
+        &nexus,
+        r#"MUTATE {
+            CREATE CONCEPT ?linus { TYPE "Person" NAME "Linus" }
+            ASSERT (:ada, "mentors", ?linus) { by: :ada, mode: "stated", at: "2026-01-01T00:00:00.000Z" } SUPERSEDING :claim
+        }"#,
+        json!({"ada": ada, "claim": claim}),
+        None,
+    )
+    .await;
+    succeeded(&corrected, "SUPERSEDING across the promotion");
+}
+
 #[tokio::test]
 async fn a_capsule_maps_source_draft_symbols_or_refuses() {
     let source = fresh("capsule_source").await;

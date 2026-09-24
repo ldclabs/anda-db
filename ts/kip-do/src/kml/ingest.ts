@@ -365,7 +365,11 @@ function sourceActor(tx: Transaction, actor: ElementReference): ElementId {
     )
   }
   const symbol = tx.env.resolveSymbol('ConceptType', actor.type, 'read')
-  const found = tx.store.conceptByKey(tx.cx.space, lineageOfSymbol(symbol), actor.key)
+  const found = tx.store.conceptByKey(
+    tx.cx.space,
+    tx.env.lineagesOf('ConceptType', lineageOfSymbol(symbol)),
+    actor.key,
+  )
   if (found !== null) return { kind: 'Concept', seq: found.id }
   throw errors.notFoundOrNotVisible(
     `no ${actor.type} keyed ${JSON.stringify(actor.key)} exists in this Space; ` +

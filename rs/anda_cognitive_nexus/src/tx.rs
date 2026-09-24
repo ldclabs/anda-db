@@ -558,8 +558,9 @@ impl Transaction {
     /// and a Preference may both be keyed `"alice"` — which is what lets a 1.x
     /// database whose identity was `(type, name)` migrate those names into keys
     /// without merging unrelated Concepts — while a Person written under an
-    /// earlier version of the same package is the same population. An empty
-    /// key stores "no logical key" and claims nothing.
+    /// earlier version of the same package is the same population, as is one
+    /// typed by a draft symbol since promoted into it (§20.16). An empty key
+    /// stores "no logical key" and claims nothing.
     async fn check_concept_key_identity(&self) -> Result<(), KipError> {
         let mut claimed: Vec<(String, &str)> = Vec::new();
         for (id, staged) in &self.staged {
@@ -569,7 +570,11 @@ impl Transaction {
             if !staged.changed || row.key.is_empty() {
                 continue;
             }
-            let claim = (crate::schema::lineage_of(&row.schema_ref), row.key.as_str());
+            let claim = (
+                self.env
+                    .lineage(crate::schema::SymbolKind::ConceptType, &row.schema_ref),
+                row.key.as_str(),
+            );
             let conflict = |holder: &str| {
                 KipError::new(
                     KipErrorCode::IdentityConflict,
@@ -586,7 +591,7 @@ impl Transaction {
             claimed.push(claim);
             if let Some(found) = self
                 .store
-                .find_concept_by_key(&self.cx.space, Some(&row.schema_ref), &row.key)
+                .find_concept_by_key(&self.cx.space, &self.env, Some(&row.schema_ref), &row.key)
                 .await?
                 && found._id != id.seq
             {
