@@ -33,6 +33,10 @@ use crate::store::write::WriteContext;
 
 impl Store {
     /// Appends one element version, in the same commit as the row itself.
+    ///
+    /// `replay` is a recovery pass over a retained redo intent, which may run
+    /// after the version was already flushed; only then is the log checked
+    /// for it first.
     pub async fn record_version<R: super::write::Row + serde::Serialize>(
         &self,
         cx: &WriteContext,
@@ -40,41 +44,30 @@ impl Store {
         version: u64,
         op: &str,
         row: &R,
+        replay: bool,
     ) -> Result<(), KipError> {
-        // A retained redo intent may replay after the version was flushed.
-        for row_id in self
-            .element_versions()
-            .query_all_ids(eq_fields(&[
-                ("space", Fv::Text(cx.space.clone())),
-                ("element", Fv::Text(id.to_string())),
-                ("tx_id", Fv::Text(cx.tx_id.clone())),
-            ]))
-            .await
-            .map_err(db_error)?
-        {
-            let old: ElementVersionRow = self
+        if replay {
+            for row_id in self
                 .element_versions()
-                .get_as(row_id)
+                .query_all_ids(eq_fields(&[
+                    ("space", Fv::Text(cx.space.clone())),
+                    ("element", Fv::Text(id.to_string())),
+                    ("tx_id", Fv::Text(cx.tx_id.clone())),
+                ]))
                 .await
-                .map_err(db_error)?;
-            if old.tx_id == cx.tx_id && old.version == version {
-                return Ok(());
+                .map_err(db_error)?
+            {
+                let old: ElementVersionRow = self
+                    .element_versions()
+                    .get_as(row_id)
+                    .await
+                    .map_err(db_error)?;
+                if old.tx_id == cx.tx_id && old.version == version {
+                    return Ok(());
+                }
             }
         }
-        let encoded = serde_json::to_value(row).map_err(|err| {
-            KipError::internal_error(format!("an element row failed to encode: {err}"))
-        })?;
-        let entry = ElementVersionRow {
-            _id: 0,
-            space: cx.space.clone(),
-            element: id.to_string(),
-            kind: id.kind.to_string(),
-            version,
-            seq: cx.seq,
-            tx_id: cx.tx_id.clone(),
-            op: op.to_string(),
-            row: encoded,
-        };
+        let entry = version_row(cx, id, version, op, row)?;
         self.element_versions()
             .add_from(&entry)
             .await
@@ -376,21 +369,29 @@ impl Store {
     /// commit is coordinate 0 — an empty Space, not an error. This engine keeps
     /// every version, so no instant falls below a retention floor.
     pub async fn seq_at_time(&self, space_id: &str, at: &str) -> Result<u64, KipError> {
-        let ids = self
-            .transactions()
-            .query_all_ids(eq_field("space", Fv::Text(space_id.to_string())))
+        let transactions = self.transactions();
+        // Timestamps are one normalized UTC form, so lexicographic order is
+        // chronological order and the index can range over them.
+        let ids = transactions
+            .query_all_ids(Filter::And(vec![
+                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
+                Box::new(Filter::Field((
+                    "committed_at".to_string(),
+                    RangeQuery::Le(Fv::Text(at.to_string())),
+                ))),
+            ]))
             .await
             .map_err(db_error)?;
-        let mut seq = 0u64;
-        for id in ids {
-            let row: TransactionRow = self.transactions().get_as(id).await.map_err(db_error)?;
-            // Timestamps are one normalized UTC form, so lexicographic order
-            // is chronological order.
-            if row.committed_at.as_str() <= at && row.seq > seq {
-                seq = row.seq;
+        // The journal is appended in commit order under the Nexus write lock,
+        // so among the entries committed by `at` the newest that took a
+        // sequence holds the greatest one; a no-op holds none (0).
+        for id in ids.into_iter().rev() {
+            let row: TransactionRow = transactions.get_as(id).await.map_err(db_error)?;
+            if row.seq > 0 {
+                return Ok(row.seq);
             }
         }
-        Ok(seq)
+        Ok(0)
     }
 
     /// The Schema Environment version that was in force at a coordinate.
@@ -426,6 +427,30 @@ impl Store {
     pub async fn current_seq(&self, space_id: &str) -> Result<u64, KipError> {
         Ok(self.get_space(space_id).await?.seq)
     }
+}
+
+/// The version-log row one committed element version is recorded as.
+pub(crate) fn version_row<R: serde::Serialize>(
+    cx: &WriteContext,
+    id: ElementId,
+    version: u64,
+    op: &str,
+    row: &R,
+) -> Result<ElementVersionRow, KipError> {
+    let encoded = serde_json::to_value(row).map_err(|err| {
+        KipError::internal_error(format!("an element row failed to encode: {err}"))
+    })?;
+    Ok(ElementVersionRow {
+        _id: 0,
+        space: cx.space.clone(),
+        element: id.to_string(),
+        kind: id.kind.to_string(),
+        version,
+        seq: cx.seq,
+        tx_id: cx.tx_id.clone(),
+        op: op.to_string(),
+        row: encoded,
+    })
 }
 
 fn decode(row: ElementVersionRow) -> Result<Element, KipError> {

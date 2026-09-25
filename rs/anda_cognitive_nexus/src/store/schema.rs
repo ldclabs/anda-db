@@ -322,7 +322,10 @@ impl Store {
             Some(
                 self.begin_transaction(
                     space_id,
-                    serde_json::json!({"principal_id": "kip:principal:system", "channel": "governance"}),
+                    serde_json::json!({
+                        "principal_id": "kip:principal:system",
+                        "channel": "governance",
+                    }),
                 )
                 .await?,
             )

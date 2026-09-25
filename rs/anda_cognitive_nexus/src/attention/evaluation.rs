@@ -1,3 +1,4 @@
+use super::watch::WatchStep;
 use super::*;
 use anda_kip::cognitive::ArtifactPin;
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,19 +105,35 @@ impl Mode {
     ) -> (Json, Json) {
         match self {
             Self::Immediate => {
-                let r = json!({"operation":"advance_watch","watch_ref":watch,"expected":expected,"generation":generation,"limit":limit});
+                let r = json!({
+                    "operation": "advance_watch",
+                    "watch_ref": watch,
+                    "expected": expected,
+                    "generation": generation,
+                    "limit": limit,
+                });
                 (r.clone(), r)
             }
             Self::Prepare(key) => (
                 json!({"operation":"prepare_watch_page","watch_ref":watch,"key":key}),
-                json!({"watch_ref":watch,"expected":expected,"generation":generation,"limit":limit,"preparation_key":key}),
+                json!({
+                    "watch_ref": watch,
+                    "expected": expected,
+                    "generation": generation,
+                    "limit": limit,
+                    "preparation_key": key,
+                }),
             ),
             Self::Evaluate {
                 ticket_ref,
                 evaluation,
                 ..
             } => (
-                json!({"operation":"commit_watch_page","ticket_ref":ticket_ref,"evaluation_key":evaluation.evaluation_key}),
+                json!({
+                    "operation": "commit_watch_page",
+                    "ticket_ref": ticket_ref,
+                    "evaluation_key": evaluation.evaluation_key,
+                }),
                 json!(evaluation),
             ),
         }
@@ -124,9 +141,11 @@ impl Mode {
 }
 
 pub(super) fn page_digest(page: &Json) -> Result<String, KipError> {
-    digest(
-        &json!({"changes":page["changes"],"coverage":page["coverage"],"resync_required":page["resync_required"]}),
-    )
+    digest(&json!({
+        "changes": page["changes"],
+        "coverage": page["coverage"],
+        "resync_required": page["resync_required"],
+    }))
 }
 
 pub(super) async fn candidates(
@@ -226,26 +245,49 @@ pub(super) async fn candidates(
     Ok(candidates)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything one Watch evaluation preparation reads, as the Watch pass
+/// resolved it.
+pub(super) struct Preparation<'a> {
+    pub authority: EffectiveAuthority,
+    pub watch_ref: &'a str,
+    pub expected: u64,
+    pub generation: u64,
+    pub limit: usize,
+    pub preparation_key: &'a str,
+    pub condition: Json,
+    pub page: &'a Json,
+    pub checkpoint: &'a WatchCheckpoint,
+    pub saved: Option<&'a ControlRecordRow>,
+    pub source_at: String,
+    pub target: u64,
+    pub deadline: bool,
+    pub semantic: bool,
+    pub key: String,
+    pub request_digest: String,
+}
+
 pub(super) async fn prepare(
     session: &Session,
-    authority: EffectiveAuthority,
-    watch_ref: &str,
-    expected: u64,
-    generation: u64,
-    limit: usize,
-    preparation_key: &str,
-    condition: Json,
-    page: &Json,
-    checkpoint: &WatchCheckpoint,
-    saved: Option<&ControlRecordRow>,
-    source_at: String,
-    target: u64,
-    deadline: bool,
-    semantic: bool,
-    key: String,
-    request_digest: String,
+    preparation: Preparation<'_>,
 ) -> Result<Json, KipError> {
+    let Preparation {
+        authority,
+        watch_ref,
+        expected,
+        generation,
+        limit,
+        preparation_key,
+        condition,
+        page,
+        checkpoint,
+        saved,
+        source_at,
+        target,
+        deadline,
+        semantic,
+        key,
+        request_digest,
+    } = preparation;
     let space = &authority.space.space_id;
     let store = &session.nexus.store;
     authority
@@ -267,7 +309,12 @@ pub(super) async fn prepare(
     .await?;
     let ticket_ref = runtime_ref(
         "watch-page",
-        &json!({"scope":checkpoint.config.scope,"principal":session.auth.principal_id,"watch_ref":watch_ref,"preparation_key":preparation_key}),
+        &json!({
+            "scope": checkpoint.config.scope,
+            "principal": session.auth.principal_id,
+            "watch_ref": watch_ref,
+            "preparation_key": preparation_key,
+        }),
     )?;
     let prepared = PreparedWatchPage {
         ticket_ref: ticket_ref.clone(),
@@ -354,7 +401,20 @@ pub(super) async fn prepare(
         )
         .await?;
     }
-    stage_control(store,&mut tx,&format!("artifact/{}",material.artifact_ref),0,"artifact",json!({"state":"available","content":content,"content_digest":material.content_digest,"source_refs":sources})).await?;
+    stage_control(
+        store,
+        &mut tx,
+        &format!("artifact/{}", material.artifact_ref),
+        0,
+        "artifact",
+        json!({
+            "state": "available",
+            "content": content,
+            "content_digest": material.content_digest,
+            "source_refs": sources,
+        }),
+    )
+    .await?;
     stage_control(store, &mut tx, &ticket_ref, 0, "runtime", json!(ticket)).await?;
     // The transaction journal retains only refs. Material copies remain governed
     // artifacts so erasure can revoke them rather than leaving a plaintext replay.
@@ -414,7 +474,11 @@ pub(super) async fn record(
 ) -> Result<String, KipError> {
     let reference = runtime_ref(
         "watch-evaluation",
-        &json!({"ticket_ref":ticket_ref,"principal":tx.auth.principal_id,"evaluation_key":evaluation.evaluation_key}),
+        &json!({
+            "ticket_ref": ticket_ref,
+            "principal": tx.auth.principal_id,
+            "evaluation_key": evaluation.evaluation_key,
+        }),
     )?;
     let content = json!({"ticket_ref":ticket_ref,"evaluation":evaluation});
     if serde_json::to_vec(&content)
@@ -434,8 +498,34 @@ pub(super) async fn record(
         content_digest: digest(&content)?,
         artifact_ref: format!("kip:artifact:{}", digest(&content)?),
     };
-    stage_control(store,tx,&format!("artifact/{}",material.artifact_ref),0,"artifact",json!({"state":"available","content":content,"content_digest":material.content_digest,"source_refs":sources})).await?;
-    stage_control(store,tx,&reference,0,"runtime",json!({"format":"nexus:watch-evaluation-v1","ticket_ref":ticket_ref,"material":material,"accepted":accepted})).await?;
+    stage_control(
+        store,
+        tx,
+        &format!("artifact/{}", material.artifact_ref),
+        0,
+        "artifact",
+        json!({
+            "state": "available",
+            "content": content,
+            "content_digest": material.content_digest,
+            "source_refs": sources,
+        }),
+    )
+    .await?;
+    stage_control(
+        store,
+        tx,
+        &reference,
+        0,
+        "runtime",
+        json!({
+            "format": "nexus:watch-evaluation-v1",
+            "ticket_ref": ticket_ref,
+            "material": material,
+            "accepted": accepted,
+        }),
+    )
+    .await?;
     Ok(reference)
 }
 
@@ -455,10 +545,12 @@ impl Session {
         let mut result = self
             .advance_watch_mode(
                 space,
-                watch_ref,
-                expected,
-                generation,
-                limit,
+                WatchStep {
+                    watch_ref,
+                    expected,
+                    generation,
+                    limit,
+                },
                 |_, _| Ok(false),
                 Mode::Prepare(preparation_key.into()),
             )
@@ -527,10 +619,12 @@ impl Session {
         validate(&payload, &evaluation)?;
         self.advance_watch_mode(
             space,
-            &ticket.watch_ref.clone(),
-            ticket.expected,
-            ticket.generation,
-            ticket.limit,
+            WatchStep {
+                watch_ref: &ticket.watch_ref.clone(),
+                expected: ticket.expected,
+                generation: ticket.generation,
+                limit: ticket.limit,
+            },
             |_, _| Ok(false),
             Mode::Evaluate {
                 ticket_ref: reference.into(),

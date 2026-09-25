@@ -254,30 +254,26 @@ impl Store {
         origin: Json,
     ) -> Result<WriteContext, KipError> {
         let space = self.get_space(space_id).await?;
-        let seq = space
-            .seq
-            .checked_add(1)
-            .filter(|n| *n <= anda_kip::MAX_SAFE_INTEGER)
-            .ok_or_else(|| {
-                KipError::resource_exhausted("Space sequence exceeds the portable numeric range")
-            })?;
+        let cx = WriteContext::tentative(&space, origin)?;
+        self.advance_seq(&space, cx.seq).await?;
+        Ok(cx)
+    }
+
+    /// Moves a Space's sequence forward to `seq`, never back.
+    ///
+    /// A committed transaction takes its sequence here, inside the redo plan
+    /// that writes its rows, so a run that never commits reserves nothing.
+    pub(crate) async fn advance_seq(&self, space: &SpaceRow, seq: u64) -> Result<(), KipError> {
+        if space.seq >= seq {
+            return Ok(());
+        }
         let mut fields = BTreeMap::new();
         fields.insert("seq".to_string(), Fv::U64(seq));
         self.spaces()
             .update(space._id, fields)
             .await
             .map_err(db_error)?;
-
-        Ok(WriteContext {
-            // A Space sequence is allocated once and never reused, so pairing
-            // it with the Space is already a unique transaction identity —
-            // and one that reads as the history coordinate it is.
-            tx_id: format!("{space_id}#{seq}"),
-            space: space_id.to_string(),
-            seq,
-            at: time::now(),
-            origin,
-        })
+        Ok(())
     }
 
     /// Records a committed transaction in the journal.
@@ -288,18 +284,13 @@ impl Store {
     pub async fn journal(
         &self,
         cx: &WriteContext,
-        mut entry: JournalEntry,
+        entry: JournalEntry,
     ) -> Result<TransactionRow, KipError> {
         if let Some(row) = self.find_transaction(&cx.tx_id).await? {
             return Ok(row);
         }
-        if entry.changes.iter().any(|c| {
-            c["touched"].as_array().is_some_and(|paths| {
-                paths
-                    .iter()
-                    .any(|p| p.as_str().is_some_and(|p| p.starts_with("governance.")))
-            })
-        }) {
+        let (row, authorization_changed) = journal_row(cx, entry);
+        if authorization_changed {
             let mut space = self.get_space(&cx.space).await?;
             if !space.policies.is_object() {
                 space.policies = serde_json::json!({});
@@ -318,39 +309,7 @@ impl Store {
                 )
                 .await
                 .map_err(db_error)?;
-            if !entry.result.is_object() {
-                entry.result = serde_json::json!({});
-            }
-            let controls = entry
-                .result
-                .as_object_mut()
-                .unwrap()
-                .entry("control_changes")
-                .or_insert_with(|| serde_json::json!([]));
-            controls
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({"kind":"authorization","version":cx.seq.to_string()}));
         }
-        let row = TransactionRow {
-            _id: 0,
-            tx_id: cx.tx_id.clone(),
-            space: cx.space.clone(),
-            seq: cx.seq,
-            snapshot_seq: cx.seq.saturating_sub(1),
-            committed_at: cx.at.clone(),
-            status: entry.status,
-            transaction_class: entry.transaction_class,
-            idempotency_key: entry.idempotency_key,
-            request_digest: entry.request_digest,
-            semantic_plan_digest: entry.semantic_plan_digest,
-            result_digest: entry.result_digest,
-            schema_environment_version: entry.schema_environment_version,
-            result: entry.result,
-            changed_ids: entry.changes.iter().filter_map(changed_id).collect(),
-            changes: entry.changes,
-            origin: entry.origin,
-        };
         let id = self.transactions().add_from(&row).await.map_err(db_error)?;
         Ok(TransactionRow { _id: id, ..row })
     }
@@ -419,6 +378,58 @@ pub struct JournalEntry {
     pub changes: Vec<Json>,
     /// The Receipt `origin` this commit is attributed to (§33.2).
     pub origin: Json,
+}
+
+/// The journal row one transaction is recorded as, and whether it changed
+/// an element's Governance members — which moves the Space's authorization
+/// epoch and is reported as a control change.
+pub(crate) fn journal_row(cx: &WriteContext, mut entry: JournalEntry) -> (TransactionRow, bool) {
+    let authorization_changed = entry.changes.iter().any(|c| {
+        c["touched"].as_array().is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|p| p.as_str().is_some_and(|p| p.starts_with("governance.")))
+        })
+    });
+    if authorization_changed {
+        if !entry.result.is_object() {
+            entry.result = serde_json::json!({});
+        }
+        if let Some(result) = entry.result.as_object_mut()
+            && let Some(controls) = result
+                .entry("control_changes")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+        {
+            controls.push(serde_json::json!({"kind":"authorization","version":cx.seq.to_string()}));
+        }
+    }
+    let row = TransactionRow {
+        _id: 0,
+        tx_id: cx.tx_id.clone(),
+        space: cx.space.clone(),
+        // Only a commit took a sequence. A no-op is journalled at 0, which
+        // every sequence-ordered reader skips, and keeps its snapshot.
+        seq: if entry.status == "committed" {
+            cx.seq
+        } else {
+            0
+        },
+        snapshot_seq: cx.seq.saturating_sub(1),
+        committed_at: cx.at.clone(),
+        status: entry.status,
+        transaction_class: entry.transaction_class,
+        idempotency_key: entry.idempotency_key,
+        request_digest: entry.request_digest,
+        semantic_plan_digest: entry.semantic_plan_digest,
+        result_digest: entry.result_digest,
+        schema_environment_version: entry.schema_environment_version,
+        result: entry.result,
+        changed_ids: entry.changes.iter().filter_map(changed_id).collect(),
+        changes: entry.changes,
+        origin: entry.origin,
+    };
+    (row, authorization_changed)
 }
 
 fn changed_id(change: &Json) -> Option<String> {

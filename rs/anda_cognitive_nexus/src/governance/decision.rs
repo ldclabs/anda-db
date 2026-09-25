@@ -688,6 +688,32 @@ impl EffectiveAuthority {
         decision.is_permitted() && decision.unrestricted
     }
 
+    /// Whether this caller may search and read every element of the Space
+    /// unnarrowed: no field mask, classification cap or result cap, and no
+    /// policy statement that could deny one element what the Space-wide
+    /// answer allows.
+    ///
+    /// For such a caller the authorized corpus is the Space's whole corpus,
+    /// so SEARCH can rank it straight from the persistent index without any
+    /// hidden candidate reaching a score (§66.4).
+    pub fn searches_whole_space(&self, auth: &AuthContext) -> bool {
+        if self
+            .statements()
+            .iter()
+            .any(|statement| statement.effect == "deny")
+        {
+            return false;
+        }
+        [Permission::Search, Permission::Read]
+            .into_iter()
+            .all(|permission| {
+                let decision = self.authorize(permission, &ResourceContext::default(), auth);
+                decision.is_permitted()
+                    && decision.unrestricted
+                    && decision.obligations.redaction_profile.is_empty()
+            })
+    }
+
     /// Whether this Principal may speak as a semantic actor here (§14, §66).
     pub fn is_bound_to_actor(&self, actor_key: &str) -> bool {
         self.bindings

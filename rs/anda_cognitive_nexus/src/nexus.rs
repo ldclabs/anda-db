@@ -73,7 +73,7 @@ impl CognitiveNexus {
         loop {
             let guard = self.lock.read().await;
             if !self.store.has_poisoned_handle()
-                && self.store.commit_log().ids().is_empty()
+                && self.store.commit_log().is_empty()
                 && !self.store.governance.control_recovery_needed()
             {
                 return Ok(guard);
@@ -888,7 +888,7 @@ impl Session {
     /// Resolving one reads the Space row, the caller's Grants, Delegations and
     /// group memberships and the active policy version; a caller whose body
     /// needs the authority too must not pay for that twice.
-    async fn gated_under<T>(
+    pub(crate) async fn gated_under<T>(
         &self,
         authority: &EffectiveAuthority,
         permission: Permission,
@@ -1307,10 +1307,7 @@ impl Executor for Session {
         request: &Request,
         operation: &Operation,
     ) -> Response {
-        if let Err(err) = serde_json::to_value((&command, request, operation))
-            .map_err(|e| KipError::invalid_request_envelope(e.to_string()))
-            .and_then(|v| anda_kip::validate_json(&v))
-        {
+        if let Err(err) = check_numbers(&command, request, operation) {
             return Response::from(err);
         }
         let space = match self.nexus.space_of(request).await {
@@ -1365,15 +1362,18 @@ impl Session {
         let evaluation_time = self.simulated_evaluation_time.as_deref();
         #[cfg(not(feature = "simulation"))]
         let evaluation_time = None;
-        let response = crate::kml::execute_at_evaluation_time(
+        let caller = crate::kml::Caller {
+            authority: &authority,
+            auth: call.auth,
+            evaluation_time,
+        };
+        let response = crate::kml::execute_as(
             &self.nexus.store,
             call.space,
             statement,
             call.request,
             call.operation,
-            &authority,
-            call.auth,
-            evaluation_time,
+            caller,
         )
         .await;
         let response = if call.request.is_dry_run() {
@@ -1528,8 +1528,8 @@ pub struct RetentionSweep {
 /// The Space-scope decision for each permission a command needs.
 ///
 /// Resolved once and then read twice — by the approval guard and by the gate.
-/// `EffectiveAuthority::authorize` re-parses every statement of the governing
-/// policy on each call, so asking it the same question twice is not free.
+/// Each `EffectiveAuthority::authorize` call matches every candidate and policy
+/// statement again, so asking it the same question twice is not free.
 fn base_authorizations(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
@@ -1843,6 +1843,48 @@ impl Executor for CognitiveNexus {
 /// discovering the gap through an error.
 pub fn supported_command_types() -> &'static [CommandType] {
     &[CommandType::Kml, CommandType::Kql, CommandType::Meta]
+}
+
+/// Holds what one call carries to the portable numeric profile (§9.3).
+///
+/// A request reaching an engine through [`anda_kip::Request::execute`] was
+/// checked whole already; this is for a host that calls [`Executor`]
+/// directly. The envelope is checked without its `operations` — the one this
+/// call runs is checked on its own — so a batch costs each operation its own
+/// size rather than the whole batch's.
+fn check_numbers(
+    command: &Command,
+    request: &Request,
+    operation: &Operation,
+) -> Result<(), KipError> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        space: &'a Option<anda_kip::SpaceSelector>,
+        execution: &'a Option<anda_kip::Execution>,
+        read: &'a Option<anda_kip::ReadBinding>,
+        ingest: &'a Option<anda_kip::IngestContext>,
+        preconditions: &'a Option<anda_kip::Preconditions>,
+        parameters: &'a Option<anda_kip::Map<String, Json>>,
+        context: &'a Option<anda_kip::RequestContext>,
+        requires: &'a Option<anda_kip::Map<String, Json>>,
+        options: &'a Option<anda_kip::RequestOptions>,
+        extensions: &'a Option<anda_kip::Map<String, Json>>,
+    }
+    let envelope = Envelope {
+        space: &request.space,
+        execution: &request.execution,
+        read: &request.read,
+        ingest: &request.ingest,
+        preconditions: &request.preconditions,
+        parameters: &request.parameters,
+        context: &request.context,
+        requires: &request.requires,
+        options: &request.options,
+        extensions: &request.extensions,
+    };
+    serde_json::to_value((command, envelope, operation))
+        .map_err(|e| KipError::invalid_request_envelope(e.to_string()))
+        .and_then(|value| anda_kip::validate_json(&value))
 }
 
 /// A Session's Space authority never administers another Space's records.

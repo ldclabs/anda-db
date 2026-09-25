@@ -218,7 +218,10 @@ mod tests {
 
     #[test]
     fn a_time_bound_round_trips_through_storage() {
-        let written = serde_json::json!({"latest": "2026-01-01T00:00:00.000Z", "earliest": "2025-01-01T00:00:00.000Z"});
+        let written = serde_json::json!({
+            "latest": "2026-01-01T00:00:00.000Z",
+            "earliest": "2025-01-01T00:00:00.000Z",
+        });
         let point = Point::read(Some(&written), "valid_time.from")
             .unwrap()
             .unwrap();
@@ -233,7 +236,10 @@ mod tests {
         assert_eq!(Point::load(""), None);
         for bad in [
             serde_json::json!({}),
-            serde_json::json!({"earliest": "2026-02-01T00:00:00.000Z", "latest": "2026-01-01T00:00:00.000Z"}),
+            serde_json::json!({
+                "earliest": "2026-02-01T00:00:00.000Z",
+                "latest": "2026-01-01T00:00:00.000Z",
+            }),
             serde_json::json!({"around": "2026-01-01T00:00:00.000Z"}),
         ] {
             assert_eq!(

@@ -66,6 +66,22 @@ async fn authorize(
     Ok(element)
 }
 
+/// The protected record of one Watch firing.
+const WATCH_FIRE: &str = concat!(
+    r#"CREATE ACTIVITY ?watch_fire {CLIENT KEY :key "#,
+    r#"SET FIELDS {activity_class:"watch_fire",status:"completed"} "#,
+    r#"SET STRUCTURAL {("inputs",:watch)}}"#,
+);
+
+/// Which Watch one pass advances, from which generation and version, and how
+/// far it may read.
+pub(super) struct WatchStep<'a> {
+    pub watch_ref: &'a str,
+    pub expected: u64,
+    pub generation: u64,
+    pub limit: usize,
+}
+
 impl Session {
     /// Arm a new generation. The native checkpoint pins deadline, condition,
     /// configuration and authorization; ordinary KML cannot attest those facts.
@@ -102,7 +118,12 @@ impl Session {
         self.with_authority(space, async |authority| {
             let element = authorize(self, &authority, space, watch_ref).await?;
             let (old, old_state) = watch_values(&element)?;
-            let request = json!({"operation":"arm_watch","watch_ref":watch_ref,"expected":expected,"replacement":replacement});
+            let request = json!({
+                "operation": "arm_watch",
+                "watch_ref": watch_ref,
+                "expected": expected,
+                "replacement": replacement,
+            });
             let key = request_key(&self.auth.principal_id, &request)?;
             let request_digest = digest(&request)?;
             if let Some(result) = replay(&self.nexus.store, space, &key, &request_digest).await? {
@@ -157,7 +178,14 @@ impl Session {
                 }],
             )
             .await?;
-            let watch = json!({"arm_generation":generation,"armed_seq":tx.cx.seq-1,"condition_digest":digest(&condition)?,"authorization_view":pinned_basis["authorization"],"consumed_seq":tx.cx.seq-1,"matched":false});
+            let watch = json!({
+                "arm_generation": generation,
+                "armed_seq": tx.cx.seq-1,
+                "condition_digest": digest(&condition)?,
+                "authorization_view": pinned_basis["authorization"],
+                "consumed_seq": tx.cx.seq-1,
+                "matched": false,
+            });
             let checkpoint = WatchCheckpoint {
                 format: "nexus:watch-checkpoint-v1".into(),
                 watch_ref: watch_ref.into(),
@@ -233,30 +261,34 @@ impl Session {
     {
         self.advance_watch_mode(
             space,
-            watch_ref,
-            expected,
-            generation,
-            limit,
+            WatchStep {
+                watch_ref,
+                expected,
+                generation,
+                limit,
+            },
             evaluate,
             Mode::Immediate,
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn advance_watch_mode<F>(
         &self,
         space: &str,
-        watch_ref: &str,
-        expected: u64,
-        generation: u64,
-        limit: usize,
+        step: WatchStep<'_>,
         evaluate: F,
         mode: Mode,
     ) -> Result<Json, KipError>
     where
         F: Fn(&Json, &Json) -> Result<bool, KipError>,
     {
+        let WatchStep {
+            watch_ref,
+            expected,
+            generation,
+            limit,
+        } = step;
         self.with_authority(space, async |authority| {
             let store = &self.nexus.store;
             let element = authorize(self, &authority, space, watch_ref).await?;
@@ -395,7 +427,8 @@ impl Session {
             {
                 if ticket.principal != self.auth.principal_id
                     || payload.basis != pinned_basis
-                    || payload.checkpoint_digest != saved.as_ref().map(|r| digest(&r.value)).transpose()?
+                    || payload.checkpoint_digest
+                        != saved.as_ref().map(|r| digest(&r.value)).transpose()?
                 {
                     return Err(conflict("basis_changed"));
                 }
@@ -427,7 +460,8 @@ impl Session {
             // A pre-deadline pass may already have proved beyond the later
             // resolved due_seq. Never move the stored watermark backwards.
             let page =
-                crate::meta::history::change_page_through(&mut cx, after, after.max(target), limit).await?;
+                crate::meta::history::change_page_through(&mut cx, after, after.max(target), limit)
+                    .await?;
             if page["resync_required"] == true {
                 return Err(conflict("history_gap"));
             }
@@ -435,26 +469,25 @@ impl Session {
                 return Err(conflict("basis_changed"));
             }
             if let Mode::Prepare(preparation_key) = &mode {
-                return evaluation::prepare(
-                    self,
+                let preparation = evaluation::Preparation {
                     authority,
                     watch_ref,
                     expected,
                     generation,
                     limit,
                     preparation_key,
-                    condition.clone(),
-                    &page,
-                    &checkpoint,
-                    saved.as_ref(),
+                    condition: condition.clone(),
+                    page: &page,
+                    checkpoint: &checkpoint,
+                    saved: saved.as_ref(),
                     source_at,
                     target,
                     deadline,
                     semantic,
                     key,
                     request_digest,
-                )
-                .await;
+                };
+                return evaluation::prepare(self, preparation).await;
             }
             let evaluated = if let Mode::Evaluate {
                 payload,
@@ -504,8 +537,21 @@ impl Session {
                     )
                     .await?;
                     let evaluation_ref =
-                        evaluation::record(store, &mut tx, ticket_ref, evaluation, payload, false).await?;
-                    return commit(store,tx,key,request_digest,json!({"status":"deferred","reason":"semantic_unknown","ticket_ref":ticket_ref,"evaluation_ref":evaluation_ref})).await;
+                        evaluation::record(store, &mut tx, ticket_ref, evaluation, payload, false)
+                            .await?;
+                    return commit(
+                        store,
+                        tx,
+                        key,
+                        request_digest,
+                        json!({
+                            "status": "deferred",
+                            "reason": "semantic_unknown",
+                            "ticket_ref": ticket_ref,
+                            "evaluation_ref": evaluation_ref,
+                        }),
+                    )
+                    .await;
                 }
                 Some(matches)
             } else {
@@ -636,7 +682,8 @@ impl Session {
             } = &mode
             {
                 let evaluation_ref =
-                    evaluation::record(store, &mut tx, ticket_ref, evaluation, payload, true).await?;
+                    evaluation::record(store, &mut tx, ticket_ref, evaluation, payload, true)
+                        .await?;
                 result["ticket_ref"] = json!(ticket_ref);
                 result["evaluation_ref"] = json!(evaluation_ref);
             }
@@ -658,8 +705,7 @@ impl Session {
                     },
                 };
                 let fire_key = fire.key()?;
-                let command = r#"CREATE ACTIVITY ?watch_fire {CLIENT KEY :key SET FIELDS {activity_class:"watch_fire",status:"completed"} SET STRUCTURAL {("inputs",:watch)}}"#;
-                let anda_kip::Command::Kml(statement) = anda_kip::parse_kip(command)? else {
+                let anda_kip::Command::Kml(statement) = anda_kip::parse_kip(WATCH_FIRE)? else {
                     unreachable!()
                 };
                 let parameters = Map::from_iter([
@@ -671,7 +717,7 @@ impl Session {
                     &mut tx,
                     &statement,
                     Some(&parameters),
-                    &anda_kip::Operation::new(command),
+                    &anda_kip::Operation::new(WATCH_FIRE),
                 )
                 .await
                 {
@@ -687,7 +733,11 @@ impl Session {
                 let activity = activity_id.to_string();
                 let wake_ref = runtime_ref(
                     "wake",
-                    &json!({"domain":"anda-brain:wake-v1","scope":checkpoint.config.scope,"fire_key":fire_key}),
+                    &json!({
+                        "domain": "anda-brain:wake-v1",
+                        "scope": checkpoint.config.scope,
+                        "fire_key": fire_key,
+                    }),
                 )?;
                 let wake = WakeRecord {
                     format: FORMAT.into(),

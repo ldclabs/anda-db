@@ -20,9 +20,9 @@
  * claim" to every question.
  */
 
-import { jsonEquals, type Json, type JsonMap } from '../json.js'
+import { jsonEquals, type Json } from '../json.js'
 import { ftsQuote } from '../sql.js'
-import { extractJsonText, segment, segmentToText } from '../tokenizer.js'
+import { extractJsonText, segmentToText } from '../tokenizer.js'
 import type { ElementKind } from '../id.js'
 import { decodeRow, type SqlRow } from './codec.js'
 import type { Element, ElementRow } from './rows.js'
@@ -31,23 +31,27 @@ import type { Element, ElementRow } from './rows.js'
 interface SearchableKind {
   fts: string
   table: string
+  /** The row columns the index is built from, one FTS column each. */
   columns: readonly string[]
-  /** The already-segmented text for each column, in column order. */
-  textOf(element: Element): string[]
+  /** The same fields as a rendered view names them. */
+  viewFields: readonly string[]
+  /** The segmented text of each column, from the fields in column order. */
+  textOf(values: readonly unknown[]): string[]
 }
+
+const strings = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 
 const CONCEPT: SearchableKind = {
   fts: 'fts_concepts',
   table: 'concepts',
   columns: ['name', 'aliases', 'attributes'],
-  textOf: (element) => {
-    const row = element.row as { name: string; aliases: string[]; attributes: JsonMap }
-    return [
-      segmentToText(row.name),
-      segmentToText(row.aliases.join(' ')),
-      segmentToText(extractJsonText(row.attributes).join(' ')),
-    ]
-  },
+  viewFields: ['name', 'aliases', 'attributes'],
+  textOf: ([name, aliases, attributes]) => [
+    segmentToText(typeof name === 'string' ? name : ''),
+    segmentToText(strings(aliases).join(' ')),
+    segmentToText(extractJsonText(attributes ?? {}).join(' ')),
+  ],
 }
 
 const PROPOSITION: SearchableKind = {
@@ -58,29 +62,34 @@ const PROPOSITION: SearchableKind = {
   // the words, and they are Concepts and Literals a search reaches on their
   // own terms.
   columns: ['predicate_ref'],
-  textOf: (element) => {
-    const row = element.row as { predicate_ref: string }
-    return [
-      // The exact symbol, segmented like anything else: `unicode61` splits it
-      // at the scheme and path separators, so `SEARCH PROPOSITION "prefers"`
-      // finds tuples under `kip://profiles/cognitive-memory@2.0.0/prefers`
-      // without the caller having to know the package it came from.
-      segmentToText(row.predicate_ref),
-    ]
-  },
+  viewFields: ['predicate_ref'],
+  // The exact symbol, segmented like anything else: `unicode61` splits it at
+  // the scheme and path separators, so `SEARCH PROPOSITION "prefers"` finds
+  // tuples under `kip://profiles/cognitive-memory@2.0.0/prefers` without the
+  // caller having to know the package it came from.
+  textOf: ([predicate]) => [segmentToText(typeof predicate === 'string' ? predicate : '')],
 }
 
 const EVIDENCE: SearchableKind = {
   fts: 'fts_evidence',
   table: 'evidence',
   columns: ['payload_inline'],
-  textOf: (element) => {
-    const row = element.row as { payload_inline: unknown }
-    return [segmentToText(extractJsonText(row.payload_inline).join(' '))]
-  },
+  viewFields: ['payload'],
+  textOf: ([payload]) => [segmentToText(extractJsonText(payload ?? null).join(' '))],
 }
 
-/** The kinds this engine indexes, keyed by element kind. */
+/**
+ * The tokens one rendered view is ranked on: the text the index would hold
+ * for the same fields, so a scan and an index rank one corpus alike.
+ */
+export function searchTokens(kind: ElementKind, view: Record<string, unknown>): string[] {
+  const searchable = SEARCHABLE[kind]
+  if (searchable === undefined) return []
+  return searchable
+    .textOf(searchable.viewFields.map((field) => view[field]))
+    .flatMap((text) => (text === '' ? [] : text.split(' ')))
+}
+
 export const SEARCHABLE: Readonly<Partial<Record<ElementKind, SearchableKind>>> = {
   Concept: CONCEPT,
   Proposition: PROPOSITION,
@@ -114,8 +123,10 @@ export function indexElement(
   }
   const rowid = element.row.id
   sql.exec(`DELETE FROM ${kind.fts} WHERE rowid = ?`, rowid)
+  sql.exec(`DELETE FROM search_docs WHERE kind = ? AND id = ?`, element.kind, rowid)
 
-  const text = kind.textOf(element)
+  const row = element.row as unknown as Record<string, unknown>
+  const text = kind.textOf(kind.columns.map((column) => row[column]))
   // An element with nothing to index stays out of the table entirely. An empty
   // row would still be a document FTS5 counts toward the average length that
   // BM25 divides by, so it would shift the scores of every real hit.
@@ -127,58 +138,89 @@ export function indexElement(
     rowid,
     ...text,
   )
+  sql.exec(
+    `INSERT INTO search_docs (kind, id, len) VALUES (?, ?, ?)`,
+    element.kind,
+    rowid,
+    text.reduce((n, value) => n + tokenCount(value), 0),
+  )
+}
+
+/** How many tokens a segmented column holds: they are joined by one space. */
+function tokenCount(text: string): number {
+  return text === '' ? 0 : text.split(' ').length
 }
 
 /** One scored hit, before the caller applies its own filters. */
-export interface SearchHit {
-  seq: number
-  score: number
-}
-
-export interface SearchQuery {
-  kind: ElementKind
-  space: string
-  /** The raw term. Segmented here, by the same function that indexed. */
-  term: string
-  /** How many rows to score. Callers over-fetch, because filters come after. */
-  limit: number
+/** One indexed document of a Space's corpus. */
+export interface CorpusDocument {
+  id: number
+  /** Its token count across the indexed columns. */
+  len: number
+  /** Its `schema_ref` or `predicate_ref`; empty for Evidence. */
+  symbol: string
 }
 
 /**
- * Scores one kind against a term, most relevant first.
+ * Every active, indexed document of one kind in a Space.
  *
- * The score is `-bm25()`: FTS5 returns a value that is *more negative* the
- * better the match, and every layer above this one — `THRESHOLD`, the sort, the
- * Rust engine it has to agree with — reads a score as bigger-is-better. Leaving
- * the sign alone would make the default `THRESHOLD 0.0` reject every hit.
- *
- * Space and lifecycle are joined from the element table rather than copied into
- * the index, so there is one copy of the truth about which Space a row is in.
+ * Reads the length table and a few element columns, never a row's content:
+ * this is the corpus whose statistics a whole-Space SEARCH scores with.
  */
-export function searchIndex(sql: SqlStorage, query: SearchQuery): SearchHit[] {
-  const kind = SEARCHABLE[query.kind]
-  if (kind === undefined) return []
-  const tokens = segment(query.term)
-  // A term that segments to nothing — punctuation, an empty string — is not an
-  // error and not a match. Handing FTS5 an empty MATCH would be a syntax error
-  // about a query the caller never wrote.
-  if (tokens.length === 0) return []
-
+export function searchCorpus(
+  sql: SqlStorage,
+  kind: ElementKind,
+  space: string,
+): CorpusDocument[] {
+  const searchable = SEARCHABLE[kind]
+  if (searchable === undefined) return []
+  const symbol =
+    kind === 'Concept' ? 'e.schema_ref' : kind === 'Proposition' ? 'e.predicate_ref' : `''`
   return sql
-    .exec<{ seq: number; score: number }>(
-      `SELECT f.rowid AS seq, -bm25(${kind.fts}) AS score
-         FROM ${kind.fts} f
-         JOIN ${kind.table} e ON e.id = f.rowid
-        WHERE ${kind.fts} MATCH ?
-          AND e.space = ?
-          AND e.state = 'active'
-        ORDER BY score DESC
-        LIMIT ?`,
-      ftsQuote(tokens),
-      query.space,
-      query.limit,
+    .exec<{ id: number; len: number; symbol: string }>(
+      `SELECT d.id AS id, d.len AS len, ${symbol} AS symbol
+         FROM search_docs d
+         JOIN ${searchable.table} e ON e.id = d.id
+        WHERE d.kind = ? AND e.space = ? AND e.state = 'active'`,
+      kind,
+      space,
     )
     .toArray()
+}
+
+/**
+ * How often each query token occurs in every indexed document of one kind
+ * that holds at least one of them, by id.
+ *
+ * The FTS match only narrows to candidates; the counts come from the stored
+ * segmented text, so they are the same tokens {@link searchCorpus} counted.
+ */
+export function termCounts(
+  sql: SqlStorage,
+  kind: ElementKind,
+  tokens: readonly string[],
+): Map<number, Map<string, number>> {
+  const searchable = SEARCHABLE[kind]
+  const out = new Map<number, Map<string, number>>()
+  if (searchable === undefined || tokens.length === 0) return out
+  const wanted = new Set(tokens)
+  for (const row of sql.exec<Record<string, SqlStorageValue>>(
+    `SELECT rowid AS id, ${searchable.columns.join(', ')}
+       FROM ${searchable.fts}
+      WHERE ${searchable.fts} MATCH ?`,
+    ftsQuote(tokens),
+  )) {
+    const counts = new Map<string, number>()
+    for (const column of searchable.columns) {
+      const text = String(row[column] ?? '')
+      if (text === '') continue
+      for (const token of text.split(' ')) {
+        if (wanted.has(token)) counts.set(token, (counts.get(token) ?? 0) + 1)
+      }
+    }
+    if (counts.size > 0) out.set(Number(row.id), counts)
+  }
+  return out
 }
 
 /**
@@ -198,6 +240,7 @@ export function rebuildSearch(sql: SqlStorage): void {
   for (const kind of SEARCH_TABLES) {
     sql.exec(`DELETE FROM ${kind.fts}`)
   }
+  sql.exec(`DELETE FROM search_docs`)
   for (const [name, kind] of Object.entries(SEARCHABLE) as [
     ElementKind,
     SearchableKind,

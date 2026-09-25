@@ -119,7 +119,12 @@ macro_rules! collections {
                         .map_err(db_error)?,
                     );
                 )*
-                Ok(Self { db, notifications: Arc::new(parking_lot::RwLock::new(None)), control_dirty: Arc::new(std::sync::atomic::AtomicBool::new(true)), $($field,)* })
+                Ok(Self {
+                    db,
+                    notifications: Arc::new(parking_lot::RwLock::new(None)),
+                    control_dirty: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    $($field,)*
+                })
             }
 
             /// Reloads every handle from storage.
@@ -132,25 +137,62 @@ macro_rules! collections {
                 [$(self.$field.get(),)*].into_iter()
             }
 
-            async fn control_fingerprint(&self,space:&crate::store::rows::SpaceRow)->Result<String,KipError> {
-                let mut values=serde_json::Map::new();
-                $(if $name!=AUDIT {
-                    let table=self.$field.get();let mut rows=vec![];
+            /// Every row of every control collection but the audit, read once
+            /// so a pass over several Spaces fingerprints each of them without
+            /// reading the plane again.
+            async fn control_rows(&self) -> Result<ControlRows, KipError> {
+                let mut out = Vec::new();
+                $(if $name != AUDIT {
+                    let table = self.$field.get();
+                    let mut rows = Vec::new();
                     for id in table.ids() {
-                        let row:$row=table.get_as(id).await.map_err(db_error)?;
-                        let value=serde_json::to_value(row).map_err(|e|KipError::internal_error(e.to_string()))?;
-                        if value["space_id"].as_str().is_none_or(|s|s.is_empty()||s==ANY_SPACE||s==space.space_id) {rows.push(value);}
+                        let row: $row = table.get_as(id).await.map_err(db_error)?;
+                        rows.push(
+                            serde_json::to_value(row)
+                                .map_err(|e| KipError::internal_error(e.to_string()))?,
+                        );
                     }
-                    values.insert($name.into(),Json::Array(rows));
+                    out.push(($name, rows));
                 })*
-                values.insert("space".into(),crate::store::space::authorization_config(space));
-                use sha2::Digest;
-                let bytes=serde_json::to_vec(&Json::Object(values)).map_err(|e|KipError::internal_error(e.to_string()))?;
-                Ok(format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes))))
+                Ok(out)
             }
-
         }
     };
+}
+
+/// The control plane's rows by collection name, as `control_rows` reads them.
+type ControlRows = Vec<(&'static str, Vec<Json>)>;
+
+/// The digest of what one Space's authorization rests on: its scoped control
+/// rows and its own authorization settings.
+fn control_fingerprint(
+    rows: &ControlRows,
+    space: &crate::store::rows::SpaceRow,
+) -> Result<String, KipError> {
+    use sha2::Digest;
+    let mut values = serde_json::Map::new();
+    for (name, rows) in rows {
+        let scoped = rows
+            .iter()
+            .filter(|value| {
+                value["space_id"]
+                    .as_str()
+                    .is_none_or(|s| s.is_empty() || s == ANY_SPACE || s == space.space_id)
+            })
+            .cloned()
+            .collect();
+        values.insert((*name).into(), Json::Array(scoped));
+    }
+    values.insert(
+        "space".into(),
+        crate::store::space::authorization_config(space),
+    );
+    let bytes = serde_json::to_vec(&Json::Object(values))
+        .map_err(|e| KipError::internal_error(e.to_string()))?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(bytes))
+    ))
 }
 
 collections! {
@@ -1319,7 +1361,10 @@ impl GovernanceStore {
                 status: "committed".into(),
                 transaction_class: "governance".into(),
                 schema_environment_version: space.schema_environment_version,
-                result: serde_json::json!({"mutation_audit_id":audit._id,"control_changes":[{"kind":if audit.operation=="publish_policy" {"policy"} else {"authorization"},"version":space.seq.to_string()}]}),
+                result: serde_json::json!({
+                    "mutation_audit_id": audit._id,
+                    "control_changes": [{"kind":if audit.operation=="publish_policy" {"policy"} else {"authorization"},"version":space.seq.to_string()}],
+                }),
                 origin: serde_json::json!({"principal_id":audit.principal_id}),
                 ..Default::default()
             };
@@ -1336,10 +1381,12 @@ impl GovernanceStore {
                 .flush(crate::tx::now_ms())
                 .await
                 .map_err(db_error)?;
+            let rows = self.control_rows().await?;
             self.checkpoint_control(
                 &controls.get(),
                 &space,
                 audit.operation == "control_recovery",
+                &rows,
             )
             .await?;
         }
@@ -1362,7 +1409,8 @@ impl GovernanceStore {
             .await
             .map_err(db_error)?;
         if ids.is_empty() {
-            self.checkpoint_control(&controls.get(), space, false)
+            let rows = self.control_rows().await?;
+            self.checkpoint_control(&controls.get(), space, false, &rows)
                 .await?;
         }
         Ok(())
@@ -1378,6 +1426,7 @@ impl GovernanceStore {
         table: &Collection,
         space: &crate::store::rows::SpaceRow,
         gap: bool,
+        rows: &ControlRows,
     ) -> Result<(), KipError> {
         let key = "internal/governance";
         let ids = table
@@ -1412,7 +1461,10 @@ impl GovernanceStore {
             seq: space.seq,
             version: 1,
             kind: "internal".into(),
-            value: serde_json::json!({"fingerprint":self.control_fingerprint(space).await?,"coverage_floor":floor}),
+            value: serde_json::json!({
+                "fingerprint": control_fingerprint(rows, space)?,
+                "coverage_floor": floor,
+            }),
             origin: Json::Null,
         };
         if let Some(old) = old {
@@ -1439,6 +1491,9 @@ impl GovernanceStore {
         let Some((spaces, _, controls)) = self.notifications.read().clone() else {
             return Ok(());
         };
+        // Read once for every Space: a delivery notice changes Space rows and
+        // the journal, never the control rows a fingerprint covers.
+        let rows = self.control_rows().await?;
         for id in spaces.get().ids() {
             let space: crate::store::rows::SpaceRow =
                 spaces.get().get_as(id).await.map_err(db_error)?;
@@ -1463,7 +1518,7 @@ impl GovernanceStore {
             };
             if let Some(old) = old {
                 if old.value["fingerprint"].as_str()
-                    != Some(self.control_fingerprint(&space).await?.as_str())
+                    != Some(control_fingerprint(&rows, &space)?.as_str())
                 {
                     let audit = GovernanceAuditRow {
                         at: time::now(),
@@ -1475,7 +1530,7 @@ impl GovernanceStore {
                     self.notify_control(&audit).await?;
                 }
             } else {
-                self.checkpoint_control(&controls.get(), &space, false)
+                self.checkpoint_control(&controls.get(), &space, false, &rows)
                     .await?;
             }
         }
@@ -1484,21 +1539,29 @@ impl GovernanceStore {
         Ok(())
     }
 
+    /// Appends one audit entry a commit plan carries, tagged with `token`.
+    ///
+    /// `replay` is a recovery pass, where the entry may already be durable and
+    /// is appended only when no entry carries the token yet.
     pub(crate) async fn replay_mutation(
         &self,
         mut row: GovernanceAuditRow,
         token: &str,
+        replay: bool,
     ) -> Result<(), KipError> {
-        let ids = self
-            .audit
-            .get()
-            .query_all_ids(eq_field("resource", Fv::Text(row.resource.clone())))
-            .await
-            .map_err(db_error)?;
-        for id in ids {
-            let old: GovernanceAuditRow = self.audit.get().get_as(id).await.map_err(db_error)?;
-            if old.record.get("_kip_commit").and_then(Json::as_str) == Some(token) {
-                return Ok(());
+        if replay {
+            let ids = self
+                .audit
+                .get()
+                .query_all_ids(eq_field("resource", Fv::Text(row.resource.clone())))
+                .await
+                .map_err(db_error)?;
+            for id in ids {
+                let old: GovernanceAuditRow =
+                    self.audit.get().get_as(id).await.map_err(db_error)?;
+                if old.record.get("_kip_commit").and_then(Json::as_str) == Some(token) {
+                    return Ok(());
+                }
             }
         }
         row.record["_kip_commit"] = Json::String(token.into());

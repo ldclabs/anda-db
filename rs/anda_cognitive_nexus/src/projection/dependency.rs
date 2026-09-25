@@ -37,9 +37,12 @@ impl Context<'_> {
         at: &str,
     ) -> Result<Json, KipError> {
         if policy.trust_version == "unavailable" {
-            return Ok(
-                serde_json::json!({"status":"unverifiable","action_eligible":false,"reasons":["historical projection control state unavailable"],"basis":self.projection_basis(policy,at,None)}),
-            );
+            return Ok(serde_json::json!({
+                "status": "unverifiable",
+                "action_eligible": false,
+                "reasons": ["historical projection control state unavailable"],
+                "basis": self.projection_basis(policy,at,None),
+            }));
         }
         let cache_key = crate::schema::contracts::digest(&serde_json::json!([
             element.id().to_string(),
@@ -173,7 +176,7 @@ impl Context<'_> {
             if !row
                 .outputs
                 .iter()
-                .any(|r| r.as_str().or_else(|| r["id"].as_str()) == Some(id.to_string().as_str()))
+                .any(|r| crate::term::reference_text(r) == Some(id.to_string().as_str()))
             {
                 continue;
             }
@@ -192,7 +195,14 @@ impl Context<'_> {
                 "exact producing DependencyBasis unavailable",
             ));
         };
-        if crate::schema::contracts::validate_value(&serde_json::json!({"$ref":"urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis"}), &contract).is_err() {
+        if crate::schema::contracts::validate_value(
+            &serde_json::json!({
+                "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/DependencyBasis",
+            }),
+            &contract,
+        )
+        .is_err()
+        {
             return Ok(Validity::issue(2, "dependency contract is invalid"));
         }
         let basis = serde_json::to_value(self.projection_basis(policy, at, None)).unwrap();

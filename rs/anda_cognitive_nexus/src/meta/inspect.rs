@@ -31,20 +31,40 @@ use crate::store::history::CursorFamily;
 /// One ranked, authorized hit: relevance score, element, redacted view.
 pub(crate) type Hit = (f64, ElementId, std::sync::Arc<Json>);
 
+/// What one search asks for, as the META statement and the KQL Search
+/// Pattern (§43.8) both spell it.
+pub(crate) struct SearchSpec<'a> {
+    pub target: SearchTarget,
+    pub term: &'a Scalar,
+    pub with_type: Option<&'a Scalar>,
+    pub with_predicate: Option<&'a Scalar>,
+    pub mode: Option<&'a Scalar>,
+    pub threshold: Option<&'a Scalar>,
+}
+
 /// Ranks the authorized, redacted corpus for one search (§66), best first.
 ///
 /// Shared by the META `SEARCH` statement and the KQL Search Pattern (§43.8),
 /// so the two cannot drift into different notions of a hit. The second value
 /// is the tightest `max_results` a Grant placed on the hits.
+///
+/// `want` is how many hits the caller can use. A caller whose authority
+/// reaches the whole Space unnarrowed is ranked from the persistent index and
+/// reads only those hits; any other reads its whole authorized corpus, where
+/// the bound changes nothing.
 pub(crate) async fn rank(
     cx: &mut Context<'_>,
-    target: SearchTarget,
-    term: &Scalar,
-    with_type: Option<&Scalar>,
-    with_predicate: Option<&Scalar>,
-    mode: Option<&Scalar>,
-    threshold: Option<&Scalar>,
+    spec: &SearchSpec<'_>,
+    want: usize,
 ) -> Result<(Vec<Hit>, Option<usize>), KipError> {
+    let SearchSpec {
+        target,
+        term,
+        with_type,
+        with_predicate,
+        mode,
+        threshold,
+    } = *spec;
     let term = scalar_str(cx, term, "SEARCH")?;
     if let Some(mode) = mode {
         let mode = scalar_str(cx, mode, "MODE")?;
@@ -128,6 +148,21 @@ pub(crate) async fn rank(
         }
     };
 
+    if !cx.is_historical()
+        && cx.authority.searches_whole_space(cx.auth)
+        && let Some(hits) = rank_indexed(
+            cx,
+            kind,
+            &term,
+            with_type.as_deref().or(with_predicate.as_deref()),
+            threshold,
+            want,
+        )
+        .await?
+    {
+        return Ok((hits, None));
+    }
+
     // Rank only the authorized, redacted corpus. Filtering global BM25 hits
     // afterwards leaks hidden document statistics and can crowd visible hits
     // out of an over-fetch window. This temporary index changes no stored state.
@@ -141,7 +176,10 @@ pub(crate) async fn rank(
     let mut views = std::collections::BTreeMap::new();
     let mut filters = vec![
         crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
-        crate::store::eq_field("state", anda_db_schema::Fv::Text("active".into())),
+        crate::store::eq_field(
+            "state",
+            anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
+        ),
     ];
     let selector = match kind {
         ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
@@ -214,22 +252,128 @@ pub(crate) async fn rank(
     }
     // Score all admitted documents before applying the threshold or page.
     for (seq, raw_score) in index.search(&term, views.len(), None) {
-        let raw_score = f64::from(raw_score);
-        if !raw_score.is_finite() || raw_score < 0.0 {
-            return Err(KipError::internal_error("invalid SEARCH ranking score"));
-        }
-        let score = raw_score / (1.0 + raw_score);
+        let score = normalized(raw_score)?;
         if score < threshold {
             continue;
         }
         let rendered = views[&seq].clone();
         hits.push((score, ElementId::new(kind, seq), rendered));
     }
-    hits.sort_by(|a, b| {
-        b.0.total_cmp(&a.0)
-            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
-    });
+    hits.sort_by(|a, b| by_rank((a.0, a.1), (b.0, b.1)));
     Ok((hits, cap))
+}
+
+/// Best first; equal scores in id order, so a traversal pages stably.
+fn by_rank(a: (f64, ElementId), b: (f64, ElementId)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0)
+        .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+}
+
+/// A raw BM25 score as `retrieval.score`: `s / (1 + s)`, in `[0, 1)`.
+fn normalized(raw: f32) -> Result<f64, KipError> {
+    let raw = f64::from(raw);
+    if !raw.is_finite() || raw < 0.0 {
+        return Err(KipError::internal_error("invalid SEARCH ranking score"));
+    }
+    Ok(raw / (1.0 + raw))
+}
+
+/// Ranks a caller's whole-Space corpus straight from the persistent index.
+///
+/// For a caller whose authority reaches every element unnarrowed, the
+/// authorized corpus *is* the Space's active corpus of the kind, so a search
+/// scoped to exactly those documents scores them as the scan would — no other
+/// Space's text and no inactive record moves a statistic (§66.4) — and only
+/// the hits a caller can use are read. `None` sends the caller back to the
+/// scan: a hit that is not readable after all.
+async fn rank_indexed(
+    cx: &mut Context<'_>,
+    kind: ElementKind,
+    term: &str,
+    lineage: Option<&str>,
+    threshold: f64,
+    want: usize,
+) -> Result<Option<Vec<Hit>>, KipError> {
+    let collection = cx.store.elements(kind);
+    let (fields, symbol_column): (&[&str], &str) = match kind {
+        ElementKind::Concept => (&["name", "aliases", "attributes"], "schema_ref"),
+        ElementKind::Proposition => (&["predicate_ref"], "predicate_ref"),
+        _ => (&["payload_inline"], ""),
+    };
+    let mut filters = vec![
+        Box::new(crate::store::eq_field(
+            "space",
+            anda_db_schema::Fv::Text(cx.space.clone()),
+        )),
+        Box::new(crate::store::eq_field(
+            "state",
+            anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
+        )),
+    ];
+    if let Some(symbol) = lineage {
+        // The range spans the whole package, so the symbols in it that are
+        // this lineage are picked off the index keys: the scope is exact
+        // without reading a row.
+        let Some((low, high)) = crate::schema::lineage_range(symbol) else {
+            return Ok(None);
+        };
+        let keys = collection
+            .get_btree_index(&[symbol_column])
+            .map_err(crate::error::db_error)?
+            .range_query_with(
+                anda_db::query::RangeQuery::Between(
+                    anda_db_schema::Fv::Text(low),
+                    anda_db_schema::Fv::Text(high),
+                ),
+                |key, _| {
+                    let same = matches!(&key, anda_db_schema::Fv::Text(text)
+                        if crate::schema::same_lineage(text, symbol));
+                    (true, if same { vec![key] } else { vec![] })
+                },
+            );
+        if keys.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        filters.push(Box::new(anda_db::query::Filter::Field((
+            symbol_column.into(),
+            anda_db::query::RangeQuery::Include(keys),
+        ))));
+    }
+    let scope = collection
+        .query_all_ids(anda_db::query::Filter::And(filters))
+        .await
+        .map_err(crate::error::db_error)?;
+    let scored = collection
+        .get_bm25_index(fields)
+        .map_err(crate::error::db_error)?
+        .search_scoped(term, scope.len().max(1), None, &scope);
+    let mut ranked = Vec::with_capacity(scored.len());
+    for (seq, raw) in scored {
+        let score = normalized(raw)?;
+        if score >= threshold {
+            ranked.push((score, ElementId::new(kind, seq)));
+        }
+    }
+    ranked.sort_by(|a, b| by_rank(*a, *b));
+    let mut hits = Vec::with_capacity(want.min(ranked.len()));
+    for (score, id) in ranked.into_iter().take(want) {
+        cx.charge(1)?;
+        let Some(element) = cx.load(id).await? else {
+            return Ok(None);
+        };
+        let decision = cx.authority.authorize(
+            crate::governance::Permission::Search,
+            &crate::governance::ResourceContext::of_element(&element),
+            cx.auth,
+        );
+        if !element.is_active() || !decision.is_permitted() {
+            return Ok(None);
+        }
+        let mut rendered = cx.view_of(id).as_ref().clone();
+        crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
+        hits.push((score, id, std::sync::Arc::new(rendered)));
+    }
+    Ok(Some(hits))
 }
 
 pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
@@ -257,16 +401,16 @@ pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Ans
         None => 0,
     };
     let term = scalar_str(cx, &command.term, "SEARCH")?;
-    let (ranked, cap) = rank(
-        cx,
-        command.target,
-        &command.term,
-        command.with_type.as_ref(),
-        command.with_predicate.as_ref(),
-        command.mode.as_ref(),
-        command.threshold.as_ref(),
-    )
-    .await?;
+    let spec = SearchSpec {
+        target: command.target,
+        term: &command.term,
+        with_type: command.with_type.as_ref(),
+        with_predicate: command.with_predicate.as_ref(),
+        mode: command.mode.as_ref(),
+        threshold: command.threshold.as_ref(),
+    };
+    // One past the page: enough to know whether another page remains.
+    let (ranked, cap) = rank(cx, &spec, offset + limit + 1).await?;
     let search_limit = cap.map_or(limit, |cap| cap.min(limit));
     let hits: Vec<(f64, Json)> = ranked
         .into_iter()

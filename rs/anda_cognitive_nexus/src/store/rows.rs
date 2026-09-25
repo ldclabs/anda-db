@@ -319,6 +319,9 @@ pub struct EvidenceRow {
     pub source_refs: Vec<Json>,
     /// The source references' equality keys.
     pub source_keys: Vec<String>,
+    /// The standard learning records this Evidence carries, and their
+    /// Space-unique identities; see [`ActivityRow::record_keys`].
+    pub record_keys: Option<Vec<String>>,
     /// The Activity that produced it.
     pub generated_by: String,
     /// The correction state: `active` or `corrected`.
@@ -382,6 +385,14 @@ pub struct ActivityRow {
     pub outputs: Vec<Json>,
     /// The outputs' equality keys.
     pub output_keys: Vec<String>,
+    /// The standard learning records this Activity carries (`AttemptRecord`,
+    /// `EvaluationRecord`, …) and their Space-unique identities
+    /// (`AttemptRecord:<attempt_id>`), derived from the Facets.
+    ///
+    /// Indexed so validating a learning record reads the records it is
+    /// checked against rather than every Activity in the Space. Optional
+    /// because it was added to stored rows by a schema upgrade.
+    pub record_keys: Option<Vec<String>>,
     /// The semantic actors involved — not authenticated Principals.
     pub associated_actors: Vec<Json>,
     /// A digest of the parameters it ran with.

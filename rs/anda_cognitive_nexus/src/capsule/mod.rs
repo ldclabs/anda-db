@@ -363,9 +363,11 @@ fn schema_dependencies(cx: &Context<'_>, refs: &BTreeSet<String>) -> Vec<SchemaD
 pub fn payload_digest(payload: &CapsulePayload) -> Result<String, KipError> {
     let value = serde_json::to_value(payload)
         .map_err(|err| KipError::internal_error(format!("a Capsule failed to encode: {err}")))?;
-    let canonical = anda_kip::try_canonical_json(
-        &serde_json::json!({"format": anda_kip::CAPSULE_FORMAT, "format_version": anda_kip::CAPSULE_VERSION, "payload": value}),
-    )?;
+    let canonical = anda_kip::try_canonical_json(&serde_json::json!({
+        "format": anda_kip::CAPSULE_FORMAT,
+        "format_version": anda_kip::CAPSULE_VERSION,
+        "payload": value,
+    }))?;
     use sha2::{Digest, Sha256};
     Ok(format!(
         "{DIGEST_PROFILE}:{}",

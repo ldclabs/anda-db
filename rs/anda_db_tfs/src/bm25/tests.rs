@@ -2554,3 +2554,52 @@ fn test_tokenize_failed_truncates_text() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+#[test]
+fn a_scoped_search_scores_as_a_fresh_index_of_the_scope() {
+    let scoped_docs = [
+        (1, "apple banana apple"),
+        (2, "banana cherry"),
+        (3, "apple cherry durian elderberry"),
+    ];
+    let outside_docs = [
+        (10, "apple apple apple apple"),
+        (11, "apple"),
+        (12, "banana banana"),
+        (
+            13,
+            "a very long document about fig grape honeydew kiwi lemon mango",
+        ),
+    ];
+    let whole = BM25Index::new("scoped_whole".to_string(), default_tokenizer(), None);
+    let fresh = BM25Index::new("scoped_fresh".to_string(), default_tokenizer(), None);
+    for (id, text) in scoped_docs {
+        whole.insert(id, text, 0).unwrap();
+        fresh.insert(id, text, 0).unwrap();
+    }
+    for (id, text) in outside_docs {
+        whole.insert(id, text, 0).unwrap();
+    }
+
+    for query in ["apple", "banana cherry", "apple durian", "missing"] {
+        let expected = fresh.search(query, 10, None);
+        // Unknown ids and duplicates in the scope change nothing.
+        let actual = whole.search_scoped(query, 10, None, &[3, 1, 2, 2, 99]);
+        assert_eq!(expected.len(), actual.len(), "{query}");
+        for ((expected_id, expected_score), (actual_id, actual_score)) in
+            expected.iter().zip(&actual)
+        {
+            assert_eq!(expected_id, actual_id, "{query}");
+            assert!((expected_score - actual_score).abs() < 1e-6, "{query}");
+        }
+        // The outside documents do move a global in-ids search.
+        if query == "apple" {
+            let global = whole
+                .try_search_in_ids(query, 10, None, &[1, 2, 3], false)
+                .unwrap();
+            assert!((global[0].1 - actual[0].1).abs() > 1e-6);
+        }
+    }
+    assert!(whole.search_scoped("apple", 10, None, &[]).is_empty());
+    assert!(whole.search_scoped("apple", 0, None, &[1]).is_empty());
+}

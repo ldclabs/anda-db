@@ -78,9 +78,9 @@ export {
   SEARCH_TABLES,
   indexElement,
   rebuildSearch,
-  searchIndex,
-  type SearchHit,
-  type SearchQuery,
+  searchCorpus,
+  termCounts,
+  type CorpusDocument,
 } from './search.js'
 
 export {

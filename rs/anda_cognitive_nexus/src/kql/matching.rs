@@ -33,6 +33,14 @@ use crate::schema::{Intent, SymbolKind};
 use crate::store::{eq_field, key_filter};
 use crate::term::Endpoint;
 
+/// Whether a tuple endpoint is an inline pattern — a nested Proposition or a
+/// matcher that searches rather than names — which is expanded into its own
+/// solutions before the tuple is matched.
+fn is_inline_pattern(term: &Term) -> bool {
+    matches!(term, Term::Proposition(_))
+        || matches!(term, Term::Match(matcher) if !identity_matcher(matcher))
+}
+
 /// The internal handle a `BELIEF (triple)` binds its resolved Proposition to.
 ///
 /// Named rather than spelled inline because it is a variable name that must not
@@ -288,7 +296,10 @@ impl Context<'_> {
         }
         let constrains_state = matcher.contains_key("state");
         if !constrains_state {
-            filters.push(eq_field("state", Fv::Text("active".into())));
+            filters.push(eq_field(
+                "state",
+                Fv::Text(crate::store::rows::state::ACTIVE.into()),
+            ));
         }
         let ids = match by_id {
             Some(id) => vec![id],
@@ -515,9 +526,7 @@ impl Context<'_> {
         known: &'s Solutions,
     ) -> EndpointExpansionFuture<'s> {
         Box::pin(async move {
-            let is_pattern = matches!(term, Term::Proposition(_))
-                || matches!(term, Term::Match(matcher) if !identity_matcher(matcher));
-            if !is_pattern {
+            if !is_inline_pattern(term) {
                 return Ok((term.clone(), Solutions::unit(), None));
             }
             let variable = format!("\0inline{}", self.next_internal_variable);
@@ -551,6 +560,10 @@ impl Context<'_> {
         triple: &PropositionTriple,
         known: &Solutions,
     ) -> Result<Solutions, KipError> {
+        // No inline pattern at either end: nothing to expand or join back.
+        if !is_inline_pattern(&triple.subject) && !is_inline_pattern(&triple.object) {
+            return self.match_tuple_simple(variable, triple, known).await;
+        }
         let (subject, left, left_var) = self.expand_endpoint(&triple.subject, known).await?;
         let scope = self.join(known.clone(), left.clone())?;
         let (object, right, right_var) = self.expand_endpoint(&triple.object, &scope).await?;
@@ -607,7 +620,7 @@ impl Context<'_> {
 
         let mut filters = vec![
             eq_field("space", Fv::Text(self.space.clone())),
-            eq_field("state", Fv::Text("active".to_string())),
+            eq_field("state", Fv::Text(crate::store::rows::state::ACTIVE.into())),
         ];
         if let Some(keys) = &subject_keys {
             filters.push(key_filter("subject_key", keys));
@@ -1166,6 +1179,7 @@ impl Context<'_> {
         };
 
         let mut pairs: Vec<(Endpoint, Endpoint)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for start in starts {
             if let Endpoint::Local(id) = &start {
                 if self
@@ -1187,7 +1201,7 @@ impl Context<'_> {
                     } else {
                         (endpoint, start.clone())
                     };
-                    if !pairs.contains(&pair) {
+                    if seen.insert((pair.0.key(), pair.1.key())) {
                         pairs.push(pair);
                     }
                 }
@@ -1251,7 +1265,9 @@ impl Context<'_> {
         forward: bool,
     ) -> Result<Vec<Endpoint>, KipError> {
         let mut reached: Vec<Endpoint> = Vec::new();
+        let mut reached_keys = std::collections::HashSet::new();
         if walk.hops.min == 0 && matches!(start, Endpoint::Local(_)) {
+            reached_keys.insert(start.key());
             reached.push(start.clone());
         }
         let mut visited = std::collections::HashSet::new();
@@ -1285,7 +1301,7 @@ impl Context<'_> {
                     if !visited.insert((neighbour.key(), state_depth)) {
                         continue;
                     }
-                    if depth >= walk.hops.min && !reached.contains(&neighbour) {
+                    if depth >= walk.hops.min && reached_keys.insert(neighbour.key()) {
                         reached.push(neighbour.clone());
                     }
                     next.push(neighbour);
@@ -1317,7 +1333,10 @@ impl Context<'_> {
                 ElementKind::Proposition,
                 Some(Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
-                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    Box::new(eq_field(
+                        "state",
+                        Fv::Text(crate::store::rows::state::ACTIVE.into()),
+                    )),
                     Box::new(key_filter(anchor, &anchor_keys)),
                     Box::new(predicate_filter(&self.env, symbols)),
                 ])),
@@ -1368,7 +1387,10 @@ impl Context<'_> {
                 ElementKind::Proposition,
                 Some(Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(self.space.clone()))),
-                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    Box::new(eq_field(
+                        "state",
+                        Fv::Text(crate::store::rows::state::ACTIVE.into()),
+                    )),
                     Box::new(predicate_filter(&self.env, symbols)),
                 ])),
             )
@@ -1377,6 +1399,7 @@ impl Context<'_> {
 
         let historical = self.is_historical();
         let mut subjects: Vec<Endpoint> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for id in ids {
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
@@ -1391,7 +1414,7 @@ impl Context<'_> {
             }
             let canonical = self.canonical_endpoint(&row.subject).await?;
             if let Ok(endpoint) = Endpoint::from_json(&canonical)
-                && !subjects.contains(&endpoint)
+                && seen.insert(endpoint.key())
             {
                 subjects.push(endpoint);
             }

@@ -201,7 +201,11 @@ pub async fn changes(cx: &mut Context<'_>, command: &ChangesCommand) -> Result<A
     let consumed = rows.last().map(|row| row.seq);
     visible_changes(cx, &mut rows).await?;
 
-    let coverage = serde_json::json!({"through_seq":if complete {cx.pinned_seq} else {consumed.unwrap_or(after)},"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
+    let coverage = serde_json::json!({
+        "through_seq": if complete {cx.pinned_seq} else {consumed.unwrap_or(after)},
+        "complete": complete,
+        "authorization_view": cx.projection_basis(&cx.policy,&cx.at,None).authorization_view,
+    });
     let page: Vec<Json> = rows
         .iter()
         .map(|row| {
@@ -428,7 +432,11 @@ pub(crate) async fn change_page_through(
         rows.last().map_or(after, |r| r.seq)
     };
     visible_changes(cx, &mut rows).await?;
-    let coverage = serde_json::json!({"through_seq":through,"complete":complete,"authorization_view":cx.projection_basis(&cx.policy,&cx.at,None).authorization_view});
+    let coverage = serde_json::json!({
+        "through_seq": through,
+        "complete": complete,
+        "authorization_view": cx.projection_basis(&cx.policy,&cx.at,None).authorization_view,
+    });
     let changes: Vec<_> = rows
         .iter()
         .map(|r| {
@@ -437,9 +445,13 @@ pub(crate) async fn change_page_through(
             value
         })
         .collect();
-    Ok(
-        serde_json::json!({"changes":changes,"coverage":coverage,"through_time":cx.at,"next_cursor":through.to_string(),"resync_required":after<floor}),
-    )
+    Ok(serde_json::json!({
+        "changes": changes,
+        "coverage": coverage,
+        "through_time": cx.at,
+        "next_cursor": through.to_string(),
+        "resync_required": after<floor,
+    }))
 }
 
 /// One journal row as the Change Envelope §36.1 fixes.

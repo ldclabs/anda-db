@@ -54,7 +54,7 @@ use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::id::ElementId;
 use crate::schema::SchemaEnvironment;
 use crate::store::rows::*;
-use crate::store::{Element, Store, eq_field};
+use crate::store::{Element, Store};
 use crate::term::{Endpoint, tuple_keys};
 use crate::tx::Transaction;
 
@@ -297,7 +297,10 @@ async fn resolve_existing(
     record: &Record,
 ) -> Result<Option<ElementId>, KipError> {
     let key = import_key(digest, &record.source_id);
-    if let Some(id) = find_by_client_key(store, space_id, record.kind, &key).await? {
+    if let Some(id) = store
+        .find_by_client_key(space_id, record.kind, &key)
+        .await?
+    {
         return Ok(Some(id));
     }
     if record.kind == ElementKind::Concept
@@ -310,30 +313,6 @@ async fn resolve_existing(
         return Ok(Some(id));
     }
     Ok(None)
-}
-
-async fn find_by_client_key(
-    store: &Store,
-    space_id: &str,
-    kind: ElementKind,
-    key: &str,
-) -> Result<Option<ElementId>, KipError> {
-    if kind == ElementKind::Proposition {
-        // A Proposition has no client key: its identity is its tuple.
-        return Ok(None);
-    }
-    let ids = store
-        .elements(kind)
-        .query_all_ids(anda_db::query::Filter::And(vec![
-            Box::new(eq_field("space", anda_db_schema::Fv::Text(space_id.into()))),
-            Box::new(eq_field(
-                "client_key",
-                anda_db_schema::Fv::Text(key.to_string()),
-            )),
-        ]))
-        .await
-        .map_err(crate::error::db_error)?;
-    Ok(ids.first().map(|seq| ElementId::new(kind, *seq)))
 }
 
 /// Step 3: the Proposition this tuple already is, once its endpoints are

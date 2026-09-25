@@ -9,9 +9,11 @@
 //! construction (Spec §26) — not because a validator rejects them, but because
 //! the only code that writes them is this module.
 //!
-//! **Every write advances the Space sequence.** `space_seq` is the coordinate
+//! **Every commit advances the Space sequence.** `space_seq` is the coordinate
 //! `CHANGES` pages through and `AS OF SEQ` reads at, so a mutation that skipped
-//! it would be invisible to both.
+//! it would be invisible to both. A transaction reserves nothing while it is
+//! planned; it takes its sequence in the redo plan that writes its rows, so a
+//! dry run, a refusal or a no-op leaves the coordinate where it was.
 //!
 //! **A version bump is a fact, not a courtesy.** `EXPECT VERSION` is the only
 //! optimistic-concurrency primitive KIP has (§81), and it compares against this
@@ -175,6 +177,10 @@ macro_rules! refresh_keys {
             .iter()
             .map(crate::kml::clauses::endpoint_key)
             .collect();
+        $row.record_keys = crate::tx::learning_record_keys(&$row.facets);
+    };
+    ($row:ident, Evidence) => {
+        $row.record_keys = crate::tx::learning_record_keys(&$row.facets);
     };
     ($row:ident, $kind:ident) => {};
 }
@@ -247,6 +253,30 @@ pub struct WriteContext {
 }
 
 impl WriteContext {
+    /// The context of a transaction opening on a Space's current snapshot.
+    ///
+    /// Its sequence is the one the transaction will produce if it commits, and
+    /// `{space}#{seq}` its id: a sequence is taken once and never reused, so
+    /// the pair is a unique transaction identity that reads as the history
+    /// coordinate it is. Nothing is reserved here: the commit's redo plan
+    /// takes the sequence with the rows it writes.
+    pub fn tentative(space: &SpaceRow, origin: Json) -> Result<Self, KipError> {
+        let seq = space
+            .seq
+            .checked_add(1)
+            .filter(|n| *n <= anda_kip::MAX_SAFE_INTEGER)
+            .ok_or_else(|| {
+                KipError::resource_exhausted("Space sequence exceeds the portable numeric range")
+            })?;
+        Ok(Self {
+            tx_id: format!("{}#{seq}", space.space_id),
+            space: space.space_id.clone(),
+            seq,
+            at: crate::time::now(),
+            origin,
+        })
+    }
+
     /// Stamps a freshly created element.
     fn stamp_new<R: Row>(&self, row: &mut R) {
         let envelope = row.envelope_mut();
@@ -326,7 +356,7 @@ impl Store {
     /// The version-bumping [`Store::update`] is the right primitive for a
     /// standalone edit; this one is for a transaction commit, where the
     /// version was already decided once for the whole transaction (§44).
-    pub(crate) async fn put_row<R: Row>(&self, row: &R) -> Result<(), KipError> {
+    pub async fn put<R: Row>(&self, row: &R) -> Result<(), KipError> {
         let collection = self.elements(R::KIND);
         let id = row.id();
         let fields = super::full_row_fields(collection.schema(), row)?;

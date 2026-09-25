@@ -46,9 +46,12 @@ use crate::store::rows::*;
 use crate::store::space::JournalEntry;
 use crate::store::write::{Row, WriteContext};
 use crate::store::{Element, Store};
+use crate::term::{element_reference, reference_text};
 mod cognitive;
 mod durable;
 mod learning;
+
+pub(crate) use learning::learning_record_keys;
 
 /// The engine state one KML statement runs against.
 pub struct Transaction {
@@ -112,6 +115,10 @@ pub struct Transaction {
     /// that disagree have no answer that is not the engine choosing one.
     assignments: BTreeMap<(ElementId, String), Option<Json>>,
     handle_views: BTreeMap<ElementId, Element>,
+    /// Keeps this run's pending tuple keys apart from any other run's: a
+    /// sequence is only reserved at commit, so two runs can open on the same
+    /// tentative coordinate.
+    shell_tag: String,
     /// The ActorBinding this transaction exercised, when an Assertion was
     /// written under one (§28.3); reported in the Receipt's `origin` (§33.2).
     exercised_binding: Option<String>,
@@ -149,7 +156,10 @@ pub struct Guard {
 }
 
 impl Transaction {
-    /// Opens a transaction, allocating its Space sequence.
+    /// Opens a transaction on the Space's current snapshot.
+    ///
+    /// The sequence it would produce is only reserved when it commits a
+    /// change; see [`WriteContext::tentative`].
     pub async fn begin(
         store: &Store,
         space_id: &str,
@@ -158,8 +168,11 @@ impl Transaction {
         authority: EffectiveAuthority,
         auth: AuthContext,
     ) -> Result<Self, KipError> {
-        let env = store.schema_environment(space_id).await?;
-        let cx = store.begin_transaction(space_id, origin).await?;
+        let space = store.get_space(space_id).await?;
+        let env = store
+            .schema_environment_at(space_id, space.schema_environment_version)
+            .await?;
+        let cx = WriteContext::tentative(&space, origin)?;
         Ok(Self::at_context(store, cx, env, dry_run, authority, auth))
     }
 
@@ -200,6 +213,11 @@ impl Transaction {
             structural_positions: BTreeMap::new(),
             assignments: BTreeMap::new(),
             handle_views: BTreeMap::new(),
+            shell_tag: format!(
+                "{}.{}",
+                now_ms(),
+                TX_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
             exercised_binding: None,
         }
     }
@@ -383,7 +401,7 @@ impl Transaction {
                 // `tuple_key` is unique-indexed, so two default shells would
                 // collide on the empty string before either had a real tuple.
                 self.insert_shell(PropositionRow {
-                    tuple_key: format!("pending:{}:{ordinal}", self.cx.tx_id),
+                    tuple_key: format!("pending:{}:{}:{ordinal}", self.cx.tx_id, self.shell_tag),
                     ..Default::default()
                 })
                 .await?
@@ -533,18 +551,22 @@ impl Transaction {
     /// An element this same transaction is staging needs no lookup: a
     /// transaction writes into one Space, so anything it mints is in it.
     async fn check_reference_closure(&self) -> Result<(), KipError> {
+        // Each referenced element is read once, however many rows cite it.
+        let mut referenced: BTreeMap<ElementId, ElementId> = BTreeMap::new();
         for (id, staged) in &self.staged {
             if !staged.changed {
                 continue;
             }
-            for referenced in staged.row.references() {
-                if self.staged.contains_key(&referenced) {
-                    continue;
+            for target in staged.row.references() {
+                if !self.staged.contains_key(&target) {
+                    referenced.entry(target).or_insert(*id);
                 }
-                self.store
-                    .check_same_space(&self.cx.space, *id, referenced)
-                    .await?;
             }
+        }
+        for (target, from) in referenced {
+            self.store
+                .check_same_space(&self.cx.space, from, target)
+                .await?;
         }
         Ok(())
     }
@@ -980,22 +1002,16 @@ impl Transaction {
         entry: JournalEntry,
         redo_owned: &mut bool,
     ) -> Result<Outcome, KipError> {
-        if let Err(error) = async {
-            Box::pin(self.validate_core_schema()).await?;
-            self.propagate_governance().await?;
-            self.check_reference_closure().await?;
-            self.check_concept_key_identity().await?;
-            self.capture_cognitive_contracts().await?;
-            self.validate_learning().await?;
-            self.validate_durable()?;
-            self.capture_erasure_edges().await?;
-            self.validate_erasure().await
-        }
-        .await
-        {
-            self.discard_shells().await;
-            return Err(error);
-        }
+        // A failure here leaves no redo intent, so `commit` removes the shells.
+        Box::pin(self.validate_core_schema()).await?;
+        self.propagate_governance().await?;
+        self.check_reference_closure().await?;
+        self.check_concept_key_identity().await?;
+        self.capture_cognitive_contracts().await?;
+        self.validate_learning().await?;
+        self.validate_durable()?;
+        self.capture_erasure_edges().await?;
+        self.validate_erasure().await?;
         if self.dry_run {
             let changes: Vec<Json> = self
                 .prepared_changes()
@@ -1006,7 +1022,7 @@ impl Transaction {
             self.discard_shells().await;
             let receipt = Receipt {
                 status: ReceiptStatus::NoEffect,
-                tx_id: Some(self.cx.tx_id.clone()),
+                tx_id: Some(no_effect_tx_id(&self.cx, "")),
                 space_id: Some(self.cx.space.clone()),
                 snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
                 space_seq: None,
@@ -1058,8 +1074,26 @@ impl Transaction {
                 && let Element::Concept(row) = &staged.row
             {
                 let key = format!("identity:{}:{id}", self.cx.tx_id);
-                self.control_effects.push(ControlRecordRow { _id:0,record_id:key.clone(),space:self.cx.space.clone(),key:key.clone(),seq:self.cx.seq,version:1,kind:"identity".into(),
-                        value:serde_json::json!({"decision_id":key,"source":id.to_string(),"target":row.merged_into,"actor":self.auth.principal_id,"basis_seq":self.cx.seq-1,"resolution_version":self.cx.seq,"status":"active"}),origin:self.cx.origin.clone() });
+                let value = serde_json::json!({
+                    "decision_id": key,
+                    "source": id.to_string(),
+                    "target": row.merged_into,
+                    "actor": self.auth.principal_id,
+                    "basis_seq": self.cx.seq - 1,
+                    "resolution_version": self.cx.seq,
+                    "status": "active",
+                });
+                self.control_effects.push(ControlRecordRow {
+                    _id: 0,
+                    record_id: key.clone(),
+                    space: self.cx.space.clone(),
+                    key,
+                    seq: self.cx.seq,
+                    version: 1,
+                    kind: "identity".into(),
+                    value,
+                    origin: self.cx.origin.clone(),
+                });
             }
         }
         let prepared = self.prepared_changes();
@@ -1147,61 +1181,97 @@ impl Transaction {
                 ..Default::default()
             })
             .collect();
-        if let Err(error) = crate::attention::validate_commit_leases(
+        crate::attention::validate_commit_leases(
             &self.store,
             &self.cx.space,
             &self.auth.principal_id,
             &self.attention_leases,
         )
-        .await
-        {
-            self.discard_shells().await;
-            return Err(error);
-        }
+        .await?;
         let control_replacements = self.artifact_erasure_replacements().await?;
-        // From this point a durable intent may exist, so recovery owns the IDs.
-        *redo_owned = true;
-        let journalled = self
-            .store
-            .commit_plan(crate::store::control::CommitPlan {
-                cx: self.cx.clone(),
-                journal: JournalEntry {
-                    status: receipt_status_name(status).to_string(),
-                    transaction_class: transaction_class.into(),
-                    schema_environment_version: self.env.version,
-                    changes: changes.clone(),
-                    result,
-                    origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
-                    ..entry
-                },
-                control_replacements,
-                writes,
-                controls: std::mem::take(&mut self.control_effects),
-                space: space_effect,
-                purge_versions: self.purges.values().flatten().copied().collect(),
-                scrub_versions: self.payload_purges.values().flatten().copied().collect(),
-                audits,
-                approvals: std::mem::take(&mut self.approval_decisions)
-                    .into_iter()
-                    .flat_map(Approved::into_ids)
-                    .collect(),
-            })
-            .await?;
+        let committed = status == ReceiptStatus::Committed;
+        if committed {
+            // The sequence is taken here, at commit, rather than when the
+            // transaction opened: a dry run, a refused plan and a no-op take
+            // none (§32.8, §69.3). Every Session path that stamps one runs
+            // under the Nexus write lock, so the head has not moved since
+            // `begin` unless a host edited the control plane around it.
+            let head = self.store.get_space(&self.cx.space).await?.seq;
+            if head.checked_add(1) != Some(self.cx.seq) {
+                // Only an unguarded host control-plane edit can get here; the
+                // plan names a coordinate somebody else took, so it is refused
+                // whole and the same request may simply run again.
+                return Err(KipError::new(
+                    KipErrorCode::SerializationConflict,
+                    format!(
+                        "{} advanced to sequence {head} while transaction {} was open",
+                        self.cx.space, self.cx.tx_id
+                    ),
+                ));
+            }
+        } else {
+            // A no-op names no coordinate, so its id must not be the one the
+            // next commit will take.
+            self.cx.tx_id = no_effect_tx_id(&self.cx, &entry.idempotency_key);
+            space_effect = None;
+        }
+        let plan = crate::store::control::CommitPlan {
+            cx: self.cx.clone(),
+            journal: JournalEntry {
+                status: receipt_status_name(status).to_string(),
+                transaction_class: transaction_class.into(),
+                schema_environment_version: self.env.version,
+                changes: changes.clone(),
+                result,
+                origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
+                ..entry
+            },
+            control_replacements,
+            writes,
+            controls: std::mem::take(&mut self.control_effects),
+            space: space_effect,
+            purge_versions: self.purges.values().flatten().copied().collect(),
+            scrub_versions: self.payload_purges.values().flatten().copied().collect(),
+            audits,
+            approvals: std::mem::take(&mut self.approval_decisions)
+                .into_iter()
+                .flat_map(Approved::into_ids)
+                .collect(),
+        };
+        // A no-op is journalled only when something must be able to find it
+        // again — a resend under its key (§34.3) — or it settles approvals
+        // and audit. Otherwise nothing durable happens at all.
+        let journalled = if committed || plan.has_durable_effect() {
+            Some(self.store.commit_plan(plan, redo_owned).await?)
+        } else {
+            self.discard_shells().await;
+            None
+        };
 
         // §32.8: a transaction that changed nothing reports no cognitive
         // sequence, however the journal records that it ran.
-        let committed = status == ReceiptStatus::Committed;
         let receipt = Receipt {
             status,
-            tx_id: Some(journalled.tx_id),
+            tx_id: Some(self.cx.tx_id.clone()),
             space_id: Some(self.cx.space.clone()),
-            snapshot_seq: Some(journalled.snapshot_seq),
-            space_seq: committed.then_some(journalled.seq),
-            committed_at: Some(journalled.committed_at),
-            transaction_class: Some(journalled.transaction_class),
-            request_digest: none_if_empty(journalled.request_digest),
-            semantic_plan_digest: none_if_empty(journalled.semantic_plan_digest),
-            result_digest: none_if_empty(journalled.result_digest),
+            snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
+            space_seq: committed.then_some(self.cx.seq),
+            committed_at: committed.then(|| self.cx.at.clone()),
+            transaction_class: Some(
+                journalled
+                    .as_ref()
+                    .map_or(transaction_class, |row| row.transaction_class.as_str())
+                    .to_string(),
+            ),
+            request_digest: journalled
+                .as_ref()
+                .and_then(|row| none_if_empty(row.request_digest.clone())),
+            semantic_plan_digest: journalled
+                .as_ref()
+                .and_then(|row| none_if_empty(row.semantic_plan_digest.clone())),
+            result_digest: journalled
+                .as_ref()
+                .and_then(|row| none_if_empty(row.result_digest.clone())),
             schema_environment_version: Some(self.env.version),
             change_summary: Some(summarize(&changes)),
             proofs: vec![],
@@ -1244,6 +1314,11 @@ impl Transaction {
                 .into_iter()
                 .map(|id| id.to_string())
                 .collect();
+            // One entry per distinct resolution the element carries: every
+            // clause that named the same reference records its own binding,
+            // and attaching all of them to each citing element grows the audit
+            // quadratically with the statement.
+            let mut seen = BTreeSet::new();
             let bindings: Vec<Json> = self
                 .reference_bindings
                 .iter()
@@ -1251,6 +1326,10 @@ impl Transaction {
                     binding["resolved"]
                         .as_str()
                         .is_some_and(|id| referenced.contains(id))
+                        && seen.insert((
+                            binding["supplied"].as_str().unwrap_or_default().to_string(),
+                            binding["resolved"].as_str().unwrap_or_default().to_string(),
+                        ))
                 })
                 .cloned()
                 .collect();
@@ -1375,7 +1454,7 @@ impl Transaction {
                 }
             }
             for reference in &activity.inputs {
-                let Some(source) = reference_id(reference) else {
+                let Some(source) = element_reference(reference) else {
                     continue;
                 };
                 if inputs.contains_key(&source.to_string()) {
@@ -1395,7 +1474,7 @@ impl Transaction {
             }
             let mut outputs = Map::new();
             for reference in &activity.outputs {
-                let Some(target) = reference_id(reference) else {
+                let Some(target) = element_reference(reference) else {
                     continue;
                 };
                 if !activity.inputs.is_empty() {
@@ -1657,6 +1736,32 @@ pub(crate) fn receipt_digest(receipt: &Receipt) -> String {
     digest_of(&value)
 }
 
+/// The id of a transaction that changed nothing.
+///
+/// A committed transaction is `{space}#{seq}`, the coordinate it produced. A
+/// no-op produces none (§32.8), so its id names the snapshot it read and a
+/// suffix that keeps two no-ops on that snapshot apart — and apart from the
+/// commit that will take the next sequence.
+fn no_effect_tx_id(cx: &WriteContext, idempotency_key: &str) -> String {
+    let nonce = TX_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let digest = digest_of(&serde_json::json!([
+        idempotency_key,
+        cx.at,
+        nonce,
+        now_ms()
+    ]));
+    let hex = digest.rsplit(':').next().unwrap_or_default();
+    format!(
+        "{}#{}~{}",
+        cx.space,
+        cx.seq.saturating_sub(1),
+        &hex[..hex.len().min(12)]
+    )
+}
+
+/// Process-wide counter keeping per-transaction tags unique.
+static TX_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The digest of a delegation chain, when the request ran under one (§28.5).
 pub(crate) fn delegation_digest(chain: &[String]) -> Option<String> {
     if chain.is_empty() {
@@ -1749,14 +1854,6 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl Store {
-    /// Writes a row verbatim, without touching its version.
-    ///
-    /// The transaction owns version assignment, so the ordinary
-    /// [`Store::update`] — which bumps — is the wrong primitive at commit time.
-    pub async fn put<R: Row>(&self, row: &R) -> Result<(), KipError> {
-        self.put_row(row).await
-    }
-
     /// Removes every element still wearing the `pending` state.
     ///
     /// A pending element belongs to no committed transaction: it was minted as
@@ -1786,13 +1883,6 @@ impl Store {
         }
         Ok(removed)
     }
-}
-
-fn reference_id(value: &Json) -> Option<ElementId> {
-    value
-        .as_str()
-        .or_else(|| value.get("id").and_then(Json::as_str))
-        .and_then(|id| id.parse().ok())
 }
 
 #[cfg(test)]

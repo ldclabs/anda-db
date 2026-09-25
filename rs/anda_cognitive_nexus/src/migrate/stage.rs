@@ -42,7 +42,7 @@ pub mod kind {
 pub struct LegacyRow {
     /// Staging id, unrelated to the 1.x id.
     pub _id: u64,
-    /// One of [`kind`].
+    /// One of the `kind` constants.
     #[field_type = "Text"]
     pub kind: String,
     /// The 1.x `_id`, so the mapping to a migrated element stays derivable.

@@ -617,25 +617,28 @@ where
     };
     audit.at = cx.at.clone();
     store
-        .commit_plan(crate::store::control::CommitPlan {
-            cx: cx.clone(),
-            journal: crate::store::space::JournalEntry {
-                status: "committed".into(),
-                transaction_class: "governance".into(),
-                schema_environment_version,
-                result: serde_json::json!({"element":id.to_string(),"op":op}),
-                changes: vec![crate::tx::entry_json(&entry)],
-                ..Default::default()
+        .commit_plan(
+            crate::store::control::CommitPlan {
+                cx: cx.clone(),
+                journal: crate::store::space::JournalEntry {
+                    status: "committed".into(),
+                    transaction_class: "governance".into(),
+                    schema_environment_version,
+                    result: serde_json::json!({"element":id.to_string(),"op":op}),
+                    changes: vec![crate::tx::entry_json(&entry)],
+                    ..Default::default()
+                },
+                writes: vec![(element, op.into())],
+                controls: vec![],
+                control_replacements: vec![],
+                space: None,
+                purge_versions: vec![],
+                scrub_versions: vec![],
+                audits: vec![audit],
+                approvals,
             },
-            writes: vec![(element, op.into())],
-            controls: vec![],
-            control_replacements: vec![],
-            space: None,
-            purge_versions: vec![],
-            scrub_versions: vec![],
-            audits: vec![audit],
-            approvals,
-        })
+            &mut false,
+        )
         .await?;
     Ok(version)
 }

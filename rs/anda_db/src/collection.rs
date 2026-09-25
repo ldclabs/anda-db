@@ -486,6 +486,20 @@ impl BM25IndexView<'_> {
         self.inner.search_advanced(query, top_k, params)
     }
 
+    /// Scores `ids` as a corpus of their own: document count, average length
+    /// and document frequencies come from the scope alone, so documents
+    /// outside it (another tenant, a record the caller may not see) cannot
+    /// move a score inside it. Ids without indexed text are ignored.
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[DocumentId],
+    ) -> Vec<(DocumentId, f32)> {
+        self.inner.search_scoped(query, top_k, params, ids)
+    }
+
     pub fn try_search_advanced(
         &self,
         query: &str,

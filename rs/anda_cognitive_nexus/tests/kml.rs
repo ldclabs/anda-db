@@ -377,8 +377,10 @@ async fn an_unknown_type_is_refused_and_writes_nothing() {
     // The failed statement left no element behind: its shell was discarded,
     // so nothing is recallable and nothing is pending.
     assert_eq!(nexus.store.sweep_pending().await.unwrap(), 0);
+    // A sequence is taken at commit, so a refused statement takes none
+    // (§32.8): the next commit is still `before + 1`.
     let after = nexus.store.get_space(DEFAULT_SPACE).await.unwrap().seq;
-    assert!(after > before, "the sequence it burned is not reused");
+    assert_eq!(after, before, "a refused statement reserves no sequence");
 }
 
 #[tokio::test]

@@ -277,7 +277,9 @@ impl Session {
             let identity = json!({"operation":"apply_trust_calibration","key":operation_key});
             let key = crate::attention::request_key(&self.auth.principal_id, &identity)?;
             let request_digest = digest(&json!({"expected":expected,"proposal":proposal}))?;
-            if let Some(result) = crate::attention::replay(store, space, &key, &request_digest).await? {
+            if let Some(result) =
+                crate::attention::replay(store, space, &key, &request_digest).await?
+            {
                 return Ok(result);
             }
             let mut tx = Transaction::begin(
@@ -290,14 +292,38 @@ impl Session {
             )
             .await?;
             let mut value = json!(proposed.configuration);
-            value["calibration"] = json!({"proposal":proposal,"method":proposed.method,"evidence_refs":proposed.evidence_refs});
-            crate::attention::stage_control(store, &mut tx, "trust", expected, "trust", value).await?;
+            value["calibration"] = json!({
+                "proposal": proposal,
+                "method": proposed.method,
+                "evidence_refs": proposed.evidence_refs,
+            });
+            crate::attention::stage_control(store, &mut tx, "trust", expected, "trust", value)
+                .await?;
             tx.defer_governance_audit(crate::governance::store::MutationEntry {
-                        at:tx.cx.at.clone(),
-                        space_id:space.into(),principal_id:self.auth.principal_id.clone(),operation:"apply_trust_calibration",resource:"trust".into(),
-                        record:json!({"proposal":proposal,"method":proposed.method,"before_version":expected,"after_version":expected+1}),
-                    });
-            crate::attention::commit(store,tx,key,request_digest,json!({"version":expected+1,"proposal":proposal,"audit_operation":"apply_trust_calibration"})).await
+                at: tx.cx.at.clone(),
+                space_id: space.into(),
+                principal_id: self.auth.principal_id.clone(),
+                operation: "apply_trust_calibration",
+                resource: "trust".into(),
+                record: json!({
+                    "proposal": proposal,
+                    "method": proposed.method,
+                    "before_version": expected,
+                    "after_version": expected+1,
+                }),
+            });
+            crate::attention::commit(
+                store,
+                tx,
+                key,
+                request_digest,
+                json!({
+                    "version": expected+1,
+                    "proposal": proposal,
+                    "audit_operation": "apply_trust_calibration",
+                }),
+            )
+            .await
         })
         .await
     }

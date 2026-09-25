@@ -110,8 +110,9 @@ async fn current(
 }
 
 fn live(session: &Session, wake: &WakeRecord, now: u64) -> Result<(), KipError> {
-    if !matches!(&wake.state,WakeState::Running{lease} if lease.owner==session.auth.principal_id && lease.expires_at_ms>now)
-    {
+    let held = matches!(&wake.state, WakeState::Running { lease }
+        if lease.owner == session.auth.principal_id && lease.expires_at_ms > now);
+    if !held {
         return Err(conflict("lease_lost"));
     }
     Ok(())
@@ -178,13 +179,18 @@ impl Session {
                 return Err(invalid("attempt decision is not Activity"));
             };
             if !decision.inputs.iter().any(|r| {
-                r.as_str()
-                    .or_else(|| r["id"].as_str())
+                crate::term::reference_text(r)
                     .is_some_and(|r| r == wake.fire_activity_ref || r == wake.fire.watch_ref)
             }) {
                 return Err(invalid("dispatch decision must name its Watch/fire input"));
             }
-            let request = json!({"wake_ref":reference,"attempt_ref":attempt_ref,"supports_idempotency":supports_idempotency,"supports_outcome_lookup":supports_outcome_lookup,"binding":wake.pins.binding});
+            let request = json!({
+                "wake_ref": reference,
+                "attempt_ref": attempt_ref,
+                "supports_idempotency": supports_idempotency,
+                "supports_outcome_lookup": supports_outcome_lookup,
+                "binding": wake.pins.binding,
+            });
             let dispatch_ref = runtime_ref(
                 "dispatch",
                 &json!({"scope":wake.scope,"attempt_id":attempt["attempt_id"]}),
@@ -218,16 +224,31 @@ impl Session {
             };
             let version = old.as_ref().map_or(0, |r| r.version);
             let dispatch_at = crate::time::now();
+            let previous = |member: &str| old.as_ref().map(|r| r.value[member].clone());
+            let state = match action {
+                "done" => "completed",
+                "outcome_unknown" => "outcome_unknown",
+                _ => "dispatching",
+            };
+            let first_dispatch_at = old
+                .as_ref()
+                .and_then(|r| r.value["first_dispatch_at"].as_str())
+                .unwrap_or(&dispatch_at);
+            let last_dispatch_at = if action == "dispatch" {
+                json!(dispatch_at)
+            } else {
+                previous("last_dispatch_at").unwrap_or(Json::Null)
+            };
             let value = json!({
                 "request": request,
-                "state": if action == "done" { "completed" } else if action == "outcome_unknown" { "outcome_unknown" } else { "dispatching" },
+                "state": state,
                 "attempt_id": attempt["attempt_id"],
                 "fencing_token": fence,
-                "outcome_ref": old.as_ref().map(|r| r.value["outcome_ref"].clone()),
+                "outcome_ref": previous("outcome_ref"),
                 "lookup_observer": lookup_observer,
-                "first_dispatch_at": old.as_ref().and_then(|r| r.value["first_dispatch_at"].as_str()).unwrap_or(&dispatch_at),
-                "last_dispatch_at": if action == "dispatch" { json!(dispatch_at) } else { old.as_ref().map(|r| r.value["last_dispatch_at"].clone()).unwrap_or(Json::Null) },
-                "lookup_receipt_ref": old.as_ref().map(|r| r.value["lookup_receipt_ref"].clone()),
+                "first_dispatch_at": first_dispatch_at,
+                "last_dispatch_at": last_dispatch_at,
+                "lookup_receipt_ref": previous("lookup_receipt_ref"),
             });
             let mut tx = Transaction::begin(
                 store,
@@ -271,8 +292,27 @@ impl Session {
                 )
                 .await?;
             }
-            let call = json!({"operation":"begin_wake_dispatch","dispatch_ref":dispatch_ref,"version":version,"request":request,"fence":fence});
-            commit(store,tx,request_key(&self.auth.principal_id,&call)?,digest(&call)?,json!({"action":action,"dispatch_ref":dispatch_ref,"idempotency_key":attempt["attempt_id"],"version":next(version)?,"intent":value})).await
+            let call = json!({
+                "operation": "begin_wake_dispatch",
+                "dispatch_ref": dispatch_ref,
+                "version": version,
+                "request": request,
+                "fence": fence,
+            });
+            commit(
+                store,
+                tx,
+                request_key(&self.auth.principal_id, &call)?,
+                digest(&call)?,
+                json!({
+                    "action": action,
+                    "dispatch_ref": dispatch_ref,
+                    "idempotency_key": attempt["attempt_id"],
+                    "version": next(version)?,
+                    "intent": value,
+                }),
+            )
+            .await
         })
         .await
     }
@@ -486,18 +526,31 @@ impl Session {
                 Action::Cancel(reason) => ("cancel_wake", json!({"reason":reason})),
                 Action::Finish(command, parameters, continuations) => (
                     "finish_wake",
-                    json!({"command":command,"parameters":parameters,"continuations":continuations}),
+                    json!({
+                        "command": command,
+                        "parameters": parameters,
+                        "continuations": continuations,
+                    }),
                 ),
             };
             let operation_key = runtime_ref(
                 "operation",
-                &json!({"domain":"anda-brain:operation-v1","scope":wake.scope,"wake_ref":reference,"operation":operation,"step":expected}),
+                &json!({
+                    "domain": "anda-brain:operation-v1",
+                    "scope": wake.scope,
+                    "wake_ref": reference,
+                    "operation": operation,
+                    "step": expected,
+                }),
             )?;
             let key = format!(
                 "attention\u{1f}{}\u{1f}{operation_key}",
                 self.auth.principal_id
             );
-            let request_digest = digest(&json!({"request":{"fence":fence,"body":body},"pins":wake.pins}))?;
+            let request_digest = digest(&json!({
+                "request": {"fence": fence, "body": body},
+                "pins": wake.pins,
+            }))?;
             if let Some(result) = replay(store, space, &key, &request_digest).await? {
                 for output in result["outputs"]
                     .as_array()
@@ -586,7 +639,8 @@ impl Session {
                             if *not_before_ms > now
                                 && *not_before_ms <= anda_kip::MAX_SAFE_INTEGER
                                 && retry.reason != "outcome_unknown" => {}
-                        WakeResume::OnChange { condition_digest } if valid_digest(condition_digest) => {}
+                        WakeResume::OnChange { condition_digest }
+                            if valid_digest(condition_digest) => {}
                         _ => {
                             return Err(invalid(
                                 "blocked work needs an explicit bounded resume condition",
@@ -612,8 +666,8 @@ impl Session {
                                     resume: WakeResume::OnChange { condition_digest },
                                     ..
                                 },
-                        } if matches!(&action,Action::ResumeVerified(verified,_) if condition_digest==*verified) =>
-                            {}
+                        } if matches!(&action, Action::ResumeVerified(verified, _)
+                            if condition_digest == *verified) => {}
                         WakeState::Blocked {
                             retry:
                                 WakeRetry {
@@ -731,7 +785,13 @@ impl Session {
                     }
                     let child_ref = runtime_ref(
                         "wake",
-                        &json!({"domain":"anda-brain:wake-continuation-v1","scope":wake.scope,"parent_ref":reference,"operation_key":operation_key,"key":child.key}),
+                        &json!({
+                            "domain": "anda-brain:wake-continuation-v1",
+                            "scope": wake.scope,
+                            "parent_ref": reference,
+                            "operation_key": operation_key,
+                            "key": child.key,
+                        }),
                     )?;
                     let mut child_wake = wake.clone();
                     child_wake.format = CONTINUATION.into();
@@ -758,9 +818,30 @@ impl Session {
                 current(self, &authority, space, &before).await?;
             }
             stage_control(store, &mut tx, reference, expected, "wake", json!(wake)).await?;
-            let receipt = json!({"format":FORMAT,"identity":{"scope":wake.scope,"operation_key":operation_key,"request_digest":request_digest},"pins":wake.pins,"state":{"status":"committed","commit_seq":tx.cx.seq,"outputs":outputs}});
+            let receipt = json!({
+                "format": FORMAT,
+                "identity": {
+                    "scope": wake.scope,
+                    "operation_key": operation_key,
+                    "request_digest": request_digest,
+                },
+                "pins": wake.pins,
+                "state": {"status": "committed", "commit_seq": tx.cx.seq, "outputs": outputs},
+            });
             stage_control(store, &mut tx, &receipt_ref, 0, "runtime", receipt).await?;
-            commit(store,tx,key,request_digest,json!({"wake":wake,"receipt_ref":receipt_ref,"outputs":outputs,"resume_verification":verification})).await
+            commit(
+                store,
+                tx,
+                key,
+                request_digest,
+                json!({
+                    "wake": wake,
+                    "receipt_ref": receipt_ref,
+                    "outputs": outputs,
+                    "resume_verification": verification,
+                }),
+            )
+            .await
         })
         .await
     }

@@ -324,7 +324,7 @@ function searchPattern(
     )
   }
   const limit = readCount(pattern.limit, b, 'LIMIT')
-  const { hits, cap } = rank(cx, pattern, b)
+  const { hits, cap } = rank(cx, pattern, b, limit)
   const out: Solution[] = []
   const bounded = hits.slice(0, cap === null ? limit : Math.min(limit, cap))
   for (const hit of bounded) cx.annotate(hit.id, 'retrieval', { score: hit.score, mode: 'keyword' })

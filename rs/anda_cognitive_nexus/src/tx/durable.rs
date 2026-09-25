@@ -31,10 +31,10 @@ impl Transaction {
             }
             let id = row.id().to_string();
             if let Element::Activity(activity) = &row {
-                for input in activity.inputs.iter().filter_map(reference_id) {
+                for input in activity.inputs.iter().filter_map(element_reference) {
                     edges.insert((input.to_string(), id.clone()));
                 }
-                for output in activity.outputs.iter().filter_map(reference_id) {
+                for output in activity.outputs.iter().filter_map(element_reference) {
                     edges.insert((id.clone(), output.to_string()));
                 }
                 if let Some(basis) = facet(&row, "DependencyBasis") {
@@ -185,14 +185,17 @@ impl Transaction {
                         "semantic erasure cannot complete while an owned dependent remains",
                     ));
                 }
+                // Edges are ordered by source, so one element's dependents
+                // are a contiguous run.
                 pending.extend(
                     edges
-                        .iter()
-                        .filter(|(source, _)| source == &id)
+                        .range((id.clone(), String::new())..)
+                        .take_while(|(source, _)| source == &id)
                         .map(|(_, target)| target.clone()),
                 );
             }
         }
+        let mut replacements: Option<Vec<ControlRecordRow>> = None;
         for target in plan["targets"].as_array().into_iter().flatten() {
             if target["state"] != "erased" {
                 continue;
@@ -203,18 +206,27 @@ impl Transaction {
                     self.final_element(reference.parse()?).await?.state() == state::PURGED
                 }
                 Some("payload") => {
-                    matches!(self.final_element(reference.parse()?).await?,Element::Evidence(row) if row.payload_mode==PAYLOAD_PURGED || row.state==state::PURGED)
+                    let element = self.final_element(reference.parse()?).await?;
+                    matches!(&element, Element::Evidence(row)
+                        if row.payload_mode == PAYLOAD_PURGED || row.state == state::PURGED)
                 }
                 Some("replay" | "blob") => {
-                    self.store
-                        .control_at(&self.cx.space, &format!("artifact/{reference}"), u64::MAX)
+                    let key = format!("artifact/{reference}");
+                    if self
+                        .store
+                        .control_at(&self.cx.space, &key, u64::MAX)
                         .await?
                         .is_some_and(|row| row.value["state"] == "erased")
-                        || self
-                            .artifact_erasure_replacements()
-                            .await?
-                            .iter()
-                            .any(|r| r.key == format!("artifact/{reference}"))
+                    {
+                        true
+                    } else {
+                        if replacements.is_none() {
+                            replacements = Some(self.artifact_erasure_replacements().await?);
+                        }
+                        replacements
+                            .as_ref()
+                            .is_some_and(|rows| rows.iter().any(|r| r.key == key))
+                    }
                 }
                 Some("exposure") => self.store.exposure_count(reference).await? == 0,
                 // Backend backups need their own verified deletion receipt;
@@ -285,15 +297,13 @@ impl Transaction {
             };
             if row.schema_ref == cognitive_memory!("SleepTask") {
                 self.require_changed_guards(*id, s)?;
-                let before = s
-                    .before
-                    .as_ref()
-                    .map(crate::view::render)
-                    .unwrap_or_default();
                 let before_lease = s.before.as_ref().and_then(|r| facet(r, "LeaseState"));
                 let after_lease = facet(&s.row, "LeaseState");
                 anda_kip::cognitive::validate_lease_transition(
-                    before["attributes"]["status"].as_str().unwrap_or("pending"),
+                    s.before
+                        .as_ref()
+                        .and_then(|before| attribute(before, "status").as_str())
+                        .unwrap_or("pending"),
                     row.attributes
                         .get("status")
                         .and_then(Json::as_str)
@@ -311,8 +321,7 @@ impl Transaction {
                 let before_status = s
                     .before
                     .as_ref()
-                    .map(crate::view::render)
-                    .and_then(|view| view["attributes"]["status"].as_str().map(str::to_string));
+                    .and_then(|before| attribute(before, "status").as_str());
                 let after_status = row
                     .attributes
                     .get("status")
@@ -323,9 +332,7 @@ impl Transaction {
                         "a new Watch must be disarmed without WatchState",
                     ));
                 }
-                if before_status
-                    .as_deref()
-                    .is_some_and(|old| old != after_status)
+                if before_status.is_some_and(|old| old != after_status)
                     && !self.authorized_watch_updates.contains(id)
                 {
                     return Err(KipError::not_authorized(
@@ -344,8 +351,8 @@ impl Transaction {
                     if !self.authorized_watch_updates.contains(id)
                         && let Some(before) = &s.before
                         && ["watch_class", "due_at"].iter().any(|field| {
-                            crate::view::render(before)["attributes"][*field]
-                                != row.attributes.get(*field).cloned().unwrap_or(Json::Null)
+                            attribute(before, field)
+                                != row.attributes.get(*field).unwrap_or(&Json::Null)
                         })
                     {
                         return Err(KipError::not_authorized(
@@ -373,5 +380,14 @@ impl Transaction {
             }
         }
         Ok(())
+    }
+}
+
+/// One attribute of a Concept as its view carries it; null for anything else.
+pub(super) fn attribute<'a>(element: &'a Element, name: &str) -> &'a Json {
+    const NULL: &Json = &Json::Null;
+    match element {
+        Element::Concept(row) => row.attributes.get(name).unwrap_or(NULL),
+        _ => NULL,
     }
 }

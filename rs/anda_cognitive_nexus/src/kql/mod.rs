@@ -29,7 +29,7 @@ use anda_kip::{
     ElementKind, Json, KipError, KqlQuery, Map, Operation, Request, Response, ResponseContext,
     ResultContext, Scalar, WhereClause,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::error::db_error;
@@ -64,6 +64,24 @@ pub struct Context<'a> {
     /// Elements loaded so far, so one query reads each row once.
     loaded: BTreeMap<ElementId, Option<Element>>,
     views: BTreeMap<ElementId, Arc<Json>>,
+    /// The read decision each admitted element was let in under, decided once.
+    visibility: BTreeMap<ElementId, crate::governance::decision::Visibility>,
+    /// Elements whose read-time attachments [`Context::load`] has made.
+    ///
+    /// Tracked apart from `views`: an element first reached through
+    /// [`Context::load_unattached`] — a merge chain, a Proposition endpoint —
+    /// already has a view, and treating that as "loaded" skipped the
+    /// reference audit for it when a later pattern bound it.
+    attached: BTreeSet<ElementId>,
+    /// Whether a referenced element's content is readable, per reference.
+    audit_readable: BTreeMap<ElementId, bool>,
+    /// The elements under identity review at this read's coordinate.
+    identity_reviews: Option<BTreeSet<String>>,
+    /// Merge classes already resolved at this read's coordinate.
+    merge_classes: BTreeMap<ElementId, Vec<ElementId>>,
+    /// The Activities whose DependencyBasis pins each element, read once by
+    /// `LIST DEPENDENTS`.
+    pub(crate) dependency_pins: Option<BTreeMap<String, Vec<ElementId>>>,
     /// The policy `BELIEF` projects under.
     pub policy: crate::projection::Policy,
     /// The world time a projection is evaluated at.
@@ -121,14 +139,23 @@ impl<'a> Context<'a> {
         authority: &'a EffectiveAuthority,
         auth: &'a AuthContext,
     ) -> Result<Self, KipError> {
+        let space_row = store.get_space(space).await?;
         Ok(Self {
-            env: store.schema_environment(space).await?,
+            env: store
+                .schema_environment_at(space, space_row.schema_environment_version)
+                .await?,
             store,
             space: space.to_string(),
             request,
             operation,
             loaded: BTreeMap::new(),
             views: BTreeMap::new(),
+            visibility: BTreeMap::new(),
+            attached: BTreeSet::new(),
+            audit_readable: BTreeMap::new(),
+            identity_reviews: None,
+            merge_classes: BTreeMap::new(),
+            dependency_pins: None,
             policy: store
                 .projection_policy_at(space, u64::MAX, &Map::new())
                 .await?,
@@ -136,7 +163,7 @@ impl<'a> Context<'a> {
             evaluated_at: crate::time::now(),
             projected: false,
             as_of: None,
-            pinned_seq: store.get_space(space).await?.seq,
+            pinned_seq: space_row.seq,
             traversal: String::new(),
             authority,
             auth,
@@ -187,10 +214,17 @@ impl<'a> Context<'a> {
     /// new pattern had to remember to apply it.
     pub async fn load(&mut self, id: ElementId) -> Result<Option<Element>, KipError> {
         let element = self.load_unattached(id).await?;
-        if let Some(reference) = element
-            .as_ref()
-            .and_then(|row| crate::repair::repair_ref(row.governance()))
-        {
+        // The attachments below depend on the element, this read's coordinate
+        // and its policy, none of which move while the read runs, so they are
+        // made once per element however many patterns reach it.
+        let Some(row) = &element else {
+            return Ok(element);
+        };
+        if !self.attached.insert(id) {
+            return Ok(element);
+        }
+        let visibility = self.visibility.get(&id).cloned();
+        if let Some(reference) = crate::repair::repair_ref(row.governance()) {
             // Current discovery governs the reference, even for a historical
             // Assertion. Admission leaves it null until this check succeeds.
             let repair = match reference.parse::<ElementId>() {
@@ -209,51 +243,35 @@ impl<'a> Context<'a> {
                 );
             }
         }
-        if let Some(row) = &element
-            && (crate::schema::contracts::is_derived(row)
-                || self
-                    .store
-                    .control_at(
-                        &self.space,
-                        &format!("identity_review/{id}"),
-                        self.pinned_seq,
-                    )
-                    .await?
-                    .is_some())
-        {
+        if crate::schema::contracts::is_derived(row) || self.under_identity_review(id).await? {
             let policy = self.policy.clone();
             let at = self.at.clone();
             let validity = self.dependency_validity(row, &policy, &at).await?;
-            if self
-                .authority
-                .may_read(row, self.auth)
-                .is_some_and(|v| v.content)
+            if visibility.as_ref().is_some_and(|v| v.content)
                 && let Some(view) = self.views.get_mut(&id)
+                && let Some(system) = Arc::make_mut(view)
+                    .get_mut("_system")
+                    .and_then(Json::as_object_mut)
             {
-                let mut json = (**view).clone();
-                if let Some(system) = json.get_mut("_system").and_then(Json::as_object_mut) {
-                    system.insert("dependency_validity".into(), validity);
-                }
-                *view = Arc::new(json);
+                system.insert("dependency_validity".into(), validity);
             }
         }
         // §43.2: a Proposition's view keeps both readings of each endpoint —
         // `subject` / `object` as stored, `canonical_subject` /
         // `canonical_object` merge-resolved at this read's coordinate.
-        if let Some(Element::Proposition(row)) = &element {
+        if let Element::Proposition(row) = row {
             let subject = self.canonical_endpoint(&row.subject).await?;
             let object = self.canonical_endpoint(&row.object).await?;
-            if let Some(view) = self.views.get(&id) {
-                let mut view = (**view).clone();
-                if let Some(object_view) = view.as_object_mut() {
-                    object_view.insert("canonical_subject".to_string(), subject);
-                    object_view.insert("canonical_object".to_string(), object);
-                }
-                self.views.insert(id, Arc::new(view));
+            if let Some(view) = self.views.get_mut(&id)
+                && let Some(object_view) = Arc::make_mut(view).as_object_mut()
+            {
+                object_view.insert("canonical_subject".to_string(), subject);
+                object_view.insert("canonical_object".to_string(), object);
             }
         }
-        if let Some(element) = &element
-            && let Some(visibility) = self.authority.may_read(element, self.auth)
+        // The attachments are new members, so the read decision is applied
+        // again over them.
+        if let Some(visibility) = &visibility
             && let Some(view) = self.views.get_mut(&id)
         {
             let view = Arc::make_mut(view);
@@ -265,6 +283,25 @@ impl<'a> Context<'a> {
         }
         self.filter_reference_audit(id).await?;
         Ok(element)
+    }
+
+    /// Whether an identity withdrawal left this element to be reviewed (§11),
+    /// at this read's coordinate.
+    ///
+    /// Reviews are rare, so the Space's reviews are read once per read rather
+    /// than looked up once per element.
+    pub(crate) async fn under_identity_review(&mut self, id: ElementId) -> Result<bool, KipError> {
+        if self.identity_reviews.is_none() {
+            let reviews = self
+                .store
+                .identity_reviews(&self.space, self.pinned_seq)
+                .await?;
+            self.identity_reviews = Some(reviews);
+        }
+        Ok(self
+            .identity_reviews
+            .as_ref()
+            .is_some_and(|reviews| reviews.contains(&id.to_string())))
     }
 
     /// Runtime reference audit is useful only for inputs this caller may read.
@@ -279,42 +316,52 @@ impl<'a> Context<'a> {
         else {
             return Ok(());
         };
-        let mut visible = Vec::new();
-        for binding in bindings {
-            let mut readable = true;
+        let mut visible = Vec::with_capacity(bindings.len());
+        'bindings: for binding in bindings {
             for key in ["supplied", "resolved"] {
                 let Some(reference) = binding[key]
                     .as_str()
                     .and_then(|value| value.parse::<ElementId>().ok())
                 else {
-                    readable = false;
-                    break;
+                    continue 'bindings;
                 };
-                let source = self
-                    .store
-                    .element_at(&self.space, reference, self.pinned_seq)
-                    .await?;
-                if !source.as_ref().is_some_and(|row| {
-                    self.authority
-                        .may_read(row, self.auth)
-                        .is_some_and(|visibility| visibility.content)
-                }) {
-                    readable = false;
-                    break;
+                if !self.content_readable(reference).await? {
+                    continue 'bindings;
                 }
             }
-            if readable {
-                visible.push(binding);
-            }
+            visible.push(binding);
         }
-        if let Some(view) = self.views.get_mut(&id) {
-            let mut json = (**view).clone();
-            if let Some(system) = json.get_mut("_system").and_then(Json::as_object_mut) {
-                system.insert("input_references".into(), Json::Array(visible));
-            }
-            *view = Arc::new(json);
+        if let Some(view) = self.views.get_mut(&id)
+            && let Some(system) = Arc::make_mut(view)
+                .get_mut("_system")
+                .and_then(Json::as_object_mut)
+        {
+            system.insert("input_references".into(), Json::Array(visible));
         }
         Ok(())
+    }
+
+    /// Whether this caller may read one element's content at this read's
+    /// coordinate, asked once per element per read.
+    ///
+    /// Outside the query universe on purpose: the audit asks about a
+    /// reference, and admitting the element would let it tighten this read's
+    /// governed limit as if it were a result.
+    async fn content_readable(&mut self, id: ElementId) -> Result<bool, KipError> {
+        if let Some(readable) = self.audit_readable.get(&id) {
+            return Ok(*readable);
+        }
+        let row = match self.as_of {
+            Some(seq) => self.store.element_at(&self.space, id, seq).await?,
+            None => self.store.get_element(id).await.ok(),
+        };
+        let readable = row.as_ref().is_some_and(|row| {
+            self.authority
+                .may_read(row, self.auth)
+                .is_some_and(|visibility| visibility.content)
+        });
+        self.audit_readable.insert(id, readable);
+        Ok(readable)
     }
 
     /// Loads and admits one element without attaching the canonical
@@ -343,6 +390,7 @@ impl<'a> Context<'a> {
     /// WHERE read. The caller supplies the transaction Space on the snapshot;
     /// the same authorization/redaction path as storage reads still applies.
     pub(crate) fn seed_element(&mut self, id: ElementId, element: Element) -> bool {
+        self.attached.remove(&id);
         let admitted = self.admit(Some(element));
         let visible = admitted.is_some();
         self.loaded.insert(id, admitted);
@@ -401,6 +449,10 @@ impl<'a> Context<'a> {
         if id.kind != ElementKind::Concept {
             return Ok(vec![id]);
         }
+        // Stable for the whole read, and a walk asks once per hop.
+        if let Some(class) = self.merge_classes.get(&id) {
+            return Ok(class.clone());
+        }
         let canonical = self.canonical_of(id).await?;
         let mut class = vec![canonical];
         let mut frontier = vec![canonical];
@@ -416,6 +468,7 @@ impl<'a> Context<'a> {
             class.push(id);
         }
         class.sort();
+        self.merge_classes.insert(id, class.clone());
         Ok(class)
     }
 
@@ -488,6 +541,7 @@ impl<'a> Context<'a> {
             return None;
         }
         let visibility = self.authority.may_read(&element, self.auth)?;
+        let id = element.id();
         if let Some(limit) = visibility
             .constraints
             .max_results
@@ -520,7 +574,8 @@ impl<'a> Context<'a> {
             // that happens to have no fields.
             crate::governance::redact::to_identity_only(&mut view);
         }
-        self.views.insert(element.id(), Arc::new(view));
+        self.views.insert(id, Arc::new(view));
+        self.visibility.insert(id, visibility);
         Some(element)
     }
 
@@ -543,7 +598,7 @@ impl<'a> Context<'a> {
 
     /// The rendered view of an element this read has admitted.
     ///
-    /// [`Context::admit`] caches a view for every element it lets through, so
+    /// `Context::admit` caches a view for every element it lets through, so
     /// the empty object is unreachable for anything that came back from
     /// [`Context::load`]. It exists so the read paths do not each invent their
     /// own answer to a question that has one — which is how one of them once
@@ -566,14 +621,18 @@ impl<'a> Context<'a> {
     /// element — and a later dot path, filter or sort key needs the view. This
     /// is where that debt is paid, once, before anything reads a field.
     pub async fn warm(&mut self, solutions: &Solutions) -> Result<(), KipError> {
-        let ids: Vec<ElementId> = solutions
+        let ids: BTreeSet<ElementId> = solutions
             .rows
             .iter()
             .flat_map(|row| row.iter())
             .filter_map(binding::Binding::element)
-            .filter(|id| !self.views.contains_key(id))
+            .filter(|id| !self.attached.contains(id))
             .collect();
-        self.charge(ids.len())?;
+        self.charge(
+            ids.iter()
+                .filter(|id| !self.loaded.contains_key(id))
+                .count(),
+        )?;
         for id in ids {
             self.load(id).await?;
         }
@@ -611,7 +670,10 @@ impl<'a> Context<'a> {
             .elements(kind)
             .query_all_ids(anda_db::query::Filter::And(vec![
                 Box::new(eq_field("space", Fv::Text(self.space.clone()))),
-                Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                Box::new(eq_field(
+                    "state",
+                    Fv::Text(crate::store::rows::state::ACTIVE.into()),
+                )),
             ]))
             .await
             .map_err(db_error)?;
@@ -762,6 +824,10 @@ impl<'a> Context<'a> {
         if let Some(seq) = self.as_of {
             self.pinned_seq = seq;
         }
+        // Answers memoized per read belong to one coordinate.
+        self.identity_reviews = None;
+        self.audit_readable.clear();
+        self.merge_classes.clear();
         if let Some(seq) = self.as_of {
             self.policy = self
                 .store
@@ -999,16 +1065,15 @@ impl<'a> Context<'a> {
             ));
         }
         let limit = crate::meta::describe::scalar_usize(self, &pattern.limit, "LIMIT")?;
-        let (hits, cap) = crate::meta::inspect::rank(
-            self,
-            pattern.target,
-            &pattern.term,
-            pattern.with_type.as_ref(),
-            pattern.with_predicate.as_ref(),
-            pattern.mode.as_ref(),
-            pattern.threshold.as_ref(),
-        )
-        .await?;
+        let spec = crate::meta::inspect::SearchSpec {
+            target: pattern.target,
+            term: &pattern.term,
+            with_type: pattern.with_type.as_ref(),
+            with_predicate: pattern.with_predicate.as_ref(),
+            mode: pattern.mode.as_ref(),
+            threshold: pattern.threshold.as_ref(),
+        };
+        let (hits, cap) = crate::meta::inspect::rank(self, &spec, limit).await?;
         let limit = cap.map_or(limit, |cap| cap.min(limit));
         let mut rows = Vec::new();
         for (score, id, _) in hits.into_iter().take(limit) {
@@ -1161,18 +1226,23 @@ async fn run(
         Some(block) => crate::projection::settings_of(block, |name| cx.param_ref(name))?,
         None => Map::new(),
     };
-    cx.policy = match store
-        .projection_policy_at(space, cx.pinned_seq, &settings)
-        .await
-    {
-        Ok(policy) => policy,
-        Err(e) if e.code == anda_kip::KipErrorCode::HistoricalSnapshotUnavailable => {
-            let mut p = crate::projection::Policy::from_settings(&settings)?;
-            p.trust_version = "unavailable".into();
-            p
-        }
-        Err(e) => return Err(e),
-    };
+    // Without settings the policy in force at this read's coordinate is the one
+    // `open` or `bind_read` already resolved; only a WITH EPISTEMIC block
+    // changes it, so only that pays for resolving it again.
+    if !settings.is_empty() {
+        cx.policy = match store
+            .projection_policy_at(space, cx.pinned_seq, &settings)
+            .await
+        {
+            Ok(policy) => policy,
+            Err(e) if e.code == anda_kip::KipErrorCode::HistoricalSnapshotUnavailable => {
+                let mut p = crate::projection::Policy::from_settings(&settings)?;
+                p.trust_version = "unavailable".into();
+                p
+            }
+            Err(e) => return Err(e),
+        };
+    }
     let mut policy = cx.policy.clone();
     cx.resolve_projection_context(&mut policy).await?;
     cx.policy = policy;

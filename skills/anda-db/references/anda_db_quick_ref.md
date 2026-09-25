@@ -271,7 +271,11 @@ See [HNSW configuration](../../../rs/anda_db_hnsw/src/config.rs) for valid bound
 Remove indexes via `remove_btree_index(&[...])`, `remove_bm25_index(&[...])`,
 or `remove_hnsw_index("embedding")`; these require `&mut Collection` and
 return `bool`. `get_btree_index`, `get_bm25_index`, and `get_hnsw_index` return
-read-only views; the internal `find_*_index` methods are not public. Update data through
+read-only views; the internal `find_*_index` methods are not public. A BM25
+view's `search_scoped(text, top_k, params, &ids)` ranks only `ids` with
+statistics computed over those ids alone — use it when the id set is an
+authorization or tenant boundary, so documents outside it cannot move a score.
+Update data through
 collection CRUD so indexing, recovery journals, and lifecycle checks stay in
 sync. Custom hooks must derive from the declared index fields: `update`
 refreshes an index only when one of those fields changes.

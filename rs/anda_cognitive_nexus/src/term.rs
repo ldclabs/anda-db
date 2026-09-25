@@ -429,6 +429,19 @@ pub fn tuple_keys(
 /// Core structural references are same-Space by definition; a canonical or
 /// foreign identity in one of these slots is a malformed record rather than an
 /// unresolved lookup (§8.2, §93.3).
+/// The id text a stored reference carries, written either as a bare id string
+/// or as `{"id": ...}` — the two spellings a reference field accepts.
+pub(crate) fn reference_text(value: &Json) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(Json::as_str))
+}
+
+/// The element a stored reference names, in either spelling.
+pub(crate) fn element_reference(value: &Json) -> Option<ElementId> {
+    reference_text(value)?.parse().ok()
+}
+
 pub fn local_ref(value: &Json, field: &str) -> Result<ElementId, KipError> {
     match Endpoint::from_json(value)? {
         Endpoint::Local(id) => Ok(id),

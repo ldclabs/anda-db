@@ -21,14 +21,33 @@ impl std::fmt::Debug for EvaluationRules {
 impl Default for EvaluationRules {
     fn default() -> Self {
         let registry = Self(Arc::new(parking_lot::RwLock::new(BTreeMap::new())));
-        registry.register(&serde_json::json!({"engine":"kip:binary-stratified-v1"}),Arc::new(|input:&EvaluationInput| {
-            let count:usize=input.samples.treatment.values().map(Vec::len).sum();
-            let quota=input.trial["quota"].as_u64().unwrap_or(2).max(input.minimum_independent_attempts);
-            if (count as u64)<quota {
-                return Ok(serde_json::json!({"status":"insufficient","effect":null,"uncertainty":{"method":"hoeffding","alpha":input.parameters["alpha"]}}));
-            }
-            evaluate_binary_rule(&input.rule,&input.parameters,&input.trial["comparability"],&input.samples)
-        })).expect("builtin rule");
+        let rule = serde_json::json!({"engine": "kip:binary-stratified-v1"});
+        registry
+            .register(
+                &rule,
+                Arc::new(|input: &EvaluationInput| {
+                    let count: usize = input.samples.treatment.values().map(Vec::len).sum();
+                    let quota = input.trial["quota"]
+                        .as_u64()
+                        .unwrap_or(2)
+                        .max(input.minimum_independent_attempts);
+                    if (count as u64) < quota {
+                        let alpha = &input.parameters["alpha"];
+                        return Ok(serde_json::json!({
+                            "status": "insufficient",
+                            "effect": null,
+                            "uncertainty": {"method": "hoeffding", "alpha": alpha},
+                        }));
+                    }
+                    evaluate_binary_rule(
+                        &input.rule,
+                        &input.parameters,
+                        &input.trial["comparability"],
+                        &input.samples,
+                    )
+                }),
+            )
+            .expect("builtin rule");
         registry
     }
 }

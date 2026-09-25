@@ -603,6 +603,25 @@ export class EffectiveAuthority {
     return isPermitted(decision.decision) && decision.unrestricted
   }
 
+  /**
+   * Whether this caller may search and read every element of the Space
+   * unnarrowed: no field mask, classification cap or result cap, and no
+   * policy statement that could deny one element what the Space-wide answer
+   * allows. For such a caller the authorized corpus is the Space's whole
+   * corpus, so SEARCH ranks it straight from the full-text index (§66.4).
+   */
+  searchesWholeSpace(auth: AuthContext): boolean {
+    if (this.statements().some((statement) => statement.effect === 'deny')) return false
+    return (['search', 'read'] as const).every((permission) => {
+      const decision = this.authorize(permission, spaceResource(), auth)
+      return (
+        isPermitted(decision.decision) &&
+        decision.unrestricted &&
+        decision.obligations.redaction_profile === ''
+      )
+    })
+  }
+
   /** Whether this Principal may speak as a semantic actor here (§14, §66). */
   isBoundToActor(actorKey: string): boolean {
     return this.bindings.some((binding) => binding.actor_key === actorKey)

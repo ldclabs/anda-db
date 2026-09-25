@@ -51,24 +51,37 @@ pub async fn execute(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> Response {
-    execute_at_evaluation_time(
-        store, space_id, statement, request, operation, authority, auth, None,
-    )
-    .await
+    let caller = Caller {
+        authority,
+        auth,
+        evaluation_time: None,
+    };
+    execute_as(store, space_id, statement, request, operation, caller).await
 }
 
-/// Private host seam. The optional time is never parsed from request content.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_at_evaluation_time(
+/// Who runs one KML statement, and under what.
+pub(crate) struct Caller<'a> {
+    pub authority: &'a EffectiveAuthority,
+    pub auth: &'a AuthContext,
+    /// Private host seam for trusted simulations; never parsed from request
+    /// content.
+    pub evaluation_time: Option<&'a str>,
+}
+
+/// [`execute`], for a Session that may carry a simulated evaluation time.
+pub(crate) async fn execute_as(
     store: &Store,
     space_id: &str,
     statement: &KmlStatement,
     request: &Request,
     operation: &Operation,
-    authority: &EffectiveAuthority,
-    auth: &AuthContext,
-    evaluation_time: Option<&str>,
+    caller: Caller<'_>,
 ) -> Response {
+    let Caller {
+        authority,
+        auth,
+        evaluation_time,
+    } = caller;
     if evaluation_time.is_some()
         && (!cfg!(feature = "simulation")
             || auth.principal_id != crate::governance::SYSTEM_PRINCIPAL

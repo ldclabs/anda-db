@@ -178,29 +178,35 @@ impl Store {
             json!([])
         };
         let result = json!({"control_changes":controls,"key":key,"version":row.version});
-        self.commit_plan(CommitPlan {
-            cx,
-            journal: JournalEntry {
-                status: "committed".into(),
-                transaction_class: if controls.as_array().is_some_and(|c| !c.is_empty()) {
-                    "governance".into()
-                } else {
-                    "service".into()
+        self.commit_plan(
+            CommitPlan {
+                cx,
+                journal: JournalEntry {
+                    status: "committed".into(),
+                    transaction_class: if controls.as_array().is_some_and(|c| !c.is_empty()) {
+                        "governance".into()
+                    } else {
+                        "service".into()
+                    },
+                    schema_environment_version: self
+                        .get_space(space)
+                        .await?
+                        .schema_environment_version,
+                    result,
+                    origin,
+                    ..Default::default()
                 },
-                schema_environment_version: self.get_space(space).await?.schema_environment_version,
-                result,
-                origin,
-                ..Default::default()
+                writes: vec![],
+                controls: vec![row.clone()],
+                control_replacements: vec![],
+                space: None,
+                purge_versions: vec![],
+                scrub_versions: vec![],
+                audits: vec![],
+                approvals: vec![],
             },
-            writes: vec![],
-            controls: vec![row.clone()],
-            control_replacements: vec![],
-            space: None,
-            purge_versions: vec![],
-            scrub_versions: vec![],
-            audits: vec![],
-            approvals: vec![],
-        })
+            &mut false,
+        )
         .await?;
         Ok(row)
     }
@@ -340,24 +346,53 @@ impl Session {
         } else {
             Permission::Derive
         };
-        self.governed(space,permission,async || {
-            let authority=self.effective_authority(space).await?;
-            let mut sources=source_refs; sources.sort(); sources.dedup();
+        self.governed(space, permission, async || {
+            let authority = self.effective_authority(space).await?;
+            let mut sources = source_refs;
+            sources.sort();
+            sources.dedup();
+            let unavailable =
+                || KipError::not_found_or_not_visible("artifact material input unavailable");
             for reference in &sources {
-                let row=self.nexus.store.get_element(reference.parse()?).await?;
-                if row.space()!=space || row.state()!=state::ACTIVE { return Err(KipError::not_found_or_not_visible("artifact material input unavailable")); }
-                let visibility=authority.may_read(&row,&self.auth).filter(|v|v.content && v.constraints.fields.is_empty()).ok_or_else(||KipError::not_found_or_not_visible("artifact material input unavailable"))?;
-                let _=visibility;
+                let row = self.nexus.store.get_element(reference.parse()?).await?;
+                if row.space() != space || row.state() != state::ACTIVE {
+                    return Err(unavailable());
+                }
+                authority
+                    .may_read(&row, &self.auth)
+                    .filter(|v| v.content && v.constraints.fields.is_empty())
+                    .ok_or_else(unavailable)?;
             }
-            let key=format!("artifact/{artifact_ref}");
-            let value=json!({"state":"available","content":content,"content_digest":content_digest,"source_refs":sources});
-            if let Some(old)=self.nexus.store.control_at(space,&key,u64::MAX).await? {
-                if old.value!=value { return Err(KipError::constraint_violation("artifact identity already has a different material binding or erasure tombstone")); }
+            let key = format!("artifact/{artifact_ref}");
+            let value = json!({
+                "state": "available",
+                "content": content,
+                "content_digest": content_digest,
+                "source_refs": sources,
+            });
+            if let Some(old) = self.nexus.store.control_at(space, &key, u64::MAX).await? {
+                if old.value != value {
+                    return Err(KipError::constraint_violation(
+                        "artifact identity already has a different material binding or \
+                         erasure tombstone",
+                    ));
+                }
             } else {
-                self.nexus.store.publish_control(space,&key,"artifact",0,value,json!({"principal_id":self.auth.principal_id})).await?;
+                self.nexus
+                    .store
+                    .publish_control(
+                        space,
+                        &key,
+                        "artifact",
+                        0,
+                        value,
+                        json!({"principal_id": self.auth.principal_id}),
+                    )
+                    .await?;
             }
             Ok(pin)
-        }).await
+        })
+        .await
     }
 
     pub async fn read_artifact(
@@ -455,68 +490,231 @@ impl Session {
         expected_identity_version: u64,
         reason_evidence: Vec<String>,
     ) -> Result<Json, KipError> {
-        self.governed(space,Permission::MergeIdentity,async || {
-            let store=&self.nexus.store;
-            let authority=self.effective_authority(space).await?;
-            let mut decision=store.control_at(space,decision_id,u64::MAX).await?.ok_or_else(|| KipError::not_found_or_not_visible("identity decision unavailable"))?;
-            let current=authority.space.policies["_kip_identity_changes"].as_array().into_iter().flatten().filter_map(Json::as_u64).max().unwrap_or(0);
-            if current != expected_identity_version { return Err(KipError::version_conflict("identity version changed")); }
-            if decision.kind != "identity" || decision.value["status"] != "active" { return Err(KipError::constraint_violation("decision is not an active identity resolution")); }
-            if reason_evidence.is_empty() { return Err(KipError::constraint_violation("identity withdrawal requires reason Evidence")); }
-            for reference in &reason_evidence {
-                let row=store.get_element(reference.parse()?).await?;
-                if !matches!(row,crate::store::Element::Evidence(_)) || row.space()!=space { return Err(KipError::not_found_or_not_visible("reason Evidence unavailable")); }
-                authority.authorize(Permission::Read,&ResourceContext::of_element(&row),&self.auth).into_result()?;
-            }
-            let source=decision.value["source"].as_str().unwrap_or("").parse::<crate::ElementId>()?;
-            let target=decision.value["target"].as_str().unwrap_or("");
-            let old=store.get_element(source).await?;
-            let crate::store::Element::Concept(old_row)=&old else { return Err(KipError::constraint_violation("identity source is not a Concept")); };
-            if old_row.merged_into != target { return Err(KipError::version_conflict("resolution no longer current")); }
-            // Removing an edge cannot introduce a cycle. Reopening a source can
-            // expose identity collisions, which must be checked before staging.
-            // Key scope is the type lineage after promotions (§7.3, §20.16).
-            let env=store.schema_environment(space).await?;
-            let concept=crate::schema::SymbolKind::ConceptType;
-            for id in store.concepts().query_all_ids(crate::store::eq_field("space",anda_db_schema::Fv::Text(space.into()))).await.map_err(crate::error::db_error)? {
-                let row:ConceptRow=store.concepts().get_as(id).await.map_err(crate::error::db_error)?;
-                if id == source.seq || row.state != state::ACTIVE { continue; }
-                if (!old_row.canonical_id.is_empty() && row.canonical_id==old_row.canonical_id)
-                    || (!old_row.key.is_empty() && row.key==old_row.key && env.same_lineage(concept,&row.schema_ref,&old_row.schema_ref)) {
-                    return Err(KipError::new(KipErrorCode::IdentityConflict,"withdrawal conflicts with an active key or canonical identity"));
-                }
-            }
-            let mut tx=crate::tx::Transaction::begin(store,space,json!({"principal_id":self.auth.principal_id}),false,authority.clone(),(*self.auth).clone()).await?;
-            let crate::store::Element::Concept(row)=tx.load(source).await? else { unreachable!() };
-            row.merged_into.clear(); row.state=state::ACTIVE.into();
-            tx.mark_changed(source,anda_kip::ChangeOp::Update); tx.identity_changed=true;
-            let mut affected=std::collections::BTreeMap::<String,Json>::new();
-            for id in store.element_versions().query_all_ids(crate::store::eq_field("space",anda_db_schema::Fv::Text(space.into()))).await.map_err(crate::error::db_error)? {
-                let version:ElementVersionRow=store.element_versions().get_as(id).await.map_err(crate::error::db_error)?;
-                if version.seq < decision.seq { continue; }
-                for reference in version.row["origin"]["_kip_runtime"]["input_references"].as_array().into_iter().flatten() {
-                    if reference["resolved"]==target || reference["supplied"]==source.to_string() {
-                        affected.insert(version.element.clone(),json!({"ref":version.element,"status":"needs_review","ambiguous":reference["supplied"]==reference["resolved"],"supplied":reference["supplied"],"resolved":reference["resolved"]}));
-                    }
-                }
-            }
-            for (id,value) in &affected {
-                let key=format!("identity_review/{id}");
-                let version=store.control_at(space,&key,u64::MAX).await?.map_or(1,|r|r.version+1);
-                tx.control_effects.push(ControlRecordRow{_id:0,record_id:format!("{}:{key}",tx.cx.tx_id),space:space.into(),key,seq:tx.cx.seq,version,kind:"identity".into(),value:value.clone(),origin:tx.cx.origin.clone()});
-            }
-            decision._id=0; decision.record_id=format!("{}:{decision_id}",tx.cx.tx_id); decision.seq=tx.cx.seq; decision.version+=1;
-            decision.value["status"]=json!("withdrawn"); decision.value["reason_evidence"]=json!(reason_evidence); decision.value["withdrawn_at_version"]=json!(tx.cx.seq);
-            tx.control_effects.push(decision);
-            let outcome=tx.commit(JournalEntry::default()).await?;
-            let mut visible=vec![]; let mut complete=true;
-            for (id,item) in affected {
-                let row=store.get_element(id.parse()?).await?;
-                if authority.may_read(&row,&self.auth).is_some_and(|v|v.content) { visible.push(item); } else { complete=false; }
-            }
-            Ok(json!({"decision_id":decision_id,"identity_version":outcome.receipt.space_seq,"review_set":visible,"complete":complete,"receipt":outcome.receipt}))
-        }).await
+        // Guard and authority taken here, as `sweep_expired` does: the body
+        // needs the resolved authority, and resolving it twice is not free.
+        let _guard = self.nexus.lock.write().await;
+        self.nexus.store.reopen_if_poisoned().await?;
+        let authority = self.effective_authority(space).await?;
+        self.gated_under(&authority, Permission::MergeIdentity, async || {
+            self.withdraw_identity_under(
+                &authority,
+                space,
+                decision_id,
+                expected_identity_version,
+                reason_evidence,
+            )
+            .await
+        })
+        .await
     }
+
+    async fn withdraw_identity_under(
+        &self,
+        authority: &crate::governance::EffectiveAuthority,
+        space: &str,
+        decision_id: &str,
+        expected_identity_version: u64,
+        reason_evidence: Vec<String>,
+    ) -> Result<Json, KipError> {
+        let store = &self.nexus.store;
+        let mut decision = store
+            .control_at(space, decision_id, u64::MAX)
+            .await?
+            .ok_or_else(|| KipError::not_found_or_not_visible("identity decision unavailable"))?;
+        let current = authority.space.policies["_kip_identity_changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Json::as_u64)
+            .max()
+            .unwrap_or(0);
+        if current != expected_identity_version {
+            return Err(KipError::version_conflict("identity version changed"));
+        }
+        if decision.kind != "identity" || decision.value["status"] != "active" {
+            return Err(KipError::constraint_violation(
+                "decision is not an active identity resolution",
+            ));
+        }
+        if reason_evidence.is_empty() {
+            return Err(KipError::constraint_violation(
+                "identity withdrawal requires reason Evidence",
+            ));
+        }
+        for reference in &reason_evidence {
+            let row = store.get_element(reference.parse()?).await?;
+            if !matches!(row, crate::store::Element::Evidence(_)) || row.space() != space {
+                return Err(KipError::not_found_or_not_visible(
+                    "reason Evidence unavailable",
+                ));
+            }
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&row),
+                    &self.auth,
+                )
+                .into_result()?;
+        }
+        let source = decision.value["source"]
+            .as_str()
+            .unwrap_or("")
+            .parse::<crate::ElementId>()?;
+        let target = decision.value["target"].as_str().unwrap_or("").to_string();
+        let crate::store::Element::Concept(old_row) = store.get_element(source).await? else {
+            return Err(KipError::constraint_violation(
+                "identity source is not a Concept",
+            ));
+        };
+        if old_row.merged_into != target {
+            return Err(KipError::version_conflict("resolution no longer current"));
+        }
+        // Removing an edge cannot introduce a cycle. Reopening a source can
+        // expose identity collisions, which must be checked before staging.
+        // Key scope is the type lineage after promotions (§7.3, §20.16).
+        let env = store.schema_environment(space).await?;
+        for (field, value) in [
+            ("canonical_id", &old_row.canonical_id),
+            ("key", &old_row.key),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            let holders = store
+                .concepts()
+                .query_all_ids(crate::store::eq_fields(&[
+                    ("space", anda_db_schema::Fv::Text(space.into())),
+                    (field, anda_db_schema::Fv::Text(value.clone())),
+                ]))
+                .await
+                .map_err(crate::error::db_error)?;
+            for id in holders {
+                if id == source.seq {
+                    continue;
+                }
+                let row: ConceptRow = store
+                    .concepts()
+                    .get_as(id)
+                    .await
+                    .map_err(crate::error::db_error)?;
+                if row.state == state::ACTIVE
+                    && (field == "canonical_id"
+                        || env.same_lineage(
+                            crate::schema::SymbolKind::ConceptType,
+                            &row.schema_ref,
+                            &old_row.schema_ref,
+                        ))
+                {
+                    return Err(KipError::new(
+                        KipErrorCode::IdentityConflict,
+                        "withdrawal conflicts with an active key or canonical identity",
+                    ));
+                }
+            }
+        }
+        let mut tx = crate::tx::Transaction::begin(
+            store,
+            space,
+            json!({"principal_id": self.auth.principal_id}),
+            false,
+            authority.clone(),
+            (*self.auth).clone(),
+        )
+        .await?;
+        let crate::store::Element::Concept(row) = tx.load(source).await? else {
+            unreachable!("the source was read as a Concept above")
+        };
+        row.merged_into.clear();
+        row.state = state::ACTIVE.into();
+        tx.mark_changed(source, anda_kip::ChangeOp::Update);
+        tx.identity_changed = true;
+        // Every write since the decision that recorded a reference through it.
+        let versions = store.element_versions();
+        let since = versions
+            .query_all_ids(anda_db::query::Filter::And(vec![
+                Box::new(crate::store::eq_field(
+                    "space",
+                    anda_db_schema::Fv::Text(space.into()),
+                )),
+                Box::new(anda_db::query::Filter::Field((
+                    "seq".into(),
+                    anda_db::query::RangeQuery::Ge(anda_db_schema::Fv::U64(decision.seq)),
+                ))),
+            ]))
+            .await
+            .map_err(crate::error::db_error)?;
+        let mut affected = std::collections::BTreeMap::<String, Json>::new();
+        for id in since {
+            let version: ElementVersionRow =
+                versions.get_as(id).await.map_err(crate::error::db_error)?;
+            for reference in version.row["origin"]["_kip_runtime"]["input_references"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if reference["resolved"] == target || reference["supplied"] == source.to_string() {
+                    affected.insert(
+                        version.element.clone(),
+                        json!({
+                            "ref": version.element,
+                            "status": "needs_review",
+                            "ambiguous": reference["supplied"] == reference["resolved"],
+                            "supplied": reference["supplied"],
+                            "resolved": reference["resolved"],
+                        }),
+                    );
+                }
+            }
+        }
+        for (id, value) in &affected {
+            let key = format!("identity_review/{id}");
+            let version = store
+                .control_at(space, &key, u64::MAX)
+                .await?
+                .map_or(1, |row| row.version + 1);
+            tx.control_effects.push(ControlRecordRow {
+                _id: 0,
+                record_id: format!("{}:{key}", tx.cx.tx_id),
+                space: space.into(),
+                key,
+                seq: tx.cx.seq,
+                version,
+                kind: "identity".into(),
+                value: value.clone(),
+                origin: tx.cx.origin.clone(),
+            });
+        }
+        decision._id = 0;
+        decision.record_id = format!("{}:{decision_id}", tx.cx.tx_id);
+        decision.seq = tx.cx.seq;
+        decision.version += 1;
+        decision.value["status"] = json!("withdrawn");
+        decision.value["reason_evidence"] = json!(reason_evidence);
+        decision.value["withdrawn_at_version"] = json!(tx.cx.seq);
+        tx.control_effects.push(decision);
+        let outcome = tx.commit(JournalEntry::default()).await?;
+        let mut visible = vec![];
+        let mut complete = true;
+        for (id, item) in affected {
+            let row = store.get_element(id.parse()?).await?;
+            if authority
+                .may_read(&row, &self.auth)
+                .is_some_and(|visibility| visibility.content)
+            {
+                visible.push(item);
+            } else {
+                complete = false;
+            }
+        }
+        Ok(json!({
+            "decision_id": decision_id,
+            "identity_version": outcome.receipt.space_seq,
+            "review_set": visible,
+            "complete": complete,
+            "receipt": outcome.receipt,
+        }))
+    }
+
     /// Replace one named policy with a CAS; prior versions remain replayable.
     pub async fn set_projection_policy(
         &self,

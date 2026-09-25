@@ -1435,7 +1435,8 @@ function search(command: SearchCommand, cx: MetaContext, b: ReadBindings): Json 
   const offset = cursor?.offset ?? 0
 
   const context = reader(cx)
-  const { hits, cap } = rank(context, command, b)
+  // One past the page: enough to know whether another page remains.
+  const { hits, cap } = rank(context, command, b, offset + limit + 1)
   const searchLimit = cap === null ? limit : Math.min(limit, cap)
   const scored = hits.map(({ score, id, kind, view }) => ({ score, hit: {
     id: formatElementId(id), kind: kind.toLowerCase(), score,

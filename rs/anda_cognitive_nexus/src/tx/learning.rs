@@ -1,6 +1,7 @@
 //! Standard CognitiveMemory lifecycle validation. No model output or mutable
 //! tally can confer local standing; the final transaction is checked as a unit.
 use super::cognitive::facet;
+use super::durable::attribute;
 use super::*;
 use anda_kip::cognitive::{EvaluationInput, EvaluationPolicy, EvaluationSamples};
 use serde_json::json;
@@ -14,7 +15,7 @@ fn refs(value: &Json) -> Vec<String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|v| v.as_str().or_else(|| v["id"].as_str()).map(str::to_string))
+        .filter_map(|v| reference_text(v).map(str::to_string))
         .collect()
 }
 fn same_json(a: &Json, b: &Json) -> bool {
@@ -43,6 +44,37 @@ fn record<'a>(element: &'a Element, name: &str) -> Result<&'a Json, KipError> {
         .facets()
         .get(&format!("{PROFILE}{name}"))
         .ok_or_else(|| fail("required standard record is missing"))
+}
+
+/// The standard records a row's Facets carry that learning validation looks
+/// rows up by, and the member each is unique by within a Space.
+const INDEXED_RECORDS: &[(&str, Option<&str>)] = &[
+    ("AttemptRecord", Some("attempt_id")),
+    ("OutcomeRecord", Some("observation_key")),
+    ("EvaluationRecord", None),
+];
+
+/// The `record_keys` column of an Activity or Evidence row: the name of each
+/// indexed standard record it carries, and `Name:value` for its unique member.
+pub(crate) fn learning_record_keys(facets: &Map<String, Json>) -> Option<Vec<String>> {
+    let mut keys = Vec::new();
+    for (name, member) in INDEXED_RECORDS {
+        let Some(value) = facets.get(&format!("{PROFILE}{name}")) else {
+            continue;
+        };
+        keys.push((*name).to_string());
+        if let Some(member) = member {
+            keys.push(record_key(
+                name,
+                value[*member].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
+fn record_key(name: &str, value: &str) -> String {
+    format!("{name}:{value}")
 }
 
 impl Transaction {
@@ -118,14 +150,34 @@ impl Transaction {
         }
     }
 
-    async fn learning_universe(&self, kind: ElementKind) -> Result<Vec<Element>, KipError> {
+    /// Every row of one kind in this Space that carries one of the named
+    /// standard records, as this transaction would leave it.
+    ///
+    /// Read only by the evaluation checks, which reason over a whole trial; an
+    /// ordinary attempt or outcome never pays for reading every record.
+    async fn learning_records(
+        &self,
+        kind: ElementKind,
+        names: &[&str],
+    ) -> Result<Vec<Element>, KipError> {
         let ids = self
             .store
             .elements(kind)
-            .query_all_ids(crate::store::eq_field(
-                "space",
-                anda_db_schema::Fv::Text(self.cx.space.clone()),
-            ))
+            .query_all_ids(anda_db::query::Filter::And(vec![
+                Box::new(crate::store::eq_field(
+                    "space",
+                    anda_db_schema::Fv::Text(self.cx.space.clone()),
+                )),
+                Box::new(anda_db::query::Filter::Field((
+                    "record_keys".into(),
+                    anda_db::query::RangeQuery::Include(
+                        names
+                            .iter()
+                            .map(|name| anda_db_schema::Fv::Text((*name).to_string()))
+                            .collect(),
+                    ),
+                ))),
+            ]))
             .await
             .map_err(db_error)?;
         let mut rows = BTreeMap::new();
@@ -139,6 +191,85 @@ impl Transaction {
             }
         }
         Ok(rows.into_values().collect())
+    }
+
+    /// Refuses a record identity another row of the Space already holds.
+    ///
+    /// Only a value this transaction holds can be newly duplicated, so each is
+    /// looked up rather than every record read.
+    async fn require_unique(
+        &self,
+        kind: ElementKind,
+        name: &str,
+        member: &str,
+        message: &str,
+    ) -> Result<(), KipError> {
+        let mut values = BTreeSet::new();
+        for staged in self.staged.values() {
+            if staged.row.kind() != kind {
+                continue;
+            }
+            if let Ok(value) = record(&staged.row, name)
+                && !values.insert(value[member].as_str().unwrap_or_default().to_string())
+            {
+                return Err(fail(message));
+            }
+        }
+        for value in values {
+            let held = self
+                .store
+                .elements(kind)
+                .query_all_ids(crate::store::eq_fields(&[
+                    ("space", anda_db_schema::Fv::Text(self.cx.space.clone())),
+                    (
+                        "record_keys",
+                        anda_db_schema::Fv::Text(record_key(name, &value)),
+                    ),
+                ]))
+                .await
+                .map_err(db_error)?;
+            if held
+                .into_iter()
+                .any(|seq| !self.staged.contains_key(&ElementId::new(kind, seq)))
+            {
+                return Err(fail(message));
+            }
+        }
+        Ok(())
+    }
+
+    /// The completed `outcome_observation` Activity that lists `id` among its
+    /// outputs, as this transaction would leave it: the stored ones through
+    /// the reverse provenance index, the staged ones in their place, in id
+    /// order.
+    async fn outcome_observation(&self, id: ElementId) -> Result<Option<Element>, KipError> {
+        let key = crate::term::Endpoint::Local(id).key();
+        let mut candidates: BTreeSet<ElementId> = self
+            .store
+            .activities_with_output(&self.cx.space, &key)
+            .await?
+            .into_iter()
+            .collect();
+        candidates.extend(
+            self.staged
+                .keys()
+                .filter(|staged| staged.kind == ElementKind::Activity),
+        );
+        let target = id.to_string();
+        for candidate in candidates {
+            let element = match self.staged.get(&candidate) {
+                Some(staged) => staged.row.clone(),
+                None => self.store.get_element(candidate).await?,
+            };
+            if matches!(&element, Element::Activity(a)
+                if a.activity_class == "outcome_observation"
+                    && a.status == "completed"
+                    && a.outputs.iter().any(|r| reference_text(r) == Some(target.as_str())))
+            {
+                return Ok(Some(element));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) async fn validate_learning(&self) -> Result<(), KipError> {
@@ -168,47 +299,29 @@ impl Transaction {
         }) {
             return Ok(());
         }
-        // Creating or selecting a Skill revision needs only the current plan.
-        // Historical uniqueness/sample scans are relevant to new audit records,
-        // not to every unrelated Skill edit in a growing memory Space.
-        let has_record = |names: &[&str]| {
-            pending
-                .iter()
-                .any(|(_, staged)| names.iter().any(|name| record(&staged.row, name).is_ok()))
-        };
-        let staged_kind = |kind| {
-            self.staged
-                .values()
-                .filter(|s| s.row.kind() == kind)
-                .map(|s| s.row.clone())
-                .collect::<Vec<_>>()
-        };
-        let activities = if has_record(&["AttemptRecord", "OutcomeRecord", "EvaluationRecord"]) {
-            self.learning_universe(ElementKind::Activity).await?
-        } else {
-            staged_kind(ElementKind::Activity)
-        };
-        let evidence = if has_record(&["OutcomeRecord", "EvaluationRecord"]) {
-            self.learning_universe(ElementKind::Evidence).await?
-        } else {
-            staged_kind(ElementKind::Evidence)
-        };
-        let mut attempts = BTreeSet::new();
-        let mut observations = BTreeSet::new();
-        for row in &activities {
-            if let Ok(value) = record(row, "AttemptRecord")
-                && !attempts.insert(value["attempt_id"].as_str().unwrap_or(""))
-            {
-                return Err(fail("attempt_id must be Space-unique"));
-            }
-        }
-        for row in &evidence {
-            if let Ok(value) = record(row, "OutcomeRecord")
-                && !observations.insert(value["observation_key"].as_str().unwrap_or(""))
-            {
-                return Err(fail("observation_key must deduplicate source events"));
-            }
-        }
+        self.require_unique(
+            ElementKind::Activity,
+            "AttemptRecord",
+            "attempt_id",
+            "attempt_id must be Space-unique",
+        )
+        .await?;
+        self.require_unique(
+            ElementKind::Evidence,
+            "OutcomeRecord",
+            "observation_key",
+            "observation_key must deduplicate source events",
+        )
+        .await?;
+        // The records this transaction itself writes; a verdict is always new
+        // here, so the stored ones never answer these checks.
+        let staged_activities: Vec<&Element> = self
+            .staged
+            .values()
+            .map(|staged| &staged.row)
+            .filter(|row| row.kind() == ElementKind::Activity)
+            .collect();
+        let mut universes: Option<(Vec<Element>, Vec<Element>)> = None;
         for (id, staged) in pending {
             let row = &staged.row;
             if is_type(row, "SkillRevision") {
@@ -231,7 +344,16 @@ impl Transaction {
                 // Revisions are immutable behavior. Their family may point at a newer revision.
             }
             if is_type(row, "Skill") {
-                if activities.iter().any(|a|self.staged.get(&a.id()).is_some_and(|s|s.is_new) && record(a,"EvaluationRecord").is_ok() && matches!(a,Element::Activity(a) if a.outputs.iter().any(|r|r.as_str().or_else(||r["id"].as_str())==Some(id.to_string().as_str())))) {self.require_changed_guards(*id,staged)?;}
+                let skill = id.to_string();
+                let verdict_outputs = |a: &&&Element| {
+                    self.staged.get(&a.id()).is_some_and(|s| s.is_new)
+                        && record(a, "EvaluationRecord").is_ok()
+                        && matches!(a, Element::Activity(a)
+                            if a.outputs.iter().any(|r| reference_text(r) == Some(skill.as_str())))
+                };
+                if staged_activities.iter().any(|a| verdict_outputs(&a)) {
+                    self.require_changed_guards(*id, staged)?;
+                }
 
                 let revisions = edge(row, "current_revision");
                 if revisions.len() != 1 {
@@ -243,8 +365,8 @@ impl Transaction {
                         "current_revision and revision_of must be bidirectional",
                     ));
                 }
-                let view = crate::view::render(row);
-                let status = view["attributes"]["status"].as_str().unwrap_or("");
+                let status_now = attribute(row, "status");
+                let status = status_now.as_str().unwrap_or("");
                 let changed_revision = staged
                     .before
                     .as_ref()
@@ -260,13 +382,36 @@ impl Transaction {
                     }
                 } else {
                     let before = staged.before.as_ref().unwrap();
-                    let old = crate::view::render(before);
-                    let lifecycle = old["attributes"]["status"] != view["attributes"]["status"]
+                    let status_before = attribute(before, "status");
+                    let lifecycle = status_before != status_now
                         || edge(before, "current_trial") != trial_ptr
                         || edge(before, "current_evaluation") != evaluation_ptr;
                     if lifecycle {
                         self.require_changed_guards(*id, staged)?;
-                        let eval=activities.iter().find(|a| self.staged.get(&a.id()).is_some_and(|s|s.changed && s.is_new) && record(a,"EvaluationRecord").is_ok_and(|e| e["from_status"]==old["attributes"]["status"] && e["to_status"]==view["attributes"]["status"] && refs(&e["revision_refs"]).contains(&revisions[0])) && matches!(a,Element::Activity(a) if a.output_keys.iter().any(|k|k.contains(&id.to_string())) || a.outputs.iter().any(|r|r["id"]==id.to_string() || r.as_str()==Some(id.to_string().as_str())))).ok_or_else(||fail("lifecycle and its pointers change only with a new validated EvaluationRecord in the same transaction"))?;
+                        let eval = staged_activities
+                            .iter()
+                            .copied()
+                            .find(|a| {
+                                self.staged
+                                    .get(&a.id())
+                                    .is_some_and(|s| s.changed && s.is_new)
+                                    && record(a, "EvaluationRecord").is_ok_and(|e| {
+                                        e["from_status"] == *status_before
+                                            && e["to_status"] == *status_now
+                                            && refs(&e["revision_refs"]).contains(&revisions[0])
+                                    })
+                                    && matches!(a, Element::Activity(a)
+                                        if a.output_keys.iter().any(|k| k.contains(&skill))
+                                            || a.outputs
+                                                .iter()
+                                                .any(|r| reference_text(r) == Some(skill.as_str())))
+                            })
+                            .ok_or_else(|| {
+                                fail(
+                                    "lifecycle and its pointers change only with a new validated \
+                                     EvaluationRecord in the same transaction",
+                                )
+                            })?;
                         let evaluation = record(eval, "EvaluationRecord")?;
                         // The pointers select immutable records; they are never
                         // a second copy that could disagree with them.
@@ -313,9 +458,11 @@ impl Transaction {
                 };
                 for reference in refs(&decision["applied_revisions"]) {
                     self.require_revision(&reference).await?;
-                    if !activity.inputs.iter().any(|r| {
-                        r.as_str().or_else(|| r["id"].as_str()) == Some(reference.as_str())
-                    }) {
+                    if !activity
+                        .inputs
+                        .iter()
+                        .any(|r| reference_text(r) == Some(reference.as_str()))
+                    {
                         return Err(fail("applied revisions must occur in decision inputs"));
                     }
                 }
@@ -392,7 +539,9 @@ impl Transaction {
                     return Err(fail("observation cannot predate its attempt"));
                 }
                 let observation = if evidence.generated_by.is_empty() {
-                    activities.iter().find(|candidate|matches!(candidate,Element::Activity(a) if a.activity_class=="outcome_observation" && a.status=="completed" && a.outputs.iter().any(|r|r.as_str().or_else(||r["id"].as_str())==Some(id.to_string().as_str())))).cloned().ok_or_else(||fail("instrument outcome needs outcome_observation provenance"))?
+                    self.outcome_observation(*id).await?.ok_or_else(|| {
+                        fail("instrument outcome needs outcome_observation provenance")
+                    })?
                 } else {
                     self.final_element(evidence.generated_by.parse()?).await?
                 };
@@ -406,10 +555,11 @@ impl Transaction {
                     || !activity
                         .inputs
                         .iter()
-                        .any(|r| r.as_str().or_else(|| r["id"].as_str()) == Some(attempt_ref))
-                    || !activity.inputs.iter().any(|r| {
-                        r.as_str().or_else(|| r["id"].as_str()) == attempt["decision_ref"].as_str()
-                    })
+                        .any(|r| reference_text(r) == Some(attempt_ref))
+                    || !activity
+                        .inputs
+                        .iter()
+                        .any(|r| reference_text(r) == attempt["decision_ref"].as_str())
                 {
                     return Err(fail(
                         "outcome observation must link its attempt and decision",
@@ -440,7 +590,19 @@ impl Transaction {
                     .as_ref()
                     .is_none_or(|old| facet(old, "EvaluationRecord").is_none())
             {
-                self.validate_evaluation(evaluation, row, &activities, &evidence)
+                if universes.is_none() {
+                    universes = Some((
+                        self.learning_records(
+                            ElementKind::Activity,
+                            &["AttemptRecord", "EvaluationRecord"],
+                        )
+                        .await?,
+                        self.learning_records(ElementKind::Evidence, &["OutcomeRecord"])
+                            .await?,
+                    ));
+                }
+                let (activities, evidence) = universes.as_ref().expect("loaded above");
+                self.validate_evaluation(evaluation, row, activities, evidence)
                     .await?;
             }
         }
@@ -545,7 +707,16 @@ impl Transaction {
         for reference in refs(&trial["baseline_outcome_refs"]) {
             let (row, record) = self.referenced_record(&reference, "OutcomeRecord").await?;
             if let Element::Evidence(e) = &row {
-                baseline_outcomes.insert(reference,json!({"record":record,"status":e.status,"corrected_by":e.corrected_by,"principal_id":self.origin_principal(&row),"observed_at":e.observed_at}));
+                baseline_outcomes.insert(
+                    reference,
+                    json!({
+                        "record": record,
+                        "status": e.status,
+                        "corrected_by": e.corrected_by,
+                        "principal_id": self.origin_principal(&row),
+                        "observed_at": e.observed_at,
+                    }),
+                );
             }
         }
         if !same_json(
@@ -591,16 +762,17 @@ impl Transaction {
                     .get(&id)
                     .and_then(|s| s.before.clone())
                     .unwrap_or_else(|| final_family.clone());
-                if crate::view::render(&before)["attributes"]["status"] != from
-                    || crate::view::render(&final_family)["attributes"]["status"] != to
+                if *attribute(&before, "status") != from
+                    || *attribute(&final_family, "status") != to
                     || edge(&final_family, "current_revision") != vec![reference.clone()]
                 {
                     return Err(fail(
                         "verdict must describe the actual selected revision and lifecycle transition",
                     ));
                 }
-                if !matches!(row,Element::Activity(a) if a.outputs.iter().any(|r|r.as_str().or_else(||r["id"].as_str())==Some(family_ref.as_str())))
-                {
+                let names_family = matches!(row, Element::Activity(a)
+                    if a.outputs.iter().any(|r| reference_text(r) == Some(family_ref.as_str())));
+                if !names_family {
                     return Err(fail("verdict must name its affected Skill in outputs"));
                 }
             }
@@ -798,7 +970,16 @@ impl Transaction {
                     Some("partial") => outcome["magnitude"].as_f64().unwrap_or(0.0),
                     _ => 0.0,
                 });
-                replay_outcomes.insert(outcome_ref.clone(),json!({"record":outcome,"status":e.status,"corrected_by":e.corrected_by,"principal_id":principal,"observed_at":e.observed_at}));
+                replay_outcomes.insert(
+                    outcome_ref.clone(),
+                    json!({
+                        "record": outcome,
+                        "status": e.status,
+                        "corrected_by": e.corrected_by,
+                        "principal_id": principal,
+                        "observed_at": e.observed_at,
+                    }),
+                );
             }
             if treatment && measured.is_none() && !missing.contains(reference) {
                 return Err(fail("missing attempts must be accounted for explicitly"));
@@ -870,7 +1051,10 @@ impl Transaction {
                     && outcome["metric"] == trial["comparability"]["metric"]
                     && outcome["window"] == trial["observation_window"]
                     && !outcomes.contains(&e.id().to_string())
-                    && matches!(e,Element::Evidence(row) if row.status!="corrected" && row.corrected_by.is_empty() && row.observed_at.as_str()<=evaluation["cutoff"].as_str().unwrap_or(""))
+                    && matches!(e, Element::Evidence(row)
+                        if row.status != "corrected"
+                            && row.corrected_by.is_empty()
+                            && row.observed_at.as_str() <= evaluation["cutoff"].as_str().unwrap_or(""))
                 {
                     return Err(fail(
                         "conflicting terminal observations need a supported adjudication rule",

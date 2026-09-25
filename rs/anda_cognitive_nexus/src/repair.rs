@@ -98,7 +98,7 @@ pub(crate) fn set_visible_reference(view: &mut Json, reference: Option<&str>) {
 /// Compares recorded actors by their current identity, without rewriting the
 /// old Assertion or requiring a new attribution after an identity merge.
 async fn actor_key(store: &Store, space: &str, actor: &Json) -> Result<String, KipError> {
-    let Some(mut id) = crate::kml::clauses::element_reference(actor) else {
+    let Some(mut id) = crate::term::element_reference(actor) else {
         return Ok(crate::kml::clauses::endpoint_key(actor));
     };
     for _ in 0..64 {

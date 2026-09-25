@@ -40,7 +40,7 @@ use crate::schema::{EndpointFacts, Intent, SymbolKind};
 use crate::store::planes::{self, PlaneKey};
 use crate::store::rows::*;
 use crate::store::{Element, Store};
-use crate::term::{Endpoint, tuple_keys};
+use crate::term::{Endpoint, element_reference, reference_text, tuple_keys};
 use crate::time;
 use crate::tx::{Guard, Transaction};
 
@@ -722,7 +722,7 @@ fn evidence_row(
         source_refs,
         generated_by: structural
             .one("generated_by")
-            .map(|value| reference_id(&value))
+            .map(|value| reference_text(&value).unwrap_or_default().to_string())
             .unwrap_or_default(),
         status: "active".to_string(),
         client_key,
@@ -774,7 +774,10 @@ async fn assertion_row(
             // view renders it without a rename, and one place fewer can drift
             // from the other.
             let mut citation = Map::new();
-            citation.insert("id".into(), Json::String(reference_id(&value)));
+            citation.insert(
+                "id".into(),
+                Json::String(reference_text(&value).unwrap_or_default().to_string()),
+            );
             if let Some(role) = options.get("role") {
                 // §20.13 fixes the Evidence roles, and a citation whose role
                 // nobody can read is a citation whose meaning is lost:
@@ -863,7 +866,10 @@ async fn assertion_row(
         },
         valid_from: from.as_ref().map(time::Point::store).unwrap_or_default(),
         valid_until: until.as_ref().map(time::Point::store).unwrap_or_default(),
-        evidence_ids: evidence.iter().filter_map(evidence_id).collect(),
+        evidence_ids: evidence
+            .iter()
+            .filter_map(|value| reference_text(value).map(str::to_string))
+            .collect(),
         evidence_refs: evidence,
         context_refs,
         status: "active".to_string(),
@@ -2033,16 +2039,6 @@ async fn canonical_key(tx: &mut Transaction, value: &Json) -> Result<String, Kip
     }
 }
 
-/// The element a stored reference names, written as an id string or as
-/// `{"id": ...}` — the two spellings a reference field accepts.
-pub(crate) fn element_reference(value: &Json) -> Option<ElementId> {
-    match value {
-        Json::String(text) => text.parse().ok(),
-        Json::Object(map) => map.get("id")?.as_str()?.parse().ok(),
-        _ => None,
-    }
-}
-
 /// `corrected` (§57.2): the record was wrong, and a new Evidence record
 /// carries the correction.
 async fn correct(
@@ -2822,14 +2818,6 @@ fn split_payload(payload: Json) -> Result<(String, Json, String), KipError> {
     }
 }
 
-fn evidence_id(value: &Json) -> Option<String> {
-    match value {
-        Json::String(text) => Some(text.clone()),
-        Json::Object(map) => map.get("id").and_then(Json::as_str).map(str::to_string),
-        _ => None,
-    }
-}
-
 pub(crate) fn endpoint_key(value: &Json) -> String {
     Endpoint::from_json(value)
         .map(|endpoint| endpoint.key())
@@ -2848,19 +2836,6 @@ fn core_fields(kind: ElementKind) -> &'static [&'static str] {
         ElementKind::Activity => &["inputs", "outputs", "associated_actors"],
         // A Concept's and a Proposition's topology is entirely Profile-defined.
         ElementKind::Concept | ElementKind::Proposition => &[],
-    }
-}
-
-/// Reads an element id out of a reference value.
-fn reference_id(value: &Json) -> String {
-    match value {
-        Json::String(text) => text.clone(),
-        Json::Object(map) => map
-            .get("id")
-            .and_then(Json::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
     }
 }
 

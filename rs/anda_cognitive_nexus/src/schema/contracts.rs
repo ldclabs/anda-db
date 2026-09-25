@@ -415,7 +415,9 @@ mod timestamp_tests {
 
     #[test]
     fn pinned_timestamp_contracts_preserve_error_classes() {
-        let schema = json!({"$ref":"urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/started_at"});
+        let schema = json!({
+            "$ref": "urn:kip:2.0:schema:cognitive-records#/$defs/AttemptRecord/properties/started_at",
+        });
         validate_value(&schema, &json!("2024-02-29T00:00:00.123Z")).unwrap();
         for value in [
             json!("2026-01-01T00:00:00Z"),

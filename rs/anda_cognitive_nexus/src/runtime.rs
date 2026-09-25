@@ -346,7 +346,7 @@ impl Session {
                 .get(&format!("{PROFILE}revision_of"))
                 .and_then(Json::as_array)
                 .and_then(|r| r.first())
-                .and_then(|r| r.as_str().or_else(|| r["id"].as_str()))
+                .and_then(crate::term::reference_text)
                 .ok_or_else(|| KipError::constraint_violation("revision family unavailable"))?;
             let family = store.get_element(family.parse()?).await?;
             if !family
@@ -355,7 +355,7 @@ impl Session {
                 .and_then(Json::as_array)
                 .is_some_and(|r| {
                     r.iter()
-                        .any(|r| r.as_str().or_else(|| r["id"].as_str()) == reference.as_str())
+                        .any(|r| crate::term::reference_text(r) == reference.as_str())
                 })
             {
                 return Err(KipError::version_conflict(
@@ -458,22 +458,47 @@ impl Session {
     ) -> Result<Json, KipError> {
         self.governed(space, Permission::Maintain, async || {
             let key = format!("dispatch/{attempt_id}");
-            let row = self.nexus.store.control_at(space, &key, u64::MAX).await?
+            let row = self
+                .nexus
+                .store
+                .control_at(space, &key, u64::MAX)
+                .await?
                 .ok_or_else(|| KipError::not_found_or_not_visible("dispatch intent unavailable"))?;
             if row.version != expected {
-                return Err(KipError::version_conflict("dispatch intent version changed"));
+                return Err(KipError::version_conflict(
+                    "dispatch intent version changed",
+                ));
             }
             let mut request: anda_kip::cognitive::DispatchRequest =
                 serde_json::from_value(row.value["request"].clone())
                     .map_err(|e| KipError::internal_error(e.to_string()))?;
             let authority = self.effective_authority(space).await?;
-            let attempt = self.nexus.store.get_element(request.attempt_ref.parse()?).await?;
-            authority.authorize(Permission::Read, &ResourceContext::of_element(&attempt), &self.auth).into_result()?;
+            let attempt = self
+                .nexus
+                .store
+                .get_element(request.attempt_ref.parse()?)
+                .await?;
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&attempt),
+                    &self.auth,
+                )
+                .into_result()?;
             if row.value["state"] == "completed" {
-                return Ok(json!({"action":"done", "idempotency_key":attempt_id, "intent":row.value, "version":row.version}));
+                return Ok(json!({
+                    "action": "done",
+                    "idempotency_key": attempt_id,
+                    "intent": row.value,
+                    "version": row.version,
+                }));
             }
             if row.value["state"] == "outcome_unknown" {
-                return Ok(json!({"action":"outcome_unknown", "idempotency_key":attempt_id, "version":row.version}));
+                return Ok(json!({
+                    "action": "outcome_unknown",
+                    "idempotency_key": attempt_id,
+                    "version": row.version,
+                }));
             }
             if fencing_token < request.fencing_token {
                 return Err(KipError::version_conflict("stale dispatch fence"));
@@ -489,11 +514,31 @@ impl Session {
             };
             let mut value = row.value;
             value["request"] = serde_json::to_value(&request).unwrap();
-            value["state"] = json!(if action == "outcome_unknown" { "outcome_unknown" } else { "dispatching" });
-            let saved = self.nexus.store.publish_control(space, &key, "dispatch", expected,
-                value, json!({"principal_id":self.auth.principal_id})).await?;
-            Ok(json!({"action":action, "idempotency_key":attempt_id, "intent":saved.value, "version":saved.version}))
-        }).await
+            value["state"] = json!(if action == "outcome_unknown" {
+                "outcome_unknown"
+            } else {
+                "dispatching"
+            });
+            let saved = self
+                .nexus
+                .store
+                .publish_control(
+                    space,
+                    &key,
+                    "dispatch",
+                    expected,
+                    value,
+                    json!({"principal_id":self.auth.principal_id}),
+                )
+                .await?;
+            Ok(json!({
+                "action": action,
+                "idempotency_key": attempt_id,
+                "intent": saved.value,
+                "version": saved.version,
+            }))
+        })
+        .await
     }
 
     /// Reconcile with a recorded instrument observation; no external retry is

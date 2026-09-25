@@ -86,7 +86,7 @@ fn redact_origin(system: &mut Json) {
 ///
 /// The caller holds `discover` and not `read`, so it may learn the element is
 /// there and nothing about what it says. Everything but the members
-/// [`ALWAYS_VISIBLE`] names goes, and a `withheld` marker takes their place —
+/// `ALWAYS_VISIBLE` names goes, and a `withheld` marker takes their place —
 /// because an element rendered as `{id, kind}` with no explanation reads as an
 /// element that happens to be empty, and "empty" is a claim about the content.
 pub fn to_identity_only(view: &mut Json) {

@@ -356,7 +356,7 @@ fn finite(value: f64) -> Result<Json, KipError> {
         .ok_or_else(|| KipError::type_mismatch(format!("{value} is not a finite KIP number")))
 }
 
-/// Converts a [`KipValue`] assignment map into plain JSON.
+/// Converts a [`anda_kip::KipValue`] assignment map into plain JSON.
 pub fn assignments_to_json(
     bindings: &Bindings<'_>,
     assignments: &[(String, MutationValue)],

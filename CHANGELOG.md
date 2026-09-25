@@ -285,12 +285,76 @@ for the parser, the executable AST and stored draft Spaces.
   artifacts and symbol references. Editing a host's previously activated lock
   no longer changes cached queries without a schema commit. Clone an environment's
   lock with `structuredClone` before editing and activating a new version.
+- **Fixed — Cognitive Nexus reference audit:** an element first reached while
+  a read resolved a Proposition's endpoints (or a merge chain) and bound by a
+  later pattern kept its `_system.input_references` unfiltered, so a narrowed
+  reader could see an alias it may not read. Read-time attachments now run
+  once per element per read, whichever path reached it, as in kip-do.
+- **Fixed — both engines, reference audit size:** each element records one
+  `input_references` entry per distinct `(supplied, resolved)` pair. Every
+  clause that named a Concept used to add its binding to every element citing
+  that Concept, so ten `ENSURE`s sharing a subject stored eleven entries on
+  each Proposition instead of two.
+- **Behavior change — Cognitive Nexus sequences:** a transaction takes its
+  Space sequence at commit, and only when it changes something (§32.8,
+  §69.3). A dry run, a refused statement and a no-op no longer advance
+  `space_seq`, so another caller's preview cannot fail a
+  `preconditions.space_seq` check. A no-op is journalled only under an
+  idempotency key (or when it settles approvals or audit), at sequence 0 with
+  an id `{space}#{snapshot}~{suffix}`; committed transactions keep
+  `{space}#{seq}`, and a fresh no-op Receipt now matches its replay (no
+  `committed_at`). A host control-plane edit through the unguarded
+  `governance()` handle that races a write fails that write
+  `SerializationConflict` instead of reusing its coordinate. kip-do already
+  behaved this way.
+- **Fixed — Cognitive Nexus transaction size:** the redo intent is stored as
+  JSON text and every row a commit writes is checked against its collection's
+  limits before anything durable happens. A statement or Capsule of about 400
+  Concepts used to fail at commit with `InternalError` (retry class
+  `OutcomeLookupRequired`) and leave every shell pending until the next
+  `connect`; the ceiling is now what one journal entry holds (roughly 2 000
+  changed elements), and anything larger fails `ResourceExhausted` cleanly.
+- **Performance — SEARCH (both engines):** a caller whose authority reaches
+  the whole Space unnarrowed is ranked from the persistent full-text index,
+  with statistics computed over the Space's active corpus of the kind only —
+  the same scores the authorized scan produces (§66.4) — and only the hits it
+  returns are read. Narrowed callers keep the scan. Rust uses the new
+  `BM25IndexView::search_scoped`; kip-do adds a `search_docs` length table
+  (schema version 9, filled by a one-time rebuild).
+- **Performance — Cognitive Nexus reads:** a KQL read no longer scans the
+  version log for each audited reference or looks up identity reviews per
+  element (a 40-Proposition tuple query made 160 version-log and 44 control
+  queries; now none and at most three), resolves the projection policy once,
+  and caches merge classes during a walk; traversals deduplicate with sets.
+  `LIST DEPENDENTS` reads DependencyBasis pins once per read,
+  `withdraw_identity` finds conflicting keys through their indexes and scans
+  only versions since the decision, and `DESCRIBE SNAPSHOT AT TIME` reads the
+  journal through a new `committed_at` index. A batch checks each operation's
+  numbers without serializing every other operation again.
+- **Performance — Cognitive Nexus learning records:** Activity and Evidence
+  rows carry an indexed `record_keys` column (collection schema version 1,
+  backfilled once on open). Attempt and observation uniqueness is a lookup of
+  the values a transaction writes, and only an EvaluationRecord reads its
+  trial's records; every Attempt or Outcome write used to read every Activity
+  and Evidence in the Space.
+- **Changed — Cognitive Nexus API:** `Store::commit_plan` takes the caller's
+  redo-ownership flag, `Store::record_version` a `replay` flag, and
+  `Store::put` absorbs `put_row`; `Store::activities_with_output`,
+  `Store::identity_reviews`, `Store::advance_seq`, `WriteContext::tentative`
+  and `EffectiveAuthority::searches_whole_space` are added; `ActivityRow` and
+  `EvidenceRow` gain `record_keys`. kip-do replaces the unused `searchIndex`
+  with `searchCorpus` / `termCounts` / `searchTokens` and adds
+  `EffectiveAuthority.searchesWholeSpace`.
 
 ### Storage and index crates
 
 `anda_db`, `anda_db_schema`, `anda_db_derive`, `anda_db_utils`,
 `anda_db_btree`, `anda_db_hnsw`, `anda_db_tfs` and `anda_object_store`.
 
+- anda_db_tfs: `BM25Index::search_scoped` scores a set of ids as a corpus of
+  its own — document count, average length and document frequencies come from
+  the set alone — so a document outside it cannot move a score inside it.
+  anda_db exposes it as `BM25IndexView::search_scoped`.
 - anda_object_store: a read that raced a delete of its key, or any failed
   metadata refresh, cleared the whole metadata cache. The deleted key is now
   evicted alone and other refresh errors leave the cache untouched. A metadata

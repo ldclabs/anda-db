@@ -105,8 +105,10 @@ impl Session {
                 return Err(invalid("dispatch has no authoritative lookup channel"));
             }
             let retained = &old.value["lookup_observer"];
-            let config: DispatchLookupObserver = serde_json::from_value(retained["observer"].clone())
-                .map_err(|_| KipError::unsupported_capability("dispatch did not pin a lookup observer"))?;
+            let config: DispatchLookupObserver =
+                serde_json::from_value(retained["observer"].clone()).map_err(|_| {
+                    KipError::unsupported_capability("dispatch did not pin a lookup observer")
+                })?;
             if config.principal_id != self.auth.principal_id
                 || self.auth.auth_method.is_empty()
                 || self.auth.auth_strength == "none"
@@ -135,9 +137,14 @@ impl Session {
                     &self.auth,
                 )
                 .into_result()?;
-            let identity = json!({"operation":"reconcile_wake_lookup","dispatch_ref":dispatch_ref,"observation_key":observation.observation_key});
+            let identity = json!({
+                "operation": "reconcile_wake_lookup",
+                "dispatch_ref": dispatch_ref,
+                "observation_key": observation.observation_key,
+            });
             let key = request_key(&self.auth.principal_id, &identity)?;
-            let request_digest = digest(&json!({"dispatch_ref":dispatch_ref,"observation":observation}))?;
+            let request_digest =
+                digest(&json!({"dispatch_ref": dispatch_ref, "observation": observation}))?;
             if let Some(result) = replay(store, space, &key, &request_digest).await? {
                 return Ok(result);
             }
@@ -150,12 +157,19 @@ impl Session {
             let last = old.value["last_dispatch_at"]
                 .as_str()
                 .ok_or_else(|| invalid("dispatch has no retained start time"))?;
-            if observation.observed_at.as_str() < last || observation.observed_at > crate::time::now() {
+            if observation.observed_at.as_str() < last
+                || observation.observed_at > crate::time::now()
+            {
                 return Err(invalid("lookup time is outside the dispatch interval"));
             }
             let receipt_ref = runtime_ref(
                 "dispatch-lookup",
-                &json!({"scope":space,"principal":self.auth.principal_id,"dispatch_ref":dispatch_ref,"observation_key":observation.observation_key}),
+                &json!({
+                    "scope": space,
+                    "principal": self.auth.principal_id,
+                    "dispatch_ref": dispatch_ref,
+                    "observation_key": observation.observation_key,
+                }),
             )?;
             let mut value = old.value;
             value["state"] = json!(match observation.status {
@@ -173,7 +187,20 @@ impl Session {
                 (*self.auth).clone(),
             )
             .await?;
-            stage_control(store,&mut tx,&receipt_ref,0,"runtime",json!({"format":"nexus:dispatch-lookup-v1","dispatch_ref":dispatch_ref,"observation":observation,"observer":config})).await?;
+            stage_control(
+                store,
+                &mut tx,
+                &receipt_ref,
+                0,
+                "runtime",
+                json!({
+                    "format": "nexus:dispatch-lookup-v1",
+                    "dispatch_ref": dispatch_ref,
+                    "observation": observation,
+                    "observer": config,
+                }),
+            )
+            .await?;
             stage_control(
                 store,
                 &mut tx,
@@ -183,7 +210,19 @@ impl Session {
                 value.clone(),
             )
             .await?;
-            commit(store,tx,key,request_digest,json!({"dispatch_ref":dispatch_ref,"version":next(expected)?,"intent":value,"lookup_receipt_ref":receipt_ref})).await
+            commit(
+                store,
+                tx,
+                key,
+                request_digest,
+                json!({
+                    "dispatch_ref": dispatch_ref,
+                    "version": next(expected)?,
+                    "intent": value,
+                    "lookup_receipt_ref": receipt_ref,
+                }),
+            )
+            .await
         })
         .await
     }

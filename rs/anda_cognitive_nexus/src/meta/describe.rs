@@ -112,13 +112,18 @@ pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer
             let value = match value {
                 Some(v) => {
                     let subject = scalar_str(cx, v, "DESCRIBE TRUST")?;
-                    serde_json::json!({"subject":subject,"weight":control.value["weights"].get(&subject).unwrap_or(&control.value["default_weight"])})
+                    serde_json::json!({
+                        "subject": subject,
+                        "weight": control.value["weights"].get(&subject).unwrap_or(&control.value["default_weight"]),
+                    })
                 }
                 None => control.value.clone(),
             };
-            Answer::whole(
-                serde_json::json!({"model":"protected-actor-weights-v1","version":crate::schema::contracts::digest(&control.value)?,"state":value}),
-            )
+            Answer::whole(serde_json::json!({
+                "model": "protected-actor-weights-v1",
+                "version": crate::schema::contracts::digest(&control.value)?,
+                "state": value,
+            }))
         }
         DescribeTarget::Access { with } => Answer::whole(access(cx, with.as_ref())?),
     })
@@ -474,26 +479,43 @@ async fn activities_consuming(
     let key = crate::term::Endpoint::Local(id).key();
     let mut ids = cx.store.activities_with_input(&cx.space, &key).await?;
     // Required contracts remain traversable even on legacy rows whose optional
-    // Activity.inputs index was incomplete. The ordinary query budget bounds it.
-    let candidates = cx.candidates(anda_kip::ElementKind::Activity, None).await?;
-    cx.charge(candidates.len())?;
-    for candidate in candidates {
-        if let Some(crate::store::Element::Activity(row)) = cx.load_unattached(candidate).await?
-            && row
+    // Activity.inputs index was incomplete. The pins are read once per read,
+    // not once per element the walk reaches; the query budget bounds it.
+    if cx.dependency_pins.is_none() {
+        let candidates = cx.candidates(anda_kip::ElementKind::Activity, None).await?;
+        cx.charge(candidates.len())?;
+        let mut pins: std::collections::BTreeMap<String, Vec<crate::id::ElementId>> =
+            Default::default();
+        for candidate in candidates {
+            let Some(crate::store::Element::Activity(row)) = cx.load_unattached(candidate).await?
+            else {
+                continue;
+            };
+            for (_, basis) in row
                 .facets
                 .iter()
                 .filter(|(name, _)| name.ends_with("/DependencyBasis"))
-                .any(|(_, basis)| {
-                    basis["groups"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|g| g["pins"].as_array().into_iter().flatten())
-                        .any(|pin| pin["id"] == id.to_string())
-                })
-        {
-            ids.push(candidate);
+            {
+                for pin in basis["groups"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|g| g["pins"].as_array().into_iter().flatten())
+                {
+                    if let Some(source) = pin["id"].as_str() {
+                        pins.entry(source.to_string()).or_default().push(candidate);
+                    }
+                }
+            }
         }
+        cx.dependency_pins = Some(pins);
+    }
+    if let Some(pinned) = cx
+        .dependency_pins
+        .as_ref()
+        .and_then(|pins| pins.get(&id.to_string()))
+    {
+        ids.extend(pinned.iter().copied());
     }
     ids.sort_unstable();
     ids.dedup();
@@ -708,7 +730,7 @@ async fn counts(cx: &mut Context<'_>) -> Result<Json, KipError> {
                 )),
                 Box::new(crate::store::eq_field(
                     "state",
-                    anda_db_schema::Fv::Text("active".to_string()),
+                    anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
                 )),
             ]))
             .await

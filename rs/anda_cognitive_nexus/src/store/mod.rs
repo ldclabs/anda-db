@@ -159,7 +159,7 @@ macro_rules! collections {
                 $(
                     let $field = Slot::new(
                         db.open_or_create_collection(
-                            <$row>::schema().map_err(schema_error)?,
+                            versioned(<$row>::schema().map_err(schema_error)?, $name),
                             collection_config($name, $description),
                             $init,
                         )
@@ -246,6 +246,50 @@ collections! {
     commit_log: CommitLogRow = (COMMIT_LOG, init_commit_log, "Recoverable multi-collection commits"),
     /// The exposure log handle (Spec §66.8).
     exposures: ExposureRow = (EXPOSURES, init_exposures, "Append-only exposure log; not cognitive state"),
+}
+
+/// The schema version each collection is opened at.
+///
+/// A collection whose row type gained a column is opened one version higher,
+/// which upgrades a stored schema in place on the next open (new columns are
+/// optional, so stored rows stay valid). Nothing else ever changes a version.
+fn versioned(mut schema: anda_db_schema::Schema, name: &str) -> anda_db_schema::Schema {
+    // 1: `record_keys`, the learning-record index.
+    if matches!(name, ACTIVITIES | EVIDENCE) {
+        schema.with_version(1);
+    }
+    schema
+}
+
+/// Recomputes a derived key column over every stored row, once, before the
+/// index on it is built.
+///
+/// Rows written before the column existed carry none; building the index
+/// first would leave them out of every lookup through it. A row whose keys
+/// already agree is not rewritten, so this changes no content or version.
+async fn backfill_keys<R>(c: &mut Collection, column: &str) -> Result<(), DBError>
+where
+    R: write::Row + serde::de::DeserializeOwned,
+{
+    if c.get_btree_index(&[column]).is_ok() {
+        return Ok(());
+    }
+    for id in c.ids() {
+        let mut row: R = c.get_as(id).await?;
+        let before = serde_json::to_value(&row).ok();
+        row.refresh_index_keys();
+        if serde_json::to_value(&row).ok() != before {
+            let mut document = Document::try_from(c.schema(), &row)?;
+            let mut fields = BTreeMap::new();
+            for name in ["input_keys", "output_keys", "record_keys"] {
+                if let Some(value) = document.remove_field(name) {
+                    fields.insert(name.to_string(), value);
+                }
+            }
+            c.update(id, fields).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Used only for Core elements and the transaction journal. These fields use
@@ -383,6 +427,8 @@ async fn init_evidence(c: &mut Collection) -> Result<(), DBError> {
     // the same bytes are two observations (§73).
     c.create_btree_index_nx(&["content_digest"]).await?;
     c.create_bm25_index_nx(&["payload_inline"]).await?;
+    backfill_keys::<EvidenceRow>(c, "record_keys").await?;
+    c.create_btree_index_nx(&["record_keys"]).await?;
     Ok(())
 }
 
@@ -396,30 +442,10 @@ async fn init_activities(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["input_keys"]).await?;
     // Older Capsule imports did not fill this derived column. Repair it once
     // before building the index; this changes no cognitive content or version.
-    if c.get_btree_index(&["output_keys"]).is_err() {
-        for id in c.ids() {
-            let mut row: ActivityRow = c.get_as(id).await?;
-            let old = (row.input_keys.clone(), row.output_keys.clone());
-            row.refresh_index_keys();
-            if old != (row.input_keys.clone(), row.output_keys.clone()) {
-                c.update(
-                    id,
-                    BTreeMap::from([
-                        (
-                            "input_keys".into(),
-                            Fv::Array(row.input_keys.into_iter().map(Fv::Text).collect()),
-                        ),
-                        (
-                            "output_keys".into(),
-                            Fv::Array(row.output_keys.into_iter().map(Fv::Text).collect()),
-                        ),
-                    ]),
-                )
-                .await?;
-            }
-        }
-    }
+    backfill_keys::<ActivityRow>(c, "output_keys").await?;
     c.create_btree_index_nx(&["output_keys"]).await?;
+    backfill_keys::<ActivityRow>(c, "record_keys").await?;
+    c.create_btree_index_nx(&["record_keys"]).await?;
     Ok(())
 }
 
@@ -461,6 +487,9 @@ async fn init_transactions(c: &mut Collection) -> Result<(), DBError> {
     c.create_btree_index_nx(&["idempotency_key"]).await?;
     c.create_btree_index_nx(&["seq"]).await?;
     c.create_btree_index_nx(&["changed_ids"]).await?;
+    // `DESCRIBE SNAPSHOT AT TIME` resolves an instant to the newest commit at
+    // or before it (§68) without reading the whole journal.
+    c.create_btree_index_nx(&["committed_at"]).await?;
     Ok(())
 }
 
@@ -612,11 +641,32 @@ impl Store {
         space_id: &str,
         input_key: &str,
     ) -> Result<Vec<ElementId>, KipError> {
+        self.activities_by_key(space_id, "input_keys", input_key)
+            .await
+    }
+
+    /// Every Activity in a Space that names one endpoint key among its
+    /// outputs: the producers of an element, by the `output_keys` index.
+    pub async fn activities_with_output(
+        &self,
+        space_id: &str,
+        output_key: &str,
+    ) -> Result<Vec<ElementId>, KipError> {
+        self.activities_by_key(space_id, "output_keys", output_key)
+            .await
+    }
+
+    async fn activities_by_key(
+        &self,
+        space_id: &str,
+        field: &str,
+        key: &str,
+    ) -> Result<Vec<ElementId>, KipError> {
         let ids = self
             .elements(ElementKind::Activity)
             .query_all_ids(eq_fields(&[
                 ("space", Fv::Text(space_id.to_string())),
-                ("input_keys", Fv::Text(input_key.to_string())),
+                (field, Fv::Text(key.to_string())),
             ]))
             .await
             .map_err(db_error)?;
@@ -1018,7 +1068,10 @@ impl Store {
                 .elements(kind)
                 .query_all_ids(anda_db::query::Filter::And(vec![
                     Box::new(eq_field("space", Fv::Text(space.to_string()))),
-                    Box::new(eq_field("state", Fv::Text("active".to_string()))),
+                    Box::new(eq_field(
+                        "state",
+                        Fv::Text(crate::store::rows::state::ACTIVE.into()),
+                    )),
                     // Elements without an expiry are absent from this sparse
                     // index; range over actual timestamps through `now`.
                     Box::new(anda_db::query::Filter::Field((
@@ -1225,6 +1278,10 @@ mod tests {
             TRANSACTIONS,
             SCHEMA_PACKAGES,
             SCHEMA_ENVS,
+            ELEMENT_VERSIONS,
+            CONTROL_RECORDS,
+            COMMIT_LOG,
+            EXPOSURES,
         ];
         let mut sorted = names.to_vec();
         sorted.sort_unstable();

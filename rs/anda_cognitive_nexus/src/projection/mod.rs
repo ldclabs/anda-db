@@ -723,8 +723,7 @@ impl Context<'_> {
                         contexts.dedup();
                         let mut timed = world::Timed::new(&row, *member, frame.partition(*member));
                         timed.context = contexts.join("\u{1f}");
-                        if let Some(actor) =
-                            crate::kml::clauses::element_reference(&row.asserted_by)
+                        if let Some(actor) = crate::term::element_reference(&row.asserted_by)
                             && actor.kind == anda_kip::ElementKind::Concept
                         {
                             let canonical = self.canonical_of(actor).await?;
@@ -791,14 +790,11 @@ impl Context<'_> {
                 }
                 if row.source.mode == "inferred"
                     || self
-                        .store
-                        .control_at(
-                            &self.space,
-                            &format!("identity_review/A-{}", row.source._id),
-                            self.pinned_seq,
-                        )
+                        .under_identity_review(crate::id::ElementId::new(
+                            anda_kip::ElementKind::Assertion,
+                            row.source._id,
+                        ))
                         .await?
-                        .is_some()
                 {
                     let checked = self
                         .dependency_validity(
@@ -1200,7 +1196,7 @@ impl Context<'_> {
                     )),
                     Box::new(crate::store::eq_field(
                         "state",
-                        anda_db_schema::Fv::Text("active".to_string()),
+                        anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
                     )),
                     Box::new(crate::store::key_filter("subject_key", &subject_keys)),
                     Box::new(predicate),

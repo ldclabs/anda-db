@@ -68,8 +68,11 @@ import { rebuildSearch } from './search.js'
  * (§7.3), so a package upgrade never mints a second `"alice"`. This engine
  * never shipped a KIP 1.x, so there is no data to migrate; the additive steps
  * exist so a development database written a day earlier still opens.
+ *
+ * 9 — `search_docs`, the per-document token counts SEARCH scopes its
+ * statistics with. Additive; the full-text rebuild fills it once.
  */
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 /**
  * The `_system` envelope every element table repeats.
@@ -468,6 +471,15 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE VIRTUAL TABLE IF NOT EXISTS fts_evidence USING fts5(
      payload_inline, tokenize='unicode61'
    )`,
+  // Each indexed document's token count. SEARCH scores a caller's corpus with
+  // that corpus's own statistics (§66.4), and FTS5 exposes no per-document
+  // length; reading it here keeps the scoped average length off the rows.
+  `CREATE TABLE IF NOT EXISTS search_docs (
+     kind TEXT NOT NULL,
+     id INTEGER NOT NULL,
+     len INTEGER NOT NULL,
+     PRIMARY KEY (kind, id)
+   ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS kip_meta (
      k TEXT PRIMARY KEY,
      v TEXT NOT NULL
@@ -879,7 +891,9 @@ export function applySchema(sql: SqlStorage): void {
  * Written after the rebuild, so an interrupted one is simply redone.
  */
 function rebuildSearchIfStale(sql: SqlStorage): void {
-  const mark = segmenterMark()
+  // The layout suffix names what a rebuild fills beyond the FTS rows, so a
+  // database built before `search_docs` existed is rebuilt once.
+  const mark = `${segmenterMark()};docs`
   if (metaGet(sql, 'fts_segmenter') === mark) return
   rebuildSearch(sql)
   metaSet(sql, 'fts_segmenter', mark)

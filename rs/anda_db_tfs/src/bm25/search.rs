@@ -37,6 +37,47 @@ impl<T: Tokenizer> BM25Index<T> {
         Ok(Self::top_k_results(scores, top_k))
     }
 
+    /// Scores the supplied document ids as if they were the whole corpus.
+    ///
+    /// Unlike [`Self::try_search_in_ids`], the document count, the average
+    /// document length and every document frequency are computed over `ids`
+    /// alone, so a document outside the scope cannot move a score inside it.
+    /// This is what a caller needs when the scope is an authorization
+    /// boundary: the result equals searching a fresh index built from exactly
+    /// those documents. Ids the index does not hold are ignored.
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+    ) -> Vec<(u64, f32)> {
+        if top_k == 0 {
+            return Vec::new();
+        }
+        let mut scope = Scores::default();
+        let mut total_tokens = 0usize;
+        for id in ids {
+            if let Some(length) = self.doc_tokens.get(id)
+                && scope.insert(*id, 0.0).is_none()
+            {
+                total_tokens += *length;
+            }
+        }
+        if scope.is_empty() {
+            return Vec::new();
+        }
+        let params = params.as_ref().unwrap_or(&self.config.bm25);
+        let mut context = QueryContext::new(self, params);
+        context.doc_count = scope.len();
+        context.avg_length = (total_tokens as f32 / scope.len() as f32).max(1.0);
+        context.scoped = true;
+        let tokens = query_tokens(&mut self.tokenizer.clone(), query.trim());
+        let scores = self.score_tokens(&tokens, &mut context, Some(&scope));
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        Self::top_k_results(scores, top_k)
+    }
+
     /// Searches the index and returns the highest-scoring documents.
     ///
     /// The query is tokenized with the index's tokenizer. Multiple tokens are
@@ -228,7 +269,20 @@ impl<T: Tokenizer> BM25Index<T> {
             let Some(posting) = self.postings.get(token) else {
                 continue;
             };
-            let weight = context.idf(token, posting.1.len()) * tf_gain;
+            // A scoped search counts a term's documents inside the scope only;
+            // otherwise the frequency is the whole index's.
+            let df = match candidates {
+                Some(candidates) if context.scoped => posting
+                    .1
+                    .iter()
+                    .filter(|(id, _)| candidates.contains_key(id))
+                    .count(),
+                _ => posting.1.len(),
+            };
+            if df == 0 {
+                continue;
+            }
+            let weight = context.idf(token, df) * tf_gain;
             // Allocate from actual matches, not a fixed minimum: missing and
             // rare terms should not reserve room for a thousand documents.
             if scores.is_empty() {
@@ -434,6 +488,8 @@ struct QueryContext {
     k1: f32,
     b: f32,
     idfs: FxHashMap<String, f32>,
+    /// Whether document frequencies are counted inside the candidate scope.
+    scoped: bool,
 }
 
 impl QueryContext {
@@ -451,6 +507,7 @@ impl QueryContext {
             k1,
             b,
             idfs: FxHashMap::default(),
+            scoped: false,
         }
     }
 

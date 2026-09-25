@@ -733,12 +733,23 @@ export class Transaction {
     for (const staged of this.staged.values()) {
       if (staged.changed && staged.verb !== 'purge') {
         const referenced = new Set(referencedIds(staged.element))
-        const bindings = this.referenceBindings.filter(
-          (binding) =>
-            isJsonMap(binding) &&
-            typeof binding.resolved === 'string' &&
-            referenced.has(binding.resolved),
-        )
+        // One entry per distinct resolution the element carries: every clause
+        // that named the same reference records its own binding, and
+        // attaching all of them to each citing element grows the audit
+        // quadratically with the statement.
+        const seen = new Set<string>()
+        const bindings = this.referenceBindings.filter((binding) => {
+          if (
+            !isJsonMap(binding) ||
+            typeof binding.resolved !== 'string' ||
+            !referenced.has(binding.resolved)
+          )
+            return false
+          const pair = JSON.stringify([binding.supplied ?? '', binding.resolved])
+          if (seen.has(pair)) return false
+          seen.add(pair)
+          return true
+        })
         if (!bindings.length) continue
         const origin = staged.element.row.origin
         origin._kip_runtime = {

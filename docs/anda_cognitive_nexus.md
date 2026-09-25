@@ -429,6 +429,12 @@ one from an earlier real commit would report a write as a preview of itself.
 `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` still finds the transaction, which is
 the other way to recover.
 
+A transaction takes its Space sequence when it commits a change, not when it
+opens: a dry run, a refused statement and a no-op leave `space_seq` where it was
+(§32.8, §69.3). A committed transaction's id is `{space}#{seq}`, the coordinate
+it produced; a no-op's is `{space}#{snapshot}~{suffix}`, and it is journalled
+only when an idempotency key must be able to find it again.
+
 `CLIENT KEY` is the finer-grained mechanism (§52.1): a `CREATE` under a key some
 earlier attempt already used resolves to that element and writes nothing at all,
 which makes one *clause* retry-safe rather than one transaction. The same key on
@@ -516,14 +522,20 @@ discovers it will read an absent feature as an absent fact.
 `PREVIEW KML` runs the real dry-run path rather than a separate simulation, so
 the preview cannot drift from what a commit would do.
 
-Keyword `SEARCH` builds a temporary BM25 corpus from the caller's authorized,
-field-redacted views. Hidden text therefore cannot affect membership or scores.
-The engine converts the non-negative BM25 score `s` to `s / (1 + s)` and applies
-stable identity tie-breakers. It scans the corpus within the shared candidate
-budget before ranking; large Spaces can return `ResourceExhausted` even with a
-small `LIMIT`. Persistent global ranks are not used to answer restricted views.
-A search continuation fails with `CursorExpired` when its index coordinate has
-changed, because historical search remains unsupported.
+Keyword `SEARCH` ranks exactly the caller's authorized, field-redacted corpus,
+so hidden text cannot affect membership or scores (§66.4). A caller whose
+authority reaches the whole Space unnarrowed — no field mask, classification or
+result cap, no policy deny — is ranked from the persistent BM25 index with
+statistics (document count, average length, document frequencies) computed over
+the Space's active documents of that kind only, which are the scores the scan
+below would produce; only the hits it returns are read. Any other caller gets a
+temporary BM25 corpus built from its authorized, redacted views, scanned within
+the shared candidate budget, so a very large Space can return
+`ResourceExhausted` for it even with a small `LIMIT`. Either way the engine
+converts the non-negative BM25 score `s` to `s / (1 + s)` and applies stable
+identity tie-breakers. A search continuation fails with `CursorExpired` when
+its index coordinate has changed, because historical search remains
+unsupported.
 
 ---
 

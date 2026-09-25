@@ -72,6 +72,16 @@ impl BM25 {
             .try_search_in_ids(query, top_k, params, ids, logical)?)
     }
 
+    pub(crate) fn search_scoped(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+    ) -> Vec<(u64, f32)> {
+        self.index.search_scoped(query, top_k, params, ids)
+    }
+
     pub(crate) fn set_tokenizer(&mut self, tokenizer: TokenizerChain) {
         self.index.set_tokenizer(tokenizer);
     }

@@ -11,13 +11,22 @@ pub(crate) fn facet<'a>(element: &'a Element, local: &str) -> Option<&'a Json> {
 }
 
 fn premises(contract: &Json) -> Json {
-    let mut groups: Vec<Json> = contract["groups"].as_array().into_iter().flatten().map(|group| {
-        let mut pins: Vec<Json> = group["pins"].as_array().into_iter().flatten().map(|pin| {
-            serde_json::json!({"id":pin["id"], "planes":pin["planes"].as_object().map(|p| p.keys().collect::<Vec<_>>())})
+    let mut groups: Vec<Json> =
+        contract["groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|group| {
+                let mut pins: Vec<Json> = group["pins"].as_array().into_iter().flatten().map(|pin| {
+            serde_json::json!({
+                "id": pin["id"],
+                "planes": pin["planes"].as_object().map(|p| p.keys().collect::<Vec<_>>()),
+            })
         }).collect();
-        pins.sort_by_key(anda_kip::canonical_json);
-        serde_json::json!({"role":group["role"], "pins":pins})
-    }).collect();
+                pins.sort_by_key(anda_kip::canonical_json);
+                serde_json::json!({"role":group["role"], "pins":pins})
+            })
+            .collect();
     groups.sort_by_key(anda_kip::canonical_json);
     Json::Array(groups)
 }
@@ -195,7 +204,7 @@ impl Transaction {
             if !activity
                 .inputs
                 .iter()
-                .any(|r| r.as_str().or_else(|| r["id"].as_str()) == Some(id))
+                .any(|r| reference_text(r) == Some(id))
             {
                 return Err(KipError::constraint_violation(
                     "dependency pin is absent from Activity inputs",
@@ -211,7 +220,7 @@ impl Transaction {
             ));
         }
         for output in &activity.outputs {
-            let id = reference_id(output).ok_or_else(|| {
+            let id = element_reference(output).ok_or_else(|| {
                 KipError::constraint_violation("revalidation needs local output references")
             })?;
             let target = self.final_element(id).await?;

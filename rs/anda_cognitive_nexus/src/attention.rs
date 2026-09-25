@@ -230,7 +230,13 @@ fn checkpoint_key(watch: &str, generation: u64) -> String {
 
 fn basis(cx: &Context<'_>) -> Json {
     let b = cx.projection_basis(&cx.policy, &cx.at, None);
-    json!({"schema":b.schema_environment_version,"identity":b.identity_version,"policy":b.policy,"trust":b.trust_version,"authorization":b.authorization_view})
+    json!({
+        "schema": b.schema_environment_version,
+        "identity": b.identity_version,
+        "policy": b.policy,
+        "trust": b.trust_version,
+        "authorization": b.authorization_view,
+    })
 }
 
 async fn configuration(store: &Store, tx: &mut Transaction) -> Result<AttentionConfig, KipError> {
@@ -365,7 +371,8 @@ pub(crate) async fn validate_commit_leases(
             serde_json::from_value(row.value).map_err(|_| invalid("corrupt wake record"))?;
         if row.version != *version
             || wake.fence != *fence
-            || !matches!(&wake.state,WakeState::Running{lease} if lease.owner==principal && lease.expires_at_ms>now)
+            || !matches!(&wake.state, WakeState::Running { lease }
+                if lease.owner == principal && lease.expires_at_ms > now)
         {
             return Err(conflict("lease_lost"));
         }

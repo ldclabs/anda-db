@@ -9,7 +9,7 @@
 //! - [`symbol`] — canonical identity: `kip://<path>@<version>/<Symbol>`, and
 //!   the rule that every persisted reference names an exact version;
 //! - [`package`] — the artifact itself, modelled on the shipped format;
-//! - [`env`] — the per-Space resolution set, which turns a model-facing local
+//! - [`env`](mod@env) — the per-Space resolution set, which turns a model-facing local
 //!   name into one exact symbol or fails saying why;
 //! - [`validate`] — the package validation layer, which is deliberately
 //!   narrower than Core validation and cannot weaken it;
