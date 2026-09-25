@@ -213,14 +213,17 @@ export function checkEnvelope(envelope: KipRequestEnvelope, space: EnvelopeSpace
         JSON.stringify(onError),
     )
   }
-  // §75.4 and §32.1. Refused outright rather than run as a sequence: a batch
-  // that committed operation by operation while the caller asked for
-  // all-or-none is the one failure `atomic` exists to prevent. (The §75.3
-  // rule that atomic cannot pair with `on_error: continue` needs no check
-  // here, because no atomic request gets past this line.)
+  // §75.3, §75.4 and §32.1. `atomic` is the `atomic_batch` capability,
+  // which this engine does not advertise, so the request is refused with
+  // `UnsupportedCapability` — as the Rust engine refuses it — rather than run
+  // as a sequence: a batch that committed operation by operation while the
+  // caller asked for all-or-none is the one failure `atomic` exists to
+  // prevent. (The §75.3 rule that atomic cannot pair with `on_error:
+  // continue` needs no check here, because no atomic request gets past this
+  // line.)
   if (mode === 'atomic') {
     throw new KipError(
-      'UnsupportedIsolation',
+      'UnsupportedCapability',
       'this engine has no atomic batch: one transaction across several ' +
         'operations is not implemented, and running them as a sequence ' +
         'would look like one',

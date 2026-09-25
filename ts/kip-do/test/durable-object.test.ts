@@ -139,7 +139,8 @@ describe('the Durable Object', () => {
     })
     expect(response.status).toBe(400)
     const body = (await response.json()) as KipResponse
-    expect(body.error?.code).toBe('UnsupportedIsolation')
+    // §75.3: `atomic` is the `atomic_batch` capability, not an isolation level.
+    expect(body.error?.code).toBe('UnsupportedCapability')
   })
 
   it('fails a request that marks an extension critical, and carries a non-critical one', async () => {

@@ -64,6 +64,23 @@ describe('the request envelope', () => {
   })
 })
 
+it('refuses an atomic batch as an unsupported capability, and an isolation level as unsupported isolation', () => {
+  // §75.3: `atomic` is the `atomic_batch` capability; a runtime that does not
+  // advertise it refuses with UnsupportedCapability, as the Rust engine does.
+  // An isolation level it cannot provide is a different refusal (§32.2).
+  const refusal = (execution: Record<string, unknown>): unknown => {
+    try {
+      checkEnvelope({ kip: '2.0', execution, operations: [read, read] } as never, space)
+    } catch (error) {
+      return (error as { code?: unknown }).code
+    }
+    return undefined
+  }
+  expect(refusal({ mode: 'atomic' })).toBe('UnsupportedCapability')
+  expect(refusal({ mode: 'sequence', isolation: 'snapshot' })).toBe('UnsupportedIsolation')
+  expect(refusal({ mode: 'sequence', isolation: 'serializable' })).toBeUndefined()
+})
+
 it('refuses envelope dry runs before any operation can commit', () => {
   expect(() => checkEnvelope({kip: '2.0', options: {dry_run: true}, operations: [read]}, space)).toThrowError(/PREVIEW KML/)
   expect(() => checkEnvelope({kip: '2.0', options: {dry_run: false}, operations: [read]}, space)).not.toThrow()

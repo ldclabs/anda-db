@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [0.14.0] — 2026-09-24
+## [0.14.0] — 2026-09-25
 
 This release aligns every AndaDB Rust package, the Python binding and
 `@ldclabs/kip-do` at **0.14.0**. It is breaking for KIP clients, for Spaces
@@ -160,6 +160,11 @@ for the parser, the executable AST and stored draft Spaces.
   `DEFINE` is refused instead of being silently dropped. In Rust the rule is
   `Command::opens_write_transaction` (with `KmlStatement::is_standalone_define`),
   checked by `Request::validate` and `PreparedRequest`.
+- **kip-do — atomic refusal code:** an `execution.mode: "atomic"` request is
+  refused with `UnsupportedCapability`, as §75.3 and the Rust engine require
+  (`atomic` is the `atomic_batch` capability), instead of `UnsupportedIsolation`.
+  An isolation level the engine cannot provide still answers
+  `UnsupportedIsolation`.
 - **Storage:** new stores no longer index `assertions.valid_until` (existing
   indexes stay, unread); a Capsule import keeps time-bound `valid_time`
   endpoints instead of dropping them.

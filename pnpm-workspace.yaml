@@ -12,5 +12,6 @@ minimumReleaseAgeExclude:
   - '@ldclabs/kip-lang'
   - '@cloudflare/workers-types@5.20260924.1'
   - wrangler@4.137.0
-overrides:
-  # '@ldclabs/kip-lang': 'link:../KIP/packages/kip-lang'
+  - '@cloudflare/workers-types@5.20260925.1'
+  - miniflare@5.20260923.0-alpha
+  - wrangler@4.139.0
