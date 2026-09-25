@@ -20,7 +20,7 @@
  * claim" to every question.
  */
 
-import { jsonEquals, type Json } from '../json.js'
+import { isJsonMap, jsonEquals, type Json } from '../json.js'
 import { ftsQuote } from '../sql.js'
 import { extractJsonText, segmentToText } from '../tokenizer.js'
 import type { ElementKind } from '../id.js'
@@ -33,8 +33,6 @@ interface SearchableKind {
   table: string
   /** The row columns the index is built from, one FTS column each. */
   columns: readonly string[]
-  /** The same fields as a rendered view names them. */
-  viewFields: readonly string[]
   /** The segmented text of each column, from the fields in column order. */
   textOf(values: readonly unknown[]): string[]
 }
@@ -46,7 +44,6 @@ const CONCEPT: SearchableKind = {
   fts: 'fts_concepts',
   table: 'concepts',
   columns: ['name', 'aliases', 'attributes'],
-  viewFields: ['name', 'aliases', 'attributes'],
   textOf: ([name, aliases, attributes]) => [
     segmentToText(typeof name === 'string' ? name : ''),
     segmentToText(strings(aliases).join(' ')),
@@ -62,7 +59,6 @@ const PROPOSITION: SearchableKind = {
   // the words, and they are Concepts and Literals a search reaches on their
   // own terms.
   columns: ['predicate_ref'],
-  viewFields: ['predicate_ref'],
   // The exact symbol, segmented like anything else: `unicode61` splits it at
   // the scheme and path separators, so `SEARCH PROPOSITION "prefers"` finds
   // tuples under `kip://profiles/cognitive-memory@2.0.0/prefers` without the
@@ -74,8 +70,17 @@ const EVIDENCE: SearchableKind = {
   fts: 'fts_evidence',
   table: 'evidence',
   columns: ['payload_inline'],
-  viewFields: ['payload'],
   textOf: ([payload]) => [segmentToText(extractJsonText(payload ?? null).join(' '))],
+}
+
+/** The indexed content in a redacted view, shared by ranking and snippets. */
+export function searchValues(kind: ElementKind, view: Record<string, unknown>): unknown[] {
+  if (kind === 'Evidence') {
+    // payload_inline is exposed inside a wrapper; mode and content_ref are
+    // not indexed content, and a masked inline member contributes no text.
+    return [isJsonMap(view.payload) ? view.payload.inline : undefined]
+  }
+  return (SEARCHABLE[kind]?.columns ?? []).map((field) => view[field])
 }
 
 /**
@@ -86,7 +91,7 @@ export function searchTokens(kind: ElementKind, view: Record<string, unknown>): 
   const searchable = SEARCHABLE[kind]
   if (searchable === undefined) return []
   return searchable
-    .textOf(searchable.viewFields.map((field) => view[field]))
+    .textOf(searchValues(kind, view))
     .flatMap((text) => (text === '' ? [] : text.split(' ')))
 }
 

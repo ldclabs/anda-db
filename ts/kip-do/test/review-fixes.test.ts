@@ -123,6 +123,54 @@ describe('review fixes', () => {
     })
   })
 
+  it('scores only visible inline Evidence content on both search paths', async () => {
+    await withNexus('evidence-search', (nexus) => {
+      nexus.execute(`MUTATE {
+        CREATE EVIDENCE ?a {SET FIELDS {evidence_class: "observation", payload: "apple"}}
+        CREATE EVIDENCE ?b {SET FIELDS {evidence_class: "observation", payload: "apple banana cherry durian"}}
+        CREATE EVIDENCE ?external {SET FIELDS {evidence_class: "observation", payload: {content_ref: "urn:example:offsite"}}}
+        CREATE EVIDENCE ?empty {SET FIELDS {evidence_class: "observation", payload: ""}}
+      }`)
+      // A result cap selects the scan while preserving the same visible corpus.
+      const gov = nexus.store.governance
+      gov.ensurePrincipal({ principal_id: 'kip:principal:capped' })
+      gov.createGrant({
+        space_id: nexus.space,
+        grantee_principal: 'kip:principal:capped',
+        actions: ['read', 'search'],
+        constraints: { max_results: 100 },
+      }, SYSTEM_PRINCIPAL)
+      const capped = nexus.session(principalAuth('kip:principal:capped'))
+      type Answer = { hits: (Hit & { snippet: string; element: { payload: { inline: string } } })[] }
+      for (const [command, count] of [
+        ['SEARCH EVIDENCE "apple" LIMIT 10', 2],
+        ['SEARCH EVIDENCE "apple" THRESHOLD 0.187 LIMIT 10', 1],
+        ['SEARCH EVIDENCE "inline" LIMIT 10', 0],
+        ['SEARCH EVIDENCE "offsite" LIMIT 10', 0],
+      ] as const) {
+        const indexed = nexus.describe(command) as unknown as Answer
+        const scanned = capped.describe(command) as unknown as Answer
+        expect(indexed.hits).toHaveLength(count)
+        expect(scanned.hits).toHaveLength(count)
+        expect(indexed.hits.map((hit) => hit.id)).toEqual(scanned.hits.map((hit) => hit.id))
+        indexed.hits.forEach((hit, i) => {
+          expect(hit.score).toBeCloseTo(scanned.hits[i]!.score, 12)
+          expect(hit.snippet).toBe(hit.element.payload.inline)
+          expect(hit.snippet).toBe(scanned.hits[i]!.snippet)
+        })
+      }
+      gov.ensurePrincipal({ principal_id: 'kip:principal:masked' })
+      gov.createGrant({
+        space_id: nexus.space,
+        grantee_principal: 'kip:principal:masked',
+        actions: ['read', 'search'],
+        constraints: { fields: ['evidence_class'] },
+      }, SYSTEM_PRINCIPAL)
+      const masked = nexus.session(principalAuth('kip:principal:masked'))
+      expect(hitsOf(masked.describe('SEARCH EVIDENCE "apple" LIMIT 10'))).toHaveLength(0)
+    })
+  })
+
   it('reads only the page an unnarrowed SEARCH returns', async () => {
     await withNexus('search-cost', (nexus, recorded) => {
       const people = Array.from(

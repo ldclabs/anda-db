@@ -16,7 +16,7 @@ import type { JsonMap } from '../json.js'
 import type { Scalar, SearchTarget } from '../kip/ast.js'
 import { lineageOfSymbol, lineageText } from '../schema/index.js'
 import { TABLES } from '../store/index.js'
-import { searchCorpus, searchTokens, termCounts } from '../store/search.js'
+import { searchCorpus, searchTokens, searchValues, termCounts } from '../store/search.js'
 import { MAX_QUERY_TOKENS, segment } from '../tokenizer.js'
 import { compareCodePoints } from '../json.js'
 import type { Context } from './context.js'
@@ -256,14 +256,6 @@ function rankIndexed(
 
 /** The text a kind is grounded on, read from the redacted view. */
 export function groundingText(kind: ElementKind, view: JsonMap): string {
-  const fields =
-    kind === 'Concept'
-      ? ['name', 'aliases', 'attributes']
-      : kind === 'Proposition'
-        ? ['predicate_ref']
-        : kind === 'Evidence'
-          ? ['payload']
-          : []
   let text = ''
   const collect = (value: unknown): void => {
     if (typeof value === 'string') {
@@ -274,6 +266,6 @@ export function groundingText(kind: ElementKind, view: JsonMap): string {
       Object.values(value as Record<string, unknown>).forEach(collect)
     }
   }
-  for (const field of fields) collect(view[field])
+  for (const value of searchValues(kind, view)) collect(value)
   return text
 }

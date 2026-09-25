@@ -408,6 +408,75 @@ async fn an_unnarrowed_search_ranks_like_the_authorized_scan() {
 }
 
 #[tokio::test]
+async fn evidence_search_scores_only_visible_inline_content_on_both_paths() {
+    let n = fresh("review_evidence_search").await;
+    ok(
+        &n,
+        r#"MUTATE {
+          CREATE EVIDENCE ?a {SET FIELDS {evidence_class: "observation", payload: "apple"}}
+          CREATE EVIDENCE ?b {SET FIELDS {evidence_class: "observation", payload: "apple banana cherry durian"}}
+          CREATE EVIDENCE ?external {SET FIELDS {evidence_class: "observation", payload: {content_ref: "urn:example:offsite"}}}
+          CREATE EVIDENCE ?empty {SET FIELDS {evidence_class: "observation", payload: ""}}
+        }"#,
+        Json::Null,
+    )
+    .await;
+    // A result cap selects the scan while preserving the same visible corpus.
+    let capped = reader(
+        &n,
+        "kip:principal:capped",
+        GrantDraft {
+            actions: vec!["read".into(), "search".into()],
+            constraints: AuthorityConstraints {
+                max_results: Some(100),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    for (command, count) in [
+        (r#"SEARCH EVIDENCE "apple" LIMIT 10"#, 2),
+        (r#"SEARCH EVIDENCE "apple" THRESHOLD 0.187 LIMIT 10"#, 1),
+        (r#"SEARCH EVIDENCE "inline" LIMIT 10"#, 0),
+        (r#"SEARCH EVIDENCE "offsite" LIMIT 10"#, 0),
+    ] {
+        let indexed = ok(&n, command, Json::Null).await;
+        let scanned = ok(&capped, command, Json::Null).await;
+        let indexed = indexed["hits"].as_array().unwrap();
+        let scanned = scanned["hits"].as_array().unwrap();
+        assert_eq!(indexed.len(), count, "{command}");
+        assert_eq!(scanned.len(), count, "{command}");
+        for (a, b) in indexed.iter().zip(scanned) {
+            assert_eq!(a["id"], b["id"], "{command}");
+            assert!(
+                (a["score"].as_f64().unwrap() - b["score"].as_f64().unwrap()).abs() < 1e-9,
+                "{command}: {} vs {}",
+                a["score"],
+                b["score"]
+            );
+            assert_eq!(a["snippet"], a["element"]["payload"]["inline"]);
+            assert_eq!(a["snippet"], b["snippet"]);
+        }
+    }
+    let masked = reader(
+        &n,
+        "kip:principal:masked",
+        GrantDraft {
+            actions: vec!["read".into(), "search".into()],
+            constraints: AuthorityConstraints {
+                fields: vec!["evidence_class".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let answer = ok(&masked, r#"SEARCH EVIDENCE "apple" LIMIT 10"#, Json::Null).await;
+    assert!(answer["hits"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_tuple_read_pays_no_version_log_or_per_element_control_lookups() {
     let n = fresh("review_read_cost").await;
     let mut text = String::from("MUTATE {\n");

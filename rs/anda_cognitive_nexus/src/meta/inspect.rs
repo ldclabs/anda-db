@@ -930,15 +930,17 @@ fn snippet_of(kind: ElementKind, view: &Json, term: &str) -> String {
 }
 
 fn grounding_text(kind: ElementKind, view: &Json) -> String {
-    let fields: &[&str] = match kind {
-        ElementKind::Concept => &["name", "aliases", "attributes"],
-        ElementKind::Proposition => &["predicate_ref"],
-        ElementKind::Evidence => &["payload"],
+    let fields: &[&Json] = match kind {
+        ElementKind::Concept => &[&view["name"], &view["aliases"], &view["attributes"]],
+        ElementKind::Proposition => &[&view["predicate_ref"]],
+        // The persistent index holds payload_inline, without the view's
+        // mode/content_ref wrapper. Read the same content after redaction.
+        ElementKind::Evidence => &[&view["payload"]["inline"]],
         _ => &[],
     };
     let mut text = String::new();
     for field in fields {
-        collect_text(&view[*field], &mut text);
+        collect_text(field, &mut text);
     }
     text
 }

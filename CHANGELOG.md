@@ -321,6 +321,11 @@ for the parser, the executable AST and stored draft Spaces.
   returns are read. Narrowed callers keep the scan. Rust uses the new
   `BM25IndexView::search_scoped`; kip-do adds a `search_docs` length table
   (schema version 9, filled by a one-time rebuild).
+- **Fixed — Evidence SEARCH (both engines):** the authorized scan and search
+  snippets use only the visible inline payload, matching the persistent index.
+  Payload mode and external content references no longer contribute terms or
+  corpus statistics, so a result cap alone cannot change scores or threshold
+  matches for callers that can read the same content.
 - **Performance — Cognitive Nexus reads:** a KQL read no longer scans the
   version log for each audited reference or looks up identity reviews per
   element (a 40-Proposition tuple query made 160 version-log and 44 control
