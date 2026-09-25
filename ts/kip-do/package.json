@@ -51,15 +51,15 @@
     "codegen:fixtures": "node scripts/codegen-fixtures.mjs",
     "codegen": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run codegen:contracts && pnpm run codegen:fixtures && pnpm run codegen:oracle-corpus",
     "prepublishOnly": "pnpm run codegen:errors && pnpm run codegen:capabilities && pnpm run codegen:profiles && pnpm run codegen:contracts && pnpm run build",
-    "ncu": "npx npm-check-updates -u",
+    "deps:update": "pnpm update --latest",
     "codegen:contracts": "node scripts/codegen-contracts.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^5.20260925.1",
+    "@cloudflare/workers-types": "^5.20260924.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.0",
-    "wrangler": "^4.139.0"
+    "wrangler": "^4.137.0"
   },
   "engines": {
     "node": ">=20"

@@ -4,14 +4,21 @@ allowBuilds:
   esbuild: true
   sharp: false
   workerd: true
+# pnpm 11 refuses versions younger than `minimumReleaseAge` (default: 1 day).
+# Strict mode stops a package.json range that only an immature version
+# satisfies from being installed silently: pnpm would otherwise append
+# `name@version` below on its own, and it honours only the first entry per
+# package name, so the second such append for a package is ignored and a later
+# install rejects the lockfile. Bump dependencies with `pnpm run deps:update`,
+# which picks only versions that already pass the policy.
+minimumReleaseAgeStrict: true
 # The reference toolkit this repository tracks release-for-release; a version
-# published hours ago is one this workspace is *meant* to be on. Name only:
-# pnpm matches these against package names, so a `name@version` entry excludes
-# nothing and the policy rejects the lockfile it was written to allow.
+# published hours ago is one this workspace is *meant* to be on. Keep one entry
+# per package: a bare name trusts every version, and several versions go in one
+# entry as `name@1.0.0 || 1.0.1`.
 minimumReleaseAgeExclude:
   - '@ldclabs/kip-lang'
-  - '@cloudflare/workers-types@5.20260924.1'
-  - wrangler@4.137.0
-  - '@cloudflare/workers-types@5.20260925.1'
-  - miniflare@5.20260923.0-alpha
-  - wrangler@4.139.0
+updateConfig:
+  ignoreDependencies:
+    # @cloudflare/vitest-pool-workers 0.22 peers on vitest ^4.1.
+    - vitest
