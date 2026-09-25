@@ -370,6 +370,14 @@ impl Command {
     pub fn is_mutation(&self) -> bool {
         matches!(self, Command::Kml(_))
     }
+
+    /// Whether executing this command opens a memory write transaction: a KML
+    /// statement other than a standalone `DEFINE`, which commits to the Schema
+    /// Environment instead (Spec §20.16). It is what a request's ingestion
+    /// context mints its Evidence into (§71.1).
+    pub fn opens_write_transaction(&self) -> bool {
+        matches!(self, Command::Kml(statement) if !statement.is_standalone_define())
+    }
 }
 
 /// The language family a command belongs to.
@@ -826,6 +834,15 @@ pub struct KmlStatement {
     pub explicit_transaction: bool,
     /// The mutations, in source order.
     pub clauses: Vec<MutationClause>,
+}
+
+impl KmlStatement {
+    /// Whether this is a standalone `DEFINE`: its own governance transaction
+    /// against the Schema Environment, never a clause of a mutation plan
+    /// (Spec §20.16).
+    pub fn is_standalone_define(&self) -> bool {
+        matches!(self.clauses.as_slice(), [MutationClause::Define(_)])
+    }
 }
 
 /// One mutation inside a transaction.

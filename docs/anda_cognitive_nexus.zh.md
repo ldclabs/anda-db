@@ -12,7 +12,7 @@ KQL/HISTORY 分页保留首个快照；cursor 按 Principal 记录在当前 Stor
 
 查询另有 100,000 次中间结果/候选配对工作预算；LIMIT 不豁免 JOIN 预算。历史重建对扫描版本收费，并在同一查询内按 kind 复用结果。性能测量见[审查基准](benchmarks/anda_nexus_2026-09-23/README.md)。
 
-追踪 KIP 提交 `597db44`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`）。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
+追踪 KIP 提交 `11a82ec`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`）。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
 
 世界时间与信念遵循该提交的 2.0 草案：没有 `from` 的主张按 `{latest: asserted_at}` 起算；`valid_time` 端点可以是 `{earliest, latest}` 区间，无法定位的主张投影为 `uncertain`，原因为 `temporal_indeterminate`。同一 actor 后续 stated/observed 的值在其起点结束先前开放的值（时序继承，§25.4），因此世界变化只需一次 `ASSERT`，`SUPERSEDING` 仅用于纠正错误的主张。`functional` 槽位形成冲突集，`functional_by: "object_type"` 按对象的 Concept Type 分区，`WITH EPISTEMIC {policy: "kip:memory-default"}` 依次按上下文特异性、第一人称证言与时间就近解决冲突。`expired` 为计算状态，从不存储。`?x SEARCH <KIND> "term" LIMIT k` 把关键词检索并入 `FIND`。投影只在 `basis` 中报告策略、`valid_at` 与快照；结构化策略（`kip:memory-default` 与引擎私有的 `kip:policy:structural`）输出 `score: null`。修正（supersession）必须保持同一 actor、同一上下文集合与同一槽位，否则报 `SupersessionMismatch`。`MnemonicState.effective_strength` 在读取时按 `kip:strength-half-life-30d` 策略计算，未钉住策略时为 `null`。
 
@@ -242,7 +242,7 @@ EXPECT VERSION 5 OF FACET "MnemonicState" 针对指定符号的单个 Facet
 
 **`LIMIT` 严格按实体 ID 升序裁剪。** Spec §52.7 允许运行时明确排序规范，定义明确的排序规则是有界批量扫描具备确定性与可重现性的前提。
 
-**请求信封字段必须严格履行或显式报错，绝不可静默忽略。** `preconditions.space_seq` 与 `preconditions.schema_environment_version` 在命令执行前优先校验（§35.4）；`requires` 会对照 `DESCRIBE CAPABILITIES` 声明的能力清单逐项核对，遇到未知特性直接拒绝执行，绝不假定其可用（§67）；`ingest` 在当前命令自身的事务内部生成 Evidence，并将每项的 `key` 绑定为请求参数，确保观察凭据源于传输信封而非模型生成的文本（§71.1, §88.12）；`options.deadline_ms` 直接被拒绝，因为 §80.2 规定客户端超时不代表事务中止，本引擎无法取消正在落盘的提交过程。
+**请求信封字段必须严格履行或显式报错，绝不可静默忽略。** `preconditions.space_seq` 与 `preconditions.schema_environment_version` 在命令执行前优先校验（§35.4）；`requires` 会对照 `DESCRIBE CAPABILITIES` 声明的能力清单逐项核对，遇到未知特性直接拒绝执行，绝不假定其可用（§67）；`ingest` 在当前命令自身的事务内部生成 Evidence，并将每项的 `key` 绑定为请求参数，确保观察凭据源于传输信封而非模型生成的文本（§71.1, §88.12）——每个条目在一个请求中只对应一个 Evidence：请求若开启多于一个写事务（独立 `DEFINE` 之外的 KML 操作），则每个条目都必须携带 `client_key`，各事务借此解析到同一个 Evidence，否则整个请求被拒绝；不开启任何写事务的请求同样被拒绝，而不是丢弃这次观测；`options.deadline_ms` 直接被拒绝，因为 §80.2 规定客户端超时不代表事务中止，本引擎无法取消正在落盘的提交过程。
 
 `UPDATE` 仅能修改可变的、非受控保护的状态。其实际允许修改的范围由*引擎加载出的实体类型*决定，而非取决于命令语法：对 Assertion 调用报错 `EpistemicRevisionRequired`，对 Evidence 报错 `EvidenceCorrectionRequired`，对已终结的 Activity 报错 `ActivityTerminal`。
 

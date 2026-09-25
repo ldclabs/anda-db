@@ -19,7 +19,7 @@ knowledge graph for AI agents.
 ## v0.14.0 upgrade
 
 Rust 1.95 or newer is required. Package versions are aligned at 0.14.0 while
-the KIP protocol stays at 2.0 (KIP `597db44`). This release breaks the KIP
+the KIP protocol stays at 2.0 (KIP `11a82ec`). This release breaks the KIP
 parser and AST, replaces the bundled CognitiveMemory draft package (Spaces
 activated under the earlier 2.1.0 draft are not migrated), moves a
 projection's policy into its `basis`, adds the Space draft vocabulary

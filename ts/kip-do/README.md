@@ -1,6 +1,6 @@
 # @ldclabs/kip-do
 
-Tracks KIP at `597db44`, with the draft memory package
+Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
 

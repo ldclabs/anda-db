@@ -2,7 +2,7 @@
 
 [English](anda-brain-nexus-contracts.md)
 
-本次实现对应 KIP `597db44`。协议版本仍是 KIP 2.0，标准包是
+本次实现对应 KIP `11a82ec`。协议版本仍是 KIP 2.0，标准包是
 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`；草案原地重写了 2.0.0，用 2.1.0 草案激活过的 Space 不迁移）。Rust 与 SQLite/Durable Object 引擎均已提供
 下列接口。Brain 的检索策略、调度循环、工具适配器与五意图 Memory Interface
 由 Anda Brain 接入；数据库负责权限、引用、版本、事务和记录有效性。

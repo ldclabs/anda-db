@@ -68,3 +68,32 @@ it('refuses envelope dry runs before any operation can commit', () => {
   expect(() => checkEnvelope({kip: '2.0', options: {dry_run: true}, operations: [read]}, space)).toThrowError(/PREVIEW KML/)
   expect(() => checkEnvelope({kip: '2.0', options: {dry_run: false}, operations: [read]}, space)).not.toThrow()
 })
+
+describe('an ingestion context is one Evidence per entry (§71.1)', () => {
+  const entry = { key: 'msg', evidence_class: 'user_statement', payload: 'I prefer dark mode.' }
+  const write = (name: string) => ({ command: `CREATE CONCEPT ?c { TYPE "T" NAME "${name}" }` })
+  const define = { command: 'DEFINE CONCEPT TYPE "Instrument" {description: "x"}' }
+  const batch = (
+    mode: string,
+    operations: { command: string }[],
+    evidence: Record<string, unknown>[] = [entry],
+  ) => ({ kip: '2.0', execution: { mode }, ingest: { evidence }, operations }) as never
+
+  it('refuses two write transactions unless every entry carries a client_key', () => {
+    for (const mode of ['sequence', 'independent']) {
+      expect(() => checkEnvelope(batch(mode, [write('a'), write('b')]), space)).toThrowError(
+        /opens 2 write transactions .* "msg" has no client_key/,
+      )
+      expect(() =>
+        checkEnvelope(batch(mode, [write('a'), write('b')], [{ ...entry, client_key: 'message:1' }]), space),
+      ).not.toThrow()
+    }
+  })
+
+  it('counts neither reads nor a standalone DEFINE as a transaction to mint into', () => {
+    expect(() => checkEnvelope(batch('sequence', [read, write('a')]), space)).not.toThrow()
+    expect(() => checkEnvelope(batch('sequence', [define, write('a')]), space)).not.toThrow()
+    const alone = { kip: '2.0', ingest: { evidence: [entry] }, operations: [define] } as never
+    expect(() => checkEnvelope(alone, space)).toThrowError(/other than a standalone DEFINE/)
+  })
+})

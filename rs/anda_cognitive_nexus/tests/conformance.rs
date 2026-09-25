@@ -3,8 +3,9 @@
 //! The fixtures in `fixtures/kip-conformance-2.0/` are a byte-for-byte copy of
 //! KIP's `conformance/engine-suite/` (`make sync-kip-conformance`), which both
 //! reference engines run. This harness reproduces KIP's own runner
-//! (`conformance/engine-runner.mjs`): one command per case, flattened to a
-//! result or an error code, ids normalized by a sorted-key walk.
+//! (`conformance/engine-runner.mjs`): one command per case — or, for a
+//! request-level contract, one `operations` batch sent as a single request —
+//! flattened to a result or an error code, ids normalized by a sorted-key walk.
 //!
 //! Three outcomes besides PASS and FAIL, all reported rather than hidden:
 //!
@@ -22,7 +23,7 @@ use anda_cognitive_nexus::{
     schema::{PackageState, SchemaLock, SchemaPackage},
 };
 use anda_db::database::{AndaDB, DBConfig};
-use anda_kip::{Executor, Json, Request};
+use anda_kip::{Executor, Json, Request, execute_request};
 use object_store::memory::InMemory;
 use serde::Deserialize;
 use serde_json::{Map, json};
@@ -65,7 +66,13 @@ enum Setup {
 #[derive(Deserialize)]
 struct Case {
     name: String,
-    command: String,
+    /// The one command, or `None` for a batch case.
+    #[serde(default)]
+    command: Option<String>,
+    /// A batch sent as one multi-operation request; its `envelope` declares
+    /// the execution mode §75 requires.
+    #[serde(default)]
+    operations: Option<Vec<BatchOperation>>,
     #[serde(default)]
     params: Map<String, Json>,
     expect: Expectation,
@@ -79,6 +86,13 @@ struct Case {
     #[serde(default)]
     #[allow(dead_code)]
     vectors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BatchOperation {
+    command: String,
+    #[serde(default)]
+    params: Map<String, Json>,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +205,46 @@ async fn execute(
                 .results
                 .first()
                 .and_then(|result| result.error.as_ref().map(|error| error.code.clone()))
+        });
+    (response.first_result().cloned(), error)
+}
+
+/// Runs a batch case as one multi-operation request through the ordinary
+/// batch path, and flattens it as KIP's runner does: the top-level error, else
+/// the first operation error in order, else the first result.
+async fn execute_batch(
+    nexus: &CognitiveNexus,
+    operations: &[BatchOperation],
+    captured: &Map<String, Json>,
+    envelope: &Map<String, Json>,
+) -> (Option<Json>, Option<String>) {
+    let operations: Vec<Json> = operations
+        .iter()
+        .map(|operation| {
+            let mut params = captured.clone();
+            params.extend(operation.params.clone());
+            json!({"command": operation.command, "parameters": params})
+        })
+        .collect();
+    let mut body = json!({"kip": "2.0", "operations": operations});
+    let object = body.as_object_mut().expect("the harness builds an object");
+    for (key, value) in envelope {
+        object.insert(key.clone(), value.clone());
+    }
+    let request = match Request::from_value(body) {
+        Ok(request) => request,
+        Err(err) => return (None, Some(err.name().to_string())),
+    };
+    let response = execute_request(nexus, &request).await;
+    let error = response
+        .error
+        .as_ref()
+        .map(|error| error.code.clone())
+        .or_else(|| {
+            response
+                .results
+                .iter()
+                .find_map(|result| result.error.as_ref().map(|error| error.code.clone()))
         });
     (response.first_result().cloned(), error)
 }
@@ -311,9 +365,17 @@ enum Outcome {
 }
 
 async fn run_case(nexus: &CognitiveNexus, case: &Case, captured: &Map<String, Json>) -> Outcome {
-    let mut params = captured.clone();
-    params.extend(case.params.clone());
-    let (result, error) = execute(nexus, &case.command, &params, &case.envelope).await;
+    let (result, error) = match (&case.command, &case.operations) {
+        (Some(command), None) => {
+            let mut params = captured.clone();
+            params.extend(case.params.clone());
+            execute(nexus, command, &params, &case.envelope).await
+        }
+        (None, Some(operations)) => {
+            execute_batch(nexus, operations, captured, &case.envelope).await
+        }
+        _ => return Outcome::Fail("a case carries one command or one operations batch".into()),
+    };
     let expected_error = case.expect.error.as_deref();
     if let Some(error) = error {
         return if error == "UnsupportedCapability" && expected_error != Some(error.as_str()) {

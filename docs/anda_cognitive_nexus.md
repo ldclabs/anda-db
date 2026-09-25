@@ -28,7 +28,7 @@ Queries also have a 100,000 intermediate-row/candidate-pair work budget; LIMIT
 does not bypass it. Historical reconstruction charges scanned versions and is
 reused per kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
 
-Tracks KIP at `597db44`, with the draft memory package
+Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [KIP reference](anda_kip.md) and the
 [Anda Brain host-contract guide](anda-brain-nexus-contracts.zh.md).
@@ -455,7 +455,11 @@ capability names `DESCRIBE CAPABILITIES` reports, and an unrecognized name is
 refused rather than assumed present (§67); `ingest` mints its Evidence inside
 the command's own transaction and binds each entry's `key` as a request
 parameter, so an observation reaches Evidence from the transport rather than
-through model-written command text (§71.1, §88.12); `options.deadline_ms` is
+through model-written command text (§71.1, §88.12) — one Evidence per entry
+per request, so a request with more than one write transaction (a KML
+operation other than a standalone `DEFINE`) is refused unless every entry
+carries `client_key`, through which each transaction resolves the same
+Evidence, and one with none is refused rather than dropping the observation; `options.deadline_ms` is
 refused, because §80.2 makes a client timeout not an abort and this engine
 cannot cancel a commit in flight.
 

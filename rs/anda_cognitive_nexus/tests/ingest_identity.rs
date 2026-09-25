@@ -1,6 +1,9 @@
 use anda_cognitive_nexus::{CognitiveNexus, nexus::DEFAULT_SPACE, profiles::COGNITIVE_MEMORY};
 use anda_db::database::{AndaDB, DBConfig};
-use anda_kip::{IngestContext, IngestEvidence, Request, TopLevelStatus, execute_request};
+use anda_kip::{
+    Execution, ExecutionMode, IngestContext, IngestEvidence, Operation, Request, TopLevelStatus,
+    execute_request,
+};
 use object_store::memory::InMemory;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -160,4 +163,46 @@ async fn explicit_null_payload_survives_ingestion_and_readback() {
         result.first_result(),
         Some(&json!([{"mode":"inline","inline":null}]))
     );
+}
+
+#[tokio::test]
+async fn independent_writes_resolve_one_evidence_through_the_client_key() {
+    // §71.1: an ingest entry is one Evidence per request. Two `independent`
+    // operations are two transactions, and both mint the entry; only its
+    // client_key makes the second resolve the first one's Evidence.
+    let nexus = fresh().await;
+    let batch = |client_key: Option<&str>| {
+        let mut req = request(vec![IngestEvidence {
+            client_key: client_key.map(str::to_string),
+            ..observation()
+        }]);
+        req.operations.push(Operation::new(
+            "UPSERT CONCEPT ?c { MATCH {type: \"Person\", key: \"other\"} SET FIELDS {name: \"Other\"} }",
+        ));
+        req.execution = Some(Execution::new(ExecutionMode::Independent));
+        req
+    };
+    let people = async || {
+        execute_request(
+            &nexus,
+            &Request::single("FIND(COUNT(?c)) WHERE { ?c CONCEPT {type: \"Person\"} }"),
+        )
+        .await
+        .first_result()
+        .unwrap()
+        .clone()
+    };
+
+    let refused = execute_request(&nexus, &batch(None)).await;
+    assert_eq!(
+        refused.error.as_ref().unwrap().code,
+        "InvalidRequestEnvelope"
+    );
+    assert_eq!(evidence_count(&nexus).await, json!([0]));
+    assert_eq!(people().await, json!([0]), "no operation ran");
+
+    let response = execute_request(&nexus, &batch(Some("thread:batch:message"))).await;
+    assert_eq!(response.status, TopLevelStatus::Succeeded, "{response:?}");
+    assert_eq!(evidence_count(&nexus).await, json!([1]));
+    assert_eq!(people().await, json!([2]));
 }

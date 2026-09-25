@@ -86,6 +86,7 @@ for (const name of readdirSync(fixtureDir).filter((f) => f.endsWith('.json') && 
   }
   for (const testCase of fixture.cases ?? []) {
     if (testCase.command) commands.add(testCase.command.trim())
+    for (const operation of testCase.operations ?? []) commands.add(operation.command.trim())
   }
 }
 

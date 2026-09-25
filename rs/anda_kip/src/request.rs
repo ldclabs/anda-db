@@ -198,9 +198,7 @@ impl Request {
     /// alignment and commit-time revalidation all remain runtime invariants.
     pub fn validate(&self) -> Result<(), KipError> {
         self.validate_shape()?;
-        if self.ingest.is_some() {
-            check_ingest_commands(self.operations.iter().map(Operation::parse_checked))?;
-        }
+        self.check_ingest_commands(self.operations.iter().map(Operation::parse_checked))?;
         Ok(())
     }
 
@@ -216,9 +214,7 @@ impl Request {
             .iter()
             .map(Operation::parse_checked)
             .collect();
-        if self.ingest.is_some() {
-            check_ingest_commands(parsed.iter().map(|result| result.as_ref()))?;
-        }
+        self.check_ingest_commands(parsed.iter().map(|result| result.as_ref()))?;
         Ok(parsed)
     }
 
@@ -376,27 +372,59 @@ impl Request {
     pub fn parse_operations(&self) -> Result<Vec<Command>, KipError> {
         self.prepare_operations()?.into_iter().collect()
     }
-}
 
-// Syntax failures stay operation-level errors; only an entirely readable
-// request can be classified as dropping its ingest observations.
-fn check_ingest_commands<C: std::borrow::Borrow<Command>, E>(
-    commands: impl IntoIterator<Item = Result<C, E>>,
-) -> Result<(), KipError> {
-    let mut all_parsed = true;
-    for command in commands {
-        match command {
-            Ok(command) if command.borrow().is_mutation() => return Ok(()),
-            Ok(_) => {}
-            Err(_) => all_parsed = false,
+    /// Checks that an ingestion context has exactly one Evidence per entry to
+    /// mint (§71.1).
+    ///
+    /// The entries are minted inside the request's write transactions: the one
+    /// transaction of an `atomic` request, else one per KML operation other
+    /// than a standalone `DEFINE`. With none, the observation would be
+    /// dropped while the request answered `succeeded`. With more than one,
+    /// each transaction would mint its own copy of one observation unless every
+    /// entry carries the `client_key` through which they resolve the same
+    /// Evidence. Syntax failures stay operation-level errors: a request is
+    /// refused for having nothing to mint into only when every operation parsed.
+    fn check_ingest_commands<C: std::borrow::Borrow<Command>, E>(
+        &self,
+        commands: impl IntoIterator<Item = Result<C, E>>,
+    ) -> Result<(), KipError> {
+        let Some(ingest) = &self.ingest else {
+            return Ok(());
+        };
+        let mut all_parsed = true;
+        let mut writes = 0usize;
+        for command in commands {
+            match command {
+                Ok(command) if command.borrow().opens_write_transaction() => writes += 1,
+                Ok(_) => {}
+                Err(_) => all_parsed = false,
+            }
         }
+        if self.execution_mode() == ExecutionMode::Atomic {
+            writes = writes.min(1);
+        }
+        if writes == 0 && all_parsed {
+            return Err(KipError::invalid_request_envelope(
+                "an ingest block needs a KML operation other than a standalone DEFINE: its \
+                 Evidence is minted inside that operation's transaction",
+            ));
+        }
+        if writes > 1
+            && let Some(entry) = ingest
+                .evidence
+                .iter()
+                .find(|entry| entry.client_key.is_none())
+        {
+            return Err(KipError::invalid_request_envelope(format!(
+                "this request opens {writes} write transactions and the ingest entry {:?} has \
+                 no client_key: each would mint its own copy of one observation. Give every \
+                 entry a client_key, through which each transaction resolves the same \
+                 Evidence (§71.1)",
+                entry.key
+            )));
+        }
+        Ok(())
     }
-    if all_parsed {
-        return Err(KipError::invalid_request_envelope(
-            "an ingest block requires at least one KML operation to mint Evidence transactionally",
-        ));
-    }
-    Ok(())
 }
 
 /// Which MemorySpace a request runs against (Spec §5).
@@ -2119,8 +2147,68 @@ mod tests {
             idempotency_key: None,
             extensions: None,
         });
-        mixed.ingest = Some(ingest);
+        mixed.ingest = Some(ingest.clone());
         mixed.validate().expect("one mutation is a transaction");
+
+        // A standalone DEFINE commits to the Schema Environment and mints
+        // nothing (§20.16), so it is no transaction to mint into either.
+        let mut define = Request::single(r#"DEFINE CONCEPT TYPE "Instrument" {description: "x"}"#);
+        define.ingest = Some(ingest);
+        let err = define
+            .validate()
+            .expect_err("a DEFINE would drop the observation");
+        assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope);
+    }
+
+    #[test]
+    fn an_ingest_entry_is_one_evidence_across_write_transactions() {
+        // §71.1: outside `atomic` every KML operation is its own transaction,
+        // so two of them would each mint the entry. Every entry then needs the
+        // client_key through which both resolve the one Evidence.
+        let entry = IngestEvidence {
+            key: "msg".into(),
+            evidence_class: "user_statement".into(),
+            payload: Some(Json::from("I prefer dark mode.")),
+            ..Default::default()
+        };
+        let batch = |mode: ExecutionMode, client_key: Option<&str>, second: &str| {
+            let mut request = Request::single(r#"CREATE CONCEPT ?c { TYPE "T" NAME "a" }"#);
+            request.operations.push(Operation::new(second));
+            request.execution = Some(Execution::new(mode));
+            request.ingest = Some(IngestContext {
+                evidence: vec![IngestEvidence {
+                    client_key: client_key.map(str::to_string),
+                    ..entry.clone()
+                }],
+                extensions: None,
+            });
+            request
+        };
+        let write = r#"CREATE CONCEPT ?d { TYPE "T" NAME "b" }"#;
+
+        for mode in [ExecutionMode::Sequence, ExecutionMode::Independent] {
+            let err = batch(mode, None, write)
+                .validate()
+                .expect_err("two transactions would mint two copies");
+            assert_eq!(err.code, KipErrorCode::InvalidRequestEnvelope);
+            assert!(err.message.contains("client_key"), "{}", err.message);
+            batch(mode, Some("message:1"), write)
+                .validate()
+                .expect("a client_key names the one logical creation");
+        }
+
+        // A DEFINE beside the write opens no second memory transaction, and
+        // an atomic batch is one transaction however many writes it holds.
+        batch(
+            ExecutionMode::Sequence,
+            None,
+            r#"DEFINE CONCEPT TYPE "Instrument" {description: "x"}"#,
+        )
+        .validate()
+        .expect("one memory transaction needs no key");
+        batch(ExecutionMode::Atomic, None, write)
+            .validate()
+            .expect("an atomic request mints once");
     }
 
     #[test]

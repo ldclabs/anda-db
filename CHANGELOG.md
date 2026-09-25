@@ -7,11 +7,10 @@ All notable changes to this workspace are documented in this file.
 This release aligns every AndaDB Rust package, the Python binding and
 `@ldclabs/kip-do` at **0.14.0**. It is breaking for KIP clients, for Spaces
 activated under the earlier CognitiveMemory draft and for two storage-crate
-APIs. The protocol version remains `2.0`, now following KIP `597db44`; the
+APIs. The protocol version remains `2.0`, now following KIP `11a82ec`; the
 bundled CognitiveMemory Schema Package is the rewritten `2.0.0` draft, and the
-TypeScript parser dependency is `@ldclabs/kip-lang@^2.4.1` (resolved from a
-sibling KIP checkout through `pnpm-workspace.yaml` `overrides` until 2.4.1 is on
-npm; drop the override before publishing). The standalone
+TypeScript parser dependency is `@ldclabs/kip-lang@^2.4.1`, resolved from npm.
+The standalone
 `cf-tokenizer` service keeps its independent `1.0.0` version and the private
 fuzz harness keeps `0.0.0`.
 
@@ -38,9 +37,9 @@ fuzz harness keeps `0.0.0`.
 5. 0.14 keeps reading the checked-in 0.8, 0.11 and 0.13 format fixtures, and
    the `v0_14` fixture is added beside them.
 
-### KIP, Cognitive Nexus and kip-do (KIP `597db44`)
+### KIP, Cognitive Nexus and kip-do (KIP `11a82ec`)
 
-Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..597db44`). Breaking
+Tracks the KIP 2.0 memory-brain revision (KIP `ae924e9..11a82ec`). Breaking
 for the parser, the executable AST and stored draft Spaces.
 
 - **Breaking — draft Spaces:** the bundled package is the rewritten
@@ -146,9 +145,21 @@ for the parser, the executable AST and stored draft Spaces.
 - **Conformance:** `fixtures/kip-conformance-2.0/` is now a byte copy of KIP's
   `conformance/engine-suite/` (`make sync-kip-conformance`), and both
   harnesses follow KIP's runner (captures, `result_contains`,
-  `pending_engine`, SKIP for unexpected `UnsupportedCapability`). Both
-  engines pass all 423 cases of KIP `597db44`, including the pending
-  `draft-vocabulary`, `supersession-scope` and `mnemonic-strength` fixtures.
+  `pending_engine`, SKIP for unexpected `UnsupportedCapability`, batch cases
+  sent as one multi-operation request). Both engines pass all 431 cases of KIP
+  `11a82ec`, including the `draft-vocabulary`, `supersession-scope` and
+  `mnemonic-strength` fixtures and `ingest-batch`, the one still pending there.
+- **Breaking — ingestion context (§71.1):** an `ingest` entry is one Evidence
+  per request. Outside `atomic` mode every KML operation is its own
+  transaction and minted the entry again, so a batch of two writes recorded
+  one observation twice. A request that opens more than one write transaction
+  (two or more KML operations other than a standalone `DEFINE`) is now refused
+  with `InvalidRequestEnvelope` before any operation runs unless every entry
+  carries `client_key`, through which each transaction resolves the same
+  Evidence. An `ingest` block whose only KML operation is a standalone
+  `DEFINE` is refused instead of being silently dropped. In Rust the rule is
+  `Command::opens_write_transaction` (with `KmlStatement::is_standalone_define`),
+  checked by `Request::validate` and `PreparedRequest`.
 - **Storage:** new stores no longer index `assertions.valid_until` (existing
   indexes stay, unread); a Capsule import keeps time-bound `valid_time`
   endpoints instead of dropping them.

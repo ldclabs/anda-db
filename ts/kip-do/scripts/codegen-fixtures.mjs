@@ -48,7 +48,15 @@ export interface Expectation {
 
 export interface Case {
   name: string
-  command: string
+  /** The one command; absent for a batch case. */
+  command?: string
+  /**
+   * A batch sent as one multi-operation request, in place of \`command\`; its
+   * \`envelope\` declares the execution mode §75 requires. The harness flattens
+   * the answer as KIP's runner does: the first operation error in order, else
+   * the first result.
+   */
+  operations?: { command: string; params?: Record<string, unknown> }[]
   params?: Record<string, unknown>
   expect: Expectation
   /** Whether the order of a top-level result array is part of the contract. */

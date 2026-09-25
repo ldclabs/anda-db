@@ -1,6 +1,6 @@
 # anda_kip
 
-Tracks KIP at `597db44`, with the draft memory package
+Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
@@ -137,7 +137,7 @@ cargo run -p anda_kip --bin kip-cli -- path/to/commands
 ## Vendored KIP documents
 
 The Specification, syntax card, companions, grammars, schemas, profile and
-`brain/` cards are copies of KIP `597db44`, byte for byte except:
+`brain/` cards are copies of KIP `11a82ec`, byte for byte except:
 
 - file names drop the `KIP-2.0-` prefix (`KIP-2.0-Memory-Interface.md` →
   `Memory-Interface.md`, `grammar/KIP-2.0-KQL.ebnf` → `grammar/KQL.ebnf`,

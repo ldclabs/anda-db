@@ -115,14 +115,24 @@ async function post(
   params: JsonMap,
   extra: Record<string, unknown> = {},
 ): Promise<Flat> {
+  return postBatch(stub, [{ command, parameters: params }], extra)
+}
+
+/**
+ * Sends operations as one KIP request and flattens the answer as KIP's runner
+ * does: the top-level error, else the first operation error in order, else
+ * the first result. A batch case therefore passes only when every operation
+ * succeeded or the error it expects came first.
+ */
+async function postBatch(
+  stub: DurableObjectStub<ConformanceKipDatabase>,
+  operations: { command: string; parameters: JsonMap }[],
+  extra: Record<string, unknown> = {},
+): Promise<Flat> {
   const response = await stub.fetch('https://kip-conformance/', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      kip: '2.0',
-      operations: [{ command, parameters: params }],
-      ...extra,
-    }),
+    body: JSON.stringify({ kip: '2.0', operations, ...extra }),
   })
   const envelope = (await response.json()) as KipResponse
 
@@ -134,8 +144,9 @@ async function post(
   if (first === undefined) {
     return { error: { code: 'InternalError', message: 'the response carried no result' } }
   }
-  if (first.error !== undefined) {
-    return { error: { code: first.error.code, message: first.error.message } }
+  const failed = envelope.results.find((result) => result.error !== undefined)
+  if (failed?.error !== undefined) {
+    return { error: { code: failed.error.code, message: failed.error.message } }
   }
   return { result: first.result === undefined ? null : first.result }
 }
@@ -145,12 +156,24 @@ async function runCase(
   testCase: Case,
   captured: JsonMap,
 ): Promise<Outcome> {
-  const outcome = await post(
-    stub,
-    testCase.command,
-    { ...captured, ...(testCase.params ?? {}) } as JsonMap,
-    testCase.envelope ?? {},
-  )
+  if ((testCase.command === undefined) === (testCase.operations === undefined)) {
+    return { kind: 'fail', name: testCase.name, detail: 'a case carries one command or one operations batch' }
+  }
+  const outcome = testCase.operations === undefined
+    ? await post(
+        stub,
+        testCase.command!,
+        { ...captured, ...(testCase.params ?? {}) } as JsonMap,
+        testCase.envelope ?? {},
+      )
+    : await postBatch(
+        stub,
+        testCase.operations.map((op) => ({
+          command: op.command,
+          parameters: { ...captured, ...(op.params ?? {}) } as JsonMap,
+        })),
+        testCase.envelope ?? {},
+      )
   const expectedError = testCase.expect.error
 
   if ('error' in outcome) {

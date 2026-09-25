@@ -13,6 +13,7 @@ import { canonicalJson, isJsonMap } from './json.js'
 import { KipError } from './errors.js'
 import type { RequestContext } from './governance/index.js'
 import type { JsonMap } from './json.js'
+import type { Command } from './kip/ast.js'
 import { parseKip } from './kip/parser.js'
 import { checkIngest, type IngestContext } from './kml/index.js'
 import { capabilityState, KIP_VERSION } from './meta/capabilities.js'
@@ -108,6 +109,18 @@ function criticalExtensions(envelope: KipRequestEnvelope): string[] {
     }
   }
   return [...names].sort()
+}
+
+/**
+ * Whether a command opens a memory write transaction: a KML statement other
+ * than a standalone `DEFINE`, which commits to the Schema Environment instead
+ * (§20.16). It is what an ingestion context mints into (§71.1); the Rust
+ * engine's `Command::opens_write_transaction`.
+ */
+function opensWriteTransaction(command: Command): boolean {
+  if (!('Kml' in command)) return false
+  const clauses = command.Kml.clauses
+  return !(clauses.length === 1 && 'Define' in clauses[0]!)
 }
 
 /**
@@ -332,33 +345,48 @@ export function checkEnvelope(envelope: KipRequestEnvelope, space: EnvelopeSpace
   // after the first statement committed would leave durable writes behind a
   // request that was never valid.
   if (envelope.ingest !== undefined) {
-    checkIngest(envelope.ingest)
-    // §71.1 mints each entry inside the request's transaction scope, and
-    // makes ingestion transactional. A request whose operations are all
-    // reads opens no such scope, so the Evidence would be minted nowhere
-    // while the request still answered `succeeded` — and the caller would go
-    // on believing the observation was recorded, which is the fidelity
-    // failure §88.12 has ingestion exist to prevent.
+    const entries = checkIngest(envelope.ingest)
+    // §71.1: an entry is one Evidence per request, minted inside the
+    // request's write transactions — here one per KML operation other than a
+    // standalone `DEFINE`, which commits to the Schema Environment and mints
+    // nothing (§20.16). (No atomic request reaches this line.)
     //
-    // Only refused once every operation parsed. A command that does not
-    // parse should still report its own syntax error rather than being
-    // recast as an envelope fault.
+    // None, and the Evidence would be minted nowhere while the request still
+    // answered `succeeded` — the caller would go on believing the observation
+    // was recorded, the fidelity failure §88.12 has ingestion exist to
+    // prevent. Only refused once every operation parsed: a command that does
+    // not parse still reports its own syntax error.
     let allParsed = true
-    let anyMutation = false
+    let writes = 0
     for (const operation of operations) {
       try {
-        if ('Kml' in parseKip(operation.command ?? '')) anyMutation = true
+        if (opensWriteTransaction(parseKip(operation.command ?? ''))) writes += 1
       } catch {
         allParsed = false
       }
     }
-    if (allParsed && !anyMutation) {
+    if (writes === 0 && allParsed) {
       throw new KipError(
         'InvalidRequestEnvelope',
-        'an `ingest` block mints Evidence inside the request\'s ' +
-          'transaction, so the request must carry at least one KML ' +
-          'operation; a read-only request would drop the observation ' +
-          'while reporting success',
+        'an `ingest` block needs a KML operation other than a standalone ' +
+          'DEFINE: its Evidence is minted inside that operation\'s ' +
+          'transaction, and a request without one would drop the ' +
+          'observation while reporting success',
+      )
+    }
+    // More than one, and each transaction would mint its own copy of one
+    // observation — copies nothing could tell apart from separate
+    // observations — unless every entry carries the client_key through which
+    // each transaction resolves the same Evidence (§52.1).
+    const keyless = writes > 1 ? entries.find((entry) => entry.client_key === undefined) : undefined
+    if (keyless !== undefined) {
+      throw new KipError(
+        'InvalidRequestEnvelope',
+        `this request opens ${writes} write transactions and the ingest ` +
+          `entry ${JSON.stringify(keyless.key)} has no client_key: each would ` +
+          `mint its own copy of one observation. Give every entry a ` +
+          `client_key, through which each transaction resolves the same ` +
+          `Evidence (§71.1)`,
       )
     }
   }
