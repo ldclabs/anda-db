@@ -1,0 +1,740 @@
+{
+ "core": {
+  "1000001:dense_all_ids": {
+   "after": {
+    "median_p50_ms": 30.274187499999996,
+    "median_p95_ms": 33.5559585,
+    "max_peak_additional_heap_bytes": 46137592,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 30.213791999999998,
+      "p95_ms": 33.29075,
+      "peak_additional_heap_bytes": 46137592
+     },
+     {
+      "trial": 2,
+      "p50_ms": 30.334583,
+      "p95_ms": 33.821167,
+      "peak_additional_heap_bytes": 46137592
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 30.863561999999998,
+    "median_p95_ms": 33.499208499999995,
+    "max_peak_additional_heap_bytes": 46137592,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 32.246958,
+      "p95_ms": 33.962458,
+      "peak_additional_heap_bytes": 46137592
+     },
+     {
+      "trial": 2,
+      "p50_ms": 29.480165999999997,
+      "p95_ms": 33.035959,
+      "peak_additional_heap_bytes": 46137592
+     }
+    ]
+   },
+   "after_over_before_p50": 0.981
+  },
+  "1000001:dense_deep_page": {
+   "after": {
+    "median_p50_ms": 0.002417,
+    "median_p95_ms": 0.0025,
+    "max_peak_additional_heap_bytes": 1079,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002417,
+      "p95_ms": 0.0025,
+      "peak_additional_heap_bytes": 1079
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.002417,
+      "p95_ms": 0.0025,
+      "peak_additional_heap_bytes": 1079
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.0024375,
+    "median_p95_ms": 0.0033334999999999997,
+    "max_peak_additional_heap_bytes": 1079,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002417,
+      "p95_ms": 0.004042,
+      "peak_additional_heap_bytes": 1079
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.002458,
+      "p95_ms": 0.0026249999999999997,
+      "peak_additional_heap_bytes": 1079
+     }
+    ]
+   },
+   "after_over_before_p50": 0.992
+  },
+  "1000001:dense_first_page": {
+   "after": {
+    "median_p50_ms": 0.0022915,
+    "median_p95_ms": 0.004875,
+    "max_peak_additional_heap_bytes": 948,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.0022500000000000003,
+      "p95_ms": 0.007209,
+      "peak_additional_heap_bytes": 948
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.002333,
+      "p95_ms": 0.002541,
+      "peak_additional_heap_bytes": 948
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.0022919999999999998,
+    "median_p95_ms": 0.007333,
+    "max_peak_additional_heap_bytes": 948,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.0022919999999999998,
+      "p95_ms": 0.005083000000000001,
+      "peak_additional_heap_bytes": 948
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.0022919999999999998,
+      "p95_ms": 0.009583,
+      "peak_additional_heap_bytes": 948
+     }
+    ]
+   },
+   "after_over_before_p50": 1.0
+  },
+  "1000001:empty_and_dense": {
+   "after": {
+    "median_p50_ms": 0.000521,
+    "median_p95_ms": 0.000584,
+    "max_peak_additional_heap_bytes": 837,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.0005,
+      "p95_ms": 0.000584,
+      "peak_additional_heap_bytes": 837
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.000542,
+      "p95_ms": 0.000584,
+      "peak_additional_heap_bytes": 837
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.000541,
+    "median_p95_ms": 0.0006039999999999999,
+    "max_peak_additional_heap_bytes": 837,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.000541,
+      "p95_ms": 0.000583,
+      "peak_additional_heap_bytes": 837
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.000541,
+      "p95_ms": 0.000625,
+      "peak_additional_heap_bytes": 837
+     }
+    ]
+   },
+   "after_over_before_p50": 0.963
+  },
+  "1000001:rare_and_dense": {
+   "after": {
+    "median_p50_ms": 0.00125,
+    "median_p95_ms": 0.006729,
+    "max_peak_additional_heap_bytes": 836,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.00125,
+      "p95_ms": 0.009708,
+      "peak_additional_heap_bytes": 836
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.00125,
+      "p95_ms": 0.0037500000000000003,
+      "peak_additional_heap_bytes": 836
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.0012295000000000001,
+    "median_p95_ms": 0.0043335000000000005,
+    "max_peak_additional_heap_bytes": 836,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.001209,
+      "p95_ms": 0.004334,
+      "peak_additional_heap_bytes": 836
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.00125,
+      "p95_ms": 0.004333,
+      "peak_additional_heap_bytes": 836
+     }
+    ]
+   },
+   "after_over_before_p50": 1.017
+  },
+  "100000:dense_all_ids": {
+   "after": {
+    "median_p50_ms": 2.353104,
+    "median_p95_ms": 2.5063120000000003,
+    "max_peak_additional_heap_bytes": 3408120,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 2.273542,
+      "p95_ms": 2.4592910000000003,
+      "peak_additional_heap_bytes": 3408120
+     },
+     {
+      "trial": 2,
+      "p50_ms": 2.432666,
+      "p95_ms": 2.5533330000000003,
+      "peak_additional_heap_bytes": 3408120
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 2.2565415,
+    "median_p95_ms": 2.4391665,
+    "max_peak_additional_heap_bytes": 3408120,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 2.2548749999999997,
+      "p95_ms": 2.42475,
+      "peak_additional_heap_bytes": 3408120
+     },
+     {
+      "trial": 2,
+      "p50_ms": 2.2582079999999998,
+      "p95_ms": 2.453583,
+      "peak_additional_heap_bytes": 3408120
+     }
+    ]
+   },
+   "after_over_before_p50": 1.043
+  },
+  "100000:dense_deep_page": {
+   "after": {
+    "median_p50_ms": 0.0024375,
+    "median_p95_ms": 0.0031670000000000005,
+    "max_peak_additional_heap_bytes": 1079,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002375,
+      "p95_ms": 0.0037500000000000003,
+      "peak_additional_heap_bytes": 1079
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.0025,
+      "p95_ms": 0.0025840000000000004,
+      "peak_additional_heap_bytes": 1079
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.0023959999999999997,
+    "median_p95_ms": 0.002521,
+    "max_peak_additional_heap_bytes": 1079,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002417,
+      "p95_ms": 0.0025,
+      "peak_additional_heap_bytes": 1079
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.002375,
+      "p95_ms": 0.002542,
+      "peak_additional_heap_bytes": 1079
+     }
+    ]
+   },
+   "after_over_before_p50": 1.017
+  },
+  "100000:dense_first_page": {
+   "after": {
+    "median_p50_ms": 0.002312,
+    "median_p95_ms": 0.0024785,
+    "max_peak_additional_heap_bytes": 948,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002208,
+      "p95_ms": 0.0024159999999999997,
+      "peak_additional_heap_bytes": 948
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.0024159999999999997,
+      "p95_ms": 0.002541,
+      "peak_additional_heap_bytes": 948
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.0022494999999999998,
+    "median_p95_ms": 0.004583500000000001,
+    "max_peak_additional_heap_bytes": 948,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.002291,
+      "p95_ms": 0.005292000000000001,
+      "peak_additional_heap_bytes": 948
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.002208,
+      "p95_ms": 0.003875,
+      "peak_additional_heap_bytes": 948
+     }
+    ]
+   },
+   "after_over_before_p50": 1.028
+  },
+  "100000:empty_and_dense": {
+   "after": {
+    "median_p50_ms": 0.000562,
+    "median_p95_ms": 0.0006665,
+    "max_peak_additional_heap_bytes": 837,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.000541,
+      "p95_ms": 0.000625,
+      "peak_additional_heap_bytes": 837
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.000583,
+      "p95_ms": 0.0007080000000000001,
+      "peak_additional_heap_bytes": 837
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.000541,
+    "median_p95_ms": 0.000583,
+    "max_peak_additional_heap_bytes": 837,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.000541,
+      "p95_ms": 0.000583,
+      "peak_additional_heap_bytes": 837
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.000541,
+      "p95_ms": 0.000583,
+      "peak_additional_heap_bytes": 837
+     }
+    ]
+   },
+   "after_over_before_p50": 1.039
+  },
+  "100000:rare_and_dense": {
+   "after": {
+    "median_p50_ms": 0.0012505,
+    "median_p95_ms": 0.0038544999999999994,
+    "max_peak_additional_heap_bytes": 836,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.001209,
+      "p95_ms": 0.004042,
+      "peak_additional_heap_bytes": 836
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.0012920000000000002,
+      "p95_ms": 0.0036669999999999997,
+      "peak_additional_heap_bytes": 836
+     }
+    ]
+   },
+   "before": {
+    "median_p50_ms": 0.001271,
+    "median_p95_ms": 0.0056875,
+    "max_peak_additional_heap_bytes": 836,
+    "trials": [
+     {
+      "trial": 1,
+      "p50_ms": 0.001333,
+      "p95_ms": 0.005625000000000001,
+      "peak_additional_heap_bytes": 836
+     },
+     {
+      "trial": 2,
+      "p50_ms": 0.001209,
+      "p95_ms": 0.00575,
+      "peak_additional_heap_bytes": 836
+     }
+    ]
+   },
+   "after_over_before_p50": 0.984
+  }
+ },
+ "core_first_call": {
+  "1000001:dense_deep_page_cold_posting": {
+   "after": {
+    "median_ms": 0.006021,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.005582999999999999
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.006459
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.0068335,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.007833
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.005834000000000001
+     }
+    ]
+   }
+  },
+  "1000001:dense_first_page_cold_posting": {
+   "after": {
+    "median_ms": 1.065375,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 1.051458
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 1.079292
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 1.1877495,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 1.329833
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 1.045666
+     }
+    ]
+   }
+  },
+  "1000001:empty_and_dense_cold_posting": {
+   "after": {
+    "median_ms": 0.002,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.0018750000000000001
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.002125
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.0020625,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.0020829999999999998
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.002042
+     }
+    ]
+   }
+  },
+  "1000001:rare_and_dense_cold_posting": {
+   "after": {
+    "median_ms": 0.0291665,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.028625
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.029708000000000002
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.029792,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.026542
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.033042
+     }
+    ]
+   }
+  },
+  "100000:dense_deep_page_cold_posting": {
+   "after": {
+    "median_ms": 0.005938000000000001,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.004667
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.007209
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.0052295,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.005709
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.00475
+     }
+    ]
+   }
+  },
+  "100000:dense_first_page_cold_posting": {
+   "after": {
+    "median_ms": 0.11797950000000001,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.137667
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.098292
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.100687,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.116416
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.08495799999999999
+     }
+    ]
+   }
+  },
+  "100000:empty_and_dense_cold_posting": {
+   "after": {
+    "median_ms": 0.0020835000000000003,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.002042
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.002125
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.0018955,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.001791
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.002
+     }
+    ]
+   }
+  },
+  "100000:rare_and_dense_cold_posting": {
+   "after": {
+    "median_ms": 0.064583,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.100833
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.028333
+     }
+    ]
+   },
+   "before": {
+    "median_ms": 0.06318700000000001,
+    "trials": [
+     {
+      "trial": 1,
+      "elapsed_ms": 0.098458
+     },
+     {
+      "trial": 2,
+      "elapsed_ms": 0.027916
+     }
+    ]
+   }
+  }
+ },
+ "nexus": {
+  "before": {
+   "cases": {
+    "rare_type": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "filter": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "bound": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "count": {
+     "status": "succeeded",
+     "result": [
+      1000001
+     ],
+     "concept_gets": 0
+    },
+    "reverse_structural": {
+     "status": "succeeded",
+     "result": [
+      "C-3"
+     ],
+     "concept_gets": 2
+    },
+    "first_page": {
+     "status": "succeeded",
+     "result": [
+      "C-1",
+      "C-2"
+     ],
+     "concept_gets": 4
+    }
+   },
+   "process_real_s": 14.24,
+   "max_rss_bytes": 1029881856
+  },
+  "after": {
+   "cases": {
+    "rare_type": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "filter": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "bound": {
+     "status": "succeeded",
+     "result": [
+      "Unique Person"
+     ],
+     "concept_gets": 1
+    },
+    "count": {
+     "status": "succeeded",
+     "result": [
+      1000001
+     ],
+     "concept_gets": 0
+    },
+    "reverse_structural": {
+     "status": "succeeded",
+     "result": [
+      "C-3"
+     ],
+     "concept_gets": 2
+    },
+    "first_page": {
+     "status": "succeeded",
+     "result": [
+      "C-1",
+      "C-2"
+     ],
+     "concept_gets": 4
+    }
+   },
+   "process_real_s": 13.98,
+   "max_rss_bytes": 1033404416
+  }
+ }
+}

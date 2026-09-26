@@ -2,7 +2,7 @@
 
 [中文版](anda_db.zh.md)
 
-Version: 0.14.0
+Version: 0.14.1
 
 ## Overview
 

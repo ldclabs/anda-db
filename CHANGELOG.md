@@ -2,7 +2,32 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [Unreleased]
+## [anda_db 0.14.1, anda_db_btree 0.14.1, anda_db_tfs 0.14.1, anda_cognitive_nexus 0.14.1] — 2026-09-26
+
+This patch release bounds million-row queries and fixes several KQL and SEARCH
+answers. The KIP protocol remains `2.0`; every other package, including the
+Python binding and `@ldclabs/kip-do`, stays at 0.14.0. `anda_db` now requires
+`anda_db_btree` and `anda_db_tfs` 0.14.1, and `anda_cognitive_nexus` requires
+`anda_db` and `anda_db_tfs` 0.14.1, because each calls APIs added here.
+
+Upgrade notes:
+
+- The first open of an existing Nexus store upgrades the Concept, Proposition,
+  Assertion and element-version collection schemas to version 1, and Evidence
+  and Activity to version 2. It also builds the new `query_keys` and
+  `lookup_key` indexes over existing rows. Let that open finish; do not cancel
+  it.
+- Do not reopen an upgraded store with 0.14.0. That version keeps the newer
+  schema without maintaining the derived indexes, so rows it writes are
+  missing from reverse `STRUCTURAL` and historical reads after returning to
+  0.14.1.
+- `ConceptRow`, `PropositionRow`, `AssertionRow`, `EvidenceRow` and
+  `ActivityRow` gained an optional `query_keys` field, and `ElementVersionRow`
+  gained `lookup_key`. Struct literals must add them or use
+  `..Default::default()`.
+- A custom `IndexHooks` implementation that derives a B-tree key from other
+  columns must override the new `btree_index_depends_on`, or updates to those
+  columns leave its index stale. The default keeps the previous behavior.
 
 ### Performance
 
@@ -31,6 +56,10 @@ All notable changes to this workspace are documented in this file.
   `version()`, without a copy of the scoped ids. Body prefetch is bounded and
   CPU-heavy ranking runs off the async executor. See the
   [million-row optimization report](docs/query-performance-million.zh.md).
+- A paired [rerun](docs/benchmarks/anda_query_scale_2026-09-26-rerun/README.md)
+  of the final follow-up against its predecessor shows no measurable change
+  at 100,000 or 1,000,001 rows, with identical heap allocations and Nexus
+  Concept GET counts.
 
 ### Fixed
 

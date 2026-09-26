@@ -1,0 +1,31 @@
+{
+  "before": "83d64276ec36a8ee324f82d340eca1c927c125df",
+  "after": "4afaef1a8d85f8a98833e61db4b90f82fb080bd6",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "target": "aarch64-apple-darwin",
+  "cpu": "Apple M1 Pro, 10 cores, 16 GiB",
+  "profile": "release-speed",
+  "opt_level": 3,
+  "lto": false,
+  "codegen_units": 16,
+  "backend": "InMemory",
+  "cargo_lock_sha256": "3924d287d914814f4ca7d653adff7ba1c3666d499f6491e61618ed6df0275cc5",
+  "harness_sha256": {
+    "rs/anda_db/benches/core_workloads.rs": "2875eb0a997f6e0709a778bae626daa506f94c85d772c4a0b2693f211a49c8de",
+    "rs/anda_cognitive_nexus/benches/query_scale.rs": "76d3e6b9b24491e1de5ec260781fbb44020b27592f51e12509ba24b0627074c5"
+  },
+  "build_directories": "separate before and after targets from git-archive exports of each commit",
+  "trials": 2,
+  "samples_per_process": 15,
+  "all_ids_samples_per_process": 5,
+  "warmups_per_case": 2,
+  "measurement_order": "before/after then after/before at each size; Nexus probes before then after",
+  "start_gate": "runs started after builds finished, once the 1-minute load average fell below 6",
+  "allocation_tracking": true,
+  "seeding_timed": false,
+  "limitations": [
+    "No exclusive CPU isolation; window server and desktop processes used about 1.5 cores.",
+    "The Nexus probe checks answers and Concept GETs over synthetic current rows; its process time is dominated by seeding and is not a query latency.",
+    "Neither harness exercises the SEARCH corpus or prepared-scope caches changed by 4afaef1."
+  ]
+}

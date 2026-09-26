@@ -1,0 +1,10 @@
+{"backend":"InMemory","documents":1000001,"samples":15,"seed_timed":false,"workload":"query_scale_environment"}
+{"elapsed_ms":0.029708000000000002,"workload":"rare_and_dense_cold_posting"}
+{"iterations":15,"p50_ms":0.00125,"p95_ms":0.0037500000000000003,"p99_ms":0.0037500000000000003,"peak_additional_heap_bytes":836,"total_ms":0.022458,"workload":"rare_and_dense"}
+{"elapsed_ms":0.002125,"workload":"empty_and_dense_cold_posting"}
+{"iterations":15,"p50_ms":0.000542,"p95_ms":0.000584,"p99_ms":0.000584,"peak_additional_heap_bytes":837,"total_ms":0.008126,"workload":"empty_and_dense"}
+{"elapsed_ms":1.079292,"workload":"dense_first_page_cold_posting"}
+{"iterations":15,"p50_ms":0.002333,"p95_ms":0.002541,"p99_ms":0.002541,"peak_additional_heap_bytes":948,"total_ms":0.035207,"workload":"dense_first_page"}
+{"elapsed_ms":0.006459,"workload":"dense_deep_page_cold_posting"}
+{"iterations":15,"p50_ms":0.002417,"p95_ms":0.0025,"p99_ms":0.0025,"peak_additional_heap_bytes":1079,"total_ms":0.036625000000000005,"workload":"dense_deep_page"}
+{"iterations":5,"p50_ms":30.334583,"p95_ms":33.821167,"p99_ms":33.821167,"peak_additional_heap_bytes":46137592,"total_ms":154.963583,"workload":"dense_all_ids"}

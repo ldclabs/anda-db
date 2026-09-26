@@ -1,0 +1,11 @@
+{"seed_progress":250000}
+{"seed_progress":500000}
+{"seed_progress":750000}
+{"seed_progress":1000000}
+{"concepts":1000001,"fixture":"current rows from a schema-valid KML template; cloned rows have no version history","latency_claim":false}
+{"case":"rare_type","concept_gets":1,"error":null,"result":["Unique Person"],"status":"succeeded"}
+{"case":"filter","concept_gets":1,"error":null,"result":["Unique Person"],"status":"succeeded"}
+{"case":"bound","concept_gets":1,"error":null,"result":["Unique Person"],"status":"succeeded"}
+{"case":"count","concept_gets":0,"error":null,"result":[1000001],"status":"succeeded"}
+{"case":"reverse_structural","concept_gets":2,"error":null,"result":["C-3"],"status":"succeeded"}
+{"case":"first_page","concept_gets":4,"error":null,"result":["C-1","C-2"],"status":"succeeded"}

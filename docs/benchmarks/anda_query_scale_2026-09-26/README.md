@@ -86,6 +86,10 @@ ANDA_NEXUS_BENCH=1 ANDA_BENCH_DOCS=1000001 \
   cargo bench -p anda_cognitive_nexus --bench query_scale --profile release-speed
 ```
 
+A later paired [rerun](../anda_query_scale_2026-09-26-rerun/README.md)
+compares `83d6427` with `4afaef1` using this harness and finds no measurable
+change.
+
 For a paired comparison, copy this commit's `core_workloads.rs` into a baseline
 checkout, copy the same Cargo.lock, build both with the same flags in separate
 targets, and save the executable paths from Cargo JSON output. Run them only
