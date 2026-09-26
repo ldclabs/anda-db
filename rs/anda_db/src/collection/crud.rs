@@ -322,8 +322,10 @@ impl Collection {
         // update the indexes
         let rt: Result<(), DBError> = (|| {
             for index in &self.btree_indexes {
-                let fields = index.virtual_field();
-                if fields_keys.iter().any(|v| fields.contains(v)) {
+                if fields_keys
+                    .iter()
+                    .any(|field| self.index_hooks.btree_index_depends_on(index, field))
+                {
                     let old_value = self
                         .index_hooks
                         .btree_index_value(index, &old_doc)

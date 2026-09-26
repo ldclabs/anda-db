@@ -22,6 +22,12 @@ const MAX_SEARCHABLE_TEXT_FRAGMENTS: usize = 4_096;
 /// vector encodings can provide their own hook implementation and install it
 /// with `Collection::set_index_hooks`.
 pub trait IndexHooks: Send + Sync {
+    /// Whether changing a physical field can change this derived index.
+    /// Override alongside btree_index_value when the key reads other columns.
+    fn btree_index_depends_on(&self, index: &BTree, field: &str) -> bool {
+        index.virtual_field().iter().any(|name| name == field)
+    }
+
     /// Returns the value to insert into a B-tree index for `doc`.
     ///
     /// The default implementation returns a borrowed single-field value or a

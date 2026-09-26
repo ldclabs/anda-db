@@ -2,7 +2,11 @@
 //! constant-time membership and swap-removal. Only the ordered ids are persisted.
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{hash::Hash, ops::Deref};
+use std::{
+    hash::Hash,
+    ops::{Deref, DerefMut},
+    sync::{Arc, OnceLock},
+};
 
 const SMALL_LIMIT: usize = 8;
 const MIN_RETAINED_CAPACITY: usize = 32;
@@ -12,7 +16,48 @@ pub(super) struct PostingList<PK> {
     ids: Vec<PK>,
     // Most distinct keys have short postings. Keep the hash-table header
     // out of every posting until membership checks need a position map.
-    positions: Option<Box<FxHashMap<PK, usize>>>,
+    positions: Option<Box<Lookup<PK>>>,
+}
+// Allocated only for large postings; singleton keys retain the compact header.
+#[derive(Clone, Debug)]
+struct Lookup<PK> {
+    positions: FxHashMap<PK, usize>,
+    ordered: OnceLock<Arc<[PK]>>,
+}
+impl<PK> Deref for Lookup<PK> {
+    type Target = FxHashMap<PK, usize>;
+    fn deref(&self) -> &Self::Target {
+        &self.positions
+    }
+}
+impl<PK> DerefMut for Lookup<PK> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.positions
+    }
+}
+impl<PK> Lookup<PK> {
+    fn new(positions: FxHashMap<PK, usize>) -> Self {
+        Self {
+            positions,
+            ordered: OnceLock::new(),
+        }
+    }
+}
+impl<PK: Ord + Clone> PostingList<PK> {
+    pub(super) fn cached_ordered(&self) -> Option<Arc<[PK]>> {
+        self.positions.as_ref()?.ordered.get().cloned()
+    }
+    pub(super) fn ordered(&self) -> Arc<[PK]> {
+        let build = || {
+            let mut ids = self.ids.clone();
+            ids.sort_unstable();
+            Arc::<[PK]>::from(ids)
+        };
+        match &self.positions {
+            Some(lookup) => lookup.ordered.get_or_init(build).clone(),
+            None => build(),
+        }
+    }
 }
 impl<PK> Default for PostingList<PK> {
     fn default() -> Self {
@@ -45,6 +90,7 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
             let index = self.ids.len();
             self.ids.push(id);
             entry.insert(index);
+            positions.ordered.take();
             return true;
         }
         if self.ids.contains(&id) {
@@ -60,7 +106,7 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
                 .map(|(i, id)| (id, i))
                 .collect();
             self.ids.reserve(1);
-            self.positions = Some(Box::new(positions));
+            self.positions = Some(Box::new(Lookup::new(positions)));
         }
         self.ids.push(id);
         true
@@ -74,6 +120,7 @@ impl<PK: Eq + Hash + Clone> PostingList<PK> {
         // implementation panics below, unwinding drops the map and leaves the
         // still-unchanged id vector as the authoritative linear fallback.
         if let Some(mut positions) = self.positions.take() {
+            positions.ordered.take();
             positions.remove(id);
             if index + 1 != self.ids.len() {
                 *positions
@@ -140,7 +187,7 @@ impl<PK: Eq + Hash + Clone> From<Vec<PK>> for PostingList<PK> {
                     false
                 }
             });
-            let positions = (ids.len() > SMALL_LIMIT).then(|| Box::new(positions));
+            let positions = (ids.len() > SMALL_LIMIT).then(|| Box::new(Lookup::new(positions)));
             Self { ids, positions }
         }
     }

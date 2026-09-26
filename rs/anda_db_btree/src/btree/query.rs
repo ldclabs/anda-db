@@ -594,6 +594,100 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
             .and_then(|posting| f(&posting.docs))
     }
 
+    /// Tests an id without scanning a large posting. No index state escapes.
+    pub fn contains_id(&self, field_value: &FV, id: &PK) -> bool {
+        self.postings
+            .get(field_value)
+            .is_some_and(|posting| posting.docs.contains(id))
+    }
+
+    /// An immutable id-ordered snapshot of one posting, cached until mutation.
+    /// The first read sorts the posting; later pages share the allocation.
+    pub fn ordered_ids(&self, field_value: &FV) -> Option<std::sync::Arc<[PK]>> {
+        self.postings
+            .get(field_value)
+            .map(|posting| posting.docs.ordered())
+    }
+
+    /// Borrows an already prepared ordering without building one.
+    pub fn cached_ordered_ids(&self, field_value: &FV) -> Option<std::sync::Arc<[PK]>> {
+        self.postings
+            .get(field_value)
+            .and_then(|posting| posting.docs.cached_ordered())
+    }
+
+    /// Intersects candidates with a range by probing the smaller side of each
+    /// posting. The second result counts inspected ids/membership probes.
+    pub fn intersect_ids(
+        &self,
+        query: RangeQuery<FV>,
+        candidates: &FxHashSet<PK>,
+    ) -> Result<(Vec<PK>, usize), BTreeError> {
+        // One posting is already unique: a temporary result hash set only
+        // adds allocation and hashing for dense complete intersections.
+        if let RangeQuery::Eq(key) = &query {
+            let Some(posting) = self.postings.get(key) else {
+                return Ok((Vec::new(), 0));
+            };
+            return if candidates.len() < posting.docs.len() {
+                Ok((
+                    candidates
+                        .iter()
+                        .filter(|id| posting.docs.contains(id))
+                        .cloned()
+                        .collect(),
+                    candidates.len(),
+                ))
+            } else {
+                Ok((
+                    posting
+                        .docs
+                        .iter()
+                        .filter(|id| candidates.contains(*id))
+                        .cloned()
+                        .collect(),
+                    posting.docs.len(),
+                ))
+            };
+        }
+        let mut found = FxHashSet::default();
+        let mut work = 0usize;
+        self.visit_postings(query, false, |_, posting| {
+            if candidates.len() < posting.len() {
+                for id in candidates {
+                    work += 1;
+                    if posting.contains(id) {
+                        found.insert(id.clone());
+                    }
+                }
+            } else {
+                for id in posting.iter() {
+                    work += 1;
+                    if candidates.contains(id) {
+                        found.insert(id.clone());
+                    }
+                }
+            }
+            (found.len() < candidates.len(), Vec::<()>::new())
+        })?;
+        Ok((found.into_iter().collect(), work))
+    }
+
+    /// Capped cardinality estimate; overlapping postings may overestimate.
+    /// Stops visiting keys once the cap is reached.
+    pub fn estimate_cardinality(
+        &self,
+        query: RangeQuery<FV>,
+        cap: usize,
+    ) -> Result<usize, BTreeError> {
+        let mut size = 0usize;
+        self.visit_postings(query, false, |_, posting| {
+            size = size.saturating_add(posting.len()).min(cap);
+            (size < cap, Vec::<()>::new())
+        })?;
+        Ok(size)
+    }
+
     /// Queries the index using a range query
     ///
     /// # Arguments
@@ -704,6 +798,18 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     where
         F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
     {
+        self.visit_postings(query, descending, |key, docs| f(key, docs))
+    }
+
+    fn visit_postings<F, R>(
+        &self,
+        query: RangeQuery<FV>,
+        descending: bool,
+        mut f: F,
+    ) -> Result<Vec<R>, BTreeError>
+    where
+        F: FnMut(&FV, &PostingList<PK>) -> (bool, Vec<R>),
+    {
         if let Err(source) = query.validate() {
             query.discard();
             return Err(self.generic_error(source));
@@ -769,7 +875,7 @@ impl<PK: BTreeKey, FV: BTreeKey> BTreeIndex<PK, FV> {
     where
         FV: 'a,
         I: DoubleEndedIterator<Item = &'a FV>,
-        F: FnMut(&FV, &Vec<PK>) -> (bool, Vec<R>),
+        F: FnMut(&FV, &PostingList<PK>) -> (bool, Vec<R>),
     {
         if descending {
             let mut groups: Vec<Vec<R>> = Vec::new();

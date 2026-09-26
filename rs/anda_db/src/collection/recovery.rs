@@ -419,7 +419,6 @@ impl Collection {
             let doc_ids = self.doc_ids.read();
             doc_ids
                 .iter()
-                .copied()
                 .filter(|id| !stored_ids.contains(id))
                 .collect()
         };

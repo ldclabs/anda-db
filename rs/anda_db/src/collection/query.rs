@@ -280,10 +280,45 @@ impl Collection {
             .saturating_mul(options.oversample.max(1))
             .min(max_candidates);
         let reranker = params.reranker.unwrap_or_default();
+        // BM25 already scores every matching posting for any top-k. Retain
+        // one bounded ranking and reuse prefixes when adaptive filtering asks
+        // for a wider window, instead of tokenizing/scoring again each round.
+        let text_rankings = if selected.is_none() && query.filter.is_some() && options.adaptive {
+            if let Some(text) = &params.text {
+                let mut rankings = Vec::new();
+                for index in &self.bm25_indexes {
+                    let hits = if params.logical_search {
+                        index.try_search_advanced(
+                            text,
+                            max_candidates,
+                            params.bm25_params.clone(),
+                        )?
+                    } else {
+                        index.search(text, max_candidates, params.bm25_params.clone())
+                    };
+                    rankings.push(hits.into_iter().map(|hit| hit.0).collect::<Vec<_>>());
+                }
+                Some(rankings)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         loop {
             let mut rankings = Vec::new();
             if let Some(text) = &params.text {
-                for index in &self.bm25_indexes {
+                for (number, index) in self.bm25_indexes.iter().enumerate() {
+                    if let Some(cached) = &text_rankings {
+                        rankings.push(
+                            cached[number]
+                                .iter()
+                                .take(breadth)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                        );
+                        continue;
+                    }
                     let hits = if let Some(ids) = &selected {
                         index.search_in_ids(
                             text,
@@ -369,6 +404,13 @@ impl Collection {
             Filter::Or(filters) => filters.iter().fold(0usize, |sum, f| {
                 sum.saturating_add(self.filter_cardinality_hint(f))
             }),
+            Filter::Field((name, query)) if name != Schema::ID_KEY => self
+                .btree_indexes
+                .iter()
+                .find(|index| index.name() == name)
+                .and_then(|index| index.estimate_cardinality(query.clone(), 4097).ok())
+                .filter(|count| *count < 4097)
+                .unwrap_or(usize::MAX),
             _ => usize::MAX,
         }
     }
@@ -494,6 +536,122 @@ impl Collection {
         self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)
     }
 
+    /// Owned-handle variant that offloads broad CPU scans to the bounded
+    /// query pool. Selective point lookups avoid the scheduling overhead.
+    pub async fn query_candidate_ids_on_worker(
+        self: Arc<Self>,
+        filter: Filter,
+        limit: usize,
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if self.filter_cardinality_hint(&filter) <= 4096 {
+            return self.query_candidate_ids(filter, limit).await;
+        }
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        crate::query::run_query_task(move || {
+            self.filter_by_field(filter, &[], limit, ScanOrder::Ascending)
+        })
+        .await?
+    }
+
+    /// Complete owned-handle scan on the bounded query worker pool.
+    pub async fn query_all_ids_on_worker(
+        self: Arc<Self>,
+        filter: Filter,
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        crate::query::run_query_task(move || {
+            self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)
+        })
+        .await?
+    }
+
+    /// In-process bounded candidate query. Unlike query_ids, the explicit
+    /// caller budget is not clamped to the HTTP page cap. Reaching the limit
+    /// is not proof of completeness: callers request budget + 1 to detect
+    /// exhaustion before loading documents. Zero returns no ids.
+    pub async fn query_candidate_ids(
+        &self,
+        filter: Filter,
+        limit: usize,
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.filter_by_field(filter, &[], limit, ScanOrder::Ascending)
+    }
+
+    /// Applies a filter to an explicit candidate set, preserving its order.
+    /// An empty set is empty, unlike the internal unbounded-scan sentinel.
+    pub async fn filter_candidate_ids(
+        &self,
+        filter: Filter,
+        candidates: &[DocumentId],
+    ) -> Result<Vec<DocumentId>, DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.filter_by_field(filter, candidates, 0, ScanOrder::Ascending)
+    }
+
+    /// Bounded ascending ID query plus per-query execution work counters.
+    pub async fn query_ids_with_stats(
+        &self,
+        filter: Filter,
+        limit: Option<usize>,
+    ) -> Result<(Vec<DocumentId>, QueryStats), DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .validate_complexity()
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })?;
+        let mut stats = QueryStats::default();
+        let limit = limit
+            .unwrap_or(Self::MAX_SEARCH_LIMIT)
+            .min(Self::MAX_SEARCH_LIMIT);
+        if limit == 0 {
+            return Ok((Vec::new(), stats));
+        }
+        self.search_count.fetch_add(1, Ordering::Relaxed);
+        let ids =
+            self.filter_by_field_tracked(filter, &[], limit, ScanOrder::Ascending, &mut stats)?;
+        stats.returned_ids = ids.len();
+        Ok((ids, stats))
+    }
+
     /// Gets a document by its ID.
     ///
     /// # Arguments
@@ -570,15 +728,27 @@ impl Collection {
         limit: usize,
         order: ScanOrder,
     ) -> Result<Vec<DocumentId>, DBError> {
+        self.filter_by_field_tracked(filter, candidates, limit, order, &mut QueryStats::default())
+    }
+
+    fn filter_by_field_tracked(
+        &self,
+        filter: Filter,
+        candidates: &[DocumentId],
+        limit: usize,
+        order: ScanOrder,
+        stats: &mut QueryStats,
+    ) -> Result<Vec<DocumentId>, DBError> {
         if candidates.is_empty() {
-            let mut result = self.filter_by_field_with(filter, None, limit, order)?;
+            let mut result =
+                self.filter_by_field_with_tracked(filter, None, limit, order, stats)?;
             result.sort_unstable();
             order.truncate(&mut result, limit);
             Ok(result)
         } else {
             let cand_set: FxHashSet<DocumentId> = candidates.iter().copied().collect();
             let matched: FxHashSet<DocumentId> = self
-                .filter_by_field_with(filter, Some(&cand_set), 0, order)?
+                .filter_by_field_with_tracked(filter, Some(&cand_set), 0, order, stats)?
                 .into_iter()
                 .collect();
 
@@ -604,13 +774,20 @@ impl Collection {
     /// order) and composite filters (an operand bounded on its own would
     /// drop matches the whole should keep) — is evaluated in full and the
     /// caller trims the match set to `limit`.
-    pub(super) fn filter_by_field_with(
+    fn filter_by_field_with_tracked(
         &self,
         filter: Filter,
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
         order: ScanOrder,
+        stats: &mut QueryStats,
     ) -> Result<Vec<DocumentId>, DBError> {
+        stats.peak_intermediate_ids = stats
+            .peak_intermediate_ids
+            .max(candidates.map_or(0, FxHashSet::len));
+        if candidates.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         if !matches!(filter, Filter::Field(_)) && only_id_fields(&filter) {
             let range =
                 RangeQuery::try_convert_from(id_filter_range(filter)).map_err(|source| {
@@ -633,29 +810,38 @@ impl Collection {
                 } else if let Some(index) =
                     self.btree_indexes.iter().find(|i| i.name() == index_name)
                 {
-                    // The whole match set must be *visited*: the scan walks
-                    // the *key* space, so stopping it after `limit` ids would
-                    // keep the ids under the smallest (or largest) keys
-                    // rather than the smallest or largest ids that
-                    // `query_ids` / `query_last_ids` promise — and a posting
-                    // list is in insertion order, so not even a single key
-                    // can be trimmed early.
-                    //
-                    // It must not be *materialized*, though: `query_ids` is
-                    // reachable over HTTP and clamps its result precisely so
-                    // one request cannot allocate a `u64` per matching
-                    // document. The requested end is therefore kept in a
-                    // bounded set — memory stays O(limit) however many
-                    // documents match, and the set also de-duplicates the ids
-                    // a non-unique index (array field, or plain duplicates)
-                    // maps under several keys, so `search` never returns the
-                    // same document twice. `limit == 0` (composite operands,
-                    // `query_all_ids`) collects everything, and sorting one
-                    // vector once is far cheaper than a set insert per id.
+                    if let Some(candidates) = candidates {
+                        let (mut ids, work) = index.intersect_ids(filter, candidates)?;
+                        stats.membership_probes += work;
+                        ids.sort_unstable();
+                        order.truncate(&mut ids, limit);
+                        return Ok(ids);
+                    }
+                    if let RangeQuery::Eq(value) = &filter {
+                        let ids = index.ordered_ids(value)?.unwrap_or_default();
+                        stats.index_keys += 1;
+                        stats.ordered_snapshot_ids += ids.len();
+                        let take = if limit == 0 {
+                            ids.len()
+                        } else {
+                            limit.min(ids.len())
+                        };
+                        let start = if order.is_descending() {
+                            ids.len() - take
+                        } else {
+                            0
+                        };
+                        stats.posting_ids += take;
+                        return Ok(ids[start..start + take].to_vec());
+                    }
+                    // Ranges may map a document under multiple unordered keys;
+                    // keep a bounded, deduplicated id-order page.
                     let keep = |id: &&DocumentId| candidates.is_none_or(|s| s.contains(*id));
                     if limit == 0 {
                         let mut rt = Vec::new();
                         index.try_range_query_ids(filter, false, |ids| {
+                            stats.index_keys += 1;
+                            stats.posting_ids += ids.len();
                             rt.extend(ids.iter().filter(keep));
                             true
                         })?;
@@ -665,6 +851,8 @@ impl Collection {
                     }
                     let mut rt: BTreeSet<DocumentId> = BTreeSet::new();
                     index.try_range_query_ids(filter, false, |ids| {
+                        stats.index_keys += 1;
+                        stats.posting_ids += ids.len();
                         for id in ids.iter().filter(keep) {
                             order.retain_id(&mut rt, *id, limit);
                         }
@@ -683,15 +871,20 @@ impl Collection {
                 // each branch. Retain a bounded, deduplicated union as we go.
                 let mut result = BTreeSet::new();
                 for query in queries {
-                    for id in self.filter_by_field_with(*query, candidates, limit, order)? {
+                    for id in
+                        self.filter_by_field_with_tracked(*query, candidates, limit, order, stats)?
+                    {
                         order.retain_id(&mut result, id, limit);
                     }
                 }
                 Ok(result.into_iter().collect())
             }
             Filter::And(mut queries) => {
+                // Complete dense results use a bulk intersection: taking a
+                // posting lock per returned id is wasteful without a limit.
                 if limit > 0
-                    && let Some(result) = self.indexed_id_page(&queries, candidates, limit, order)
+                    && let Some(result) =
+                        self.indexed_id_page(&queries, candidates, limit, order, stats)
                 {
                     return result;
                 }
@@ -701,13 +894,16 @@ impl Collection {
                     return Ok(Vec::new());
                 };
                 let mut rt: FxHashSet<DocumentId> = self
-                    .filter_by_field_with(*query, candidates, 0, order)?
+                    .filter_by_field_with_tracked(*query, candidates, 0, order, stats)?
                     .into_iter()
                     .collect();
 
                 for query in iter {
+                    if rt.is_empty() {
+                        return Ok(Vec::new());
+                    }
                     rt = self
-                        .filter_by_field_with(*query, Some(&rt), 0, order)?
+                        .filter_by_field_with_tracked(*query, Some(&rt), 0, order, stats)?
                         .into_iter()
                         .collect();
                     if rt.is_empty() {
@@ -724,7 +920,7 @@ impl Collection {
             }
             Filter::Not(query) => {
                 let exclude: FxHashSet<u64> = self
-                    .filter_by_field_with(*query, candidates, 0, order)?
+                    .filter_by_field_with_tracked(*query, candidates, 0, order, stats)?
                     .into_iter()
                     .collect();
                 Ok(self.walk_complement(&exclude, candidates, limit, order))
@@ -732,62 +928,162 @@ impl Collection {
         }
     }
 
-    /// Common owner/status equality plus id pagination. A posting is not in
-    /// id order after deletes, so visit it once and retain only the first/last
-    /// page. Other AND shapes continue through the general intersection path.
+    /// Intersects equality postings in id order, including nested AND and ID
+    /// cursors. A shared ordered snapshot avoids holding index locks while
+    /// testing the other postings (which may belong to the same index).
     fn indexed_id_page(
         &self,
         queries: &[Box<Filter>],
         candidates: Option<&FxHashSet<DocumentId>>,
         limit: usize,
         order: ScanOrder,
+        stats: &mut QueryStats,
     ) -> Option<Result<Vec<DocumentId>, DBError>> {
-        let mut indexed = None;
-        let mut id_queries = Vec::new();
+        if candidates.is_some() {
+            return None;
+        }
+        fn flatten<'a>(filter: &'a Filter, out: &mut Vec<&'a Filter>) {
+            match filter {
+                Filter::And(children) if !children.is_empty() => {
+                    for child in children {
+                        flatten(child, out);
+                    }
+                }
+                _ => out.push(filter),
+            }
+        }
+        let mut flat = Vec::new();
         for query in queries {
+            flatten(query, &mut flat);
+        }
+        let mut equalities = Vec::new();
+        let mut id_queries = Vec::new();
+        for query in flat {
             if only_id_fields(query) {
-                id_queries.push(Box::new(id_filter_range((**query).clone())));
-            } else if let Filter::Field((name, RangeQuery::Eq(value))) = query.as_ref()
-                && indexed.is_none()
-            {
-                indexed = Some((name, value));
+                id_queries.push(Box::new(id_filter_range(query.clone())));
+            } else if let Filter::Field((name, RangeQuery::Eq(value))) = query {
+                equalities.push((name, value));
             } else {
                 return None;
             }
         }
-        let (name, value) = indexed?;
-        if id_queries.is_empty() {
+        if equalities.is_empty() {
             return None;
         }
         Some((|| {
-            let mut id_query = RangeQuery::<u64>::try_convert_from(RangeQuery::And(id_queries))
+            let mut indexes = Vec::new();
+            for (name, value) in equalities {
+                let index = self
+                    .btree_indexes
+                    .iter()
+                    .find(|index| index.name() == name)
+                    .ok_or_else(|| DBError::Index {
+                        name: self.name.clone(),
+                        source: format!("BTree index {name:?} not found").into(),
+                    })?;
+                indexes.push((index, value));
+            }
+            indexes.sort_by_key(|(index, value)| {
+                index.query_with(value, |ids| Some(ids.len())).unwrap_or(0)
+            });
+            let (driver, value) = indexes[0];
+            stats.index_keys += indexes.len();
+            let has_id_filter = !id_queries.is_empty();
+            let mut id_query = if id_queries.is_empty() {
+                RangeQuery::Ge(0)
+            } else {
+                RangeQuery::<u64>::try_convert_from(if id_queries.len() == 1 {
+                    *id_queries.pop().expect("one ID filter")
+                } else {
+                    RangeQuery::And(id_queries)
+                })
                 .map_err(|source| DBError::Generic {
                     name: self.name.clone(),
                     source,
-                })?;
+                })?
+            };
             normalize_id_query(&mut id_query);
-            let index = self
-                .btree_indexes
-                .iter()
-                .find(|i| i.name() == name)
-                .ok_or_else(|| DBError::Index {
-                    name: self.name.clone(),
-                    source: format!("BTree index {name:?} not found").into(),
-                })?;
-            let live = self.doc_ids.read();
-            let mut result = BTreeSet::new();
-            index.try_range_query_ids(RangeQuery::Eq(value.clone()), false, |ids| {
-                for &id in ids {
-                    if candidates.is_none_or(|c| c.contains(&id))
-                        && live.contains(&id)
-                        && matches_id_query(&id_query, id)
-                    {
-                        order.retain_id(&mut result, id, limit);
+            let Some((lo, hi)) = id_envelope(&id_query) else {
+                return Ok(Vec::new());
+            };
+            let driver_len = driver.query_with(value, |ids| Some(ids.len())).unwrap_or(0);
+            let id_count = match &id_query {
+                RangeQuery::Eq(_) => 1,
+                RangeQuery::Include(ids) => ids.len(),
+                _ => self.doc_ids.read().range_len(lo..=hi),
+            };
+            let cached = driver.cached_ordered_ids(value)?;
+            if cached.is_none() && has_id_filter && id_count <= 4096 && id_count < driver_len {
+                let ids = self.filter_by_id(id_query, None, 0, order);
+                let mut selected = Vec::new();
+                let walk: Box<dyn Iterator<Item = &u64>> = if order.is_descending() {
+                    Box::new(ids.iter().rev())
+                } else {
+                    Box::new(ids.iter())
+                };
+                for &id in walk {
+                    stats.bitmap_ids += 1;
+                    let mut matched = true;
+                    for (index, value) in &indexes {
+                        stats.membership_probes += 1;
+                        if !index.contains_id(value, id)? {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        selected.push(id);
+                    }
+                    if limit > 0 && selected.len() == limit {
+                        break;
                     }
                 }
-                true
-            })?;
-            Ok(result.into_iter().collect())
+                if order.is_descending() {
+                    selected.reverse();
+                }
+                return Ok(selected);
+            }
+            let ids = match cached {
+                Some(ids) => ids,
+                None => driver.ordered_ids(value)?.unwrap_or_default(),
+            };
+            stats.ordered_snapshot_ids += ids.len();
+            let first = ids.partition_point(|id| *id < lo);
+            let last = ids.partition_point(|id| *id <= hi);
+            let live = self.doc_ids.read();
+            let mut result = Vec::new();
+            let walk: Box<dyn Iterator<Item = &u64>> = if order.is_descending() {
+                Box::new(ids[first..last].iter().rev())
+            } else {
+                Box::new(ids[first..last].iter())
+            };
+            for &id in walk {
+                stats.posting_ids += 1;
+                if !live.contains(&id)
+                    || !matches_id_query(&id_query, id)
+                    || candidates.is_some_and(|c| !c.contains(&id))
+                {
+                    continue;
+                }
+                let mut matches = true;
+                for (index, value) in &indexes[1..] {
+                    stats.membership_probes += 1;
+                    if !index.contains_id(value, id)? {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    result.push(id);
+                }
+                if limit > 0 && result.len() == limit {
+                    break;
+                }
+            }
+            if order.is_descending() {
+                result.reverse();
+            }
+            Ok(result)
         })())
     }
 
@@ -838,7 +1134,6 @@ impl Collection {
         };
         Self::collect_ids(
             live.range(lo..=hi)
-                .copied()
                 .filter(|id| matches_id_query(&query, *id)),
             candidates,
             None,
@@ -869,7 +1164,7 @@ impl Collection {
             return result;
         }
         Self::collect_ids(
-            doc_ids.iter().copied(),
+            doc_ids.range(0..=u64::MAX),
             candidates,
             Some(exclude),
             limit,

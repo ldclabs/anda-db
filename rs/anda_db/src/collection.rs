@@ -440,6 +440,15 @@ impl BTreeIndexView<'_> {
         self.inner.range_query_with(query, f)
     }
 
+    /// Capped upper estimate based on posting lengths, without copying ids.
+    pub fn estimate_cardinality(
+        &self,
+        query: RangeQuery<Fv>,
+        cap: usize,
+    ) -> Result<usize, DBError> {
+        self.inner.estimate_cardinality(query, cap)
+    }
+
     pub fn keys(&self, cursor: Option<String>, limit: Option<usize>) -> Vec<Fv> {
         self.inner.keys(cursor, limit)
     }
@@ -498,6 +507,42 @@ impl BM25IndexView<'_> {
         ids: &[DocumentId],
     ) -> Vec<(DocumentId, f32)> {
         self.inner.search_scoped(query, top_k, params, ids)
+    }
+
+    /// Scoped top-k using a caller's total score/tie order.
+    pub fn search_scoped_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
+        self.inner
+            .search_scoped_by(query, top_k, params, ids, compare)
+    }
+
+    /// Precomputes reusable corpus membership and length statistics.
+    pub fn prepare_scope(&self, ids: &[u64]) -> anda_db_tfs::PreparedScope {
+        self.inner.prepare_scope(ids)
+    }
+    /// Searches a prepared corpus with stable caller-defined boundary ties.
+    pub fn search_prepared_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        scope: &anda_db_tfs::PreparedScope,
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
+        self.inner
+            .search_prepared_by(query, top_k, params, scope, compare)
     }
 
     pub fn try_search_advanced(
@@ -938,12 +983,12 @@ impl Collection {
 
     /// Returns the latest (highest) document ID in the collection, if any.
     pub fn latest_document_id(&self) -> Option<DocumentId> {
-        self.doc_ids.read().last().cloned()
+        self.doc_ids.read().last()
     }
 
     /// Returns a vector of all document IDs in the collection in ascending order.
     pub fn ids(&self) -> Vec<DocumentId> {
-        self.doc_ids.read().iter().copied().collect()
+        self.doc_ids.read().iter().collect()
     }
 
     /// Checks if a document with the given ID exists in the collection.

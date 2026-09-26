@@ -25,8 +25,9 @@ allowing local creation. The new output index backfills old Activity reference
 keys on first open without changing cognitive content, versions or file formats.
 
 Queries also have a 100,000 intermediate-row/candidate-pair work budget; LIMIT
-does not bypass it. Historical reconstruction charges scanned versions and is
-reused per kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
+does not bypass it. Historical reads choose a small version range or per-element predecessor
+lookups, charge the visited versions/candidates, and reuse reconstruction per
+kind within one query. See the [paired benchmarks](benchmarks/anda_nexus_2026-09-23/README.md).
 
 Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
@@ -89,6 +90,16 @@ serves.
 > have been a worse lie than an absent one. Nothing in this document describes
 > `DELETE PROPOSITIONS`, `_version` metadata or Domains; if you are looking for
 > those, you are looking at the wrong major version.
+
+Current reads can push safe bound variables and scalar predicates into exact
+indexes. A single fully indexed element pattern under unrestricted authority
+can page by ID or answer an element COUNT from the index; general joins and
+paths retain their work limits. SEARCH keeps a stable top-k and bounded caches
+of corpus statistics/authorized text, with fresh returned views. New optional
+`query_keys` and `lookup_key` columns are computed by index hooks; the
+first open upgrades schemas and backfills their indexes over existing rows.
+See the [million-row implementation and measurements](query-performance-million.zh.md)
+for supported fast paths, cache limits, cold-read costs and remaining bounds.
 
 ---
 
@@ -198,10 +209,11 @@ Space contains at most one active element. Only `tuple_key`, `space_id` and
 `tx_id` are genuinely unique; everything else is indexed per column and
 intersected with `Filter::And`.
 
-**Absence is the empty string, not `Option`.** An `Option<T>` column is a
-`FieldType::Option`, which a B-Tree index cannot range over as one ordered
-domain. No legal value of these columns is ever empty, so `""` is an
-unambiguous "unset" that still sorts.
+**Existing optional business text uses the empty-string sentinel.** Optional
+index columns are supported by AndaDB; the derived query indexes use optional
+schema slots so old rows can be upgraded without changing their content.
+Existing business text keeps `""` as its unambiguous unset value, and sparse
+index hooks omit that sentinel.
 
 **Every reference gets a key column beside its JSON.** The JSON is the record;
 the key is `Endpoint::key`, a deterministic string that makes reference equality

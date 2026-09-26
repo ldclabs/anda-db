@@ -52,9 +52,31 @@ impl<T: Tokenizer> BM25Index<T> {
         params: Option<BM25Params>,
         ids: &[u64],
     ) -> Vec<(u64, f32)> {
+        self.search_scoped_by(query, top_k, params, ids, Self::compare_scored_docs)
+    }
+
+    /// Scoped scoring with an explicit total order, including boundary ties.
+    /// The comparator must rank higher scores first; it may customize ties.
+    pub fn search_scoped_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
         if top_k == 0 {
             return Vec::new();
         }
+        let scope = self.prepare_scope(ids);
+        self.search_prepared_by(query, top_k, params, &scope, compare)
+    }
+
+    /// Builds reusable membership and average-length statistics for a corpus.
+    pub fn prepare_scope(&self, ids: &[u64]) -> PreparedScope {
         let mut scope = Scores::default();
         let mut total_tokens = 0usize;
         for id in ids {
@@ -64,18 +86,48 @@ impl<T: Tokenizer> BM25Index<T> {
                 total_tokens += *length;
             }
         }
+        PreparedScope {
+            source: ids.to_vec(),
+            ids: scope,
+            total_tokens,
+            version: self.stats().version,
+        }
+    }
+
+    /// Scores a prepared corpus, refreshing lengths after index mutation.
+    pub fn search_prepared_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        scope: &PreparedScope,
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
+        if top_k == 0 {
+            return Vec::new();
+        }
+        let refreshed;
+        let scope = if scope.version != self.stats().version {
+            refreshed = self.prepare_scope(&scope.source);
+            &refreshed
+        } else {
+            scope
+        };
         if scope.is_empty() {
             return Vec::new();
         }
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let mut context = QueryContext::new(self, params);
         context.doc_count = scope.len();
-        context.avg_length = (total_tokens as f32 / scope.len() as f32).max(1.0);
+        context.avg_length = (scope.total_tokens as f32 / scope.len() as f32).max(1.0);
         context.scoped = true;
         let tokens = query_tokens(&mut self.tokenizer.clone(), query.trim());
-        let scores = self.score_tokens(&tokens, &mut context, Some(&scope));
+        let scores = self.score_tokens(&tokens, &mut context, Some(&scope.ids));
         self.search_count.fetch_add(1, Ordering::Relaxed);
-        Self::top_k_results(scores, top_k)
+        Self::top_k_results_by(scores, top_k, compare)
     }
 
     /// Searches the index and returns the highest-scoring documents.
@@ -94,10 +146,23 @@ impl<T: Tokenizer> BM25Index<T> {
     ///
     /// A vector of `(document_id, score)` pairs sorted by descending score.
     pub fn search(&self, query: &str, top_k: usize, params: Option<BM25Params>) -> Vec<(u64, f32)> {
+        self.search_by(query, top_k, params, Self::compare_scored_docs)
+    }
+
+    /// Full-corpus scoring with a caller-defined score/tie order.
+    pub fn search_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
         if top_k == 0 {
             return Vec::new();
         }
-
         let params = params.as_ref().unwrap_or(&self.config.bm25);
         let mut context = QueryContext::new(self, params);
         let tokens = query_tokens(&mut self.tokenizer.clone(), query.trim());
@@ -106,7 +171,7 @@ impl<T: Tokenizer> BM25Index<T> {
         // short-circuits above), matching the HNSW index's semantics.
         self.search_count.fetch_add(1, Ordering::Relaxed);
 
-        Self::top_k_results(scored_docs, top_k)
+        Self::top_k_results_by(scored_docs, top_k, compare)
     }
 
     /// Searches the index with a boolean query expression.
@@ -183,16 +248,23 @@ impl<T: Tokenizer> BM25Index<T> {
     /// Extracts the top-k results from scored documents using partial sorting.
     /// Uses `select_nth_unstable_by` for O(n + k·log(k)) instead of O(n·log(n)).
     fn top_k_results(scored_docs: FxHashMap<u64, f32>, top_k: usize) -> Vec<(u64, f32)> {
+        Self::top_k_results_by(scored_docs, top_k, Self::compare_scored_docs)
+    }
+
+    fn top_k_results_by<F>(scored_docs: Scores, top_k: usize, compare: F) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
         if top_k == 0 || scored_docs.is_empty() {
             return Vec::new();
         }
 
         let mut results: Vec<(u64, f32)> = scored_docs.into_iter().collect();
         if results.len() > top_k {
-            results.select_nth_unstable_by(top_k - 1, Self::compare_scored_docs);
+            results.select_nth_unstable_by(top_k - 1, &compare);
             results.truncate(top_k);
         }
-        results.sort_unstable_by(Self::compare_scored_docs);
+        results.sort_unstable_by(&compare);
         results
     }
 

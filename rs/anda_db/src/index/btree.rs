@@ -598,6 +598,105 @@ impl BTree {
         })
     }
 
+    /// Intersects a candidate set through posting membership, without scanning
+    /// an entire large equality posting. Returns ids and inspected-id work.
+    pub fn intersect_ids(
+        &self,
+        query: RangeQuery<Fv>,
+        candidates: &rustc_hash::FxHashSet<u64>,
+    ) -> Result<(Vec<u64>, usize), DBError> {
+        with_typed_inner!(self, |btree, Key| {
+            let query =
+                RangeQuery::<Key>::try_convert_from(query).map_err(|source| DBError::Index {
+                    name: self.name().into(),
+                    source,
+                })?;
+            btree
+                .index
+                .intersect_ids(query, candidates)
+                .map_err(DBError::from)
+        })
+    }
+
+    /// Capped upper estimate of a range's matching ids.
+    pub fn estimate_cardinality(
+        &self,
+        query: RangeQuery<Fv>,
+        cap: usize,
+    ) -> Result<usize, DBError> {
+        with_typed_inner!(self, |btree, Key| {
+            let query =
+                RangeQuery::<Key>::try_convert_from(query).map_err(|source| DBError::Index {
+                    name: self.name().into(),
+                    source,
+                })?;
+            btree
+                .index
+                .estimate_cardinality(query, cap)
+                .map_err(DBError::from)
+        })
+    }
+
+    /// Cached immutable id-ordered equality posting, safe to use outside locks.
+    pub fn ordered_ids(&self, value: &Fv) -> Result<Option<Arc<[u64]>>, DBError> {
+        with_typed_inner!(self, |btree, Key| {
+            let RangeQuery::Eq(key) = RangeQuery::<Key>::try_convert_from(RangeQuery::Eq(
+                value.clone(),
+            ))
+            .map_err(|source| DBError::Index {
+                name: self.name().into(),
+                source,
+            })?
+            else {
+                unreachable!()
+            };
+            Ok(btree.index.ordered_ids(&key))
+        })
+    }
+
+    /// Reuses an existing posting ordering without sorting on a cold lookup.
+    pub fn cached_ordered_ids(&self, value: &Fv) -> Result<Option<Arc<[u64]>>, DBError> {
+        with_typed_inner!(self, |btree, Key| {
+            let RangeQuery::Eq(key) = RangeQuery::<Key>::try_convert_from(RangeQuery::Eq(
+                value.clone(),
+            ))
+            .map_err(|source| DBError::Index {
+                name: self.name().into(),
+                source,
+            })?
+            else {
+                unreachable!()
+            };
+            Ok(btree.index.cached_ordered_ids(&key))
+        })
+    }
+
+    /// Tests one equality posting's membership without copying it.
+    pub fn contains_id(&self, value: &Fv, id: u64) -> Result<bool, DBError> {
+        match (self, value) {
+            (BTree::U64(tree), Fv::U64(key)) => return Ok(tree.index.contains_id(key, &id)),
+            (BTree::I64(tree), Fv::I64(key)) => return Ok(tree.index.contains_id(key, &id)),
+            (BTree::String(tree), Fv::Text(key)) => return Ok(tree.index.contains_id(key, &id)),
+            (BTree::Bytes(tree), Fv::Bytes(key)) => return Ok(tree.index.contains_id(key, &id)),
+            _ => {}
+        }
+        // Preserve the accepted numeric aliases and errors through the common
+        // conversion path; ordinary text/byte membership allocates nothing.
+        with_typed_inner!(self, |btree, Key| {
+            let RangeQuery::Eq(key) = RangeQuery::<Key>::try_convert_from(RangeQuery::Eq(
+                value.clone(),
+            ))
+            .map_err(|source| DBError::Index {
+                name: self.name().into(),
+                source,
+            })?
+            else {
+                unreachable!()
+            };
+            Ok(btree.index.contains_id(&key, &id))
+        })
+    }
+
     /// Executes `f` with the document ids matching an exact key.
     pub fn query_with<F, R>(&self, field_value: &Fv, f: F) -> Option<R>
     where

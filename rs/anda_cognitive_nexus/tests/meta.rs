@@ -1182,3 +1182,31 @@ async fn host_capabilities_are_the_hosts_to_declare() {
         "2.0"
     );
 }
+
+#[tokio::test]
+async fn search_top_k_preserves_ties_and_invalidates_cached_scopes() {
+    let nexus = fresh("search_cached_scope").await;
+    let mut command = String::from("MUTATE {\n");
+    for i in 0..30 {
+        command.push_str(&format!(
+            "CREATE CONCEPT ?p{i} {{ TYPE \"Person\" NAME \"sharedword\" }}\n"
+        ));
+    }
+    command.push('}');
+    ok(&nexus, &command).await;
+    let query = r#"SEARCH CONCEPT "sharedword" WITH TYPE "Person" LIMIT 5"#;
+    for _ in 0..2 {
+        let result = ok(&nexus, query).await;
+        let ids: Vec<_> = result["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["C-1", "C-10", "C-11", "C-12", "C-13"]);
+    }
+    ok(&nexus, r#"UPDATE "C-1" SET FIELDS {name: "differentword"}"#).await;
+    let result = ok(&nexus, query).await;
+    assert_eq!(result["hits"][0]["id"], "C-10");
+    assert_eq!(result["hits"].as_array().unwrap().len(), 5);
+}

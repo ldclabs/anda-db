@@ -82,6 +82,39 @@ impl BM25 {
         self.index.search_scoped(query, top_k, params, ids)
     }
 
+    pub(crate) fn search_scoped_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        ids: &[u64],
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
+        self.index
+            .search_scoped_by(query, top_k, params, ids, compare)
+    }
+
+    pub(crate) fn prepare_scope(&self, ids: &[u64]) -> anda_db_tfs::PreparedScope {
+        self.index.prepare_scope(ids)
+    }
+    pub(crate) fn search_prepared_by<F>(
+        &self,
+        query: &str,
+        top_k: usize,
+        params: Option<BM25Params>,
+        scope: &anda_db_tfs::PreparedScope,
+        compare: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
+    {
+        self.index
+            .search_prepared_by(query, top_k, params, scope, compare)
+    }
+
     pub(crate) fn set_tokenizer(&mut self, tokenizer: TokenizerChain) {
         self.index.set_tokenizer(tokenizer);
     }

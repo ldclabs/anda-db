@@ -1,0 +1,17 @@
+{
+  "rust_command": "cargo test --workspace --all-features -j 2",
+  "rust_passed": 1895,
+  "rust_ignored": 1,
+  "ignored_reason": "existing format-fixture generator (not regenerated)",
+  "clippy": "cargo clippy --workspace --all-targets --all-features -- -D warnings: passed",
+  "typescript": "codegen, vitest (577 passed / 34 files), tsc --noEmit: passed",
+  "format": "cargo fmt --all -- --check: passed",
+  "diff": "git diff --check: passed",
+  "nexus_million_current_rows": 1000001,
+  "not_run": [
+    "nightly fuzzing",
+    "Python binding tests",
+    "separate WASM/tokenizer workspace tests",
+    "live cloud backend and exclusive-host concurrency benchmarks"
+  ]
+}

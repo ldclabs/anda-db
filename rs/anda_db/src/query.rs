@@ -10,6 +10,56 @@ const MAX_FILTER_NODES: usize = 4_096;
 const MAX_FILTER_BRANCHES: usize = 1_024;
 const MAX_RANGE_INCLUDE_KEYS: usize = 4_096;
 
+/// Runs owned, read-only CPU query work on a bounded blocking pool. The
+/// permit stays with the worker even if its caller cancels the await.
+/// Callers remain responsible for their snapshot/transaction guard.
+pub async fn run_query_task<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, crate::error::DBError> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Ok(work());
+    }
+    static SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            ))
+        });
+    let permit =
+        SLOTS
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|source| crate::error::DBError::Generic {
+                name: "query worker".into(),
+                source: source.into(),
+            })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|source| crate::error::DBError::Generic {
+        name: "query worker".into(),
+        source: source.into(),
+    })
+}
+
+/// Work performed by a collection filter. Counts expose plan regressions
+/// without relying on wall-clock timings; cached posting ordering is separate
+/// from visited ids because building a first ordered snapshot can be O(N).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryStats {
+    pub index_keys: usize,
+    pub posting_ids: usize,
+    /// Bitmap ids tested by a multi-equality plan driven by an ID range.
+    pub bitmap_ids: usize,
+    pub membership_probes: usize,
+    pub ordered_snapshot_ids: usize,
+    pub peak_intermediate_ids: usize,
+    pub returned_ids: usize,
+}
+
 /// A query for searching the database.
 ///
 /// This structure defines the parameters for performing searches against the database,

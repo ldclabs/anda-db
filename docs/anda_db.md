@@ -817,3 +817,14 @@ If you only need an in-process memory database in Rust, `anda_db` is the direct 
 AndaDB is best understood as a schema-aware, embeddable, multi-index document store specialized for AI memory systems. Its strength is not only that it stores data, but that it keeps lexical, structural, and semantic retrieval close to the write path while remaining deployable as a normal Rust library.
 
 For agent builders, that combination is the core value proposition: one collection model, one persistence layer, and multiple retrieval paths that can be fused into a single memory access pattern.
+
+
+Equality postings now provide mutation-invalidated ordered snapshots and small-set
+membership probes. AND can page through multiple equality predicates and an
+ID cursor without materializing the full intersection. The first ordered read
+still prepares that posting; later reads reuse it. `query_ids_with_stats`
+reports posting visits, membership probes, snapshot cardinality and intermediate
+IDs. Broad owned-handle scans can use the bounded query worker pool. Custom
+B-tree hooks that read additional columns must override
+`IndexHooks::btree_index_depends_on` so updates refresh their derived keys.
+See [million-row measurements](query-performance-million.zh.md).

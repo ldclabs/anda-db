@@ -714,6 +714,23 @@ impl EffectiveAuthority {
             })
     }
 
+    /// Time-conditioned grants and policy rules can change the visible
+    /// corpus without any stored version changing. Keep those searches on
+    /// the live authorization path instead of caching their corpus.
+    pub(crate) fn has_time_conditions(&self) -> bool {
+        self.candidates
+            .iter()
+            .map(|candidate| &candidate.conditions)
+            .chain(
+                self.statements
+                    .iter()
+                    .map(|statement| &statement.conditions),
+            )
+            .any(|conditions| {
+                !conditions.valid_from.is_empty() || !conditions.valid_until.is_empty()
+            })
+    }
+
     /// Whether this Principal may speak as a semantic actor here (§14, §66).
     pub fn is_bound_to_actor(&self, actor_key: &str) -> bool {
         self.bindings
@@ -1095,6 +1112,38 @@ mod tests {
             min_auth_strength: min_strength.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn search_corpus_caches_exclude_clock_conditioned_authority() {
+        let mut authority = EffectiveAuthority {
+            space: SpaceRow::default(),
+            principal: PrincipalRow::default(),
+            groups: vec![],
+            is_owner: false,
+            policy: None,
+            bindings: vec![],
+            statements: vec![],
+            candidates: vec![],
+        };
+        assert!(!authority.has_time_conditions());
+        authority.statements.push(PolicyStatement {
+            conditions: AuthorityConditions {
+                valid_from: "2099-01-01T00:00:00.000Z".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(authority.has_time_conditions());
+        authority.statements.clear();
+        authority.candidates.push(
+            candidate_of_grant(&GrantRow {
+                conditions: serde_json::json!({"valid_until":"2099-01-01T00:00:00.000Z"}),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert!(authority.has_time_conditions());
     }
 
     #[test]

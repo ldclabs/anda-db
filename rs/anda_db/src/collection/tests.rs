@@ -5094,3 +5094,52 @@ async fn oversized_legacy_history_can_reindex_and_update_status_but_not_be_newly
     db.close().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn nested_multi_index_pages_remain_ordered_after_deletion() -> Result<(), DBError> {
+    let db = setup_test_db().await?;
+    let c = create_test_collection(&db, async |c| {
+        c.create_btree_index_nx(&["age"]).await?;
+        c.create_btree_index_nx(&["name"]).await
+    })
+    .await?;
+    let mut ids = Vec::new();
+    for _ in 0..20 {
+        ids.push(c.add_from(&create_test_doc(0, "same", 30, vec![])).await?);
+    }
+    let page = || {
+        Filter::And(vec![
+            Box::new(Filter::And(vec![
+                Box::new(Filter::Field(("age".into(), RangeQuery::Eq(Fv::U64(30))))),
+                Box::new(Filter::Field((
+                    "name".into(),
+                    RangeQuery::Eq(Fv::Text("same".into())),
+                ))),
+            ])),
+            Box::new(Filter::Field((
+                "_id".into(),
+                RangeQuery::Gt(Fv::U64(ids[4])),
+            ))),
+        ])
+    };
+    assert_eq!(c.query_ids(page(), Some(3)).await?, ids[5..8]);
+    let (_, stats) = c.query_ids_with_stats(page(), Some(3)).await?;
+    assert_eq!(stats.posting_ids + stats.bitmap_ids, 3);
+    assert_eq!(stats.membership_probes, 6);
+    assert_eq!(stats.ordered_snapshot_ids, 0);
+    assert_eq!(stats.returned_ids, 3);
+    c.remove(ids[5]).await?;
+    assert_eq!(c.query_ids(page(), Some(3)).await?, ids[6..9]);
+    assert_eq!(c.query_last_ids(page(), Some(3)).await?, ids[17..20]);
+    assert!(
+        c.query_ids(
+            Filter::And(vec![Box::new(page()), Box::new(Filter::And(vec![]))]),
+            Some(3)
+        )
+        .await?
+        .is_empty()
+    );
+    c.flush(unix_ms()).await?;
+    db.close().await?;
+    Ok(())
+}

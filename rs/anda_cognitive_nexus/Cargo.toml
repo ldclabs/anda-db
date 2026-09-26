@@ -57,3 +57,7 @@ log = { workspace = true }
 
 [lib]
 doctest = false
+
+[[bench]]
+name = "query_scale"
+harness = false

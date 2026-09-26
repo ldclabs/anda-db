@@ -550,6 +550,8 @@ async fn a_structural_pattern_reads_record_topology() {
     )
     .await;
     assert_eq!(rows(&steps), &vec![json!("Step one"), json!("Step two")]);
+    let inline = ok(&nexus, r#"FIND(?step.name) WHERE {STRUCTURAL ({name:"Deploy"}, "has_step", ?step)} ORDER BY ?step.name"#).await;
+    assert_eq!(inline, steps);
 }
 
 #[tokio::test]
@@ -1205,4 +1207,151 @@ async fn anti_joins_start_from_the_pinned_endpoint() {
     )
     .await;
     assert_eq!(optional, json!([["Lonely0", null], ["P7", "O7"]]));
+}
+
+/// Only one Person matches: an unrelated same-package type must not consume
+/// the candidate budget. The large fixture uses current rows deliberately;
+/// historical version behavior is covered separately in history.rs.
+#[tokio::test]
+async fn selective_queries_and_first_pages_do_not_scan_unrelated_concepts() {
+    let nexus = nexus("kql_selective_scale").await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "Unique Person" }"#,
+    )
+    .await;
+    let collection = nexus.store.elements(anda_kip::ElementKind::Concept);
+    let mut filler: anda_cognitive_nexus::rows::ConceptRow = collection.get_as(1).await.unwrap();
+    filler._id = 0;
+    filler.schema_ref = "kip://profiles/cognitive-memory@2.0.0/Event".into();
+    filler.name.clear();
+    for _ in 0..100_000 {
+        collection.add_from(&filler).await.unwrap();
+    }
+    for query in [
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} } LIMIT 1"#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} FILTER(?c.name == "Unique Person") } LIMIT 1"#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {id: "C-1"} ?c CONCEPT {} } LIMIT 1"#,
+        r#"FIND(?c.name) WHERE { ?c CONCEPT {} } LIMIT 1"#,
+    ] {
+        assert_eq!(ok(&nexus, query).await, json!(["Unique Person"]), "{query}");
+    }
+    assert_eq!(
+        ok(&nexus, "FIND(COUNT(?c)) WHERE { ?c CONCEPT {} }").await,
+        json!([100_001])
+    );
+    let first = run(&nexus, "FIND(?c.id) WHERE { ?c CONCEPT {} } LIMIT 2").await;
+    assert_eq!(first.status, TopLevelStatus::Succeeded);
+    let token = first.results[0].next_cursor.as_ref().unwrap();
+    let second = ok(
+        &nexus,
+        &format!("FIND(?c.id) WHERE {{ ?c CONCEPT {{}} }} LIMIT 2 CURSOR \"{token}\""),
+    )
+    .await;
+    assert_eq!(second, json!(["C-3", "C-4"]));
+}
+
+#[tokio::test]
+async fn filter_pushdown_preserves_canonical_text_equality_after_updates() {
+    let nexus = nexus("filter_canonical_text").await;
+    ok(&nexus, r#"CREATE CONCEPT ?c {TYPE "Person" NAME "K"}"#).await;
+    let query = r#"FIND(?c.name) WHERE {?c CONCEPT {} FILTER(?c.name == "K")}"#;
+    assert_eq!(ok(&nexus, query).await, json!(["K"]));
+    ok(&nexus, r#"UPDATE "C-1" SET FIELDS {name:"other"}"#).await;
+    assert_eq!(ok(&nexus, query).await, json!([]));
+    ok(&nexus, "UPDATE \"C-1\" SET FIELDS {name: \"e\u{301}\"}").await;
+    assert_eq!(
+        ok(
+            &nexus,
+            r#"FIND(COUNT(?c)) WHERE {?c CONCEPT {} FILTER(?c.name == "é")}"#
+        )
+        .await,
+        json!([1])
+    );
+}
+
+#[tokio::test]
+async fn filter_pushdown_does_not_hide_row_dependent_errors() {
+    let nexus = nexus("filter_hint_errors").await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?c {TYPE "Person" NAME "present" SET ATTRIBUTES {display_name:"present"}}"#,
+    )
+    .await;
+    for query in [
+        r#"FIND(?c) WHERE {?c CONCEPT {} FILTER(?c.attributes == "x" && ?c.name == "absent")}"#,
+        r#"FIND(?c) WHERE {?c CONCEPT {} FILTER(?c.attributes == "x") FILTER(?c.name == "absent")}"#,
+    ] {
+        let response = run(&nexus, query).await;
+        assert_eq!(response.error.unwrap().code, "TypeMismatch", "{query}");
+    }
+}
+
+#[tokio::test]
+async fn belief_frame_cache_does_not_share_a_different_archived_target_frame() {
+    use anda_cognitive_nexus::{
+        governance::{AuthContext, EffectiveAuthority},
+        kql::Context,
+    };
+    let nexus = nexus("belief_frame_cache_identity").await;
+    ok(&nexus, r#"MUTATE {
+        CREATE CONCEPT ?who {TYPE "Person" NAME "Alice"}
+        CREATE CONCEPT ?one {TYPE "Option" NAME "one"}
+        CREATE CONCEPT ?two {TYPE "Option" NAME "two"}
+        ENSURE PROPOSITION ?p1 (?who,"prefers",?one)
+        ENSURE PROPOSITION ?p2 (?who,"prefers",?two)
+        CREATE ASSERTION ?a1 {SET FIELDS {proposition:?p1,asserted_by:?who,stance:"support",mode:"stated",confidence:0.9}}
+        CREATE ASSERTION ?a2 {SET FIELDS {proposition:?p2,asserted_by:?who,stance:"support",mode:"stated",confidence:0.9}}
+    }"#).await;
+    let auth = AuthContext::system();
+    let authority = EffectiveAuthority::resolve(&nexus.store, DEFAULT_SPACE, &auth)
+        .await
+        .unwrap();
+    let mut active = Context::open(&nexus.store, DEFAULT_SPACE, None, None, &authority, &auth)
+        .await
+        .unwrap();
+    let policy = active.policy.clone();
+    let at = active.at.clone();
+    active
+        .project_belief("P-1".parse().unwrap(), &policy, &at)
+        .await
+        .unwrap();
+    let work = active.work();
+    active
+        .project_belief("P-2".parse().unwrap(), &policy, &at)
+        .await
+        .unwrap();
+    assert_eq!(
+        active.work().charged_candidates,
+        work.charged_candidates,
+        "the same active slot should be projected once"
+    );
+    ok(&nexus, r#"TRANSITION "P-1" TO "archived""#).await;
+    let auth = AuthContext::system();
+    let authority = EffectiveAuthority::resolve(&nexus.store, DEFAULT_SPACE, &auth)
+        .await
+        .unwrap();
+    let mut cached = Context::open(&nexus.store, DEFAULT_SPACE, None, None, &authority, &auth)
+        .await
+        .unwrap();
+    let policy = cached.policy.clone();
+    let at = cached.at.clone();
+    cached
+        .project_belief("P-1".parse().unwrap(), &policy, &at)
+        .await
+        .unwrap();
+    let actual = cached
+        .project_belief("P-2".parse().unwrap(), &policy, &at)
+        .await
+        .unwrap()
+        .to_json();
+    let mut fresh = Context::open(&nexus.store, DEFAULT_SPACE, None, None, &authority, &auth)
+        .await
+        .unwrap();
+    let expected = fresh
+        .project_belief("P-2".parse().unwrap(), &policy, &at)
+        .await
+        .unwrap()
+        .to_json();
+    assert_eq!(actual, expected);
 }

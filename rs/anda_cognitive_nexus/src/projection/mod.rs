@@ -66,11 +66,15 @@ struct Candidate {
 }
 
 /// The Propositions projected together, and how their values relate.
-#[derive(Default)]
-struct Frame {
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Frame {
     /// Every candidate value, the target included: the whole slot when the
     /// predicate constrains one (§20.15).
     members: Vec<ElementId>,
+    /// Share target results only within an ordinary active slot and the same
+    /// canonical subject / exact predicate definition.
+    shareable: bool,
+    sharing: BTreeMap<ElementId, (String, String)>,
     /// Each member's `functional_by` partition: its object's Concept Type
     /// lineage. Absent otherwise.
     partitions: BTreeMap<ElementId, String>,
@@ -173,6 +177,7 @@ struct Excluded {
 }
 
 /// The projected belief about one Proposition.
+#[derive(Clone)]
 pub struct Belief {
     /// The Proposition projected, when one durably exists.
     ///
@@ -199,7 +204,7 @@ pub struct Belief {
     policy: Policy,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Ledger {
     unverified_dependency: bool,
     candidate_status: BeliefStatus,
@@ -510,14 +515,56 @@ impl Context<'_> {
         at: &str,
     ) -> Result<Belief, KipError> {
         self.require_projection_history(policy)?;
+        let basis = serde_json::to_string(&(policy, at, self.pinned_seq, self.env.version))
+            .expect("policy serializes");
+        if let Some(belief) = self.belief_cache.get(&(basis.clone(), proposition)) {
+            return Ok(belief.clone());
+        }
         let frame = self.frame(proposition).await?;
         let index = frame
             .members
             .iter()
             .position(|member| *member == proposition)
             .unwrap_or_default();
-        let mut beliefs = self.project_frame(&frame, policy, at).await?;
-        Ok(beliefs.swap_remove(index))
+        // A target added explicitly to an active slot (for example an
+        // archived Proposition) can change its frame. Share only identical
+        // frames, including partitions, opposition and the exact member set.
+        let shared: std::collections::BTreeSet<_> = if frame.shareable {
+            frame
+                .sharing
+                .get(&proposition)
+                .map(|anchor| {
+                    frame
+                        .sharing
+                        .iter()
+                        .filter_map(|(id, group)| (group == anchor).then_some(*id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let frame_key = (basis.clone(), frame);
+        let beliefs = if let Some(cached) = self.frame_cache.get(&frame_key) {
+            cached.clone()
+        } else {
+            let projected =
+                std::sync::Arc::new(self.project_frame(&frame_key.1, policy, at).await?);
+            self.frame_cache.insert(frame_key, projected.clone());
+            projected
+        };
+        for belief in beliefs.iter() {
+            if let Some(id) = belief.proposition
+                && shared.contains(&id)
+            {
+                self.belief_cache
+                    .insert((basis.clone(), id), belief.clone());
+            }
+        }
+        let belief = beliefs[index].clone();
+        self.belief_cache
+            .insert((basis, proposition), belief.clone());
+        Ok(belief)
     }
 
     /// The answer for a fully grounded `BELIEF` whose Proposition does not
@@ -619,7 +666,8 @@ impl Context<'_> {
         }
         let subject = Endpoint::from_json(&row.subject)?;
         frame.members = self.slot_propositions(&subject, &row.predicate_ref).await?;
-        if !frame.members.contains(&target) {
+        frame.shareable = frame.members.contains(&target);
+        if !frame.shareable {
             frame.members.push(target);
         }
         frame.subject_keys = self.endpoint_keys(&subject).await?;
@@ -638,6 +686,13 @@ impl Context<'_> {
             let Some(Element::Proposition(value)) = self.load(member).await? else {
                 continue;
             };
+            if let Ok(subject) =
+                Endpoint::from_json(&self.canonical_endpoint(&value.subject).await?)
+            {
+                frame
+                    .sharing
+                    .insert(member, (subject.key(), value.predicate_ref.clone()));
+            }
             if by {
                 // The partition is the object's Concept Type lineage.
                 let partition = match Endpoint::from_json(&value.object) {
@@ -1162,30 +1217,11 @@ impl Context<'_> {
         predicate_ref: &str,
     ) -> Result<Vec<ElementId>, KipError> {
         let subject_keys = self.endpoint_keys(subject).await?;
-        // Every version of the lineage, and a draft symbol promoted into it
-        // (§20.14, §20.16).
-        let mut ranges: Vec<Box<anda_db::query::Filter>> = self
-            .env
-            .lineage_ranges(crate::schema::SymbolKind::PredicateType, predicate_ref)
-            .into_iter()
-            .map(|(low, high)| {
-                Box::new(anda_db::query::Filter::Field((
-                    "predicate_ref".to_string(),
-                    anda_db::query::RangeQuery::Between(
-                        anda_db_schema::Fv::Text(low),
-                        anda_db_schema::Fv::Text(high),
-                    ),
-                )))
-            })
-            .collect();
-        let predicate = match ranges.len() {
-            0 => crate::store::eq_field(
-                "predicate_ref",
-                anda_db_schema::Fv::Text(predicate_ref.to_string()),
-            ),
-            1 => *ranges.pop().expect("one range"),
-            _ => anda_db::query::Filter::Or(ranges),
-        };
+        let predicate = self.symbol_filter(
+            anda_kip::ElementKind::Proposition,
+            "predicate_ref",
+            &[predicate_ref.to_string()],
+        )?;
         let ids = self
             .candidates(
                 anda_kip::ElementKind::Proposition,

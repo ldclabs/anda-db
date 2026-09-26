@@ -86,6 +86,10 @@ where
 }
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    if std::env::var_os("ANDA_BENCH_QUERY_SCALE").is_some() {
+        query_scale_bench().await;
+        return;
+    }
     if std::env::var_os("ANDA_BENCH_REVIEW").is_some() {
         review_bench().await;
         return;
@@ -641,4 +645,127 @@ async fn scheduler_bench() {
         "{}",
         serde_json::json!({"workload":"codec_scheduler","harness_version":3,"requested_tick_ms":1,"tick_samples":ticks.len(),"maximum_tick_ms":ticks.last().unwrap(),"p95_tick_ms":ticks[(ticks.len()*95/100).min(ticks.len()-1)],"elapsed_ms":started.elapsed().as_secs_f64()*1000.})
     );
+}
+
+/// Uses only public APIs present in the baseline, so the same harness can
+/// compare checkouts without timing fixture construction or compilation.
+async fn query_scale_bench() {
+    #[derive(Serialize, AndaDBSchema)]
+    struct ScaleRow {
+        _id: u64,
+        tenant: u64,
+        status: u64,
+        needle: u64,
+    }
+    let n = count("ANDA_BENCH_DOCS", 1_000_001).max(100);
+    let samples = count("ANDA_BENCH_ITERATIONS", 15).max(1);
+    let db = AndaDB::connect(
+        Arc::new(InMemory::new()),
+        DBConfig {
+            name: "query_scale".into(),
+            storage: StorageConfig {
+                compress_level: 0,
+                cache_max_capacity: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let c = db
+        .create_collection(
+            ScaleRow::schema().unwrap(),
+            CollectionConfig {
+                name: "rows".into(),
+                ..Default::default()
+            },
+            async |c| {
+                c.create_btree_index(&["tenant"]).await?;
+                c.create_btree_index(&["status"]).await?;
+                c.create_btree_index(&["needle"]).await
+            },
+        )
+        .await
+        .unwrap();
+    for i in 0..n {
+        c.add_from(&ScaleRow {
+            _id: 0,
+            tenant: 1,
+            status: 1,
+            needle: u64::from(i < 10),
+        })
+        .await
+        .unwrap();
+    }
+    let eq = |field: &str, value| Filter::Field((field.into(), RangeQuery::Eq(Fv::U64(value))));
+    let cases = [
+        (
+            "rare_and_dense",
+            Filter::And(vec![
+                Box::new(eq("needle", 1)),
+                Box::new(eq("tenant", 1)),
+                Box::new(eq("status", 1)),
+            ]),
+            (1..=10).collect::<Vec<_>>(),
+        ),
+        (
+            "empty_and_dense",
+            Filter::And(vec![
+                Box::new(eq("needle", 99)),
+                Box::new(eq("tenant", 1)),
+                Box::new(eq("status", 1)),
+            ]),
+            vec![],
+        ),
+        (
+            "dense_first_page",
+            Filter::And(vec![Box::new(eq("tenant", 1)), Box::new(eq("status", 1))]),
+            (1..=50).collect::<Vec<_>>(),
+        ),
+        (
+            "dense_deep_page",
+            Filter::And(vec![
+                Box::new(eq("tenant", 1)),
+                Box::new(eq("status", 1)),
+                Box::new(id(RangeQuery::Gt(Fv::U64(n as u64 - 100)))),
+            ]),
+            ((n as u64 - 99)..=(n as u64 - 50)).collect::<Vec<_>>(),
+        ),
+    ];
+    println!(
+        "{}",
+        serde_json::json!({"workload":"query_scale_environment", "documents":n, "samples":samples, "backend":"InMemory", "seed_timed":false})
+    );
+    for (name, filter, expected) in cases {
+        let start = Instant::now();
+        assert_eq!(
+            c.query_ids(filter.clone(), Some(50)).await.unwrap(),
+            expected
+        );
+        println!(
+            "{}",
+            serde_json::json!({"workload":format!("{name}_cold_posting"), "elapsed_ms":start.elapsed().as_secs_f64()*1000.})
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                c.query_ids(filter.clone(), Some(50)).await.unwrap(),
+                expected
+            );
+        }
+        measure(name, samples, || async {
+            assert_eq!(
+                c.query_ids(filter.clone(), Some(50)).await.unwrap(),
+                expected
+            );
+        })
+        .await;
+    }
+    // The all-ID API is a complete answer, and is not silently page-clamped.
+    let filters = Filter::And(vec![Box::new(eq("tenant", 1)), Box::new(eq("status", 1))]);
+    measure("dense_all_ids", samples.min(5), || async {
+        assert_eq!(c.query_all_ids(filters.clone()).await.unwrap().len(), n);
+    })
+    .await;
+    db.close().await.unwrap();
 }

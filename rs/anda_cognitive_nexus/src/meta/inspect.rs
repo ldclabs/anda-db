@@ -31,6 +31,22 @@ use crate::store::history::CursorFamily;
 /// One ranked, authorized hit: relevance score, element, redacted view.
 pub(crate) type Hit = (f64, ElementId, std::sync::Arc<Json>);
 
+const SEARCH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) struct AuthorizedCorpus {
+    index: anda_db_tfs::BM25Index<anda_db_tfs::TokenizerChain>,
+    cap: Option<usize>,
+    read_cap: Option<usize>,
+    weight: usize,
+}
+impl std::fmt::Debug for AuthorizedCorpus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedCorpus")
+            .field("weight", &self.weight)
+            .finish()
+    }
+}
+
 /// What one search asks for, as the META statement and the KQL Search
 /// Pattern (§43.8) both spell it.
 pub(crate) struct SearchSpec<'a> {
@@ -163,6 +179,67 @@ pub(crate) async fn rank(
         return Ok((hits, None));
     }
 
+    // A cache contains only searchable text, never time-dependent rendered
+    // views. Data, schema and the complete effective authority invalidate it.
+    let corpus_key = crate::schema::contracts::digest(&serde_json::json!([
+        cx.space,
+        cx.pinned_seq,
+        cx.env.version,
+        cx.store.elements(kind).stats().version,
+        kind.to_string(),
+        with_type,
+        with_predicate,
+        format!("{:?}:{:?}", cx.authority, cx.auth),
+        cx.policy,
+        cx.read_origin
+    ]))?;
+    let cacheable_corpus = !cx.is_historical() && !cx.authority.has_time_conditions();
+    if cacheable_corpus {
+        let cached = cx
+            .store
+            .search_corpora
+            .lock()
+            .iter()
+            .find(|(key, _)| key == &corpus_key)
+            .map(|(_, corpus)| corpus.clone());
+        if let Some(corpus) = cached {
+            cx.narrow_limit(corpus.read_cap);
+            let mut hits = Vec::new();
+            let scored = {
+                let corpus = corpus.clone();
+                let term = term.clone();
+                anda_db::query::run_query_task(move || {
+                    corpus.index.search_by(&term, want, None, search_order)
+                })
+                .await
+                .map_err(crate::error::db_error)?
+            };
+            for (seq, raw) in scored {
+                let score = normalized(raw)?;
+                if score < threshold {
+                    continue;
+                }
+                let id = ElementId::new(kind, seq);
+                cx.charge(1)?;
+                let Some(element) = cx.load(id).await? else {
+                    continue;
+                };
+                let decision = cx.authority.authorize(
+                    crate::governance::Permission::Search,
+                    &crate::governance::ResourceContext::of_element(&element),
+                    cx.auth,
+                );
+                if !decision.is_permitted() {
+                    continue;
+                }
+                let mut view = cx.view_of(id).as_ref().clone();
+                crate::governance::redact::apply(&mut view, &decision.constraints, cx.read_origin);
+                hits.push((score, id, std::sync::Arc::new(view)));
+            }
+            return Ok((hits, corpus.cap));
+        }
+    }
+
     // Rank only the authorized, redacted corpus. Filtering global BM25 hits
     // afterwards leaks hidden document statistics and can crowd visible hits
     // out of an over-fetch window. This temporary index changes no stored state.
@@ -174,6 +251,7 @@ pub(crate) async fn rank(
         None,
     );
     let mut views = std::collections::BTreeMap::new();
+    let mut corpus_weight = 0usize;
     let mut filters = vec![
         crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
         crate::store::eq_field(
@@ -206,7 +284,11 @@ pub(crate) async fn rank(
         )
         .await?;
     cx.charge(ids.len())?;
-    for id in ids {
+    cx.prefetch(&ids).await?;
+    for (ordinal, id) in ids.into_iter().enumerate() {
+        if ordinal % 64 == 0 {
+            tokio::task::yield_now().await;
+        }
         let Some(element) = cx.load(id).await? else {
             continue;
         };
@@ -242,6 +324,9 @@ pub(crate) async fn rank(
             continue;
         }
         let text = grounding_text(kind, rendered.as_ref());
+        corpus_weight = corpus_weight
+            .saturating_add(text.len().saturating_mul(16))
+            .saturating_add(512);
         match index.insert(id.seq, &text, 0) {
             Ok(()) => {
                 views.insert(id.seq, rendered);
@@ -251,7 +336,7 @@ pub(crate) async fn rank(
         }
     }
     // Score all admitted documents before applying the threshold or page.
-    for (seq, raw_score) in index.search(&term, views.len(), None) {
+    for (seq, raw_score) in index.search_by(&term, want, None, search_order) {
         let score = normalized(raw_score)?;
         if score < threshold {
             continue;
@@ -260,7 +345,35 @@ pub(crate) async fn rank(
         hits.push((score, ElementId::new(kind, seq), rendered));
     }
     hits.sort_by(|a, b| by_rank((a.0, a.1), (b.0, b.1)));
+    if cacheable_corpus && corpus_weight <= SEARCH_CACHE_BYTES {
+        let corpus = std::sync::Arc::new(AuthorizedCorpus {
+            index,
+            cap,
+            read_cap: cx.governed_limit(),
+            weight: corpus_weight,
+        });
+        let mut cache = cx.store.search_corpora.lock();
+        while !cache.is_empty()
+            && (cache.len() >= 4
+                || cache
+                    .iter()
+                    .map(|(_, c)| c.weight)
+                    .sum::<usize>()
+                    .saturating_add(corpus_weight)
+                    > SEARCH_CACHE_BYTES)
+        {
+            cache.pop_front();
+        }
+        cache.push_back((corpus_key, corpus));
+    }
     Ok((hits, cap))
+}
+
+// All hits in a search share a kind. Preserve the protocol's lexical ID tie
+// order inside top-k selection, not after a numerically truncated boundary.
+fn search_order(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1)
+        .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
 }
 
 /// Best first; equal scores in id order, so a traversal pages stably.
@@ -311,42 +424,78 @@ async fn rank_indexed(
         )),
     ];
     if let Some(symbol) = lineage {
-        // The range spans the whole package, so the symbols in it that are
-        // this lineage are picked off the index keys: the scope is exact
-        // without reading a row.
-        let Some((low, high)) = crate::schema::lineage_range(symbol) else {
-            return Ok(None);
-        };
-        let keys = collection
-            .get_btree_index(&[symbol_column])
-            .map_err(crate::error::db_error)?
-            .range_query_with(
-                anda_db::query::RangeQuery::Between(
-                    anda_db_schema::Fv::Text(low),
-                    anda_db_schema::Fv::Text(high),
-                ),
-                |key, _| {
-                    let same = matches!(&key, anda_db_schema::Fv::Text(text)
-                        if crate::schema::same_lineage(text, symbol));
-                    (true, if same { vec![key] } else { vec![] })
-                },
-            );
-        if keys.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-        filters.push(Box::new(anda_db::query::Filter::Field((
-            symbol_column.into(),
-            anda_db::query::RangeQuery::Include(keys),
-        ))));
+        filters.push(Box::new(cx.symbol_filter(
+            kind,
+            symbol_column,
+            &[symbol.to_string()],
+        )?));
     }
-    let scope = collection
-        .query_all_ids(anda_db::query::Filter::And(filters))
+    let scope_key = format!(
+        "{}:{kind:?}:{}:{}:{lineage:?}",
+        cx.space,
+        collection.stats().version,
+        cx.env.version
+    );
+    let cached = cx
+        .store
+        .search_scopes
+        .lock()
+        .iter()
+        .find(|(key, _)| key == &scope_key)
+        .map(|(_, scope)| scope.clone());
+    let scope = if let Some(scope) = cached {
+        scope
+    } else {
+        let ids = collection
+            .clone()
+            .query_all_ids_on_worker(anda_db::query::Filter::And(filters))
+            .await
+            .map_err(crate::error::db_error)?;
+        let scope = {
+            let collection = collection.clone();
+            let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            std::sync::Arc::new(
+                anda_db::query::run_query_task(move || {
+                    collection
+                        .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+                        .map(|index| index.prepare_scope(&ids))
+                })
+                .await
+                .map_err(crate::error::db_error)?
+                .map_err(crate::error::db_error)?,
+            )
+        };
+        if scope.cache_weight() <= SEARCH_CACHE_BYTES {
+            let mut cache = cx.store.search_scopes.lock();
+            while !cache.is_empty()
+                && (cache.len() >= 4
+                    || cache
+                        .iter()
+                        .map(|(_, s)| s.cache_weight())
+                        .sum::<usize>()
+                        .saturating_add(scope.cache_weight())
+                        > SEARCH_CACHE_BYTES)
+            {
+                cache.pop_front();
+            }
+            cache.push_back((scope_key, scope.clone()));
+        }
+        scope
+    };
+    let scored = {
+        let collection = collection.clone();
+        let scope = scope.clone();
+        let term = term.to_string();
+        let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        anda_db::query::run_query_task(move || {
+            collection
+                .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+                .map(|index| index.search_prepared_by(&term, want, None, &scope, search_order))
+        })
         .await
-        .map_err(crate::error::db_error)?;
-    let scored = collection
-        .get_bm25_index(fields)
         .map_err(crate::error::db_error)?
-        .search_scoped(term, scope.len().max(1), None, &scope);
+        .map_err(crate::error::db_error)?
+    };
     let mut ranked = Vec::with_capacity(scored.len());
     for (seq, raw) in scored {
         let score = normalized(raw)?;

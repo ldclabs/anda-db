@@ -2603,3 +2603,27 @@ fn a_scoped_search_scores_as_a_fresh_index_of_the_scope() {
     assert!(whole.search_scoped("apple", 10, None, &[]).is_empty());
     assert!(whole.search_scoped("apple", 0, None, &[1]).is_empty());
 }
+
+#[test]
+fn prepared_scope_refreshes_and_top_k_keeps_lexical_boundary_ties() {
+    let index = BM25Index::new("prepared".into(), default_tokenizer(), None);
+    let ids = (1..=30).collect::<Vec<u64>>();
+    for &id in &ids {
+        index.insert(id, "shared", 0).unwrap();
+    }
+    let compare = |a: &(u64, f32), b: &(u64, f32)| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+    };
+    let scope = index.prepare_scope(&ids);
+    let first = index.search_prepared_by("shared", 5, None, &scope, compare);
+    assert_eq!(
+        first.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+        vec![1, 10, 11, 12, 13]
+    );
+    assert!(index.remove(1, "shared", 1));
+    let cached = index.search_prepared_by("shared", 5, None, &scope, compare);
+    let fresh = index.search_scoped_by("shared", 5, None, &ids, compare);
+    assert_eq!(cached, fresh);
+    assert_eq!(cached[0].0, 10);
+}

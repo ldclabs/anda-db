@@ -29,6 +29,7 @@ use anda_kip::{
     ElementKind, Json, KipError, KqlQuery, Map, Operation, Request, Response, ResponseContext,
     ResultContext, Scalar, WhereClause,
 };
+use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -48,6 +49,15 @@ use project::Projected;
 pub const MAX_CANDIDATES: usize = 100_000;
 /// Total intermediate rows/candidate join pairs per query, including nested blocks.
 pub const MAX_SOLUTIONS: usize = 100_000;
+
+/// Read-only counters for an embedded query's charged work and memoization.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueryWork {
+    pub charged_candidates: usize,
+    pub charged_solutions: usize,
+    pub loaded_elements: usize,
+    pub cached_frames: usize,
+}
 
 /// The state one query execution carries.
 pub struct Context<'a> {
@@ -127,6 +137,14 @@ pub struct Context<'a> {
     /// variables introduced by a WHERE branch. Standalone KQL has none.
     ambient: Solutions,
     next_internal_variable: u64,
+    element_window: Option<(usize, Option<u64>)>,
+    element_hints: Vec<anda_db::query::Filter>,
+    element_page: bool,
+    existential: bool,
+    pub(crate) belief_cache: BTreeMap<(String, ElementId), crate::projection::Belief>,
+    pub(crate) frame_cache:
+        BTreeMap<(String, crate::projection::Frame), Arc<Vec<crate::projection::Belief>>>,
+    page_offset_base: usize,
 }
 
 impl<'a> Context<'a> {
@@ -185,6 +203,13 @@ impl<'a> Context<'a> {
             dependency_cache: BTreeMap::new(),
             ambient: Solutions::unit(),
             next_internal_variable: 0,
+            element_window: None,
+            element_hints: Vec::new(),
+            element_page: false,
+            existential: false,
+            belief_cache: BTreeMap::new(),
+            frame_cache: BTreeMap::new(),
+            page_offset_base: 0,
         })
     }
 
@@ -391,6 +416,8 @@ impl<'a> Context<'a> {
     /// the same authorization/redaction path as storage reads still applies.
     pub(crate) fn seed_element(&mut self, id: ElementId, element: Element) -> bool {
         self.attached.remove(&id);
+        self.belief_cache.clear();
+        self.frame_cache.clear();
         let admitted = self.admit(Some(element));
         let visible = admitted.is_some();
         self.loaded.insert(id, admitted);
@@ -614,6 +641,48 @@ impl<'a> Context<'a> {
         self.governed_limit
     }
 
+    pub(crate) fn narrow_limit(&mut self, limit: Option<usize>) {
+        if let Some(limit) = limit {
+            self.governed_limit = Some(self.governed_limit.map_or(limit, |old| old.min(limit)));
+        }
+    }
+
+    /// Fetch independent bodies concurrently; admission and attachments still
+    /// run in the deterministic candidate order. The batch bounds I/O and
+    /// yields between chunks without weakening the Nexus snapshot guard.
+    pub(super) async fn prefetch(&mut self, ids: &[ElementId]) -> Result<(), KipError> {
+        let pending: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.loaded.contains_key(id))
+            .collect();
+        for chunk in pending.chunks(128) {
+            let store = self.store;
+            let space = &self.space;
+            let coordinate = self.as_of;
+            let mut stream = futures::stream::iter(chunk.iter().copied())
+                .map(|id| async move {
+                    let row = match coordinate {
+                        Some(seq) => store.element_at(space, id, seq).await?,
+                        None => store.get_element(id).await.ok(),
+                    };
+                    Ok::<_, KipError>((id, row))
+                })
+                .buffered(8);
+            let mut rows = Vec::with_capacity(chunk.len());
+            while let Some(row) = stream.next().await {
+                rows.push(row?);
+            }
+            drop(stream);
+            for (id, row) in rows {
+                let admitted = self.admit(row);
+                self.loaded.insert(id, admitted);
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
     /// Loads every element a solution set mentions.
     ///
     /// A pattern binds an endpoint it never loaded — `(?person, "prefers",
@@ -633,10 +702,25 @@ impl<'a> Context<'a> {
                 .filter(|id| !self.loaded.contains_key(id))
                 .count(),
         )?;
+        self.prefetch(&ids.iter().copied().collect::<Vec<_>>())
+            .await?;
         for id in ids {
             self.load(id).await?;
         }
         Ok(())
+    }
+
+    pub fn work(&self) -> QueryWork {
+        QueryWork {
+            charged_candidates: MAX_CANDIDATES - self.budget,
+            charged_solutions: MAX_SOLUTIONS - self.solution_budget,
+            loaded_elements: self.loaded.len(),
+            cached_frames: self.frame_cache.len(),
+        }
+    }
+
+    pub(super) fn remaining_candidates(&self) -> usize {
+        self.budget
     }
 
     /// Charges candidates against the query budget.
@@ -722,23 +806,13 @@ impl<'a> Context<'a> {
             self.historical_ids.insert(key, ids.clone());
             return Ok(ids);
         }
-        let ids = match filters {
-            Some(filters) => self
-                .store
-                .elements(kind)
-                .query_all_ids(filters)
-                .await
-                .map_err(db_error)?,
-            None => self
-                .store
-                .elements(kind)
-                .query_all_ids(anda_db::query::Filter::Field((
-                    "space".to_string(),
-                    anda_db::query::RangeQuery::Eq(Fv::Text(self.space.clone())),
-                )))
-                .await
-                .map_err(db_error)?,
-        };
+        let filter = filters.unwrap_or_else(|| eq_field("space", Fv::Text(self.space.clone())));
+        let ids = self
+            .store
+            .elements(kind)
+            .query_candidate_ids_on_worker(filter, self.budget.saturating_add(1))
+            .await
+            .map_err(db_error)?;
         Ok(ids
             .into_iter()
             .map(|seq| ElementId::new(kind, seq))
@@ -828,6 +902,8 @@ impl<'a> Context<'a> {
         self.identity_reviews = None;
         self.audit_readable.clear();
         self.merge_classes.clear();
+        self.belief_cache.clear();
+        self.frame_cache.clear();
         if let Some(seq) = self.as_of {
             self.policy = self
                 .store
@@ -924,7 +1000,19 @@ impl<'a> Context<'a> {
         mut solutions: Solutions,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Solutions, KipError>> + Send + 's>> {
         Box::pin(async move {
-            for clause in clauses {
+            for (at, clause) in clauses.iter().enumerate() {
+                let mut hints = Vec::new();
+                if let WhereClause::Concept { variable, .. } = clause {
+                    for next in &clauses[at + 1..] {
+                        let WhereClause::Filter { expression } = next else {
+                            break;
+                        };
+                        if !self.filter_hint(variable, &mut hints, expression) {
+                            break;
+                        }
+                    }
+                }
+                self.element_hints = hints;
                 solutions = self.apply_clause(solutions, clause).await?;
             }
             Ok(solutions)
@@ -947,25 +1035,25 @@ impl<'a> Context<'a> {
         Ok(match clause {
             WhereClause::Concept { variable, matcher } => {
                 let table = self
-                    .match_element(ElementKind::Concept, variable, matcher)
+                    .match_element_bound(ElementKind::Concept, variable, matcher, &solutions)
                     .await?;
                 self.join(solutions, table)?
             }
             WhereClause::Assertion { variable, matcher } => {
                 let table = self
-                    .match_element(ElementKind::Assertion, variable, matcher)
+                    .match_element_bound(ElementKind::Assertion, variable, matcher, &solutions)
                     .await?;
                 self.join(solutions, table)?
             }
             WhereClause::Evidence { variable, matcher } => {
                 let table = self
-                    .match_element(ElementKind::Evidence, variable, matcher)
+                    .match_element_bound(ElementKind::Evidence, variable, matcher, &solutions)
                     .await?;
                 self.join(solutions, table)?
             }
             WhereClause::Activity { variable, matcher } => {
                 let table = self
-                    .match_element(ElementKind::Activity, variable, matcher)
+                    .match_element_bound(ElementKind::Activity, variable, matcher, &solutions)
                     .await?;
                 self.join(solutions, table)?
             }
@@ -1000,21 +1088,54 @@ impl<'a> Context<'a> {
                 solutions
             }
             WhereClause::Not(inner) => {
+                let columns = correlation_columns(inner, &solutions);
+                let mut memo = std::collections::HashMap::new();
                 let mut out = solutions.header();
                 for row in &solutions.rows {
+                    let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
                     let incoming = solutions.with_rows(vec![row.clone()]);
-                    let table = self.solve_with(inner, incoming.clone()).await?;
-                    if self.join(incoming.clone(), table)?.is_empty() {
+                    let exists = if let Some(found) = memo.get(&key) {
+                        *found
+                    } else {
+                        let previous = self.existential;
+                        self.existential = self.can_test_existence(inner);
+                        let result = self.solve_with(inner, incoming.clone()).await;
+                        self.existential = previous;
+                        let found = !self.join(incoming.clone(), result?)?.is_empty();
+                        memo.insert(key, found);
+                        found
+                    };
+                    if !exists {
                         out = self.union(out, incoming)?;
                     }
                 }
                 out
             }
             WhereClause::Optional(inner) => {
+                let columns = correlation_columns(inner, &solutions);
+                let retained: BTreeSet<_> = columns.iter().map(|i| &solutions.vars[*i]).collect();
+                let mut memo = std::collections::HashMap::<Vec<String>, Solutions>::new();
                 let mut out = solutions.header();
                 for row in &solutions.rows {
+                    let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
                     let incoming = solutions.with_rows(vec![row.clone()]);
-                    let table = self.solve_with(inner, incoming.clone()).await?;
+                    let table = if let Some(table) = memo.get(&key) {
+                        table.clone()
+                    } else {
+                        let mut table = self.solve_with(inner, incoming.clone()).await?;
+                        for index in (0..table.vars.len()).rev() {
+                            if solutions.vars.contains(&table.vars[index])
+                                && !retained.contains(&table.vars[index])
+                            {
+                                table.vars.remove(index);
+                                for row in &mut table.rows {
+                                    row.remove(index);
+                                }
+                            }
+                        }
+                        memo.insert(key, table.clone());
+                        table
+                    };
                     let joined = incoming.left_join_bounded(table, &mut self.solution_budget)?;
                     out = self.union(out, joined)?;
                 }
@@ -1089,6 +1210,38 @@ impl<'a> Context<'a> {
 }
 
 /// Runs one KQL query.
+fn correlation_columns(clauses: &[WhereClause], solutions: &Solutions) -> Vec<usize> {
+    fn strings(value: &Json, out: &mut BTreeSet<String>) {
+        match value {
+            Json::String(value) => {
+                out.insert(value.clone());
+            }
+            Json::Array(values) => {
+                for value in values {
+                    strings(value, out);
+                }
+            }
+            Json::Object(values) => {
+                for value in values.values() {
+                    strings(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut used = BTreeSet::new();
+    strings(
+        &serde_json::to_value(clauses).expect("validated query serializes"),
+        &mut used,
+    );
+    solutions
+        .vars
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| used.contains(name).then_some(i))
+        .collect()
+}
+
 pub async fn execute(
     store: &Store,
     space: &str,
@@ -1260,6 +1413,66 @@ async fn run(
 
     let visible = validation::validate_block(&mut cx, &query.where_clauses, &Default::default())?;
     validation::validate_projection(&cx, query, &visible)?;
+    let limit = query
+        .limit
+        .as_ref()
+        .map(|value| scalar_usize(&cx, value, "LIMIT"))
+        .transpose()?;
+    if cursor.is_none() && !cx.is_historical() && query.for_time.is_none()
+        && query.order_by.as_ref().is_none_or(Vec::is_empty)
+        && cx.authority.searches_whole_space(cx.auth)
+        && !cx.authority.has_time_conditions()
+        && let [clause] = query.where_clauses.as_slice()
+        && let Some((kind, variable, filter)) = cx.covering_element(clause)?
+        && !query.find_clause.expressions.is_empty()
+        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { func: anda_kip::AggregationFunction::Count, var, .. } if var.var == variable && var.path.is_empty()))
+    {
+        let count = cx.store.elements(kind).query_all_ids_on_worker(filter).await.map_err(db_error)?.len();
+        let value = if query.find_clause.expressions.len() == 1 { Json::from(count) }
+            else { Json::Array(vec![Json::from(count); query.find_clause.expressions.len()]) };
+        let rows = if limit == Some(0) || cx.governed_limit() == Some(0) { vec![] } else { vec![value] };
+        return Ok(Answer { projected: Projected { rows, next_cursor: None }, schema_environment_version: environment_version, epistemic_policy: None, snapshot_seq: cx.pinned_seq, valid_at: None });
+    }
+    let mut page_offset = cursor.as_ref().map(|cursor| cursor.offset);
+    if let Some(limit) = limit
+        && !cx.is_historical()
+        && query.for_time.is_none()
+        && query.order_by.as_ref().is_none_or(Vec::is_empty)
+        && query
+            .find_clause
+            .expressions
+            .iter()
+            .all(|expr| matches!(expr, anda_kip::FindExpression::Variable(_)))
+        && cx.authority.searches_whole_space(cx.auth)
+        && !cx.authority.has_time_conditions()
+        && let [clause] = query.where_clauses.as_slice()
+        && cx.can_page_element(clause)
+    {
+        let seek = cursor.as_ref().and_then(|cursor| {
+            let token = cursor.to_token(space);
+            cx.store
+                .query_seeks
+                .lock()
+                .iter()
+                .rev()
+                .find(|(principal, issued, _)| {
+                    principal == &cx.auth.principal_id && issued == &token
+                })
+                .map(|(_, _, id)| *id)
+        });
+        cx.element_page = true;
+        if seek.is_some() {
+            cx.page_offset_base = page_offset.unwrap_or(0);
+            page_offset = Some(0);
+        }
+        cx.element_window = Some((
+            page_offset
+                .unwrap_or(0)
+                .saturating_add(limit)
+                .saturating_add(1),
+            seek,
+        ));
+    }
     let mut solutions = cx.solve(&query.where_clauses).await?;
     let mut valid_at = None;
     if let Some(for_time) = &query.for_time {
@@ -1278,11 +1491,6 @@ async fn run(
         valid_at = Some(at);
     }
 
-    let limit = query
-        .limit
-        .as_ref()
-        .map(|scalar| scalar_usize(&cx, scalar, "LIMIT"))
-        .transpose()?;
     // ORDER BY and the projection both read fields off bound elements. The
     // governed cap is merged in by `project`, after this — every element that
     // could tighten it has been admitted by then.
@@ -1294,7 +1502,7 @@ async fn run(
         &query.find_clause,
         query.order_by.as_ref(),
         limit,
-        cursor.as_ref().map(|cursor| cursor.offset),
+        page_offset,
         pinned_seq,
     )?;
     Ok(Answer {

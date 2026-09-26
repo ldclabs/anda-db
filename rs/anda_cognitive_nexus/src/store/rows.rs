@@ -110,6 +110,9 @@ pub struct ConceptRow {
     pub facets: Map<String, Json>,
     /// Profile structural fields: symbol → ordered array of references (§8.2).
     pub structural: Map<String, Json>,
+    /// Index-only topology and canonical text keys; recomputed by the collection hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_keys: Option<Vec<String>>,
     /// The Governance hook (§31).
     pub governance: Json,
     /// The storage-lifecycle hook (§33).
@@ -174,6 +177,9 @@ pub struct PropositionRow {
     pub facets: Map<String, Json>,
     /// Profile structural fields.
     pub structural: Map<String, Json>,
+    /// Index-only topology and canonical text keys; recomputed by the collection hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_keys: Option<Vec<String>>,
     /// The Governance hook. Proposition *existence* is sensitive data, so this
     /// is not a formality (§32).
     pub governance: Json,
@@ -262,6 +268,9 @@ pub struct AssertionRow {
     pub facets: Map<String, Json>,
     /// Profile structural fields.
     pub structural: Map<String, Json>,
+    /// Index-only topology and canonical text keys; recomputed by the collection hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_keys: Option<Vec<String>>,
     /// The Governance hook.
     pub governance: Json,
     /// The storage-lifecycle hook.
@@ -334,6 +343,9 @@ pub struct EvidenceRow {
     pub facets: Map<String, Json>,
     /// Profile structural fields.
     pub structural: Map<String, Json>,
+    /// Index-only topology and canonical text keys; recomputed by the collection hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_keys: Option<Vec<String>>,
     /// The Governance hook.
     pub governance: Json,
     /// The storage-lifecycle hook. Evidence deletion is audit-sensitive (§43).
@@ -403,6 +415,9 @@ pub struct ActivityRow {
     pub facets: Map<String, Json>,
     /// Profile structural fields.
     pub structural: Map<String, Json>,
+    /// Index-only topology and canonical text keys; recomputed by the collection hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_keys: Option<Vec<String>>,
     /// The Governance hook.
     pub governance: Json,
     /// The storage-lifecycle hook.
@@ -604,6 +619,9 @@ pub struct ElementVersionRow {
     pub tx_id: String,
     /// What the change was called: `create`, `update`, `archive`, …
     pub op: String,
+    /// Ordered version locator, computed from space/element/seq/version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_key: Option<String>,
     /// The complete row, as stored.
     pub row: Json,
 }

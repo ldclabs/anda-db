@@ -234,6 +234,9 @@ change hybrid ordering. The collection clamps candidate limits to at most
 | `query_ids(filter, limit)` | Lowest matching ids, ascending; default/cap 1000 |
 | `query_last_ids(filter, limit)` | Highest matching ids, still returned ascending; default/cap 1000 |
 | `query_all_ids(filter)` | Every matching id, ascending; caller owns the memory bound |
+| `query_ids_with_stats(filter, limit)` | Bounded ascending page plus `QueryStats` work counters |
+| `query_candidate_ids(filter, limit)` | Explicit in-process bound without the HTTP cap; request budget + 1 to detect exhaustion |
+| `filter_candidate_ids(filter, ids)` | Filter an explicit set, preserving its order; empty stays empty |
 
 For forward pagination add `_id > last_id`. For newest-first pages, combine
 the application filter with `_id < cursor` and call `query_last_ids`; reverse
@@ -290,3 +293,11 @@ dead ids; persist the repairs with `db.flush().await?`. Inspect
 `collection.recovery_issues()` for corrupt/schema-invalid skipped objects,
 and `collection.stats()` / `storage_stats()` / `db.stats()` for diagnostics.
 See [storage and recovery](storage_and_recovery.md) before handling failures.
+
+Broad queries with an owned `Arc<Collection>` can use
+`query_candidate_ids_on_worker` / `query_all_ids_on_worker`; work is limited to
+four blocking workers (or the available CPU count). Equality paging caches an
+ordered posting until mutation, so benchmark cold and warm calls separately.
+Hooks deriving B-tree keys from other columns must implement
+`btree_index_depends_on`; otherwise updating those columns cannot refresh the
+index. The persisted bitmap now provides ordered ID traversal directly.

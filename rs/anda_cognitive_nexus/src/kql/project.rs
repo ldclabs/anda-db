@@ -62,10 +62,13 @@ impl Context<'_> {
             return self.project_grouped(solutions, find, order_by, limit, offset, pinned_seq);
         }
 
-        self.sort(&mut solutions, order_by)?;
-
-        let offset = offset.unwrap_or(0);
         let total = solutions.rows.len();
+        let offset = offset.unwrap_or(0);
+        self.sort(
+            &mut solutions,
+            order_by,
+            limit.map(|limit| offset.saturating_add(limit)),
+        )?;
         let window: Vec<Vec<Binding>> = solutions
             .rows
             .iter()
@@ -81,12 +84,25 @@ impl Context<'_> {
             crate::store::history::PageCursor {
                 family: crate::store::history::CursorFamily::Query,
                 snapshot_seq: pinned_seq,
-                offset: consumed,
+                offset: self.page_offset_base.saturating_add(consumed),
                 traversal: self.traversal.clone(),
             }
             .issue(self.store, &self.space, &self.auth.principal_id)
         });
 
+        if self.element_page
+            && let Some(token) = &next_cursor
+            && let Some(id) = window
+                .last()
+                .and_then(|row| row.first())
+                .and_then(Binding::element)
+        {
+            let mut seeks = self.store.query_seeks.lock();
+            if seeks.len() >= 2048 {
+                seeks.pop_front();
+            }
+            seeks.push_back((self.auth.principal_id.clone(), token.clone(), id.seq));
+        }
         let mut rows = Vec::with_capacity(window.len());
         for row in &window {
             let mut projected = Vec::with_capacity(find.expressions.len());
@@ -145,6 +161,7 @@ impl Context<'_> {
         &self,
         solutions: &mut Solutions,
         order_by: Option<&Vec<OrderByItem>>,
+        keep: Option<usize>,
     ) -> Result<(), KipError> {
         let snapshot = solutions.header();
         let keys: Vec<(anda_kip::DotPathVar, OrderDirection)> = order_by
@@ -179,7 +196,8 @@ impl Context<'_> {
             }
         }
 
-        decorated.sort_by(|(left_keys, left), (right_keys, right)| {
+        let compare = |(left_keys, left): &(Vec<Json>, Vec<Binding>),
+                       (right_keys, right): &(Vec<Json>, Vec<Binding>)| {
             for (index, (_, direction)) in keys.iter().enumerate() {
                 let (left_key, right_key) = (&left_keys[index], &right_keys[index]);
                 // Null sorts last in *both* directions (§44.7). Reversing it
@@ -204,7 +222,14 @@ impl Context<'_> {
             // The tiebreaker that makes paging safe: without a total order,
             // two pages of the same query can overlap or skip rows.
             compare_rows(left, right)
-        });
+        };
+        if let Some(keep) = keep.filter(|keep| *keep < decorated.len()) {
+            if keep > 0 {
+                decorated.select_nth_unstable_by(keep - 1, &compare);
+            }
+            decorated.truncate(keep);
+        }
+        decorated.sort_by(compare);
 
         solutions.rows = decorated.into_iter().map(|(_, row)| row).collect();
         Ok(())
@@ -241,19 +266,19 @@ impl Context<'_> {
         // Indexed by the key's canonical text rather than scanned for: a
         // linear scan per solution is quadratic in the result size, and an
         // aggregate is exactly the query someone runs over everything.
-        let mut groups: Vec<(Vec<Json>, Vec<Vec<Binding>>)> = Vec::new();
+        let mut groups: Vec<(Vec<Json>, Vec<usize>)> = Vec::new();
         let mut index: HashMap<String, usize> = HashMap::new();
-        for row in &solutions.rows {
+        for (row_index, row) in solutions.rows.iter().enumerate() {
             let key: Vec<Json> = keys
                 .iter()
                 .map(|path| self.read_variable(&solutions, row, path))
                 .collect();
             let token = super::binding::value_key(&Json::Array(key.clone()));
             match index.get(&token) {
-                Some(at) => groups[*at].1.push(row.clone()),
+                Some(at) => groups[*at].1.push(row_index),
                 None => {
                     index.insert(token, groups.len());
-                    groups.push((key, vec![row.clone()]));
+                    groups.push((key, vec![row_index]));
                 }
             }
         }
@@ -296,10 +321,9 @@ impl Context<'_> {
         // Resolved once per group — the sort reads them, and so does the row.
         let mut resolved: Vec<(Vec<Json>, Vec<Json>)> = Vec::with_capacity(groups.len());
         for (key, rows) in groups {
-            let group = solutions.with_rows(rows);
             let mut aggregates = Vec::with_capacity(plan.len());
             for (func, var, distinct) in &plan {
-                aggregates.push(self.aggregate_column(&group, *func, var, *distinct)?);
+                aggregates.push(self.aggregate_column(&solutions, &rows, *func, var, *distinct)?);
             }
             resolved.push((key, aggregates));
         }
@@ -448,14 +472,24 @@ impl Context<'_> {
     fn aggregate_column(
         &self,
         group: &Solutions,
+        row_indices: &[usize],
         func: AggregationFunction,
         var: &anda_kip::DotPathVar,
         distinct: bool,
     ) -> Result<Json, KipError> {
         let mut seen = std::collections::HashSet::new();
         let mut column = Vec::new();
-        for row in &group.rows {
-            let value = self.read_variable(group, row, var);
+        let mut count = 0usize;
+        for &index in row_indices {
+            let row = &group.rows[index];
+            let value = if func == AggregationFunction::Count && var.path.is_empty() {
+                group
+                    .get(row, &var.var)
+                    .map(Binding::to_json)
+                    .unwrap_or(Json::Null)
+            } else {
+                self.read_variable(group, row, var)
+            };
             if distinct {
                 let key = if var.path.is_empty() {
                     group
@@ -469,9 +503,17 @@ impl Context<'_> {
                     continue;
                 }
             }
-            column.push(value);
+            if func == AggregationFunction::Count {
+                count += usize::from(!value.is_null());
+            } else {
+                column.push(value);
+            }
         }
-        aggregate(func, &column)
+        if func == AggregationFunction::Count {
+            Ok(Json::from(count))
+        } else {
+            aggregate(func, &column)
+        }
     }
 }
 

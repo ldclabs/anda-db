@@ -4,6 +4,31 @@ All notable changes to this workspace are documented in this file.
 
 ## [Unreleased]
 
+### Performance
+
+- B-tree filters probe small candidate sets, stop on empty intersections, and
+  reuse immutable ordered postings for equality/ID pages. Range estimates now
+  guide selective hybrid search; adaptive BM25 reuses one bounded ranking.
+  Collection IDs use the persisted bitmap directly instead of a second tree.
+  `query_ids_with_stats` exposes filter work, and owned scan APIs use a bounded
+  query worker pool.
+- KQL resolves exact lineage keys before candidate collection, pushes existing
+  element/reference bindings and safe adjacent scalar filters, and supports
+  indexed pages and covering `COUNT` under unrestricted authority. NOT can
+  stop after a complete terminal match; correlated blocks and belief frames
+  reuse equivalent work. General sort uses a bounded prefix and aggregates
+  avoid cloning complete rows or rendering Elements solely to count them.
+- Nexus builds optional derived topology and historical version-locator
+  indexes on open, including old rows. Version reads seek to the required
+  version; snapshot reconstruction chooses a small version range or skips
+  whole old-version chains. Index hooks declare physical-field dependencies
+  so derived postings remain correct after updates and recovery.
+- SEARCH selects only the needed top-k with the protocol's tie ordering.
+  Bounded caches reuse corpus statistics and authorized search text, keyed by
+  data/schema/authority state; returned views are still loaded and redacted
+  for the current read. Body prefetch is bounded and CPU-heavy ranking runs
+  off the async executor. See the [million-row optimization report](docs/query-performance-million.zh.md).
+
 ### Fixed
 
 - Historical KQL tuple patterns skip bound-endpoint index narrowing, which
@@ -14,8 +39,8 @@ All notable changes to this workspace are documented in this file.
   queries retain the index optimization.
 - KQL `NOT` and `OPTIONAL` blocks no longer re-scan the Space for every outer
   row. A tuple pattern whose subject or object variable every earlier solution
-  already bound narrows the Proposition index by those elements (up to 256
-  distinct, merge classes included), and a `STRUCTURAL` pattern reads such a
+  already bound narrows the Proposition index by those elements (large binding
+  sets use bounded Include operands, merge classes included), and a `STRUCTURAL` pattern reads such a
   bound source the way it reads a fixed one. An anti-join such as
   `?c CONCEPT {} NOT { (?c, ?p, ?o) }` over a few thousand elements now examines
   about one candidate set per row instead of rows × all Propositions, and no

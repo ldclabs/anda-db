@@ -4593,6 +4593,11 @@ async fn hidden_search_text_cannot_change_visible_scores() {
             .len(),
         1
     );
+    let cached = run_as(&session, r#"SEARCH CONCEPT "Note""#).await;
+    assert_eq!(
+        before.first_result().unwrap()["hits"],
+        cached.first_result().unwrap()["hits"]
+    );
     let changed = run_as(
         &nexus.system_session(),
         r#"UPDATE "C-2" SET FIELDS {name: "Note Note Note Note Note confidential ranking words"}"#,
@@ -4666,4 +4671,10 @@ async fn search_enforces_its_own_field_mask_and_result_limit() {
         1
     );
     assert!(visible.results[0].next_cursor.is_some());
+    let repeated = run_as(&session, r#"SEARCH CONCEPT "Note" LIMIT 10"#).await;
+    assert_eq!(
+        visible.first_result().unwrap()["hits"],
+        repeated.first_result().unwrap()["hits"]
+    );
+    assert!(repeated.results[0].next_cursor.is_some());
 }

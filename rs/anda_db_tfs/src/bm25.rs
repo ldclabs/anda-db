@@ -19,6 +19,31 @@ use crate::error::*;
 use crate::query::*;
 use crate::tokenizer::*;
 
+/// Reusable corpus membership and length statistics. A mutation invalidates
+/// its statistics; searches automatically refresh against the original ids.
+#[derive(Debug)]
+pub struct PreparedScope {
+    source: Vec<u64>,
+    ids: FxHashMap<u64, f32>,
+    total_tokens: usize,
+    version: u64,
+}
+impl PreparedScope {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+    /// Conservative accounting weight for bounded caller caches.
+    pub fn cache_weight(&self) -> usize {
+        self.source
+            .capacity()
+            .saturating_mul(8)
+            .saturating_add(self.ids.capacity().saturating_mul(32))
+    }
+}
+
 const MAX_NOT_COMPLEMENT_DOCS: usize = 10_000;
 const DOC_LOCK_STRIPES: usize = 128;
 

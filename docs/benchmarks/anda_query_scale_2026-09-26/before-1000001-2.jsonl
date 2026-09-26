@@ -1,0 +1,10 @@
+{"backend":"InMemory","documents":1000001,"samples":15,"seed_timed":false,"workload":"query_scale_environment"}
+{"elapsed_ms":2.755708,"workload":"rare_and_dense_cold_posting"}
+{"iterations":15,"p50_ms":2.319375,"p95_ms":2.325333,"p99_ms":2.325333,"peak_additional_heap_bytes":846,"total_ms":34.792835000000004,"workload":"rare_and_dense"}
+{"elapsed_ms":0.005958000000000001,"workload":"empty_and_dense_cold_posting"}
+{"iterations":15,"p50_ms":0.000458,"p95_ms":0.0007080000000000001,"p99_ms":0.0007080000000000001,"peak_additional_heap_bytes":837,"total_ms":0.006999000000000002,"workload":"empty_and_dense"}
+{"elapsed_ms":35.088666999999994,"workload":"dense_first_page_cold_posting"}
+{"iterations":15,"p50_ms":32.581042,"p95_ms":34.144083,"p99_ms":34.144083,"peak_additional_heap_bytes":46137672,"total_ms":489.551372,"workload":"dense_first_page"}
+{"elapsed_ms":19.404292,"workload":"dense_deep_page_cold_posting"}
+{"iterations":15,"p50_ms":19.855375000000002,"p95_ms":22.893375,"p99_ms":22.893375,"peak_additional_heap_bytes":46137771,"total_ms":306.16041700000005,"workload":"dense_deep_page"}
+{"iterations":5,"p50_ms":33.664708000000005,"p95_ms":33.931208999999996,"p99_ms":33.931208999999996,"peak_additional_heap_bytes":46137592,"total_ms":168.28437499999998,"workload":"dense_all_ids"}

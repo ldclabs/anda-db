@@ -141,6 +141,9 @@ macro_rules! collections {
             /// and its runtime. Empty until the host says otherwise.
             host_capabilities: Arc<parking_lot::RwLock<crate::meta::HostCapabilities>>,
             issued_cursors: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String)>>>,
+            pub(crate) search_scopes: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, Arc<anda_db_tfs::PreparedScope>)>>>,
+            pub(crate) search_corpora: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, Arc<crate::meta::inspect::AuthorizedCorpus>)>>>,
+            pub(crate) query_seeks: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String, u64)>>>,
             $($field: Slot,)*
             /// Resolved Schema Environments, keyed by Space and version.
             ///
@@ -174,6 +177,9 @@ macro_rules! collections {
                     evaluation_rules: crate::evaluation::EvaluationRules::default(),
                     host_capabilities: Arc::new(parking_lot::RwLock::new(Default::default())),
                     issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
+                    search_scopes: Arc::new(parking_lot::Mutex::new(Default::default())),
+                    search_corpora: Arc::new(parking_lot::Mutex::new(Default::default())),
+                    query_seeks: Arc::new(parking_lot::Mutex::new(Default::default())),
                     $($field,)*
                     environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
                 };
@@ -188,6 +194,9 @@ macro_rules! collections {
             /// runs again, reinstalling the sparse index hooks and jieba
             /// tokenizer before the freshly loaded handle recovers mutations.
             pub async fn reopen(&self) -> Result<(), KipError> {
+                self.search_scopes.lock().clear();
+                self.search_corpora.lock().clear();
+                self.query_seeks.lock().clear();
                 $(self.$field.set(self.reload($name, $init).await?);)*
                 self.governance.reopen().await
             }
@@ -256,6 +265,11 @@ collections! {
 fn versioned(mut schema: anda_db_schema::Schema, name: &str) -> anda_db_schema::Schema {
     // 1: `record_keys`, the learning-record index.
     if matches!(name, ACTIVITIES | EVIDENCE) {
+        schema.with_version(2);
+    } else if matches!(
+        name,
+        CONCEPTS | PROPOSITIONS | ASSERTIONS | ELEMENT_VERSIONS
+    ) {
         schema.with_version(1);
     }
     schema
@@ -300,7 +314,52 @@ where
 struct SparseIndexHooks;
 
 impl IndexHooks for SparseIndexHooks {
+    fn btree_index_depends_on(&self, index: &BTree, field: &str) -> bool {
+        match index.name() {
+            "query_keys" => matches!(
+                field,
+                "structural"
+                    | "name"
+                    | "key"
+                    | "canonical_id"
+                    | "evidence_ids"
+                    | "context_refs"
+                    | "source_refs"
+                    | "generated_by"
+                    | "inputs"
+                    | "outputs"
+                    | "associated_actors"
+            ),
+            "lookup_key" => matches!(field, "space" | "element" | "seq" | "version"),
+            _ => DefaultIndexHooks.btree_index_depends_on(index, field),
+        }
+    }
+
     fn btree_index_value<'a>(&self, index: &BTree, doc: &'a Document) -> Option<Cow<'a, Fv>> {
+        if index.name() == "query_keys" {
+            return Some(Cow::Owned(Fv::Array(
+                query_index_keys(doc).into_iter().map(Fv::Text).collect(),
+            )));
+        }
+        if index.name() == "lookup_key" {
+            let (
+                Some(Fv::Text(space)),
+                Some(Fv::Text(element)),
+                Some(Fv::U64(seq)),
+                Some(Fv::U64(version)),
+            ) = (
+                doc.get_field("space"),
+                doc.get_field("element"),
+                doc.get_field("seq"),
+                doc.get_field("version"),
+            )
+            else {
+                return None;
+            };
+            return Some(Cow::Owned(Fv::Text(history::version_lookup_key(
+                space, element, *seq, *version,
+            ))));
+        }
         let value = DefaultIndexHooks.btree_index_value(index, doc)?;
         if matches!(
             index.name(),
@@ -321,6 +380,77 @@ impl IndexHooks for SparseIndexHooks {
             Some(value)
         }
     }
+}
+
+/// Distinguishes Core fields from full Profile symbols without delimiter collisions.
+pub(crate) fn topology_key(profile: bool, field: &str, target: Option<&str>) -> String {
+    serde_json::to_string(&(profile, field, target)).expect("strings serialize")
+}
+
+pub(crate) fn text_query_key(field: &str, text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    serde_json::to_string(&("text", field, text.nfc().collect::<String>()))
+        .expect("strings serialize")
+}
+
+fn query_index_keys(doc: &Document) -> Vec<String> {
+    fn value(input: &Fv) -> anda_kip::Json {
+        match input {
+            Fv::Json(value) => value.clone(),
+            Fv::Array(items) => anda_kip::Json::Array(items.iter().map(value).collect()),
+            _ => serde_json::to_value(input).unwrap_or_default(),
+        }
+    }
+    fn add(keys: &mut Vec<String>, profile: bool, field: &str, refs: &anda_kip::Json) {
+        let refs: Vec<&anda_kip::Json> = match refs {
+            anda_kip::Json::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        for reference in refs {
+            let id = reference
+                .as_str()
+                .or_else(|| reference.get("id").and_then(anda_kip::Json::as_str));
+            if reference.is_object() || id.is_some_and(|id| !id.is_empty()) {
+                keys.push(topology_key(profile, field, None));
+            }
+            if let Some(id) = id.filter(|id| !id.is_empty()) {
+                keys.push(topology_key(profile, field, Some(id)));
+            }
+        }
+    }
+    let mut keys = Vec::new();
+    for field in ["name", "key", "canonical_id"] {
+        if let Some(Fv::Text(text)) = doc.get_field(field)
+            && !text.is_empty()
+        {
+            keys.push(text_query_key(field, text));
+        }
+    }
+    if let Some(structural) = doc.get_field("structural") {
+        // The profile map's values are JSON reference lists; serialization
+        // leaves element ids and symbol names untouched.
+        if let Some(fields) = value(structural).as_object() {
+            for (field, refs) in fields {
+                add(&mut keys, true, field, refs);
+            }
+        }
+    }
+    for (field, column) in [
+        ("evidence", "evidence_ids"),
+        ("context", "context_refs"),
+        ("source", "source_refs"),
+        ("generated_by", "generated_by"),
+        ("inputs", "inputs"),
+        ("outputs", "outputs"),
+        ("associated_actors", "associated_actors"),
+    ] {
+        if let Some(refs) = doc.get_field(column) {
+            add(&mut keys, false, field, &value(refs));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 async fn init_control(c: &mut Collection) -> Result<(), DBError> {
@@ -355,6 +485,7 @@ async fn init_commit_log(c: &mut Collection) -> Result<(), DBError> {
 /// starts with default hooks and tokenizer and needs both reinstalled.
 async fn init_envelope(c: &mut Collection) -> Result<(), DBError> {
     c.set_index_hooks(Arc::new(SparseIndexHooks));
+    c.create_btree_index_nx(&["query_keys"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
     c.create_btree_index_nx(&["state"]).await?;
     c.create_btree_index_nx(&["expires_at"]).await?;
@@ -467,6 +598,8 @@ async fn init_schema_envs(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_element_versions(c: &mut Collection) -> Result<(), DBError> {
+    c.set_index_hooks(Arc::new(SparseIndexHooks));
+    c.create_btree_index_nx(&["lookup_key"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
     // The historical read is "the greatest version of this element at or
     // before this sequence", so both columns are ranged over.
@@ -726,6 +859,11 @@ pub fn eq_field(field: &str, value: Fv) -> Filter {
 pub(crate) fn key_filter(field: &str, keys: &[String]) -> Filter {
     match keys {
         [key] => eq_field(field, Fv::Text(key.clone())),
+        keys if keys.len() > 4096 => Filter::Or(
+            keys.chunks(4096)
+                .map(|chunk| Box::new(key_filter(field, chunk)))
+                .collect(),
+        ),
         _ => Filter::Field((
             field.to_string(),
             RangeQuery::Include(keys.iter().cloned().map(Fv::Text).collect()),
@@ -1318,5 +1456,119 @@ mod tests {
         }));
         assert!(!element.is_active());
         assert_eq!(element.id().to_string(), "C-1");
+    }
+}
+
+#[cfg(test)]
+mod query_index_upgrade_tests {
+    use super::*;
+
+    fn legacy_schema(schema: anda_db_schema::Schema, omitted: &str) -> anda_db_schema::Schema {
+        let mut builder = anda_db_schema::Schema::builder();
+        for field in schema
+            .iter()
+            .filter(|field| field.name() != "_id" && field.name() != omitted)
+        {
+            builder.add_field(field.clone()).unwrap();
+        }
+        builder.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_indexes_backfill_old_rows_and_track_updates_after_reopen() {
+        let db = Arc::new(
+            AndaDB::connect(
+                Arc::new(object_store::memory::InMemory::new()),
+                anda_db::database::DBConfig {
+                    name: "query_index_upgrade".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let concepts = db
+            .create_collection(
+                legacy_schema(ConceptRow::schema().unwrap(), "query_keys"),
+                collection_config(CONCEPTS, "legacy"),
+                async |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let versions = db
+            .create_collection(
+                legacy_schema(ElementVersionRow::schema().unwrap(), "lookup_key"),
+                collection_config(ELEMENT_VERSIONS, "legacy"),
+                async |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let field = "kip://profiles/cognitive-memory@2.0.0/has_step";
+        let mut row = ConceptRow {
+            space: "test".into(),
+            state: "active".into(),
+            name: "legacy".into(),
+            structural: serde_json::json!({field: [{"id":"C-2"}]})
+                .as_object()
+                .unwrap()
+                .clone(),
+            ..Default::default()
+        };
+        row._id = concepts.add_from(&row).await.unwrap();
+        versions
+            .add_from(&ElementVersionRow {
+                space: "test".into(),
+                element: "C-1".into(),
+                kind: "concept".into(),
+                seq: 1,
+                version: 1,
+                row: serde_json::to_value(&row).unwrap(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.close_collection(CONCEPTS).await.unwrap();
+        db.close_collection(ELEMENT_VERSIONS).await.unwrap();
+        let store = Store::open(db).await.unwrap();
+        let filter = |target| key_filter("query_keys", &[topology_key(true, field, Some(target))]);
+        assert_eq!(
+            store.concepts().query_all_ids(filter("C-2")).await.unwrap(),
+            vec![1]
+        );
+        assert!(
+            store
+                .element_at("test", "C-1".parse().unwrap(), 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        row.structural
+            .insert(field.into(), serde_json::json!([{"id":"C-3"}]));
+        store.put(&row).await.unwrap();
+        assert!(
+            store
+                .concepts()
+                .query_all_ids(filter("C-2"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.concepts().query_all_ids(filter("C-3")).await.unwrap(),
+            vec![1]
+        );
+        store.flush(0).await.unwrap();
+        store.reopen().await.unwrap();
+        assert_eq!(
+            store.concepts().query_all_ids(filter("C-3")).await.unwrap(),
+            vec![1]
+        );
+        assert!(
+            store
+                .element_at("test", "C-1".parse().unwrap(), 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

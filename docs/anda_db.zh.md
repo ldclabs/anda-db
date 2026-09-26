@@ -707,3 +707,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 AndaDB 本质上是一个面向 AI 记忆系统优化的、具备 Schema 感知能力、支持多种索引的嵌入式文档存储引擎。其核心优势不仅在于持久化存储数据，更在于它将词法检索、结构化过滤和语义检索深度整合在写入路径中，同时保持作为普通 Rust 库的轻量化嵌入式部署形态。
 
 对于 Agent 开发者而言，这种组合构成了其核心价值：单一的集合模型、统一的持久化层，以及能够无缝融合为单一记忆访问范式的多路检索能力。
+
+
+等值 posting 现在支持更新时失效的有序快照和小候选 membership 探测；多个等值条件与 ID 游标可直接分页求交。首次有序读取仍需准备该 posting，后续读取复用快照。`query_ids_with_stats` 报告 posting 访问、membership 探测、有序快照基数及中间 ID 数；持有 Arc 的调用方可选择有界查询工作线程。自定义 B-tree 钩子读取其他列时，必须覆盖 `IndexHooks::btree_index_depends_on`，确保这些列更新后刷新派生索引。详见[百万级测量](query-performance-million.zh.md)。

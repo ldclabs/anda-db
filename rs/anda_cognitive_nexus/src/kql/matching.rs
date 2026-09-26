@@ -244,6 +244,219 @@ impl Context<'_> {
         Ok(())
     }
 
+    /// Resolve lineage membership on the index's distinct keys, before any
+    /// document candidates are materialized or charged. Package ranges alone
+    /// include unrelated symbols. Historical candidates ignore this filter.
+    pub(crate) fn symbol_filter(
+        &self,
+        kind: ElementKind,
+        column: &str,
+        symbols: &[String],
+    ) -> Result<Filter, KipError> {
+        if self.is_historical() {
+            return Ok(Filter::And(vec![]));
+        }
+        let symbol_kind = if kind == ElementKind::Concept {
+            SymbolKind::ConceptType
+        } else {
+            SymbolKind::PredicateType
+        };
+        let collection = self.store.elements(kind);
+        let index = collection
+            .get_btree_index(&[column])
+            .map_err(crate::error::db_error)?;
+        let mut keys = std::collections::BTreeSet::new();
+        for symbol in symbols {
+            let ranges = self.env.lineage_ranges(symbol_kind, symbol);
+            if ranges.is_empty() {
+                keys.insert(symbol.clone());
+            }
+            for (low, high) in ranges {
+                let found = index.range_query_with(
+                    RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
+                    |key, _| {
+                        let values = match key {
+                            Fv::Text(text) if self.env.same_lineage(symbol_kind, &text, symbol) => {
+                                vec![text]
+                            }
+                            _ => vec![],
+                        };
+                        (true, values)
+                    },
+                );
+                keys.extend(found);
+            }
+        }
+        Ok(key_filter(column, &keys.into_iter().collect::<Vec<_>>()))
+    }
+
+    /// Add necessary scalar equality constraints from adjacent conjunctive
+    /// filters. Keep the original FILTER so redaction and null semantics are
+    /// still checked against admitted views. Do not infer symbols from text.
+    pub(super) fn filter_hint(
+        &self,
+        variable: &str,
+        filters: &mut Vec<Filter>,
+        expression: &anda_kip::FilterExpression,
+    ) -> bool {
+        use anda_kip::{
+            ComparisonOperator as C, FilterExpression as E, FilterOperand as O,
+            LogicalOperator as L,
+        };
+        if !self.authority.searches_whole_space(self.auth) || self.authority.has_time_conditions() {
+            return false;
+        }
+        let before = filters.len();
+        let total = match expression {
+            E::Logical {
+                left,
+                operator: L::And,
+                right,
+            } => {
+                self.filter_hint(variable, filters, left)
+                    && self.filter_hint(variable, filters, right)
+            }
+            E::Comparison {
+                left,
+                operator: C::Equal,
+                right,
+            } => {
+                let (path, operand) = match (left, right) {
+                    (O::Variable(path), value) | (value, O::Variable(path)) => (path, value),
+                    _ => return false,
+                };
+                if path.var != variable {
+                    return false;
+                }
+                let key = match path.path.as_slice() {
+                    [anda_kip::PathStep::Field(name)]
+                        if matches!(name.as_str(), "name" | "key" | "canonical_id") =>
+                    {
+                        name.as_str()
+                    }
+                    _ => return false,
+                };
+                let value = match operand {
+                    O::Literal(value) => Json::from(value.clone()),
+                    O::Param(name) => match self.param_ref(name) {
+                        Ok(value) => value,
+                        Err(_) => return false,
+                    },
+                    _ => return false,
+                };
+                if let Some(text) = value.as_str() {
+                    filters.push(eq_field(
+                        "query_keys",
+                        Fv::Text(crate::store::text_query_key(key, text)),
+                    ));
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        // Never move a selective condition before a fallible operand: doing
+        // so could hide a row-dependent TypeMismatch on a discarded row.
+        if !total {
+            filters.truncate(before);
+        }
+        total
+    }
+
+    pub(super) fn can_test_existence(&self, clauses: &[anda_kip::WhereClause]) -> bool {
+        use anda_kip::WhereClause as W;
+        match clauses {
+            [W::Concept { .. } | W::Assertion { .. } | W::Evidence { .. } | W::Activity { .. }] => {
+                true
+            }
+            [
+                W::Structural {
+                    subject, object, ..
+                },
+            ] => !is_inline_pattern(subject) && !is_inline_pattern(object),
+            [
+                W::Proposition {
+                    matcher: PropositionMatcher::Tuple(triple),
+                    ..
+                },
+            ] => {
+                matches!(triple.predicate, PredTerm::Atom(_))
+                    && !is_inline_pattern(&triple.subject)
+                    && !is_inline_pattern(&triple.object)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn can_page_element(&self, clause: &anda_kip::WhereClause) -> bool {
+        use anda_kip::WhereClause as W;
+        let (kind, matcher) = match clause {
+            W::Concept { matcher, .. } => (ElementKind::Concept, matcher),
+            W::Assertion { matcher, .. } => (ElementKind::Assertion, matcher),
+            W::Evidence { matcher, .. } => (ElementKind::Evidence, matcher),
+            W::Activity { matcher, .. } => (ElementKind::Activity, matcher),
+            _ => return false,
+        };
+        matcher.iter().all(|(key, value)| {
+            column_of(kind, key).is_some()
+                && matches!(value, MatchValue::Literal(_) | MatchValue::Param(_))
+        })
+    }
+
+    /// Exact covering filter for a single indexed element pattern. This is
+    /// used only under whole-Space unmasked authority and without field binds.
+    pub(super) fn covering_element(
+        &mut self,
+        clause: &anda_kip::WhereClause,
+    ) -> Result<Option<(ElementKind, String, Filter)>, KipError> {
+        use anda_kip::WhereClause as W;
+        if !self.can_page_element(clause) {
+            return Ok(None);
+        }
+        let (kind, variable, matcher) = match clause {
+            W::Concept { variable, matcher } => (ElementKind::Concept, variable, matcher),
+            W::Assertion { variable, matcher } => (ElementKind::Assertion, variable, matcher),
+            W::Evidence { variable, matcher } => (ElementKind::Evidence, variable, matcher),
+            W::Activity { variable, matcher } => (ElementKind::Activity, variable, matcher),
+            _ => return Ok(None),
+        };
+        let mut filters = vec![eq_field("space", Fv::Text(self.space.clone()))];
+        if !matcher.contains_key("state") {
+            filters.push(eq_field("state", Fv::Text("active".into())));
+        }
+        for (key, value) in matcher {
+            let Slot::Value(value) = self.classify(value)? else {
+                return Ok(None);
+            };
+            if key == "id" {
+                let id = ElementId::parse_kind(
+                    value
+                        .as_str()
+                        .ok_or_else(|| KipError::type_mismatch("id must be text"))?,
+                    kind,
+                )?;
+                filters.push(eq_field("_id", Fv::U64(id.seq)));
+            } else if is_symbol_key(kind, key) {
+                filters.push(self.symbol_filter(
+                    kind,
+                    "schema_ref",
+                    &[self.matcher_text(kind, key, &value)?],
+                )?);
+            } else {
+                filters.push(eq_field(
+                    column_of(kind, key).expect("covering column"),
+                    Fv::Text(self.matcher_text(kind, key, &value)?),
+                ));
+            }
+        }
+        Ok(Some((
+            kind,
+            variable.clone(),
+            Filter::And(filters.into_iter().map(Box::new).collect()),
+        )))
+    }
+
     /// Match every supplied field against the same authorized element view.
     /// Index predicates narrow candidates; the complete matcher is still
     /// checked when an explicit id bypasses those indexes.
@@ -253,33 +466,45 @@ impl Context<'_> {
         variable: &str,
         matcher: &ObjectMatcher,
     ) -> Result<Solutions, KipError> {
-        let mut filters = vec![eq_field("space", Fv::Text(self.space.clone()))];
+        self.match_element_bound(kind, variable, matcher, &Solutions::unit())
+            .await
+    }
+
+    pub(crate) async fn match_element_bound(
+        &mut self,
+        kind: ElementKind,
+        variable: &str,
+        matcher: &ObjectMatcher,
+        known: &Solutions,
+    ) -> Result<Solutions, KipError> {
+        let mut filters = std::mem::take(&mut self.element_hints);
+        filters.push(eq_field("space", Fv::Text(self.space.clone())));
         let mut by_id = None;
         let mut type_lineages = Vec::new();
         let historical = self.is_historical();
         for (key, value) in matcher {
             let Slot::Value(value) = self.classify(value)? else {
+                if !historical
+                    && is_reference_key(kind, key)
+                    && let Some(column) = column_of(kind, key)
+                    && let MatchValue::Variable(name) = value
+                    && let Some(ids) = bound_elements(known, name)
+                {
+                    filters.push(key_filter(
+                        column,
+                        &ids.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    ));
+                }
                 continue;
             };
             if is_symbol_key(kind, key) {
                 let symbol = self.matcher_text(kind, key, &value)?;
                 if !historical {
-                    let ranges: Vec<Box<Filter>> = self
-                        .env
-                        .lineage_ranges(crate::schema::SymbolKind::ConceptType, &symbol)
-                        .into_iter()
-                        .map(|(low, high)| {
-                            Box::new(Filter::Field((
-                                "schema_ref".into(),
-                                RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
-                            )))
-                        })
-                        .collect();
-                    match ranges.len() {
-                        0 => {}
-                        1 => filters.extend(ranges.into_iter().map(|range| *range)),
-                        _ => filters.push(Filter::Or(ranges)),
-                    }
+                    filters.push(self.symbol_filter(
+                        kind,
+                        "schema_ref",
+                        std::slice::from_ref(&symbol),
+                    )?);
                 }
                 type_lineages.push(symbol);
             } else if key == "id" {
@@ -303,19 +528,48 @@ impl Context<'_> {
         }
         let ids = match by_id {
             Some(id) => vec![id],
-            None => {
-                self.candidates(
-                    kind,
-                    Some(Filter::And(filters.into_iter().map(Box::new).collect())),
-                )
-                .await?
-            }
+            None => match bound_elements(known, variable) {
+                Some(ids) => ids.into_iter().filter(|id| id.kind == kind).collect(),
+                None => {
+                    if let Some((limit, after)) = self.element_window.take() {
+                        if let Some(after) = after {
+                            filters.push(Filter::Field((
+                                "_id".into(),
+                                RangeQuery::Gt(Fv::U64(after)),
+                            )));
+                        }
+                        self.store
+                            .elements(kind)
+                            .query_candidate_ids_on_worker(
+                                Filter::And(filters.into_iter().map(Box::new).collect()),
+                                limit.min(self.remaining_candidates().saturating_add(1)),
+                            )
+                            .await
+                            .map_err(crate::error::db_error)?
+                            .into_iter()
+                            .map(|seq| ElementId::new(kind, seq))
+                            .collect()
+                    } else {
+                        self.candidates(
+                            kind,
+                            Some(Filter::And(filters.into_iter().map(Box::new).collect())),
+                        )
+                        .await?
+                    }
+                }
+            },
         };
-        self.charge(ids.len())?;
+        if !self.existential {
+            self.charge(ids.len())?;
+            self.prefetch(&ids).await?;
+        }
         let mut vars = vec![variable.to_string()];
         collect_matcher_vars(matcher, &mut vars);
         let mut rows = Vec::new();
         'candidates: for id in ids {
+            if self.existential {
+                self.charge(1)?;
+            }
             let Some(element) = self.load(id).await? else {
                 continue;
             };
@@ -357,7 +611,13 @@ impl Context<'_> {
                     continue 'candidates;
                 }
             }
-            rows.push(row);
+            if self.existential {
+                if compatible_row(known, &vars, &row) {
+                    return Ok(Solutions::table(vars, vec![row]));
+                }
+            } else {
+                rows.push(row);
+            }
         }
         Ok(Solutions::table(vars, rows))
     }
@@ -506,9 +766,8 @@ impl Context<'_> {
 
     /// The stored endpoint keys of a variable every earlier solution bound
     /// (`bound_elements`), each Concept widened to its merge class the way a
-    /// fixed endpoint is. `None` above [`MAX_PINNED`] elements, where the
-    /// index lookup would be larger than the scan it replaces, or for a
-    /// historical read, whose candidates cannot be narrowed by these indexes.
+    /// fixed endpoint is. Historical reads cannot use this index narrowing.
+    /// Large binding sets are split into bounded Include operands by key_filter.
     async fn pinned_keys(
         &mut self,
         known: &Solutions,
@@ -521,7 +780,7 @@ impl Context<'_> {
         if self.is_historical() {
             return Ok(None);
         }
-        let Some(ids) = bound_elements(known, name).filter(|ids| ids.len() <= MAX_PINNED) else {
+        let Some(ids) = bound_elements(known, name) else {
             return Ok(None);
         };
         let mut keys = Vec::new();
@@ -562,7 +821,7 @@ impl Context<'_> {
             self.next_internal_variable += 1;
             let mut table = match term {
                 Term::Match(matcher) => {
-                    self.match_element(ElementKind::Concept, &variable, matcher)
+                    self.match_element_bound(ElementKind::Concept, &variable, matcher, known)
                         .await?
                 }
                 Term::Proposition(matcher) => {
@@ -668,7 +927,7 @@ impl Context<'_> {
             filters.push(key_filter("object_key", keys));
         }
         if let PredicateSlot::Fixed(symbols) = &predicates {
-            filters.push(predicate_filter(&self.env, symbols));
+            filters.push(self.symbol_filter(ElementKind::Proposition, "predicate_ref", symbols)?);
         }
 
         let historical = self.is_historical();
@@ -678,7 +937,10 @@ impl Context<'_> {
                 Some(Filter::And(filters.into_iter().map(Box::new).collect())),
             )
             .await?;
-        self.charge(ids.len())?;
+        if !self.existential {
+            self.charge(ids.len())?;
+            self.prefetch(&ids).await?;
+        }
 
         let mut vars: Vec<String> = Vec::new();
         if let Some(var) = variable {
@@ -699,6 +961,9 @@ impl Context<'_> {
 
         let mut rows = Vec::new();
         'candidates: for id in ids {
+            if self.existential {
+                self.charge(1)?;
+            }
             let Some(crate::store::Element::Proposition(row)) = self.load(id).await? else {
                 continue;
             };
@@ -746,7 +1011,13 @@ impl Context<'_> {
             {
                 continue 'candidates;
             }
-            rows.push(solution);
+            if self.existential {
+                if compatible_row(known, &vars, &solution) {
+                    return Ok(Solutions::table(vars, vec![solution]));
+                }
+            } else {
+                rows.push(solution);
+            }
         }
         Ok(Solutions::table(vars, rows))
     }
@@ -777,12 +1048,19 @@ impl Context<'_> {
         object: &Term,
         known: &Solutions,
     ) -> Result<Solutions, KipError> {
-        let (subject, left, left_var) = self.expand_endpoint(subject, &Solutions::unit()).await?;
-        let (object, right, right_var) = self.expand_endpoint(object, &left).await?;
-        let matched = self
-            .match_structural_simple(edge, &subject, field, &object, known)
-            .await?;
+        if !is_inline_pattern(subject) && !is_inline_pattern(object) {
+            return self
+                .match_structural_simple(edge, subject, field, object, known)
+                .await;
+        }
+        let (subject, left, left_var) = self.expand_endpoint(subject, known).await?;
+        let scope = self.join(known.clone(), left.clone())?;
+        let (object, right, right_var) = self.expand_endpoint(object, &scope).await?;
         let expanded = self.join(left, right)?;
+        let scoped = self.join(known.clone(), expanded.clone())?;
+        let matched = self
+            .match_structural_simple(edge, &subject, field, &object, &scoped)
+            .await?;
         let mut result = self.join(matched, expanded)?;
         remove_internal(&mut result, left_var.iter().chain(right_var.iter()));
         Ok(result)
@@ -896,11 +1174,50 @@ impl Context<'_> {
                     .into_iter()
                     .filter(|id| !plane.exclusive || id.kind == plane.holder)
                     .collect(),
+                None if !self.is_historical() => {
+                    let targets = match &target {
+                        EndpointSlot::Fixed(Endpoint::Local(id)) => Some(vec![*id]),
+                        EndpointSlot::Bind(name) => bound_elements(known, name),
+                        _ => None,
+                    };
+                    let keys = match targets {
+                        Some(ids) => ids
+                            .into_iter()
+                            .map(|id| {
+                                crate::store::topology_key(
+                                    plane.in_structural_map,
+                                    &plane.field,
+                                    Some(&id.to_string()),
+                                )
+                            })
+                            .collect(),
+                        None => vec![crate::store::topology_key(
+                            plane.in_structural_map,
+                            &plane.field,
+                            None,
+                        )],
+                    };
+                    self.candidates(
+                        plane.holder,
+                        Some(Filter::And(vec![
+                            Box::new(eq_field("space", Fv::Text(self.space.clone()))),
+                            Box::new(eq_field("state", Fv::Text("active".into()))),
+                            Box::new(key_filter("query_keys", &keys)),
+                        ])),
+                    )
+                    .await?
+                }
                 None => self.active_of(plane.holder).await?,
             };
-            self.charge(sources.len())?;
+            if !self.existential {
+                self.charge(sources.len())?;
+                self.prefetch(&sources).await?;
+            }
 
             for id in sources {
+                if self.existential {
+                    self.charge(1)?;
+                }
                 let Some(element) = self.load(id).await? else {
                     continue;
                 };
@@ -973,7 +1290,13 @@ impl Context<'_> {
                     {
                         continue 'references;
                     }
-                    rows.push(solution);
+                    if self.existential {
+                        if compatible_row(known, &vars, &solution) {
+                            return Ok(Solutions::table(vars, vec![solution]));
+                        }
+                    } else {
+                        rows.push(solution);
+                    }
                 }
             }
         }
@@ -1384,7 +1707,11 @@ impl Context<'_> {
                         Fv::Text(crate::store::rows::state::ACTIVE.into()),
                     )),
                     Box::new(key_filter(anchor, &anchor_keys)),
-                    Box::new(predicate_filter(&self.env, symbols)),
+                    Box::new(self.symbol_filter(
+                        ElementKind::Proposition,
+                        "predicate_ref",
+                        symbols,
+                    )?),
                 ])),
             )
             .await?;
@@ -1437,7 +1764,11 @@ impl Context<'_> {
                         "state",
                         Fv::Text(crate::store::rows::state::ACTIVE.into()),
                     )),
-                    Box::new(predicate_filter(&self.env, symbols)),
+                    Box::new(self.symbol_filter(
+                        ElementKind::Proposition,
+                        "predicate_ref",
+                        symbols,
+                    )?),
                 ])),
             )
             .await?;
@@ -1583,35 +1914,6 @@ fn tuple_matches(
     true
 }
 
-/// An index filter over `predicate_ref` for every version of each lineage
-/// (§20.14): the package is ranged over, and [`predicate_matches`] settles
-/// the symbol afterwards.
-///
-/// A promoted draft symbol (§20.16) adds the draft package's range, so the
-/// lineage a promotion joined is read as one.
-fn predicate_filter(env: &crate::schema::SchemaEnvironment, symbols: &[String]) -> Filter {
-    let mut ranges: Vec<Box<Filter>> = Vec::with_capacity(symbols.len());
-    for symbol in symbols {
-        let lineage = env.lineage_ranges(crate::schema::SymbolKind::PredicateType, symbol);
-        if lineage.is_empty() {
-            ranges.push(Box::new(eq_field(
-                "predicate_ref",
-                Fv::Text(symbol.clone()),
-            )));
-        }
-        for (low, high) in lineage {
-            ranges.push(Box::new(Filter::Field((
-                "predicate_ref".to_string(),
-                RangeQuery::Between(Fv::Text(low), Fv::Text(high)),
-            ))));
-        }
-    }
-    match ranges.len() {
-        1 => *ranges.pop().expect("one range"),
-        _ => Filter::Or(ranges),
-    }
-}
-
 /// Whether a stored predicate belongs to one of the lineages a pattern named,
 /// promotions included.
 fn predicate_matches(
@@ -1632,9 +1934,6 @@ struct Walk {
     hops: anda_kip::HopRange,
 }
 
-/// The most distinct bound elements pushed into one index lookup.
-const MAX_PINNED: usize = 256;
-
 /// The elements a variable is bound to in *every* solution so far.
 ///
 /// A pattern's result is joined with those solutions afterwards, so a
@@ -1643,6 +1942,16 @@ const MAX_PINNED: usize = 256;
 /// that row bound instead of re-scanning the Space for every row. A row that
 /// leaves the variable unbound (`OPTIONAL` padding) or binds a non-element
 /// gives no bound, and neither does an empty set.
+fn compatible_row(known: &Solutions, vars: &[String], row: &[Binding]) -> bool {
+    known.rows.iter().any(|incoming| {
+        vars.iter().zip(row).all(|(name, value)| {
+            known.get(incoming, name).is_none_or(|bound| {
+                matches!(bound, Binding::Null) || matches!(value, Binding::Null) || bound == value
+            })
+        })
+    })
+}
+
 fn bound_elements(known: &Solutions, name: &str) -> Option<Vec<ElementId>> {
     let index = known.vars.iter().position(|var| var == name)?;
     if known.rows.is_empty() {

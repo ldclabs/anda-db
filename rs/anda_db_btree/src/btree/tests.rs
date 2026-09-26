@@ -4072,3 +4072,41 @@ fn postings_do_not_keep_the_legacy_update_counter() {
     let decoded: (u32, u64, Vec<u64>) = cbor2::from_reader(&bytes[..]).unwrap();
     assert_eq!(decoded, (7, 0, vec![1, 2]));
 }
+
+#[test]
+fn sparse_intersection_probes_candidates_and_ordered_snapshots_survive_mutation() {
+    let index = BTreeIndex::<u64, u64>::new("selective".into(), None);
+    for id in 1..=100_000 {
+        index.insert(id, 7, 1).unwrap();
+    }
+    let candidates = FxHashSet::from_iter([3, 42, 100_001]);
+    let (ids, work) = index.intersect_ids(RangeQuery::Eq(7), &candidates).unwrap();
+    assert_eq!(
+        ids.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([3, 42])
+    );
+    assert_eq!(
+        work, 3,
+        "work must follow the small candidate set, not 100K postings"
+    );
+    let (_, work) = index
+        .intersect_ids(RangeQuery::Eq(7), &FxHashSet::default())
+        .unwrap();
+    assert_eq!(work, 0);
+    let first = index.ordered_ids(&7).unwrap();
+    let again = index.ordered_ids(&7).unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    index.remove(1, 7, 2);
+    index.insert(0, 7, 3).unwrap();
+    let current = index.ordered_ids(&7).unwrap();
+    assert_eq!(&current[..3], &[0, 2, 3]);
+    assert_eq!(
+        &first[..3],
+        &[1, 2, 3],
+        "in-flight readers retain an immutable snapshot"
+    );
+    assert_eq!(
+        index.estimate_cardinality(RangeQuery::Eq(7), 11).unwrap(),
+        11
+    );
+}

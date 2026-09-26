@@ -1,0 +1,25 @@
+{
+  "baseline": "db8608ed0ae45b6879abff21bf9a383bc19fd6e2",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+  "target": "aarch64-apple-darwin",
+  "profile": "release-speed",
+  "opt_level": 3,
+  "lto": false,
+  "codegen_units": 16,
+  "backend": "InMemory",
+  "trials": 2,
+  "samples_per_process": 15,
+  "all_ids_samples_per_process": 5,
+  "warmups_per_case": 2,
+  "seeding_timed": false,
+  "allocation_tracking": true,
+  "build_directories": "separate before and after targets",
+  "cargo_lock_sha256": "3924d287d914814f4ca7d653adff7ba1c3666d499f6491e61618ed6df0275cc5",
+  "measurement_order": "before/after then after/before at each size",
+  "limitations": [
+    "No live cloud backend or exclusive CPU isolation.",
+    "First-call records share one process and indexes; deep pages reuse the first-page ordering.",
+    "Nexus million-row probe checks answers and logical Concept GETs using synthetic current rows, not a million-version history.",
+    "Initial after results retain a measured regression before the final bulk-intersection correction."
+  ]
+}

@@ -10,7 +10,9 @@ KQL/HISTORY 分页保留首个快照；cursor 按 Principal 记录在当前 Stor
 
 事务最终身份校验同时作用于 dry-run 与真实提交；提交前拒绝会清理 pending 行。Capsule 新记录经过类型、属性、Facet 与端点检查；ValidationOnly 包仍可用于验证导入数据，不授予本地创建权限。新输出索引首次打开时补齐旧 Activity 的派生键，不改变认知内容、版本或持久化格式。
 
-查询另有 100,000 次中间结果/候选配对工作预算；LIMIT 不豁免 JOIN 预算。历史重建对扫描版本收费，并在同一查询内按 kind 复用结果。性能测量见[审查基准](benchmarks/anda_nexus_2026-09-23/README.md)。
+查询另有 100,000 次中间结果/候选配对工作预算；LIMIT 不豁免 JOIN 预算。历史读取在小版本范围扫描和逐元素版本定位之间选择，并在同一查询内按 kind 复用结果。性能测量见[审查基准](benchmarks/anda_nexus_2026-09-23/README.md)。
+
+百万级优化新增了精确 lineage 和绑定下推、受限的索引分页/覆盖 COUNT、NOT 存在性执行、STRUCTURAL 反向索引及历史版本定位。首次打开旧库会升级可选索引列并回填索引，不改变认知内容。SEARCH 的 top-k 使用一致的同分排序，语料缓存按数据、Schema 与授权状态失效，返回视图仍重新加载和脱敏。具体适用条件与测量见[百万级优化报告](query-performance-million.zh.md)。
 
 追踪 KIP 提交 `11a82ec`，包含草案记忆包 `kip://profiles/cognitive-memory@2.0.0`（内容摘要 `sha256:734aa0fd…`）。另请参阅 [KIP 参考文档](anda_kip.zh.md)与 [Anda Brain 宿主契约指南](anda-brain-nexus-contracts.zh.md)。
 
@@ -123,7 +125,7 @@ src/
 
 **所有索引均为单字段索引。** `anda_db` 的复合 B-Tree 索引基于带 `with_unique()` 的虚拟字段构建，因此复合索引*必然*同时施加唯一性约束。若对 `(space, state)` 建立复合索引，意味着一个 Space 只能容纳至多一个活跃元素。系统中唯有 `tuple_key`、`space_id` 与 `tx_id` 具备严格唯一性；其余列均按单列建立索引，查询时通过 `Filter::And` 进行交集过滤。
 
-**字段缺失采用空字符串表示，而非 `Option`。** `Option<T>` 列对应 `FieldType::Option`，B-Tree 索引无法将其作为统一的有序域进行范围扫描。此类列的合法业务值均不为空，因此 `""` 是明确且支持排序的“未设置”表示。
+**既有业务文本沿用空字符串表示缺失。** AndaDB 支持可选索引列；新增派生查询索引采用可选列，以兼容旧行。既有文本列的空字符串通过索引钩子省略，不改变其业务含义。
 
 **所有引用字段在 JSON 旁额外维护一个 Key 列。** JSON 存储完整记录；Key 列存储 `Endpoint::key` 确定性字符串，从而将引用相等性判断转换为索引精准点查，避免全表扫描与反序列化比对。
 

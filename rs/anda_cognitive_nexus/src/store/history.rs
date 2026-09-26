@@ -31,6 +31,16 @@ use crate::error::db_error;
 use crate::id::ElementId;
 use crate::store::write::WriteContext;
 
+/// Fixed-width big-endian decimal components provide tuple ordering. Space
+/// and element are hex encoded, so user-provided separators cannot alias keys.
+pub(crate) fn version_lookup_key(space: &str, element: &str, seq: u64, version: u64) -> String {
+    format!(
+        "{}/{}/{seq:020}/{version:020}",
+        hex::encode(space),
+        hex::encode(element)
+    )
+}
+
 impl Store {
     /// Appends one element version, in the same commit as the row itself.
     ///
@@ -170,34 +180,26 @@ impl Store {
         id: ElementId,
         seq: u64,
     ) -> Result<Option<Element>, KipError> {
-        let ids = self
-            .element_versions()
-            .query_all_ids(Filter::And(vec![
-                Box::new(eq_field("space", Fv::Text(space_id.to_string()))),
-                Box::new(eq_field("element", Fv::Text(id.to_string()))),
-                Box::new(Filter::Field((
-                    "seq".to_string(),
-                    RangeQuery::Le(Fv::U64(seq)),
-                ))),
-            ]))
-            .await
+        let table = self.element_versions();
+        let index = table.get_btree_index(&["lookup_key"]).map_err(db_error)?;
+        let mut ids = Vec::new();
+        index
+            .try_range_query_ids(
+                RangeQuery::Between(
+                    Fv::Text(version_lookup_key(space_id, &id.to_string(), 0, 0)),
+                    Fv::Text(version_lookup_key(space_id, &id.to_string(), seq, u64::MAX)),
+                ),
+                true,
+                |posting| {
+                    ids.extend(posting.iter().min().copied());
+                    false
+                },
+            )
             .map_err(db_error)?;
-
-        let mut best: Option<ElementVersionRow> = None;
-        for row_id in ids {
-            let row: ElementVersionRow = self
-                .element_versions()
-                .get_as(row_id)
-                .await
-                .map_err(db_error)?;
-            if best
-                .as_ref()
-                .is_none_or(|current| (row.seq, row.version) > (current.seq, current.version))
-            {
-                best = Some(row);
-            }
+        match ids.first() {
+            Some(id) => decode(table.get_as(*id).await.map_err(db_error)?).map(Some),
+            None => Ok(None),
         }
-        best.map(decode).transpose()
     }
 
     /// Every element that existed in a Space at a coordinate, by kind.
@@ -226,64 +228,113 @@ impl Store {
         budget: usize,
     ) -> Result<(Vec<Element>, usize), KipError> {
         let table = self.element_versions();
-        let filter = Filter::And(vec![
-            Box::new(eq_field("space", Fv::Text(space_id.into()))),
-            Box::new(eq_field("kind", Fv::Text(kind.to_string()))),
-            Box::new(Filter::Field(("seq".into(), RangeQuery::Le(Fv::U64(seq))))),
-        ]);
-        let mut ids = Vec::new();
-        let mut after = 0;
-        loop {
-            let limit = budget
-                .saturating_sub(ids.len())
-                .saturating_add(1)
-                .min(anda_db::collection::Collection::MAX_SEARCH_LIMIT);
-            let page = table
-                .query_ids(
-                    Filter::And(vec![
-                        Box::new(filter.clone()),
-                        Box::new(Filter::Field((
-                            "_id".into(),
-                            RangeQuery::Gt(Fv::U64(after)),
-                        ))),
+        // An early coordinate may contain few versions but many elements
+        // created later. Prefer that small sequence range over all identities.
+        let sequences = table.get_btree_index(&["seq"]).map_err(db_error)?;
+        let past = RangeQuery::Le(Fv::U64(seq));
+        if sequences
+            .estimate_cardinality(past.clone(), budget.saturating_add(1))
+            .map_err(db_error)?
+            <= budget
+        {
+            let mut past_ids = Vec::new();
+            sequences
+                .try_range_query_ids(past, false, |ids| {
+                    past_ids.extend_from_slice(ids);
+                    true
+                })
+                .map_err(db_error)?;
+            let ids = table
+                .filter_candidate_ids(
+                    eq_fields(&[
+                        ("space", Fv::Text(space_id.into())),
+                        ("kind", Fv::Text(kind.to_string())),
                     ]),
-                    Some(limit),
+                    &past_ids,
                 )
                 .await
                 .map_err(db_error)?;
-            if let Some(id) = page.last() {
-                after = *id;
-            }
-            let done = page.len() < limit;
-            ids.extend(page);
-            if ids.len() > budget {
-                return Err(KipError::resource_exhausted(
-                    "historical version scan exceeds query budget",
-                ));
-            }
-            if done {
-                break;
-            }
-        }
-        let scanned = ids.len();
-        let mut latest: BTreeMap<String, ElementVersionRow> = BTreeMap::new();
-        for row_id in ids {
-            let row: ElementVersionRow = self
-                .element_versions()
-                .get_as(row_id)
-                .await
-                .map_err(db_error)?;
-            match latest.get(&row.element) {
-                Some(current) if (current.seq, current.version) >= (row.seq, row.version) => {}
-                _ => {
+            let scanned = ids.len();
+            let mut latest = BTreeMap::<String, ElementVersionRow>::new();
+            for id in ids {
+                let row: ElementVersionRow = table.get_as(id).await.map_err(db_error)?;
+                if latest
+                    .get(&row.element)
+                    .is_none_or(|old| (row.seq, row.version) > (old.seq, old.version))
+                {
                     latest.insert(row.element.clone(), row);
                 }
             }
+            return Ok((
+                latest.into_values().map(decode).collect::<Result<_, _>>()?,
+                scanned,
+            ));
         }
-        Ok((
-            latest.into_values().map(decode).collect::<Result<_, _>>()?,
-            scanned,
-        ))
+        let index = table.get_btree_index(&["lookup_key"]).map_err(db_error)?;
+        let kind_id = ElementId::new(kind, 0).to_string();
+        let prefix = format!(
+            "{}/{}",
+            hex::encode(space_id),
+            hex::encode(kind_id.trim_end_matches('0'))
+        );
+        let high = format!("{prefix}\u{10ffff}");
+        let mut cursor = prefix;
+        let mut selected = Vec::new();
+        let mut scanned = 0usize;
+        loop {
+            // Find the next element prefix, then seek to its predecessor
+            // version. Jump past the entire version chain before continuing.
+            let keys = index.range_query_with(
+                RangeQuery::Between(Fv::Text(cursor.clone()), Fv::Text(high.clone())),
+                |key, _| (false, vec![key]),
+            );
+            let Some(Fv::Text(key)) = keys.first() else {
+                break;
+            };
+            let Some((group, _)) = key.rsplit_once('/') else {
+                return Err(KipError::internal_error("invalid version locator"));
+            };
+            let Some((group, _)) = group.rsplit_once('/') else {
+                return Err(KipError::internal_error("invalid version locator"));
+            };
+            index
+                .try_range_query_ids(
+                    RangeQuery::Between(
+                        Fv::Text(format!("{group}/{:020}/{:020}", 0, 0)),
+                        Fv::Text(format!("{group}/{seq:020}/{:020}", u64::MAX)),
+                    ),
+                    true,
+                    |posting| {
+                        selected.extend(posting.iter().min().copied());
+                        false
+                    },
+                )
+                .map_err(db_error)?;
+            scanned = selected.len();
+            if scanned > budget {
+                return Err(KipError::resource_exhausted(
+                    "historical element scan exceeds query budget",
+                ));
+            }
+            cursor = format!("{group}/\u{10ffff}");
+        }
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(selected)
+            .map(|row_id| {
+                let table = table.clone();
+                async move {
+                    table
+                        .get_as::<ElementVersionRow>(row_id)
+                        .await
+                        .map_err(db_error)
+                }
+            })
+            .buffered(8);
+        let mut elements = Vec::new();
+        while let Some(row) = stream.next().await {
+            elements.push(decode(row?)?);
+        }
+        Ok((elements, scanned))
     }
 
     /// Ordered by logical sequence, independent of journal insertion order.
@@ -449,6 +500,7 @@ pub(crate) fn version_row<R: serde::Serialize>(
         seq: cx.seq,
         tx_id: cx.tx_id.clone(),
         op: op.to_string(),
+        lookup_key: None,
         row: encoded,
     })
 }
@@ -772,4 +824,104 @@ pub fn snapshot_json(
         "schema_environment_version": schema_version,
         "snapshot_token": coordinate.to_token(space_id),
     })
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn historical_locators_skip_long_chains_and_future_identities() {
+        let db = anda_db::database::AndaDB::connect(
+            Arc::new(object_store::memory::InMemory::new()),
+            anda_db::database::DBConfig {
+                name: "version_seek_test".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let store = Store::open(Arc::new(db)).await.unwrap();
+        let table = store.element_versions();
+        for seq in 1..=100u64 {
+            let row = ConceptRow {
+                _id: 1,
+                space: "test".into(),
+                state: "active".into(),
+                version: seq,
+                name: format!("v{seq}"),
+                ..Default::default()
+            };
+            table
+                .add_from(&ElementVersionRow {
+                    space: "test".into(),
+                    element: "C-1".into(),
+                    kind: "concept".into(),
+                    seq,
+                    version: seq,
+                    row: serde_json::to_value(row).unwrap(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        for id in 2..=40u64 {
+            let row = ConceptRow {
+                _id: id,
+                space: "test".into(),
+                state: "active".into(),
+                version: 1,
+                ..Default::default()
+            };
+            table
+                .add_from(&ElementVersionRow {
+                    space: "test".into(),
+                    element: format!("C-{id}"),
+                    kind: "concept".into(),
+                    seq: 200,
+                    version: 1,
+                    row: serde_json::to_value(row).unwrap(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let before = table.stats().get_count;
+        let row = store
+            .element_at("test", "C-1".parse().unwrap(), 77)
+            .await
+            .unwrap()
+            .unwrap();
+        let Element::Concept(row) = row else {
+            panic!("concept");
+        };
+        assert_eq!(row.name, "v77");
+        assert_eq!(table.stats().get_count - before, 1);
+        let before = table.stats().get_count;
+        let (rows, scanned) = store
+            .elements_at_bounded("test", ElementKind::Concept, 77, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(scanned, 1);
+        assert_eq!(table.stats().get_count - before, 1);
+        assert_eq!(
+            store
+                .elements_at_bounded("test", ElementKind::Concept, 1, 10)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .elements_at_bounded("test", ElementKind::Concept, 0, 10)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
 }

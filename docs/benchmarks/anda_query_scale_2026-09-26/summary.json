@@ -1,0 +1,82 @@
+{
+  "100000:before:rare_and_dense": {
+    "p50_ms": 0.23091699999999998,
+    "peak_additional_heap_bytes": 846
+  },
+  "100000:before:empty_and_dense": {
+    "p50_ms": 0.000458,
+    "peak_additional_heap_bytes": 837
+  },
+  "100000:before:dense_first_page": {
+    "p50_ms": 2.481771,
+    "peak_additional_heap_bytes": 3408200
+  },
+  "100000:before:dense_deep_page": {
+    "p50_ms": 1.357542,
+    "peak_additional_heap_bytes": 3408299
+  },
+  "100000:before:dense_all_ids": {
+    "p50_ms": 2.5671045,
+    "peak_additional_heap_bytes": 3408120
+  },
+  "100000:after:rare_and_dense": {
+    "p50_ms": 0.00125,
+    "peak_additional_heap_bytes": 836
+  },
+  "100000:after:empty_and_dense": {
+    "p50_ms": 0.0005625,
+    "peak_additional_heap_bytes": 837
+  },
+  "100000:after:dense_first_page": {
+    "p50_ms": 0.0022085,
+    "peak_additional_heap_bytes": 916
+  },
+  "100000:after:dense_deep_page": {
+    "p50_ms": 0.002375,
+    "peak_additional_heap_bytes": 1047
+  },
+  "100000:after:dense_all_ids": {
+    "p50_ms": 2.2409790000000003,
+    "peak_additional_heap_bytes": 3408120
+  },
+  "1000001:before:rare_and_dense": {
+    "p50_ms": 2.3168545,
+    "peak_additional_heap_bytes": 846
+  },
+  "1000001:before:empty_and_dense": {
+    "p50_ms": 0.000458,
+    "peak_additional_heap_bytes": 837
+  },
+  "1000001:before:dense_first_page": {
+    "p50_ms": 32.7982295,
+    "peak_additional_heap_bytes": 46137672
+  },
+  "1000001:before:dense_deep_page": {
+    "p50_ms": 19.952125000000002,
+    "peak_additional_heap_bytes": 46137771
+  },
+  "1000001:before:dense_all_ids": {
+    "p50_ms": 33.6717705,
+    "peak_additional_heap_bytes": 46137592
+  },
+  "1000001:after:rare_and_dense": {
+    "p50_ms": 0.001209,
+    "peak_additional_heap_bytes": 836
+  },
+  "1000001:after:empty_and_dense": {
+    "p50_ms": 0.000542,
+    "peak_additional_heap_bytes": 837
+  },
+  "1000001:after:dense_first_page": {
+    "p50_ms": 0.0023125,
+    "peak_additional_heap_bytes": 916
+  },
+  "1000001:after:dense_deep_page": {
+    "p50_ms": 0.0024165,
+    "peak_additional_heap_bytes": 1047
+  },
+  "1000001:after:dense_all_ids": {
+    "p50_ms": 28.923333,
+    "peak_additional_heap_bytes": 46137592
+  }
+}
