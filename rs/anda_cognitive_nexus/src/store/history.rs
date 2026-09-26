@@ -287,11 +287,12 @@ impl Store {
             ));
         }
         let index = table.get_btree_index(&["lookup_key"]).map_err(db_error)?;
-        let kind_id = ElementId::new(kind, 0).to_string();
+        // Every id of a kind starts with its tag, so the hex prefix of
+        // `"C-"` covers exactly that kind's version chains.
         let prefix = format!(
             "{}/{}",
             hex::encode(space_id),
-            hex::encode(kind_id.trim_end_matches('0'))
+            hex::encode(format!("{}-", ElementId::tag(kind)))
         );
         let high = format!("{prefix}\u{10ffff}");
         let mut cursor = prefix;
@@ -700,37 +701,48 @@ impl CursorFamily {
 
 impl PageCursor {
     /// Server-mapped continuations preserve ordinary paging without granting
-    /// arbitrary historical reads. Eviction or reconnect requires a new page 1.
-    pub(crate) fn issue(&self, store: &Store, space: &str, principal: &str) -> String {
+    /// arbitrary historical reads. `seek` is the row id the page before this
+    /// cursor ended at, when the next page can start right after it instead
+    /// of walking its offset again. Eviction or reconnect requires a new
+    /// page 1.
+    pub(crate) fn issue(
+        &self,
+        store: &Store,
+        space: &str,
+        principal: &str,
+        seek: Option<u64>,
+    ) -> String {
         let token = self.to_token(space);
         let mut issued = store.issued_cursors.lock();
-        if !issued.iter().any(|(p, t)| p == principal && t == &token) {
+        if !issued.iter().any(|(p, t, _)| p == principal && t == &token) {
             if issued.len() == 1024 {
                 issued.pop_front();
             }
-            issued.push_back((principal.into(), token.clone()));
+            issued.push_back((principal.into(), token.clone(), seek));
         }
         token
     }
 
+    /// The seek an issued cursor carries, or `CursorExpired` when this
+    /// engine does not remember issuing the token to this principal.
     pub(crate) fn require_issued(
         &self,
         store: &Store,
         token: &str,
         principal: &str,
-    ) -> Result<(), KipError> {
-        if !store
+    ) -> Result<Option<u64>, KipError> {
+        store
             .issued_cursors
             .lock()
             .iter()
-            .any(|(p, t)| p == principal && t == token)
-        {
-            return Err(KipError::cursor_expired(
-                self.family.tag(),
-                "continuation unavailable; start a new traversal",
-            ));
-        }
-        Ok(())
+            .find(|(p, t, _)| p == principal && t == token)
+            .map(|(_, _, seek)| *seek)
+            .ok_or_else(|| {
+                KipError::cursor_expired(
+                    self.family.tag(),
+                    "continuation unavailable; start a new traversal",
+                )
+            })
     }
 
     /// The opaque token a client passes back to continue.

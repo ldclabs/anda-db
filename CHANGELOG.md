@@ -25,9 +25,12 @@ All notable changes to this workspace are documented in this file.
   so derived postings remain correct after updates and recovery.
 - SEARCH selects only the needed top-k with the protocol's tie ordering.
   Bounded caches reuse corpus statistics and authorized search text, keyed by
-  data/schema/authority state; returned views are still loaded and redacted
-  for the current read. Body prefetch is bounded and CPU-heavy ranking runs
-  off the async executor. See the [million-row optimization report](docs/query-performance-million.zh.md).
+  the Space's sequence, schema and authority state, so another Space's writes
+  leave them intact; returned views are still loaded and redacted for the
+  current read. A `PreparedScope` holds only membership and lengths as of its
+  `version()`, without a copy of the scoped ids. Body prefetch is bounded and
+  CPU-heavy ranking runs off the async executor. See the
+  [million-row optimization report](docs/query-performance-million.zh.md).
 
 ### Fixed
 

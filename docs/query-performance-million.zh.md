@@ -26,7 +26,7 @@
 - Concept/Proposition/Assertion schema 升至 1，Evidence/Activity 升至 2，版本日志升至 1；新增列均可选。旧字段索引编号由 Schema 升级保留。
 - `query_keys` 和 `lookup_key` 是声明给索引钩子的派生列，旧正文可以没有这些值。首次打开会为既有行建立新索引，后续更新由依赖声明维护。不要取消打开、恢复或写入过程。
 - BTree posting、文档 ID bitmap 的持久化编码未改变。有序快照不持久化；缓存失效不影响已开始读取的不可变快照。
-- prepared scopes 与授权文本缓存分别最多 4 项，各使用 64 MiB 的保守计费上限；过大的项不缓存。Store 重开时清空。它们不缓存随读取时间变化的返回视图。包含生效/到期时间条件的 Grant 或 Policy 不缓存授权语料，避免时钟变化后继续使用旧可见域。
+- prepared scopes 与授权文本缓存分别最多 4 项，各使用 64 MiB 的保守计费上限；过大的项不缓存。Store 重开时清空。缓存 key 用 Space 序号（该 Space 的任何行变化都会提交一个序号）加 schema 版本与完整有效授权，其它 Space 的写入不会使其失效。`PreparedScope` 只保存成员与长度统计及其准备时的索引版本，不保存 ID 副本，也不自动刷新；同一 Space 序号下的行不会变化，所以按序号取到的 scope 总是当前的。它们不缓存随读取时间变化的返回视图。包含生效/到期时间条件的 Grant 或 Policy 不缓存授权语料，避免时钟变化后继续使用旧可见域。
 - 查询 worker 数为 `min(available_parallelism, 4)`。取消等待不会提前释放仍在运行的 worker 的许可；无 Tokio runtime 时直接执行只读任务。
 - 100,000 候选与中间解预算继续适用于通用执行。覆盖 COUNT 不加载每个元素，索引分页只加载所需窗口；不能据此假设所有百万行 JOIN、历史查询或受限权限搜索都已无界可用。
 

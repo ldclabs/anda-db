@@ -19,11 +19,12 @@ use crate::error::*;
 use crate::query::*;
 use crate::tokenizer::*;
 
-/// Reusable corpus membership and length statistics. A mutation invalidates
-/// its statistics; searches automatically refresh against the original ids.
+/// Reusable corpus membership and length statistics, as of the index
+/// version it was prepared at. The caller decides when a scope is stale:
+/// compare [`PreparedScope::version`] with the index's stats version, or key
+/// the scope by whatever guarantees its documents did not change.
 #[derive(Debug)]
 pub struct PreparedScope {
-    source: Vec<u64>,
     ids: FxHashMap<u64, f32>,
     total_tokens: usize,
     version: u64,
@@ -35,12 +36,13 @@ impl PreparedScope {
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
+    /// The index stats version the lengths were read at.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
     /// Conservative accounting weight for bounded caller caches.
     pub fn cache_weight(&self) -> usize {
-        self.source
-            .capacity()
-            .saturating_mul(8)
-            .saturating_add(self.ids.capacity().saturating_mul(32))
+        self.ids.capacity().saturating_mul(32)
     }
 }
 

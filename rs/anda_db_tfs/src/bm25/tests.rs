@@ -2605,7 +2605,7 @@ fn a_scoped_search_scores_as_a_fresh_index_of_the_scope() {
 }
 
 #[test]
-fn prepared_scope_refreshes_and_top_k_keeps_lexical_boundary_ties() {
+fn prepared_scope_reports_its_version_and_top_k_keeps_lexical_boundary_ties() {
     let index = BM25Index::new("prepared".into(), default_tokenizer(), None);
     let ids = (1..=30).collect::<Vec<u64>>();
     for &id in &ids {
@@ -2621,9 +2621,17 @@ fn prepared_scope_refreshes_and_top_k_keeps_lexical_boundary_ties() {
         first.iter().map(|hit| hit.0).collect::<Vec<_>>(),
         vec![1, 10, 11, 12, 13]
     );
+    assert_eq!(scope.version(), index.stats().version);
     assert!(index.remove(1, "shared", 1));
-    let cached = index.search_prepared_by("shared", 5, None, &scope, compare);
-    let fresh = index.search_scoped_by("shared", 5, None, &ids, compare);
-    assert_eq!(cached, fresh);
-    assert_eq!(cached[0].0, 10);
+    // A scope is what it was prepared as: the caller notices the version
+    // moved and prepares again.
+    assert_ne!(scope.version(), index.stats().version);
+    let fresh = index.prepare_scope(&ids);
+    assert_eq!(fresh.len(), 29);
+    let again = index.search_prepared_by("shared", 5, None, &fresh, compare);
+    assert_eq!(
+        again,
+        index.search_scoped_by("shared", 5, None, &ids, compare)
+    );
+    assert_eq!(again[0].0, 10);
 }

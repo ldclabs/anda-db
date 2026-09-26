@@ -4,6 +4,7 @@ use anda_cognitive_nexus::{
     CognitiveNexus,
     nexus::DEFAULT_SPACE,
     schema::{PackageState, SchemaLock, SchemaPackage},
+    store::space::SpaceDraft,
 };
 use anda_db::database::{AndaDB, DBConfig};
 use anda_kip::{Executor, Json, Request, TopLevelStatus};
@@ -1209,4 +1210,71 @@ async fn search_top_k_preserves_ties_and_invalidates_cached_scopes() {
     let result = ok(&nexus, query).await;
     assert_eq!(result["hits"][0]["id"], "C-10");
     assert_eq!(result["hits"].as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn indexed_search_scopes_survive_writes_in_other_spaces() {
+    let nexus = fresh("search_scope_other_space").await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?p { TYPE "Person" NAME "sharedword" }"#,
+    )
+    .await;
+    let query = r#"SEARCH CONCEPT "sharedword" WITH TYPE "Person" LIMIT 5"#;
+    let concepts = nexus.store.elements(anda_kip::ElementKind::Concept);
+    let hits = |result: &Json| result["hits"].as_array().unwrap().len();
+    assert_eq!(hits(&ok(&nexus, query).await), 1);
+
+    // Another Space filling up with the same word neither invalidates this
+    // Space's prepared scope nor reaches its hits.
+    nexus
+        .store
+        .open_or_create_space(SpaceDraft {
+            space_id: "kip:space:other".into(),
+            owner_principal: "kip:principal:system".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut lock = SchemaLock::default();
+    lock.packages
+        .insert(PROFILE_ID.to_string(), "2.0.0".to_string());
+    lock.states
+        .insert(PROFILE_ID.to_string(), PackageState::Active);
+    nexus
+        .activate_schema("kip:space:other", lock)
+        .await
+        .unwrap();
+    let command = r#"CREATE CONCEPT ?x { TYPE "Person" NAME "sharedword" }"#;
+    let mut other = Request::single(command);
+    other.space = Some(anda_kip::SpaceSelector {
+        id: Some("kip:space:other".into()),
+        ..Default::default()
+    });
+    let response = nexus
+        .execute(
+            anda_kip::parse_kip(command).unwrap(),
+            &other,
+            &other.operations[0],
+        )
+        .await;
+    assert_eq!(
+        response.status,
+        TopLevelStatus::Succeeded,
+        "{:#?}",
+        response.error
+    );
+    let scans = concepts.stats().search_count;
+    assert_eq!(hits(&ok(&nexus, query).await), 1);
+    assert_eq!(concepts.stats().search_count, scans, "the scope was reused");
+
+    // A write in this Space moves its sequence and rebuilds the scope.
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?q { TYPE "Person" NAME "sharedword" }"#,
+    )
+    .await;
+    let scans = concepts.stats().search_count;
+    assert_eq!(hits(&ok(&nexus, query).await), 2);
+    assert!(concepts.stats().search_count > scans);
 }

@@ -19,10 +19,9 @@ impl DocumentIds {
     }
 
     pub(super) fn insert(&mut self, id: DocumentId) -> bool {
-        if self.bitmap.contains(id) {
+        if !self.bitmap.add_checked(id) {
             return false;
         }
-        self.bitmap.add(id);
         self.dirty = true;
         true
     }
@@ -32,10 +31,9 @@ impl DocumentIds {
     }
 
     pub(super) fn remove(&mut self, id: &DocumentId) -> bool {
-        if !self.bitmap.contains(*id) {
+        if !self.bitmap.remove_checked(*id) {
             return false;
         }
-        self.bitmap.remove(*id);
         self.dirty = true;
         true
     }

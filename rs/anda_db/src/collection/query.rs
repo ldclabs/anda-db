@@ -196,6 +196,18 @@ impl Collection {
             .await
     }
 
+    /// Every query entry point starts here: recovery first, then the shape
+    /// bound that keeps one request from allocating an arbitrary plan.
+    async fn admit_filter(&self, filter: Option<&Filter>) -> Result<(), DBError> {
+        self.ensure_recovered().await?;
+        filter
+            .map_or(Ok(()), Filter::validate_complexity)
+            .map_err(|source| DBError::Generic {
+                name: self.name.clone(),
+                source: source.into(),
+            })
+    }
+
     /// Hybrid search with bounded oversampling and optional selective subset
     /// scoring. Prefiltered fusion ranks within the matching subset; disable
     /// prefiltering for the historical global-rank-then-filter behavior.
@@ -204,13 +216,7 @@ impl Collection {
         query: Query,
         options: SearchOptions,
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        query
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(query.filter.as_ref()).await?;
         self.search_count.fetch_add(1, Ordering::Relaxed);
         let limit = query.limit.unwrap_or(10).min(Self::MAX_SEARCH_LIMIT);
         if limit == 0 {
@@ -487,13 +493,7 @@ impl Collection {
         limit: Option<usize>,
         order: ScanOrder,
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
         if limit == Some(0) {
@@ -523,13 +523,7 @@ impl Collection {
     /// All matching document IDs in ascending order, or an error if filtering
     /// fails.
     pub async fn query_all_ids(&self, filter: Filter) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
 
         self.search_count.fetch_add(1, Ordering::Relaxed);
         // The internal scan uses `0` for "unbounded".
@@ -543,13 +537,7 @@ impl Collection {
         filter: Filter,
         limit: usize,
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -568,13 +556,7 @@ impl Collection {
         self: Arc<Self>,
         filter: Filter,
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
         self.search_count.fetch_add(1, Ordering::Relaxed);
         crate::query::run_query_task(move || {
             self.filter_by_field(filter, &[], 0, ScanOrder::Ascending)
@@ -591,13 +573,7 @@ impl Collection {
         filter: Filter,
         limit: usize,
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
         self.search_count.fetch_add(1, Ordering::Relaxed);
         if limit == 0 {
             return Ok(Vec::new());
@@ -612,13 +588,7 @@ impl Collection {
         filter: Filter,
         candidates: &[DocumentId],
     ) -> Result<Vec<DocumentId>, DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -631,13 +601,7 @@ impl Collection {
         filter: Filter,
         limit: Option<usize>,
     ) -> Result<(Vec<DocumentId>, QueryStats), DBError> {
-        self.ensure_recovered().await?;
-        filter
-            .validate_complexity()
-            .map_err(|source| DBError::Generic {
-                name: self.name.clone(),
-                source: source.into(),
-            })?;
+        self.admit_filter(Some(&filter)).await?;
         let mut stats = QueryStats::default();
         let limit = limit
             .unwrap_or(Self::MAX_SEARCH_LIMIT)

@@ -246,16 +246,15 @@ impl Context<'_> {
 
     /// Resolve lineage membership on the index's distinct keys, before any
     /// document candidates are materialized or charged. Package ranges alone
-    /// include unrelated symbols. Historical candidates ignore this filter.
+    /// include unrelated symbols. A historical read reconstructs its
+    /// candidates from the version log and never hands this filter to an
+    /// index, so callers on that path skip building it.
     pub(crate) fn symbol_filter(
         &self,
         kind: ElementKind,
         column: &str,
         symbols: &[String],
     ) -> Result<Filter, KipError> {
-        if self.is_historical() {
-            return Ok(Filter::And(vec![]));
-        }
         let symbol_kind = if kind == ElementKind::Concept {
             SymbolKind::ConceptType
         } else {
@@ -477,14 +476,27 @@ impl Context<'_> {
         matcher: &ObjectMatcher,
         known: &Solutions,
     ) -> Result<Solutions, KipError> {
+        let mut by_id = None;
+        if let Some(value) = matcher.get("id")
+            && let Slot::Value(value) = self.classify(value)?
+        {
+            let text = value
+                .as_str()
+                .ok_or_else(|| KipError::type_mismatch("id must be an element id string"))?;
+            by_id = Some(ElementId::parse_kind(text, kind)?);
+        }
+        let bound = bound_elements(known, variable);
+        let historical = self.is_historical();
+        // Index predicates only narrow a scan. A fixed id, an earlier binding
+        // and a historical reconstruction never consult them, so the lineage
+        // key walks and filter values are not built for those.
+        let indexed = !historical && by_id.is_none() && bound.is_none();
         let mut filters = std::mem::take(&mut self.element_hints);
         filters.push(eq_field("space", Fv::Text(self.space.clone())));
-        let mut by_id = None;
         let mut type_lineages = Vec::new();
-        let historical = self.is_historical();
         for (key, value) in matcher {
             let Slot::Value(value) = self.classify(value)? else {
-                if !historical
+                if indexed
                     && is_reference_key(kind, key)
                     && let Some(column) = column_of(kind, key)
                     && let MatchValue::Variable(name) = value
@@ -499,7 +511,7 @@ impl Context<'_> {
             };
             if is_symbol_key(kind, key) {
                 let symbol = self.matcher_text(kind, key, &value)?;
-                if !historical {
+                if indexed {
                     filters.push(self.symbol_filter(
                         kind,
                         "schema_ref",
@@ -507,16 +519,14 @@ impl Context<'_> {
                     )?);
                 }
                 type_lineages.push(symbol);
-            } else if key == "id" {
-                let text = value
-                    .as_str()
-                    .ok_or_else(|| KipError::type_mismatch("id must be an element id string"))?;
-                by_id = Some(ElementId::parse_kind(text, kind)?);
-            } else if !historical && let Some(column) = column_of(kind, key) {
-                filters.push(eq_field(
-                    column,
-                    Fv::Text(self.matcher_text(kind, key, &value)?),
-                ));
+            } else if key != "id"
+                && !historical
+                && let Some(column) = column_of(kind, key)
+            {
+                let text = self.matcher_text(kind, key, &value)?;
+                if indexed {
+                    filters.push(eq_field(column, Fv::Text(text)));
+                }
             }
         }
         let constrains_state = matcher.contains_key("state");
@@ -528,11 +538,11 @@ impl Context<'_> {
         }
         let ids = match by_id {
             Some(id) => vec![id],
-            None => match bound_elements(known, variable) {
+            None => match bound {
                 Some(ids) => ids.into_iter().filter(|id| id.kind == kind).collect(),
                 None => {
-                    if let Some((limit, after)) = self.element_window.take() {
-                        if let Some(after) = after {
+                    if let Some(page) = self.element_page {
+                        if let Some(after) = page.seek {
                             filters.push(Filter::Field((
                                 "_id".into(),
                                 RangeQuery::Gt(Fv::U64(after)),
@@ -542,7 +552,8 @@ impl Context<'_> {
                             .elements(kind)
                             .query_candidate_ids_on_worker(
                                 Filter::And(filters.into_iter().map(Box::new).collect()),
-                                limit.min(self.remaining_candidates().saturating_add(1)),
+                                page.window
+                                    .min(self.remaining_candidates().saturating_add(1)),
                             )
                             .await
                             .map_err(crate::error::db_error)?

@@ -32,6 +32,42 @@ use crate::store::history::CursorFamily;
 pub(crate) type Hit = (f64, ElementId, std::sync::Arc<Json>);
 
 const SEARCH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SEARCH_CACHE_ENTRIES: usize = 4;
+
+type BoundedCache<V> = std::collections::VecDeque<(String, std::sync::Arc<V>)>;
+
+fn find_cached<V>(cache: &BoundedCache<V>, key: &str) -> Option<std::sync::Arc<V>> {
+    cache
+        .iter()
+        .find(|(cached, _)| cached == key)
+        .map(|(_, value)| value.clone())
+}
+
+/// Keeps the newest few entries within the byte budget, oldest out first.
+/// An entry over the whole budget is not kept at all.
+fn push_bounded<V>(
+    cache: &mut BoundedCache<V>,
+    key: String,
+    value: std::sync::Arc<V>,
+    weight: impl Fn(&V) -> usize,
+) {
+    let added = weight(&value);
+    if added > SEARCH_CACHE_BYTES {
+        return;
+    }
+    while !cache.is_empty()
+        && (cache.len() >= SEARCH_CACHE_ENTRIES
+            || cache
+                .iter()
+                .map(|(_, cached)| weight(cached))
+                .sum::<usize>()
+                .saturating_add(added)
+                > SEARCH_CACHE_BYTES)
+    {
+        cache.pop_front();
+    }
+    cache.push_back((key, value));
+}
 
 pub(crate) struct AuthorizedCorpus {
     index: anda_db_tfs::BM25Index<anda_db_tfs::TokenizerChain>,
@@ -180,12 +216,13 @@ pub(crate) async fn rank(
     }
 
     // A cache contains only searchable text, never time-dependent rendered
-    // views. Data, schema and the complete effective authority invalidate it.
+    // views. The Space's sequence (every change to its rows commits one),
+    // its schema and the complete effective authority invalidate it; another
+    // Space's writes do not.
     let corpus_key = crate::schema::contracts::digest(&serde_json::json!([
         cx.space,
         cx.pinned_seq,
         cx.env.version,
-        cx.store.elements(kind).stats().version,
         kind.to_string(),
         with_type,
         with_predicate,
@@ -195,13 +232,7 @@ pub(crate) async fn rank(
     ]))?;
     let cacheable_corpus = !cx.is_historical() && !cx.authority.has_time_conditions();
     if cacheable_corpus {
-        let cached = cx
-            .store
-            .search_corpora
-            .lock()
-            .iter()
-            .find(|(key, _)| key == &corpus_key)
-            .map(|(_, corpus)| corpus.clone());
+        let cached = find_cached(&cx.store.search_corpora.lock(), &corpus_key);
         if let Some(corpus) = cached {
             cx.narrow_limit(corpus.read_cap);
             let mut hits = Vec::new();
@@ -347,26 +378,19 @@ pub(crate) async fn rank(
         hits.push((score, ElementId::new(kind, seq), rendered));
     }
     hits.sort_by(|a, b| by_rank((a.0, a.1), (b.0, b.1)));
-    if cacheable_corpus && corpus_weight <= SEARCH_CACHE_BYTES {
+    if cacheable_corpus {
         let corpus = std::sync::Arc::new(AuthorizedCorpus {
             index,
             cap,
             read_cap,
             weight: corpus_weight,
         });
-        let mut cache = cx.store.search_corpora.lock();
-        while !cache.is_empty()
-            && (cache.len() >= 4
-                || cache
-                    .iter()
-                    .map(|(_, c)| c.weight)
-                    .sum::<usize>()
-                    .saturating_add(corpus_weight)
-                    > SEARCH_CACHE_BYTES)
-        {
-            cache.pop_front();
-        }
-        cache.push_back((corpus_key, corpus));
+        push_bounded(
+            &mut cx.store.search_corpora.lock(),
+            corpus_key,
+            corpus,
+            |corpus| corpus.weight,
+        );
     }
     Ok((hits, cap))
 }
@@ -432,19 +456,13 @@ async fn rank_indexed(
             &[symbol.to_string()],
         )?));
     }
+    // The scope is this Space's rows and their lengths: it moves only with
+    // the Space's own sequence or schema, not with other Spaces' writes.
     let scope_key = format!(
-        "{}:{kind:?}:{}:{}:{lineage:?}",
-        cx.space,
-        collection.stats().version,
-        cx.env.version
+        "{}:{}:{}:{kind:?}:{lineage:?}",
+        cx.space, cx.pinned_seq, cx.env.version
     );
-    let cached = cx
-        .store
-        .search_scopes
-        .lock()
-        .iter()
-        .find(|(key, _)| key == &scope_key)
-        .map(|(_, scope)| scope.clone());
+    let cached = find_cached(&cx.store.search_scopes.lock(), &scope_key);
     let scope = if let Some(scope) = cached {
         scope
     } else {
@@ -467,21 +485,12 @@ async fn rank_indexed(
                 .map_err(crate::error::db_error)?,
             )
         };
-        if scope.cache_weight() <= SEARCH_CACHE_BYTES {
-            let mut cache = cx.store.search_scopes.lock();
-            while !cache.is_empty()
-                && (cache.len() >= 4
-                    || cache
-                        .iter()
-                        .map(|(_, s)| s.cache_weight())
-                        .sum::<usize>()
-                        .saturating_add(scope.cache_weight())
-                        > SEARCH_CACHE_BYTES)
-            {
-                cache.pop_front();
-            }
-            cache.push_back((scope_key, scope.clone()));
-        }
+        push_bounded(
+            &mut cx.store.search_scopes.lock(),
+            scope_key,
+            scope.clone(),
+            anda_db_tfs::PreparedScope::cache_weight,
+        );
         scope
     };
     let scored = {

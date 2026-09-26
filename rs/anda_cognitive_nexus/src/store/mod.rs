@@ -140,10 +140,11 @@ macro_rules! collections {
             /// What the host declares around this Nexus (§67.4): a Brain binding
             /// and its runtime. Empty until the host says otherwise.
             host_capabilities: Arc<parking_lot::RwLock<crate::meta::HostCapabilities>>,
-            issued_cursors: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String)>>>,
+            /// `(principal, token, seek)`: the cursors this engine issued and,
+            /// for an indexed KQL page, the row id that page ended at.
+            issued_cursors: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String, Option<u64>)>>>,
             pub(crate) search_scopes: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, Arc<anda_db_tfs::PreparedScope>)>>>,
             pub(crate) search_corpora: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, Arc<crate::meta::inspect::AuthorizedCorpus>)>>>,
-            pub(crate) query_seeks: Arc<parking_lot::Mutex<std::collections::VecDeque<(String, String, u64)>>>,
             $($field: Slot,)*
             /// Resolved Schema Environments, keyed by Space and version.
             ///
@@ -179,7 +180,6 @@ macro_rules! collections {
                     issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
                     search_scopes: Arc::new(parking_lot::Mutex::new(Default::default())),
                     search_corpora: Arc::new(parking_lot::Mutex::new(Default::default())),
-                    query_seeks: Arc::new(parking_lot::Mutex::new(Default::default())),
                     $($field,)*
                     environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
                 };
@@ -196,7 +196,6 @@ macro_rules! collections {
             pub async fn reopen(&self) -> Result<(), KipError> {
                 self.search_scopes.lock().clear();
                 self.search_corpora.lock().clear();
-                self.query_seeks.lock().clear();
                 $(self.$field.set(self.reload($name, $init).await?);)*
                 self.governance.reopen().await
             }

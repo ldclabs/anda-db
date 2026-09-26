@@ -509,27 +509,13 @@ impl BM25IndexView<'_> {
         self.inner.search_scoped(query, top_k, params, ids)
     }
 
-    /// Scoped top-k using a caller's total score/tie order.
-    pub fn search_scoped_by<F>(
-        &self,
-        query: &str,
-        top_k: usize,
-        params: Option<BM25Params>,
-        ids: &[u64],
-        compare: F,
-    ) -> Vec<(u64, f32)>
-    where
-        F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
-    {
-        self.inner
-            .search_scoped_by(query, top_k, params, ids, compare)
-    }
-
     /// Precomputes reusable corpus membership and length statistics.
     pub fn prepare_scope(&self, ids: &[u64]) -> anda_db_tfs::PreparedScope {
         self.inner.prepare_scope(ids)
     }
     /// Searches a prepared corpus with stable caller-defined boundary ties.
+    /// The scope is used as prepared: compare `PreparedScope::version` with
+    /// the index stats version, or key it by something that pins its rows.
     pub fn search_prepared_by<F>(
         &self,
         query: &str,

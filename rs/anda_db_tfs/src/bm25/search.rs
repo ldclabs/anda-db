@@ -90,14 +90,14 @@ impl<T: Tokenizer> BM25Index<T> {
             }
         }
         PreparedScope {
-            source: ids.to_vec(),
             ids: scope,
             total_tokens,
             version,
         }
     }
 
-    /// Scores a prepared corpus, refreshing lengths after index mutation.
+    /// Scores a prepared corpus. The scope's membership and lengths are used
+    /// as prepared; a caller that mutated scoped documents prepares anew.
     pub fn search_prepared_by<F>(
         &self,
         query: &str,
@@ -109,17 +109,7 @@ impl<T: Tokenizer> BM25Index<T> {
     where
         F: Fn(&(u64, f32), &(u64, f32)) -> std::cmp::Ordering,
     {
-        if top_k == 0 {
-            return Vec::new();
-        }
-        let refreshed;
-        let scope = if scope.version != self.stats().version {
-            refreshed = self.prepare_scope(&scope.source);
-            &refreshed
-        } else {
-            scope
-        };
-        if scope.is_empty() {
+        if top_k == 0 || scope.is_empty() {
             return Vec::new();
         }
         let params = params.as_ref().unwrap_or(&self.config.bm25);

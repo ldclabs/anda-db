@@ -79,30 +79,23 @@ impl Context<'_> {
         let consumed = offset + window.len();
         // The cursor carries the coordinate this page was read at, so the
         // next one continues over the same canonical snapshot rather than over
-        // whatever the Space holds by then (§44.8).
+        // whatever the Space holds by then (§44.8). An indexed page also
+        // remembers the row it ended at, so the continuation seeks past it.
         let next_cursor = (limit.is_some() && consumed < total).then(|| {
+            let page = self.element_page;
+            let seek = page
+                .and_then(|_| window.last()?.first()?.element())
+                .map(|id| id.seq);
             crate::store::history::PageCursor {
                 family: crate::store::history::CursorFamily::Query,
                 snapshot_seq: pinned_seq,
-                offset: self.page_offset_base.saturating_add(consumed),
+                offset: page
+                    .map_or(0, |page| page.offset_base)
+                    .saturating_add(consumed),
                 traversal: self.traversal.clone(),
             }
-            .issue(self.store, &self.space, &self.auth.principal_id)
+            .issue(self.store, &self.space, &self.auth.principal_id, seek)
         });
-
-        if self.element_page
-            && let Some(token) = &next_cursor
-            && let Some(id) = window
-                .last()
-                .and_then(|row| row.first())
-                .and_then(Binding::element)
-        {
-            let mut seeks = self.store.query_seeks.lock();
-            if seeks.len() >= 2048 {
-                seeks.pop_front();
-            }
-            seeks.push_back((self.auth.principal_id.clone(), token.clone(), id.seq));
-        }
         let mut rows = Vec::with_capacity(window.len());
         for row in &window {
             let mut projected = Vec::with_capacity(find.expressions.len());
@@ -345,7 +338,7 @@ impl Context<'_> {
                 offset: consumed,
                 traversal: self.traversal.clone(),
             }
-            .issue(self.store, &self.space, &self.auth.principal_id)
+            .issue(self.store, &self.space, &self.auth.principal_id, None)
         });
 
         let mut rows = Vec::with_capacity(window.len());

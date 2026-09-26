@@ -137,14 +137,26 @@ pub struct Context<'a> {
     /// variables introduced by a WHERE branch. Standalone KQL has none.
     ambient: Solutions,
     next_internal_variable: u64,
-    element_window: Option<(usize, Option<u64>)>,
+    /// Set when the query's only pattern is read as an indexed page.
+    element_page: Option<ElementPage>,
     element_hints: Vec<anda_db::query::Filter>,
-    element_page: bool,
     existential: bool,
     pub(crate) belief_cache: BTreeMap<(String, ElementId), crate::projection::Belief>,
     pub(crate) frame_cache:
         BTreeMap<(String, crate::projection::Frame), Arc<Vec<crate::projection::Belief>>>,
-    page_offset_base: usize,
+}
+
+/// An indexed page over a query's single element pattern: the candidates it
+/// reads and, on a continuation this engine remembers, where the previous
+/// page ended (§44.8).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ElementPage {
+    /// Candidates to read: `offset + limit + 1`, or `limit + 1` after a seek.
+    pub(super) window: usize,
+    /// The row id the previous page ended at.
+    pub(super) seek: Option<u64>,
+    /// Rows the seek skipped, so the next cursor still reports the total.
+    pub(super) offset_base: usize,
 }
 
 impl<'a> Context<'a> {
@@ -203,13 +215,11 @@ impl<'a> Context<'a> {
             dependency_cache: BTreeMap::new(),
             ambient: Solutions::unit(),
             next_internal_variable: 0,
-            element_window: None,
+            element_page: None,
             element_hints: Vec::new(),
-            element_page: false,
             existential: false,
             belief_cache: BTreeMap::new(),
             frame_cache: BTreeMap::new(),
-            page_offset_base: 0,
         })
     }
 
@@ -1321,12 +1331,13 @@ struct Answer {
     valid_at: Option<String>,
 }
 
-/// Reads a `CURSOR` slot as the opaque token this engine issues.
+/// Reads a `CURSOR` slot as the opaque token this engine issues, with the
+/// seek the cursor was issued with.
 fn page_cursor(
     cx: &Context<'_>,
     scalar: &Scalar,
     space: &str,
-) -> Result<crate::store::history::PageCursor, KipError> {
+) -> Result<(crate::store::history::PageCursor, Option<u64>), KipError> {
     let token = match scalar {
         Scalar::Literal(literal) => Json::from(literal.clone()),
         Scalar::Param(name) => cx.param_ref(name)?,
@@ -1344,8 +1355,81 @@ fn page_cursor(
         crate::store::history::CursorFamily::Query,
         &cx.traversal,
     )?;
-    cursor.require_issued(cx.store, &token, &cx.auth.principal_id)?;
-    Ok(cursor)
+    let seek = cursor.require_issued(cx.store, &token, &cx.auth.principal_id)?;
+    Ok((cursor, seek))
+}
+
+/// One WHERE pattern that an index can answer on its own: a current read
+/// with no world time and no ORDER BY, by an authority that reaches the
+/// whole Space unnarrowed and without clock-dependent conditions.
+fn index_answerable<'q>(cx: &Context<'_>, query: &'q KqlQuery) -> Option<&'q WhereClause> {
+    let [clause] = query.where_clauses.as_slice() else {
+        return None;
+    };
+    (!cx.is_historical()
+        && query.for_time.is_none()
+        && query.order_by.as_ref().is_none_or(Vec::is_empty)
+        && cx.authority.searches_whole_space(cx.auth)
+        && !cx.authority.has_time_conditions())
+    .then_some(clause)
+}
+
+/// `FIND(COUNT(?x))` over one covering pattern: the index's match count is
+/// the answer, so no element body is read. `None` leaves the query to the
+/// general path, which also serves the cursor and grouping cases.
+async fn covering_count(
+    cx: &mut Context<'_>,
+    query: &KqlQuery,
+    clause: &WhereClause,
+    limit: Option<usize>,
+) -> Result<Option<Projected>, KipError> {
+    use anda_kip::{AggregationFunction, FindExpression};
+    fn counted(expression: &FindExpression) -> Option<&str> {
+        match expression {
+            FindExpression::Aggregation {
+                func: AggregationFunction::Count,
+                var,
+                ..
+            } if var.path.is_empty() => Some(var.var.as_str()),
+            _ => None,
+        }
+    }
+    let expressions = &query.find_clause.expressions;
+    let Some(variable) = expressions.first().and_then(counted) else {
+        return Ok(None);
+    };
+    if !expressions.iter().all(|e| counted(e) == Some(variable)) {
+        return Ok(None);
+    }
+    // Checked after the FIND shape: building the covering filter walks
+    // lineage index keys, which a non-COUNT query would only repeat.
+    let Some((kind, pattern_variable, filter)) = cx.covering_element(clause)? else {
+        return Ok(None);
+    };
+    if pattern_variable != variable {
+        return Ok(None);
+    }
+    let count = cx
+        .store
+        .elements(kind)
+        .query_all_ids_on_worker(filter)
+        .await
+        .map_err(db_error)?
+        .len();
+    let value = if expressions.len() == 1 {
+        Json::from(count)
+    } else {
+        Json::Array(vec![Json::from(count); expressions.len()])
+    };
+    let rows = if limit == Some(0) || cx.governed_limit() == Some(0) {
+        vec![]
+    } else {
+        vec![value]
+    };
+    Ok(Some(Projected {
+        rows,
+        next_cursor: None,
+    }))
 }
 
 async fn run(
@@ -1373,9 +1457,12 @@ async fn run(
     );
     // The cursor is read before the coordinate is bound, because it *is* one
     // of the things that decides the coordinate.
-    let cursor = match &query.cursor {
-        Some(scalar) => Some(page_cursor(&cx, scalar, space)?),
-        None => None,
+    let (cursor, seek) = match &query.cursor {
+        Some(scalar) => {
+            let (cursor, seek) = page_cursor(&cx, scalar, space)?;
+            (Some(cursor), seek)
+        }
+        None => (None, None),
     };
     cx.bind_read(query.as_of.as_ref(), request, cursor.clone())
         .await?;
@@ -1424,63 +1511,43 @@ async fn run(
         .as_ref()
         .map(|value| scalar_usize(&cx, value, "LIMIT"))
         .transpose()?;
-    // The FIND shape is checked first: building the covering filter walks
-    // lineage index keys, which a non-COUNT query would only repeat.
-    if cursor.is_none() && !cx.is_historical() && query.for_time.is_none()
-        && query.order_by.as_ref().is_none_or(Vec::is_empty)
-        && !query.find_clause.expressions.is_empty()
-        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { func: anda_kip::AggregationFunction::Count, var, .. } if var.path.is_empty()))
-        && cx.authority.searches_whole_space(cx.auth)
-        && !cx.authority.has_time_conditions()
-        && let [clause] = query.where_clauses.as_slice()
-        && let Some((kind, variable, filter)) = cx.covering_element(clause)?
-        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { var, .. } if var.var == variable))
-    {
-        let count = cx.store.elements(kind).query_all_ids_on_worker(filter).await.map_err(db_error)?.len();
-        let value = if query.find_clause.expressions.len() == 1 { Json::from(count) }
-            else { Json::Array(vec![Json::from(count); query.find_clause.expressions.len()]) };
-        let rows = if limit == Some(0) || cx.governed_limit() == Some(0) { vec![] } else { vec![value] };
-        return Ok(Answer { projected: Projected { rows, next_cursor: None }, schema_environment_version: environment_version, epistemic_policy: None, snapshot_seq: cx.pinned_seq, valid_at: None });
-    }
     let mut page_offset = cursor.as_ref().map(|cursor| cursor.offset);
-    if let Some(limit) = limit
-        && !cx.is_historical()
-        && query.for_time.is_none()
-        && query.order_by.as_ref().is_none_or(Vec::is_empty)
-        && query
-            .find_clause
-            .expressions
-            .iter()
-            .all(|expr| matches!(expr, anda_kip::FindExpression::Variable(_)))
-        && cx.authority.searches_whole_space(cx.auth)
-        && !cx.authority.has_time_conditions()
-        && let [clause] = query.where_clauses.as_slice()
-        && cx.can_page_element(clause)
-    {
-        let seek = cursor.as_ref().and_then(|cursor| {
-            let token = cursor.to_token(space);
-            cx.store
-                .query_seeks
-                .lock()
-                .iter()
-                .rev()
-                .find(|(principal, issued, _)| {
-                    principal == &cx.auth.principal_id && issued == &token
-                })
-                .map(|(_, _, id)| *id)
-        });
-        cx.element_page = true;
-        if seek.is_some() {
-            cx.page_offset_base = page_offset.unwrap_or(0);
-            page_offset = Some(0);
+    if let Some(clause) = index_answerable(&cx, query) {
+        if cursor.is_none()
+            && let Some(projected) = covering_count(&mut cx, query, clause, limit).await?
+        {
+            return Ok(Answer {
+                projected,
+                schema_environment_version: environment_version,
+                epistemic_policy: None,
+                snapshot_seq: cx.pinned_seq,
+                valid_at: None,
+            });
         }
-        cx.element_window = Some((
-            page_offset
-                .unwrap_or(0)
-                .saturating_add(limit)
-                .saturating_add(1),
-            seek,
-        ));
+        if let Some(limit) = limit
+            && query
+                .find_clause
+                .expressions
+                .iter()
+                .all(|expr| matches!(expr, anda_kip::FindExpression::Variable(_)))
+            && cx.can_page_element(clause)
+        {
+            // After a remembered seek the window starts right after it, so
+            // this page's own offset is zero and the cursor reports the sum.
+            let offset_base = if seek.is_some() {
+                page_offset.take().unwrap_or(0)
+            } else {
+                0
+            };
+            cx.element_page = Some(ElementPage {
+                window: page_offset
+                    .unwrap_or(0)
+                    .saturating_add(limit)
+                    .saturating_add(1),
+                seek,
+                offset_base,
+            });
+        }
     }
     let mut solutions = cx.solve(&query.where_clauses).await?;
     let mut valid_at = None;

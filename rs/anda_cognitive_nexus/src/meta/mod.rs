@@ -192,7 +192,7 @@ pub(crate) fn next_cursor(
             offset: consumed,
             traversal: cx.traversal.clone(),
         }
-        .issue(cx.store, &cx.space, &cx.auth.principal_id)
+        .issue(cx.store, &cx.space, &cx.auth.principal_id, None)
     })
 }
 
