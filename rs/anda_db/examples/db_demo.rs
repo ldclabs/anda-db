@@ -131,7 +131,7 @@ async fn add_knowledges_and_query(collection: &Arc<Collection>) -> Result<(), DB
     let knowledges = vec![
         Knowledge {
             _id: 0,
-            thread: thread.clone(),
+            thread,
             created_at: unix_ms() / 1000,
             authors: vec!["Anda".to_string(), "Bill".to_string()],
             metadata: BTreeMap::new(),
@@ -143,7 +143,7 @@ async fn add_knowledges_and_query(collection: &Arc<Collection>) -> Result<(), DB
         },
         Knowledge {
             _id: 0,
-            thread: thread.clone(),
+            thread,
             created_at: unix_ms() / 1000,
             authors: vec!["Charlie".to_string()],
             metadata: BTreeMap::new(),
@@ -179,7 +179,7 @@ async fn add_knowledges_and_query(collection: &Arc<Collection>) -> Result<(), DB
         .await?;
     assert_eq!(result.len(), 1);
     // set thread id to the first knowledge for next search
-    thread = result[0].thread.clone();
+    thread = result[0].thread;
     for doc in &result {
         println!("Find knowledge: {:?}\n", doc);
     }
