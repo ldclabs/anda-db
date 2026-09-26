@@ -504,6 +504,27 @@ impl Context<'_> {
         }
     }
 
+    /// The stored endpoint keys of a variable every earlier solution bound
+    /// (`bound_elements`), each Concept widened to its merge class the way a
+    /// fixed endpoint is. `None` above [`MAX_PINNED`] elements, where the
+    /// index lookup would be larger than the scan it replaces.
+    async fn pinned_keys(
+        &mut self,
+        known: &Solutions,
+        name: &str,
+    ) -> Result<Option<Vec<String>>, KipError> {
+        let Some(ids) = bound_elements(known, name).filter(|ids| ids.len() <= MAX_PINNED) else {
+            return Ok(None);
+        };
+        let mut keys = Vec::new();
+        for id in ids {
+            keys.extend(self.endpoint_keys(&Endpoint::Local(id)).await?);
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(Some(keys))
+    }
+
     fn validate_endpoint(&mut self, term: &Term) -> Result<(), KipError> {
         match term {
             Term::Match(matcher) if !identity_matcher(matcher) => {
@@ -616,6 +637,16 @@ impl Context<'_> {
         let object_keys = match &object {
             EndpointSlot::Fixed(endpoint) => Some(self.endpoint_keys(endpoint).await?),
             EndpointSlot::Bind(_) => None,
+        };
+        // An endpoint variable every earlier solution already bound narrows
+        // the index like a fixed endpoint does; see `bound_elements`.
+        let subject_keys = match (&subject, subject_keys) {
+            (EndpointSlot::Bind(name), None) => self.pinned_keys(known, name).await?,
+            (_, keys) => keys,
+        };
+        let object_keys = match (&object, object_keys) {
+            (EndpointSlot::Bind(name), None) => self.pinned_keys(known, name).await?,
+            (_, keys) => keys,
         };
 
         let mut filters = vec![
@@ -736,11 +767,12 @@ impl Context<'_> {
         subject: &Term,
         field: &AstSymbolRef,
         object: &Term,
+        known: &Solutions,
     ) -> Result<Solutions, KipError> {
         let (subject, left, left_var) = self.expand_endpoint(subject, &Solutions::unit()).await?;
         let (object, right, right_var) = self.expand_endpoint(object, &left).await?;
         let matched = self
-            .match_structural_simple(edge, &subject, field, &object)
+            .match_structural_simple(edge, &subject, field, &object, known)
             .await?;
         let expanded = self.join(left, right)?;
         let mut result = self.join(matched, expanded)?;
@@ -754,6 +786,7 @@ impl Context<'_> {
         subject: &Term,
         field: &AstSymbolRef,
         object: &Term,
+        known: &Solutions,
     ) -> Result<Solutions, KipError> {
         let name = match field {
             AstSymbolRef::Name(name) => name.clone(),
@@ -841,16 +874,21 @@ impl Context<'_> {
         for plane in &planes {
             // Structural fields live on one element each, so the source side is
             // the only one an index narrows; an unbound source means scanning
-            // the kind that could carry the field.
-            let sources: Vec<ElementId> = match &source {
-                EndpointSlot::Fixed(Endpoint::Local(id)) => {
-                    if plane.exclusive && id.kind != plane.holder {
-                        vec![]
-                    } else {
-                        vec![*id]
-                    }
-                }
-                _ => self.active_of(plane.holder).await?,
+            // the kind that could carry the field. A source every earlier
+            // solution already bound is read like a fixed one (`bound_elements`),
+            // which is also how kip-do reads a bound source: a Core field only
+            // on its own kind, a Profile field on any element's generic map.
+            let pinned = match &source {
+                EndpointSlot::Fixed(Endpoint::Local(id)) => Some(vec![*id]),
+                EndpointSlot::Bind(name) => bound_elements(known, name),
+                EndpointSlot::Fixed(_) => None,
+            };
+            let sources: Vec<ElementId> = match pinned {
+                Some(ids) => ids
+                    .into_iter()
+                    .filter(|id| !plane.exclusive || id.kind == plane.holder)
+                    .collect(),
+                None => self.active_of(plane.holder).await?,
             };
             self.charge(sources.len())?;
 
@@ -1584,6 +1622,29 @@ struct Walk {
     symbols: Vec<String>,
     /// How many hops of them are acceptable.
     hops: anda_kip::HopRange,
+}
+
+/// The most distinct bound elements pushed into one index lookup.
+const MAX_PINNED: usize = 256;
+
+/// The elements a variable is bound to in *every* solution so far.
+///
+/// A pattern's result is joined with those solutions afterwards, so a
+/// candidate outside this set could never survive. That is what lets a `NOT`
+/// or `OPTIONAL` block, evaluated once per outer row, start from the element
+/// that row bound instead of re-scanning the Space for every row. A row that
+/// leaves the variable unbound (`OPTIONAL` padding) or binds a non-element
+/// gives no bound, and neither does an empty set.
+fn bound_elements(known: &Solutions, name: &str) -> Option<Vec<ElementId>> {
+    let index = known.vars.iter().position(|var| var == name)?;
+    if known.rows.is_empty() {
+        return None;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in &known.rows {
+        ids.insert(row.get(index)?.element()?);
+    }
+    Some(ids.into_iter().collect())
 }
 
 /// The endpoints a variable is already bound to by the solutions so far.

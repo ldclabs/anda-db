@@ -1143,3 +1143,66 @@ async fn known_function_argument_types_are_validated_without_rows() {
         );
     }
 }
+
+/// `NOT` and `OPTIONAL` blocks run once per outer row. A tuple or structural
+/// pattern inside them starts from the element that row pinned instead of
+/// re-scanning the Space, so an anti-join costs about one lookup per row.
+/// Before, both queries below examined rows × all candidates and failed with
+/// `ResourceExhausted` well under realistic sizes.
+#[tokio::test]
+async fn anti_joins_start_from_the_pinned_endpoint() {
+    let nexus = nexus("kql_pinned_anti_join").await;
+    let pairs = 350;
+    let mut text = String::from("MUTATE {\n");
+    for i in 0..pairs {
+        text.push_str(&format!(
+            "CREATE CONCEPT ?p{i} {{ TYPE \"Person\" NAME \"P{i}\" }}\n\
+             CREATE CONCEPT ?o{i} {{ TYPE \"Option\" NAME \"O{i}\" }}\n\
+             ENSURE PROPOSITION ?t{i} (?p{i}, \"prefers\", ?o{i})\n\
+             CREATE ASSERTION ?a{i} {{ SET FIELDS {{proposition: ?t{i}, asserted_by: ?p{i}, \
+             stance: \"support\", mode: \"stated\", confidence: 0.9}}{evidence} }}\n",
+            evidence = if i < 10 {
+                r#" SET STRUCTURAL {("evidence", ?e) {role: "support"}}"#
+            } else {
+                ""
+            },
+        ));
+    }
+    for i in 0..5 {
+        text.push_str(&format!(
+            "CREATE CONCEPT ?lonely{i} {{ TYPE \"Person\" NAME \"Lonely{i}\" }}\n"
+        ));
+    }
+    text.push_str(
+        "CREATE EVIDENCE ?e { SET FIELDS {evidence_class: \"observation\", payload: \"seen\"} }\n}",
+    );
+    ok(&nexus, &text).await;
+
+    // No tuple in either direction: only the five lonely Concepts.
+    let orphans = ok(
+        &nexus,
+        r#"FIND(COUNT(?c)) WHERE { ?c CONCEPT {} NOT { (?c, ?out, ?o) } NOT { (?s, ?in, ?c) } }"#,
+    )
+    .await;
+    assert_eq!(orphans, json!([5]));
+
+    // Assertions citing no Evidence: every one but the ten that do.
+    let uncited = ok(
+        &nexus,
+        r#"FIND(COUNT(?a)) WHERE { ?a ASSERTION {} NOT { STRUCTURAL (?a, "evidence", ?e) } }"#,
+    )
+    .await;
+    assert_eq!(uncited, json!([pairs - 10]));
+
+    // OPTIONAL keeps its padding: a lonely Person has no preference to join.
+    let optional = ok(
+        &nexus,
+        r#"FIND(?p.name, ?o.name) WHERE {
+            ?p CONCEPT {type: "Person"}
+            OPTIONAL { (?p, "prefers", ?o) }
+            FILTER(?p.name == "Lonely0" || ?p.name == "P7")
+        } ORDER BY ?p.name"#,
+    )
+    .await;
+    assert_eq!(optional, json!([["Lonely0", null], ["P7", "O7"]]));
+}

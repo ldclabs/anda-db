@@ -2,6 +2,21 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- KQL `NOT` and `OPTIONAL` blocks no longer re-scan the Space for every outer
+  row. A tuple pattern whose subject or object variable every earlier solution
+  already bound narrows the Proposition index by those elements (up to 256
+  distinct, merge classes included), and a `STRUCTURAL` pattern reads such a
+  bound source the way it reads a fixed one. An anti-join such as
+  `?c CONCEPT {} NOT { (?c, ?p, ?o) }` over a few thousand elements now examines
+  about one candidate set per row instead of rows × all Propositions, and no
+  longer fails `ResourceExhausted` at the 100,000-element budget. Answers are
+  unchanged, except that a bound non-Concept source now reports its Profile
+  structural fields, as a fixed source and kip-do already did.
+
 ## [0.14.0] — 2026-09-25
 
 This release aligns every AndaDB Rust package, the Python binding and

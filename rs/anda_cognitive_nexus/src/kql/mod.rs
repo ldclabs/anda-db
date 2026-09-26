@@ -987,7 +987,7 @@ impl<'a> Context<'a> {
                 object,
             } => {
                 let table = self
-                    .match_structural(variable.as_deref(), subject, field, object)
+                    .match_structural(variable.as_deref(), subject, field, object, &solutions)
                     .await?;
                 self.join(solutions, table)?
             }
