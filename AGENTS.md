@@ -175,6 +175,12 @@ and include the generated diff:
 - `test/conformance/fixtures.generated.ts`
 - `test/oracle/corpus.generated.ts`
 
+The oracle corpus is harvested from the shared conformance fixtures and from
+every KIP command string literal in the `src/` and `tests/` directories of
+`rs/anda_kip` and `rs/anda_cognitive_nexus`. Adding or editing such a string
+is a generation-source change even when the commit touches only Rust tests:
+regenerate before committing, or the CI TypeScript job fails its drift check.
+
 When the Rust KIP parser changes, also run `pnpm run build:oracle-wasm` from
 `ts/kip-do` and include the updated `vendor/anda_kip_wasm/` artifacts. This
 requires wasm-pack and the WASM target toolchain. `pnpm run codegen` does not
