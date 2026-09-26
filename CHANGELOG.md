@@ -47,6 +47,10 @@ All notable changes to this workspace are documented in this file.
   longer fails `ResourceExhausted` at the 100,000-element budget. Answers are
   unchanged, except that a bound non-Concept source now reports its Profile
   structural fields, as a fixed source and kip-do already did.
+- `SEARCH ... WITH TYPE` / `WITH PREDICATE` under a narrowed authority now
+  reads a promoted draft lineage (§20.16) whole, as unrestricted callers and
+  KQL type patterns do, instead of dropping elements still typed with the
+  draft symbol.
 
 ## [0.14.0] — 2026-09-25
 

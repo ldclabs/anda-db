@@ -8,7 +8,7 @@ use anda_cognitive_nexus::{
     capsule::SymbolMapping,
     governance::{
         AuthContext, SYSTEM_PRINCIPAL,
-        rows::principal_class,
+        rows::{AuthorityScope, principal_class},
         store::{GrantDraft, PrincipalDraft},
     },
     nexus::DEFAULT_SPACE,
@@ -661,4 +661,66 @@ async fn a_capsule_maps_source_draft_symbols_or_refuses() {
     )
     .await;
     assert_eq!(imported, json!(["kip://local/draft@0.0.0/Instrument"]));
+}
+
+/// `SEARCH ... WITH TYPE` reads a promoted lineage whole, whichever retrieval
+/// path the caller's authority selects: a Concept-scoped Grant takes the
+/// authorized-corpus scan, an unrestricted one the persistent index.
+#[tokio::test]
+async fn a_typed_search_reads_a_promoted_lineage_under_any_authority() {
+    let nexus = fresh("promoted_search").await;
+    ok(
+        &nexus,
+        r#"DEFINE CONCEPT TYPE "Instrument" {description: "A musical instrument."}"#,
+    )
+    .await;
+    ok(&nexus, DEFINE_MENTORS).await;
+    ok(
+        &nexus,
+        r#"CREATE CONCEPT ?violin { TYPE "Instrument" NAME "Violin" }"#,
+    )
+    .await;
+    activate_music(&nexus).await;
+    promote_to_music(&nexus).await;
+
+    let reader = "kip:principal:scoped-reader";
+    let gov = nexus.governance();
+    gov.ensure_principal(PrincipalDraft {
+        principal_id: reader.into(),
+        principal_class: principal_class::AGENT.into(),
+        display_name: reader.into(),
+        auth_provider: "test".into(),
+        auth_subject: reader.into(),
+    })
+    .await
+    .unwrap();
+    gov.create_grant(
+        GrantDraft {
+            space_id: DEFAULT_SPACE.into(),
+            grantee_principal: reader.into(),
+            actions: ["read", "search", "discover"].map(str::to_string).to_vec(),
+            scope: AuthorityScope {
+                kinds: vec!["concept".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        SYSTEM_PRINCIPAL,
+    )
+    .await
+    .unwrap();
+
+    let query = r#"SEARCH CONCEPT "Violin" WITH TYPE "Instrument""#;
+    let ids = |result: Json| {
+        result["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    let whole_space = ids(ok(&nexus, query).await);
+    let scoped = ids(ok(&nexus.session(AuthContext::principal(reader)), query).await);
+    assert_eq!(whole_space, vec![json!("C-1")]);
+    assert_eq!(scoped, whole_space);
 }

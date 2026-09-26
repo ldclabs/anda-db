@@ -252,6 +252,9 @@ pub(crate) async fn rank(
     );
     let mut views = std::collections::BTreeMap::new();
     let mut corpus_weight = 0usize;
+    // Only the caps these candidates' admission placed: the query's own
+    // governed limit may also carry other patterns' elements.
+    let mut read_cap: Option<usize> = None;
     let mut filters = vec![
         crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
         crate::store::eq_field(
@@ -264,16 +267,10 @@ pub(crate) async fn rank(
         ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
         _ => None,
     };
-    if let Some((field, symbol)) = selector
-        && let Some((low, high)) = crate::schema::lineage_range(symbol)
-    {
-        filters.push(anda_db::query::Filter::Field((
-            field.into(),
-            anda_db::query::RangeQuery::Between(
-                anda_db_schema::Fv::Text(low),
-                anda_db_schema::Fv::Text(high),
-            ),
-        )));
+    // The same promotion-aware lineage keys as the whole-Space path, so the
+    // authority a caller holds never changes which types a search reaches.
+    if let Some((field, symbol)) = selector {
+        filters.push(cx.symbol_filter(kind, field, std::slice::from_ref(symbol))?);
     }
     let ids = cx
         .candidates(
@@ -292,6 +289,9 @@ pub(crate) async fn rank(
         let Some(element) = cx.load(id).await? else {
             continue;
         };
+        if let Some(limit) = cx.read_limit_of(id) {
+            read_cap = Some(read_cap.map_or(limit, |c| c.min(limit)));
+        }
         if !element.is_active() {
             continue;
         }
@@ -310,16 +310,18 @@ pub(crate) async fn rank(
         crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
         let rendered = std::sync::Arc::new(rendered);
         if let Some(expected) = &with_type
-            && !rendered["schema_ref"]
-                .as_str()
-                .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
+            && !rendered["schema_ref"].as_str().is_some_and(|actual| {
+                cx.env
+                    .same_lineage(crate::schema::SymbolKind::ConceptType, actual, expected)
+            })
         {
             continue;
         }
         if let Some(expected) = &with_predicate
-            && !rendered["predicate_ref"]
-                .as_str()
-                .is_some_and(|actual| crate::schema::same_lineage(actual, expected))
+            && !rendered["predicate_ref"].as_str().is_some_and(|actual| {
+                cx.env
+                    .same_lineage(crate::schema::SymbolKind::PredicateType, actual, expected)
+            })
         {
             continue;
         }
@@ -349,7 +351,7 @@ pub(crate) async fn rank(
         let corpus = std::sync::Arc::new(AuthorizedCorpus {
             index,
             cap,
-            read_cap: cx.governed_limit(),
+            read_cap,
             weight: corpus_weight,
         });
         let mut cache = cx.store.search_corpora.lock();

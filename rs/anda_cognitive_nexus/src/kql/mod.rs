@@ -647,6 +647,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The result cap admitting this one element placed on the read, if any.
+    pub(crate) fn read_limit_of(&self, id: ElementId) -> Option<usize> {
+        let limit = self.visibility.get(&id)?.constraints.max_results?;
+        Some(limit as usize)
+    }
+
     /// Fetch independent bodies concurrently; admission and attachments still
     /// run in the deterministic candidate order. The batch bounds I/O and
     /// yields between chunks without weakening the Nexus snapshot guard.
@@ -1418,14 +1424,17 @@ async fn run(
         .as_ref()
         .map(|value| scalar_usize(&cx, value, "LIMIT"))
         .transpose()?;
+    // The FIND shape is checked first: building the covering filter walks
+    // lineage index keys, which a non-COUNT query would only repeat.
     if cursor.is_none() && !cx.is_historical() && query.for_time.is_none()
         && query.order_by.as_ref().is_none_or(Vec::is_empty)
+        && !query.find_clause.expressions.is_empty()
+        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { func: anda_kip::AggregationFunction::Count, var, .. } if var.path.is_empty()))
         && cx.authority.searches_whole_space(cx.auth)
         && !cx.authority.has_time_conditions()
         && let [clause] = query.where_clauses.as_slice()
         && let Some((kind, variable, filter)) = cx.covering_element(clause)?
-        && !query.find_clause.expressions.is_empty()
-        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { func: anda_kip::AggregationFunction::Count, var, .. } if var.var == variable && var.path.is_empty()))
+        && query.find_clause.expressions.iter().all(|expression| matches!(expression, anda_kip::FindExpression::Aggregation { var, .. } if var.var == variable))
     {
         let count = cx.store.elements(kind).query_all_ids_on_worker(filter).await.map_err(db_error)?.len();
         let value = if query.find_clause.expressions.len() == 1 { Json::from(count) }

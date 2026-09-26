@@ -77,6 +77,9 @@ impl<T: Tokenizer> BM25Index<T> {
 
     /// Builds reusable membership and average-length statistics for a corpus.
     pub fn prepare_scope(&self, ids: &[u64]) -> PreparedScope {
+        // Read the version before the lengths: a mutation that races the
+        // scan then leaves the scope looking stale, never current.
+        let version = self.stats().version;
         let mut scope = Scores::default();
         let mut total_tokens = 0usize;
         for id in ids {
@@ -90,7 +93,7 @@ impl<T: Tokenizer> BM25Index<T> {
             source: ids.to_vec(),
             ids: scope,
             total_tokens,
-            version: self.stats().version,
+            version,
         }
     }
 

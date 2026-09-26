@@ -925,13 +925,13 @@ impl Collection {
     ///
     /// # Constraint
     ///
-    /// [`Collection::update`] only refreshes an index when one of the updated
-    /// fields is part of that index's declared field list
-    /// (`index.virtual_field()` / the HNSW field name). A hook that derives an
-    /// index value from *other* fields will therefore go stale on updates that
-    /// touch only those other fields. Keep hook inputs within the index's
-    /// declared fields, or update the declared fields together with the
-    /// derived-from fields.
+    /// [`Collection::update`] refreshes a B-tree index only when an updated
+    /// field satisfies [`IndexHooks::btree_index_depends_on`] (by default, the
+    /// index's declared `index.virtual_field()` list); a hook that derives a
+    /// B-tree key from other columns must override it to name them. BM25 and
+    /// HNSW indexes refresh only for their declared fields, so their hooks
+    /// must keep inputs within those fields or have callers update the
+    /// declared fields together with the derived-from ones.
     pub fn set_index_hooks(&mut self, hooks: Arc<dyn IndexHooks>) {
         self.index_hooks = hooks;
     }

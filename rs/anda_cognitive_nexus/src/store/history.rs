@@ -227,7 +227,22 @@ impl Store {
         seq: u64,
         budget: usize,
     ) -> Result<(Vec<Element>, usize), KipError> {
+        use futures::StreamExt;
         let table = self.element_versions();
+        // Both paths read the chosen version rows with bounded concurrency.
+        let rows = |ids: Vec<u64>| {
+            futures::stream::iter(ids)
+                .map(|row_id| {
+                    let table = table.clone();
+                    async move {
+                        table
+                            .get_as::<ElementVersionRow>(row_id)
+                            .await
+                            .map_err(db_error)
+                    }
+                })
+                .buffered(8)
+        };
         // An early coordinate may contain few versions but many elements
         // created later. Prefer that small sequence range over all identities.
         let sequences = table.get_btree_index(&["seq"]).map_err(db_error)?;
@@ -256,8 +271,9 @@ impl Store {
                 .map_err(db_error)?;
             let scanned = ids.len();
             let mut latest = BTreeMap::<String, ElementVersionRow>::new();
-            for id in ids {
-                let row: ElementVersionRow = table.get_as(id).await.map_err(db_error)?;
+            let mut stream = rows(ids);
+            while let Some(row) = stream.next().await {
+                let row = row?;
                 if latest
                     .get(&row.element)
                     .is_none_or(|old| (row.seq, row.version) > (old.seq, old.version))
@@ -318,18 +334,7 @@ impl Store {
             }
             cursor = format!("{group}/\u{10ffff}");
         }
-        use futures::StreamExt;
-        let mut stream = futures::stream::iter(selected)
-            .map(|row_id| {
-                let table = table.clone();
-                async move {
-                    table
-                        .get_as::<ElementVersionRow>(row_id)
-                        .await
-                        .map_err(db_error)
-                }
-            })
-            .buffered(8);
+        let mut stream = rows(selected);
         let mut elements = Vec::new();
         while let Some(row) = stream.next().await {
             elements.push(decode(row?)?);

@@ -981,12 +981,11 @@ impl Collection {
                         name: self.name.clone(),
                         source: format!("BTree index {name:?} not found").into(),
                     })?;
-                indexes.push((index, value));
+                let len = index.query_with(value, |ids| Some(ids.len())).unwrap_or(0);
+                indexes.push((len, index, value));
             }
-            indexes.sort_by_key(|(index, value)| {
-                index.query_with(value, |ids| Some(ids.len())).unwrap_or(0)
-            });
-            let (driver, value) = indexes[0];
+            indexes.sort_by_key(|(len, ..)| *len);
+            let (driver_len, driver, value) = indexes[0];
             stats.index_keys += indexes.len();
             let has_id_filter = !id_queries.is_empty();
             let mut id_query = if id_queries.is_empty() {
@@ -1006,7 +1005,6 @@ impl Collection {
             let Some((lo, hi)) = id_envelope(&id_query) else {
                 return Ok(Vec::new());
             };
-            let driver_len = driver.query_with(value, |ids| Some(ids.len())).unwrap_or(0);
             let id_count = match &id_query {
                 RangeQuery::Eq(_) => 1,
                 RangeQuery::Include(ids) => ids.len(),
@@ -1024,7 +1022,7 @@ impl Collection {
                 for &id in walk {
                     stats.bitmap_ids += 1;
                     let mut matched = true;
-                    for (index, value) in &indexes {
+                    for (_, index, value) in &indexes {
                         stats.membership_probes += 1;
                         if !index.contains_id(value, id)? {
                             matched = false;
@@ -1059,14 +1057,11 @@ impl Collection {
             };
             for &id in walk {
                 stats.posting_ids += 1;
-                if !live.contains(&id)
-                    || !matches_id_query(&id_query, id)
-                    || candidates.is_some_and(|c| !c.contains(&id))
-                {
+                if !live.contains(&id) || !matches_id_query(&id_query, id) {
                     continue;
                 }
                 let mut matches = true;
-                for (index, value) in &indexes[1..] {
+                for (_, index, value) in &indexes[1..] {
                     stats.membership_probes += 1;
                     if !index.contains_id(value, id)? {
                         matches = false;
