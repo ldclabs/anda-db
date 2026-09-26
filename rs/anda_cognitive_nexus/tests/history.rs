@@ -127,6 +127,64 @@ async fn evolving(name: &str) -> (CognitiveNexus, u64, u64, String) {
     (nexus, created, renamed, tx)
 }
 
+/// Historical indexes cannot narrow merge-class lookups. Expanding each of
+/// 150 bound endpoints over 700 Concepts would exceed the candidate budget,
+/// even though this Space has only one tuple and no merged Concepts.
+#[tokio::test]
+async fn historical_bound_tuple_endpoints_stay_within_budget() {
+    let nexus = nexus("historical_bound_endpoints").await;
+    let mut text = String::from("MUTATE {\n");
+    for i in 0..150 {
+        text.push_str(&format!(
+            "CREATE CONCEPT ?p{i} {{ TYPE \"Person\" NAME \"P{i}\" }}\n\
+             CREATE CONCEPT ?o{i} {{ TYPE \"Option\" NAME \"O{i}\" }}\n"
+        ));
+    }
+    for i in 0..400 {
+        text.push_str(&format!(
+            "CREATE CONCEPT ?filler{i} {{ TYPE \"Person\" }}\n"
+        ));
+    }
+    text.push_str("ENSURE PROPOSITION ?t (?p0, \"prefers\", ?o0)\n}");
+    let (created, _) = commit(&nexus, &text).await;
+
+    for suffix in [String::new(), format!(" AS OF SEQ {created}")] {
+        for (query, expected) in [
+            (
+                r#"FIND(COUNT(?p)) WHERE {
+                    ?p CONCEPT {type: "Person", name: ?name}
+                    (?p, "prefers", ?o)
+                }"#,
+                json!([1]),
+            ),
+            (
+                r#"FIND(COUNT(?o)) WHERE {
+                    ?o CONCEPT {type: "Option"}
+                    (?p, "prefers", ?o)
+                }"#,
+                json!([1]),
+            ),
+            (
+                r#"FIND(COUNT(?p)) WHERE {
+                    ?p CONCEPT {type: "Person", name: ?name}
+                    NOT { (?p, "prefers", ?o) }
+                }"#,
+                json!([149]),
+            ),
+            (
+                r#"FIND(COUNT(?o), COUNT(?p)) WHERE {
+                    ?o CONCEPT {type: "Option"}
+                    OPTIONAL { (?p, "prefers", ?o) }
+                }"#,
+                json!([[150, 1]]),
+            ),
+        ] {
+            let command = format!("{query}{suffix}");
+            assert_eq!(ok(&nexus, &command).await, expected, "{command}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn as_of_seq_reads_the_state_that_coordinate_held() {
     let (nexus, created, renamed, _) = evolving("as_of_seq").await;

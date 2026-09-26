@@ -507,12 +507,20 @@ impl Context<'_> {
     /// The stored endpoint keys of a variable every earlier solution bound
     /// (`bound_elements`), each Concept widened to its merge class the way a
     /// fixed endpoint is. `None` above [`MAX_PINNED`] elements, where the
-    /// index lookup would be larger than the scan it replaces.
+    /// index lookup would be larger than the scan it replaces, or for a
+    /// historical read, whose candidates cannot be narrowed by these indexes.
     async fn pinned_keys(
         &mut self,
         known: &Solutions,
         name: &str,
     ) -> Result<Option<Vec<String>>, KipError> {
+        // Historical candidates ignore index filters, so expanding a merge
+        // class would scan all historical Concepts for each bound endpoint
+        // without narrowing the tuple scan. The subsequent join still checks
+        // these variable bindings against canonical tuple endpoints.
+        if self.is_historical() {
+            return Ok(None);
+        }
         let Some(ids) = bound_elements(known, name).filter(|ids| ids.len() <= MAX_PINNED) else {
             return Ok(None);
         };

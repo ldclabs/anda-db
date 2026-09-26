@@ -6,6 +6,12 @@ All notable changes to this workspace are documented in this file.
 
 ### Fixed
 
+- Historical KQL tuple patterns skip bound-endpoint index narrowing, which
+  cannot use historical indexes. Resolving a merge class for each bound
+  Concept otherwise repeatedly scanned all historical Concepts and could
+  exhaust the 100,000-element budget with only one Proposition. Canonical
+  endpoint matching and joins still enforce the bindings; current-state
+  queries retain the index optimization.
 - KQL `NOT` and `OPTIONAL` blocks no longer re-scan the Space for every outer
   row. A tuple pattern whose subject or object variable every earlier solution
   already bound narrows the Proposition index by those elements (up to 256
