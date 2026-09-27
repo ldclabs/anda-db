@@ -977,3 +977,105 @@ async fn completed_commitments_migrate_and_old_untouched_rows_are_repaired_once(
         nexus.close().await.unwrap();
     }
 }
+
+/// Creates and names Concepts, then finds one by a name FILTER, which the
+/// engine answers from its `query_keys` index, and one by a word inside a
+/// Chinese name, which only the Jieba tokenizer splits out.
+async fn filter_finds_a_new_concept(nexus: &CognitiveNexus) {
+    query(
+        nexus,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "Restarted Ada" }"#,
+    )
+    .await;
+    assert_eq!(
+        query(
+            nexus,
+            r#"FIND(?c.name) WHERE { ?c CONCEPT {} FILTER(?c.name == "Restarted Ada") }"#,
+        )
+        .await,
+        json!(["Restarted Ada"])
+    );
+    query(
+        nexus,
+        r#"CREATE CONCEPT ?c { TYPE "Person" NAME "长期记忆系统" }"#,
+    )
+    .await;
+    let hits = query(nexus, r#"SEARCH CONCEPT "记忆" LIMIT 5"#).await;
+    assert!(
+        hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["element"]["name"] == "长期记忆系统"),
+        "{hits}"
+    );
+}
+
+/// `connect` reads the persisted layout before it opens the store. The handle
+/// that probe opens must not become the store's: it has default index hooks
+/// and tokenizer, so after a restart new rows missed `query_keys`, and a
+/// FILTER that index answers found nothing.
+#[tokio::test]
+async fn a_restarted_2_0_database_indexes_what_it_writes() {
+    let store = Arc::new(InMemory::new());
+    open_v2(store.clone(), "restart_fresh")
+        .await
+        .close()
+        .await
+        .unwrap();
+    let nexus = open_v2(store, "restart_fresh").await;
+    filter_finds_a_new_concept(&nexus).await;
+}
+
+/// A migrated database is probed on every start: staging keeps its marker.
+#[tokio::test]
+async fn a_restarted_migrated_database_indexes_what_it_writes() {
+    let store = write_v1("restart_migrated").await;
+    open_v2(store.clone(), "restart_migrated")
+        .await
+        .close()
+        .await
+        .unwrap();
+    let nexus = open_v2(store, "restart_migrated").await;
+    filter_finds_a_new_concept(&nexus).await;
+}
+
+/// A store written before a collection's schema gained a column opens with
+/// the upgrade. The probe's handle used to stay registered at the stored
+/// version, so `Store::open` refused the upgrade and `connect` failed.
+#[tokio::test]
+async fn a_store_from_an_earlier_schema_version_upgrades_on_connect() {
+    use anda_cognitive_nexus::store::rows::ConceptRow;
+
+    let store = Arc::new(InMemory::new());
+    open_v2(store.clone(), "restart_upgrade")
+        .await
+        .close()
+        .await
+        .unwrap();
+    // Rewind `concepts` to the layout before `query_keys` existed.
+    let db = open_raw(store.clone(), "restart_upgrade").await;
+    db.delete_collection("concepts").await.unwrap();
+    let mut builder = anda_db::schema::Schema::builder();
+    for field in ConceptRow::schema()
+        .unwrap()
+        .iter()
+        .filter(|field| !matches!(field.name(), "_id" | "query_keys"))
+    {
+        builder.add_field(field.clone()).unwrap();
+    }
+    db.create_collection(
+        builder.build().unwrap(),
+        CollectionConfig {
+            name: "concepts".to_string(),
+            description: "Concepts — units of meaning".to_string(),
+        },
+        async |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    let nexus = open_v2(store, "restart_upgrade").await;
+    filter_finds_a_new_concept(&nexus).await;
+}

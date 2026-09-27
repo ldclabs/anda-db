@@ -2,6 +2,35 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.14.2] — 2026-09-26
+
+### Fixes
+
+- `anda_cognitive_nexus`: `CognitiveNexus::connect` no longer leaves the
+  handles it opened to detect a KIP 1.x layout registered for `Store::open` to
+  adopt. An adopted handle skipped the collection setup, so after every restart
+  the Concept collection (and, in a migrated store, the Proposition one) ran
+  without the engine's index hooks and Jieba tokenizer. In 0.14.1 this had two
+  visible effects:
+  - Rows written after a restart were missing from `query_keys`, so a KQL
+    `FILTER` on `name`, `key` or `canonical_id` equality, and the reference
+    narrowing that index serves, missed them (an owner-promoted draft type
+    queried by name returned nothing).
+  - A store written by 0.14.0 could not be opened: the probe kept its Concept
+    collection at schema version 0, and `connect` failed with "collection is
+    open with schema version 0, but version 1 was requested". The upgrade the
+    0.14.1 notes describe happened only for hosts that call `Store::open`
+    directly.
+
+  The probe now installs the element tokenizer and index hooks before recovery
+  replays anything, reuses a handle that is already open without closing it,
+  and closes a 2.0 collection it loaded, so `Store::open` loads it with its full
+  setup and schema upgrade. A migration stages a Proposition collection only
+  when it holds the 1.x layout. Existing entries are not rebuilt: a row written
+  after a restart under 0.14.1 stays out of `query_keys`, and a Concept written
+  after a restart under 0.14.0 or 0.14.1 keeps default-tokenizer BM25 terms,
+  until an update rewrites the columns those indexes derive from.
+
 ## [anda_db 0.14.1, anda_db_btree 0.14.1, anda_db_tfs 0.14.1, anda_cognitive_nexus 0.14.1] — 2026-09-26
 
 This patch release bounds million-row queries and fixes several KQL and SEARCH

@@ -483,7 +483,7 @@ async fn init_commit_log(c: &mut Collection) -> Result<(), DBError> {
 /// `create_*_nx` is a no-op once the index exists, but a freshly loaded handle
 /// starts with default hooks and tokenizer and needs both reinstalled.
 async fn init_envelope(c: &mut Collection) -> Result<(), DBError> {
-    c.set_index_hooks(Arc::new(SparseIndexHooks));
+    install_element_hooks(c);
     c.create_btree_index_nx(&["query_keys"]).await?;
     c.create_btree_index_nx(&["space"]).await?;
     c.create_btree_index_nx(&["state"]).await?;
@@ -491,8 +491,17 @@ async fn init_envelope(c: &mut Collection) -> Result<(), DBError> {
     Ok(())
 }
 
-async fn init_concepts(c: &mut Collection) -> Result<(), DBError> {
+/// The tokenizer and index hooks every element collection is opened with,
+/// installed before recovery replays anything and without building an index.
+/// A handle opened only to inspect the stored layout installs these too
+/// (`migrate::prepare`): recovery under the defaults would leave index entries
+/// the engine's hooks cannot later identify.
+pub(crate) fn install_element_hooks(c: &mut Collection) {
     c.set_tokenizer(jieba_tokenizer());
+    c.set_index_hooks(Arc::new(SparseIndexHooks));
+}
+
+async fn init_concepts(c: &mut Collection) -> Result<(), DBError> {
     init_envelope(c).await?;
     // `key` is the logical identity `UPSERT ... MATCH {key: ...}` resolves. It
     // is Space-local and type-lineage scoped, so lookup intersects this with
@@ -512,7 +521,6 @@ async fn init_concepts(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_propositions(c: &mut Collection) -> Result<(), DBError> {
-    c.set_tokenizer(jieba_tokenizer());
     init_envelope(c).await?;
     // Declared `#[unique]` by the schema: this is the constraint that keeps
     // one canonical Proposition per semantic tuple in a Space (§93.6).
@@ -532,7 +540,6 @@ async fn init_propositions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_assertions(c: &mut Collection) -> Result<(), DBError> {
-    c.set_tokenizer(jieba_tokenizer());
     init_envelope(c).await?;
     // Projection's first move is always "every Assertion about this
     // Proposition", so this index is the one that has to be fast.
@@ -549,7 +556,6 @@ async fn init_assertions(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_evidence(c: &mut Collection) -> Result<(), DBError> {
-    c.set_tokenizer(jieba_tokenizer());
     init_envelope(c).await?;
     c.create_btree_index_nx(&["client_key"]).await?;
     c.create_btree_index_nx(&["evidence_class"]).await?;
@@ -563,7 +569,6 @@ async fn init_evidence(c: &mut Collection) -> Result<(), DBError> {
 }
 
 async fn init_activities(c: &mut Collection) -> Result<(), DBError> {
-    c.set_tokenizer(jieba_tokenizer());
     init_envelope(c).await?;
     c.create_btree_index_nx(&["client_key"]).await?;
     c.create_btree_index_nx(&["activity_class"]).await?;

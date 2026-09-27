@@ -81,6 +81,60 @@ async fn init_staging(c: &mut anda_db::collection::Collection) -> Result<(), DBE
     Ok(())
 }
 
+/// An element collection opened to read which layout it stores.
+///
+/// The database keeps a handle registered, and the next open of that name
+/// returns it with its setup callback skipped. So a probe that loaded the
+/// collection installs the engine's tokenizer and index hooks before recovery
+/// replays anything, and [`Probe::release`] unregisters a 2.0 collection again:
+/// `Store::open` must load it with its whole setup — indexes a newer engine
+/// adds, and any schema upgrade, which an open handle refuses. Kept, the probe
+/// handle indexed nothing into `query_keys` and tokenized with the defaults.
+struct Probe {
+    collection: Arc<anda_db::collection::Collection>,
+    /// Whether this probe loaded the handle, rather than finding it open.
+    loaded: bool,
+}
+
+impl Probe {
+    async fn open(db: &AndaDB, name: &str) -> Result<Self, KipError> {
+        // An open handle is someone's: read it, never close it.
+        if let Some(collection) = db.get_open_collection(name) {
+            return Ok(Self {
+                collection,
+                loaded: false,
+            });
+        }
+        // Opened without a schema, so a persisted 1.x one stays in force and
+        // no index is built against fields it does not have.
+        let collection = db
+            .open_collection(name.to_string(), async |c| {
+                crate::store::install_element_hooks(c);
+                Ok(())
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(Self {
+            collection,
+            loaded: true,
+        })
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.collection.schema()
+    }
+
+    /// Unregisters a handle this probe loaded; see [`Probe`].
+    async fn release(self, db: &AndaDB) -> Result<(), KipError> {
+        if !self.loaded {
+            return Ok(());
+        }
+        let name = self.collection.name().to_string();
+        drop(self.collection);
+        db.close_collection(&name).await.map_err(db_error)
+    }
+}
+
 /// Whether a persisted `concepts` collection is the 1.x one.
 ///
 /// Decided from the schema the collection actually carries, not from a version
@@ -109,15 +163,13 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
     if !collections.contains(CONCEPTS) {
         // A fresh database, or one already migrated: nothing occupies the name.
         if collections.contains(PROPOSITIONS) {
-            let c = db
-                .open_collection(PROPOSITIONS.to_string(), async |_| Ok(()))
-                .await
-                .map_err(db_error)?;
-            if is_v1_propositions(&c.schema()) {
+            let probe = Probe::open(db, PROPOSITIONS).await?;
+            if is_v1_propositions(&probe.schema()) {
                 return Err(KipError::internal_error(
                     "migration: legacy propositions remain without concepts or a durable staging copy",
                 ));
             }
+            probe.release(db).await?;
         }
         return Ok(());
     }
@@ -125,13 +177,11 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
     // Opened without a schema, so the persisted 1.x one stays in force and no
     // index is built against fields it does not have. Passing the 2.0 schema
     // here is what fails with a message about a missing `key` field.
-    let concepts = db
-        .open_collection(CONCEPTS.to_string(), async |_| Ok(()))
-        .await
-        .map_err(db_error)?;
-    if !is_v1_concepts(&concepts.schema()) {
-        return Ok(());
+    let probe = Probe::open(db, CONCEPTS).await?;
+    if !is_v1_concepts(&probe.schema()) {
+        return probe.release(db).await;
     }
+    let concepts = probe.collection;
 
     log::warn!(
         action = "migrate::prepare",
@@ -170,11 +220,13 @@ pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
 
     copy_out(&concepts, &staging, kind::CONCEPT).await?;
     if collections.contains(PROPOSITIONS) {
-        let propositions = db
-            .open_collection(PROPOSITIONS.to_string(), async |_| Ok(()))
-            .await
-            .map_err(db_error)?;
-        copy_out(&propositions, &staging, kind::PROPOSITION).await?;
+        // Only 1.x rows are staged; a 2.0 collection is left to `Store::open`.
+        let probe = Probe::open(db, PROPOSITIONS).await?;
+        if is_v1_propositions(&probe.schema()) {
+            copy_out(&probe.collection, &staging, kind::PROPOSITION).await?;
+        } else {
+            probe.release(db).await?;
+        }
     }
     staging.flush(unix_ms()).await.map_err(db_error)?;
     staging
@@ -215,39 +267,40 @@ async fn drop_legacy_collections(
         if !db.metadata().collections.contains(name) {
             continue;
         }
-        let collection = db
-            .open_collection(name.to_string(), async |_| Ok(()))
-            .await
-            .map_err(db_error)?;
+        let probe = Probe::open(db, name).await?;
         let legacy = if name == CONCEPTS {
-            is_v1_concepts(&collection.schema())
+            is_v1_concepts(&probe.schema())
         } else {
-            is_v1_propositions(&collection.schema())
+            is_v1_propositions(&probe.schema())
         };
-        if legacy {
-            // A compatibility checkpoint or storage failure must not cause us
-            // to discard the last surviving copy. Verify each remaining source
-            // row before its collection is irreversibly removed.
-            let kind = if name == CONCEPTS {
-                LegacyKind::Concept
-            } else {
-                LegacyKind::Proposition
-            };
-            let copies: std::collections::BTreeMap<_, _> = rows(staging, kind)
-                .await?
-                .into_iter()
-                .map(|row| (row.legacy_id, row.doc))
-                .collect();
-            for id in collection.ids() {
-                let source: Json = collection.get_as(id).await.map_err(db_error)?;
-                if copies.get(&id) != Some(&source) {
-                    return Err(KipError::internal_error(format!(
-                        "migration: refusing to drop {name}; staging has no identical copy of row {id}"
-                    )));
-                }
-            }
-            db.delete_collection(name).await.map_err(db_error)?;
+        // A migrated database comes through here on every start.
+        if !legacy {
+            probe.release(db).await?;
+            continue;
         }
+        let collection = probe.collection;
+        // A compatibility checkpoint or storage failure must not cause us
+        // to discard the last surviving copy. Verify each remaining source
+        // row before its collection is irreversibly removed.
+        let kind = if name == CONCEPTS {
+            LegacyKind::Concept
+        } else {
+            LegacyKind::Proposition
+        };
+        let copies: std::collections::BTreeMap<_, _> = rows(staging, kind)
+            .await?
+            .into_iter()
+            .map(|row| (row.legacy_id, row.doc))
+            .collect();
+        for id in collection.ids() {
+            let source: Json = collection.get_as(id).await.map_err(db_error)?;
+            if copies.get(&id) != Some(&source) {
+                return Err(KipError::internal_error(format!(
+                    "migration: refusing to drop {name}; staging has no identical copy of row {id}"
+                )));
+            }
+        }
+        db.delete_collection(name).await.map_err(db_error)?;
     }
     Ok(())
 }
@@ -265,24 +318,24 @@ pub(crate) async fn read_live_v1(
     if !collections.contains(CONCEPTS) {
         return Ok(None);
     }
-    let concepts = db
-        .open_collection(CONCEPTS.to_string(), async |_| Ok(()))
-        .await
-        .map_err(db_error)?;
-    if !is_v1_concepts(&concepts.schema()) {
+    let probe = Probe::open(db, CONCEPTS).await?;
+    if !is_v1_concepts(&probe.schema()) {
+        probe.release(db).await?;
         return Ok(None);
     }
+    let concepts = probe.collection;
 
     let mut concept_rows = Vec::new();
     read_into(&concepts, kind::CONCEPT, &mut concept_rows).await?;
 
     let mut proposition_rows = Vec::new();
     if collections.contains(PROPOSITIONS) {
-        let propositions = db
-            .open_collection(PROPOSITIONS.to_string(), async |_| Ok(()))
-            .await
-            .map_err(db_error)?;
-        read_into(&propositions, kind::PROPOSITION, &mut proposition_rows).await?;
+        let probe = Probe::open(db, PROPOSITIONS).await?;
+        if is_v1_propositions(&probe.schema()) {
+            read_into(&probe.collection, kind::PROPOSITION, &mut proposition_rows).await?;
+        } else {
+            probe.release(db).await?;
+        }
     }
     Ok(Some((concept_rows, proposition_rows)))
 }
