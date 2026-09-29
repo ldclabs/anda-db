@@ -667,6 +667,26 @@ impl Session {
         .await
     }
 
+    /// Returns an element the 1.x migration archived on a stamped TTL; only
+    /// the migration's own repair reaches it.
+    pub(crate) async fn restore_migrated(
+        &self,
+        space_id: &str,
+        element: crate::id::ElementId,
+    ) -> Result<(), KipError> {
+        self.with_authority(space_id, async |authority| {
+            crate::governance::element::restore_migrated(
+                &self.nexus.store,
+                space_id,
+                element,
+                &authority,
+                &self.auth,
+            )
+            .await
+        })
+        .await
+    }
+
     /// Acts on the elements whose retention has lapsed (§19.1, §19.2).
     ///
     /// `retention.expires_at` says when the *record* stops being kept. It is not

@@ -33,7 +33,7 @@
 
 use anda_kip::{Executor, Json, KipError, KipErrorCode, Map, Operation, Request, TopLevelStatus};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::MIGRATION_KEY_PREFIX;
 use super::package::Vocabulary;
@@ -114,7 +114,8 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         return Ok(());
     };
     if stage::is_complete(&staging).await? {
-        return repair_completed_commitments(nexus, &staging).await;
+        repair_completed_commitments(nexus, &staging).await?;
+        return repair_durable_expiry(nexus, &staging).await;
     }
 
     let concepts = stage::rows(&staging, LegacyKind::Concept).await?;
@@ -186,10 +187,12 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
         &concept_ids,
         &actor,
         &speakers,
+        &durable_relations(&concepts, &propositions),
     )
     .await?;
     for row in &concepts {
-        if super::values::archive(&row.doc["metadata"], &crate::time::now()) {
+        let metadata = super::values::lifecycle(&row.doc["metadata"], durable_concept(row));
+        if super::values::archive(&metadata, &crate::time::now()) {
             run(
                 nexus,
                 "TRANSITION :id TO \"archived\"",
@@ -211,6 +214,7 @@ pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
     )
     .await?;
     repair_completed_commitments(nexus, &staging).await?;
+    repair_durable_expiry(nexus, &staging).await?;
     log::warn!(
         action = "migrate::load",
         concepts = concept_ids.len(),
@@ -274,6 +278,155 @@ async fn repair_completed_commitments(
         .await
         .map_err(internal)?;
     Ok(())
+}
+
+fn durable_concept(row: &LegacyRow) -> bool {
+    row.doc["type"].as_str().is_some_and(super::values::durable)
+}
+
+/// The 1.x relation rows between two durable Concepts.
+///
+/// A statement default reached its links too, so these carry the same stamped
+/// TTL. A claim that `$self` learned an Insight or that its owner prefers
+/// something lasts as long as the two things it connects; a link to an Event
+/// keeps the Event's lifecycle.
+fn durable_relations(concepts: &[LegacyRow], propositions: &[LegacyRow]) -> BTreeSet<u64> {
+    let durable: BTreeSet<u64> = concepts
+        .iter()
+        .filter(|row| durable_concept(row))
+        .map(|row| row.legacy_id)
+        .collect();
+    let is_durable = |endpoint: &Json| {
+        endpoint
+            .as_str()
+            .and_then(|endpoint| endpoint.strip_prefix("C:"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some_and(|id| durable.contains(&id))
+    };
+    propositions
+        .iter()
+        .filter(|row| is_durable(&row.doc["subject"]) && is_durable(&row.doc["object"]))
+        .map(|row| row.legacy_id)
+        .collect()
+}
+
+/// Takes back what 0.14.2 and earlier did to durable records with a stamped
+/// 1.x TTL ([`super::values::durable`]): the TTL became `retention.expires_at`,
+/// so the retention sweep archives them on that date, and one already past
+/// was archived at import.
+///
+/// Only what the migration itself wrote is undone. A record whose retention
+/// changed since import was decided by someone and is left alone. An archive
+/// is reversed only when the TTL was its one reason — lapsed when the record
+/// was imported, or lapsed later and swept, which the sweep records on the
+/// element — because reviving an element archived for any other reason is
+/// what `release` refuses to do. The durable marker makes this one scan.
+async fn repair_durable_expiry(
+    nexus: &CognitiveNexus,
+    staging: &std::sync::Arc<anda_db::collection::Collection>,
+) -> Result<(), KipError> {
+    const MARKER: &str = "durable_expiry_repaired_v1";
+    if staging.get_extension_as::<bool>(MARKER) == Some(true) {
+        return Ok(());
+    }
+    let concepts = stage::rows(staging, LegacyKind::Concept).await?;
+    let propositions = stage::rows(staging, LegacyKind::Proposition).await?;
+    let mut repaired = (0usize, 0usize);
+    for row in concepts.iter().filter(|row| durable_concept(row)) {
+        let key = concept_key(row.legacy_id);
+        let outcome = repair_expiry(
+            nexus,
+            anda_kip::ElementKind::Concept,
+            &key,
+            &row.doc["metadata"],
+        )
+        .await?;
+        repaired.0 += usize::from(outcome.0);
+        repaired.1 += usize::from(outcome.1);
+    }
+    let durable = durable_relations(&concepts, &propositions);
+    for row in propositions
+        .iter()
+        .filter(|row| durable.contains(&row.legacy_id))
+    {
+        for predicate in row.doc["predicates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Json::as_str)
+        {
+            let outcome = repair_expiry(
+                nexus,
+                anda_kip::ElementKind::Assertion,
+                &proposition_key(row.legacy_id, predicate),
+                super::values::metadata(&row.doc["properties"][predicate]),
+            )
+            .await?;
+            repaired.0 += usize::from(outcome.0);
+            repaired.1 += usize::from(outcome.1);
+        }
+    }
+    staging
+        .save_extension_from(MARKER.to_string(), &true)
+        .await
+        .map_err(internal)?;
+    if repaired != (0, 0) {
+        log::warn!(
+            action = "migrate::repair_durable_expiry",
+            cleared = repaired.0,
+            restored = repaired.1;
+            "cleared a stamped KIP 1.x TTL from {} durable record(s); restored {}",
+            repaired.0,
+            repaired.1,
+        );
+    }
+    Ok(())
+}
+
+/// Repairs one migrated element; reports (retention cleared, archive reversed).
+async fn repair_expiry(
+    nexus: &CognitiveNexus,
+    kind: anda_kip::ElementKind,
+    client_key: &str,
+    metadata: &Json,
+) -> Result<(bool, bool), KipError> {
+    let stamped = super::values::retention(metadata);
+    let lifecycle = super::values::lifecycle(metadata, true);
+    let kept = super::values::retention(&lifecycle);
+    if stamped == kept {
+        return Ok((false, false));
+    }
+    let Some(id) = nexus
+        .store
+        .find_by_client_key(DEFAULT_SPACE, kind, client_key)
+        .await?
+    else {
+        return Ok((false, false));
+    };
+    let element = nexus.store.get_element(id).await?;
+    let members = |retention: &Json| retention.as_object().cloned().unwrap_or_default();
+    let cleared = members(element.retention()) == members(&kept);
+    if !cleared && element.retention() != &stamped {
+        return Ok((false, false));
+    }
+    let lapsed_at_import = super::values::timestamp(&metadata["expires_at"])
+        .is_some_and(|at| at.as_str() <= element.envelope().created_at.as_str());
+    let swept = element.governance()["retention_lapsed"] == "expired";
+    let restore = element.state() == crate::store::rows::state::ARCHIVED
+        && (lapsed_at_import || swept)
+        && !super::values::archive(&lifecycle, &crate::time::now());
+    if !cleared {
+        let mut parameters = Map::from_iter([("id".into(), json!(id.to_string()))]);
+        let retention = render_assignments(&kept, "r", &mut parameters);
+        run(nexus, &format!("SET RETENTION :id {retention}"), parameters).await?;
+    }
+    if restore {
+        nexus
+            .system_session()
+            .restore_migrated(DEFAULT_SPACE, id)
+            .await?;
+    }
+    Ok((!cleared, restore))
 }
 
 /// Installs the generated package and adds it to the Space's active lock.
@@ -468,7 +621,10 @@ async fn load_concepts(
             // actually showed people.
             parameters.insert(
                 format!("r{index}"),
-                super::values::retention(&row.doc["metadata"]),
+                super::values::retention(&super::values::lifecycle(
+                    &row.doc["metadata"],
+                    super::values::durable(type_name),
+                )),
             );
             parameters.insert(format!("raw{index}"), row.doc.clone());
             let identity = if name.is_empty() {
@@ -576,6 +732,7 @@ async fn load_propositions(
     concepts: &BTreeMap<u64, String>,
     actor: &str,
     speakers: &BTreeMap<String, String>,
+    durable: &BTreeSet<u64>,
 ) -> Result<usize, KipError> {
     let mut created: BTreeMap<String, String> = BTreeMap::new();
     let mut claims = BTreeMap::new();
@@ -644,6 +801,7 @@ async fn load_propositions(
                 vocabulary,
                 actor,
                 speakers,
+                durable,
                 &mut created,
                 &mut claims,
             )
@@ -651,18 +809,20 @@ async fn load_propositions(
         }
         outstanding = deferred;
     }
-    finalize_claims(nexus, rows, &claims, &created, speakers).await?;
+    finalize_claims(nexus, rows, &claims, &created, speakers, durable).await?;
     Ok(assertions)
 }
 
 type Ready = (u64, String, Json, String, String);
 
+#[allow(clippy::too_many_arguments)]
 async fn write_batch(
     nexus: &CognitiveNexus,
     chunk: &[Ready],
     vocabulary: &Vocabulary,
     actor: &str,
     speakers: &BTreeMap<String, String>,
+    durable: &BTreeSet<u64>,
     created: &mut BTreeMap<String, String>,
     claims: &mut BTreeMap<String, String>,
 ) -> Result<usize, KipError> {
@@ -705,7 +865,13 @@ async fn write_batch(
             json!({"legacy_id":legacy_id,"predicate":predicate,"properties":properties}),
         );
         parameters.insert(format!("time{index}"), super::values::valid_time(metadata));
-        parameters.insert(format!("ret{index}"), super::values::retention(metadata));
+        parameters.insert(
+            format!("ret{index}"),
+            super::values::retention(&super::values::lifecycle(
+                metadata,
+                durable.contains(legacy_id),
+            )),
+        );
         // A legacy `author` that names exactly one migrated Concept is a
         // speaker the old system really did record; anything else stays the
         // migration actor, and the string stays an attribute (§12).
@@ -762,8 +928,10 @@ async fn finalize_claims(
     claims: &BTreeMap<String, String>,
     propositions: &BTreeMap<String, String>,
     speakers: &BTreeMap<String, String>,
+    durable: &BTreeSet<u64>,
 ) -> Result<(), KipError> {
     let mut metadata = BTreeMap::new();
+    let mut durable_keys = BTreeSet::new();
     for row in rows {
         for predicate in row.doc["predicates"]
             .as_array()
@@ -771,8 +939,12 @@ async fn finalize_claims(
             .flatten()
             .filter_map(Json::as_str)
         {
+            let key = proposition_key(row.legacy_id, predicate);
+            if durable.contains(&row.legacy_id) {
+                durable_keys.insert(key.clone());
+            }
             metadata.insert(
-                proposition_key(row.legacy_id, predicate),
+                key,
                 super::values::metadata(&row.doc["properties"][predicate]),
             );
         }
@@ -806,7 +978,10 @@ async fn finalize_claims(
         {
             parameters.insert("by".into(), json!(next_id));
             run(nexus, "TRANSITION :id TO \"superseded\" BY :by", parameters).await?;
-        } else if super::values::archive(meta, &now) {
+        } else if super::values::archive(
+            &super::values::lifecycle(meta, durable_keys.contains(&key)),
+            &now,
+        ) {
             // An ambiguous legacy actor or revision pointer does not authorize
             // us to fabricate a source-specific withdrawal/supersession.
             run(nexus, "TRANSITION :id TO \"archived\"", parameters).await?;

@@ -334,6 +334,57 @@ pub async fn release(
     Ok(())
 }
 
+/// Returns an element the KIP 1.x migration archived on a 1.x TTL that was
+/// never meant for it.
+///
+/// Archive is one-way for every ordinary caller (§52.5), and `release` refuses
+/// to revive an archived element because it cannot know why it was archived.
+/// This is the migration taking back its own write: the caller has checked the
+/// staged 1.x row and found the stamped TTL to be the one reason. Crate-private
+/// so no request reaches it, and audited like every Governance move.
+pub(crate) async fn restore_migrated(
+    store: &Store,
+    space_id: &str,
+    id: ElementId,
+    authority: &EffectiveAuthority,
+    auth: &AuthContext,
+) -> Result<(), KipError> {
+    let element = readable(store, space_id, id, authority, auth).await?;
+    if element.state() != state::ARCHIVED {
+        return Ok(());
+    }
+    let resource = ResourceContext::of_element(&element);
+    let approved = decide(
+        store,
+        space_id,
+        &resource,
+        Permission::Archive,
+        authority,
+        auth,
+    )
+    .await?;
+    // The sweep's reason goes with the archive it explained.
+    let patch = |governance: &Json| set_member(governance, RETENTION_LAPSED_KEY, Json::Null);
+    apply(
+        &Governed {
+            store,
+            space_id,
+            auth,
+        },
+        element,
+        Change {
+            op: "migration_restore",
+            audit_op: "migration_restore",
+            new_state: Some(state::ACTIVE),
+        },
+        patch,
+        |version| serde_json::json!({"reason": "stamped_legacy_ttl", "version": version}),
+        approved,
+    )
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------

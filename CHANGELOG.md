@@ -2,6 +2,26 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_cognitive_nexus 0.14.3] — 2026-09-30
+
+### Fixes
+
+- `anda_cognitive_nexus`: the KIP 1.x migration no longer expires records
+  1.x meant to keep. 1.x `expires_at` was a cleanup signal, and a
+  statement-level `WITH METADATA` default stamped an Event's TTL onto every
+  node the statement touched, including the Brain's own `$self`, its owner and
+  the Domains its knowledge is filed under. 0.14.2 carried that stamp into
+  `retention.expires_at`, so the retention sweep archives such a record on that
+  date, and archived one already past at import. Records of the types 1.x never
+  gave a TTL (`Person`, `Preference`, `Insight`, `Domain`, `$ConceptType`,
+  `$PropositionType`) and claims between two of them now drop the stamp; Events
+  and their links keep their expiry. A store migrated by 0.14.2 or earlier is
+  repaired once on open: the stamped expiry is cleared unless retention changed
+  since import, and a record archived at import or by a later sweep only
+  because of it returns to ordinary recall through a new audited Governance
+  move (`migration_restore`, journaled as `lifecycle` `archived` → `active`).
+  A record archived for any other reason stays archived.
+
 ## [anda_cognitive_nexus 0.14.2] — 2026-09-26
 
 ### Fixes

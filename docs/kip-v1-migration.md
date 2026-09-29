@@ -51,6 +51,17 @@ provenance, not independent Evidence or permission.
   that the old system did not record.
 - Validity windows map to `valid_time`, and expiry maps to retention. Pinning
   and mnemonic values are preserved separately from epistemic confidence.
+- 1.x `expires_at` was a cleanup signal, and a statement-level `WITH METADATA`
+  default stamped it onto every node a statement touched. Records of the types
+  1.x never gave a TTL (`Person`, `Preference`, `Insight`, `Domain`,
+  `$ConceptType`, `$PropositionType`), and claims between two of them, drop
+  that stamp: it neither becomes `retention.expires_at` nor archives them at
+  import. Events and their links keep their expiry. Stores migrated by 0.14.2
+  or earlier get a one-time guarded repair on open: a stamped expiry the
+  migration wrote is cleared unless retention changed since, and a record it
+  archived at import, or the retention sweep archived later, only because of
+  the stamp returns to ordinary recall. Anything archived for another reason
+  stays archived; the original stays in LegacyRecord.
 - A recorded retraction is reconstructed when attribution is known. Native
   supersession requires a reconstructible, acyclic revision by the same actor
   about the same Proposition. Cross-Proposition changes and ambiguous excluded

@@ -1079,3 +1079,270 @@ async fn a_store_from_an_earlier_schema_version_upgrades_on_connect() {
     let nexus = open_v2(store, "restart_upgrade").await;
     filter_finds_a_new_concept(&nexus).await;
 }
+
+const PAST: &str = "2020-01-01T00:00:00.000Z";
+const FUTURE: &str = "2099-01-01T00:00:00.000Z";
+
+/// A 1.x store whose formation stamped an episodic TTL onto the durable nodes
+/// and links one statement touched, the way a statement-level `WITH METADATA`
+/// default did. Returns the store and each fixture row's legacy id.
+async fn write_v1_stamped(
+    name: &str,
+) -> (Arc<InMemory>, std::collections::BTreeMap<&'static str, u64>) {
+    let store = write_v1(name).await;
+    let db = open_raw(store.clone(), name).await;
+    let concepts = db
+        .open_collection("concepts".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    let mut ids = std::collections::BTreeMap::new();
+    for (label, kind, name, metadata) in [
+        (
+            "self",
+            "Person",
+            "$self",
+            json!({"memory_tier":"short-term","expires_at":FUTURE}),
+        ),
+        (
+            "owner",
+            "Person",
+            "owner-principal",
+            json!({"expires_at":PAST}),
+        ),
+        ("domain", "Domain", "anda", json!({"expires_at":PAST})),
+        ("later", "Domain", "later", json!({"expires_at":FUTURE})),
+        (
+            "insight",
+            "Insight",
+            "Tests first",
+            json!({"expires_at":PAST}),
+        ),
+        (
+            "retired",
+            "Person",
+            "Retired",
+            json!({"status":"deprecated","expires_at":PAST}),
+        ),
+        ("event_old", "Event", "Old chat", json!({"expires_at":PAST})),
+        (
+            "event_new",
+            "Event",
+            "New chat",
+            json!({"expires_at":FUTURE}),
+        ),
+    ] {
+        let id = concepts
+            .add_from(&V1Concept {
+                _id: 0,
+                r#type: kind.into(),
+                name: name.into(),
+                attributes: json!({}),
+                metadata,
+            })
+            .await
+            .unwrap();
+        ids.insert(label, id);
+    }
+    concepts.flush(now_ms()).await.unwrap();
+    let propositions = db
+        .open_collection("propositions".into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    for (label, subject, predicate, object, expires_at) in [
+        ("learned", "self", "learned", "insight", FUTURE),
+        ("belongs", "owner", "belongs_to_domain", "domain", PAST),
+        ("involves", "event_old", "involves", "owner", PAST),
+    ] {
+        let id = propositions
+            .add_from(&V1Proposition {
+                _id: 0,
+                subject: format!("C:{}", ids[subject]),
+                object: format!("C:{}", ids[object]),
+                predicates: json!([predicate]),
+                properties: json!({predicate: {"attributes": {}, "metadata": {"expires_at": expires_at}}}),
+            })
+            .await
+            .unwrap();
+        ids.insert(label, id);
+    }
+    propositions.flush(now_ms()).await.unwrap();
+    db.close().await.unwrap();
+    (store, ids)
+}
+
+/// The migrated element a fixture row became, as its stored row.
+async fn migrated(nexus: &CognitiveNexus, key: &str) -> (anda_kip::ElementKind, u64, Json) {
+    let kind = if key.contains(":P:") {
+        anda_kip::ElementKind::Assertion
+    } else {
+        anda_kip::ElementKind::Concept
+    };
+    let id = nexus
+        .store
+        .find_by_client_key(DEFAULT_SPACE, kind, key)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{key} was not migrated"));
+    let row = nexus
+        .store
+        .elements(kind)
+        .get_as::<Json>(id.seq)
+        .await
+        .unwrap();
+    (kind, id.seq, row)
+}
+
+fn fixture_key(label: &str, ids: &std::collections::BTreeMap<&'static str, u64>) -> String {
+    match label {
+        "learned" => format!("kip:migrate:v1:P:{}:learned", ids[label]),
+        "belongs" => format!("kip:migrate:v1:P:{}:belongs_to_domain", ids[label]),
+        "involves" => format!("kip:migrate:v1:P:{}:involves", ids[label]),
+        _ => format!("kip:migrate:v1:C:{}", ids[label]),
+    }
+}
+
+#[tokio::test]
+async fn a_stamped_legacy_ttl_does_not_expire_durable_records() {
+    let name = "stamped_ttl";
+    let (store, ids) = write_v1_stamped(name).await;
+    let nexus = open_v2(store, name).await;
+    for (label, state, expires_at) in [
+        ("self", "active", None),
+        ("owner", "active", None),
+        ("domain", "active", None),
+        ("later", "active", None),
+        ("insight", "active", None),
+        // Archived for its status, not its TTL.
+        ("retired", "archived", None),
+        // An Event keeps the lifecycle 1.x gave it, and so do its links.
+        ("event_old", "archived", Some(PAST)),
+        ("event_new", "active", Some(FUTURE)),
+        ("learned", "active", None),
+        ("belongs", "active", None),
+        ("involves", "archived", Some(PAST)),
+    ] {
+        let (_, _, row) = migrated(&nexus, &fixture_key(label, &ids)).await;
+        assert_eq!(row["state"], state, "{label}");
+        assert_eq!(
+            row["retention"]["expires_at"].as_str(),
+            expires_at,
+            "{label}"
+        );
+    }
+    nexus.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_records_expired_by_an_earlier_migration_are_repaired_once() {
+    use anda_db::schema::Fv;
+    let name = "stamped_ttl_repair";
+    let (store, ids) = write_v1_stamped(name).await;
+    let nexus = open_v2(store.clone(), name).await;
+    // Reproduce what 0.14.2 stored: every TTL carried into retention, those
+    // already lapsed archived at import, and `$self` archived later by the
+    // retention sweep, which records why.
+    for (label, expires_at, archived) in [
+        ("self", FUTURE, true),
+        ("owner", PAST, true),
+        ("domain", PAST, true),
+        ("later", FUTURE, false),
+        ("insight", PAST, true),
+        ("retired", PAST, true),
+        ("learned", FUTURE, false),
+        ("belongs", PAST, true),
+    ] {
+        let (kind, seq, row) = migrated(&nexus, &fixture_key(label, &ids)).await;
+        let mut fields = std::collections::BTreeMap::from([
+            (
+                "retention".into(),
+                Fv::Json(json!({"expires_at": expires_at})),
+            ),
+            ("expires_at".into(), Fv::Text(expires_at.into())),
+        ]);
+        if archived {
+            fields.insert("state".into(), Fv::Text("archived".into()));
+        }
+        if label == "self" {
+            let mut governance = row["governance"].clone();
+            governance["retention_lapsed"] = json!("expired");
+            fields.insert("governance".into(), Fv::Json(governance));
+        }
+        nexus
+            .store
+            .elements(kind)
+            .update(seq, fields)
+            .await
+            .unwrap();
+    }
+    nexus.close().await.unwrap();
+    drop(nexus);
+
+    // Someone later decided this Domain's retention; that is not the stamp.
+    let nexus = open_v2(store.clone(), name).await;
+    let (_, later, _) = migrated(&nexus, &fixture_key("later", &ids)).await;
+    query(
+        &nexus,
+        &format!(
+            r#"SET RETENTION "C-{later}" {{retention_class: "standard", expires_at: "2098-01-01T00:00:00.000Z"}}"#
+        ),
+    )
+    .await;
+    let staging = nexus
+        .store
+        .db
+        .open_collection(LEGACY_STAGING.into(), async |_| Ok(()))
+        .await
+        .unwrap();
+    staging
+        .remove_extension("durable_expiry_repaired_v1")
+        .await
+        .unwrap();
+    nexus.close().await.unwrap();
+    drop(nexus);
+
+    let mut versions = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let nexus = open_v2(store.clone(), name).await;
+        for (label, state, expires_at) in [
+            ("self", "active", None),
+            ("owner", "active", None),
+            ("domain", "active", None),
+            ("later", "active", Some("2098-01-01T00:00:00.000Z")),
+            ("insight", "active", None),
+            // Its status archived it; only the stamp comes off.
+            ("retired", "archived", None),
+            ("event_old", "archived", Some(PAST)),
+            ("event_new", "active", Some(FUTURE)),
+            ("learned", "active", None),
+            ("belongs", "active", None),
+            ("involves", "archived", Some(PAST)),
+        ] {
+            let (_, _, row) = migrated(&nexus, &fixture_key(label, &ids)).await;
+            assert_eq!(row["state"], state, "{label}");
+            assert_eq!(
+                row["retention"]["expires_at"].as_str(),
+                expires_at,
+                "{label}"
+            );
+            assert!(
+                row["governance"].get("retention_lapsed").is_none(),
+                "{label}"
+            );
+            // The second start repairs nothing further.
+            let version = row["version"].as_u64().unwrap();
+            assert_eq!(
+                *versions.entry(label).or_insert(version),
+                version,
+                "{label}"
+            );
+        }
+        // Ordinary recall sees the restored records again.
+        let owner = query(
+            &nexus,
+            r#"FIND(?p.name) WHERE { ?p CONCEPT {type: "Person", key: "owner-principal"} }"#,
+        )
+        .await;
+        assert_eq!(owner, json!(["owner-principal"]));
+        nexus.close().await.unwrap();
+    }
+}

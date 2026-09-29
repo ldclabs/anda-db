@@ -194,6 +194,44 @@ pub(super) fn retention(metadata: &Json) -> Json {
     }
 }
 
+/// The 1.x Concept types whose records were meant to last.
+///
+/// 1.x `expires_at` was a cleanup *signal* for episodic records (1.x §2.10),
+/// never a deadline its engine enforced, and it leaked: a statement-level
+/// `WITH METADATA` default shallow-merged onto every element the statement
+/// touched, which 1.x's own syntax guide warns "silently stamping an episodic
+/// TTL onto matched durable nodes (e.g., a Person)". On these types the stamp
+/// is that artifact rather than anyone's decision, and 2.0 enforces what 1.x
+/// only signalled: carried over, it archived a Brain's own `$self`, its owner
+/// and the Domains its knowledge is filed under. The list is the one 1.x's
+/// formation guidance names as never carrying a TTL.
+const DURABLE_TYPES: &[&str] = &[
+    "$ConceptType",
+    "$PropositionType",
+    "Domain",
+    "Person",
+    "Preference",
+    "Insight",
+];
+
+pub(super) fn durable(type_name: &str) -> bool {
+    DURABLE_TYPES.contains(&type_name)
+}
+
+/// A record's 1.x metadata as the lifecycle mapping reads it: a durable one
+/// without its stamped `expires_at`. Pinning, class, status and validity still
+/// apply, and the original stays verbatim in `LegacyRecord`.
+pub(super) fn lifecycle(metadata: &Json, durable: bool) -> std::borrow::Cow<'_, Json> {
+    match metadata.as_object() {
+        Some(members) if durable && members.contains_key("expires_at") => {
+            let mut members = members.clone();
+            members.remove("expires_at");
+            std::borrow::Cow::Owned(Json::Object(members))
+        }
+        _ => std::borrow::Cow::Borrowed(metadata),
+    }
+}
+
 pub(super) fn mnemonic(metadata: &Json) -> Option<Json> {
     let mut state = Map::new();
     for field in ["memory_strength", "salience", "utility"] {
