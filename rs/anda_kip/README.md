@@ -1,13 +1,17 @@
 # anda_kip
 
+[![Crates.io](https://img.shields.io/crates/v/anda_kip.svg)](https://crates.io/crates/anda_kip)
+[![Docs.rs](https://docs.rs/anda_kip/badge.svg)](https://docs.rs/anda_kip)
+
 Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Cognitive Nexus documentation](../../docs/anda_cognitive_nexus.md) for implemented contracts and capability boundaries.
 
-`anda_kip` is the protocol SDK of the AndaDB workspace: the parser, executable
-AST, runtime envelope, error registry and executor seam for **KIP 2.0**
-(Knowledge Interaction Protocol), the cognitive state protocol between an Agent
-and a persistent Cognitive Nexus.
+`anda_kip` is the protocol SDK of the [AndaDB](https://github.com/ldclabs/anda-db)
+workspace: the parser, executable AST, runtime envelope, error registry and
+executor seam for **KIP 2.0** (Knowledge Interaction Protocol), the cognitive
+state protocol between an Agent and a persistent Cognitive Nexus. The KIP
+protocol version (`2.0`) is independent of this crate's version.
 
 ## What KIP 2.0 changes
 
@@ -46,28 +50,37 @@ erase the audit trail.
   lifecycle, Evidence roles, SEARCH modes, and the `[0,1]` ranges the protocol
   itself fixes. A misspelled `stance` is refused here rather than half-way
   through an engine's transaction;
-- **`error`** — the Core Error Registry (§87): stable named codes with a
-  category, a retry class and a recovery hint;
+- **`draft`** — what a `DEFINE` body may declare for the Space draft
+  vocabulary (§20.16);
+- **`error`** — the Core Error Registry (§87): 78 stable named codes, each
+  with a category, a retry class and a recovery hint;
 - **`request`** — the runtime envelope (§71–§85), including ingestion contexts,
   execution modes and receipts;
 - **`types`** — the Core data model (§6–§19);
 - **`capsule`** — portable Cognitive Capsules (§37–§41), with the canonical
   serialization their digests are taken over (§37.7);
 - **`conformance`** — the profile names an implementation declares (§89);
-- **`executor`** — the trait an engine implements, plus the read-only path;
-- bundled agent-facing prompts and function-calling schemas.
+- **`executor`** — the `Executor` trait an engine implements, and the
+  runners around it: `execute_kip`, `execute_readonly`, `execute_request`
+  and `execute_request_readonly`;
+- **`memory`** — the optional Agent-to-Brain Memory Interface binding (see
+  below);
+- **`cognitive`** — host-side contracts shared by Nexus engines and Brain
+  implementations, such as recording repair;
+- **`timestamp`** and **`json`** — canonical §6.5 timestamps and strict
+  portable JSON decoding;
+- bundled agent-facing material: `KIP_SYNTAX`, `SELF_INSTRUCTIONS`,
+  `SYSTEM_INSTRUCTIONS`, `COGNITIVE_MEMORY_PROFILE`, and the function-calling
+  definitions `KIP_FUNCTION_DEFINITION` (`execute_kip`) and
+  `KIP_READONLY_FUNCTION_DEFINITION` (`execute_kip_readonly`).
 
 This crate is protocol-only. Everything that needs state — Schema resolution,
-Governance, transactions, projection — belongs to an engine behind `Executor`.
+Governance, transactions, projection — belongs to an engine behind `Executor`,
+such as [`anda_cognitive_nexus`](../anda_cognitive_nexus).
 
-## Timestamp inputs
-
-KIP §6.5 requires valid UTC timestamps with exactly three fractional digits:
-`YYYY-MM-DDTHH:mm:ss.SSSZ`, including `.000Z` for whole seconds. Invalid
-strings return `ConstraintViolation`; non-string timestamps return
-`TypeMismatch`. Optional/null values follow each field's contract. The engines
-validate inputs without padding fractions or converting offsets; generated
-clock values truncate to milliseconds. Use `space_seq` for commit order.
+`pub` means API: `tests/surface.rs` compares every public item with
+`tests/fixtures/public_surface.txt`, so widening or narrowing the surface is a
+deliberate change to that file.
 
 ## Getting started
 
@@ -87,9 +100,11 @@ let read = parse_kip(
            ?a ASSERTION {proposition: ?p}
        }"#,
 )?;
+assert!(matches!(read, Command::Kql(_)));
 
 // What is currently believed: a Projection, computed not stored.
 let belief = parse_kip(r#"FIND(?b) WHERE { ?b BELIEF (:alice, "timezone", ?tz) }"#)?;
+assert!(matches!(belief, Command::Kql(_)));
 
 // Recording a claim. `by` and `mode` have no safe default: guessing the actor
 // would forge attribution, guessing the mode would turn hearsay into observation.
@@ -102,6 +117,32 @@ assert!(write.is_mutation());
 # Ok::<(), anda_kip::KipError>(())
 ```
 
+To run commands, hand an `Executor` to the runners: `execute_kip(&engine,
+command, dry_run)` for one command, `execute_readonly` for the read-only path
+(which refuses state-changing commands by what they parse as, never by a
+label), and `execute_request` for a full request envelope. A batch is not a
+transaction: the runners execute `independent` and `sequence` batches and
+refuse `atomic` with `UnsupportedCapability` rather than faking it.
+
+## Feature flags
+
+| Feature             | Effect                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| `schema-validation` | JSON Schema validation of Memory Interface shapes and `schema_validator` (`jsonschema` 0.58) |
+
+The feature is off by default so the parser's WASM build stays small.
+`schema_validator` returns a `jsonschema::Validator`, which is why the
+`jsonschema` 0.58 upgrade moved this crate to 0.14.1.
+
+## Timestamp inputs
+
+KIP §6.5 requires valid UTC timestamps with exactly three fractional digits:
+`YYYY-MM-DDTHH:mm:ss.SSSZ`, including `.000Z` for whole seconds. Invalid
+strings return `ConstraintViolation`; non-string timestamps return
+`TypeMismatch`. Optional/null values follow each field's contract. The engines
+validate inputs without padding fractions or converting offsets; generated
+clock values truncate to milliseconds. Use `space_seq` for commit order.
+
 ## SDK compatibility notes
 
 Capsule records retain wire order in `CapsuleRecords(Vec<Json>)`; use `by_kind`
@@ -110,10 +151,6 @@ round trips. Core lifecycle reference lists accept portable reference objects
 as well as native-view IDs. Explicit null payloads/results remain present.
 Independent/sequence batch receipts are attached to `results[].receipt`.
 See [SDK migration details](../../docs/anda_kip.md#11-cognitive-capsules).
-
-Parser and ingest benchmarks run with
-`cargo bench -p anda_kip --bench protocol --profile release-speed`.
-See the [paired measurements](../../docs/benchmarks/anda_kip_2026-09-23/README.md).
 
 ## Memory Interface binding
 
@@ -130,9 +167,33 @@ serves.
 
 ## Command-line syntax check
 
+`kip-cli` parses every `.kip` file in the given files or directories,
+reports each missing, unreadable or invalid one, and exits non-zero if any
+failed:
+
 ```bash
 cargo run -p anda_kip --bin kip-cli -- path/to/commands
 ```
+
+## Testing, benchmarks and fuzzing
+
+```bash
+cargo test -p anda_kip --all-features
+cargo bench -p anda_kip --bench protocol --profile release-speed
+```
+
+The tests cover property-based parser checks, byte-identical AST parity with
+fixtures produced by `@ldclabs/kip-lang` (see
+[tests/fixtures](tests/fixtures/README.md)), the wire schemas, the syntax
+documents and the public surface.
+Benchmark results are recorded in
+[docs/benchmarks/anda_kip_2026-09-23](../../docs/benchmarks/anda_kip_2026-09-23/README.md).
+Coverage-guided parser fuzzing lives in [`fuzz/`](fuzz/README.md).
+
+KIP command strings in this crate's `src/` and `tests/` feed the TypeScript
+engine's parser-oracle corpus. After adding or editing one, run
+`pnpm run codegen` in [`ts/kip-do`](../../ts/kip-do); after a parser change,
+also rebuild the WASM oracle with `pnpm run build:oracle-wasm`.
 
 ## Vendored KIP documents
 
@@ -159,6 +220,7 @@ live in `anda_cognitive_nexus/profiles/`.
 - [`Capsule-Specification.md`](./Capsule-Specification.md) — its §37–§41 and §95, the Cognitive Capsule, carried in a companion under the same numbering
 - [`Optional-Profiles-and-Migration.md`](./Optional-Profiles-and-Migration.md) — its §100, §101, §103 and Appendix I: the optional Historical and High-Assurance profiles, and KIP 1.x migration
 - [`Invariants.md`](./Invariants.md) — the invariant registry: the 49 Core invariants and the Cognitive Memory Profile's 49, one list
+- [`Memory-Interface.md`](./Memory-Interface.md) — the optional Agent-to-Brain binding
 - [`grammar/`](./grammar) and [`schemas/`](./schemas) — the normative EBNF grammars and the request / response / change-envelope wire schemas
 - [`KIPSyntax.md`](./KIPSyntax.md) — the LLM-facing syntax reference
 - [`SelfInstructions.md`](./SelfInstructions.md) — how an Agent should use its memory
@@ -167,8 +229,11 @@ live in `anda_cognitive_nexus/profiles/`.
 
 ## Related crates
 
-- `anda_cognitive_nexus` — the reference KIP executor
-- `anda_db` — the embedded storage core the reference backend uses
+- [`anda_cognitive_nexus`](../anda_cognitive_nexus) — the reference Rust KIP
+  engine
+- [`anda_kip_wasm`](../anda_kip_wasm) — this parser compiled to WebAssembly,
+  the oracle for the TypeScript engine's parser
+- [`@ldclabs/kip-do`](../../ts/kip-do) — the independent TypeScript engine
 
 ## License
 

@@ -1,32 +1,34 @@
 # anda_db_schema
 
-`anda_db_schema` is the type-system layer of the AndaDB workspace. It defines
-field types, field values, field entries, schemas, documents, and helper types
-used across the embedded database, derive macros, and higher-level memory
-components.
+[![Crates.io](https://img.shields.io/crates/v/anda_db_schema.svg)](https://crates.io/crates/anda_db_schema)
+[![Docs.rs](https://docs.rs/anda_db_schema/badge.svg)](https://docs.rs/anda_db_schema)
 
-## What This Crate Provides
+`anda_db_schema` is the type-system layer of the
+[AndaDB](https://github.com/ldclabs/anda-db) workspace. It defines the field
+types, field values, schemas and documents shared by the embedded database,
+its derive macros and the higher-level memory components. `anda_db`
+re-exports it as `anda_db::schema`.
 
-- `FieldType` for schema-level type declarations
-- `FieldValue` for runtime values validated against schemas
-- `FieldEntry` for per-field metadata such as type, uniqueness, and description
-- `Schema` and schema builders
-- `Document` and `DocumentOwned`
-- `Resource` and other shared model types used by the workspace
+## What this crate provides
 
-## When to Use It
+- `FieldType` (alias `Ft`): the closed set of declarable types — `Bool`,
+  `I64`, `U64`, `F64`, `F32`, `Bytes`, `Text`, `Json`, `Vector` (`bf16`),
+  `Array`, `Map` (typed keys, with wildcard keys for open maps) and `Option`.
+- `FieldValue` (alias `Fv`): the runtime value validated against a
+  `FieldType`, convertible to and from CBOR (`Cbor`) and serde-compatible in
+  both JSON and CBOR.
+- `FieldEntry` (alias `Fe`): one field's name, type, description, uniqueness
+  flag and stable numeric index, used as the on-disk key.
+- `Schema` and `SchemaBuilder`: an ordered, versioned set of field entries
+  with an implicit unique `_id: U64`, and forward-compatible upgrades through
+  `Schema::upgrade_with`.
+- `Document` (bound to a schema) and `DocumentOwned` (standalone).
+- `Resource`: a predefined structure for external files, blobs and URIs.
+- `Vector` (`Vec<bf16>`) with `vector_from_f32` / `vector_from_f64`.
+- The `AndaDBSchema` and `FieldTyped` derive macros, re-exported from
+  [`anda_db_derive`](../anda_db_derive).
 
-Use `anda_db_schema` when you need to:
-
-- define or inspect collection schemas directly
-- construct documents programmatically
-- validate field values before insertion
-- build tooling around AndaDB's type model
-- share the same document vocabulary across multiple crates
-
-## Getting Started
-
-Add the crate to your project:
+## Getting started
 
 ```toml
 [dependencies]
@@ -34,10 +36,7 @@ anda_db_schema = "0.14"
 serde = { version = "1", features = ["derive"] }
 ```
 
-This crate is commonly paired with `anda_db_derive` when you want schemas to be
-generated automatically from Rust structs.
-
-A typed document round trip:
+Derive a schema and round-trip a typed value through a `Document`:
 
 ```rust
 use anda_db_schema::{AndaDBSchema, Document, Vector, vector_from_f32};
@@ -65,27 +64,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Schema upgrades preserve field indexes and nested-key deletion history.
-An older schema with incomplete history needs a full scan of raw documents
-and pending recovery images before new fields can be allocated. The core
-AndaDB collection performs this scan automatically during upgrade; custom
-storage integrations use `Schema::history_recovery()`.
+Or build one by hand and fill a document field by field:
 
-JSON serialization rejects non-finite `F32`/`F64` values instead of silently
-writing null. Binary CBOR still represents infinities. Text/bytes are
-separated using explicit `txt:`/`b64:` prefixes in human-readable formats.
+```rust
+use anda_db_schema::{Document, FieldEntry, FieldType, Fv, Schema};
+use std::sync::Arc;
 
-## Technical Reference
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = Schema::builder();
+    builder
+        .with_version(1)
+        .add_field(FieldEntry::new("title".into(), FieldType::Text)?.with_unique())?
+        .add_field(FieldEntry::new(
+            "tags".into(),
+            FieldType::Option(Box::new(FieldType::Array(vec![FieldType::Text]))),
+        )?)?;
+    let schema = Arc::new(builder.build()?);
+    assert_eq!(schema.version(), 1);
 
-Deep technical documentation for this crate lives in:
+    let mut doc = Document::new(schema);
+    doc.set_id(1);
+    doc.set_field("title", Fv::Text("Hello".into()))?;
+    assert_eq!(doc.get_field("title"), Some(&Fv::Text("Hello".into())));
+    Ok(())
+}
+```
 
-- [docs/anda_db_schema.md](../../docs/anda_db_schema.md)
+## Serialization rules
+
+- Persistence normalizes values to CBOR. `NaN` is rejected so `FieldValue`
+  keeps a meaningful equality.
+- JSON serialization rejects non-finite `F32`/`F64` values instead of writing
+  `null`; binary CBOR still represents infinities.
+- Human-readable formats separate text from bytes with explicit `txt:` and
+  `b64:` prefixes.
+- An untyped round trip keeps the data but normalizes some variants (`F32` →
+  `F64`, non-negative `I64` → `U64`, `Vector` → `Array(U64)`); extracting
+  with the declared `FieldType` restores the declared variant.
+
+## Schema upgrades
+
+`Schema::upgrade_with` carries persisted field indexes and nested-key
+deletion history from the previous schema, so stored documents stay readable.
+An upgrade needs a higher version, and new fields must be optional. An older
+schema with incomplete history needs a full scan of raw documents and pending
+recovery images before new fields can be allocated: the AndaDB collection
+performs that scan automatically during an upgrade, and custom storage
+integrations use `Schema::history_recovery()`.
+
+## Testing
+
+```bash
+cargo test -p anda_db_schema -p anda_db_derive
+```
+
+The Rust examples in this README are compiled and run as doctests.
+
+## Technical reference
+
+- [docs/anda_db_schema.md](../../docs/anda_db_schema.md): type system,
+  document model and on-disk format
 - [docs/anda_db_derive.md](../../docs/anda_db_derive.md)
+- [Schemas and CBOR quick reference](../../skills/anda-db/references/schema_and_cbor.md)
 
-## Related Crates
+## Related crates
 
-- `anda_db` for the embedded database built on top of this type system
-- `anda_db_derive` for `AndaDBSchema` and `FieldTyped`
+- [`anda_db`](../anda_db): the embedded database built on this type system
+- [`anda_db_derive`](../anda_db_derive): `AndaDBSchema` and `FieldTyped`
 
 ## License
 

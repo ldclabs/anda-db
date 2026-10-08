@@ -6,11 +6,17 @@ Objects. It exposes a small batch HTTP API around `jieba-rs` and Unicode word
 segmentation, packaged as a `linux/amd64` container for
 [Cloudflare Containers](https://developers.cloudflare.com/containers/).
 
-The service is the public successor to the private `alink-tokenizer` referenced
-by older `@ldclabs/kip-do` documentation. Its first consumer is
-[`@ldclabs/kip-do`](../../ts/kip-do), where the same service tokenizes text on
-both the index and query paths so Chinese and other multilingual search terms
-use one vocabulary.
+The service is the public successor to the private `alink-tokenizer`. It was
+built for the KIP 1.x line of [`@ldclabs/kip-do`](../../ts/kip-do), which sent
+text from both the index and query paths to it so Chinese and other
+multilingual search terms used one vocabulary. The KIP 2.0 engine no longer
+uses it: it maintains its FTS5 index inside a synchronous Durable Object
+transaction, which cannot make an HTTP call, and segments with
+`Intl.Segmenter` instead. The service remains available for any Worker that
+needs Jieba segmentation on both sides of its own index.
+
+`cf-tokenizer` is a standalone Cargo workspace with its own lockfile and its
+own version (`1.0.0`); it is not part of the AndaDB release family.
 
 The process is deliberately small: it listens on port `8080`, keeps only the
 read-only jieba dictionary in memory, and does not persist or request-log input.
@@ -234,7 +240,7 @@ npx wrangler deploy
 npx wrangler containers list
 ```
 
-Deploy that Worker, then bind it from a consumer such as `kip-do`:
+Deploy that Worker, then bind it from a consumer Worker:
 
 ```jsonc
 {
@@ -273,7 +279,8 @@ vocabularies and turns a visible outage into silent search misses.
 
 Deploy one tokenizer vocabulary at a time. A deliberately mixed old/new pool
 can return different versions for consecutive chunks of one logical write;
-`@ldclabs/kip-do` detects and rejects that condition so the caller can retry.
+consumers should detect that condition (compare `X-Tokenizer-Version` across
+the chunks) and reject the write so the caller can retry.
 After a version rollout, allow the consumer's stale-index job to finish before
 considering the rollout complete.
 

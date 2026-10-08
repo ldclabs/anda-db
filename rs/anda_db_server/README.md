@@ -38,12 +38,27 @@ cargo run -p anda_db_server -- s3
 cargo run -p anda_db_server -- --api-key my-secret local --path ./debug/db
 ```
 
-Options: `--addr` (default `127.0.0.1:8080`), `--api-key`, `--primary-db`
-(default `anda_db`), `--flush-interval-secs` (default `30`),
-`--request-timeout-secs` (default `300`), `--max-concurrent-mutations`
-(default `32`), `--max-body-size` (default `2097152`), `--max-databases`
-(default `64`), and `--shutdown-timeout-secs` (default `30`). All options can
-also be set through their uppercase environment variables.
+Every option is a flag or the matching environment variable (a `.env` file is
+read on start):
+
+| Flag / environment variable                               | Default          | Meaning                                                            |
+| --------------------------------------------------------- | ---------------- | ------------------------------------------------------------------ |
+| `--addr` / `ADDR`                                         | `127.0.0.1:8080` | Listen address                                                     |
+| `--api-key` / `API_KEY`                                   | —                | Admin key; required on a non-loopback address                      |
+| `--insecure-no-api-key` / `INSECURE_NO_API_KEY`           | `false`          | Allow a non-loopback listener without a key (dangerous)            |
+| `--primary-db` / `PRIMARY_DB`                             | `anda_db`        | Primary database; also stores the registry and key map             |
+| `--flush-interval-secs` / `FLUSH_INTERVAL_SECS`           | `30`             | Background flush interval for every open database                  |
+| `--request-timeout-secs` / `REQUEST_TIMEOUT_SECS`         | `300`            | Per-request processing timeout                                     |
+| `--max-concurrent-mutations` / `MAX_CONCURRENT_MUTATIONS` | `32`             | Concurrent non-cancel-safe mutations (and cold opens)              |
+| `--max-body-size` / `MAX_BODY_SIZE`                       | `2097152`        | Maximum request body in bytes                                      |
+| `--max-databases` / `MAX_DATABASES`                       | `64`             | Registered non-primary databases                                   |
+| `--shutdown-timeout-secs` / `SHUTDOWN_TIMEOUT_SECS`       | `30`             | Grace period for draining in-flight RPCs                           |
+| `local --path` / `LOCAL_DB_PATH`                          | `./db`           | Database directory for the `local` subcommand                      |
+
+The `s3` subcommand reads `AWS_BUCKET`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT` and the other `AWS_*` variables
+understood by `object_store`'s `AmazonS3Builder::from_env`. Local storage is
+wrapped in `anda_object_store::MetaStore` for conditional updates.
 
 Local storage directories are created automatically. The server binds its
 listener before opening storage and does not enable `SO_REUSEPORT`. Run only
@@ -381,11 +396,13 @@ print(rpc("/anda_db", "doc.add", {
 }))
 ```
 
-## Related Crates
+## Related crates
 
 - [`anda_db`](../anda_db) — the embedded database engine
 - [`anda_db_shard_proxy`](../anda_db_shard_proxy) — shard routing for
   multi-tenant deployments
+- [`anda_cognitive_nexus_server`](../anda_cognitive_nexus_server) — KIP
+  memory over HTTP, for graph-shaped memory instead of documents
 
 ## License
 

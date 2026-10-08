@@ -1,6 +1,8 @@
 # Anda DB
 
 [![Build Status](https://github.com/ldclabs/anda-db/actions/workflows/test.yml/badge.svg)](https://github.com/ldclabs/anda-db/actions)
+[![Crates.io](https://img.shields.io/crates/v/anda_db.svg)](https://crates.io/crates/anda_db)
+[![Docs.rs](https://docs.rs/anda_db/badge.svg)](https://docs.rs/anda_db)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ldclabs/anda-db/blob/main/LICENSE)
 
 Anda DB is a modular Rust workspace for building durable AI memory systems.
@@ -12,140 +14,169 @@ retrieval modes built in:
 - HNSW indexes for vector similarity search
 
 On top of that core, the workspace provides a portable object-store-backed
-persistence layer, a declarative knowledge protocol called [KIP](https://github.com/ldclabs/kip), and the
-reference Cognitive Nexus runtime that turns the database into a persistent
-knowledge graph for AI agents.
+persistence layer, an SDK for the [KIP](https://github.com/ldclabs/KIP)
+(Knowledge Interaction Protocol) 2.0 cognitive state protocol, and two
+reference KIP engines: the Rust Cognitive Nexus built on Anda DB, and an
+independent TypeScript engine that runs inside SQLite-backed Cloudflare
+Durable Objects.
 
-## v0.14.0 upgrade
+## Current release
 
-Rust 1.95 or newer is required. Package versions are aligned at 0.14.0 while
-the KIP protocol stays at 2.0 (KIP `11a82ec`). This release breaks the KIP
-parser and AST, replaces the bundled CognitiveMemory draft package (Spaces
-activated under the earlier 2.1.0 draft are not migrated), moves a
-projection's policy into its `basis`, adds the Space draft vocabulary
-(`DEFINE`), and removes unused `anda_db_schema` and `anda_db_utils` APIs. Read the
-[release notes](CHANGELOG.md#0140--2026-09-24) before upgrading; KIP 1.x
-stores still follow the [v1 migration guide](docs/kip-v1-migration.md).
+The Rust crates form the **0.14** release family. Patch versions diverge
+after a release, so pin each crate by reading its own `Cargo.toml`:
 
-## What Anda DB Is For
+| Package                                                                  | Version |
+| ------------------------------------------------------------------------ | ------- |
+| `anda_cognitive_nexus`                                                   | 0.14.4  |
+| `anda_db`                                                                | 0.14.2  |
+| `anda_db_btree`, `anda_db_tfs`, `anda_kip`                               | 0.14.1  |
+| other Rust crates, the Python binding, `@ldclabs/kip-do` (npm)           | 0.14.0  |
+| `cf-tokenizer` (standalone service, own versioning)                      | 1.0.0   |
+
+- Rust 1.95 or newer is required (edition 2024).
+- The KIP protocol version is `2.0`, following KIP `11a82ec`, with the
+  bundled `kip://profiles/cognitive-memory@2.0.0` draft Schema Package. KIP
+  protocol versions are independent of package versions.
+- Upgrading from 0.13 is breaking for KIP clients and for Spaces activated
+  under the earlier CognitiveMemory draft. The first open of a Nexus store by
+  0.14.1 or newer upgrades its collection schemas; do not reopen it with
+  0.14.0 afterwards.
+
+Read the [changelog](CHANGELOG.md) before upgrading. KIP 1.x stores migrate
+through the [v1 migration guide](docs/kip-v1-migration.md).
+
+## What Anda DB is for
 
 Anda DB is designed for applications that need more than a plain key-value
-store but less than a full external database service. It works especially well
-for:
+store but less than a full external database service:
 
 - long-term memory for AI agents
-- embedded retrieval systems inside Rust services
-- hybrid search over structured, lexical, and semantic data
-- knowledge-graph workloads with explicit protocol execution
-- deployments that need to run locally during development and on cloud object
-  storage in production
+- embedded retrieval inside Rust services
+- hybrid search over structured, lexical and semantic data
+- knowledge-graph memory with explicit protocol execution
+- deployments that run on a local filesystem during development and on cloud
+  object storage in production
 
-The core design goal is simple: keep the data model, retrieval logic, and
-persistence lifecycle inside the application process, while still supporting
-durability, recovery, and rich search.
+The design goal is to keep the data model, retrieval logic and persistence
+lifecycle inside the application process, while still supporting durability,
+crash recovery and rich search.
 
-## Use Cases / Deployment Modes
+### Use cases
 
-### Use Cases
+- **Agent long-term memory**: persist facts, observations, preferences,
+  events and embeddings for one or many agents
+- **Embedded hybrid retrieval**: combine B-Tree filters, BM25 lexical search
+  and vector similarity search inside a Rust service
+- **Knowledge-graph memory**: record who claimed what, on what evidence, and
+  what changed when, through KIP and a Cognitive Nexus
+- **Private or regulated deployments**: keep storage inside your own
+  environment, with optional encryption at rest
+- **Multi-tenant memory platforms**: expose many logical databases behind one
+  service layer and shard them when needed
 
-Anda DB is a good fit for several product and platform patterns:
+### Deployment modes
 
-- **Agent long-term memory**: persist facts, observations, preferences, events, and embeddings for one or many agents
-- **Embedded hybrid retrieval**: combine structured filters, BM25 lexical search, and vector similarity search inside a Rust service
-- **Knowledge-graph memory systems**: model concepts and propositions through KIP and the Cognitive Nexus runtime
-- **Private or regulated AI deployments**: keep storage inside your own environment while still using modern object-store semantics and optional encryption-at-rest
-- **Multi-tenant memory platforms**: expose many logical databases behind one service layer and shard them when needed
+The same data model supports several deployment shapes:
 
-### Deployment Modes
+| Mode                     | Entry point                                                                |
+| ------------------------ | -------------------------------------------------------------------------- |
+| Embedded Rust library    | link [`anda_db`](rs/anda_db) or [`anda_cognitive_nexus`](rs/anda_cognitive_nexus) into your process |
+| Local persistent storage | `object_store` local filesystem wrapped in `anda_object_store::MetaStore`  |
+| Cloud object storage     | S3, GCS, Azure Blob or another `object_store` backend enabled by your app  |
+| Database service         | [`anda-db-server`](rs/anda_db_server): CBOR-first HTTP RPC                  |
+| KIP memory service       | [`anda-cognitive-nexus-server`](rs/anda_cognitive_nexus_server): HTTP/JSON-RPC |
+| Sharded service          | [`anda-db-shard-proxy`](rs/anda_db_shard_proxy) in front of database servers |
+| Cloudflare edge          | [`@ldclabs/kip-do`](ts/kip-do): one Nexus per Durable Object                |
+| Python                   | [`anda_cognitive_nexus_py`](py/anda_cognitive_nexus_py): in-process Nexus   |
 
-The workspace supports several deployment shapes without changing the core data model:
+## Key capabilities
 
-- **Embedded library mode**: link `anda_db` directly into a Rust application for the lowest-latency, in-process integration
-- **Single-node persistent mode**: run on local filesystem storage for self-hosted or appliance-style deployments
-- **Cloud object storage mode**: keep the same database logic while targeting S3, GCS, Azure Blob, or other `object_store` backends enabled by the embedding application
-- **Database service mode**: expose the core database through `anda_db_server`
-- **KIP memory service mode**: expose the Cognitive Nexus through `anda_cognitive_nexus_server`
-- **Sharded service mode**: route multiple logical databases through `anda_db_shard_proxy` for multi-tenant deployments
-
-This separation between storage, protocol, and service layers is what allows
-Anda DB to scale from a single embedded process to a routed, service-oriented
-memory platform.
-
-## Key Capabilities
-
-- Embedded database engine with no mandatory external database service
-- Schema validation and document-oriented collections
-- Hybrid retrieval via BM25 + HNSW + RRF reranking
-- Portable persistence through `object_store`
-- Optional transparent encryption-at-rest through `anda_object_store`
-- KIP parser and executor model for graph-shaped AI memory
-- Reference Cognitive Nexus implementation built on top of AndaDB
+- Embedded database engine with no mandatory external service
+- Schema validation, versioned schema upgrades and derive macros for Rust
+  structs
+- Hybrid retrieval: BM25 + HNSW fused with reciprocal-rank fusion, filtered
+  through B-Tree indexes
+- Portable persistence through `object_store`, with incremental index
+  flushing, checkpoints and crash recovery
+- Format-compatibility fixtures and a crash-consistency harness for the
+  storage layer
+- Optional transparent AES-256-GCM encryption at rest
+- A KIP 2.0 SDK (parser, AST, request envelope, error registry, executor
+  seam) and two reference engines held to one shared conformance suite
 - Optional HTTP server and shard-proxy layers for service deployments
 
-## Why `object_store` Matters
+## Why `object_store` matters
 
-One of Anda DB's main architectural strengths is that persistence is built on
-top of the `object_store::ObjectStore` trait instead of being tied to one local
-filesystem implementation.
-
-That means the same database logic can be reused across multiple storage
-backends, depending on which `object_store` features your application enables:
+Persistence is built on the `object_store::ObjectStore` trait instead of one
+local filesystem implementation, so the same database logic runs on whichever
+backends your application enables:
 
 - in-memory storage for tests and ephemeral runs
 - local filesystem storage for embedded deployments
-- Amazon S3
-- Google Cloud Storage
-- Azure Blob Storage
+- Amazon S3, Google Cloud Storage and Azure Blob Storage
 - HTTP/WebDAV-compatible object storage
 
-This portability is important for AI memory systems. You can develop locally,
-test in-process, and later move the same storage model onto cloud object
-storage without rewriting the database layer.
+You can develop locally, test in-process, and move the same storage model to
+cloud object storage without rewriting the database layer. On top of that
+abstraction, [`anda_object_store`](rs/anda_object_store) adds:
 
-On top of that abstraction, `anda_object_store` adds:
+- `MetaStore`: side-car metadata, logical ETags and portable conditional
+  updates for backends without native support (such as the local
+  filesystem)
+- `EncryptedStore`: chunked AES-256-GCM encryption with authenticated
+  metadata and seekable range reads
 
-- portable conditional-update semantics via `MetaStore`
-- transparent chunked AES-256-GCM encryption via `EncryptedStore`
+## Workspace overview
 
-## Workspace Overview
+| Path                                                             | Role                                                                    | Distribution |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------ |
+| [`rs/anda_db`](rs/anda_db)                                       | Core embedded database: collections, queries, indexes, storage          | crates.io    |
+| [`rs/anda_db_schema`](rs/anda_db_schema)                         | Field types, values, schemas and documents                              | crates.io    |
+| [`rs/anda_db_derive`](rs/anda_db_derive)                         | `AndaDBSchema` and `FieldTyped` derive macros                           | crates.io    |
+| [`rs/anda_db_btree`](rs/anda_db_btree)                           | Exact-match and range index                                             | crates.io    |
+| [`rs/anda_db_tfs`](rs/anda_db_tfs)                               | BM25 full-text search                                                   | crates.io    |
+| [`rs/anda_db_hnsw`](rs/anda_db_hnsw)                             | HNSW vector index                                                       | crates.io    |
+| [`rs/anda_db_utils`](rs/anda_db_utils)                           | Standalone `UniqueVec`; not used by the other crates                    | crates.io    |
+| [`rs/anda_object_store`](rs/anda_object_store)                   | Metadata and encryption wrappers over `object_store`                    | crates.io    |
+| [`rs/anda_kip`](rs/anda_kip)                                     | KIP 2.0 SDK: parser, AST, envelope, errors, executor seam, specs        | crates.io    |
+| [`rs/anda_cognitive_nexus`](rs/anda_cognitive_nexus)             | Reference Rust KIP engine on Anda DB                                    | crates.io    |
+| [`rs/anda_db_server`](rs/anda_db_server)                         | HTTP server for the core database API                                   | source       |
+| [`rs/anda_cognitive_nexus_server`](rs/anda_cognitive_nexus_server) | HTTP/JSON-RPC server for the Cognitive Nexus                          | source, Docker |
+| [`rs/anda_db_shard_proxy`](rs/anda_db_shard_proxy)               | PostgreSQL-routed shard proxy for multi-tenant deployments              | source       |
+| [`rs/anda_kip_wasm`](rs/anda_kip_wasm)                           | WASM build of the Rust parser, the test oracle for `kip-do`; own workspace | not published |
+| [`rs/cf-tokenizer`](rs/cf-tokenizer)                             | Stateless Jieba tokenizer service for Cloudflare Containers; own workspace | Docker     |
+| [`ts/kip-do`](ts/kip-do)                                         | Independent TypeScript KIP engine on Cloudflare Durable Objects         | npm          |
+| [`py/anda_cognitive_nexus_py`](py/anda_cognitive_nexus_py)       | Python binding for the Rust Nexus; not a default workspace member       | source       |
+| [`fixtures/kip-conformance-2.0`](fixtures/kip-conformance-2.0)   | Vendored KIP engine suite that both engines run                         | —            |
+| [`skills/anda-db`](skills/anda-db)                               | Agent-facing usage guide and API references                             | —            |
+| [`docs`](docs)                                                   | Technical, maintenance and benchmark documents                          | —            |
 
-The workspace is layered rather than monolithic.
-
-| Crate                         | Role                                                                           |
-| ----------------------------- | ------------------------------------------------------------------------------ |
-| `anda_db`                     | Core embedded database: collections, queries, indexes, and storage integration |
-| `anda_db_schema`              | Type system, field values, schemas, and document model                         |
-| `anda_db_derive`              | Derive macros such as `AndaDBSchema` and `FieldTyped`                          |
-| `anda_db_btree`               | Exact-match and range index engine                                             |
-| `anda_db_tfs`                 | Embedded BM25 full-text search engine                                          |
-| `anda_db_hnsw`                | HNSW approximate-nearest-neighbor vector index                                 |
-| `anda_db_utils`               | Standalone `UniqueVec` utility (not used by the workspace crates)              |
-| `anda_object_store`           | Portable metadata and encryption wrappers for `object_store`                   |
-| `anda_kip`                    | KIP parser, AST, request/response model, executor framework                    |
-| `anda_cognitive_nexus`        | Reference KIP executor and AI memory graph runtime                             |
-| `anda_db_server`              | HTTP server for the core database layer                                        |
-| `anda_cognitive_nexus_server` | HTTP/JSON-RPC server for the Cognitive Nexus                                   |
-| `anda_db_shard_proxy`         | Shard-routing proxy for multi-tenant deployments                               |
-
-## Architecture at a Glance
+## Architecture at a glance
 
 ```text
-Application or Agent Runtime
-  -> anda_kip                    protocol and request model
-  -> anda_cognitive_nexus        reference memory graph runtime
-  -> anda_db                     embedded storage and retrieval core
-     -> anda_db_schema           schema and document model
-     -> anda_db_derive           schema generation macros
-     -> anda_db_btree            exact and range index
-     -> anda_db_tfs              BM25 lexical search
-     -> anda_db_hnsw             HNSW vector search
-     -> anda_object_store        metadata and encryption wrappers
-     -> object_store             backend abstraction for local and cloud storage
+Agent / application
+  │
+  ├─ KIP 2.0 (Rust)
+  │   anda_kip                   parser, AST, envelope, error registry, Executor trait
+  │    └─ anda_cognitive_nexus   transactions, projection, Governance, Schema Packages
+  │        └─ anda_db            ↓
+  │
+  ├─ Documents and hybrid search
+  │   anda_db                    collections, queries, recovery
+  │    ├─ anda_db_schema, anda_db_derive        schema and document model
+  │    ├─ anda_db_btree, anda_db_tfs, anda_db_hnsw   B-Tree, BM25, HNSW indexes
+  │    └─ anda_object_store → object_store       local or cloud storage
+  │
+  └─ KIP 2.0 (Cloudflare)
+      @ldclabs/kip-lang → ts/kip-do  Durable Object SQLite
+      (parser checked against anda_kip compiled to WASM: rs/anda_kip_wasm)
 ```
 
-## Quick Start: Embedded Database Usage
+The service crates wrap these libraries: `anda_db_server` exposes `anda_db`,
+`anda_cognitive_nexus_server` exposes `anda_cognitive_nexus`, and
+`anda_db_shard_proxy` routes requests across `anda_db_server` shards.
 
-Add the core dependencies to your `Cargo.toml`.
+## Quick start: embedded database
 
 ```toml
 [dependencies]
@@ -156,15 +187,16 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-Example:
+`anda_db/full` only enables `object_store/fs`; the B-Tree, BM25, HNSW and
+Jieba support are always compiled in.
 
 ```rust
 use anda_db::{
     collection::CollectionConfig,
     database::{AndaDB, DBConfig},
     index::HnswConfig,
-    query::{Query, Search},
-    schema::{AndaDBSchema, Vector, vector_from_f32},
+    query::{Filter, Query, RangeQuery, Search},
+    schema::{AndaDBSchema, Fv, Vector, vector_from_f32},
     storage::StorageConfig,
 };
 use anda_object_store::MetaStoreBuilder;
@@ -175,7 +207,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize, AndaDBSchema)]
 struct Memory {
     _id: u64,
-    title: String,
+    topic: String,
     body: String,
     embedding: Vector,
 }
@@ -183,19 +215,20 @@ struct Memory {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all("./db")?;
+    // The local filesystem has no conditional updates; MetaStore adds them.
     let store = Arc::new(
         MetaStoreBuilder::new(
             LocalFileSystem::new_with_prefix("./db")?.with_fsync(true),
-            10000,
-        ).build(),
+            10_000,
+        )
+        .build(),
     );
-
     let db = AndaDB::connect(
         store,
         DBConfig {
             name: "agent_memory".into(),
             description: "Embedded AI memory".into(),
-            storage: StorageConfig::default(),
+            storage: StorageConfig::default().with_cache_max_bytes(64 * 1024 * 1024),
             lock: None,
         },
     )
@@ -208,8 +241,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name: "memories".into(),
                 description: "Long-term memory collection".into(),
             },
+            // Runs only when the collection is opened fresh: install
+            // tokenizers and index hooks here, before creating indexes.
             async |c| {
-                c.create_bm25_index_nx(&["title", "body"]).await?;
+                c.create_btree_index_nx(&["topic"]).await?;
+                c.create_bm25_index_nx(&["topic", "body"]).await?;
                 c.create_hnsw_index_nx(
                     "embedding",
                     HnswConfig {
@@ -223,15 +259,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    memories
+    let id = memories
         .add_from(&Memory {
-            _id: 0,
-            title: "Rust".into(),
+            _id: 0, // The collection allocates the real id.
+            topic: "rust".into(),
             body: "Rust is well suited to embedded AI memory services.".into(),
             embedding: vector_from_f32(vec![0.1, 0.2, 0.3, 0.4]),
         })
         .await?;
 
+    // Hybrid search: BM25 and HNSW results fused by RRF, filtered by B-Tree.
     let results: Vec<Memory> = memories
         .search_as(Query {
             search: Some(Search {
@@ -239,76 +276,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vector: Some(vec![0.1, 0.2, 0.3, 0.4]),
                 ..Default::default()
             }),
+            filter: Some(Filter::Field((
+                "topic".into(),
+                RangeQuery::Eq(Fv::Text("rust".into())),
+            ))),
             limit: Some(10),
-            ..Default::default()
         })
         .await?;
 
-    println!("Found {} results", results.len());
-
+    let loaded: Memory = memories.get_as(id).await?;
+    println!("Loaded {}, found {}", loaded.topic, results.len());
     db.close().await?;
     Ok(())
 }
 ```
 
-For a richer end-to-end example with BM25 tokenization, filtering, and vector
-search, see [rs/anda_db/examples/db_demo.rs](./rs/anda_db/examples/db_demo.rs).
+Operating rules worth knowing before production use:
+
+- Share one live writer per database namespace; clone `AndaDB` and
+  `Arc<Collection>` handles for concurrent tasks.
+- Await mutations, flushes and `close()` to completion. A cancelled mutation
+  can poison a collection handle; reopen it through the database.
+- The open callback is skipped for an already open handle. Call
+  `db.close_collection(name)` before reopening with a different index
+  configuration.
+- Set the HNSW `dimension` and `distance_metric` to match your embedding
+  model; the default metric is Euclidean.
+
+The [anda_db README](rs/anda_db/README.md) and
+[docs/anda_db.md](docs/anda_db.md) cover the full API. A richer runnable
+example is [rs/anda_db/examples/db_demo.rs](rs/anda_db/examples/db_demo.rs):
+
+```bash
+cargo run -p anda_db --example db_demo --features full
+```
 
 ## KIP and the Cognitive Nexus
 
-The workspace includes a higher-level memory layer for agent reasoning.
+KIP 2.0 separates what a single self-describing graph would blur together:
+meaning, belief, evidence, provenance, mnemonic state, retention, Governance
+and Schema. A **Proposition** is a truth-neutral `(subject, predicate,
+object)` tuple; an **Assertion** records one actor's commitment to it with a
+stance, mode, confidence and Evidence; and what is currently believed is a
+**projection** computed from Assertions under a named policy, never stored as
+truth.
 
-- `anda_kip` defines the Knowledge Interaction Protocol: parser, AST,
-  request/response model, error codes, and executor trait.
-- `anda_cognitive_nexus` is the reference KIP backend built on top of
-  `anda_db`, storing concepts and propositions in persistent collections.
+- [`anda_kip`](rs/anda_kip) is the protocol SDK: KQL/KML/META parsers, the
+  executable AST, the request/response envelope, the Core Error Registry, the
+  `Executor` trait, agent-facing prompts and function definitions, and the
+  vendored KIP specification.
+- [`anda_cognitive_nexus`](rs/anda_cognitive_nexus) is the reference engine:
+  transactions, KQL with two time axes, `BELIEF` projection, META, Capsules,
+  a separate Governance control plane and versioned Schema Packages, all
+  stored in Anda DB collections.
+- [`@ldclabs/kip-do`](ts/kip-do) is an independent TypeScript engine on
+  Durable Object SQLite. Its parser (`@ldclabs/kip-lang`) is compared field
+  for field against the Rust parser compiled to WASM.
+- Both engines run the shared suite in
+  [`fixtures/kip-conformance-2.0`](fixtures/kip-conformance-2.0).
 
-Use these crates when you want a graph-shaped, protocol-driven AI memory system
-instead of a direct document-database integration.
-
-## Service Layers
-
-If you want to expose Anda DB over the network rather than embed it directly,
-the workspace provides optional service crates.
-
-- `anda_db_server` for the core database API
-- `anda_cognitive_nexus_server` for KIP over HTTP/JSON-RPC
-- `anda_db_shard_proxy` for shard routing and multi-tenant entrypoints
-
-These layers are optional. The primary design remains embedded-first.
+Ask an engine for `DESCRIBE CAPABILITIES` before relying on optional
+behavior: gaps are reported as structured data and refused as
+`UnsupportedCapability`. Brain hosts that add scheduling, evaluation or
+dispatch should read the
+[Brain host contracts](docs/anda-brain-nexus-contracts.md).
 
 ## Documentation
 
-The root README is the overview. The deeper technical references live in
-[docs/README.md](./docs/README.md).
+The root README is the overview; [docs/README.md](docs/README.md) is the
+documentation hub ([中文](docs/README.zh.md)). Most documents have a Chinese
+`.zh.md` companion.
 
-Key documents:
+| Topic                         | Document                                                                                                   |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Core database                 | [anda_db.md](docs/anda_db.md)                                                                              |
+| Schemas and derives           | [anda_db_schema.md](docs/anda_db_schema.md), [anda_db_derive.md](docs/anda_db_derive.md)                   |
+| Indexes                       | [anda_db_btree.md](docs/anda_db_btree.md), [anda_db_tfs.md](docs/anda_db_tfs.md), [anda_db_hnsw.md](docs/anda_db_hnsw.md) |
+| Storage wrappers              | [anda_object_store.md](docs/anda_object_store.md)                                                          |
+| KIP SDK                       | [anda_kip.md](docs/anda_kip.md), [specification](rs/anda_kip/SPECIFICATION.md), [syntax](rs/anda_kip/KIPSyntax.md) |
+| Cognitive Nexus               | [anda_cognitive_nexus.md](docs/anda_cognitive_nexus.md)                                                    |
+| Brain host integration        | [anda-brain-nexus-contracts.md](docs/anda-brain-nexus-contracts.md)                                        |
+| Engine parity                 | [kip-do-nexus-parity.md](docs/kip-do-nexus-parity.md)                                                      |
+| KIP 1.x migration             | [kip-v1-migration.md](docs/kip-v1-migration.md)                                                            |
+| Testing                       | [testing.md](docs/testing.md)                                                                              |
+| Benchmarks                    | [docs/benchmarks](docs/benchmarks), [million-row query report (中文)](docs/query-performance-million.zh.md) |
+| Agent-facing usage guide      | [skills/anda-db](skills/anda-db/SKILL.md)                                                                  |
 
-- [docs/anda_db.md](./docs/anda_db.md): core embedded database design and API model
-- [docs/anda_db_schema.md](./docs/anda_db_schema.md): schema, field values, and documents
-- [docs/anda_db_derive.md](./docs/anda_db_derive.md): derive macros and field-type inference
-- [docs/anda_db_btree.md](./docs/anda_db_btree.md): exact and range index internals
-- [docs/anda_db_tfs.md](./docs/anda_db_tfs.md): BM25 full-text engine
-- [docs/anda_db_hnsw.md](./docs/anda_db_hnsw.md): HNSW vector index
-- [docs/anda_object_store.md](./docs/anda_object_store.md): metadata and encryption wrappers over `object_store`
-- [docs/anda_kip.md](./docs/anda_kip.md): KIP parser and executor framework
-- [docs/anda_cognitive_nexus.md](./docs/anda_cognitive_nexus.md): reference AI memory graph runtime
+## Development
 
-## Build and Test
+Run commands from the repository root. Root `cargo --workspace` commands do
+not include `rs/anda_kip_wasm`, `rs/cf-tokenizer` (separate workspaces),
+`ts/kip-do` or the Python binding.
 
-```bash
-cargo build
-cargo test
-```
+| Scope                                        | Command                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------ |
+| Rust workspace compile                       | `cargo check --workspace --all-features`                           |
+| Rust workspace tests                         | `cargo test --workspace --all-features`                            |
+| Core database tests                          | `cargo test -p anda_db --all-features`                             |
+| Crash recovery and format compatibility      | `cargo test -p anda_db --test crash_recovery --test format_compat` |
+| Schema and derive                            | `cargo test -p anda_db_schema -p anda_db_derive`                   |
+| KIP SDK and Rust engine                      | `cargo test -p anda_kip -p anda_cognitive_nexus`                   |
+| TypeScript engine (Node 24, pnpm 11)         | `make test-ts`                                                     |
+| Formatting and Clippy (rewrites files)       | `make lint`                                                        |
+| Formatting check only                        | `cargo fmt --all -- --check`                                       |
 
-For crate-specific testing, run commands such as:
+`make test-all` adds format-compatibility checks and KIP fuzzing (nightly and
+`cargo-fuzz`); `make test-full` also runs the TypeScript checks. The Python
+binding is tested with `make test-py` after enabling its workspace member; see
+its [README](py/anda_cognitive_nexus_py/README.md).
 
-```bash
-cargo test -p anda_db
-cargo test -p anda_db_btree
-cargo test -p anda_kip
-```
+Changes to KIP command strings in Rust sources or tests, to the error
+registry or to the conformance fixtures feed generated TypeScript files: run
+`pnpm run codegen` in `ts/kip-do` and commit the result. A Rust parser change
+also needs `pnpm run build:oracle-wasm`. See [AGENTS.md](AGENTS.md) for the
+full contributor workflow.
 
 ## License
 
-Anda DB is licensed under the MIT License. See [LICENSE](./LICENSE) for details.
+Anda DB is licensed under the MIT License. See [LICENSE](LICENSE) for details.

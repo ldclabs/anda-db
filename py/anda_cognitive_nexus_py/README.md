@@ -1,6 +1,10 @@
 # Anda Python Bindings (anda_cognitive_nexus_py)
 
-This crate provides the official Python bindings for the Anda engine, allowing Python applications to interact with an agent's cognitive nexus (Anda DB) using the Knowledge Interaction Protocol (KIP).
+This crate provides the official Python bindings for the Anda engine, allowing Python applications to interact with an agent's cognitive nexus (Anda DB) using the Knowledge Interaction Protocol (KIP). It embeds the Rust [`anda_cognitive_nexus`](../../rs/anda_cognitive_nexus) engine in-process.
+
+The Maturin project in [`py/pyproject.toml`](../pyproject.toml) is named
+`anda-db` (version 0.14.0, from this crate's `Cargo.toml`) and exposes the
+`anda_cognitive_nexus_py` module.
 
 This bridge is built using [`PyO3`](https://pyo3.rs/) and packaged using [`maturin`](https://www.maturin.rs/), enabling high-performance, in-process communication between Python and the core Rust engine.
 
@@ -46,7 +50,7 @@ array of the repository root `Cargo.toml` before running any `cargo` command
 against it, and comment it back out afterwards.
 
 ```bash
-git clone REPO_URL
+git clone https://github.com/ldclabs/anda-db.git
 cd anda-db
 # edit Cargo.toml: uncomment "py/anda_cognitive_nexus_py" under [workspace] members
 export PYO3_PYTHON="$(uv python find 3.12)"
@@ -90,7 +94,8 @@ Next, use `maturin` to build the Rust crate and install it as an editable packag
 
 ```bash
 uv pip install -r anda_cognitive_nexus_py/tests_py/requirements.txt
-# This command will compile the Rust code and install the `anda` package
+# Compile the Rust code and install the `anda-db` distribution, which
+# provides the `anda_cognitive_nexus_py` module
 maturin develop
 ```
 
@@ -238,7 +243,7 @@ response = await db.execute_request({
 			"key": "msg",
 			"evidence_class": "user_statement",
 			"payload": "I prefer dark mode.",
-			"observed_at": "2026-08-14T01:00:00Z",
+			"observed_at": "2026-08-14T01:00:00.000Z",  # KIP §6.5: always .SSSZ
 		}]
 	},
 	"operations": [
@@ -321,6 +326,19 @@ Reported honestly rather than approximated:
 - **Only the default MemorySpace exists.** `space` in the envelope is honoured
   and a named Space must already exist; this binding has no API to create
   another one.
-- The engine's own gaps — semantic `SEARCH`, Capsule signatures, the `restore`
-  import mode, `DESCRIBE TRUST` — are reported by `DESCRIBE CAPABILITIES` as
-  structured data rather than discovered by triggering an error.
+- The engine's own gaps — semantic and historical `SEARCH`, Capsule
+  signatures, the `restore` import mode — are reported by
+  `DESCRIBE CAPABILITIES` as structured data rather than discovered by
+  triggering an error.
+
+---
+
+## Related
+
+- [`anda_cognitive_nexus`](../../rs/anda_cognitive_nexus): the Rust engine this binding embeds
+- [`anda_kip`](../../rs/anda_kip): the KIP 2.0 SDK, specification and syntax reference
+- [`anda_cognitive_nexus_server`](../../rs/anda_cognitive_nexus_server): the same engine over HTTP
+
+## License
+
+MIT. See [LICENSE](../../LICENSE).

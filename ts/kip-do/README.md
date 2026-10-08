@@ -1,5 +1,7 @@
 # @ldclabs/kip-do
 
+[![npm](https://img.shields.io/npm/v/@ldclabs/kip-do.svg)](https://www.npmjs.com/package/@ldclabs/kip-do)
+
 Tracks KIP at `11a82ec`, with the draft memory package
 `kip://profiles/cognitive-memory@2.0.0` (content digest `sha256:734aa0fd…`). See the
 [Anda Brain host-contract guide](../../docs/anda-brain-nexus-contracts.zh.md) for implemented contracts and capability boundaries.
@@ -17,6 +19,9 @@ grammar's behaviour by a differential test.
 ```bash
 npm install @ldclabs/kip-do
 ```
+
+The package version (0.14.0) follows the AndaDB release family; the protocol
+it speaks is KIP `2.0`.
 
 ## Timestamp inputs
 
@@ -51,8 +56,8 @@ historical read path. **The shared conformance suite passes** — the list in
 closing the last gap meant deleting a name and a new one cannot hide inside a
 number that happens to match.
 
-`DESCRIBE CAPABILITIES` reports every gap with a reason. Two are worth naming
-here:
+`DESCRIBE CAPABILITIES` reports every gap with a reason. A few are worth
+naming here:
 
 - **Governance is enforced per element, on reads and on writes.** There are
   Principals, groups, Grants, Delegations, Policy versions and Approvals. Every
@@ -87,6 +92,10 @@ here:
 - **`SEARCH ASSERTION | ACTIVITY`.** An Assertion carries a stance, a mode and a
   number; an Activity a class and two timestamps. Neither has free text to
   index, and an empty answer would read as "no such claim exists".
+- **`atomic` batches.** `operations[]` is a batch, not a transaction: a request
+  runs as `independent` or `sequence`, and `execution.mode: "atomic"` is
+  refused with `UnsupportedCapability`, as the Rust engine refuses it, rather
+  than run one operation at a time under an all-or-none label.
 
 Reading the past works on both axes, and they are deliberately kept apart:
 `AS OF SEQ` asks what this Brain *held* then, `FOR TIME` asks what was *true*
@@ -144,7 +153,7 @@ The oracle currently reports no divergences in either direction across the
 whole corpus. The four it found on the way — the worst of which rounded an
 out-of-range integer instead of refusing it, so a command executed with a
 different number than it said — were fixed upstream in
-`@ldclabs/kip-lang@2.0.1`. The package now depends on `@ldclabs/kip-lang@^2.3.1` for KIP 2.0.
+`@ldclabs/kip-lang@2.0.1`. The package now depends on `@ldclabs/kip-lang@^2.4.1` for KIP 2.0.
 
 ### The error registry
 
@@ -153,7 +162,7 @@ names, each carrying a category, a retry class and an agent-facing recovery
 hint. The table is **generated** from the Rust source
 (`scripts/codegen-errors.mjs` → `src/errors.generated.ts`), read through
 `anda_kip_wasm::error_catalog()` so it enumerates `KipErrorCode::ALL` rather
-than whatever a text scraper could see. Hand-copying 79 codes with their hints
+than whatever a text scraper could see. Hand-copying 78 codes with their hints
 and retry classes produces a table that compiles, passes tests, and is quietly
 wrong — a mismatched `hint` breaks an agent's self-correction loop, and a
 widened `retry` class turns a lost write into a duplicated one.
@@ -332,29 +341,45 @@ throughput ceiling, and Durable Objects have no read replicas.
 
 ## Development
 
+The package is a member of the repository's pnpm workspace. CI uses Node 24
+and pnpm 11; pnpm's `minimumReleaseAge` policy is strict, so bump dependencies
+with `pnpm run deps:update` rather than by hand.
+
 ```bash
-pnpm install
-pnpm run codegen:errors          # regenerate the error registry from the oracle
-pnpm run codegen:profiles        # re-vendor the Schema Package artifacts
-pnpm run codegen:fixtures        # re-inline the shared conformance fixtures
-pnpm run codegen:oracle-corpus   # re-harvest the differential corpus
-pnpm run build:oracle-wasm       # rebuild the oracle from rs/anda_kip (needs wasm-pack)
+pnpm install                     # from the repository root
+cd ts/kip-do
+pnpm run typecheck
 pnpm test                        # runs inside workerd via @cloudflare/vitest-pool-workers
+pnpm run codegen                 # every generated file below, in order
+pnpm run build:oracle-wasm       # rebuild the oracle from rs/anda_kip (needs wasm-pack)
 pnpm run build
 ```
+
+`make test-ts` from the repository root runs the typecheck and the tests, as
+the CI `typescript` job does. `pnpm run codegen` runs the individual steps:
+
+| Script                    | Generates                                  | Source                                               |
+| ------------------------- | ------------------------------------------ | ---------------------------------------------------- |
+| `codegen:errors`          | `src/errors.generated.ts`                  | the Rust error registry, through the WASM oracle     |
+| `codegen:capabilities`    | `src/meta/capability-names.generated.ts`   | `rs/anda_kip/capabilities.json`                      |
+| `codegen:profiles`        | `src/schema/profiles.generated.ts`         | `rs/anda_cognitive_nexus/profiles/`                  |
+| `codegen:contracts`       | `src/schema/contracts.generated.ts`        | `rs/anda_kip/schemas/` and the bundled profiles      |
+| `codegen:fixtures`        | `test/conformance/fixtures.generated.ts`   | `fixtures/kip-conformance-2.0/`                      |
+| `codegen:oracle-corpus`   | `test/oracle/corpus.generated.ts`          | the fixtures and KIP strings in Rust `src/`/`tests/` |
+
+CI regenerates these files and fails on drift. Adding or editing a KIP command
+string in `rs/anda_kip` or `rs/anda_cognitive_nexus` sources or tests is a
+generation-source change too.
 
 Tests run in **workerd**, not Node. The engine's contract is the platform's —
 `transactionSync`, FTS5, the 100-parameter ceiling — and none of it is
 reproducible against a Node SQLite shim.
 
 `vendor/anda_kip_wasm/` is committed but **not** shipped: it is the oracle
-`test/parser-oracle.test.ts` compares against. Rebuild and commit it whenever
+`test/parser-oracle.test.ts` compares against, built from
+[`rs/anda_kip_wasm`](../../rs/anda_kip_wasm). Rebuild and commit it whenever
 the Rust grammar changes, together with `pnpm run codegen:oracle-corpus` —
 that is the moment a divergence is meant to surface.
-
-## License
-
-MIT. See [LICENSE](../../LICENSE).
 
 ## Brain host contracts
 
@@ -445,3 +470,7 @@ approval. New operations still require approval when the active policy says so.
 
 The [Nexus parity audit](../../docs/kip-do-nexus-parity.md) records the commit scope
 and regression coverage for these host APIs.
+
+## License
+
+MIT. See [LICENSE](../../LICENSE).

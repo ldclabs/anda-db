@@ -1,33 +1,54 @@
 # anda_db_utils
 
-`anda_db_utils` provides standalone collection and serialization utilities.
-It remains available to downstream users; current workspace production code
-does not depend on these helpers.
+[![Crates.io](https://img.shields.io/crates/v/anda_db_utils.svg)](https://crates.io/crates/anda_db_utils)
+[![Docs.rs](https://docs.rs/anda_db_utils/badge.svg)](https://docs.rs/anda_db_utils)
 
-## What This Crate Provides
+`anda_db_utils` is a small, dependency-light utility crate maintained
+alongside the [AndaDB](https://github.com/ldclabs/anda-db) workspace. It
+remains available to downstream users; no other workspace crate depends on
+it.
 
-- `UniqueVec<T>` for ordered unique collections
+## What this crate provides
 
-## When to Use It
+- `UniqueVec<T>`: an insertion-ordered vector that rejects duplicates, with
+  O(1) membership checks (`contains`, `push`, `extend`), order-preserving
+  removal (`remove`, `remove_if`, `retain`), `swap_remove_if`,
+  `intersect_with`, and conversions to `Vec` or a hash set. It serializes as
+  a plain sequence through serde.
 
-Use `anda_db_utils` when you need:
+0.14 removed the former `Pipe` and `CountingWriter` helpers; see the
+[changelog](../../CHANGELOG.md).
 
-- deterministic uniqueness with vector-like iteration order
-- a small utility dependency for application code
-
-## Getting Started
-
-Add the crate to your project:
+## Getting started
 
 ```toml
 [dependencies]
 anda_db_utils = "0.14"
 ```
 
-## Related Crates
+```rust
+use anda_db_utils::UniqueVec;
 
-- `anda_db_btree` and `anda_db_tfs` for embedded index implementations
-- `anda_db` for the top-level embedded database layer
+let mut tags = UniqueVec::from(vec!["rust", "db"]);
+assert!(!tags.push("rust")); // already present
+assert!(tags.push("ai"));
+assert_eq!(tags.as_ref(), &["rust", "db", "ai"]);
+```
+
+## Trade-offs
+
+- Every element is stored twice — in the ordered `Vec` and in a membership
+  set — trading roughly twice the memory for constant-time duplicate checks.
+- Hashing uses unseeded FxHash, like the rest of the workspace. It has no
+  collision resistance: avoid it where an adversary controls the keys and
+  hash flooding is a concern.
+
+## Testing
+
+```bash
+cargo test -p anda_db_utils
+cargo bench -p anda_db_utils --bench unique_vec
+```
 
 ## License
 

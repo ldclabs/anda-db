@@ -1,9 +1,10 @@
 # anda_kip fuzzing
 
 Coverage-guided fuzzing of the KIP parsers (KQL / KML / META / JSON), which
-are exposed to untrusted input through `anda_db_server`. The invariant under
-test: parsers always terminate and return a `Result` — no panics, no hangs,
-no unbounded memory.
+are exposed to untrusted input through `anda_cognitive_nexus_server`, the
+Python binding and every host that hands an Agent `execute_kip`. The invariant
+under test: parsers always terminate and return a `Result` — no panics, no
+hangs, no unbounded memory.
 
 The always-on subset of these checks runs in normal CI via
 `rs/anda_kip/tests/proptest_parser.rs`. This directory is for open-ended
