@@ -75,6 +75,10 @@ The root workspace uses Rust edition 2024 with MSRV **1.95**. Rust crates are
 in the **0.14** release family; patch versions can diverge after a release,
 so read each `Cargo.toml` instead of assuming a shared patch version. Use workspace
 dependencies and existing feature conventions when editing workspace crates.
+The root `Cargo.lock` is ignored, but the server's Docker build uses the tracked
+`rs/anda_cognitive_nexus_server/Cargo.lock` with `--locked`: refresh it with
+`cp Cargo.lock rs/anda_cognitive_nexus_server/Cargo.lock` whenever a crate
+version or dependency changes.
 
 - `object_store` is on 0.14. `anda_db/full` only enables `object_store/fs`;
   core indexes and Jieba are already available without that feature.

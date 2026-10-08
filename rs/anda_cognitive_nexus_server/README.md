@@ -153,9 +153,10 @@ This is not a total process memory limit: index memory and the metadata wrapper'
 separate cache are additional.
 
 The Docker build copies this crate's committed `Cargo.lock` snapshot to the
-workspace root and builds with `--locked`. After changing workspace dependencies,
-refresh it with `cp Cargo.lock rs/anda_cognitive_nexus_server/Cargo.lock` from
-the repository root. The default
+workspace root and builds with `--locked`. After changing workspace dependencies
+or bumping a workspace crate's version, refresh it with
+`cp Cargo.lock rs/anda_cognitive_nexus_server/Cargo.lock` from the repository
+root. The default
 release profile favors binary size. For throughput comparisons, build with
 `cargo build --locked --profile release-speed -p anda_cognitive_nexus_server`
 and use `target/release-speed/anda-cognitive-nexus-server`. Measure your workload
