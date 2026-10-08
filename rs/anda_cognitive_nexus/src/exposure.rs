@@ -73,16 +73,21 @@ pub struct ExposureQuery {
 
 impl Store {
     /// Removes every exposure entry of one element; part of its erasure.
-    pub(crate) async fn remove_exposures(&self, element: &str) -> Result<(), KipError> {
-        let table = self.exposures();
-        let ids = table
-            .query_all_ids(eq_field("element", Fv::Text(element.into())))
-            .await
-            .map_err(db_error)?;
-        for id in ids {
-            table.remove(id).await.map_err(db_error)?;
-        }
-        Ok(())
+    pub(crate) fn remove_exposures(
+        &self,
+        element: &str,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let table = self.exposures();
+            let ids = table
+                .query_all_ids(eq_field("element", Fv::Text(element.into())))
+                .await
+                .map_err(db_error)?;
+            for id in ids {
+                table.remove(id).await.map_err(db_error)?;
+            }
+            Ok(())
+        })
     }
 
     /// How many exposure entries one element still has.
@@ -176,114 +181,118 @@ impl Session {
     ///
     /// Requires `read_audit`. An entry whose element the reader may not
     /// discover is omitted, and the page says nothing about how many were.
-    pub async fn read_exposures(
+    pub fn read_exposures(
         &self,
         space: &str,
         query: ExposureQuery,
-    ) -> Result<Json, KipError> {
-        let limit = query.limit.unwrap_or(100);
-        if limit == 0 || limit > MAX_EXPOSURES {
-            return Err(KipError::constraint_violation(format!(
-                "exposure page limit is 1..={MAX_EXPOSURES}"
-            )));
-        }
-        let after = match &query.cursor {
-            None => 0,
-            Some(cursor) => cursor
-                .strip_prefix("exposure:")
-                .and_then(|n| n.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    KipError::new(
-                        anda_kip::KipErrorCode::CursorInvalid,
-                        "invalid exposure cursor",
-                    )
-                })?,
-        };
-        let _guard = self.nexus.read_guard().await?;
-        let authority = self.effective_authority(space).await?;
-        authority
-            .authorize(
-                Permission::ReadAudit,
-                &ResourceContext::default(),
-                &self.auth,
-            )
-            .into_result()?;
-        let store = &self.nexus.store;
-        let table = store.exposures();
-        let mut scanned = after;
-        let mut records = Vec::new();
-        let mut last = None;
-        let mut more = false;
-        'pages: loop {
-            // Scan the id range directly: combining multiple equality indexes
-            // would materialize their full intersection before applying a limit.
-            // Each batch starts after the last scanned id, including hidden rows.
-            let ids = table
-                .query_ids(
-                    Filter::Field(("_id".into(), RangeQuery::Gt(Fv::U64(scanned)))),
-                    Some(READ_BATCH),
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            let limit = query.limit.unwrap_or(100);
+            if limit == 0 || limit > MAX_EXPOSURES {
+                return Err(KipError::constraint_violation(format!(
+                    "exposure page limit is 1..={MAX_EXPOSURES}"
+                )));
+            }
+            let after = match &query.cursor {
+                None => 0,
+                Some(cursor) => cursor
+                    .strip_prefix("exposure:")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        KipError::new(
+                            anda_kip::KipErrorCode::CursorInvalid,
+                            "invalid exposure cursor",
+                        )
+                    })?,
+            };
+            let _guard = self.nexus.read_guard().await?;
+            let authority = self.effective_authority(space).await?;
+            authority
+                .authorize(
+                    Permission::ReadAudit,
+                    &ResourceContext::default(),
+                    &self.auth,
                 )
-                .await
-                .map_err(db_error)?;
-            let exhausted = ids.len() < READ_BATCH;
-            for id in ids {
-                scanned = id;
-                let row: ExposureRow = table.get_as(id).await.map_err(db_error)?;
-                if row.space != space
-                    || query
-                        .element_id
-                        .as_ref()
-                        .is_some_and(|element| *element != row.element)
-                {
-                    continue;
+                .into_result()?;
+            let store = &self.nexus.store;
+            let table = store.exposures();
+            let mut scanned = after;
+            let mut records = Vec::new();
+            let mut last = None;
+            let mut more = false;
+            'pages: loop {
+                // Scan the id range directly: combining multiple equality indexes
+                // would materialize their full intersection before applying a limit.
+                // Each batch starts after the last scanned id, including hidden rows.
+                let ids = table
+                    .query_ids(
+                        Filter::Field(("_id".into(), RangeQuery::Gt(Fv::U64(scanned)))),
+                        Some(READ_BATCH),
+                    )
+                    .await
+                    .map_err(db_error)?;
+                let exhausted = ids.len() < READ_BATCH;
+                for id in ids {
+                    scanned = id;
+                    let row: ExposureRow = table.get_as(id).await.map_err(db_error)?;
+                    if row.space != space
+                        || query
+                            .element_id
+                            .as_ref()
+                            .is_some_and(|element| *element != row.element)
+                    {
+                        continue;
+                    }
+                    let discoverable = match row.element.parse::<ElementId>() {
+                        Ok(element) => {
+                            store
+                                .get_element(element)
+                                .await
+                                .ok()
+                                .is_some_and(|element| {
+                                    element.state() != state::PURGED
+                                        && authority.may_read(&element, &self.auth).is_some()
+                                })
+                        }
+                        Err(_) => false,
+                    };
+                    if !discoverable {
+                        continue;
+                    }
+                    // Look ahead to a visible entry, so hidden trailing rows never
+                    // produce a cursor or an extra empty page.
+                    if records.len() == limit {
+                        more = true;
+                        break 'pages;
+                    }
+                    last = Some(id);
+                    records.push(ExposureRecord {
+                        space_id: row.space,
+                        element_id: row.element,
+                        exposure: Exposure::from_wire(&row.exposure).unwrap_or(Exposure::Retrieved),
+                        snapshot_seq: row.snapshot_seq,
+                        recorded_at: row.recorded_at,
+                        principal_id: row.principal_id,
+                        decision_ref: Some(row.decision_ref).filter(|r| !r.is_empty()),
+                        recall_ref: Some(row.recall_ref).filter(|r| !r.is_empty()),
+                    });
                 }
-                let discoverable = match row.element.parse::<ElementId>() {
-                    Ok(element) => store
-                        .get_element(element)
-                        .await
-                        .ok()
-                        .is_some_and(|element| {
-                            element.state() != state::PURGED
-                                && authority.may_read(&element, &self.auth).is_some()
-                        }),
-                    Err(_) => false,
-                };
-                if !discoverable {
-                    continue;
+                if exhausted {
+                    break;
                 }
-                // Look ahead to a visible entry, so hidden trailing rows never
-                // produce a cursor or an extra empty page.
-                if records.len() == limit {
-                    more = true;
-                    break 'pages;
-                }
-                last = Some(id);
-                records.push(ExposureRecord {
-                    space_id: row.space,
-                    element_id: row.element,
-                    exposure: Exposure::from_wire(&row.exposure).unwrap_or(Exposure::Retrieved),
-                    snapshot_seq: row.snapshot_seq,
-                    recorded_at: row.recorded_at,
-                    principal_id: row.principal_id,
-                    decision_ref: Some(row.decision_ref).filter(|r| !r.is_empty()),
-                    recall_ref: Some(row.recall_ref).filter(|r| !r.is_empty()),
-                });
             }
-            if exhausted {
-                break;
-            }
-        }
-        // `cursor` is the position after the last delivered entry (or the one
-        // given, when nothing was delivered): a reader that keeps it reads only
-        // newer entries next time, full page or not.
-        let position = last
-            .map(|id| format!("exposure:{id}"))
-            .or_else(|| query.cursor.clone());
-        Ok(json!({
-            "records": records,
-            "next_cursor": if more { position.clone() } else { None },
-            "cursor": position,
-        }))
+            // `cursor` is the position after the last delivered entry (or the one
+            // given, when nothing was delivered): a reader that keeps it reads only
+            // newer entries next time, full page or not.
+            let position = last
+                .map(|id| format!("exposure:{id}"))
+                .or_else(|| query.cursor.clone());
+            Ok(json!({
+                "records": records,
+                "next_cursor": if more { position.clone() } else { None },
+                "cursor": position,
+            }))
+        })
     }
 }
 

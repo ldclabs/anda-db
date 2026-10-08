@@ -159,55 +159,72 @@ impl Collection {
     /// The extensions should not be large, as they are stored in the same object as collection metadata which size is expected to be small (<= 1MB) and loaded frequently.
     /// Returns [`DBError::PayloadTooLarge`] without changing anything when
     /// the value would push the metadata past the storage object budget.
-    pub async fn save_extension(&self, key: String, value: FieldValue) -> Result<(), DBError> {
-        let _operation_lease = self.mutation_lease().await?;
-        self.guarded("Collection::save_extension", async {
-            self.update_metadata(|meta| self.insert_extension(meta, key, value))?;
-            // Persist the metadata object directly (a single small put)
-            // instead of running a full flush: extensions live only in the
-            // metadata object, and the full flush caused write amplification
-            // plus an unpersisted window — a concurrent flusher could claim
-            // the version first, making this call take the fast path and
-            // return Ok while the winner's snapshot (possibly without this
-            // extension) was still in flight or failed. The unclaimed write
-            // keeps the "returning Ok means persisted" contract and does not
-            // advance `last_saved_version`, so the next full flush still
-            // persists the ids bitmap alongside the metadata.
-            self.store_metadata_unclaimed().await
+    pub fn save_extension(
+        &self,
+        key: String,
+        value: FieldValue,
+    ) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            let _operation_lease = self.mutation_lease().await?;
+            self.guarded("Collection::save_extension", async {
+                self.update_metadata(|meta| self.insert_extension(meta, key, value))?;
+                // Persist the metadata object directly (a single small put)
+                // instead of running a full flush: extensions live only in the
+                // metadata object, and the full flush caused write amplification
+                // plus an unpersisted window — a concurrent flusher could claim
+                // the version first, making this call take the fast path and
+                // return Ok while the winner's snapshot (possibly without this
+                // extension) was still in flight or failed. The unclaimed write
+                // keeps the "returning Ok means persisted" contract and does not
+                // advance `last_saved_version`, so the next full flush still
+                // persists the ids bitmap alongside the metadata.
+                self.store_metadata_unclaimed().await
+            })
+            .await
         })
-        .await
     }
 
     /// Sets a user-defined extension key-value pair with a serializable value and immediately persists the change.
-    pub async fn save_extension_from<T>(&self, key: String, value: &T) -> Result<(), DBError>
+    pub fn save_extension_from<T>(
+        &self,
+        key: String,
+        value: &T,
+    ) -> impl Future<Output = Result<(), DBError>>
     where
         T: Serialize,
     {
-        let field_value = FieldValue::serialized(value, None)?;
-        self.save_extension(key, field_value).await
+        Box::pin(async move {
+            let field_value = FieldValue::serialized(value, None)?;
+            self.save_extension(key, field_value).await
+        })
     }
 
     /// Removes a user-defined extension key and immediately persists the change.
     /// Returns the previous value if the key existed.
-    pub async fn remove_extension(&self, key: &str) -> Result<Option<FieldValue>, DBError> {
-        let _operation_lease = self.mutation_lease().await?;
+    pub fn remove_extension(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<FieldValue>, DBError>> + Send {
+        Box::pin(async move {
+            let _operation_lease = self.mutation_lease().await?;
 
-        self.guarded("Collection::remove_extension", async {
-            let old = self.update_metadata(|meta| {
-                let old = meta.extensions.remove(key);
+            self.guarded("Collection::remove_extension", async {
+                let old = self.update_metadata(|meta| {
+                    let old = meta.extensions.remove(key);
+                    if old.is_some() {
+                        meta.stats.version += 1;
+                    }
+                    old
+                });
                 if old.is_some() {
-                    meta.stats.version += 1;
+                    // See `save_extension` for why this is a direct, unclaimed
+                    // metadata write instead of a full flush.
+                    self.store_metadata_unclaimed().await?;
                 }
-                old
-            });
-            if old.is_some() {
-                // See `save_extension` for why this is a direct, unclaimed
-                // metadata write instead of a full flush.
-                self.store_metadata_unclaimed().await?;
-            }
-            Ok(old)
+                Ok(old)
+            })
+            .await
         })
-        .await
     }
 
     /// Provides access to the entire extensions map for advanced use cases.

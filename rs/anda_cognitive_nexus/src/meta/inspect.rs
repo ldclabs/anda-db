@@ -104,295 +104,301 @@ pub(crate) struct SearchSpec<'a> {
 /// reaches the whole Space unnarrowed is ranked from the persistent index and
 /// reads only those hits; any other reads its whole authorized corpus, where
 /// the bound changes nothing.
-pub(crate) async fn rank(
+pub(crate) fn rank(
     cx: &mut Context<'_>,
     spec: &SearchSpec<'_>,
     want: usize,
-) -> Result<(Vec<Hit>, Option<usize>), KipError> {
-    let SearchSpec {
-        target,
-        term,
-        with_type,
-        with_predicate,
-        mode,
-        threshold,
-    } = *spec;
-    let term = scalar_str(cx, term, "SEARCH")?;
-    if let Some(mode) = mode {
-        let mode = scalar_str(cx, mode, "MODE")?;
-        if mode != "keyword" {
-            return Err(KipError::new(
-                KipErrorCode::SearchModeUnsupported,
-                format!(
-                    "this engine has no embedding model, so {mode:?} search is unavailable; \
-                     \"keyword\" is the only mode"
-                ),
-            ));
-        }
-    }
-    let threshold = match threshold {
-        Some(scalar) => match scalar_json(cx, scalar)? {
-            Json::Number(n) => n.as_f64().unwrap_or(0.0),
-            other => {
-                return Err(KipError::type_mismatch(format!(
-                    "THRESHOLD takes a number, got {other}"
-                )));
-            }
-        },
-        None => 0.0,
-    };
-    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-        return Err(KipError::type_mismatch(
-            "THRESHOLD must be a number in [0, 1]",
-        ));
-    }
-    if (with_type.is_some() && target != SearchTarget::Concept)
-        || (with_predicate.is_some() && target != SearchTarget::Proposition)
-    {
-        return Err(KipError::invalid_syntax(
-            "SEARCH modifier is not meaningful for this kind",
-        ));
-    }
-    let with_type = match with_type {
-        Some(scalar) => Some(
-            cx.env
-                .resolve_symbol(
-                    crate::schema::SymbolKind::ConceptType,
-                    &scalar_str(cx, scalar, "WITH TYPE")?,
-                    crate::schema::Intent::Read,
-                )?
-                .to_string(),
-        ),
-        None => None,
-    };
-    let with_predicate = match with_predicate {
-        Some(scalar) => Some(
-            cx.env
-                .resolve_symbol(
-                    crate::schema::SymbolKind::PredicateType,
-                    &scalar_str(cx, scalar, "WITH PREDICATE")?,
-                    crate::schema::Intent::Read,
-                )?
-                .to_string(),
-        ),
-        None => None,
-    };
-
-    let kind = match target {
-        SearchTarget::Concept => ElementKind::Concept,
-        SearchTarget::Proposition => ElementKind::Proposition,
-        SearchTarget::Evidence => ElementKind::Evidence,
-        // An Assertion's content is a stance and a number, and an Activity's is
-        // a class and two timestamps. Neither carries text worth indexing, and
-        // returning nothing would read as "no such claim exists".
-        //
-        // `UnsupportedCapability`, not `SearchIndexUnavailable`: the second
-        // carries the `safe_same_request` retry class, which would send an
-        // Agent back to re-run a search that can never work. A permanent
-        // absence reported as a transient one is a retry loop.
-        SearchTarget::Assertion | SearchTarget::Activity => {
-            return Err(KipError::new(
-                KipErrorCode::UnsupportedCapability,
-                "Assertions and Activities carry no free text, so this engine builds no \
-                 full-text index over them; reach them through the Proposition or Evidence they \
-                 are about",
-            ));
-        }
-    };
-
-    if !cx.is_historical()
-        && cx.authority.searches_whole_space(cx.auth)
-        && let Some(hits) = rank_indexed(
-            cx,
-            kind,
-            &term,
-            with_type.as_deref().or(with_predicate.as_deref()),
+) -> impl Future<Output = Result<(Vec<Hit>, Option<usize>), KipError>> + Send {
+    Box::pin(async move {
+        let SearchSpec {
+            target,
+            term,
+            with_type,
+            with_predicate,
+            mode,
             threshold,
-            want,
-        )
-        .await?
-    {
-        return Ok((hits, None));
-    }
-
-    // A cache contains only searchable text, never time-dependent rendered
-    // views. The Space's sequence (every change to its rows commits one),
-    // its schema and the complete effective authority invalidate it; another
-    // Space's writes do not.
-    let corpus_key = crate::schema::contracts::digest(&serde_json::json!([
-        cx.space,
-        cx.pinned_seq,
-        cx.env.version,
-        kind.to_string(),
-        with_type,
-        with_predicate,
-        format!("{:?}:{:?}", cx.authority, cx.auth),
-        cx.policy,
-        cx.read_origin
-    ]))?;
-    let cacheable_corpus = !cx.is_historical() && !cx.authority.has_time_conditions();
-    if cacheable_corpus {
-        let cached = find_cached(&cx.store.search_corpora.lock(), &corpus_key);
-        if let Some(corpus) = cached {
-            cx.narrow_limit(corpus.read_cap);
-            let mut hits = Vec::new();
-            let scored = {
-                let corpus = corpus.clone();
-                let term = term.clone();
-                anda_db::query::run_query_task(move || {
-                    corpus.index.search_by(&term, want, None, search_order)
-                })
-                .await
-                .map_err(crate::error::db_error)?
-            };
-            for (seq, raw) in scored {
-                let score = normalized(raw)?;
-                if score < threshold {
-                    continue;
-                }
-                let id = ElementId::new(kind, seq);
-                cx.charge(1)?;
-                let Some(element) = cx.load(id).await? else {
-                    continue;
-                };
-                let decision = cx.authority.authorize(
-                    crate::governance::Permission::Search,
-                    &crate::governance::ResourceContext::of_element(&element),
-                    cx.auth,
-                );
-                if !decision.is_permitted() {
-                    continue;
-                }
-                let mut view = cx.view_of(id).as_ref().clone();
-                crate::governance::redact::apply(&mut view, &decision.constraints, cx.read_origin);
-                hits.push((score, id, std::sync::Arc::new(view)));
+        } = *spec;
+        let term = scalar_str(cx, term, "SEARCH")?;
+        if let Some(mode) = mode {
+            let mode = scalar_str(cx, mode, "MODE")?;
+            if mode != "keyword" {
+                return Err(KipError::new(
+                    KipErrorCode::SearchModeUnsupported,
+                    format!(
+                        "this engine has no embedding model, so {mode:?} search is unavailable; \
+                         \"keyword\" is the only mode"
+                    ),
+                ));
             }
-            return Ok((hits, corpus.cap));
         }
-    }
-
-    // Rank only the authorized, redacted corpus. Filtering global BM25 hits
-    // afterwards leaks hidden document statistics and can crowd visible hits
-    // out of an over-fetch window. This temporary index changes no stored state.
-    let mut hits: Vec<Hit> = Vec::new();
-    let mut cap: Option<usize> = None;
-    let index = anda_db_tfs::BM25Index::new(
-        "authorized-search".into(),
-        anda_db_tfs::jieba_tokenizer(),
-        None,
-    );
-    let mut views = std::collections::BTreeMap::new();
-    let mut corpus_weight = 0usize;
-    // Only the caps these candidates' admission placed: the query's own
-    // governed limit may also carry other patterns' elements.
-    let mut read_cap: Option<usize> = None;
-    let mut filters = vec![
-        crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
-        crate::store::eq_field(
-            "state",
-            anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
-        ),
-    ];
-    let selector = match kind {
-        ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
-        ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
-        _ => None,
-    };
-    // The same promotion-aware lineage keys as the whole-Space path, so the
-    // authority a caller holds never changes which types a search reaches.
-    if let Some((field, symbol)) = selector {
-        filters.push(cx.symbol_filter(kind, field, std::slice::from_ref(symbol))?);
-    }
-    let ids = cx
-        .candidates(
-            kind,
-            Some(anda_db::query::Filter::And(
-                filters.into_iter().map(Box::new).collect(),
-            )),
-        )
-        .await?;
-    cx.charge(ids.len())?;
-    cx.prefetch(&ids).await?;
-    for (ordinal, id) in ids.into_iter().enumerate() {
-        if ordinal % 64 == 0 {
-            tokio::task::yield_now().await;
-        }
-        let Some(element) = cx.load(id).await? else {
-            continue;
+        let threshold = match threshold {
+            Some(scalar) => match scalar_json(cx, scalar)? {
+                Json::Number(n) => n.as_f64().unwrap_or(0.0),
+                other => {
+                    return Err(KipError::type_mismatch(format!(
+                        "THRESHOLD takes a number, got {other}"
+                    )));
+                }
+            },
+            None => 0.0,
         };
-        if let Some(limit) = cx.read_limit_of(id) {
-            read_cap = Some(read_cap.map_or(limit, |c| c.min(limit)));
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(KipError::type_mismatch(
+                "THRESHOLD must be a number in [0, 1]",
+            ));
         }
-        if !element.is_active() {
-            continue;
-        }
-        let decision = cx.authority.authorize(
-            crate::governance::Permission::Search,
-            &crate::governance::ResourceContext::of_element(&element),
-            cx.auth,
-        );
-        if !decision.is_permitted() {
-            continue;
-        }
-        if let Some(max) = decision.constraints.max_results {
-            cap = Some(cap.map_or(max as usize, |c| c.min(max as usize)));
-        }
-        let mut rendered = cx.view_of(id).as_ref().clone();
-        crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
-        let rendered = std::sync::Arc::new(rendered);
-        if let Some(expected) = &with_type
-            && !rendered["schema_ref"].as_str().is_some_and(|actual| {
-                cx.env
-                    .same_lineage(crate::schema::SymbolKind::ConceptType, actual, expected)
-            })
+        if (with_type.is_some() && target != SearchTarget::Concept)
+            || (with_predicate.is_some() && target != SearchTarget::Proposition)
         {
-            continue;
+            return Err(KipError::invalid_syntax(
+                "SEARCH modifier is not meaningful for this kind",
+            ));
         }
-        if let Some(expected) = &with_predicate
-            && !rendered["predicate_ref"].as_str().is_some_and(|actual| {
+        let with_type = match with_type {
+            Some(scalar) => Some(
                 cx.env
-                    .same_lineage(crate::schema::SymbolKind::PredicateType, actual, expected)
-            })
-        {
-            continue;
-        }
-        let text = grounding_text(kind, rendered.as_ref());
-        corpus_weight = corpus_weight
-            .saturating_add(text.len().saturating_mul(16))
-            .saturating_add(512);
-        match index.insert(id.seq, &text, 0) {
-            Ok(()) => {
-                views.insert(id.seq, rendered);
+                    .resolve_symbol(
+                        crate::schema::SymbolKind::ConceptType,
+                        &scalar_str(cx, scalar, "WITH TYPE")?,
+                        crate::schema::Intent::Read,
+                    )?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        let with_predicate = match with_predicate {
+            Some(scalar) => Some(
+                cx.env
+                    .resolve_symbol(
+                        crate::schema::SymbolKind::PredicateType,
+                        &scalar_str(cx, scalar, "WITH PREDICATE")?,
+                        crate::schema::Intent::Read,
+                    )?
+                    .to_string(),
+            ),
+            None => None,
+        };
+
+        let kind = match target {
+            SearchTarget::Concept => ElementKind::Concept,
+            SearchTarget::Proposition => ElementKind::Proposition,
+            SearchTarget::Evidence => ElementKind::Evidence,
+            // An Assertion's content is a stance and a number, and an Activity's is
+            // a class and two timestamps. Neither carries text worth indexing, and
+            // returning nothing would read as "no such claim exists".
+            //
+            // `UnsupportedCapability`, not `SearchIndexUnavailable`: the second
+            // carries the `safe_same_request` retry class, which would send an
+            // Agent back to re-run a search that can never work. A permanent
+            // absence reported as a transient one is a retry loop.
+            SearchTarget::Assertion | SearchTarget::Activity => {
+                return Err(KipError::new(
+                    KipErrorCode::UnsupportedCapability,
+                    "Assertions and Activities carry no free text, so this engine builds no \
+                     full-text index over them; reach them through the Proposition or Evidence they \
+                     are about",
+                ));
             }
-            Err(anda_db_tfs::BM25Error::TokenizeFailed { .. }) => {}
-            Err(err) => return Err(KipError::internal_error(err.to_string())),
+        };
+
+        if !cx.is_historical()
+            && cx.authority.searches_whole_space(cx.auth)
+            && let Some(hits) = rank_indexed(
+                cx,
+                kind,
+                &term,
+                with_type.as_deref().or(with_predicate.as_deref()),
+                threshold,
+                want,
+            )
+            .await?
+        {
+            return Ok((hits, None));
         }
-    }
-    // Score all admitted documents before applying the threshold or page.
-    for (seq, raw_score) in index.search_by(&term, want, None, search_order) {
-        let score = normalized(raw_score)?;
-        if score < threshold {
-            continue;
+
+        // A cache contains only searchable text, never time-dependent rendered
+        // views. The Space's sequence (every change to its rows commits one),
+        // its schema and the complete effective authority invalidate it; another
+        // Space's writes do not.
+        let corpus_key = crate::schema::contracts::digest(&serde_json::json!([
+            cx.space,
+            cx.pinned_seq,
+            cx.env.version,
+            kind.to_string(),
+            with_type,
+            with_predicate,
+            format!("{:?}:{:?}", cx.authority, cx.auth),
+            cx.policy,
+            cx.read_origin
+        ]))?;
+        let cacheable_corpus = !cx.is_historical() && !cx.authority.has_time_conditions();
+        if cacheable_corpus {
+            let cached = find_cached(&cx.store.search_corpora.lock(), &corpus_key);
+            if let Some(corpus) = cached {
+                cx.narrow_limit(corpus.read_cap);
+                let mut hits = Vec::new();
+                let scored = {
+                    let corpus = corpus.clone();
+                    let term = term.clone();
+                    anda_db::query::run_query_task(move || {
+                        corpus.index.search_by(&term, want, None, search_order)
+                    })
+                    .await
+                    .map_err(crate::error::db_error)?
+                };
+                for (seq, raw) in scored {
+                    let score = normalized(raw)?;
+                    if score < threshold {
+                        continue;
+                    }
+                    let id = ElementId::new(kind, seq);
+                    cx.charge(1)?;
+                    let Some(element) = cx.load(id).await? else {
+                        continue;
+                    };
+                    let decision = cx.authority.authorize(
+                        crate::governance::Permission::Search,
+                        &crate::governance::ResourceContext::of_element(&element),
+                        cx.auth,
+                    );
+                    if !decision.is_permitted() {
+                        continue;
+                    }
+                    let mut view = cx.view_of(id).as_ref().clone();
+                    crate::governance::redact::apply(
+                        &mut view,
+                        &decision.constraints,
+                        cx.read_origin,
+                    );
+                    hits.push((score, id, std::sync::Arc::new(view)));
+                }
+                return Ok((hits, corpus.cap));
+            }
         }
-        let rendered = views[&seq].clone();
-        hits.push((score, ElementId::new(kind, seq), rendered));
-    }
-    hits.sort_by(|a, b| by_rank((a.0, a.1), (b.0, b.1)));
-    if cacheable_corpus {
-        let corpus = std::sync::Arc::new(AuthorizedCorpus {
-            index,
-            cap,
-            read_cap,
-            weight: corpus_weight,
-        });
-        push_bounded(
-            &mut cx.store.search_corpora.lock(),
-            corpus_key,
-            corpus,
-            |corpus| corpus.weight,
+
+        // Rank only the authorized, redacted corpus. Filtering global BM25 hits
+        // afterwards leaks hidden document statistics and can crowd visible hits
+        // out of an over-fetch window. This temporary index changes no stored state.
+        let mut hits: Vec<Hit> = Vec::new();
+        let mut cap: Option<usize> = None;
+        let index = anda_db_tfs::BM25Index::new(
+            "authorized-search".into(),
+            anda_db_tfs::jieba_tokenizer(),
+            None,
         );
-    }
-    Ok((hits, cap))
+        let mut views = std::collections::BTreeMap::new();
+        let mut corpus_weight = 0usize;
+        // Only the caps these candidates' admission placed: the query's own
+        // governed limit may also carry other patterns' elements.
+        let mut read_cap: Option<usize> = None;
+        let mut filters = vec![
+            crate::store::eq_field("space", anda_db_schema::Fv::Text(cx.space.clone())),
+            crate::store::eq_field(
+                "state",
+                anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
+            ),
+        ];
+        let selector = match kind {
+            ElementKind::Concept => with_type.as_ref().map(|v| ("schema_ref", v)),
+            ElementKind::Proposition => with_predicate.as_ref().map(|v| ("predicate_ref", v)),
+            _ => None,
+        };
+        // The same promotion-aware lineage keys as the whole-Space path, so the
+        // authority a caller holds never changes which types a search reaches.
+        if let Some((field, symbol)) = selector {
+            filters.push(cx.symbol_filter(kind, field, std::slice::from_ref(symbol))?);
+        }
+        let ids = cx
+            .candidates(
+                kind,
+                Some(anda_db::query::Filter::And(
+                    filters.into_iter().map(Box::new).collect(),
+                )),
+            )
+            .await?;
+        cx.charge(ids.len())?;
+        cx.prefetch(&ids).await?;
+        for (ordinal, id) in ids.into_iter().enumerate() {
+            if ordinal % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+            let Some(element) = cx.load(id).await? else {
+                continue;
+            };
+            if let Some(limit) = cx.read_limit_of(id) {
+                read_cap = Some(read_cap.map_or(limit, |c| c.min(limit)));
+            }
+            if !element.is_active() {
+                continue;
+            }
+            let decision = cx.authority.authorize(
+                crate::governance::Permission::Search,
+                &crate::governance::ResourceContext::of_element(&element),
+                cx.auth,
+            );
+            if !decision.is_permitted() {
+                continue;
+            }
+            if let Some(max) = decision.constraints.max_results {
+                cap = Some(cap.map_or(max as usize, |c| c.min(max as usize)));
+            }
+            let mut rendered = cx.view_of(id).as_ref().clone();
+            crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
+            let rendered = std::sync::Arc::new(rendered);
+            if let Some(expected) = &with_type
+                && !rendered["schema_ref"].as_str().is_some_and(|actual| {
+                    cx.env
+                        .same_lineage(crate::schema::SymbolKind::ConceptType, actual, expected)
+                })
+            {
+                continue;
+            }
+            if let Some(expected) = &with_predicate
+                && !rendered["predicate_ref"].as_str().is_some_and(|actual| {
+                    cx.env
+                        .same_lineage(crate::schema::SymbolKind::PredicateType, actual, expected)
+                })
+            {
+                continue;
+            }
+            let text = grounding_text(kind, rendered.as_ref());
+            corpus_weight = corpus_weight
+                .saturating_add(text.len().saturating_mul(16))
+                .saturating_add(512);
+            match index.insert(id.seq, &text, 0) {
+                Ok(()) => {
+                    views.insert(id.seq, rendered);
+                }
+                Err(anda_db_tfs::BM25Error::TokenizeFailed { .. }) => {}
+                Err(err) => return Err(KipError::internal_error(err.to_string())),
+            }
+        }
+        // Score all admitted documents before applying the threshold or page.
+        for (seq, raw_score) in index.search_by(&term, want, None, search_order) {
+            let score = normalized(raw_score)?;
+            if score < threshold {
+                continue;
+            }
+            let rendered = views[&seq].clone();
+            hits.push((score, ElementId::new(kind, seq), rendered));
+        }
+        hits.sort_by(|a, b| by_rank((a.0, a.1), (b.0, b.1)));
+        if cacheable_corpus {
+            let corpus = std::sync::Arc::new(AuthorizedCorpus {
+                index,
+                cap,
+                read_cap,
+                weight: corpus_weight,
+            });
+            push_bounded(
+                &mut cx.store.search_corpora.lock(),
+                corpus_key,
+                corpus,
+                |corpus| corpus.weight,
+            );
+        }
+        Ok((hits, cap))
+    })
 }
 
 // All hits in a search share a kind. Preserve the protocol's lexical ID tie
@@ -425,203 +431,210 @@ fn normalized(raw: f32) -> Result<f64, KipError> {
 /// Space's text and no inactive record moves a statistic (§66.4) — and only
 /// the hits a caller can use are read. `None` sends the caller back to the
 /// scan: a hit that is not readable after all.
-async fn rank_indexed(
+fn rank_indexed(
     cx: &mut Context<'_>,
     kind: ElementKind,
     term: &str,
     lineage: Option<&str>,
     threshold: f64,
     want: usize,
-) -> Result<Option<Vec<Hit>>, KipError> {
-    let collection = cx.store.elements(kind);
-    let (fields, symbol_column): (&[&str], &str) = match kind {
-        ElementKind::Concept => (&["name", "aliases", "attributes"], "schema_ref"),
-        ElementKind::Proposition => (&["predicate_ref"], "predicate_ref"),
-        _ => (&["payload_inline"], ""),
-    };
-    let mut filters = vec![
-        Box::new(crate::store::eq_field(
-            "space",
-            anda_db_schema::Fv::Text(cx.space.clone()),
-        )),
-        Box::new(crate::store::eq_field(
-            "state",
-            anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
-        )),
-    ];
-    if let Some(symbol) = lineage {
-        filters.push(Box::new(cx.symbol_filter(
-            kind,
-            symbol_column,
-            &[symbol.to_string()],
-        )?));
-    }
-    // The scope is this Space's rows and their lengths: it moves only with
-    // the Space's own sequence or schema, not with other Spaces' writes.
-    let scope_key = format!(
-        "{}:{}:{}:{kind:?}:{lineage:?}",
-        cx.space, cx.pinned_seq, cx.env.version
-    );
-    let cached = find_cached(&cx.store.search_scopes.lock(), &scope_key);
-    let scope = if let Some(scope) = cached {
-        scope
-    } else {
-        let ids = collection
-            .clone()
-            .query_all_ids_on_worker(anda_db::query::Filter::And(filters))
-            .await
-            .map_err(crate::error::db_error)?;
-        let scope = {
-            let collection = collection.clone();
-            let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-            std::sync::Arc::new(
-                anda_db::query::run_query_task(move || {
-                    collection
-                        .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
-                        .map(|index| index.prepare_scope(&ids))
-                })
+) -> impl Future<Output = Result<Option<Vec<Hit>>, KipError>> + Send {
+    Box::pin(async move {
+        let collection = cx.store.elements(kind);
+        let (fields, symbol_column): (&[&str], &str) = match kind {
+            ElementKind::Concept => (&["name", "aliases", "attributes"], "schema_ref"),
+            ElementKind::Proposition => (&["predicate_ref"], "predicate_ref"),
+            _ => (&["payload_inline"], ""),
+        };
+        let mut filters = vec![
+            Box::new(crate::store::eq_field(
+                "space",
+                anda_db_schema::Fv::Text(cx.space.clone()),
+            )),
+            Box::new(crate::store::eq_field(
+                "state",
+                anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
+            )),
+        ];
+        if let Some(symbol) = lineage {
+            filters.push(Box::new(cx.symbol_filter(
+                kind,
+                symbol_column,
+                &[symbol.to_string()],
+            )?));
+        }
+        // The scope is this Space's rows and their lengths: it moves only with
+        // the Space's own sequence or schema, not with other Spaces' writes.
+        let scope_key = format!(
+            "{}:{}:{}:{kind:?}:{lineage:?}",
+            cx.space, cx.pinned_seq, cx.env.version
+        );
+        let cached = find_cached(&cx.store.search_scopes.lock(), &scope_key);
+        let scope = if let Some(scope) = cached {
+            scope
+        } else {
+            let ids = collection
+                .clone()
+                .query_all_ids_on_worker(anda_db::query::Filter::And(filters))
                 .await
-                .map_err(crate::error::db_error)?
-                .map_err(crate::error::db_error)?,
-            )
+                .map_err(crate::error::db_error)?;
+            let scope = {
+                let collection = collection.clone();
+                let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+                std::sync::Arc::new(
+                    anda_db::query::run_query_task(move || {
+                        collection
+                            .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+                            .map(|index| index.prepare_scope(&ids))
+                    })
+                    .await
+                    .map_err(crate::error::db_error)?
+                    .map_err(crate::error::db_error)?,
+                )
+            };
+            push_bounded(
+                &mut cx.store.search_scopes.lock(),
+                scope_key,
+                scope.clone(),
+                anda_db_tfs::PreparedScope::cache_weight,
+            );
+            scope
         };
-        push_bounded(
-            &mut cx.store.search_scopes.lock(),
-            scope_key,
-            scope.clone(),
-            anda_db_tfs::PreparedScope::cache_weight,
-        );
-        scope
-    };
-    let scored = {
-        let collection = collection.clone();
-        let scope = scope.clone();
-        let term = term.to_string();
-        let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        anda_db::query::run_query_task(move || {
-            collection
-                .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
-                .map(|index| index.search_prepared_by(&term, want, None, &scope, search_order))
-        })
-        .await
-        .map_err(crate::error::db_error)?
-        .map_err(crate::error::db_error)?
-    };
-    let mut ranked = Vec::with_capacity(scored.len());
-    for (seq, raw) in scored {
-        let score = normalized(raw)?;
-        if score >= threshold {
-            ranked.push((score, ElementId::new(kind, seq)));
-        }
-    }
-    ranked.sort_by(|a, b| by_rank(*a, *b));
-    let mut hits = Vec::with_capacity(want.min(ranked.len()));
-    for (score, id) in ranked.into_iter().take(want) {
-        cx.charge(1)?;
-        let Some(element) = cx.load(id).await? else {
-            return Ok(None);
+        let scored = {
+            let collection = collection.clone();
+            let scope = scope.clone();
+            let term = term.to_string();
+            let fields = fields.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            anda_db::query::run_query_task(move || {
+                collection
+                    .get_bm25_index(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+                    .map(|index| index.search_prepared_by(&term, want, None, &scope, search_order))
+            })
+            .await
+            .map_err(crate::error::db_error)?
+            .map_err(crate::error::db_error)?
         };
-        let decision = cx.authority.authorize(
-            crate::governance::Permission::Search,
-            &crate::governance::ResourceContext::of_element(&element),
-            cx.auth,
-        );
-        if !element.is_active() || !decision.is_permitted() {
-            return Ok(None);
+        let mut ranked = Vec::with_capacity(scored.len());
+        for (seq, raw) in scored {
+            let score = normalized(raw)?;
+            if score >= threshold {
+                ranked.push((score, ElementId::new(kind, seq)));
+            }
         }
-        let mut rendered = cx.view_of(id).as_ref().clone();
-        crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
-        hits.push((score, id, std::sync::Arc::new(rendered)));
-    }
-    Ok(Some(hits))
+        ranked.sort_by(|a, b| by_rank(*a, *b));
+        let mut hits = Vec::with_capacity(want.min(ranked.len()));
+        for (score, id) in ranked.into_iter().take(want) {
+            cx.charge(1)?;
+            let Some(element) = cx.load(id).await? else {
+                return Ok(None);
+            };
+            let decision = cx.authority.authorize(
+                crate::governance::Permission::Search,
+                &crate::governance::ResourceContext::of_element(&element),
+                cx.auth,
+            );
+            if !element.is_active() || !decision.is_permitted() {
+                return Ok(None);
+            }
+            let mut rendered = cx.view_of(id).as_ref().clone();
+            crate::governance::redact::apply(&mut rendered, &decision.constraints, cx.read_origin);
+            hits.push((score, id, std::sync::Arc::new(rendered)));
+        }
+        Ok(Some(hits))
+    })
 }
 
-pub async fn search(cx: &mut Context<'_>, command: &SearchCommand) -> Result<Answer, KipError> {
-    if command.as_of_seq.is_some() {
-        return Err(KipError::new(
-            KipErrorCode::HistoricalSearchUnavailable,
-            "this engine keeps no historical index, so AS OF SEQ search is unavailable",
-        ));
-    }
-    let limit = match &command.limit {
-        Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?.min(100),
-        None => 10,
-    };
-    let offset = match &command.cursor {
-        Some(scalar) => {
-            let cursor = super::read_cursor(cx, scalar, CursorFamily::Search)?;
-            if cursor.snapshot_seq != cx.pinned_seq {
-                return Err(KipError::cursor_expired(
-                    "search",
-                    "SEARCH index changed; start a new traversal",
-                ));
-            }
-            cursor.offset
+pub fn search(
+    cx: &mut Context<'_>,
+    command: &SearchCommand,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        if command.as_of_seq.is_some() {
+            return Err(KipError::new(
+                KipErrorCode::HistoricalSearchUnavailable,
+                "this engine keeps no historical index, so AS OF SEQ search is unavailable",
+            ));
         }
-        None => 0,
-    };
-    let term = scalar_str(cx, &command.term, "SEARCH")?;
-    let spec = SearchSpec {
-        target: command.target,
-        term: &command.term,
-        with_type: command.with_type.as_ref(),
-        with_predicate: command.with_predicate.as_ref(),
-        mode: command.mode.as_ref(),
-        threshold: command.threshold.as_ref(),
-    };
-    // One past the page: enough to know whether another page remains.
-    let (ranked, cap) = rank(cx, &spec, offset + limit + 1).await?;
-    let search_limit = cap.map_or(limit, |cap| cap.min(limit));
-    let hits: Vec<(f64, Json)> = ranked
-        .into_iter()
-        .map(|(score, id, rendered)| {
-            (
-                score,
-                serde_json::json!({
-                    "id": id.to_string(), "kind": id.kind.to_string(),
-                    "score": score,
-                    "retrieval": {"score": score, "mode": "keyword"},
-                    "snippet": snippet_of(id.kind, rendered.as_ref(), &term),
-                    "element": rendered.as_ref(),
-                }),
-            )
-        })
-        .collect();
+        let limit = match &command.limit {
+            Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?.min(100),
+            None => 10,
+        };
+        let offset = match &command.cursor {
+            Some(scalar) => {
+                let cursor = super::read_cursor(cx, scalar, CursorFamily::Search)?;
+                if cursor.snapshot_seq != cx.pinned_seq {
+                    return Err(KipError::cursor_expired(
+                        "search",
+                        "SEARCH index changed; start a new traversal",
+                    ));
+                }
+                cursor.offset
+            }
+            None => 0,
+        };
+        let term = scalar_str(cx, &command.term, "SEARCH")?;
+        let spec = SearchSpec {
+            target: command.target,
+            term: &command.term,
+            with_type: command.with_type.as_ref(),
+            with_predicate: command.with_predicate.as_ref(),
+            mode: command.mode.as_ref(),
+            threshold: command.threshold.as_ref(),
+        };
+        // One past the page: enough to know whether another page remains.
+        let (ranked, cap) = rank(cx, &spec, offset + limit + 1).await?;
+        let search_limit = cap.map_or(limit, |cap| cap.min(limit));
+        let hits: Vec<(f64, Json)> = ranked
+            .into_iter()
+            .map(|(score, id, rendered)| {
+                (
+                    score,
+                    serde_json::json!({
+                        "id": id.to_string(), "kind": id.kind.to_string(),
+                        "score": score,
+                        "retrieval": {"score": score, "mode": "keyword"},
+                        "snippet": snippet_of(id.kind, rendered.as_ref(), &term),
+                        "element": rendered.as_ref(),
+                    }),
+                )
+            })
+            .collect();
 
-    let limit = search_limit.min(cx.governed_limit().unwrap_or(limit));
-    let total = hits.len();
-    let page: Vec<Json> = hits
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|(_, hit)| hit)
-        .collect();
-    let consumed = offset + page.len();
+        let limit = search_limit.min(cx.governed_limit().unwrap_or(limit));
+        let total = hits.len();
+        let page: Vec<Json> = hits
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(_, hit)| hit)
+            .collect();
+        let consumed = offset + page.len();
 
-    let space = cx.store.get_space(&cx.space).await?;
-    Ok(Answer {
-        result: serde_json::json!({
-            "hits": page,
-            "search_context": {
-                "mode": "keyword",
-                "score_semantics": "bm25_relevance_not_confidence",
-                "normalization": "s / (1 + s), authorized redacted corpus only",
-                // §77: the index may lag the committed state, and a caller
-                // deciding whether a miss means anything needs to know that.
-                "index_seq": space.seq,
-                "current_space_seq": space.seq,
-                "consistency": "index is maintained synchronously with commits",
+        let space = cx.store.get_space(&cx.space).await?;
+        Ok(Answer {
+            result: serde_json::json!({
+                "hits": page,
+                "search_context": {
+                    "mode": "keyword",
+                    "score_semantics": "bm25_relevance_not_confidence",
+                    "normalization": "s / (1 + s), authorized redacted corpus only",
+                    // §77: the index may lag the committed state, and a caller
+                    // deciding whether a miss means anything needs to know that.
+                    "index_seq": space.seq,
+                    "current_space_seq": space.seq,
+                    "consistency": "index is maintained synchronously with commits",
+                },
+                "caveat": "a SEARCH score is not a confidence and a miss is not an absence; \
+                           ground with SEARCH, then read with FIND or BELIEF",
+                "exhaustive": true,
+            }),
+            next_cursor: if limit == 0 {
+                None
+            } else {
+                super::next_cursor(cx, CursorFamily::Search, consumed, total)
             },
-            "caveat": "a SEARCH score is not a confidence and a miss is not an absence; \
-                       ground with SEARCH, then read with FIND or BELIEF",
-            "exhaustive": true,
-        }),
-        next_cursor: if limit == 0 {
-            None
-        } else {
-            super::next_cursor(cx, CursorFamily::Search, consumed, total)
-        },
-        warnings: Vec::new(),
+            warnings: Vec::new(),
+        })
     })
 }
 
@@ -690,137 +703,146 @@ pub fn validate(cx: &mut Context<'_>, command: &ValidateCommand) -> Result<Answe
 }
 
 /// `EXPORT CAPSULE` — the portable form of a subgraph.
-pub async fn export_capsule(
+pub fn export_capsule(
     cx: &mut Context<'_>,
     command: &anda_kip::ExportCapsuleCommand,
-) -> Result<Answer, KipError> {
-    // An export is snapshot-consistent (§41.1): binding the read coordinate
-    // before the roots are selected is what makes the closure it walks one
-    // coherent state rather than several.
-    if let Some(as_of) = &command.as_of {
-        let seq = cx.resolve_as_of(as_of).await?;
-        cx.as_of = Some(seq);
-        let version = cx.store.schema_version_at(&cx.space, seq).await?;
-        cx.env = cx.store.schema_environment_at(&cx.space, version).await?;
-    }
-    let mut options = anda_kip::Map::new();
-    if let Some(block) = &command.options {
-        options = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
-    }
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        // An export is snapshot-consistent (§41.1): binding the read coordinate
+        // before the roots are selected is what makes the closure it walks one
+        // coherent state rather than several.
+        if let Some(as_of) = &command.as_of {
+            let seq = cx.resolve_as_of(as_of).await?;
+            cx.as_of = Some(seq);
+            let version = cx.store.schema_version_at(&cx.space, seq).await?;
+            cx.env = cx.store.schema_environment_at(&cx.space, version).await?;
+        }
+        let mut options = anda_kip::Map::new();
+        if let Some(block) = &command.options {
+            options = crate::projection::settings_of(block, |name| cx.param_ref(name))?;
+        }
 
-    // The roots come from the selection block, exactly as a KQL read would
-    // find them — an export selects with the same solver a query uses, so the
-    // two cannot disagree about what a pattern matches.
-    let solutions = cx.solve(&command.where_clauses).await?;
-    let roots: Vec<crate::id::ElementId> = match &command.target {
-        anda_kip::ElementRef::Handle(name) => solutions.elements_of(name),
-        anda_kip::ElementRef::Id(id) => vec![id.parse()?],
-        anda_kip::ElementRef::Param(name) => match cx.param_ref(name)? {
-            Json::String(id) => vec![id.parse()?],
-            other => {
-                return Err(KipError::type_mismatch(format!(
-                    "the parameter :{name} must carry an element id, got {other}"
-                )));
-            }
-        },
-    };
-    if roots.is_empty() {
-        return Err(KipError::projection_target_unbound(
-            "the selection block bound no root elements, so there is nothing to export",
-        ));
-    }
+        // The roots come from the selection block, exactly as a KQL read would
+        // find them — an export selects with the same solver a query uses, so the
+        // two cannot disagree about what a pattern matches.
+        let solutions = cx.solve(&command.where_clauses).await?;
+        let roots: Vec<crate::id::ElementId> = match &command.target {
+            anda_kip::ElementRef::Handle(name) => solutions.elements_of(name),
+            anda_kip::ElementRef::Id(id) => vec![id.parse()?],
+            anda_kip::ElementRef::Param(name) => match cx.param_ref(name)? {
+                Json::String(id) => vec![id.parse()?],
+                other => {
+                    return Err(KipError::type_mismatch(format!(
+                        "the parameter :{name} must carry an element id, got {other}"
+                    )));
+                }
+            },
+        };
+        if roots.is_empty() {
+            return Err(KipError::projection_target_unbound(
+                "the selection block bound no root elements, so there is nothing to export",
+            ));
+        }
 
-    let capsule = crate::capsule::export(cx, roots, &options).await?;
-    Ok(Answer::whole(serde_json::to_value(&capsule).map_err(
-        |err| KipError::internal_error(format!("a Capsule failed to encode: {err}")),
-    )?))
+        let capsule = crate::capsule::export(cx, roots, &options).await?;
+        Ok(Answer::whole(serde_json::to_value(&capsule).map_err(
+            |err| KipError::internal_error(format!("a Capsule failed to encode: {err}")),
+        )?))
+    })
 }
 
 /// `PREVIEW KML` and `PREVIEW IMPORT CAPSULE` — effect, without committing.
-pub async fn preview(cx: &mut Context<'_>, command: &PreviewCommand) -> Result<Answer, KipError> {
-    let PreviewCommand::Kml(scalar) = command else {
-        let PreviewCommand::ImportCapsule { capsule, into } = command else {
-            unreachable!("the two preview forms are exhaustive");
+pub fn preview(
+    cx: &mut Context<'_>,
+    command: &PreviewCommand,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let PreviewCommand::Kml(scalar) = command else {
+            let PreviewCommand::ImportCapsule { capsule, into } = command else {
+                unreachable!("the two preview forms are exhaustive");
+            };
+            let source = scalar_str(cx, capsule, "PREVIEW IMPORT CAPSULE")?;
+            let into = scalar_str(cx, into, "INTO")?;
+            let parsed = crate::capsule::parse(&source)?;
+            // Validation runs against the destination Space, because that is where
+            // the schema has to resolve — an artifact that is fine here may be
+            // unreadable there.
+            let nexus = crate::CognitiveNexus::attach(cx.store.clone());
+            let report =
+                crate::capsule::import(&nexus, &parsed, &into, true, cx.auth.clone(), false, &[])
+                    .await?;
+            return Ok(Answer::whole(report.to_json(true)));
         };
-        let source = scalar_str(cx, capsule, "PREVIEW IMPORT CAPSULE")?;
-        let into = scalar_str(cx, into, "INTO")?;
-        let parsed = crate::capsule::parse(&source)?;
-        // Validation runs against the destination Space, because that is where
-        // the schema has to resolve — an artifact that is fine here may be
-        // unreadable there.
-        let nexus = crate::CognitiveNexus::attach(cx.store.clone());
-        let report =
-            crate::capsule::import(&nexus, &parsed, &into, true, cx.auth.clone(), false, &[])
-                .await?;
-        return Ok(Answer::whole(report.to_json(true)));
-    };
-    let source = scalar_str(cx, scalar, "PREVIEW KML")?;
-    let statement = match anda_kip::parse_kip(&source)? {
-        anda_kip::Command::Kml(statement) => statement,
-        other => {
-            return Err(KipError::language_mismatch(format!(
-                "PREVIEW KML takes a mutation, and this is {}",
-                anda_kip::CommandType::from(&other)
-            )));
+        let source = scalar_str(cx, scalar, "PREVIEW KML")?;
+        let statement = match anda_kip::parse_kip(&source)? {
+            anda_kip::Command::Kml(statement) => statement,
+            other => {
+                return Err(KipError::language_mismatch(format!(
+                    "PREVIEW KML takes a mutation, and this is {}",
+                    anda_kip::CommandType::from(&other)
+                )));
+            }
+        };
+
+        // A preview is a dry run, which is the same code path a committing run
+        // takes right up to the commit. Simulating it separately would let the two
+        // drift, and the drift would only show up as a preview that lied.
+        let mut request = anda_kip::Request::single(&source);
+        request.options = Some(anda_kip::RequestOptions {
+            dry_run: Some(true),
+            ..Default::default()
+        });
+        let operation = request.operations[0].clone();
+        let response = crate::kml::execute(
+            cx.store,
+            &cx.space,
+            &statement,
+            &request,
+            &operation,
+            cx.authority,
+            cx.auth,
+        )
+        .await;
+
+        if let Some(error) = response.error {
+            return Ok(Answer::whole(serde_json::json!({
+                "would_commit": false,
+                "error": error,
+            })));
         }
-    };
-
-    // A preview is a dry run, which is the same code path a committing run
-    // takes right up to the commit. Simulating it separately would let the two
-    // drift, and the drift would only show up as a preview that lied.
-    let mut request = anda_kip::Request::single(&source);
-    request.options = Some(anda_kip::RequestOptions {
-        dry_run: Some(true),
-        ..Default::default()
-    });
-    let operation = request.operations[0].clone();
-    let response = crate::kml::execute(
-        cx.store,
-        &cx.space,
-        &statement,
-        &request,
-        &operation,
-        cx.authority,
-        cx.auth,
-    )
-    .await;
-
-    if let Some(error) = response.error {
-        return Ok(Answer::whole(serde_json::json!({
-            "would_commit": false,
-            "error": error,
-        })));
-    }
-    // §75 puts a single operation's Receipt on its own result; the top-level
-    // slot belongs to an `atomic` transaction, which this engine does not run.
-    // Reading the wrong one made every preview report a null Receipt.
-    let receipt = response
-        .results
-        .first()
-        .and_then(|result| result.receipt.as_ref());
-    Ok(Answer::whole(serde_json::json!({
-        "would_commit": true,
-        "effect": response.first_result(),
-        "receipt": receipt,
-        "note": "a preview reserves no identity and establishes no durable state",
-    })))
+        // §75 puts a single operation's Receipt on its own result; the top-level
+        // slot belongs to an `atomic` transaction, which this engine does not run.
+        // Reading the wrong one made every preview report a null Receipt.
+        let receipt = response
+            .results
+            .first()
+            .and_then(|result| result.receipt.as_ref());
+        Ok(Answer::whole(serde_json::json!({
+            "would_commit": true,
+            "effect": response.first_result(),
+            "receipt": receipt,
+            "note": "a preview reserves no identity and establishes no durable state",
+        })))
+    })
 }
 
 /// `VERIFY` — integrity.
-pub async fn verify(
+pub fn verify(
     cx: &mut Context<'_>,
     target: VerifyTarget,
     value: &Scalar,
-) -> Result<Answer, KipError> {
-    match target {
-        VerifyTarget::Capsule => {
-            let source = scalar_str(cx, value, "VERIFY CAPSULE")?;
-            let capsule = crate::capsule::parse(&source)?;
-            Ok(Answer::whole(crate::capsule::verify(&capsule)?))
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        match target {
+            VerifyTarget::Capsule => {
+                let source = scalar_str(cx, value, "VERIFY CAPSULE")?;
+                let capsule = crate::capsule::parse(&source)?;
+                Ok(Answer::whole(crate::capsule::verify(&capsule)?))
+            }
+            VerifyTarget::Receipt => verify_receipt(cx, value).await,
+            VerifyTarget::SchemaPackage => verify_package(cx, value).await,
         }
-        VerifyTarget::Receipt => verify_receipt(cx, value).await,
-        VerifyTarget::SchemaPackage => verify_package(cx, value).await,
-    }
+    })
 }
 
 /// The artifact a `VERIFY` operand names: JSON text, or the object itself
@@ -992,80 +1014,86 @@ async fn attest_receipt(
 /// (§20.11, sha256 over every top-level field except `integrity`), and —
 /// where a package is installed under the same reference — whether it is the
 /// same content.
-async fn verify_package(cx: &mut Context<'_>, value: &Scalar) -> Result<Answer, KipError> {
-    let artifact = artifact_json(cx, value, "VERIFY SCHEMA PACKAGE")?;
-    let text = serde_json::to_string(&artifact).map_err(|err| {
-        KipError::internal_error(format!("a JSON value failed to re-encode: {err}"))
-    })?;
-    let package = crate::schema::SchemaPackage::parse(&text)?;
-    let package_ref = package.package_ref()?.to_string();
-    let integrity = artifact.get("integrity");
-    let declared = integrity
-        .and_then(|integrity| integrity.get("content_digest"))
-        .and_then(Json::as_str)
-        .filter(|digest| !digest.is_empty());
-    let declared = match declared {
-        Some(declared) => {
-            let mut covered = artifact.clone();
-            if let Some(object) = covered.as_object_mut() {
-                object.remove("integrity");
+fn verify_package(
+    cx: &mut Context<'_>,
+    value: &Scalar,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let artifact = artifact_json(cx, value, "VERIFY SCHEMA PACKAGE")?;
+        let text = serde_json::to_string(&artifact).map_err(|err| {
+            KipError::internal_error(format!("a JSON value failed to re-encode: {err}"))
+        })?;
+        let package = crate::schema::SchemaPackage::parse(&text)?;
+        let package_ref = package.package_ref()?.to_string();
+        let integrity = artifact.get("integrity");
+        let declared = integrity
+            .and_then(|integrity| integrity.get("content_digest"))
+            .and_then(Json::as_str)
+            .filter(|digest| !digest.is_empty());
+        let declared = match declared {
+            Some(declared) => {
+                let mut covered = artifact.clone();
+                if let Some(object) = covered.as_object_mut() {
+                    object.remove("integrity");
+                }
+                let recomputed = declared_package_digest(&covered);
+                if recomputed != declared {
+                    return Err(KipError::new(
+                        KipErrorCode::DigestMismatch,
+                        format!(
+                            "this package declares the digest {declared} and its content digests to \
+                             {recomputed}; it was modified after it was published"
+                        ),
+                    ));
+                }
+                serde_json::json!({
+                    "checked": true,
+                    "content_digest": declared,
+                    "covers": "all top-level fields except integrity",
+                })
             }
-            let recomputed = declared_package_digest(&covered);
-            if recomputed != declared {
-                return Err(KipError::new(
-                    KipErrorCode::DigestMismatch,
-                    format!(
-                        "this package declares the digest {declared} and its content digests to \
-                         {recomputed}; it was modified after it was published"
-                    ),
-                ));
+            None => serde_json::json!({
+                "checked": false,
+                "reason": "the artifact declares no integrity.content_digest",
+            }),
+        };
+        let engine_digest = crate::store::schema::content_digest(
+            &serde_json::to_value(&package).unwrap_or(Json::Null),
+        );
+        let installed = match cx.store.installed_packages().await?.get(&package_ref) {
+            Some(stored) => {
+                let stored_digest = crate::store::schema::content_digest(
+                    &serde_json::to_value(stored.as_ref()).unwrap_or(Json::Null),
+                );
+                serde_json::json!({"known": true, "matches": stored_digest == engine_digest})
             }
-            serde_json::json!({
-                "checked": true,
-                "content_digest": declared,
-                "covers": "all top-level fields except integrity",
-            })
-        }
-        None => serde_json::json!({
-            "checked": false,
-            "reason": "the artifact declares no integrity.content_digest",
-        }),
-    };
-    let engine_digest =
-        crate::store::schema::content_digest(&serde_json::to_value(&package).unwrap_or(Json::Null));
-    let installed = match cx.store.installed_packages().await?.get(&package_ref) {
-        Some(stored) => {
-            let stored_digest = crate::store::schema::content_digest(
-                &serde_json::to_value(stored.as_ref()).unwrap_or(Json::Null),
-            );
-            serde_json::json!({"known": true, "matches": stored_digest == engine_digest})
-        }
-        None => serde_json::json!({"known": false}),
-    };
-    let valid = installed
-        .get("matches")
-        .and_then(Json::as_bool)
-        .unwrap_or(true);
-    let signatures = integrity
-        .and_then(|integrity| integrity.get("signatures"))
-        .and_then(Json::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    Ok(Answer::whole(serde_json::json!({
-        "valid": valid,
-        "package_ref": package_ref,
-        "content_digest": engine_digest,
-        "declared": declared,
-        "signed": signatures > 0,
-        "signature": {
-            "checked": false,
-            "reason": "capsule_signatures is not advertised (§37.8); a signature on this package \
-                       is carried, not checked",
-        },
-        "installed": installed,
-        "note": "a matching digest means the artifact is intact, not that its definitions are \
-                 wanted; VALIDATE SCHEMA PACKAGE and DESCRIBE PACKAGE answer that",
-    })))
+            None => serde_json::json!({"known": false}),
+        };
+        let valid = installed
+            .get("matches")
+            .and_then(Json::as_bool)
+            .unwrap_or(true);
+        let signatures = integrity
+            .and_then(|integrity| integrity.get("signatures"))
+            .and_then(Json::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        Ok(Answer::whole(serde_json::json!({
+            "valid": valid,
+            "package_ref": package_ref,
+            "content_digest": engine_digest,
+            "declared": declared,
+            "signed": signatures > 0,
+            "signature": {
+                "checked": false,
+                "reason": "capsule_signatures is not advertised (§37.8); a signature on this package \
+                           is carried, not checked",
+            },
+            "installed": installed,
+            "note": "a matching digest means the artifact is intact, not that its definitions are \
+                     wanted; VALIDATE SCHEMA PACKAGE and DESCRIBE PACKAGE answer that",
+        })))
+    })
 }
 
 /// The digest a published package declares (§20.11): `sha256:` over the RFC

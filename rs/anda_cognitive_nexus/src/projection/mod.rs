@@ -483,24 +483,26 @@ impl Context<'_> {
         }
     }
 
-    pub async fn resolve_projection_context(
+    pub fn resolve_projection_context(
         &mut self,
         policy: &mut Policy,
-    ) -> Result<(), KipError> {
-        let mut refs = Vec::new();
-        for reference in &policy.context_refs {
-            let id = reference.parse::<ElementId>()?;
-            if id.kind != anda_kip::ElementKind::Concept || self.load(id).await?.is_none() {
-                return Err(KipError::not_found_or_not_visible(
-                    "projection context is unavailable",
-                ));
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let mut refs = Vec::new();
+            for reference in &policy.context_refs {
+                let id = reference.parse::<ElementId>()?;
+                if id.kind != anda_kip::ElementKind::Concept || self.load(id).await?.is_none() {
+                    return Err(KipError::not_found_or_not_visible(
+                        "projection context is unavailable",
+                    ));
+                }
+                refs.push(self.canonical_of(id).await?.to_string());
             }
-            refs.push(self.canonical_of(id).await?.to_string());
-        }
-        refs.sort();
-        refs.dedup();
-        policy.context_refs = refs;
-        Ok(())
+            refs.sort();
+            refs.dedup();
+            policy.context_refs = refs;
+            Ok(())
+        })
     }
 
     /// Projects belief about one Proposition.
@@ -508,63 +510,65 @@ impl Context<'_> {
     /// A Proposition in a constrained slot is projected together with its
     /// slot: world time (§25.4) and final belief (§21.11) are properties of
     /// the slot, so a single `BELIEF` and a `BELIEF SLOT` at one basis agree.
-    pub async fn project_belief(
+    pub fn project_belief(
         &mut self,
         proposition: ElementId,
         policy: &Policy,
         at: &str,
-    ) -> Result<Belief, KipError> {
-        self.require_projection_history(policy)?;
-        let basis = serde_json::to_string(&(policy, at, self.pinned_seq, self.env.version))
-            .expect("policy serializes");
-        if let Some(belief) = self.belief_cache.get(&(basis.clone(), proposition)) {
-            return Ok(belief.clone());
-        }
-        let frame = self.frame(proposition).await?;
-        let index = frame
-            .members
-            .iter()
-            .position(|member| *member == proposition)
-            .unwrap_or_default();
-        // A target added explicitly to an active slot (for example an
-        // archived Proposition) can change its frame. Share only identical
-        // frames, including partitions, opposition and the exact member set.
-        let shared: std::collections::BTreeSet<_> = if frame.shareable {
-            frame
-                .sharing
-                .get(&proposition)
-                .map(|anchor| {
-                    frame
-                        .sharing
-                        .iter()
-                        .filter_map(|(id, group)| (group == anchor).then_some(*id))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            std::collections::BTreeSet::new()
-        };
-        let frame_key = (basis.clone(), frame);
-        let beliefs = if let Some(cached) = self.frame_cache.get(&frame_key) {
-            cached.clone()
-        } else {
-            let projected =
-                std::sync::Arc::new(self.project_frame(&frame_key.1, policy, at).await?);
-            self.frame_cache.insert(frame_key, projected.clone());
-            projected
-        };
-        for belief in beliefs.iter() {
-            if let Some(id) = belief.proposition
-                && shared.contains(&id)
-            {
-                self.belief_cache
-                    .insert((basis.clone(), id), belief.clone());
+    ) -> impl Future<Output = Result<Belief, KipError>> + Send {
+        Box::pin(async move {
+            self.require_projection_history(policy)?;
+            let basis = serde_json::to_string(&(policy, at, self.pinned_seq, self.env.version))
+                .expect("policy serializes");
+            if let Some(belief) = self.belief_cache.get(&(basis.clone(), proposition)) {
+                return Ok(belief.clone());
             }
-        }
-        let belief = beliefs[index].clone();
-        self.belief_cache
-            .insert((basis, proposition), belief.clone());
-        Ok(belief)
+            let frame = self.frame(proposition).await?;
+            let index = frame
+                .members
+                .iter()
+                .position(|member| *member == proposition)
+                .unwrap_or_default();
+            // A target added explicitly to an active slot (for example an
+            // archived Proposition) can change its frame. Share only identical
+            // frames, including partitions, opposition and the exact member set.
+            let shared: std::collections::BTreeSet<_> = if frame.shareable {
+                frame
+                    .sharing
+                    .get(&proposition)
+                    .map(|anchor| {
+                        frame
+                            .sharing
+                            .iter()
+                            .filter_map(|(id, group)| (group == anchor).then_some(*id))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            let frame_key = (basis.clone(), frame);
+            let beliefs = if let Some(cached) = self.frame_cache.get(&frame_key) {
+                cached.clone()
+            } else {
+                let projected =
+                    std::sync::Arc::new(self.project_frame(&frame_key.1, policy, at).await?);
+                self.frame_cache.insert(frame_key, projected.clone());
+                projected
+            };
+            for belief in beliefs.iter() {
+                if let Some(id) = belief.proposition
+                    && shared.contains(&id)
+                {
+                    self.belief_cache
+                        .insert((basis.clone(), id), belief.clone());
+                }
+            }
+            let belief = beliefs[index].clone();
+            self.belief_cache
+                .insert((basis, proposition), belief.clone());
+            Ok(belief)
+        })
     }
 
     /// The answer for a fully grounded `BELIEF` whose Proposition does not
@@ -601,141 +605,148 @@ impl Context<'_> {
 
     /// The conflict set of one slot: every Proposition with this subject and
     /// predicate, each projected (§35).
-    pub async fn project_slot(
+    pub fn project_slot(
         &mut self,
         subject: &Endpoint,
         predicate_ref: &str,
         policy: &Policy,
         at: &str,
-    ) -> Result<Slot, KipError> {
-        self.require_projection_history(policy)?;
-        let members = self.slot_propositions(subject, predicate_ref).await?;
-        let candidates = match members.first() {
-            Some(first) => {
-                let mut frame = self.frame(*first).await?;
-                // An unconstrained slot projects every value on its own.
-                if frame.members.len() < members.len() {
-                    frame.members = members;
+    ) -> impl Future<Output = Result<Slot, KipError>> + Send {
+        Box::pin(async move {
+            self.require_projection_history(policy)?;
+            let members = self.slot_propositions(subject, predicate_ref).await?;
+            let candidates = match members.first() {
+                Some(first) => {
+                    let mut frame = self.frame(*first).await?;
+                    // An unconstrained slot projects every value on its own.
+                    if frame.members.len() < members.len() {
+                        frame.members = members;
+                    }
+                    self.project_frame(&frame, policy, at).await?
                 }
-                self.project_frame(&frame, policy, at).await?
-            }
-            None => Vec::new(),
-        };
-        let next = candidates
-            .iter()
-            .filter_map(|b| b.basis.next_invalid_at.clone())
-            .min();
-        Ok(Slot {
-            basis: self.projection_basis(policy, at, next),
-            candidates,
-            warnings: vec![
-                "protected actor trust weights are applied; evidence quality is not automatically graded"
-                    .to_string(),
-            ],
+                None => Vec::new(),
+            };
+            let next = candidates
+                .iter()
+                .filter_map(|b| b.basis.next_invalid_at.clone())
+                .min();
+            Ok(Slot {
+                basis: self.projection_basis(policy, at, next),
+                candidates,
+                warnings: vec![
+                    "protected actor trust weights are applied; evidence quality is not automatically graded"
+                        .to_string(),
+                ],
+            })
         })
     }
 
     /// The Propositions projected together with `target`, and how they
     /// relate: the whole slot when its predicate constrains one (§20.15).
-    async fn frame(&mut self, target: ElementId) -> Result<Frame, KipError> {
-        let mut frame = Frame {
-            members: vec![target],
-            ..Default::default()
-        };
-        let Some(Element::Proposition(row)) = self.load(target).await? else {
-            return Ok(frame);
-        };
-        // A predicate this environment cannot resolve declares nothing.
-        let Some(def) = row
-            .predicate_ref
-            .parse::<crate::schema::SymbolRef>()
-            .ok()
-            .and_then(|symbol| self.env.predicate_def(&symbol).ok())
-            .cloned()
-        else {
-            return Ok(frame);
-        };
-        // §20.15, §25.2: values that never conflict on time form no slot.
-        if def.temporal_conflict == "none" {
-            return Ok(frame);
-        }
-        let by = def.functional_by.as_deref() == Some("object_type");
-        let slot = def.functional || by;
-        if !slot && def.exclusive_values.is_empty() && !def.boolean_completeness {
-            return Ok(frame);
-        }
-        let subject = Endpoint::from_json(&row.subject)?;
-        frame.members = self.slot_propositions(&subject, &row.predicate_ref).await?;
-        frame.shareable = frame.members.contains(&target);
-        if !frame.shareable {
-            frame.members.push(target);
-        }
-        frame.subject_keys = self.endpoint_keys(&subject).await?;
-        frame.slot_lines = slot;
-        // `complete` makes a functional slot's values exclusive: accepting
-        // one rejects the others. Without it, competing values are a conflict
-        // set and never opposition (§21.11, §25).
-        frame.conflict = slot && !def.complete;
-        frame.reason = if slot {
-            "functional_value"
-        } else {
-            "exclusive_value"
-        };
-        let mut objects = BTreeMap::new();
-        for member in frame.members.clone() {
-            let Some(Element::Proposition(value)) = self.load(member).await? else {
-                continue;
+    fn frame(&mut self, target: ElementId) -> impl Future<Output = Result<Frame, KipError>> + Send {
+        Box::pin(async move {
+            let mut frame = Frame {
+                members: vec![target],
+                ..Default::default()
             };
-            if let Ok(subject) =
-                Endpoint::from_json(&self.canonical_endpoint(&value.subject).await?)
-            {
-                frame
-                    .sharing
-                    .insert(member, (subject.key(), value.predicate_ref.clone()));
-            }
-            if by {
-                // The partition is the object's Concept Type lineage.
-                let partition = match Endpoint::from_json(&value.object) {
-                    Ok(Endpoint::Local(id)) => match self.load(id).await? {
-                        Some(Element::Concept(concept)) => self
-                            .env
-                            .lineage(crate::schema::SymbolKind::ConceptType, &concept.schema_ref),
-                        _ => String::new(),
-                    },
-                    _ => String::new(),
-                };
-                frame.partitions.insert(member, partition);
-            }
-            objects.insert(member, value.object.clone());
-        }
-        for (member, object) in &objects {
-            let group: Vec<Json> = def
-                .exclusive_values
-                .iter()
-                .find(|group| group.iter().any(|value| same_object(value, object)))
+            let Some(Element::Proposition(row)) = self.load(target).await? else {
+                return Ok(frame);
+            };
+            // A predicate this environment cannot resolve declares nothing.
+            let Some(def) = row
+                .predicate_ref
+                .parse::<crate::schema::SymbolRef>()
+                .ok()
+                .and_then(|symbol| self.env.predicate_def(&symbol).ok())
                 .cloned()
-                .unwrap_or_default();
-            // §12.7, §20.15: under `boolean_completeness`, object `false` is
-            // the negation of object `true`, so each opposes the other.
-            let negation = def
-                .boolean_completeness
-                .then(|| boolean_object(object).map(|flag| !flag))
-                .flatten();
-            let rivals: Vec<ElementId> = objects
-                .iter()
-                .filter(|(other, _)| *other != member)
-                .filter(|(other, value)| {
-                    (slot && def.complete && frame.partition(**other) == frame.partition(*member))
-                        || group.iter().any(|g| same_object(g, value))
-                        || negation.is_some_and(|flag| boolean_object(value) == Some(flag))
-                })
-                .map(|(other, _)| *other)
-                .collect();
-            if !rivals.is_empty() {
-                frame.opposing.insert(*member, rivals);
+            else {
+                return Ok(frame);
+            };
+            // §20.15, §25.2: values that never conflict on time form no slot.
+            if def.temporal_conflict == "none" {
+                return Ok(frame);
             }
-        }
-        Ok(frame)
+            let by = def.functional_by.as_deref() == Some("object_type");
+            let slot = def.functional || by;
+            if !slot && def.exclusive_values.is_empty() && !def.boolean_completeness {
+                return Ok(frame);
+            }
+            let subject = Endpoint::from_json(&row.subject)?;
+            frame.members = self.slot_propositions(&subject, &row.predicate_ref).await?;
+            frame.shareable = frame.members.contains(&target);
+            if !frame.shareable {
+                frame.members.push(target);
+            }
+            frame.subject_keys = self.endpoint_keys(&subject).await?;
+            frame.slot_lines = slot;
+            // `complete` makes a functional slot's values exclusive: accepting
+            // one rejects the others. Without it, competing values are a conflict
+            // set and never opposition (§21.11, §25).
+            frame.conflict = slot && !def.complete;
+            frame.reason = if slot {
+                "functional_value"
+            } else {
+                "exclusive_value"
+            };
+            let mut objects = BTreeMap::new();
+            for member in frame.members.clone() {
+                let Some(Element::Proposition(value)) = self.load(member).await? else {
+                    continue;
+                };
+                if let Ok(subject) =
+                    Endpoint::from_json(&self.canonical_endpoint(&value.subject).await?)
+                {
+                    frame
+                        .sharing
+                        .insert(member, (subject.key(), value.predicate_ref.clone()));
+                }
+                if by {
+                    // The partition is the object's Concept Type lineage.
+                    let partition = match Endpoint::from_json(&value.object) {
+                        Ok(Endpoint::Local(id)) => match self.load(id).await? {
+                            Some(Element::Concept(concept)) => self.env.lineage(
+                                crate::schema::SymbolKind::ConceptType,
+                                &concept.schema_ref,
+                            ),
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    frame.partitions.insert(member, partition);
+                }
+                objects.insert(member, value.object.clone());
+            }
+            for (member, object) in &objects {
+                let group: Vec<Json> = def
+                    .exclusive_values
+                    .iter()
+                    .find(|group| group.iter().any(|value| same_object(value, object)))
+                    .cloned()
+                    .unwrap_or_default();
+                // §12.7, §20.15: under `boolean_completeness`, object `false` is
+                // the negation of object `true`, so each opposes the other.
+                let negation = def
+                    .boolean_completeness
+                    .then(|| boolean_object(object).map(|flag| !flag))
+                    .flatten();
+                let rivals: Vec<ElementId> = objects
+                    .iter()
+                    .filter(|(other, _)| *other != member)
+                    .filter(|(other, value)| {
+                        (slot
+                            && def.complete
+                            && frame.partition(**other) == frame.partition(*member))
+                            || group.iter().any(|g| same_object(g, value))
+                            || negation.is_some_and(|flag| boolean_object(value) == Some(flag))
+                    })
+                    .map(|(other, _)| *other)
+                    .collect();
+                if !rivals.is_empty() {
+                    frame.opposing.insert(*member, rivals);
+                }
+            }
+            Ok(frame)
+        })
     }
 
     /// Projects every member of a frame at one basis.
@@ -745,318 +756,322 @@ impl Context<'_> {
     /// indeterminate at `at` (§25.4, §25.5) — then candidate status from what
     /// is inside, then the slot stage: a conflict set stands `contested`
     /// unless the policy's precedence rules resolve it (§21.11, §21.13).
-    async fn project_frame(
+    fn project_frame(
         &mut self,
         frame: &Frame,
         policy: &Policy,
         at: &str,
-    ) -> Result<Vec<Belief>, KipError> {
-        struct Row {
-            timed: world::Timed,
-            candidate: Candidate,
-            source: AssertionRow,
-            mode: String,
-            contexts: Vec<String>,
-            placement: world::Placement,
-        }
-        let mut rows: Vec<Row> = Vec::new();
-        let mut excluded: BTreeMap<ElementId, Vec<(String, &'static str)>> = BTreeMap::new();
-        for member in &frame.members {
-            for row in self.assertions_about(*member).await? {
-                match self.eligible(&row, policy).await? {
-                    Ok(candidate) => {
-                        // Lines and precedence compare the actor and the
-                        // context set as they are now, merge-resolved: a
-                        // context merged after the claim was written is still
-                        // the same scope (§25.4).
-                        let mut contexts = Vec::with_capacity(row.context_refs.len());
-                        for reference in &row.context_refs {
-                            let canonical = self.canonical_endpoint(reference).await?;
-                            contexts.push(crate::kml::clauses::endpoint_key(&canonical));
+    ) -> impl Future<Output = Result<Vec<Belief>, KipError>> + Send {
+        Box::pin(async move {
+            struct Row {
+                timed: world::Timed,
+                candidate: Candidate,
+                source: AssertionRow,
+                mode: String,
+                contexts: Vec<String>,
+                placement: world::Placement,
+            }
+            let mut rows: Vec<Row> = Vec::new();
+            let mut excluded: BTreeMap<ElementId, Vec<(String, &'static str)>> = BTreeMap::new();
+            for member in &frame.members {
+                for row in self.assertions_about(*member).await? {
+                    match self.eligible(&row, policy).await? {
+                        Ok(candidate) => {
+                            // Lines and precedence compare the actor and the
+                            // context set as they are now, merge-resolved: a
+                            // context merged after the claim was written is still
+                            // the same scope (§25.4).
+                            let mut contexts = Vec::with_capacity(row.context_refs.len());
+                            for reference in &row.context_refs {
+                                let canonical = self.canonical_endpoint(reference).await?;
+                                contexts.push(crate::kml::clauses::endpoint_key(&canonical));
+                            }
+                            contexts.sort();
+                            contexts.dedup();
+                            let mut timed =
+                                world::Timed::new(&row, *member, frame.partition(*member));
+                            timed.context = contexts.join("\u{1f}");
+                            if let Some(actor) = crate::term::element_reference(&row.asserted_by)
+                                && actor.kind == anda_kip::ElementKind::Concept
+                            {
+                                let canonical = self.canonical_of(actor).await?;
+                                timed.actor = crate::term::Endpoint::Local(canonical).key();
+                            }
+                            rows.push(Row {
+                                timed,
+                                candidate,
+                                mode: row.mode.clone(),
+                                contexts,
+                                source: row,
+                                placement: world::Placement::Outside,
+                            })
                         }
-                        contexts.sort();
-                        contexts.dedup();
-                        let mut timed = world::Timed::new(&row, *member, frame.partition(*member));
-                        timed.context = contexts.join("\u{1f}");
-                        if let Some(actor) = crate::term::element_reference(&row.asserted_by)
-                            && actor.kind == anda_kip::ElementKind::Concept
-                        {
-                            let canonical = self.canonical_of(actor).await?;
-                            timed.actor = crate::term::Endpoint::Local(canonical).key();
-                        }
-                        rows.push(Row {
-                            timed,
-                            candidate,
-                            mode: row.mode.clone(),
-                            contexts,
-                            source: row,
-                            placement: world::Placement::Outside,
-                        })
+                        Err(out) => excluded
+                            .entry(*member)
+                            .or_default()
+                            .push((out.id.to_string(), out.reason)),
                     }
-                    Err(out) => excluded
-                        .entry(*member)
-                        .or_default()
-                        .push((out.id.to_string(), out.reason)),
                 }
             }
-        }
-        let mut timed: Vec<world::Timed> = rows.iter().map(|r| r.timed.clone()).collect();
-        world::succeed(&mut timed, frame.slot_lines);
-        let mut next_invalid_at: Option<String> = None;
-        for (row, timed) in rows.iter_mut().zip(timed) {
-            row.placement = timed.place(at);
-            if let Some(next) = timed.boundaries_after(at).min()
-                && next_invalid_at.as_deref().is_none_or(|old| next < old)
-            {
-                next_invalid_at = Some(next.to_string());
-            }
-            row.timed = timed;
-        }
-
-        let mut beliefs = Vec::with_capacity(frame.members.len());
-        for member in &frame.members {
-            let mut ledger = Ledger {
-                warnings: vec![
-                    // Not a caveat about this answer in particular: it is what
-                    // the engine structurally cannot do yet, and an answer that
-                    // read as trust-weighted when it is not would be worse
-                    // than none.
-                    "protected actor trust weights are applied; evidence quality is not automatically graded"
-                        .to_string(),
-                ],
-                excluded: excluded.remove(member).unwrap_or_default(),
-                next_invalid_at: next_invalid_at.clone(),
-                ..Default::default()
-            };
-            let mut candidates = Vec::new();
-            for row in rows.iter().filter(|r| r.timed.proposition == *member) {
-                let id = row.candidate.id.to_string();
-                match row.placement {
-                    world::Placement::Outside => {
-                        ledger.excluded.push((id, "outside_valid_time"));
-                        continue;
-                    }
-                    world::Placement::Indeterminate => {
-                        // Material, but it cannot decide a status (§25.5).
-                        ledger.indeterminate.push(id);
-                        continue;
-                    }
-                    world::Placement::Inside => {}
-                }
-                if row.source.mode == "inferred"
-                    || self
-                        .under_identity_review(crate::id::ElementId::new(
-                            anda_kip::ElementKind::Assertion,
-                            row.source._id,
-                        ))
-                        .await?
+            let mut timed: Vec<world::Timed> = rows.iter().map(|r| r.timed.clone()).collect();
+            world::succeed(&mut timed, frame.slot_lines);
+            let mut next_invalid_at: Option<String> = None;
+            for (row, timed) in rows.iter_mut().zip(timed) {
+                row.placement = timed.place(at);
+                if let Some(next) = timed.boundaries_after(at).min()
+                    && next_invalid_at.as_deref().is_none_or(|old| next < old)
                 {
-                    let checked = self
-                        .dependency_validity(
-                            &Element::Assertion(Box::new(row.source.clone())),
-                            policy,
-                            at,
-                        )
-                        .await?;
-                    if checked["action_eligible"] != true {
-                        ledger.unverified_dependency = true;
-                    }
-                    if let Some(next) = checked["basis"]["next_invalid_at"].as_str()
-                        && ledger
-                            .next_invalid_at
-                            .as_ref()
-                            .is_none_or(|old| next < old.as_str())
-                    {
-                        ledger.next_invalid_at = Some(next.to_string());
-                    }
+                    next_invalid_at = Some(next.to_string());
                 }
-                match row.candidate.stance.as_str() {
-                    "support" => ledger.supporting.push(id),
-                    "reject" => ledger.opposing.push(id),
-                    // An `uncertain` stance is material — the actor engaged
-                    // with the question — but it takes no side, so it can move
-                    // the answer off `insufficient` without moving it toward
-                    // either pole.
-                    _ => ledger.uncertain.push(id),
-                }
-                candidates.push(weighed(row.candidate.clone(), policy));
+                row.timed = timed;
             }
-            let (local_support, local_groups) = aggregate(&candidates, false);
-            let (local_opposition, opposing_groups) = aggregate(&candidates, true);
-            ledger.support_groups = local_groups;
-            ledger.opposition_groups = opposing_groups;
-            ledger.candidate_status = classify(local_support, local_opposition, &ledger, policy);
-            // A candidate whose only material at the instant is indeterminate
-            // is `uncertain`, and says why (§25.5). Indeterminate rows beside
-            // material that is inside decide nothing and are only listed.
-            if ledger.candidate_status == BeliefStatus::Insufficient
-                && !ledger.indeterminate.is_empty()
-            {
-                ledger.candidate_status = BeliefStatus::Uncertain;
-                ledger.reasons.push("temporal_indeterminate");
-            }
-            // Exclusive values (§25, `complete`, exclusive groups, boolean
-            // negation): a rival's support opposes this value.
-            if policy.expand_conflicts
-                && let Some(rivals) = frame.opposing.get(member)
-            {
-                for rival in rivals {
-                    let rival_candidates: Vec<Candidate> = rows
-                        .iter()
-                        .filter(|r| {
-                            r.timed.proposition == *rival
-                                && r.placement == world::Placement::Inside
-                                && r.candidate.stance == "support"
-                        })
-                        .map(|r| weighed(r.candidate.clone(), policy))
-                        .collect();
-                    let (rival_support, _) = aggregate(&rival_candidates, false);
-                    if local_support >= policy.material && rival_support >= policy.material {
-                        ledger.conflict_refs.push(rival.to_string());
-                    }
-                    for mut candidate in rival_candidates {
-                        candidate.opposes_target = true;
-                        ledger.opposing.push(candidate.id.to_string());
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            let (support, support_groups) = aggregate(&candidates, false);
-            let (opposition, opposition_groups) = aggregate(&candidates, true);
-            ledger.support_groups = support_groups;
-            ledger.opposition_groups = opposition_groups;
-            let mut status = if !ledger.conflict_refs.is_empty() {
-                ledger.conflict_reasons.push("exclusive_value".into());
-                BeliefStatus::Contested
-            } else if ledger.support_groups.is_empty()
-                && ledger.opposition_groups.is_empty()
-                && ledger.uncertain.is_empty()
-            {
-                ledger.candidate_status
-            } else {
-                classify(support, opposition, &ledger, policy)
-            };
-            if ledger.unverified_dependency && status == BeliefStatus::Accepted {
-                status = BeliefStatus::Uncertain;
-                ledger
-                    .warnings
-                    .push("inferred support has no verified recursive dependency basis".into());
-            }
-            beliefs.push(Belief {
-                proposition: Some(*member),
-                status,
-                basis: self.projection_basis(policy, at, ledger.next_invalid_at.clone()),
-                support,
-                opposition,
-                ledger,
-                precedence: None,
-                slot_leading: None,
-                policy: policy.clone(),
-            });
-        }
 
-        // The slot stage (§21.11): materially supported values of one
-        // functional slot — per partition under `functional_by` — conflict.
-        if frame.conflict {
-            let mut partitions: Vec<String> = frame
-                .members
-                .iter()
-                .map(|member| frame.partition(*member))
-                .collect();
-            partitions.sort();
-            partitions.dedup();
-            for partition in partitions {
-                let supported: Vec<usize> = (0..beliefs.len())
-                    // Materially supported by what is inside at the basis,
-                    // and not held back by an unverified dependency.
-                    .filter(|&i| {
-                        frame.partition(frame.members[i]) == partition
-                            && beliefs[i].support >= policy.material
-                            && !beliefs[i].ledger.unverified_dependency
-                    })
-                    .collect();
-                if supported.len() < 2 {
-                    continue;
-                }
-                let support_rows = |i: usize| -> Vec<&Row> {
-                    rows.iter()
-                        .filter(|r| {
-                            r.timed.proposition == frame.members[i]
-                                && r.placement == world::Placement::Inside
-                                && r.candidate.stance == "support"
-                        })
-                        .collect()
+            let mut beliefs = Vec::with_capacity(frame.members.len());
+            for member in &frame.members {
+                let mut ledger = Ledger {
+                    warnings: vec![
+                        // Not a caveat about this answer in particular: it is what
+                        // the engine structurally cannot do yet, and an answer that
+                        // read as trust-weighted when it is not would be worse
+                        // than none.
+                        "protected actor trust weights are applied; evidence quality is not automatically graded"
+                            .to_string(),
+                    ],
+                    excluded: excluded.remove(member).unwrap_or_default(),
+                    next_invalid_at: next_invalid_at.clone(),
+                    ..Default::default()
                 };
-                let winner = if policy.precedence {
-                    precedence(&supported, |i| {
-                        support_rows(i)
-                            .into_iter()
-                            .map(|r| Support {
-                                contexts: &r.contexts,
-                                first_person: frame.subject_keys.contains(&r.timed.actor)
-                                    && matches!(r.mode.as_str(), "stated" | "observed"),
-                                by_subject: frame.subject_keys.contains(&r.timed.actor),
-                                observed: r.mode == "observed",
-                                start_key: &r.timed.start_key,
+                let mut candidates = Vec::new();
+                for row in rows.iter().filter(|r| r.timed.proposition == *member) {
+                    let id = row.candidate.id.to_string();
+                    match row.placement {
+                        world::Placement::Outside => {
+                            ledger.excluded.push((id, "outside_valid_time"));
+                            continue;
+                        }
+                        world::Placement::Indeterminate => {
+                            // Material, but it cannot decide a status (§25.5).
+                            ledger.indeterminate.push(id);
+                            continue;
+                        }
+                        world::Placement::Inside => {}
+                    }
+                    if row.source.mode == "inferred"
+                        || self
+                            .under_identity_review(crate::id::ElementId::new(
+                                anda_kip::ElementKind::Assertion,
+                                row.source._id,
+                            ))
+                            .await?
+                    {
+                        let checked = self
+                            .dependency_validity(
+                                &Element::Assertion(Box::new(row.source.clone())),
+                                policy,
+                                at,
+                            )
+                            .await?;
+                        if checked["action_eligible"] != true {
+                            ledger.unverified_dependency = true;
+                        }
+                        if let Some(next) = checked["basis"]["next_invalid_at"].as_str()
+                            && ledger
+                                .next_invalid_at
+                                .as_ref()
+                                .is_none_or(|old| next < old.as_str())
+                        {
+                            ledger.next_invalid_at = Some(next.to_string());
+                        }
+                    }
+                    match row.candidate.stance.as_str() {
+                        "support" => ledger.supporting.push(id),
+                        "reject" => ledger.opposing.push(id),
+                        // An `uncertain` stance is material — the actor engaged
+                        // with the question — but it takes no side, so it can move
+                        // the answer off `insufficient` without moving it toward
+                        // either pole.
+                        _ => ledger.uncertain.push(id),
+                    }
+                    candidates.push(weighed(row.candidate.clone(), policy));
+                }
+                let (local_support, local_groups) = aggregate(&candidates, false);
+                let (local_opposition, opposing_groups) = aggregate(&candidates, true);
+                ledger.support_groups = local_groups;
+                ledger.opposition_groups = opposing_groups;
+                ledger.candidate_status =
+                    classify(local_support, local_opposition, &ledger, policy);
+                // A candidate whose only material at the instant is indeterminate
+                // is `uncertain`, and says why (§25.5). Indeterminate rows beside
+                // material that is inside decide nothing and are only listed.
+                if ledger.candidate_status == BeliefStatus::Insufficient
+                    && !ledger.indeterminate.is_empty()
+                {
+                    ledger.candidate_status = BeliefStatus::Uncertain;
+                    ledger.reasons.push("temporal_indeterminate");
+                }
+                // Exclusive values (§25, `complete`, exclusive groups, boolean
+                // negation): a rival's support opposes this value.
+                if policy.expand_conflicts
+                    && let Some(rivals) = frame.opposing.get(member)
+                {
+                    for rival in rivals {
+                        let rival_candidates: Vec<Candidate> = rows
+                            .iter()
+                            .filter(|r| {
+                                r.timed.proposition == *rival
+                                    && r.placement == world::Placement::Inside
+                                    && r.candidate.stance == "support"
+                            })
+                            .map(|r| weighed(r.candidate.clone(), policy))
+                            .collect();
+                        let (rival_support, _) = aggregate(&rival_candidates, false);
+                        if local_support >= policy.material && rival_support >= policy.material {
+                            ledger.conflict_refs.push(rival.to_string());
+                        }
+                        for mut candidate in rival_candidates {
+                            candidate.opposes_target = true;
+                            ledger.opposing.push(candidate.id.to_string());
+                            candidates.push(candidate);
+                        }
+                    }
+                }
+                let (support, support_groups) = aggregate(&candidates, false);
+                let (opposition, opposition_groups) = aggregate(&candidates, true);
+                ledger.support_groups = support_groups;
+                ledger.opposition_groups = opposition_groups;
+                let mut status = if !ledger.conflict_refs.is_empty() {
+                    ledger.conflict_reasons.push("exclusive_value".into());
+                    BeliefStatus::Contested
+                } else if ledger.support_groups.is_empty()
+                    && ledger.opposition_groups.is_empty()
+                    && ledger.uncertain.is_empty()
+                {
+                    ledger.candidate_status
+                } else {
+                    classify(support, opposition, &ledger, policy)
+                };
+                if ledger.unverified_dependency && status == BeliefStatus::Accepted {
+                    status = BeliefStatus::Uncertain;
+                    ledger
+                        .warnings
+                        .push("inferred support has no verified recursive dependency basis".into());
+                }
+                beliefs.push(Belief {
+                    proposition: Some(*member),
+                    status,
+                    basis: self.projection_basis(policy, at, ledger.next_invalid_at.clone()),
+                    support,
+                    opposition,
+                    ledger,
+                    precedence: None,
+                    slot_leading: None,
+                    policy: policy.clone(),
+                });
+            }
+
+            // The slot stage (§21.11): materially supported values of one
+            // functional slot — per partition under `functional_by` — conflict.
+            if frame.conflict {
+                let mut partitions: Vec<String> = frame
+                    .members
+                    .iter()
+                    .map(|member| frame.partition(*member))
+                    .collect();
+                partitions.sort();
+                partitions.dedup();
+                for partition in partitions {
+                    let supported: Vec<usize> = (0..beliefs.len())
+                        // Materially supported by what is inside at the basis,
+                        // and not held back by an unverified dependency.
+                        .filter(|&i| {
+                            frame.partition(frame.members[i]) == partition
+                                && beliefs[i].support >= policy.material
+                                && !beliefs[i].ledger.unverified_dependency
+                        })
+                        .collect();
+                    if supported.len() < 2 {
+                        continue;
+                    }
+                    let support_rows = |i: usize| -> Vec<&Row> {
+                        rows.iter()
+                            .filter(|r| {
+                                r.timed.proposition == frame.members[i]
+                                    && r.placement == world::Placement::Inside
+                                    && r.candidate.stance == "support"
                             })
                             .collect()
-                    })
-                } else {
-                    None
-                };
-                let ids: Vec<String> = supported
-                    .iter()
-                    .map(|&i| frame.members[i].to_string())
-                    .collect();
-                // Leading compares eligible independent roots (§27.2), never
-                // the numeric support a structural policy does not have.
-                let roots: Vec<usize> = beliefs
-                    .iter()
-                    .map(|b| b.ledger.support_groups.len())
-                    .collect();
-                for &i in &supported {
-                    let me = frame.members[i].to_string();
-                    match winner {
-                        Some((rule, won)) if won == i => {
-                            beliefs[i].precedence = Some(serde_json::json!({
-                                "rule": rule,
-                                "prevailed_over": ids.iter().filter(|id| **id != me).collect::<Vec<_>>(),
-                            }));
-                        }
-                        Some((rule, won)) => {
-                            let belief = &mut beliefs[i];
-                            belief.status = BeliefStatus::Uncertain;
-                            belief.ledger.reasons.push("outranked");
-                            belief.precedence = Some(serde_json::json!({
-                                "rule": rule,
-                                "outranked_by": frame.members[won].to_string(),
-                            }));
-                        }
-                        None => {
-                            // Leading over the final conflict set: a tie
-                            // between the values is `none` (§21.11).
-                            let best_rival = supported
-                                .iter()
-                                .filter(|&&j| j != i)
-                                .map(|&j| roots[j])
-                                .max()
-                                .unwrap_or(0);
-                            let belief = &mut beliefs[i];
-                            belief.slot_leading = Some(match roots[i].cmp(&best_rival) {
-                                std::cmp::Ordering::Greater => "support",
-                                std::cmp::Ordering::Less => "opposition",
-                                std::cmp::Ordering::Equal => "none",
-                            });
-                            belief.status = BeliefStatus::Contested;
-                            belief.ledger.conflict_refs =
-                                ids.iter().filter(|id| **id != me).cloned().collect();
-                            belief.ledger.conflict_reasons = vec![frame.reason.to_string()];
+                    };
+                    let winner = if policy.precedence {
+                        precedence(&supported, |i| {
+                            support_rows(i)
+                                .into_iter()
+                                .map(|r| Support {
+                                    contexts: &r.contexts,
+                                    first_person: frame.subject_keys.contains(&r.timed.actor)
+                                        && matches!(r.mode.as_str(), "stated" | "observed"),
+                                    by_subject: frame.subject_keys.contains(&r.timed.actor),
+                                    observed: r.mode == "observed",
+                                    start_key: &r.timed.start_key,
+                                })
+                                .collect()
+                        })
+                    } else {
+                        None
+                    };
+                    let ids: Vec<String> = supported
+                        .iter()
+                        .map(|&i| frame.members[i].to_string())
+                        .collect();
+                    // Leading compares eligible independent roots (§27.2), never
+                    // the numeric support a structural policy does not have.
+                    let roots: Vec<usize> = beliefs
+                        .iter()
+                        .map(|b| b.ledger.support_groups.len())
+                        .collect();
+                    for &i in &supported {
+                        let me = frame.members[i].to_string();
+                        match winner {
+                            Some((rule, won)) if won == i => {
+                                beliefs[i].precedence = Some(serde_json::json!({
+                                    "rule": rule,
+                                    "prevailed_over": ids.iter().filter(|id| **id != me).collect::<Vec<_>>(),
+                                }));
+                            }
+                            Some((rule, won)) => {
+                                let belief = &mut beliefs[i];
+                                belief.status = BeliefStatus::Uncertain;
+                                belief.ledger.reasons.push("outranked");
+                                belief.precedence = Some(serde_json::json!({
+                                    "rule": rule,
+                                    "outranked_by": frame.members[won].to_string(),
+                                }));
+                            }
+                            None => {
+                                // Leading over the final conflict set: a tie
+                                // between the values is `none` (§21.11).
+                                let best_rival = supported
+                                    .iter()
+                                    .filter(|&&j| j != i)
+                                    .map(|&j| roots[j])
+                                    .max()
+                                    .unwrap_or(0);
+                                let belief = &mut beliefs[i];
+                                belief.slot_leading = Some(match roots[i].cmp(&best_rival) {
+                                    std::cmp::Ordering::Greater => "support",
+                                    std::cmp::Ordering::Less => "opposition",
+                                    std::cmp::Ordering::Equal => "none",
+                                });
+                                belief.status = BeliefStatus::Contested;
+                                belief.ledger.conflict_refs =
+                                    ids.iter().filter(|id| **id != me).cloned().collect();
+                                belief.ledger.conflict_reasons = vec![frame.reason.to_string()];
+                            }
                         }
                     }
                 }
             }
-        }
-        Ok(beliefs)
+            Ok(beliefs)
+        })
     }
 
     /// Stages 4–6: lifecycle, visibility, context, Evidence and mode
@@ -1211,55 +1226,57 @@ impl Context<'_> {
     /// the tuples recorded on what was merged into it, and the predicate is
     /// its lineage, so a `BELIEF SLOT` over a later package version sees every
     /// Assertion the slot ever gathered.
-    pub async fn slot_propositions(
+    pub fn slot_propositions(
         &mut self,
         subject: &Endpoint,
         predicate_ref: &str,
-    ) -> Result<Vec<ElementId>, KipError> {
-        let subject_keys = self.endpoint_keys(subject).await?;
-        let predicate = self.symbol_filter(
-            anda_kip::ElementKind::Proposition,
-            "predicate_ref",
-            &[predicate_ref.to_string()],
-        )?;
-        let ids = self
-            .candidates(
+    ) -> impl Future<Output = Result<Vec<ElementId>, KipError>> + Send {
+        Box::pin(async move {
+            let subject_keys = self.endpoint_keys(subject).await?;
+            let predicate = self.symbol_filter(
                 anda_kip::ElementKind::Proposition,
-                Some(anda_db::query::Filter::And(vec![
-                    Box::new(crate::store::eq_field(
-                        "space",
-                        anda_db_schema::Fv::Text(self.space.clone()),
-                    )),
-                    Box::new(crate::store::eq_field(
-                        "state",
-                        anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
-                    )),
-                    Box::new(crate::store::key_filter("subject_key", &subject_keys)),
-                    Box::new(predicate),
-                ])),
-            )
-            .await?;
-        self.charge(ids.len())?;
-
-        // The predicate index was ranged over a lineage, so the symbol is
-        // settled here; at a past coordinate the index could not narrow at
-        // all, so the whole slot is matched against the historical rows.
-        let historical = self.is_historical();
-        let mut slot = Vec::new();
-        for id in ids {
-            if let Some(Element::Proposition(row)) = self.load(id).await?
-                && self.env.same_lineage(
-                    crate::schema::SymbolKind::PredicateType,
-                    &row.predicate_ref,
-                    predicate_ref,
+                "predicate_ref",
+                &[predicate_ref.to_string()],
+            )?;
+            let ids = self
+                .candidates(
+                    anda_kip::ElementKind::Proposition,
+                    Some(anda_db::query::Filter::And(vec![
+                        Box::new(crate::store::eq_field(
+                            "space",
+                            anda_db_schema::Fv::Text(self.space.clone()),
+                        )),
+                        Box::new(crate::store::eq_field(
+                            "state",
+                            anda_db_schema::Fv::Text(crate::store::rows::state::ACTIVE.into()),
+                        )),
+                        Box::new(crate::store::key_filter("subject_key", &subject_keys)),
+                        Box::new(predicate),
+                    ])),
                 )
-                && (!historical
-                    || (row.state == "active" && subject_keys.contains(&row.subject_key)))
-            {
-                slot.push(id);
+                .await?;
+            self.charge(ids.len())?;
+
+            // The predicate index was ranged over a lineage, so the symbol is
+            // settled here; at a past coordinate the index could not narrow at
+            // all, so the whole slot is matched against the historical rows.
+            let historical = self.is_historical();
+            let mut slot = Vec::new();
+            for id in ids {
+                if let Some(Element::Proposition(row)) = self.load(id).await?
+                    && self.env.same_lineage(
+                        crate::schema::SymbolKind::PredicateType,
+                        &row.predicate_ref,
+                        predicate_ref,
+                    )
+                    && (!historical
+                        || (row.state == "active" && subject_keys.contains(&row.subject_key)))
+                {
+                    slot.push(id);
+                }
             }
-        }
-        Ok(slot)
+            Ok(slot)
+        })
     }
 }
 

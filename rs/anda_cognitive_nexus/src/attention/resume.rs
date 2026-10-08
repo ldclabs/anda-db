@@ -65,47 +65,49 @@ impl crate::CognitiveNexus {
 }
 
 impl Session {
-    pub(super) async fn verified_resume(
+    pub(super) fn verified_resume(
         &self,
         space: &str,
         reference: &str,
         expected: u64,
         fence: u64,
-    ) -> Result<Option<(String, RuntimePin)>, KipError> {
-        let wake = self.read_wake(space, reference).await?;
-        let WakeState::Blocked {
-            retry:
-                WakeRetry {
-                    resume: WakeResume::OnChange { condition_digest },
-                    ..
-                },
-        } = &wake.state
-        else {
-            return Ok(None);
-        };
-        if wake.version != expected || wake.fence != fence {
-            return Err(conflict("version_or_fence_conflict"));
-        }
-        let binding = self
-            .nexus
-            .resume_verifiers
-            .get(condition_digest)
-            .ok_or_else(|| {
-                KipError::unsupported_capability(
-                    "no registered verifier for this wake resume condition",
-                )
-            })?;
-        let digest = condition_digest.clone();
-        if !binding
-            .verifier
-            .verify(WakeResumeInput {
-                wake,
-                condition: binding.condition,
-            })
-            .await?
-        {
-            return Err(conflict("not_ready"));
-        }
-        Ok(Some((digest, binding.pin)))
+    ) -> impl Future<Output = Result<Option<(String, RuntimePin)>, KipError>> + Send {
+        Box::pin(async move {
+            let wake = self.read_wake(space, reference).await?;
+            let WakeState::Blocked {
+                retry:
+                    WakeRetry {
+                        resume: WakeResume::OnChange { condition_digest },
+                        ..
+                    },
+            } = &wake.state
+            else {
+                return Ok(None);
+            };
+            if wake.version != expected || wake.fence != fence {
+                return Err(conflict("version_or_fence_conflict"));
+            }
+            let binding = self
+                .nexus
+                .resume_verifiers
+                .get(condition_digest)
+                .ok_or_else(|| {
+                    KipError::unsupported_capability(
+                        "no registered verifier for this wake resume condition",
+                    )
+                })?;
+            let digest = condition_digest.clone();
+            if !binding
+                .verifier
+                .verify(WakeResumeInput {
+                    wake,
+                    condition: binding.condition,
+                })
+                .await?
+            {
+                return Err(conflict("not_ready"));
+            }
+            Ok(Some((digest, binding.pin)))
+        })
     }
 }

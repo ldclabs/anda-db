@@ -32,133 +32,140 @@ use crate::store::rows::TransactionRow;
 /// to the present. The coordinate is a description: the sequence, the
 /// transaction that committed it and when, the schema environment in force —
 /// and the token a later read may bind to (§78).
-pub async fn snapshot(
+pub fn snapshot(
     cx: &mut Context<'_>,
     as_of: Option<&AsOf>,
     at_time: Option<&Scalar>,
-) -> Result<Answer, KipError> {
-    let space = cx.store.get_space(&cx.space).await?;
-    let seq = match (as_of, at_time) {
-        (Some(as_of), _) => cx.resolve_as_of(as_of).await?,
-        (None, Some(scalar)) => {
-            let at = scalar_str(cx, scalar, "DESCRIBE SNAPSHOT AT TIME")?;
-            let at = crate::time::normalize(&at, "AT TIME")?;
-            // This engine keeps every version, so no instant is below a
-            // retention floor: a time before the first commit is sequence 0,
-            // an empty Space rather than an error.
-            cx.store.seq_at_time(&cx.space, &at).await?
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let space = cx.store.get_space(&cx.space).await?;
+        let seq = match (as_of, at_time) {
+            (Some(as_of), _) => cx.resolve_as_of(as_of).await?,
+            (None, Some(scalar)) => {
+                let at = scalar_str(cx, scalar, "DESCRIBE SNAPSHOT AT TIME")?;
+                let at = crate::time::normalize(&at, "AT TIME")?;
+                // This engine keeps every version, so no instant is below a
+                // retention floor: a time before the first commit is sequence 0,
+                // an empty Space rather than an error.
+                cx.store.seq_at_time(&cx.space, &at).await?
+            }
+            (None, None) => space.seq,
+        };
+        if seq > space.seq {
+            return Err(KipError::new(
+                KipErrorCode::HistoricalSnapshotUnavailable,
+                format!(
+                    "this Space is at sequence {}, so {seq} is not a coordinate it has reached",
+                    space.seq
+                ),
+            ));
         }
-        (None, None) => space.seq,
-    };
-    if seq > space.seq {
-        return Err(KipError::new(
-            KipErrorCode::HistoricalSnapshotUnavailable,
-            format!(
-                "this Space is at sequence {}, so {seq} is not a coordinate it has reached",
-                space.seq
-            ),
-        ));
-    }
-    let coordinate = crate::store::history::Coordinate { seq };
-    let committed = cx.store.transaction_at_seq(&cx.space, seq).await?;
-    let schema_version = cx.store.schema_version_at(&cx.space, seq).await?;
-    // The token is a promise the engine keeps: a later read carrying it in
-    // `read.snapshot_token` answers at this coordinate.
-    Ok(Answer::whole(crate::store::history::snapshot_json(
-        &cx.space,
-        coordinate,
-        committed.as_ref(),
-        schema_version,
-    )))
+        let coordinate = crate::store::history::Coordinate { seq };
+        let committed = cx.store.transaction_at_seq(&cx.space, seq).await?;
+        let schema_version = cx.store.schema_version_at(&cx.space, seq).await?;
+        // The token is a promise the engine keeps: a later read carrying it in
+        // `read.snapshot_token` answers at this coordinate.
+        Ok(Answer::whole(crate::store::history::snapshot_json(
+            &cx.space,
+            coordinate,
+            committed.as_ref(),
+            schema_version,
+        )))
+    })
 }
 
 /// `HISTORY ELEMENT` and `HISTORY SPACE`.
-pub async fn history(cx: &mut Context<'_>, command: &HistoryCommand) -> Result<Answer, KipError> {
-    let (element, from_seq, to_seq, limit, cursor) = match command {
-        HistoryCommand::Element {
-            value,
-            from_seq,
-            to_seq,
-            limit,
-            cursor,
-        } => (
-            Some(scalar_str(cx, value, "HISTORY ELEMENT")?),
-            from_seq.as_ref(),
-            to_seq.as_ref(),
-            limit.as_ref(),
-            cursor.as_ref(),
-        ),
-        HistoryCommand::Space {
-            from_seq,
-            to_seq,
-            limit,
-            cursor,
-        } => (
-            None,
-            from_seq.as_ref(),
-            to_seq.as_ref(),
-            limit.as_ref(),
-            cursor.as_ref(),
-        ),
-    };
+pub fn history(
+    cx: &mut Context<'_>,
+    command: &HistoryCommand,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let (element, from_seq, to_seq, limit, cursor) = match command {
+            HistoryCommand::Element {
+                value,
+                from_seq,
+                to_seq,
+                limit,
+                cursor,
+            } => (
+                Some(scalar_str(cx, value, "HISTORY ELEMENT")?),
+                from_seq.as_ref(),
+                to_seq.as_ref(),
+                limit.as_ref(),
+                cursor.as_ref(),
+            ),
+            HistoryCommand::Space {
+                from_seq,
+                to_seq,
+                limit,
+                cursor,
+            } => (
+                None,
+                from_seq.as_ref(),
+                to_seq.as_ref(),
+                limit.as_ref(),
+                cursor.as_ref(),
+            ),
+        };
 
-    // Through the read path's choke point, so an element this caller may not
-    // read answers exactly as one that was never written does (§30.4).
-    // Answering `[]` for both would be equally non-disclosing but less useful:
-    // an empty page already means "nothing in this range", so a mistyped id
-    // would come back as silence instead of as a mistake.
-    if let Some(named) = &element {
-        let id = named.parse::<crate::id::ElementId>()?;
-        if cx.load(id).await?.is_none() {
-            return Err(KipError::not_found_or_not_visible(format!(
-                "no element {id}"
+        // Through the read path's choke point, so an element this caller may not
+        // read answers exactly as one that was never written does (§30.4).
+        // Answering `[]` for both would be equally non-disclosing but less useful:
+        // an empty page already means "nothing in this range", so a mistyped id
+        // would come back as silence instead of as a mistake.
+        if let Some(named) = &element {
+            let id = named.parse::<crate::id::ElementId>()?;
+            if cx.load(id).await?.is_none() {
+                return Err(KipError::not_found_or_not_visible(format!(
+                    "no element {id}"
+                )));
+            }
+        }
+
+        let from = bound(cx, from_seq, 0)?;
+        let to = bound(cx, to_seq, cx.pinned_seq)?.min(cx.pinned_seq);
+        let limit = match limit {
+            Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?,
+            None => usize::MAX,
+        };
+        let offset = match cursor {
+            Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::History)?.offset,
+            None => 0,
+        };
+
+        let mut filters = vec![Box::new(crate::store::eq_field(
+            "space",
+            Fv::Text(cx.space.clone()),
+        ))];
+        if let Some(id) = &element {
+            // The journal records which elements each transaction touched, so an
+            // element's chronology is an index lookup rather than a scan.
+            filters.push(Box::new(crate::store::eq_field(
+                "changed_ids",
+                Fv::Text(id.clone()),
             )));
         }
-    }
+        let mut rows = journal(cx, Filter::And(filters)).await?;
+        rows.retain(|row| row.seq >= from && row.seq <= to);
+        rows.sort_by_key(|row| row.seq);
+        // Before the total is computed, so a page count cannot report entries the
+        // page itself will not contain (§104).
+        visible_changes(cx, &mut rows).await?;
 
-    let from = bound(cx, from_seq, 0)?;
-    let to = bound(cx, to_seq, cx.pinned_seq)?.min(cx.pinned_seq);
-    let limit = match limit {
-        Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?,
-        None => usize::MAX,
-    };
-    let offset = match cursor {
-        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::History)?.offset,
-        None => 0,
-    };
+        let total = rows.len();
+        let page: Vec<Json> = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|row| entry(&row, element.as_deref()))
+            .collect();
+        let consumed = offset + page.len();
 
-    let mut filters = vec![Box::new(crate::store::eq_field(
-        "space",
-        Fv::Text(cx.space.clone()),
-    ))];
-    if let Some(id) = &element {
-        // The journal records which elements each transaction touched, so an
-        // element's chronology is an index lookup rather than a scan.
-        filters.push(Box::new(crate::store::eq_field(
-            "changed_ids",
-            Fv::Text(id.clone()),
-        )));
-    }
-    let mut rows = journal(cx, Filter::And(filters)).await?;
-    rows.retain(|row| row.seq >= from && row.seq <= to);
-    rows.sort_by_key(|row| row.seq);
-    // Before the total is computed, so a page count cannot report entries the
-    // page itself will not contain (§104).
-    visible_changes(cx, &mut rows).await?;
-
-    let total = rows.len();
-    let page: Vec<Json> = rows
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|row| entry(&row, element.as_deref()))
-        .collect();
-    let consumed = offset + page.len();
-
-    Ok(Answer {
-        result: Json::Array(page),
-        next_cursor: super::next_cursor(cx, CursorFamily::History, consumed, total),
-        warnings: Vec::new(),
+        Ok(Answer {
+            result: Json::Array(page),
+            next_cursor: super::next_cursor(cx, CursorFamily::History, consumed, total),
+            warnings: Vec::new(),
+        })
     })
 }
 
@@ -248,39 +255,54 @@ fn change_cursor(cx: &Context<'_>, scalar: &Scalar) -> Result<u64, KipError> {
 }
 
 /// `DESCRIBE TRANSACTION`.
-pub async fn transaction(cx: &mut Context<'_>, tx_id: &str) -> Result<Json, KipError> {
-    let row = cx
-        .store
-        .find_transaction(tx_id)
-        .await?
-        .ok_or_else(transaction_unavailable)?;
-    describe_visible(cx, row).await
+pub fn transaction(
+    cx: &mut Context<'_>,
+    tx_id: &str,
+) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        let row = cx
+            .store
+            .find_transaction(tx_id)
+            .await?
+            .ok_or_else(transaction_unavailable)?;
+        describe_visible(cx, row).await
+    })
 }
 
 /// `DESCRIBE TRANSACTION BY IDEMPOTENCY KEY` — the lost-response lookup (§80.4).
-pub async fn transaction_by_key(cx: &mut Context<'_>, key: &str) -> Result<Json, KipError> {
-    let row = crate::kml::find_transaction_for_key(cx.store, &cx.space, cx.auth, key)
-        .await?
-        .ok_or_else(transaction_unavailable)?;
-    describe_visible(cx, row).await
+pub fn transaction_by_key(
+    cx: &mut Context<'_>,
+    key: &str,
+) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        let row = crate::kml::find_transaction_for_key(cx.store, &cx.space, cx.auth, key)
+            .await?
+            .ok_or_else(transaction_unavailable)?;
+        describe_visible(cx, row).await
+    })
 }
 
 fn transaction_unavailable() -> KipError {
     KipError::new(KipErrorCode::TransactionUnknown, "transaction unavailable")
 }
 
-async fn describe_visible(cx: &mut Context<'_>, row: TransactionRow) -> Result<Json, KipError> {
-    if row.space != cx.space || row.seq > cx.pinned_seq {
-        return Err(transaction_unavailable());
-    }
-    if row.changes.is_empty() {
-        return Ok(described(&row));
-    }
-    let mut rows = vec![row];
-    visible_changes(cx, &mut rows).await?;
-    rows.first()
-        .map(described)
-        .ok_or_else(transaction_unavailable)
+fn describe_visible(
+    cx: &mut Context<'_>,
+    row: TransactionRow,
+) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        if row.space != cx.space || row.seq > cx.pinned_seq {
+            return Err(transaction_unavailable());
+        }
+        if row.changes.is_empty() {
+            return Ok(described(&row));
+        }
+        let mut rows = vec![row];
+        visible_changes(cx, &mut rows).await?;
+        rows.first()
+            .map(described)
+            .ok_or_else(transaction_unavailable)
+    })
 }
 
 /// One transaction, as `DESCRIBE TRANSACTION` answers it.

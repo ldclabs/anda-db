@@ -239,62 +239,69 @@ fn basis(cx: &Context<'_>) -> Json {
     })
 }
 
-async fn configuration(store: &Store, tx: &mut Transaction) -> Result<AttentionConfig, KipError> {
-    if let Some(row) = store.control_at(&tx.cx.space, CONFIG, u64::MAX).await? {
-        let cfg: AttentionConfig = serde_json::from_value(row.value)
-            .map_err(|_| invalid("corrupt attention configuration"))?;
-        validate_config(&cfg)?;
-        return Ok(cfg);
-    }
-    let cfg = AttentionConfig {
-        scope: RuntimeScope {
-            space_id: tx.cx.space.clone(),
-            space_instance: hex::encode(rand::random::<[u8; 32]>()),
-        },
-        pins: RuntimePins {
-            policy: RuntimePin {
-                id: "nexus:structured-watch-v1".into(),
-                digest: digest(&json!({"engine":"nexus:structured-watch-v1"}))?,
+fn configuration(
+    store: &Store,
+    tx: &mut Transaction,
+) -> impl Future<Output = Result<AttentionConfig, KipError>> + Send {
+    Box::pin(async move {
+        if let Some(row) = store.control_at(&tx.cx.space, CONFIG, u64::MAX).await? {
+            let cfg: AttentionConfig = serde_json::from_value(row.value)
+                .map_err(|_| invalid("corrupt attention configuration"))?;
+            validate_config(&cfg)?;
+            return Ok(cfg);
+        }
+        let cfg = AttentionConfig {
+            scope: RuntimeScope {
+                space_id: tx.cx.space.clone(),
+                space_instance: hex::encode(rand::random::<[u8; 32]>()),
             },
-            evaluator: None,
-            binding: None,
-        },
-    };
-    validate_config(&cfg)?;
-    stage_control(store, tx, CONFIG, 0, "runtime", json!(cfg)).await?;
-    Ok(cfg)
+            pins: RuntimePins {
+                policy: RuntimePin {
+                    id: "nexus:structured-watch-v1".into(),
+                    digest: digest(&json!({"engine":"nexus:structured-watch-v1"}))?,
+                },
+                evaluator: None,
+                binding: None,
+            },
+        };
+        validate_config(&cfg)?;
+        stage_control(store, tx, CONFIG, 0, "runtime", json!(cfg)).await?;
+        Ok(cfg)
+    })
 }
 
-pub(crate) async fn stage_control(
+pub(crate) fn stage_control(
     store: &Store,
     tx: &mut Transaction,
     key: &str,
     expected: u64,
     kind: &str,
     value: Json,
-) -> Result<(), KipError> {
-    anda_kip::validate_json(&value)?;
-    if store
-        .control_at(&tx.cx.space, key, u64::MAX)
-        .await?
-        .map_or(0, |r| r.version)
-        != expected
-        || tx.control_effects.iter().any(|r| r.key == key)
-    {
-        return Err(conflict("version_conflict"));
-    }
-    tx.control_effects.push(ControlRecordRow {
-        _id: 0,
-        record_id: format!("{}:{key}", tx.cx.tx_id),
-        space: tx.cx.space.clone(),
-        key: key.into(),
-        seq: tx.cx.seq,
-        version: next(expected)?,
-        kind: kind.into(),
-        value,
-        origin: tx.cx.origin.clone(),
-    });
-    Ok(())
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        anda_kip::validate_json(&value)?;
+        if store
+            .control_at(&tx.cx.space, key, u64::MAX)
+            .await?
+            .map_or(0, |r| r.version)
+            != expected
+            || tx.control_effects.iter().any(|r| r.key == key)
+        {
+            return Err(conflict("version_conflict"));
+        }
+        tx.control_effects.push(ControlRecordRow {
+            _id: 0,
+            record_id: format!("{}:{key}", tx.cx.tx_id),
+            space: tx.cx.space.clone(),
+            key: key.into(),
+            seq: tx.cx.seq,
+            version: next(expected)?,
+            kind: kind.into(),
+            value,
+            origin: tx.cx.origin.clone(),
+        });
+        Ok(())
+    })
 }
 
 pub(crate) fn request_key(principal: &str, request: &Json) -> Result<String, KipError> {
@@ -304,176 +311,188 @@ pub(crate) fn request_key(principal: &str, request: &Json) -> Result<String, Kip
     ))
 }
 
-async fn reply(store: &Store, tx_id: &str) -> Result<Json, KipError> {
-    let row = store.find_transaction(tx_id).await?.ok_or_else(|| {
-        KipError::outcome_unknown("attention commit receipt unavailable; re-read before retry")
-    })?;
-    let mut result = row.result["runtime"].clone();
-    if !result.is_object() {
-        return Err(invalid("attention receipt lacks its retained result"));
-    }
-    let replay = crate::kml::replay(&row);
-    result["receipt"] =
-        serde_json::to_value(&replay.results[0].receipt).map_err(|e| invalid(&e.to_string()))?;
-    Ok(result)
+fn reply(store: &Store, tx_id: &str) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        let row = store.find_transaction(tx_id).await?.ok_or_else(|| {
+            KipError::outcome_unknown("attention commit receipt unavailable; re-read before retry")
+        })?;
+        let mut result = row.result["runtime"].clone();
+        if !result.is_object() {
+            return Err(invalid("attention receipt lacks its retained result"));
+        }
+        let replay = crate::kml::replay(&row);
+        result["receipt"] = serde_json::to_value(&replay.results[0].receipt)
+            .map_err(|e| invalid(&e.to_string()))?;
+        Ok(result)
+    })
 }
 
-pub(crate) async fn replay(
+pub(crate) fn replay(
     store: &Store,
     space: &str,
     key: &str,
     request_digest: &str,
-) -> Result<Option<Json>, KipError> {
-    let Some(row) = store
-        .find_transaction_by_idempotency_key(space, key)
-        .await?
-    else {
-        return Ok(None);
-    };
-    if row.request_digest != request_digest {
-        return Err(invalid("idempotency_conflict"));
-    }
-    Ok(Some(reply(store, &row.tx_id).await?))
+) -> impl Future<Output = Result<Option<Json>, KipError>> + Send {
+    Box::pin(async move {
+        let Some(row) = store
+            .find_transaction_by_idempotency_key(space, key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if row.request_digest != request_digest {
+            return Err(invalid("idempotency_conflict"));
+        }
+        Ok(Some(reply(store, &row.tx_id).await?))
+    })
 }
 
-pub(crate) async fn commit(
+pub(crate) fn commit(
     store: &Store,
     mut tx: Transaction,
     key: String,
     request_digest: String,
     result: Json,
-) -> Result<Json, KipError> {
-    tx.runtime_result = Some(result);
-    let tx_id = tx.cx.tx_id.clone();
-    tx.commit(JournalEntry {
-        idempotency_key: key,
-        request_digest,
-        ..Default::default()
+) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        tx.runtime_result = Some(result);
+        let tx_id = tx.cx.tx_id.clone();
+        tx.commit(JournalEntry {
+            idempotency_key: key,
+            request_digest,
+            ..Default::default()
+        })
+        .await?;
+        reply(store, &tx_id).await
     })
-    .await?;
-    reply(store, &tx_id).await
 }
 
 /// Last real-time fence check immediately before the redo plan is accepted.
-pub(crate) async fn validate_commit_leases(
+pub(crate) fn validate_commit_leases(
     store: &Store,
     space: &str,
     principal: &str,
     guards: &[(String, u64, u64)],
-) -> Result<(), KipError> {
-    let now = crate::tx::now_ms();
-    for (reference, version, fence) in guards {
-        let row = store
-            .control_at(space, reference, u64::MAX)
-            .await?
-            .ok_or_else(|| conflict("lease_lost"))?;
-        let wake: WakeRecord =
-            serde_json::from_value(row.value).map_err(|_| invalid("corrupt wake record"))?;
-        if row.version != *version
-            || wake.fence != *fence
-            || !matches!(&wake.state, WakeState::Running { lease }
-                if lease.owner == principal && lease.expires_at_ms > now)
-        {
-            return Err(conflict("lease_lost"));
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let now = crate::tx::now_ms();
+        for (reference, version, fence) in guards {
+            let row = store
+                .control_at(space, reference, u64::MAX)
+                .await?
+                .ok_or_else(|| conflict("lease_lost"))?;
+            let wake: WakeRecord =
+                serde_json::from_value(row.value).map_err(|_| invalid("corrupt wake record"))?;
+            if row.version != *version
+                || wake.fence != *fence
+                || !matches!(&wake.state, WakeState::Running { lease }
+                    if lease.owner == principal && lease.expires_at_ms > now)
+            {
+                return Err(conflict("lease_lost"));
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The generic Governance control reader must not bypass the permissions on
 /// work records or the cognitive elements they describe.
-pub(crate) async fn authorize_control_read(
+pub(crate) fn authorize_control_read(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
     row: &ControlRecordRow,
-) -> Result<(), KipError> {
-    if row.kind == "wake" {
-        work::load(session, authority, space, &row.key).await?;
-    } else if row.kind == "dispatch" && row.key.starts_with("dispatch/v1/") {
-        let request = &row.value["request"];
-        let wake_ref = request["wake_ref"]
-            .as_str()
-            .ok_or_else(|| invalid("dispatch lacks wake reference"))?;
-        work::load(session, authority, space, wake_ref).await?;
-        let attempt_ref = request["attempt_ref"]
-            .as_str()
-            .ok_or_else(|| invalid("dispatch lacks attempt reference"))?;
-        let attempt = session
-            .nexus
-            .store
-            .get_element(attempt_ref.parse()?)
-            .await?;
-        if attempt.space() != space || attempt.state() != crate::store::rows::state::ACTIVE {
-            return Err(KipError::not_found_or_not_visible(
-                "dispatch attempt unavailable",
-            ));
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        if row.kind == "wake" {
+            work::load(session, authority, space, &row.key).await?;
+        } else if row.kind == "dispatch" && row.key.starts_with("dispatch/v1/") {
+            let request = &row.value["request"];
+            let wake_ref = request["wake_ref"]
+                .as_str()
+                .ok_or_else(|| invalid("dispatch lacks wake reference"))?;
+            work::load(session, authority, space, wake_ref).await?;
+            let attempt_ref = request["attempt_ref"]
+                .as_str()
+                .ok_or_else(|| invalid("dispatch lacks attempt reference"))?;
+            let attempt = session
+                .nexus
+                .store
+                .get_element(attempt_ref.parse()?)
+                .await?;
+            if attempt.space() != space || attempt.state() != crate::store::rows::state::ACTIVE {
+                return Err(KipError::not_found_or_not_visible(
+                    "dispatch attempt unavailable",
+                ));
+            }
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&attempt),
+                    &session.auth,
+                )
+                .into_result()?;
+            if !authority
+                .may_read(&attempt, &session.auth)
+                .is_some_and(|v| v.content && v.constraints.fields.is_empty())
+            {
+                return Err(KipError::not_found_or_not_visible(
+                    "dispatch attempt is not fully visible",
+                ));
+            }
+        } else if row.kind == "runtime" && row.key != CONFIG {
+            if !row.key.starts_with("watch-evaluation/v1/") {
+                return Err(KipError::not_authorized(
+                    "attention runtime records use their dedicated read or replay API",
+                ));
+            }
+            let material = row.value["material"]["artifact_ref"]
+                .as_str()
+                .ok_or_else(|| invalid("evaluation material reference missing"))?;
+            session
+                .nexus
+                .store
+                .authorized_artifact(space, material, authority, &session.auth)
+                .await?;
         }
-        authority
-            .authorize(
-                Permission::Read,
-                &ResourceContext::of_element(&attempt),
-                &session.auth,
-            )
-            .into_result()?;
-        if !authority
-            .may_read(&attempt, &session.auth)
-            .is_some_and(|v| v.content && v.constraints.fields.is_empty())
-        {
-            return Err(KipError::not_found_or_not_visible(
-                "dispatch attempt is not fully visible",
-            ));
-        }
-    } else if row.kind == "runtime" && row.key != CONFIG {
-        if !row.key.starts_with("watch-evaluation/v1/") {
-            return Err(KipError::not_authorized(
-                "attention runtime records use their dedicated read or replay API",
-            ));
-        }
-        let material = row.value["material"]["artifact_ref"]
-            .as_str()
-            .ok_or_else(|| invalid("evaluation material reference missing"))?;
-        session
-            .nexus
-            .store
-            .authorized_artifact(space, material, authority, &session.auth)
-            .await?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl Session {
     /// Pins trusted host configuration. Scope is immutable after first arming;
     /// config changes invalidate old observation bases, never silently re-arm.
-    pub async fn set_attention_config(
+    pub fn set_attention_config(
         &self,
         space: &str,
         expected: u64,
         config: AttentionConfig,
-    ) -> Result<Json, KipError> {
-        validate_config(&config)?;
-        self.governed(space, Permission::ManagePolicy, async || {
-            if let Some(old) = self.nexus.store.control_at(space, CONFIG, u64::MAX).await? {
-                let previous: AttentionConfig = serde_json::from_value(old.value)
-                    .map_err(|_| invalid("corrupt attention configuration"))?;
-                if previous.scope != config.scope {
-                    return Err(invalid("attention instance cannot be replaced in place"));
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            validate_config(&config)?;
+            self.governed(space, Permission::ManagePolicy, async || {
+                if let Some(old) = self.nexus.store.control_at(space, CONFIG, u64::MAX).await? {
+                    let previous: AttentionConfig = serde_json::from_value(old.value)
+                        .map_err(|_| invalid("corrupt attention configuration"))?;
+                    if previous.scope != config.scope {
+                        return Err(invalid("attention instance cannot be replaced in place"));
+                    }
                 }
-            }
-            let saved = self
-                .nexus
-                .store
-                .publish_control(
-                    space,
-                    CONFIG,
-                    "policy",
-                    expected,
-                    json!(config),
-                    json!({"principal_id":self.auth.principal_id}),
-                )
-                .await?;
-            Ok(json!({"version":saved.version,"config":saved.value}))
+                let saved = self
+                    .nexus
+                    .store
+                    .publish_control(
+                        space,
+                        CONFIG,
+                        "policy",
+                        expected,
+                        json!(config),
+                        json!({"principal_id":self.auth.principal_id}),
+                    )
+                    .await?;
+                Ok(json!({"version":saved.version,"config":saved.value}))
+            })
+            .await
         })
-        .await
     }
 }

@@ -2,244 +2,261 @@ use super::cognitive::facet;
 use super::*;
 
 impl Transaction {
-    async fn erasure_edges(&self) -> Result<BTreeSet<(String, String)>, KipError> {
-        let mut rows = vec![];
-        for kind in ElementKind::ALL {
-            let ids = self
-                .store
-                .elements(*kind)
+    fn erasure_edges(
+        &self,
+    ) -> impl Future<Output = Result<BTreeSet<(String, String)>, KipError>> + Send {
+        Box::pin(async move {
+            let mut rows = vec![];
+            for kind in ElementKind::ALL {
+                let ids = self
+                    .store
+                    .elements(*kind)
+                    .query_all_ids(crate::store::eq_field(
+                        "space",
+                        anda_db_schema::Fv::Text(self.cx.space.clone()),
+                    ))
+                    .await
+                    .map_err(db_error)?;
+                if rows.len() + ids.len() > crate::kql::MAX_CANDIDATES {
+                    return Err(KipError::constraint_violation(
+                        "erasure closure exceeds scan budget; completion cannot be claimed",
+                    ));
+                }
+                for id in ids {
+                    rows.push(self.store.get_element(ElementId::new(*kind, id)).await?);
+                }
+            }
+            rows.extend(self.staged.values().map(|s| s.row.clone()));
+            let mut edges = BTreeSet::new();
+            for row in rows {
+                if facet(&row, "ErasurePlan").is_some() {
+                    continue;
+                }
+                let id = row.id().to_string();
+                if let Element::Activity(activity) = &row {
+                    for input in activity.inputs.iter().filter_map(element_reference) {
+                        edges.insert((input.to_string(), id.clone()));
+                    }
+                    for output in activity.outputs.iter().filter_map(element_reference) {
+                        edges.insert((id.clone(), output.to_string()));
+                    }
+                    if let Some(basis) = facet(&row, "DependencyBasis") {
+                        for pin in basis["groups"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|g| g["pins"].as_array().into_iter().flatten())
+                        {
+                            if let Some(source) = pin["id"].as_str() {
+                                edges.insert((source.into(), id.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    for source in row.references() {
+                        edges.insert((source.to_string(), id.clone()));
+                    }
+                }
+            }
+            let table = self.store.control_records();
+            for id in table
                 .query_all_ids(crate::store::eq_field(
                     "space",
                     anda_db_schema::Fv::Text(self.cx.space.clone()),
                 ))
                 .await
-                .map_err(db_error)?;
-            if rows.len() + ids.len() > crate::kql::MAX_CANDIDATES {
-                return Err(KipError::constraint_violation(
-                    "erasure closure exceeds scan budget; completion cannot be claimed",
-                ));
-            }
-            for id in ids {
-                rows.push(self.store.get_element(ElementId::new(*kind, id)).await?);
-            }
-        }
-        rows.extend(self.staged.values().map(|s| s.row.clone()));
-        let mut edges = BTreeSet::new();
-        for row in rows {
-            if facet(&row, "ErasurePlan").is_some() {
-                continue;
-            }
-            let id = row.id().to_string();
-            if let Element::Activity(activity) = &row {
-                for input in activity.inputs.iter().filter_map(element_reference) {
-                    edges.insert((input.to_string(), id.clone()));
-                }
-                for output in activity.outputs.iter().filter_map(element_reference) {
-                    edges.insert((id.clone(), output.to_string()));
-                }
-                if let Some(basis) = facet(&row, "DependencyBasis") {
-                    for pin in basis["groups"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|g| g["pins"].as_array().into_iter().flatten())
-                    {
-                        if let Some(source) = pin["id"].as_str() {
-                            edges.insert((source.into(), id.clone()));
+                .map_err(db_error)?
+            {
+                let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
+                if row.key.starts_with("erasure_edges/") {
+                    for edge in row.value["edges"].as_array().into_iter().flatten() {
+                        if let (Some(a), Some(b)) = (edge[0].as_str(), edge[1].as_str()) {
+                            edges.insert((a.into(), b.into()));
                         }
                     }
                 }
-            } else {
-                for source in row.references() {
-                    edges.insert((source.to_string(), id.clone()));
-                }
             }
-        }
-        let table = self.store.control_records();
-        for id in table
-            .query_all_ids(crate::store::eq_field(
-                "space",
-                anda_db_schema::Fv::Text(self.cx.space.clone()),
-            ))
-            .await
-            .map_err(db_error)?
-        {
-            let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
-            if row.key.starts_with("erasure_edges/") {
-                for edge in row.value["edges"].as_array().into_iter().flatten() {
-                    if let (Some(a), Some(b)) = (edge[0].as_str(), edge[1].as_str()) {
-                        edges.insert((a.into(), b.into()));
-                    }
-                }
-            }
-        }
-        Ok(edges)
+            Ok(edges)
+        })
     }
 
     /// Keep only non-content edges crossing a purged node. Otherwise deleting a
     /// producing Activity could hide a still-retained summary from later erasure.
-    pub(crate) async fn capture_erasure_edges(&mut self) -> Result<(), KipError> {
-        let roots: BTreeSet<String> = self
-            .purges
-            .keys()
-            .chain(self.payload_purges.keys())
-            .map(ToString::to_string)
-            .collect();
-        if roots.is_empty() {
-            return Ok(());
-        }
-        let edges: Vec<_> = self
-            .erasure_edges()
-            .await?
-            .into_iter()
-            .filter(|(a, b)| roots.contains(a) || roots.contains(b))
-            .collect();
-        let key = format!("erasure_edges/{}", self.cx.tx_id);
-        self.control_effects.push(ControlRecordRow {
-            _id: 0,
-            record_id: key.clone(),
-            space: self.cx.space.clone(),
-            key,
-            seq: self.cx.seq,
-            version: 1,
-            kind: "erasure".into(),
-            value: serde_json::json!({"edges":edges}),
-            origin: self.cx.origin.clone(),
-        });
-        Ok(())
-    }
-
-    pub(crate) async fn artifact_erasure_replacements(
-        &self,
-    ) -> Result<Vec<ControlRecordRow>, KipError> {
-        let erased: BTreeSet<String> = self
-            .purges
-            .keys()
-            .chain(self.payload_purges.keys())
-            .map(ToString::to_string)
-            .collect();
-        if erased.is_empty() {
-            return Ok(vec![]);
-        }
-        let table = self.store.control_records();
-        let mut replacements = vec![];
-        for id in table
-            .query_all_ids(crate::store::eq_field(
-                "space",
-                anda_db_schema::Fv::Text(self.cx.space.clone()),
-            ))
-            .await
-            .map_err(db_error)?
-        {
-            let mut row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
-            if row.key.starts_with("artifact/")
-                && row.value["state"] == "available"
-                && row.value["source_refs"].as_array().is_some_and(|refs| {
-                    refs.iter()
-                        .any(|r| r.as_str().is_some_and(|r| erased.contains(r)))
-                })
-            {
-                row.value.as_object_mut().unwrap().remove("content");
-                row.value["state"] = serde_json::json!("erased");
-                replacements.push(row);
-            }
-        }
-        Ok(replacements)
-    }
-
-    pub(crate) async fn validate_erasure(&self) -> Result<(), KipError> {
-        for staged in self.staged.values().filter(|s| s.changed) {
-            if let Some(plan) = facet(&staged.row, "ErasurePlan") {
-                self.validate_erasure_plan(plan).await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn validate_erasure_plan(&self, plan: &Json) -> Result<(), KipError> {
-        crate::schema::contracts::validate_value(
-            &serde_json::json!({"$ref":"urn:kip:2.0:schema:cognitive-records#/$defs/ErasurePlan"}),
-            plan,
-        )?;
-        if plan["status"] == "completed" && plan["scope"] == "semantic_forgetting" {
-            let mut pending: Vec<String> = plan["source_event_refs"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Json::as_str)
-                .map(str::to_string)
+    pub(crate) fn capture_erasure_edges(
+        &mut self,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let roots: BTreeSet<String> = self
+                .purges
+                .keys()
+                .chain(self.payload_purges.keys())
+                .map(ToString::to_string)
                 .collect();
-            if pending.is_empty() {
-                return Err(KipError::constraint_violation(
-                    "semantic erasure completion requires explicit source roots",
-                ));
+            if roots.is_empty() {
+                return Ok(());
             }
-            let edges = self.erasure_edges().await?;
-            let mut seen = BTreeSet::new();
-            while let Some(id) = pending.pop() {
-                if !seen.insert(id.clone()) {
-                    continue;
+            let edges: Vec<_> = self
+                .erasure_edges()
+                .await?
+                .into_iter()
+                .filter(|(a, b)| roots.contains(a) || roots.contains(b))
+                .collect();
+            let key = format!("erasure_edges/{}", self.cx.tx_id);
+            self.control_effects.push(ControlRecordRow {
+                _id: 0,
+                record_id: key.clone(),
+                space: self.cx.space.clone(),
+                key,
+                seq: self.cx.seq,
+                version: 1,
+                kind: "erasure".into(),
+                value: serde_json::json!({"edges":edges}),
+                origin: self.cx.origin.clone(),
+            });
+            Ok(())
+        })
+    }
+
+    pub(crate) fn artifact_erasure_replacements(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ControlRecordRow>, KipError>> + Send {
+        Box::pin(async move {
+            let erased: BTreeSet<String> = self
+                .purges
+                .keys()
+                .chain(self.payload_purges.keys())
+                .map(ToString::to_string)
+                .collect();
+            if erased.is_empty() {
+                return Ok(vec![]);
+            }
+            let table = self.store.control_records();
+            let mut replacements = vec![];
+            for id in table
+                .query_all_ids(crate::store::eq_field(
+                    "space",
+                    anda_db_schema::Fv::Text(self.cx.space.clone()),
+                ))
+                .await
+                .map_err(db_error)?
+            {
+                let mut row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
+                if row.key.starts_with("artifact/")
+                    && row.value["state"] == "available"
+                    && row.value["source_refs"].as_array().is_some_and(|refs| {
+                        refs.iter()
+                            .any(|r| r.as_str().is_some_and(|r| erased.contains(r)))
+                    })
+                {
+                    row.value.as_object_mut().unwrap().remove("content");
+                    row.value["state"] = serde_json::json!("erased");
+                    replacements.push(row);
                 }
-                if self.final_element(id.parse()?).await?.state() != state::PURGED {
+            }
+            Ok(replacements)
+        })
+    }
+
+    pub(crate) fn validate_erasure(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            for staged in self.staged.values().filter(|s| s.changed) {
+                if let Some(plan) = facet(&staged.row, "ErasurePlan") {
+                    self.validate_erasure_plan(plan).await?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn validate_erasure_plan(
+        &self,
+        plan: &Json,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            crate::schema::contracts::validate_value(
+                &serde_json::json!({"$ref":"urn:kip:2.0:schema:cognitive-records#/$defs/ErasurePlan"}),
+                plan,
+            )?;
+            if plan["status"] == "completed" && plan["scope"] == "semantic_forgetting" {
+                let mut pending: Vec<String> = plan["source_event_refs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Json::as_str)
+                    .map(str::to_string)
+                    .collect();
+                if pending.is_empty() {
                     return Err(KipError::constraint_violation(
-                        "semantic erasure cannot complete while an owned dependent remains",
+                        "semantic erasure completion requires explicit source roots",
                     ));
                 }
-                // Edges are ordered by source, so one element's dependents
-                // are a contiguous run.
-                pending.extend(
-                    edges
-                        .range((id.clone(), String::new())..)
-                        .take_while(|(source, _)| source == &id)
-                        .map(|(_, target)| target.clone()),
-                );
-            }
-        }
-        let mut replacements: Option<Vec<ControlRecordRow>> = None;
-        for target in plan["targets"].as_array().into_iter().flatten() {
-            if target["state"] != "erased" {
-                continue;
-            }
-            let reference = target["ref"].as_str().unwrap_or("");
-            let erased = match target["surface"].as_str() {
-                Some("element" | "summary" | "index" | "cache") => {
-                    self.final_element(reference.parse()?).await?.state() == state::PURGED
-                }
-                Some("payload") => {
-                    let element = self.final_element(reference.parse()?).await?;
-                    matches!(&element, Element::Evidence(row)
-                        if row.payload_mode == PAYLOAD_PURGED || row.state == state::PURGED)
-                }
-                Some("replay" | "blob") => {
-                    let key = format!("artifact/{reference}");
-                    if self
-                        .store
-                        .control_at(&self.cx.space, &key, u64::MAX)
-                        .await?
-                        .is_some_and(|row| row.value["state"] == "erased")
-                    {
-                        true
-                    } else {
-                        if replacements.is_none() {
-                            replacements = Some(self.artifact_erasure_replacements().await?);
-                        }
-                        replacements
-                            .as_ref()
-                            .is_some_and(|rows| rows.iter().any(|r| r.key == key))
+                let edges = self.erasure_edges().await?;
+                let mut seen = BTreeSet::new();
+                while let Some(id) = pending.pop() {
+                    if !seen.insert(id.clone()) {
+                        continue;
                     }
+                    if self.final_element(id.parse()?).await?.state() != state::PURGED {
+                        return Err(KipError::constraint_violation(
+                            "semantic erasure cannot complete while an owned dependent remains",
+                        ));
+                    }
+                    // Edges are ordered by source, so one element's dependents
+                    // are a contiguous run.
+                    pending.extend(
+                        edges
+                            .range((id.clone(), String::new())..)
+                            .take_while(|(source, _)| source == &id)
+                            .map(|(_, target)| target.clone()),
+                    );
                 }
-                Some("exposure") => self.store.exposure_count(reference).await? == 0,
-                // Backend backups need their own verified deletion receipt;
-                // a model-authored plan is not such a receipt.
-                _ => false,
-            };
-            if !erased {
-                return Err(KipError::constraint_violation(
-                    "ErasurePlan cannot complete while a target is retained, held or lacks verified erasure coverage",
-                ));
             }
-        }
-        Ok(())
+            let mut replacements: Option<Vec<ControlRecordRow>> = None;
+            for target in plan["targets"].as_array().into_iter().flatten() {
+                if target["state"] != "erased" {
+                    continue;
+                }
+                let reference = target["ref"].as_str().unwrap_or("");
+                let erased = match target["surface"].as_str() {
+                    Some("element" | "summary" | "index" | "cache") => {
+                        self.final_element(reference.parse()?).await?.state() == state::PURGED
+                    }
+                    Some("payload") => {
+                        let element = self.final_element(reference.parse()?).await?;
+                        matches!(&element, Element::Evidence(row)
+                            if row.payload_mode == PAYLOAD_PURGED || row.state == state::PURGED)
+                    }
+                    Some("replay" | "blob") => {
+                        let key = format!("artifact/{reference}");
+                        if self
+                            .store
+                            .control_at(&self.cx.space, &key, u64::MAX)
+                            .await?
+                            .is_some_and(|row| row.value["state"] == "erased")
+                        {
+                            true
+                        } else {
+                            if replacements.is_none() {
+                                replacements = Some(self.artifact_erasure_replacements().await?);
+                            }
+                            replacements
+                                .as_ref()
+                                .is_some_and(|rows| rows.iter().any(|r| r.key == key))
+                        }
+                    }
+                    Some("exposure") => self.store.exposure_count(reference).await? == 0,
+                    // Backend backups need their own verified deletion receipt;
+                    // a model-authored plan is not such a receipt.
+                    _ => false,
+                };
+                if !erased {
+                    return Err(KipError::constraint_violation(
+                        "ErasurePlan cannot complete while a target is retained, held or lacks verified erasure coverage",
+                    ));
+                }
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn validate_durable(&mut self) -> Result<(), KipError> {

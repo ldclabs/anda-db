@@ -112,86 +112,88 @@ pub struct Selection<'a> {
     pub limit: Option<&'a Scalar>,
 }
 
-pub async fn targets(
+pub fn targets(
     store: &Store,
     tx: &Transaction,
     selection: &Selection<'_>,
     b: &Bindings<'_>,
-) -> Result<Targets, KipError> {
-    let Selection {
-        what,
-        permission,
-        target,
-        where_clauses,
-        limit,
-    } = *selection;
-    let Some(clauses) = where_clauses else {
-        return Ok(Targets {
-            ids: vec![b.element_ref(target)?],
+) -> impl Future<Output = Result<Targets, KipError>> + Send {
+    Box::pin(async move {
+        let Selection {
+            what,
             permission,
-        });
-    };
+            target,
+            where_clauses,
+            limit,
+        } = *selection;
+        let Some(clauses) = where_clauses else {
+            return Ok(Targets {
+                ids: vec![b.element_ref(target)?],
+                permission,
+            });
+        };
 
-    let mut cx = kql::Context::open(
-        store,
-        &tx.cx.space,
-        b.request,
-        b.operation,
-        &tx.authority,
-        &tx.auth,
-    )
-    .await?;
-    let vars: Vec<_> = tx.handles().keys().cloned().collect();
-    let row = tx
-        .handles()
-        .values()
-        .map(|id| {
-            if let Some(element) = tx.handle_view(*id) {
-                cx.seed_element(*id, element.clone());
-            }
-            kql::binding::Binding::Element(*id)
-        })
-        .collect();
-    let solutions = cx
-        .solve_seeded(clauses, kql::binding::Solutions::table(vars, vec![row]))
+        let mut cx = kql::Context::open(
+            store,
+            &tx.cx.space,
+            b.request,
+            b.operation,
+            &tx.authority,
+            &tx.auth,
+        )
         .await?;
-    let limit = limit
-        .map(|scalar| b.scalar_u64(scalar, "LIMIT"))
-        .transpose()?
-        .map(|limit| limit as usize);
+        let vars: Vec<_> = tx.handles().keys().cloned().collect();
+        let row = tx
+            .handles()
+            .values()
+            .map(|id| {
+                if let Some(element) = tx.handle_view(*id) {
+                    cx.seed_element(*id, element.clone());
+                }
+                kql::binding::Binding::Element(*id)
+            })
+            .collect();
+        let solutions = cx
+            .solve_seeded(clauses, kql::binding::Solutions::table(vars, vec![row]))
+            .await?;
+        let limit = limit
+            .map(|scalar| b.scalar_u64(scalar, "LIMIT"))
+            .transpose()?
+            .map(|limit| limit as usize);
 
-    let variable = match target {
-        // A block output is a bound operand: WHERE guards its fixed identity.
-        ElementRef::Handle(name) if tx.handles().contains_key(name.as_str()) => None,
-        ElementRef::Handle(name) => Some(name.as_str()),
-        _ => None,
-    };
+        let variable = match target {
+            // A block output is a bound operand: WHERE guards its fixed identity.
+            ElementRef::Handle(name) if tx.handles().contains_key(name.as_str()) => None,
+            ElementRef::Handle(name) => Some(name.as_str()),
+            _ => None,
+        };
 
-    let ids = match variable {
-        Some(name) => {
-            if !solutions.binds(name) {
-                return Err(KipError::reference_error(format!(
-                    "the {what} selection block does not bind ?{name}"
-                )));
+        let ids = match variable {
+            Some(name) => {
+                if !solutions.binds(name) {
+                    return Err(KipError::reference_error(format!(
+                        "the {what} selection block does not bind ?{name}"
+                    )));
+                }
+                let mut ids = solutions.elements_of(name);
+                // §52.7: a documented order, so a bounded sweep is repeatable.
+                ids.sort_unstable();
+                ids.dedup();
+                if let Some(limit) = limit {
+                    ids.truncate(limit);
+                }
+                ids
             }
-            let mut ids = solutions.elements_of(name);
-            // §52.7: a documented order, so a bounded sweep is repeatable.
-            ids.sort_unstable();
-            ids.dedup();
-            if let Some(limit) = limit {
-                ids.truncate(limit);
+            None => {
+                // A guard: the statement already names its target.
+                if solutions.is_empty() || limit == Some(0) {
+                    Vec::new()
+                } else {
+                    vec![b.element_ref(target)?]
+                }
             }
-            ids
-        }
-        None => {
-            // A guard: the statement already names its target.
-            if solutions.is_empty() || limit == Some(0) {
-                Vec::new()
-            } else {
-                vec![b.element_ref(target)?]
-            }
-        }
-    };
+        };
 
-    Ok(Targets { ids, permission })
+        Ok(Targets { ids, permission })
+    })
 }

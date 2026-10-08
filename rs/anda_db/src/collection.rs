@@ -769,14 +769,16 @@ impl Collection {
     /// Runs `fut` under a [`CancelGuard`]: dropping the returned future
     /// before completion poisons the handle, completing it (with either
     /// result) disarms the guard.
-    async fn guarded<F, T>(&self, action: &'static str, fut: F) -> T
+    fn guarded<F, T>(&self, action: &'static str, fut: F) -> impl Future<Output = T> + Send
     where
-        F: Future<Output = T>,
+        F: Future<Output = T> + Send,
     {
-        let guard = self.cancel_guard(action);
-        let rt = fut.await;
-        guard.disarm();
-        rt
+        Box::pin(async move {
+            let guard = self.cancel_guard(action);
+            let rt = fut.await;
+            guard.disarm();
+            rt
+        })
     }
 
     /// Acquires an active-operation lease.  The state is deliberately checked

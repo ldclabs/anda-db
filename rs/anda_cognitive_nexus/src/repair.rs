@@ -130,72 +130,74 @@ impl Session {
     /// already exist as the caller's own Assertions citing the same source,
     /// with `asserted_at` recovered from that source — never the repair time.
     /// A retry of the same repair returns the recorded one without writing.
-    pub async fn repair_recording(
+    pub fn repair_recording(
         &self,
         space: &str,
         repair: RecordingRepair,
-    ) -> Result<Json, KipError> {
-        check_shape(&repair)?;
-        self.with_authority(space, async |authority| {
-            let store = &self.nexus.store;
-            let key = format!(
-                "{REPAIR_CLASS}:{}",
-                crate::schema::contracts::digest(&serde_json::to_value(&repair).unwrap())?
-            );
-            // The same repair, retried, is answered from the recorded one under
-            // current authorization; nothing is checked or written again.
-            if let Some(activity) =
-                recorded(store, space, &key, &repair, &authority, &self.auth).await?
-            {
-                return Ok(json!({
-                    "repair_ref": activity,
-                    "invalidated_refs": repair.invalidated_refs,
-                    "replacement_refs": repair.replacement_refs,
-                    "replayed": true,
-                }));
-            }
-            check(store, space, &repair, &authority, &self.auth).await?;
-            // The engine's record of who wrote this and through what, as an
-            // ordinary write records it (§26).
-            let mut origin = json!({"principal_id": self.auth.principal_id});
-            if !self.auth.client.is_empty() {
-                origin["channel"] = json!(self.auth.client);
-            }
-            let mut tx = crate::tx::Transaction::begin(
-                store,
-                space,
-                origin,
-                false,
-                authority.clone(),
-                (*self.auth).clone(),
-            )
-            .await?;
-            match stage(store, &mut tx, &repair, &key).await {
-                Ok(Staged::Fresh(activity)) => {
-                    let outcome = tx.commit(JournalEntry::default()).await?;
-                    Ok(json!({
-                        "repair_ref": activity,
-                        "invalidated_refs": repair.invalidated_refs,
-                        "replacement_refs": repair.replacement_refs,
-                        "receipt": outcome.receipt,
-                    }))
-                }
-                Ok(Staged::Replayed(activity)) => {
-                    tx.abort().await;
-                    Ok(json!({
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            check_shape(&repair)?;
+            self.with_authority(space, async |authority| {
+                let store = &self.nexus.store;
+                let key = format!(
+                    "{REPAIR_CLASS}:{}",
+                    crate::schema::contracts::digest(&serde_json::to_value(&repair).unwrap())?
+                );
+                // The same repair, retried, is answered from the recorded one under
+                // current authorization; nothing is checked or written again.
+                if let Some(activity) =
+                    recorded(store, space, &key, &repair, &authority, &self.auth).await?
+                {
+                    return Ok(json!({
                         "repair_ref": activity,
                         "invalidated_refs": repair.invalidated_refs,
                         "replacement_refs": repair.replacement_refs,
                         "replayed": true,
-                    }))
+                    }));
                 }
-                Err(error) => {
-                    tx.abort().await;
-                    Err(error)
+                check(store, space, &repair, &authority, &self.auth).await?;
+                // The engine's record of who wrote this and through what, as an
+                // ordinary write records it (§26).
+                let mut origin = json!({"principal_id": self.auth.principal_id});
+                if !self.auth.client.is_empty() {
+                    origin["channel"] = json!(self.auth.client);
                 }
-            }
+                let mut tx = crate::tx::Transaction::begin(
+                    store,
+                    space,
+                    origin,
+                    false,
+                    authority.clone(),
+                    (*self.auth).clone(),
+                )
+                .await?;
+                match stage(store, &mut tx, &repair, &key).await {
+                    Ok(Staged::Fresh(activity)) => {
+                        let outcome = tx.commit(JournalEntry::default()).await?;
+                        Ok(json!({
+                            "repair_ref": activity,
+                            "invalidated_refs": repair.invalidated_refs,
+                            "replacement_refs": repair.replacement_refs,
+                            "receipt": outcome.receipt,
+                        }))
+                    }
+                    Ok(Staged::Replayed(activity)) => {
+                        tx.abort().await;
+                        Ok(json!({
+                            "repair_ref": activity,
+                            "invalidated_refs": repair.invalidated_refs,
+                            "replacement_refs": repair.replacement_refs,
+                            "replayed": true,
+                        }))
+                    }
+                    Err(error) => {
+                        tx.abort().await;
+                        Err(error)
+                    }
+                }
+            })
+            .await
         })
-        .await
     }
 }
 
@@ -559,20 +561,21 @@ fn stale(reference: &str, actual: u64, expected: u64) -> KipError {
 
 /// Plans the repair Activity, then — for a fresh repair — the invalidations
 /// and the `recording` control coordinate (§36.1).
-async fn stage(
+fn stage(
     store: &Store,
     tx: &mut crate::tx::Transaction,
     repair: &RecordingRepair,
     key: &str,
-) -> Result<Staged, KipError> {
-    let inputs: Vec<&String> = std::iter::once(&repair.source_ref)
-        .chain(&repair.invalidated_refs)
-        .collect();
-    let tuples: Vec<String> = (0..inputs.len())
-        .map(|i| format!("(\"inputs\", :input{i})"))
-        .collect();
-    let command = format!(
-        r#"CREATE ACTIVITY ?repair {{
+) -> impl Future<Output = Result<Staged, KipError>> + Send {
+    Box::pin(async move {
+        let inputs: Vec<&String> = std::iter::once(&repair.source_ref)
+            .chain(&repair.invalidated_refs)
+            .collect();
+        let tuples: Vec<String> = (0..inputs.len())
+            .map(|i| format!("(\"inputs\", :input{i})"))
+            .collect();
+        let command = format!(
+            r#"CREATE ACTIVITY ?repair {{
             CLIENT KEY :key
             SET FIELDS {{activity_class: "{REPAIR_CLASS}", status: "completed", started_at: :now, ended_at: :now}}
             SET FACET "{REPAIR_FACET}" {{
@@ -583,84 +586,85 @@ async fn stage(
             }}
             SET STRUCTURAL {{ {} }}
         }}"#,
-        tuples.join(" ")
-    );
-    let mut parameters = Map::from_iter([
-        ("key".to_string(), json!(key)),
-        ("now".to_string(), json!(tx.cx.at)),
-        ("source_ref".to_string(), json!(repair.source_ref)),
-        ("source_digest".to_string(), json!(repair.source_digest)),
-        ("source_locator".to_string(), json!(repair.source_locator)),
-        (
-            "invalidated_refs".to_string(),
-            json!(repair.invalidated_refs),
-        ),
-        (
-            "replacement_refs".to_string(),
-            json!(repair.replacement_refs),
-        ),
-        (
-            "reason".to_string(),
-            serde_json::to_value(repair.reason).unwrap(),
-        ),
-        (
-            "expected_versions".to_string(),
-            json!(repair.expected_versions),
-        ),
-    ]);
-    for (i, reference) in inputs.iter().enumerate() {
-        parameters.insert(format!("input{i}"), json!(reference));
-    }
-    let anda_kip::Command::Kml(statement) = anda_kip::parse_kip(&command)? else {
-        return Err(KipError::internal_error("repair command is not KML"));
-    };
-    crate::kml::plan(
-        store,
-        tx,
-        &statement,
-        Some(&parameters),
-        &anda_kip::Operation::new(command.as_str()),
-    )
-    .await?;
-    let activity_id = tx.handles()["repair"];
-    let activity = activity_id.to_string();
-    if !tx.is_new_element(activity_id) {
-        // The same repair, retried: its digest is the key. Nothing is written
-        // again, and the recorded repair is what the caller learns.
-        return Ok(Staged::Replayed(activity));
-    }
-    tx.authorized_recording_repairs.insert(activity_id);
-
-    for reference in &repair.invalidated_refs {
-        let id: ElementId = reference.parse()?;
-        if let Element::Assertion(row) = tx.load(id).await? {
-            if !row.governance.is_object() {
-                row.governance = json!({});
-            }
-            row.governance[REPAIR_KEY] = json!(activity);
+            tuples.join(" ")
+        );
+        let mut parameters = Map::from_iter([
+            ("key".to_string(), json!(key)),
+            ("now".to_string(), json!(tx.cx.at)),
+            ("source_ref".to_string(), json!(repair.source_ref)),
+            ("source_digest".to_string(), json!(repair.source_digest)),
+            ("source_locator".to_string(), json!(repair.source_locator)),
+            (
+                "invalidated_refs".to_string(),
+                json!(repair.invalidated_refs),
+            ),
+            (
+                "replacement_refs".to_string(),
+                json!(repair.replacement_refs),
+            ),
+            (
+                "reason".to_string(),
+                serde_json::to_value(repair.reason).unwrap(),
+            ),
+            (
+                "expected_versions".to_string(),
+                json!(repair.expected_versions),
+            ),
+        ]);
+        for (i, reference) in inputs.iter().enumerate() {
+            parameters.insert(format!("input{i}"), json!(reference));
         }
-        tx.mark_changed(id, anda_kip::ChangeOp::Update);
-    }
+        let anda_kip::Command::Kml(statement) = anda_kip::parse_kip(&command)? else {
+            return Err(KipError::internal_error("repair command is not KML"));
+        };
+        crate::kml::plan(
+            store,
+            tx,
+            &statement,
+            Some(&parameters),
+            &anda_kip::Operation::new(command.as_str()),
+        )
+        .await?;
+        let activity_id = tx.handles()["repair"];
+        let activity = activity_id.to_string();
+        if !tx.is_new_element(activity_id) {
+            // The same repair, retried: its digest is the key. Nothing is written
+            // again, and the recorded repair is what the caller learns.
+            return Ok(Staged::Replayed(activity));
+        }
+        tx.authorized_recording_repairs.insert(activity_id);
 
-    let control_key = format!("recording/{activity}");
-    tx.control_effects.push(ControlRecordRow {
-        _id: 0,
-        record_id: format!("{}:{control_key}", tx.cx.tx_id),
-        space: tx.cx.space.clone(),
-        key: control_key,
-        seq: tx.cx.seq,
-        version: 1,
-        kind: "recording".into(),
-        value: json!({
-            "repair_ref": activity,
-            "source_ref": repair.source_ref,
-            "invalidated_refs": repair.invalidated_refs,
-            "replacement_refs": repair.replacement_refs,
-            "reason": repair.reason,
-        }),
-        origin: tx.cx.origin.clone(),
-    });
-    Ok(Staged::Fresh(activity))
+        for reference in &repair.invalidated_refs {
+            let id: ElementId = reference.parse()?;
+            if let Element::Assertion(row) = tx.load(id).await? {
+                if !row.governance.is_object() {
+                    row.governance = json!({});
+                }
+                row.governance[REPAIR_KEY] = json!(activity);
+            }
+            tx.mark_changed(id, anda_kip::ChangeOp::Update);
+        }
+
+        let control_key = format!("recording/{activity}");
+        tx.control_effects.push(ControlRecordRow {
+            _id: 0,
+            record_id: format!("{}:{control_key}", tx.cx.tx_id),
+            space: tx.cx.space.clone(),
+            key: control_key,
+            seq: tx.cx.seq,
+            version: 1,
+            kind: "recording".into(),
+            value: json!({
+                "repair_ref": activity,
+                "source_ref": repair.source_ref,
+                "invalidated_refs": repair.invalidated_refs,
+                "replacement_refs": repair.replacement_refs,
+                "reason": repair.reason,
+            }),
+            origin: tx.cx.origin.clone(),
+        });
+        Ok(Staged::Fresh(activity))
+    })
 }
 
 #[cfg(test)]

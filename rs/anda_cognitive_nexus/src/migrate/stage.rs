@@ -97,26 +97,28 @@ struct Probe {
 }
 
 impl Probe {
-    async fn open(db: &AndaDB, name: &str) -> Result<Self, KipError> {
-        // An open handle is someone's: read it, never close it.
-        if let Some(collection) = db.get_open_collection(name) {
-            return Ok(Self {
+    fn open(db: &AndaDB, name: &str) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            // An open handle is someone's: read it, never close it.
+            if let Some(collection) = db.get_open_collection(name) {
+                return Ok(Self {
+                    collection,
+                    loaded: false,
+                });
+            }
+            // Opened without a schema, so a persisted 1.x one stays in force and
+            // no index is built against fields it does not have.
+            let collection = db
+                .open_collection(name.to_string(), async |c| {
+                    crate::store::install_element_hooks(c);
+                    Ok(())
+                })
+                .await
+                .map_err(db_error)?;
+            Ok(Self {
                 collection,
-                loaded: false,
-            });
-        }
-        // Opened without a schema, so a persisted 1.x one stays in force and
-        // no index is built against fields it does not have.
-        let collection = db
-            .open_collection(name.to_string(), async |c| {
-                crate::store::install_element_hooks(c);
-                Ok(())
+                loaded: true,
             })
-            .await
-            .map_err(db_error)?;
-        Ok(Self {
-            collection,
-            loaded: true,
         })
     }
 
@@ -149,106 +151,108 @@ fn is_v1_concepts(schema: &Schema) -> bool {
 }
 
 /// Extracts a 1.x layout into staging and drops the colliding collections.
-pub(crate) async fn prepare(db: &Arc<AndaDB>) -> Result<(), KipError> {
-    let collections = db.metadata().collections;
-    let staging = open(db).await?;
-    if let Some(staging) = &staging
-        && (has_marker(staging, kind::EXTRACTED).await?
-            // Compatibility with a pre-checkpoint migration interrupted after
-            // its first delete. That implementation flushed all rows first.
-            || !collections.contains(CONCEPTS) && !staging.is_empty())
-    {
-        return drop_legacy_collections(db, staging).await;
-    }
-    if !collections.contains(CONCEPTS) {
-        // A fresh database, or one already migrated: nothing occupies the name.
+pub(crate) fn prepare(db: &Arc<AndaDB>) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let collections = db.metadata().collections;
+        let staging = open(db).await?;
+        if let Some(staging) = &staging
+            && (has_marker(staging, kind::EXTRACTED).await?
+                // Compatibility with a pre-checkpoint migration interrupted after
+                // its first delete. That implementation flushed all rows first.
+                || !collections.contains(CONCEPTS) && !staging.is_empty())
+        {
+            return drop_legacy_collections(db, staging).await;
+        }
+        if !collections.contains(CONCEPTS) {
+            // A fresh database, or one already migrated: nothing occupies the name.
+            if collections.contains(PROPOSITIONS) {
+                let probe = Probe::open(db, PROPOSITIONS).await?;
+                if is_v1_propositions(&probe.schema()) {
+                    return Err(KipError::internal_error(
+                        "migration: legacy propositions remain without concepts or a durable staging copy",
+                    ));
+                }
+                probe.release(db).await?;
+            }
+            return Ok(());
+        }
+
+        // Opened without a schema, so the persisted 1.x one stays in force and no
+        // index is built against fields it does not have. Passing the 2.0 schema
+        // here is what fails with a message about a missing `key` field.
+        let probe = Probe::open(db, CONCEPTS).await?;
+        if !is_v1_concepts(&probe.schema()) {
+            return probe.release(db).await;
+        }
+        let concepts = probe.collection;
+
+        log::warn!(
+            action = "migrate::prepare",
+            collection = CONCEPTS;
+            "KIP 1.x layout detected; extracting into {LEGACY_STAGING} before it is replaced",
+        );
+
+        let staging = db
+            .open_or_create_collection(
+                LegacyRow::schema().map_err(|err| {
+                    KipError::new(KipErrorCode::InternalError, format!("migration: {err}"))
+                })?,
+                CollectionConfig {
+                    name: LEGACY_STAGING.to_string(),
+                    description: "KIP 1.x rows, kept verbatim across the 2.0 migration".to_string(),
+                },
+                init_staging,
+            )
+            .await
+            .map_err(db_error)?;
+
+        // A previous attempt may have been interrupted part-way through the copy.
+        // The source is still authoritative at this point — nothing has been
+        // dropped yet — so the honest repair is to redo the copy from scratch
+        // rather than guess which rows made it.
+        if !staging.is_empty() {
+            log::warn!(
+                action = "migrate::prepare";
+                "{LEGACY_STAGING} already holds rows and the 1.x source is still present; \
+                 an earlier extract was interrupted, redoing it",
+            );
+            for id in staging.ids() {
+                staging.remove(id).await.map_err(db_error)?;
+            }
+        }
+
+        copy_out(&concepts, &staging, kind::CONCEPT).await?;
         if collections.contains(PROPOSITIONS) {
+            // Only 1.x rows are staged; a 2.0 collection is left to `Store::open`.
             let probe = Probe::open(db, PROPOSITIONS).await?;
             if is_v1_propositions(&probe.schema()) {
-                return Err(KipError::internal_error(
-                    "migration: legacy propositions remain without concepts or a durable staging copy",
-                ));
+                copy_out(&probe.collection, &staging, kind::PROPOSITION).await?;
+            } else {
+                probe.release(db).await?;
             }
-            probe.release(db).await?;
         }
-        return Ok(());
-    }
+        staging.flush(unix_ms()).await.map_err(db_error)?;
+        staging
+            .add_from(&LegacyRow {
+                _id: 0,
+                kind: kind::EXTRACTED.into(),
+                legacy_id: 0,
+                doc: serde_json::json!({"rows": staging.len()}),
+            })
+            .await
+            .map_err(db_error)?;
+        staging.flush(unix_ms()).await.map_err(db_error)?;
 
-    // Opened without a schema, so the persisted 1.x one stays in force and no
-    // index is built against fields it does not have. Passing the 2.0 schema
-    // here is what fails with a message about a missing `key` field.
-    let probe = Probe::open(db, CONCEPTS).await?;
-    if !is_v1_concepts(&probe.schema()) {
-        return probe.release(db).await;
-    }
-    let concepts = probe.collection;
-
-    log::warn!(
-        action = "migrate::prepare",
-        collection = CONCEPTS;
-        "KIP 1.x layout detected; extracting into {LEGACY_STAGING} before it is replaced",
-    );
-
-    let staging = db
-        .open_or_create_collection(
-            LegacyRow::schema().map_err(|err| {
-                KipError::new(KipErrorCode::InternalError, format!("migration: {err}"))
-            })?,
-            CollectionConfig {
-                name: LEGACY_STAGING.to_string(),
-                description: "KIP 1.x rows, kept verbatim across the 2.0 migration".to_string(),
-            },
-            init_staging,
-        )
-        .await
-        .map_err(db_error)?;
-
-    // A previous attempt may have been interrupted part-way through the copy.
-    // The source is still authoritative at this point — nothing has been
-    // dropped yet — so the honest repair is to redo the copy from scratch
-    // rather than guess which rows made it.
-    if !staging.is_empty() {
+        let staged = staging.len();
         log::warn!(
-            action = "migrate::prepare";
-            "{LEGACY_STAGING} already holds rows and the 1.x source is still present; \
-             an earlier extract was interrupted, redoing it",
+            action = "migrate::prepare",
+            staged = staged;
+            "extracted {staged} KIP 1.x row(s); dropping the 1.x collections",
         );
-        for id in staging.ids() {
-            staging.remove(id).await.map_err(db_error)?;
-        }
-    }
 
-    copy_out(&concepts, &staging, kind::CONCEPT).await?;
-    if collections.contains(PROPOSITIONS) {
-        // Only 1.x rows are staged; a 2.0 collection is left to `Store::open`.
-        let probe = Probe::open(db, PROPOSITIONS).await?;
-        if is_v1_propositions(&probe.schema()) {
-            copy_out(&probe.collection, &staging, kind::PROPOSITION).await?;
-        } else {
-            probe.release(db).await?;
-        }
-    }
-    staging.flush(unix_ms()).await.map_err(db_error)?;
-    staging
-        .add_from(&LegacyRow {
-            _id: 0,
-            kind: kind::EXTRACTED.into(),
-            legacy_id: 0,
-            doc: serde_json::json!({"rows": staging.len()}),
-        })
-        .await
-        .map_err(db_error)?;
-    staging.flush(unix_ms()).await.map_err(db_error)?;
-
-    let staged = staging.len();
-    log::warn!(
-        action = "migrate::prepare",
-        staged = staged;
-        "extracted {staged} KIP 1.x row(s); dropping the 1.x collections",
-    );
-
-    // Only now, with a durable copy on the other side of a flush.
-    drop_legacy_collections(db, &staging).await
+        // Only now, with a durable copy on the other side of a flush.
+        drop_legacy_collections(db, &staging).await
+    })
 }
 
 fn is_v1_propositions(schema: &Schema) -> bool {
@@ -259,51 +263,56 @@ fn is_v1_propositions(schema: &Schema) -> bool {
 
 /// A restart may find either old collection, or already-created v2 ones.
 /// Only remove a confirmed old layout, after durable extraction.
-async fn drop_legacy_collections(
+fn drop_legacy_collections(
     db: &Arc<AndaDB>,
     staging: &Arc<anda_db::collection::Collection>,
-) -> Result<(), KipError> {
-    for name in [CONCEPTS, PROPOSITIONS] {
-        if !db.metadata().collections.contains(name) {
-            continue;
-        }
-        let probe = Probe::open(db, name).await?;
-        let legacy = if name == CONCEPTS {
-            is_v1_concepts(&probe.schema())
-        } else {
-            is_v1_propositions(&probe.schema())
-        };
-        // A migrated database comes through here on every start.
-        if !legacy {
-            probe.release(db).await?;
-            continue;
-        }
-        let collection = probe.collection;
-        // A compatibility checkpoint or storage failure must not cause us
-        // to discard the last surviving copy. Verify each remaining source
-        // row before its collection is irreversibly removed.
-        let kind = if name == CONCEPTS {
-            LegacyKind::Concept
-        } else {
-            LegacyKind::Proposition
-        };
-        let copies: std::collections::BTreeMap<_, _> = rows(staging, kind)
-            .await?
-            .into_iter()
-            .map(|row| (row.legacy_id, row.doc))
-            .collect();
-        for id in collection.ids() {
-            let source: Json = collection.get_as(id).await.map_err(db_error)?;
-            if copies.get(&id) != Some(&source) {
-                return Err(KipError::internal_error(format!(
-                    "migration: refusing to drop {name}; staging has no identical copy of row {id}"
-                )));
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        for name in [CONCEPTS, PROPOSITIONS] {
+            if !db.metadata().collections.contains(name) {
+                continue;
             }
+            let probe = Probe::open(db, name).await?;
+            let legacy = if name == CONCEPTS {
+                is_v1_concepts(&probe.schema())
+            } else {
+                is_v1_propositions(&probe.schema())
+            };
+            // A migrated database comes through here on every start.
+            if !legacy {
+                probe.release(db).await?;
+                continue;
+            }
+            let collection = probe.collection;
+            // A compatibility checkpoint or storage failure must not cause us
+            // to discard the last surviving copy. Verify each remaining source
+            // row before its collection is irreversibly removed.
+            let kind = if name == CONCEPTS {
+                LegacyKind::Concept
+            } else {
+                LegacyKind::Proposition
+            };
+            let copies: std::collections::BTreeMap<_, _> = rows(staging, kind)
+                .await?
+                .into_iter()
+                .map(|row| (row.legacy_id, row.doc))
+                .collect();
+            for id in collection.ids() {
+                let source: Json = collection.get_as(id).await.map_err(db_error)?;
+                if copies.get(&id) != Some(&source) {
+                    return Err(KipError::internal_error(format!(
+                        "migration: refusing to drop {name}; staging has no identical copy of row {id}"
+                    )));
+                }
+            }
+            db.delete_collection(name).await.map_err(db_error)?;
         }
-        db.delete_collection(name).await.map_err(db_error)?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
+
+/// The Concept and Proposition rows of a 1.x layout.
+pub(crate) type LegacyRows = (Vec<LegacyRow>, Vec<LegacyRow>);
 
 /// Reads a live 1.x layout without staging or changing anything.
 ///
@@ -311,33 +320,35 @@ async fn drop_legacy_collections(
 /// staging area: staging is a write, and the whole point of a dry run is that
 /// an operator can point it at a production database and learn what would
 /// happen without that database becoming different for having been asked.
-pub(crate) async fn read_live_v1(
+pub(crate) fn read_live_v1(
     db: &Arc<AndaDB>,
-) -> Result<Option<(Vec<LegacyRow>, Vec<LegacyRow>)>, KipError> {
-    let collections = db.metadata().collections;
-    if !collections.contains(CONCEPTS) {
-        return Ok(None);
-    }
-    let probe = Probe::open(db, CONCEPTS).await?;
-    if !is_v1_concepts(&probe.schema()) {
-        probe.release(db).await?;
-        return Ok(None);
-    }
-    let concepts = probe.collection;
-
-    let mut concept_rows = Vec::new();
-    read_into(&concepts, kind::CONCEPT, &mut concept_rows).await?;
-
-    let mut proposition_rows = Vec::new();
-    if collections.contains(PROPOSITIONS) {
-        let probe = Probe::open(db, PROPOSITIONS).await?;
-        if is_v1_propositions(&probe.schema()) {
-            read_into(&probe.collection, kind::PROPOSITION, &mut proposition_rows).await?;
-        } else {
-            probe.release(db).await?;
+) -> impl Future<Output = Result<Option<LegacyRows>, KipError>> + Send {
+    Box::pin(async move {
+        let collections = db.metadata().collections;
+        if !collections.contains(CONCEPTS) {
+            return Ok(None);
         }
-    }
-    Ok(Some((concept_rows, proposition_rows)))
+        let probe = Probe::open(db, CONCEPTS).await?;
+        if !is_v1_concepts(&probe.schema()) {
+            probe.release(db).await?;
+            return Ok(None);
+        }
+        let concepts = probe.collection;
+
+        let mut concept_rows = Vec::new();
+        read_into(&concepts, kind::CONCEPT, &mut concept_rows).await?;
+
+        let mut proposition_rows = Vec::new();
+        if collections.contains(PROPOSITIONS) {
+            let probe = Probe::open(db, PROPOSITIONS).await?;
+            if is_v1_propositions(&probe.schema()) {
+                read_into(&probe.collection, kind::PROPOSITION, &mut proposition_rows).await?;
+            } else {
+                probe.release(db).await?;
+            }
+        }
+        Ok(Some((concept_rows, proposition_rows)))
+    })
 }
 
 async fn read_into(
@@ -381,17 +392,19 @@ async fn copy_out(
 }
 
 /// Opens the staging collection, or `None` when there is nothing staged.
-pub(crate) async fn open(
+pub(crate) fn open(
     db: &Arc<AndaDB>,
-) -> Result<Option<Arc<anda_db::collection::Collection>>, KipError> {
-    if !db.metadata().collections.contains(LEGACY_STAGING) {
-        return Ok(None);
-    }
-    let staging = db
-        .open_collection(LEGACY_STAGING.to_string(), init_staging)
-        .await
-        .map_err(db_error)?;
-    Ok(Some(staging))
+) -> impl Future<Output = Result<Option<Arc<anda_db::collection::Collection>>, KipError>> + Send {
+    Box::pin(async move {
+        if !db.metadata().collections.contains(LEGACY_STAGING) {
+            return Ok(None);
+        }
+        let staging = db
+            .open_collection(LEGACY_STAGING.to_string(), init_staging)
+            .await
+            .map_err(db_error)?;
+        Ok(Some(staging))
+    })
 }
 
 /// Every staged row of one kind, oldest first.
@@ -424,28 +437,30 @@ pub(crate) async fn rows(
 }
 
 /// Whether phase 3 already finished.
-pub(crate) async fn is_complete(
+pub(crate) fn is_complete(
     staging: &Arc<anda_db::collection::Collection>,
-) -> Result<bool, KipError> {
-    has_marker(staging, kind::MARKER).await
+) -> impl Future<Output = Result<bool, KipError>> + Send {
+    Box::pin(async move { has_marker(staging, kind::MARKER).await })
 }
 
-async fn has_marker(
+fn has_marker(
     staging: &Arc<anda_db::collection::Collection>,
     marker: &str,
-) -> Result<bool, KipError> {
-    let markers: Vec<LegacyRow> = staging
-        .search_as(Query {
-            filter: Some(Filter::Field((
-                "kind".to_string(),
-                RangeQuery::Eq(Fv::Text(marker.to_string())),
-            ))),
-            limit: Some(1),
-            ..Default::default()
-        })
-        .await
-        .map_err(db_error)?;
-    Ok(!markers.is_empty())
+) -> impl Future<Output = Result<bool, KipError>> + Send {
+    Box::pin(async move {
+        let markers: Vec<LegacyRow> = staging
+            .search_as(Query {
+                filter: Some(Filter::Field((
+                    "kind".to_string(),
+                    RangeQuery::Eq(Fv::Text(marker.to_string())),
+                ))),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(!markers.is_empty())
+    })
 }
 
 /// Records that phase 3 finished, so a later restart skips it.

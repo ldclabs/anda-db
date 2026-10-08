@@ -16,116 +16,123 @@ use crate::schema::{Intent, SymbolKind};
 use crate::store::history::CursorFamily;
 
 /// Runs one `DESCRIBE`.
-pub async fn run(cx: &mut Context<'_>, target: &DescribeTarget) -> Result<Answer, KipError> {
-    Ok(match target {
-        DescribeTarget::Protocol => Answer::whole(protocol()),
-        DescribeTarget::Capabilities => Answer::whole(capabilities(
-            &cx.store.host_capabilities(),
-            Some(cx.authority),
-            cx.auth,
-        )),
-        DescribeTarget::Primer { mode } => Answer::whole(primer(cx, mode.as_ref()).await?),
-        DescribeTarget::Space { value } => {
-            let id = match value {
-                Some(scalar) => scalar_str(cx, scalar, "DESCRIBE SPACE")?,
-                None => cx.space.clone(),
-            };
-            Answer::whole(space(cx, &id).await?)
-        }
-        DescribeTarget::SchemaEnvironment { as_of } => {
-            // The environment a past coordinate resolved through, not today's:
-            // reconstructing history under current schema would answer a
-            // question nobody asked (§20.9).
-            if let Some(as_of) = as_of {
-                let seq = cx.resolve_as_of(as_of).await?;
-                let version = cx.store.schema_version_at(&cx.space, seq).await?;
-                let env = cx.store.schema_environment_at(&cx.space, version).await?;
-                let mut answer = schema_environment_of(&env);
-                if let Some(object) = answer.as_object_mut() {
-                    object.insert("snapshot_seq".to_string(), serde_json::json!(seq));
-                }
-                return Ok(Answer::whole(answer));
+pub fn run(
+    cx: &mut Context<'_>,
+    target: &DescribeTarget,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        Ok(match target {
+            DescribeTarget::Protocol => Answer::whole(protocol()),
+            DescribeTarget::Capabilities => Answer::whole(capabilities(
+                &cx.store.host_capabilities(),
+                Some(cx.authority),
+                cx.auth,
+            )),
+            DescribeTarget::Primer { mode } => Answer::whole(primer(cx, mode.as_ref()).await?),
+            DescribeTarget::Space { value } => {
+                let id = match value {
+                    Some(scalar) => scalar_str(cx, scalar, "DESCRIBE SPACE")?,
+                    None => cx.space.clone(),
+                };
+                Answer::whole(space(cx, &id).await?)
             }
-            Answer::whole(schema_environment(cx))
-        }
-        DescribeTarget::Package(scalar) => {
-            let reference = scalar_str(cx, scalar, "DESCRIBE PACKAGE")?;
-            Answer::whole(package(cx, &reference)?)
-        }
-        DescribeTarget::Type(scalar) => Answer::whole(symbol(cx, SymbolKind::ConceptType, scalar)?),
-        DescribeTarget::Predicate(scalar) => {
-            Answer::whole(symbol(cx, SymbolKind::PredicateType, scalar)?)
-        }
-        DescribeTarget::Facet(scalar) => Answer::whole(symbol(cx, SymbolKind::Facet, scalar)?),
-        DescribeTarget::StructuralField(scalar) => {
-            Answer::whole(symbol(cx, SymbolKind::StructuralField, scalar)?)
-        }
-        DescribeTarget::Compatibility { from, to } => {
-            let from = scalar_str(cx, from, "DESCRIBE COMPATIBILITY FROM")?;
-            let to = scalar_str(cx, to, "DESCRIBE COMPATIBILITY TO")?;
-            Answer::whole(compatibility(cx, &from, &to)?)
-        }
-        DescribeTarget::Error(scalar) => {
-            let code = scalar_str(cx, scalar, "DESCRIBE ERROR")?;
-            Answer::whole(error(&code)?)
-        }
-        DescribeTarget::EpistemicPolicy { value } => {
-            let name = match value {
-                Some(scalar) => scalar_str(cx, scalar, "DESCRIBE EPISTEMIC POLICY")?,
-                None => cx.policy.id.clone(),
-            };
-            Answer::whole(policy(cx, &name).await?)
-        }
-        DescribeTarget::Transaction(scalar) => {
-            let tx_id = scalar_str(cx, scalar, "DESCRIBE TRANSACTION")?;
-            Answer::whole(super::history::transaction(cx, &tx_id).await?)
-        }
-        DescribeTarget::TransactionByIdempotencyKey(scalar) => {
-            let key = scalar_str(cx, scalar, "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY")?;
-            Answer::whole(super::history::transaction_by_key(cx, &key).await?)
-        }
-        DescribeTarget::Snapshot { as_of, at_time } => {
-            return super::history::snapshot(cx, as_of.as_ref(), at_time.as_ref()).await;
-        }
-        DescribeTarget::Capsule(scalar) => {
-            let source = scalar_str(cx, scalar, "DESCRIBE CAPSULE")?;
-            Answer::whole(crate::capsule::describe(&source)?)
-        }
-        DescribeTarget::Trust { value } => {
-            cx.authority
-                .authorize(
-                    Permission::ReadGovernanceHistory,
-                    &ResourceContext::default(),
-                    cx.auth,
-                )
-                .into_result()?;
-            let control = cx
-                .store
-                .control_at(&cx.space, "trust", cx.pinned_seq)
-                .await?
-                .ok_or_else(|| {
-                    KipError::new(
-                        KipErrorCode::HistoricalSnapshotUnavailable,
-                        "trust state unavailable",
-                    )
-                })?;
-            let value = match value {
-                Some(v) => {
-                    let subject = scalar_str(cx, v, "DESCRIBE TRUST")?;
-                    serde_json::json!({
-                        "subject": subject,
-                        "weight": control.value["weights"].get(&subject).unwrap_or(&control.value["default_weight"]),
-                    })
+            DescribeTarget::SchemaEnvironment { as_of } => {
+                // The environment a past coordinate resolved through, not today's:
+                // reconstructing history under current schema would answer a
+                // question nobody asked (§20.9).
+                if let Some(as_of) = as_of {
+                    let seq = cx.resolve_as_of(as_of).await?;
+                    let version = cx.store.schema_version_at(&cx.space, seq).await?;
+                    let env = cx.store.schema_environment_at(&cx.space, version).await?;
+                    let mut answer = schema_environment_of(&env);
+                    if let Some(object) = answer.as_object_mut() {
+                        object.insert("snapshot_seq".to_string(), serde_json::json!(seq));
+                    }
+                    return Ok(Answer::whole(answer));
                 }
-                None => control.value.clone(),
-            };
-            Answer::whole(serde_json::json!({
-                "model": "protected-actor-weights-v1",
-                "version": crate::schema::contracts::digest(&control.value)?,
-                "state": value,
-            }))
-        }
-        DescribeTarget::Access { with } => Answer::whole(access(cx, with.as_ref())?),
+                Answer::whole(schema_environment(cx))
+            }
+            DescribeTarget::Package(scalar) => {
+                let reference = scalar_str(cx, scalar, "DESCRIBE PACKAGE")?;
+                Answer::whole(package(cx, &reference)?)
+            }
+            DescribeTarget::Type(scalar) => {
+                Answer::whole(symbol(cx, SymbolKind::ConceptType, scalar)?)
+            }
+            DescribeTarget::Predicate(scalar) => {
+                Answer::whole(symbol(cx, SymbolKind::PredicateType, scalar)?)
+            }
+            DescribeTarget::Facet(scalar) => Answer::whole(symbol(cx, SymbolKind::Facet, scalar)?),
+            DescribeTarget::StructuralField(scalar) => {
+                Answer::whole(symbol(cx, SymbolKind::StructuralField, scalar)?)
+            }
+            DescribeTarget::Compatibility { from, to } => {
+                let from = scalar_str(cx, from, "DESCRIBE COMPATIBILITY FROM")?;
+                let to = scalar_str(cx, to, "DESCRIBE COMPATIBILITY TO")?;
+                Answer::whole(compatibility(cx, &from, &to)?)
+            }
+            DescribeTarget::Error(scalar) => {
+                let code = scalar_str(cx, scalar, "DESCRIBE ERROR")?;
+                Answer::whole(error(&code)?)
+            }
+            DescribeTarget::EpistemicPolicy { value } => {
+                let name = match value {
+                    Some(scalar) => scalar_str(cx, scalar, "DESCRIBE EPISTEMIC POLICY")?,
+                    None => cx.policy.id.clone(),
+                };
+                Answer::whole(policy(cx, &name).await?)
+            }
+            DescribeTarget::Transaction(scalar) => {
+                let tx_id = scalar_str(cx, scalar, "DESCRIBE TRANSACTION")?;
+                Answer::whole(super::history::transaction(cx, &tx_id).await?)
+            }
+            DescribeTarget::TransactionByIdempotencyKey(scalar) => {
+                let key = scalar_str(cx, scalar, "DESCRIBE TRANSACTION BY IDEMPOTENCY KEY")?;
+                Answer::whole(super::history::transaction_by_key(cx, &key).await?)
+            }
+            DescribeTarget::Snapshot { as_of, at_time } => {
+                return super::history::snapshot(cx, as_of.as_ref(), at_time.as_ref()).await;
+            }
+            DescribeTarget::Capsule(scalar) => {
+                let source = scalar_str(cx, scalar, "DESCRIBE CAPSULE")?;
+                Answer::whole(crate::capsule::describe(&source)?)
+            }
+            DescribeTarget::Trust { value } => {
+                cx.authority
+                    .authorize(
+                        Permission::ReadGovernanceHistory,
+                        &ResourceContext::default(),
+                        cx.auth,
+                    )
+                    .into_result()?;
+                let control = cx
+                    .store
+                    .control_at(&cx.space, "trust", cx.pinned_seq)
+                    .await?
+                    .ok_or_else(|| {
+                        KipError::new(
+                            KipErrorCode::HistoricalSnapshotUnavailable,
+                            "trust state unavailable",
+                        )
+                    })?;
+                let value = match value {
+                    Some(v) => {
+                        let subject = scalar_str(cx, v, "DESCRIBE TRUST")?;
+                        serde_json::json!({
+                            "subject": subject,
+                            "weight": control.value["weights"].get(&subject).unwrap_or(&control.value["default_weight"]),
+                        })
+                    }
+                    None => control.value.clone(),
+                };
+                Answer::whole(serde_json::json!({
+                    "model": "protected-actor-weights-v1",
+                    "version": crate::schema::contracts::digest(&control.value)?,
+                    "state": value,
+                }))
+            }
+            DescribeTarget::Access { with } => Answer::whole(access(cx, with.as_ref())?),
+        })
     })
 }
 
@@ -248,66 +255,71 @@ fn string_of(settings: &anda_kip::Map<String, Json>, key: &str) -> String {
 }
 
 /// Runs one `LIST`.
-pub async fn list(cx: &mut Context<'_>, command: &ListCommand) -> Result<Answer, KipError> {
-    let limit = match &command.limit {
-        Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?,
-        None => usize::MAX,
-    };
-    let cursor = match &command.cursor {
-        Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::List)?.offset,
-        None => 0,
-    };
+pub fn list(
+    cx: &mut Context<'_>,
+    command: &ListCommand,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let limit = match &command.limit {
+            Some(scalar) => scalar_usize(cx, scalar, "LIMIT")?,
+            None => usize::MAX,
+        };
+        let cursor = match &command.cursor {
+            Some(scalar) => super::read_cursor(cx, scalar, CursorFamily::List)?.offset,
+            None => 0,
+        };
 
-    let mut truncated = false;
-    let mut items: Vec<Json> = match command.target {
-        ListTarget::Spaces => spaces(cx).await?,
-        ListTarget::SchemaPackages => {
-            let status = match &command.status {
-                Some(scalar) => Some(scalar_str(cx, scalar, "STATUS")?),
-                None => None,
-            };
-            packages(cx, status.as_deref())
-        }
-        ListTarget::Types => symbols(cx, SymbolKind::ConceptType),
-        ListTarget::Predicates => symbols(cx, SymbolKind::PredicateType),
-        ListTarget::Facets => symbols(cx, SymbolKind::Facet),
-        ListTarget::StructuralFields => symbols(cx, SymbolKind::StructuralField),
-        ListTarget::EpistemicPolicies => vec![
-            policy(cx, &Policy::baseline().id).await?,
-            policy(cx, &Policy::forecast().id).await?,
-            policy(cx, &Policy::memory_default().id).await?,
-            policy(cx, &Policy::structural().id).await?,
-        ],
-        ListTarget::Dependents => {
-            let (rows, cut) = dependents(cx, command).await?;
-            truncated = cut;
-            rows
-        }
-    };
+        let mut truncated = false;
+        let mut items: Vec<Json> = match command.target {
+            ListTarget::Spaces => spaces(cx).await?,
+            ListTarget::SchemaPackages => {
+                let status = match &command.status {
+                    Some(scalar) => Some(scalar_str(cx, scalar, "STATUS")?),
+                    None => None,
+                };
+                packages(cx, status.as_deref())
+            }
+            ListTarget::Types => symbols(cx, SymbolKind::ConceptType),
+            ListTarget::Predicates => symbols(cx, SymbolKind::PredicateType),
+            ListTarget::Facets => symbols(cx, SymbolKind::Facet),
+            ListTarget::StructuralFields => symbols(cx, SymbolKind::StructuralField),
+            ListTarget::EpistemicPolicies => vec![
+                policy(cx, &Policy::baseline().id).await?,
+                policy(cx, &Policy::forecast().id).await?,
+                policy(cx, &Policy::memory_default().id).await?,
+                policy(cx, &Policy::structural().id).await?,
+            ],
+            ListTarget::Dependents => {
+                let (rows, cut) = dependents(cx, command).await?;
+                truncated = cut;
+                rows
+            }
+        };
 
-    let total = items.len();
-    items = items.into_iter().skip(cursor).take(limit).collect();
-    let consumed = cursor + items.len();
-    let mut answer = Answer {
-        result: Json::Array(items),
-        next_cursor: super::next_cursor(cx, CursorFamily::List, consumed, total),
-        warnings: Vec::new(),
-    };
-    if truncated {
-        // A `LIST` answer is the row list, so the flag §63.5 asks for travels
-        // beside it as a coded caveat on the operation result.
-        answer.warnings.push(anda_kip::Warning::Coded {
-            code: "truncated".to_string(),
-            message: Some(
-                "the traversal was cut short by an element this Principal may not discover \
-                 (§63.5); the list may be incomplete"
-                    .to_string(),
-            ),
-            details: Some(serde_json::json!({"truncated": true})),
-            extensions: None,
-        });
-    }
-    Ok(answer)
+        let total = items.len();
+        items = items.into_iter().skip(cursor).take(limit).collect();
+        let consumed = cursor + items.len();
+        let mut answer = Answer {
+            result: Json::Array(items),
+            next_cursor: super::next_cursor(cx, CursorFamily::List, consumed, total),
+            warnings: Vec::new(),
+        };
+        if truncated {
+            // A `LIST` answer is the row list, so the flag §63.5 asks for travels
+            // beside it as a coded caveat on the operation result.
+            answer.warnings.push(anda_kip::Warning::Coded {
+                code: "truncated".to_string(),
+                message: Some(
+                    "the traversal was cut short by an element this Principal may not discover \
+                     (§63.5); the list may be incomplete"
+                        .to_string(),
+                ),
+                details: Some(serde_json::json!({"truncated": true})),
+                extensions: None,
+            });
+        }
+        Ok(answer)
+    })
 }
 
 /// How deep a `LIST DEPENDENTS` closure this engine will walk (§63.5).
@@ -345,99 +357,102 @@ pub(crate) const MAX_DEPENDENTS_DEPTH: u64 = 8;
 ///
 /// Reachability is topology, not judgment (§57.5): a listed dependent is not
 /// thereby stale, wrong, or in need of change.
-async fn dependents(
+fn dependents(
     cx: &mut Context<'_>,
     command: &ListCommand,
-) -> Result<(Vec<Json>, bool), KipError> {
-    let Some(operand) = &command.element else {
-        // The grammar requires the operand, so reaching here means an AST
-        // arrived from somewhere that does not.
-        return Err(KipError::invalid_syntax(
-            "LIST DEPENDENTS requires the element whose dependents are listed",
-        ));
-    };
-    let named = scalar_str(cx, operand, "LIST DEPENDENTS")?;
-    let depth = match &command.depth {
-        Some(scalar) => depth_bound(cx, scalar)?,
-        None => 1,
-    };
+) -> impl Future<Output = Result<(Vec<Json>, bool), KipError>> + Send {
+    Box::pin(async move {
+        let Some(operand) = &command.element else {
+            // The grammar requires the operand, so reaching here means an AST
+            // arrived from somewhere that does not.
+            return Err(KipError::invalid_syntax(
+                "LIST DEPENDENTS requires the element whose dependents are listed",
+            ));
+        };
+        let named = scalar_str(cx, operand, "LIST DEPENDENTS")?;
+        let depth = match &command.depth {
+            Some(scalar) => depth_bound(cx, scalar)?,
+            None => 1,
+        };
 
-    let Ok(root) = named.parse::<crate::id::ElementId>() else {
-        return Err(KipError::invalid_identifier(format!(
-            "{named:?} is not an element id"
-        )));
-    };
-    // §30.4: a root this caller may not discover is answered exactly as an
-    // absent one is. Refusing here would turn the command into an existence
-    // oracle for elements the caller cannot read.
-    if cx.load(root).await?.is_none() {
-        return Ok((Vec::new(), false));
-    }
-    // §63.5: traversal does not pass through an element the caller may not
-    // discover, and when that cuts a path short the result says so — without
-    // saying where, which would disclose the element it walked around.
-    let mut truncated = false;
+        let Ok(root) = named.parse::<crate::id::ElementId>() else {
+            return Err(KipError::invalid_identifier(format!(
+                "{named:?} is not an element id"
+            )));
+        };
+        // §30.4: a root this caller may not discover is answered exactly as an
+        // absent one is. Refusing here would turn the command into an existence
+        // oracle for elements the caller cannot read.
+        if cx.load(root).await?.is_none() {
+            return Ok((Vec::new(), false));
+        }
+        // §63.5: traversal does not pass through an element the caller may not
+        // discover, and when that cuts a path short the result says so — without
+        // saying where, which would disclose the element it walked around.
+        let mut truncated = false;
 
-    // Everything below is walked in sorted id order, and each level's frontier
-    // is sorted before the next one runs. Two engines answering the same
-    // question must agree on which Activity first reached a dependent that two
-    // of them produced, or the `via` they report — and the paging that slices
-    // this list — would depend on storage layout.
-    let mut seen: std::collections::BTreeSet<crate::id::ElementId> =
-        std::collections::BTreeSet::from([root]);
-    let mut frontier = vec![root];
-    let mut rows: Vec<Json> = Vec::new();
+        // Everything below is walked in sorted id order, and each level's frontier
+        // is sorted before the next one runs. Two engines answering the same
+        // question must agree on which Activity first reached a dependent that two
+        // of them produced, or the `via` they report — and the paging that slices
+        // this list — would depend on storage layout.
+        let mut seen: std::collections::BTreeSet<crate::id::ElementId> =
+            std::collections::BTreeSet::from([root]);
+        let mut frontier = vec![root];
+        let mut rows: Vec<Json> = Vec::new();
 
-    for distance in 1..=depth {
-        let mut next = std::collections::BTreeSet::new();
-        for source in std::mem::take(&mut frontier) {
-            for activity in activities_consuming(cx, source).await? {
-                // An Activity the caller may not read is not a route: naming it
-                // in `via` would disclose it, and walking through it would
-                // disclose that it exists (§30.4).
-                let Some(crate::store::Element::Activity(row)) = cx.load(activity).await? else {
-                    truncated |= cx.store.contains(activity).await;
-                    continue;
-                };
-                // The outputs are the wide part of the traversal: one Activity
-                // may name any number, and each costs a parse and a load. A
-                // budget that saw only the Activities would let the fan-out run
-                // unbounded, which is the shape a read is supposed to refuse
-                // rather than stall on.
-                cx.charge(row.outputs.len())?;
-                for output in &row.outputs {
-                    let Some(id) = crate::term::Endpoint::from_json(output)
-                        .ok()
-                        .and_then(|endpoint| endpoint.local())
+        for distance in 1..=depth {
+            let mut next = std::collections::BTreeSet::new();
+            for source in std::mem::take(&mut frontier) {
+                for activity in activities_consuming(cx, source).await? {
+                    // An Activity the caller may not read is not a route: naming it
+                    // in `via` would disclose it, and walking through it would
+                    // disclose that it exists (§30.4).
+                    let Some(crate::store::Element::Activity(row)) = cx.load(activity).await?
                     else {
+                        truncated |= cx.store.contains(activity).await;
                         continue;
                     };
-                    // First reach wins, so a dependent is reported at its
-                    // shortest distance and a DAG that converges does not
-                    // report the same element twice.
-                    if !seen.insert(id) {
-                        continue;
+                    // The outputs are the wide part of the traversal: one Activity
+                    // may name any number, and each costs a parse and a load. A
+                    // budget that saw only the Activities would let the fan-out run
+                    // unbounded, which is the shape a read is supposed to refuse
+                    // rather than stall on.
+                    cx.charge(row.outputs.len())?;
+                    for output in &row.outputs {
+                        let Some(id) = crate::term::Endpoint::from_json(output)
+                            .ok()
+                            .and_then(|endpoint| endpoint.local())
+                        else {
+                            continue;
+                        };
+                        // First reach wins, so a dependent is reported at its
+                        // shortest distance and a DAG that converges does not
+                        // report the same element twice.
+                        if !seen.insert(id) {
+                            continue;
+                        }
+                        if cx.load(id).await?.is_none() {
+                            truncated |= cx.store.contains(id).await;
+                            continue;
+                        }
+                        next.insert(id);
+                        rows.push(serde_json::json!({
+                            "id": id.to_string(),
+                            "kind": id.kind.to_string(),
+                            "distance": distance,
+                            "via": {"activity": activity.to_string()},
+                        }));
                     }
-                    if cx.load(id).await?.is_none() {
-                        truncated |= cx.store.contains(id).await;
-                        continue;
-                    }
-                    next.insert(id);
-                    rows.push(serde_json::json!({
-                        "id": id.to_string(),
-                        "kind": id.kind.to_string(),
-                        "distance": distance,
-                        "via": {"activity": activity.to_string()},
-                    }));
                 }
             }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next.into_iter().collect();
         }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next.into_iter().collect();
-    }
-    Ok((rows, truncated))
+        Ok((rows, truncated))
+    })
 }
 
 /// Reads the `DEPTH` bound, capped at [`MAX_DEPENDENTS_DEPTH`].
@@ -995,33 +1010,35 @@ fn error(code: &str) -> Result<Json, KipError> {
     }))
 }
 
-async fn policy(cx: &Context<'_>, name: &str) -> Result<Json, KipError> {
-    let settings = anda_kip::Map::from_iter([("policy".into(), Json::String(name.into()))]);
-    let policy = cx
-        .store
-        .projection_policy_at(&cx.space, cx.pinned_seq, &settings)
-        .await?;
-    Ok(serde_json::json!({
-        "id": policy.id,
-        "version": policy.version,
-        "eligible_modes": policy.modes,
-        "accept_threshold": policy.accept,
-        "material_threshold": policy.material,
-        "unstated_confidence_weight": policy.unstated_confidence,
-        "conflict_set_expansion": policy.expand_conflicts,
-        // §21.10: a structural policy counts root groups and weighs nothing.
-        "structural": policy.structural,
-        // §21.13's ordered precedence rules, when the policy resolves conflicts.
-        "precedence": if policy.precedence {
-            serde_json::json!(["context_specificity", "first_person_testimony", "recency"])
-        } else {
-            Json::Array(Vec::new())
-        },
-        "notes": [
-            "mode gates eligibility and never weights a claim: a mode does not grant trust",
-            "corroboration groups are counted once; repetition is not evidence",
-        ],
-    }))
+fn policy(cx: &Context<'_>, name: &str) -> impl Future<Output = Result<Json, KipError>> + Send {
+    Box::pin(async move {
+        let settings = anda_kip::Map::from_iter([("policy".into(), Json::String(name.into()))]);
+        let policy = cx
+            .store
+            .projection_policy_at(&cx.space, cx.pinned_seq, &settings)
+            .await?;
+        Ok(serde_json::json!({
+            "id": policy.id,
+            "version": policy.version,
+            "eligible_modes": policy.modes,
+            "accept_threshold": policy.accept,
+            "material_threshold": policy.material,
+            "unstated_confidence_weight": policy.unstated_confidence,
+            "conflict_set_expansion": policy.expand_conflicts,
+            // §21.10: a structural policy counts root groups and weighs nothing.
+            "structural": policy.structural,
+            // §21.13's ordered precedence rules, when the policy resolves conflicts.
+            "precedence": if policy.precedence {
+                serde_json::json!(["context_specificity", "first_person_testimony", "recency"])
+            } else {
+                Json::Array(Vec::new())
+            },
+            "notes": [
+                "mode gates eligibility and never weights a claim: a mode does not grant trust",
+                "corroboration groups are counted once; repetition is not evidence",
+            ],
+        }))
+    })
 }
 
 pub(crate) fn scalar_str(

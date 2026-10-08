@@ -179,47 +179,49 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result containing either the new AndaDB instance or an error
-    pub async fn create(
+    pub fn create(
         object_store: Arc<dyn ObjectStore>,
         config: DBConfig,
-    ) -> Result<Self, DBError> {
-        validate_field_name(config.name.as_str())?;
+    ) -> impl Future<Output = Result<Self, DBError>> + Send {
+        Box::pin(async move {
+            validate_field_name(config.name.as_str())?;
 
-        let storage = Storage::connect(
-            config.name.clone(),
-            object_store.clone(),
-            config.storage.clone(),
-        )
-        .await?;
+            let storage = Storage::connect(
+                config.name.clone(),
+                object_store.clone(),
+                config.storage.clone(),
+            )
+            .await?;
 
-        let metadata = DBMetadata {
-            config,
-            collections: BTreeSet::new(),
-            extensions: BTreeMap::new(),
-        };
+            let metadata = DBMetadata {
+                config,
+                collections: BTreeSet::new(),
+                extensions: BTreeMap::new(),
+            };
 
-        match storage.create(Self::METADATA_PATH, &metadata).await {
-            Ok(_) => {
-                // DB created successfully, and store storage metadata
-                storage.store_metadata(0, unix_ms()).await?;
+            match storage.create(Self::METADATA_PATH, &metadata).await {
+                Ok(_) => {
+                    // DB created successfully, and store storage metadata
+                    storage.store_metadata(0, unix_ms()).await?;
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
-        }
 
-        Ok(Self {
-            inner: Arc::new(InnerDB {
-                name: metadata.config.name.clone(),
-                object_store,
-                storage,
-                metadata: RwLock::new(metadata),
-                metadata_version: AtomicU64::new(0),
-                saved_metadata_version: AtomicU64::new(0),
-                metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
-                collections: RwLock::new(BTreeMap::new()),
-                read_only: Arc::new(AtomicBool::new(false)),
-                dropping_collections: RwLock::new(BTreeSet::new()),
-                collection_locks: parking_lot::Mutex::new(HashMap::new()),
-            }),
+            Ok(Self {
+                inner: Arc::new(InnerDB {
+                    name: metadata.config.name.clone(),
+                    object_store,
+                    storage,
+                    metadata: RwLock::new(metadata),
+                    metadata_version: AtomicU64::new(0),
+                    saved_metadata_version: AtomicU64::new(0),
+                    metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    collections: RwLock::new(BTreeMap::new()),
+                    read_only: Arc::new(AtomicBool::new(false)),
+                    dropping_collections: RwLock::new(BTreeSet::new()),
+                    collection_locks: parking_lot::Mutex::new(HashMap::new()),
+                }),
+            })
         })
     }
 
@@ -234,76 +236,80 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result containing either the AndaDB instance or an error
-    pub async fn connect(
+    pub fn connect(
         object_store: Arc<dyn ObjectStore>,
         config: DBConfig,
-    ) -> Result<Self, DBError> {
-        match Self::open(object_store.clone(), config.clone()).await {
-            Ok(db) => Ok(db),
-            Err(DBError::NotFound { .. }) => Self::create(object_store, config).await,
-            Err(err) => Err(err),
-        }
+    ) -> impl Future<Output = Result<Self, DBError>> + Send {
+        Box::pin(async move {
+            match Self::open(object_store.clone(), config.clone()).await {
+                Ok(db) => Ok(db),
+                Err(DBError::NotFound { .. }) => Self::create(object_store, config).await,
+                Err(err) => Err(err),
+            }
+        })
     }
 
     /// Connects to an existing database with the given configuration.
     /// This method fails if the database doesn't exist.
-    pub async fn open(
+    pub fn open(
         object_store: Arc<dyn ObjectStore>,
         config: DBConfig,
-    ) -> Result<Self, DBError> {
-        validate_field_name(config.name.as_str())?;
+    ) -> impl Future<Output = Result<Self, DBError>> + Send {
+        Box::pin(async move {
+            validate_field_name(config.name.as_str())?;
 
-        let storage = Storage::connect(
-            config.name.clone(),
-            object_store.clone(),
-            config.storage.clone(),
-        )
-        .await?;
+            let storage = Storage::connect(
+                config.name.clone(),
+                object_store.clone(),
+                config.storage.clone(),
+            )
+            .await?;
 
-        match storage.fetch::<DBMetadata>(Self::METADATA_PATH).await {
-            Ok((mut metadata, _)) => {
-                // Storage adopts the requested prefix on relocation. Keep
-                // collection paths on that same prefix, never the old name.
-                let relocated = metadata.config.name != config.name;
-                metadata.config.name = config.name.clone();
-                let set_lock = match (&metadata.config.lock, config.lock) {
-                    (None, Some(lock)) => Some(lock),
-                    (Some(existing_lock), lock) => {
-                        if lock.as_ref() != Some(existing_lock) {
-                            return Err(DBError::Storage {
-                                name: config.name.clone(),
-                                source: "Database lock mismatch".into(),
-                            });
+            match storage.fetch::<DBMetadata>(Self::METADATA_PATH).await {
+                Ok((mut metadata, _)) => {
+                    // Storage adopts the requested prefix on relocation. Keep
+                    // collection paths on that same prefix, never the old name.
+                    let relocated = metadata.config.name != config.name;
+                    metadata.config.name = config.name.clone();
+                    let set_lock = match (&metadata.config.lock, config.lock) {
+                        (None, Some(lock)) => Some(lock),
+                        (Some(existing_lock), lock) => {
+                            if lock.as_ref() != Some(existing_lock) {
+                                return Err(DBError::Storage {
+                                    name: config.name.clone(),
+                                    source: "Database lock mismatch".into(),
+                                });
+                            }
+                            None
                         }
-                        None
+                        _ => None,
+                    };
+
+                    let this = Self {
+                        inner: Arc::new(InnerDB {
+                            name: metadata.config.name.clone(),
+                            object_store,
+                            storage,
+                            metadata: RwLock::new(metadata),
+                            metadata_version: AtomicU64::new(u64::from(relocated)),
+                            saved_metadata_version: AtomicU64::new(0),
+                            metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+                            collections: RwLock::new(BTreeMap::new()),
+                            read_only: Arc::new(AtomicBool::new(false)),
+                            dropping_collections: RwLock::new(BTreeSet::new()),
+                            collection_locks: parking_lot::Mutex::new(HashMap::new()),
+                        }),
+                    };
+
+                    if let Some(lock) = set_lock {
+                        this.set_lock(lock).await?;
                     }
-                    _ => None,
-                };
 
-                let this = Self {
-                    inner: Arc::new(InnerDB {
-                        name: metadata.config.name.clone(),
-                        object_store,
-                        storage,
-                        metadata: RwLock::new(metadata),
-                        metadata_version: AtomicU64::new(u64::from(relocated)),
-                        saved_metadata_version: AtomicU64::new(0),
-                        metadata_flush_lock: Arc::new(tokio::sync::Mutex::new(())),
-                        collections: RwLock::new(BTreeMap::new()),
-                        read_only: Arc::new(AtomicBool::new(false)),
-                        dropping_collections: RwLock::new(BTreeSet::new()),
-                        collection_locks: parking_lot::Mutex::new(HashMap::new()),
-                    }),
-                };
-
-                if let Some(lock) = set_lock {
-                    this.set_lock(lock).await?;
+                    Ok(this)
                 }
-
-                Ok(this)
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        }
+        })
     }
 
     /// Returns the name of the database.
@@ -436,53 +442,57 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result indicating success or an error
-    pub async fn close(&self) -> Result<(), DBError> {
-        self.set_read_only(true);
-        // A collection failure does not stop the database metadata flush;
-        // the first such failure is surfaced after it.
-        let collections = self
-            .for_each_collection("AndaDB::close", |collection| async move {
-                collection.close().await
-            })
-            .await;
+    pub fn close(&self) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            self.set_read_only(true);
+            // A collection failure does not stop the database metadata flush;
+            // the first such failure is surfaced after it.
+            let collections = self
+                .for_each_collection("AndaDB::close", |collection| async move {
+                    collection.close().await
+                })
+                .await;
 
-        let start = Instant::now();
-        match self.flush_metadata(unix_ms()).await {
-            Ok(_) => {
-                let elapsed = start.elapsed();
-                log::info!(
-                    action = "AndaDB::close",
-                    database = self.inner.name,
-                    elapsed = elapsed.as_millis();
-                    "Database closed successfully in {elapsed:?}",
-                );
+            let start = Instant::now();
+            match self.flush_metadata(unix_ms()).await {
+                Ok(_) => {
+                    let elapsed = start.elapsed();
+                    log::info!(
+                        action = "AndaDB::close",
+                        database = self.inner.name,
+                        elapsed = elapsed.as_millis();
+                        "Database closed successfully in {elapsed:?}",
+                    );
+                }
+                Err(err) => {
+                    let elapsed = start.elapsed();
+                    log::error!(
+                        action = "AndaDB::close",
+                        database = self.inner.name,
+                        elapsed = elapsed.as_millis();
+                        "Failed to close database: {err:?}",
+                    );
+                    return Err(err);
+                }
             }
-            Err(err) => {
-                let elapsed = start.elapsed();
-                log::error!(
-                    action = "AndaDB::close",
-                    database = self.inner.name,
-                    elapsed = elapsed.as_millis();
-                    "Failed to close database: {err:?}",
-                );
-                return Err(err);
-            }
-        }
-        collections
+            collections
+        })
     }
 
     /// Flushes the database, ensuring all data is written to storage.
     ///
     /// Collections persist nothing while read-only, but changed database
     /// metadata is still written; an unchanged database writes nothing.
-    pub async fn flush(&self) -> Result<(), DBError> {
-        let collections = self
-            .for_each_collection("AndaDB::flush", |collection| async move {
-                collection.flush(unix_ms()).await
-            })
-            .await;
-        self.flush_metadata(unix_ms()).await?;
-        collections
+    pub fn flush(&self) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            let collections = self
+                .for_each_collection("AndaDB::flush", |collection| async move {
+                    collection.flush(unix_ms()).await
+                })
+                .await;
+            self.flush_metadata(unix_ms()).await?;
+            collections
+        })
     }
 
     /// Runs `op` on every registered collection, 8 at a time, logging each
@@ -664,70 +674,74 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result containing either the new Collection or an error
-    pub async fn create_collection<F>(
+    pub fn create_collection<F>(
         &self,
         schema: Schema,
         config: CollectionConfig,
         f: F,
-    ) -> Result<Arc<Collection>, DBError>
+    ) -> impl Future<Output = Result<Arc<Collection>, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        self.ensure_writable()?;
-        self.ensure_creatable(&config.name)?;
+        Box::pin(async move {
+            self.ensure_writable()?;
+            self.ensure_creatable(&config.name)?;
 
-        // Serialize with other lifecycle operations on the same name, so a
-        // concurrent creator is observed through its registration rather
-        // than a storage conflict, and a concurrent delete/close cannot
-        // interleave with the files written here.
-        let _name_guard = self.lock_collection_name(&config.name).await;
-        // Re-check the states that may have changed while waiting for the
-        // lock: a concurrent delete may have started (and not finished), or
-        // a concurrent creator may have registered the name.
-        self.ensure_creatable(&config.name)?;
-        // self.metadata.collections will check it exists again in Collection::create
-        let collection = Collection::create(self.clone(), schema, config).await?;
-        self.register_created_collection(collection, f).await
+            // Serialize with other lifecycle operations on the same name, so a
+            // concurrent creator is observed through its registration rather
+            // than a storage conflict, and a concurrent delete/close cannot
+            // interleave with the files written here.
+            let _name_guard = self.lock_collection_name(&config.name).await;
+            // Re-check the states that may have changed while waiting for the
+            // lock: a concurrent delete may have started (and not finished), or
+            // a concurrent creator may have registered the name.
+            self.ensure_creatable(&config.name)?;
+            // self.metadata.collections will check it exists again in Collection::create
+            let collection = Collection::create(self.clone(), schema, config).await?;
+            self.register_created_collection(collection, f).await
+        })
     }
 
     /// Runs the creation callback on a freshly created collection, registers
     /// it in the database, and persists collection and database metadata.
-    async fn register_created_collection<F>(
+    fn register_created_collection<F>(
         &self,
         mut collection: Collection,
         f: F,
-    ) -> Result<Arc<Collection>, DBError>
+    ) -> impl Future<Output = Result<Arc<Collection>, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        let start = Instant::now();
-        if let Err(err) = f(&mut collection).await {
-            // The collection is not registered in the database metadata yet;
-            // delete the files written so far so the name can be created again.
-            let _ = collection.drop_data().await;
-            return Err(err);
-        }
-        let collection = Arc::new(collection);
-        {
-            let mut collections = self.inner.collections.write();
-            collections.insert(collection.name().to_string(), collection.clone());
-            self.update_metadata(|metadata| {
-                metadata.collections.insert(collection.name().to_string());
-            });
-        }
+        Box::pin(async move {
+            let start = Instant::now();
+            if let Err(err) = f(&mut collection).await {
+                // The collection is not registered in the database metadata yet;
+                // delete the files written so far so the name can be created again.
+                let _ = collection.drop_data().await;
+                return Err(err);
+            }
+            let collection = Arc::new(collection);
+            {
+                let mut collections = self.inner.collections.write();
+                collections.insert(collection.name().to_string(), collection.clone());
+                self.update_metadata(|metadata| {
+                    metadata.collections.insert(collection.name().to_string());
+                });
+            }
 
-        let now = unix_ms();
-        collection.flush(now).await?;
-        self.flush_metadata(now).await?;
-        let elapsed = start.elapsed();
-        log::info!(
-            action = "AndaDB::create_collection",
-            database = self.inner.name,
-            collection = collection.name(),
-            elapsed = elapsed.as_millis();
-            "Create a collection successfully in {elapsed:?}",
-        );
-        Ok(collection)
+            let now = unix_ms();
+            collection.flush(now).await?;
+            self.flush_metadata(now).await?;
+            let elapsed = start.elapsed();
+            log::info!(
+                action = "AndaDB::create_collection",
+                database = self.inner.name,
+                collection = collection.name(),
+                elapsed = elapsed.as_millis();
+                "Create a collection successfully in {elapsed:?}",
+            );
+            Ok(collection)
+        })
     }
 
     /// Opens an existing collection or creates a new one if it doesn't exist.
@@ -759,73 +773,75 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result containing either the Collection or an error
-    pub async fn open_or_create_collection<F>(
+    pub fn open_or_create_collection<F>(
         &self,
         schema: Schema,
         config: CollectionConfig,
         f: F,
-    ) -> Result<Arc<Collection>, DBError>
+    ) -> impl Future<Output = Result<Arc<Collection>, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        self.ensure_writable()?;
-        // A delete tombstone always wins over a cached handle: a cancelled
-        // delete deliberately keeps both until a retry finishes the prefix
-        // removal. Returning the handle first would resurrect an object that
-        // has already entered its irreversible deleting state.
-        self.ensure_not_dropping(&config.name)?;
-
-        {
-            if let Some(collection) = self.inner.collections.read().get(&config.name)
-                && collection.is_active_handle()
-            {
-                Self::ensure_open_handle_schema(collection, Some(&schema))?;
-                return Ok(collection.clone());
-            }
-        }
-
-        if !self.contains_collection(&config.name) {
-            // Serialize with other lifecycle operations on this name: when a
-            // concurrent `open_or_create_collection` of the same name wins
-            // the race, we observe its registration after acquiring the lock
-            // and fall through to the open path instead of failing with
-            // `AlreadyExists`.
-            let name_guard = self.lock_collection_name(&config.name).await;
-            // A delete of this name may have started while we were waiting
-            // for the lock; creating now would resurrect it mid-drop.
+        Box::pin(async move {
+            self.ensure_writable()?;
+            // A delete tombstone always wins over a cached handle: a cancelled
+            // delete deliberately keeps both until a retry finishes the prefix
+            // removal. Returning the handle first would resurrect an object that
+            // has already entered its irreversible deleting state.
             self.ensure_not_dropping(&config.name)?;
-            let exists_now = self.inner.collections.read().contains_key(&config.name)
-                || self.contains_collection(&config.name);
-            if !exists_now {
-                match Collection::create(self.clone(), schema.clone(), config.clone()).await {
-                    Ok(collection) => {
-                        return self.register_created_collection(collection, f).await;
-                    }
-                    Err(err @ DBError::AlreadyExists { .. }) => {
-                        // Lost to a writer outside this process (or leftover
-                        // files from a crashed create): fall back to opening.
-                        // Release the name lock first — the open path below
-                        // re-acquires it for the load from storage.
-                        drop(name_guard);
-                        return match self
-                            .open_collection_with_schema(config.name, Some(schema), f)
-                            .await
-                        {
-                            // Not a registered collection (e.g. leftover files
-                            // from a crashed create): surface the original
-                            // AlreadyExists so the caller can clean up with
-                            // `delete_collection`.
-                            Err(DBError::NotFound { .. }) => Err(err),
-                            other => other,
-                        };
-                    }
-                    Err(err) => return Err(err),
+
+            {
+                if let Some(collection) = self.inner.collections.read().get(&config.name)
+                    && collection.is_active_handle()
+                {
+                    Self::ensure_open_handle_schema(collection, Some(&schema))?;
+                    return Ok(collection.clone());
                 }
             }
-        }
 
-        self.open_collection_with_schema(config.name, Some(schema), f)
-            .await
+            if !self.contains_collection(&config.name) {
+                // Serialize with other lifecycle operations on this name: when a
+                // concurrent `open_or_create_collection` of the same name wins
+                // the race, we observe its registration after acquiring the lock
+                // and fall through to the open path instead of failing with
+                // `AlreadyExists`.
+                let name_guard = self.lock_collection_name(&config.name).await;
+                // A delete of this name may have started while we were waiting
+                // for the lock; creating now would resurrect it mid-drop.
+                self.ensure_not_dropping(&config.name)?;
+                let exists_now = self.inner.collections.read().contains_key(&config.name)
+                    || self.contains_collection(&config.name);
+                if !exists_now {
+                    match Collection::create(self.clone(), schema.clone(), config.clone()).await {
+                        Ok(collection) => {
+                            return self.register_created_collection(collection, f).await;
+                        }
+                        Err(err @ DBError::AlreadyExists { .. }) => {
+                            // Lost to a writer outside this process (or leftover
+                            // files from a crashed create): fall back to opening.
+                            // Release the name lock first — the open path below
+                            // re-acquires it for the load from storage.
+                            drop(name_guard);
+                            return match self
+                                .open_collection_with_schema(config.name, Some(schema), f)
+                                .await
+                            {
+                                // Not a registered collection (e.g. leftover files
+                                // from a crashed create): surface the original
+                                // AlreadyExists so the caller can clean up with
+                                // `delete_collection`.
+                                Err(DBError::NotFound { .. }) => Err(err),
+                                other => other,
+                            };
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+
+            self.open_collection_with_schema(config.name, Some(schema), f)
+                .await
+        })
     }
 
     /// Opens an existing collection.
@@ -847,114 +863,120 @@ impl AndaDB {
     ///
     /// # Returns
     /// A Result containing either the Collection or an error
-    pub async fn open_collection<F>(&self, name: String, f: F) -> Result<Arc<Collection>, DBError>
+    pub fn open_collection<F>(
+        &self,
+        name: String,
+        f: F,
+    ) -> impl Future<Output = Result<Arc<Collection>, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        self.open_collection_with_schema(name, None, f).await
+        Box::pin(async move { self.open_collection_with_schema(name, None, f).await })
     }
 
     /// Opens an existing collection, upgrading its schema if the provided schema
     /// has a higher version than the stored one.
-    async fn open_collection_with_schema<F>(
+    fn open_collection_with_schema<F>(
         &self,
         name: String,
         schema: Option<Schema>,
         f: F,
-    ) -> Result<Arc<Collection>, DBError>
+    ) -> impl Future<Output = Result<Arc<Collection>, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        self.ensure_not_dropping(&name)?;
-        {
-            if let Some(collection) = self.inner.collections.read().get(&name)
-                && collection.is_active_handle()
+        Box::pin(async move {
+            self.ensure_not_dropping(&name)?;
             {
-                Self::ensure_open_handle_schema(collection, schema.as_ref())?;
-                return Ok(collection.clone());
+                if let Some(collection) = self.inner.collections.read().get(&name)
+                    && collection.is_active_handle()
+                {
+                    Self::ensure_open_handle_schema(collection, schema.as_ref())?;
+                    return Ok(collection.clone());
+                }
             }
-        }
-        self.ensure_registered(&name)?;
+            self.ensure_registered(&name)?;
 
-        // Load from storage under the per-name lifecycle lock: a concurrent
-        // `close_collection` may still be flushing this collection's state
-        // (its index files use overwrite semantics), and loading before that
-        // finishes would create a second writable instance whose writes the
-        // close would clobber. The lock also serializes with create/delete.
-        let _name_guard = self.lock_collection_name(&name).await;
-        // Re-check the fast paths after acquiring the lock: a concurrent
-        // open may have registered the collection while we waited, or a
-        // delete may have started/completed.
-        self.ensure_not_dropping(&name)?;
+            // Load from storage under the per-name lifecycle lock: a concurrent
+            // `close_collection` may still be flushing this collection's state
+            // (its index files use overwrite semantics), and loading before that
+            // finishes would create a second writable instance whose writes the
+            // close would clobber. The lock also serializes with create/delete.
+            let _name_guard = self.lock_collection_name(&name).await;
+            // Re-check the fast paths after acquiring the lock: a concurrent
+            // open may have registered the collection while we waited, or a
+            // delete may have started/completed.
+            self.ensure_not_dropping(&name)?;
 
-        // A cancelled close deliberately leaves its retiring handle in the
-        // registry. Finish its drain/flush under the same per-name lock before
-        // loading a fresh generation, then remove only that exact Arc.
-        let retiring = { self.inner.collections.read().get(&name).cloned() };
-        if let Some(collection) = retiring {
-            if collection.is_active_handle() {
-                Self::ensure_open_handle_schema(&collection, schema.as_ref())?;
-                return Ok(collection);
+            // A cancelled close deliberately leaves its retiring handle in the
+            // registry. Finish its drain/flush under the same per-name lock before
+            // loading a fresh generation, then remove only that exact Arc.
+            let retiring = { self.inner.collections.read().get(&name).cloned() };
+            if let Some(collection) = retiring {
+                if collection.is_active_handle() {
+                    Self::ensure_open_handle_schema(&collection, schema.as_ref())?;
+                    return Ok(collection);
+                }
+                if collection.is_poisoned() {
+                    // A poisoned handle is treated like a crashed process: its
+                    // in-memory state must not be flushed. Wait for in-flight
+                    // operations to drain, drop the handle, and let the fresh
+                    // load below run the reopen recovery path (mutation-intent
+                    // replay plus the repair scan).
+                    let _drain = collection.drain_operations().await;
+                } else {
+                    collection.close().await?;
+                }
+                let mut collections = self.inner.collections.write();
+                if collections
+                    .get(&name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &collection))
+                {
+                    collections.remove(&name);
+                }
             }
-            if collection.is_poisoned() {
-                // A poisoned handle is treated like a crashed process: its
-                // in-memory state must not be flushed. Wait for in-flight
-                // operations to drain, drop the handle, and let the fresh
-                // load below run the reopen recovery path (mutation-intent
-                // replay plus the repair scan).
-                let _drain = collection.drain_operations().await;
-            } else {
-                collection.close().await?;
-            }
-            let mut collections = self.inner.collections.write();
-            if collections
-                .get(&name)
-                .is_some_and(|current| Arc::ptr_eq(current, &collection))
+            self.ensure_registered(&name)?;
+
+            let collection = Collection::open(self.clone(), name, schema, f).await?;
+            let collection = Arc::new(collection);
             {
-                collections.remove(&name);
+                // A concurrent open of the same collection may have won the race
+                // while we were loading. Keep the registered instance as the single
+                // source of truth: two live instances would maintain divergent
+                // in-memory state (doc id bitmap, indexes) over the same storage.
+                let mut collections = self.inner.collections.write();
+                if let Some(existing) = collections.get(collection.name()) {
+                    return Ok(existing.clone());
+                }
+                // Re-validate against a concurrent `delete_collection` that
+                // completed while `Collection::open` was loading: registering now
+                // would resurrect a "zombie" handle whose storage prefix has been
+                // (or is being) deleted, and whose future flushes would write
+                // objects back under the deleted prefix.
+                if self
+                    .inner
+                    .dropping_collections
+                    .read()
+                    .contains(collection.name())
+                    || !self.contains_collection(collection.name())
+                {
+                    return Err(DBError::NotFound {
+                        name: collection.name().to_string(),
+                        path: self.inner.name.clone(),
+                        source: "collection was deleted while being opened".into(),
+                        _id: 0,
+                    });
+                }
+                collections.insert(collection.name().to_string(), collection.clone());
             }
-        }
-        self.ensure_registered(&name)?;
-
-        let collection = Collection::open(self.clone(), name, schema, f).await?;
-        let collection = Arc::new(collection);
-        {
-            // A concurrent open of the same collection may have won the race
-            // while we were loading. Keep the registered instance as the single
-            // source of truth: two live instances would maintain divergent
-            // in-memory state (doc id bitmap, indexes) over the same storage.
-            let mut collections = self.inner.collections.write();
-            if let Some(existing) = collections.get(collection.name()) {
-                return Ok(existing.clone());
+            let now = unix_ms();
+            // A read-only open may replay recovery state in memory for correct
+            // reads, but must not persist it or let the callback mutate storage.
+            if !self.is_read_only() {
+                collection.flush(now).await?;
             }
-            // Re-validate against a concurrent `delete_collection` that
-            // completed while `Collection::open` was loading: registering now
-            // would resurrect a "zombie" handle whose storage prefix has been
-            // (or is being) deleted, and whose future flushes would write
-            // objects back under the deleted prefix.
-            if self
-                .inner
-                .dropping_collections
-                .read()
-                .contains(collection.name())
-                || !self.contains_collection(collection.name())
-            {
-                return Err(DBError::NotFound {
-                    name: collection.name().to_string(),
-                    path: self.inner.name.clone(),
-                    source: "collection was deleted while being opened".into(),
-                    _id: 0,
-                });
-            }
-            collections.insert(collection.name().to_string(), collection.clone());
-        }
-        let now = unix_ms();
-        // A read-only open may replay recovery state in memory for correct
-        // reads, but must not persist it or let the callback mutate storage.
-        if !self.is_read_only() {
-            collection.flush(now).await?;
-        }
-        Ok(collection)
+            Ok(collection)
+        })
     }
 
     /// Closes an open collection and removes it from the database's in-memory
@@ -981,20 +1003,22 @@ impl AndaDB {
     /// retiring the same handle before loading a fresh generation.
     ///
     /// Returns `Ok(())` when the collection is not currently open.
-    pub async fn close_collection(&self, name: &str) -> Result<(), DBError> {
-        let _name_guard = self.lock_collection_name(name).await;
-        let collection = { self.inner.collections.read().get(name).cloned() };
-        if let Some(collection) = collection {
-            collection.close().await?;
-            let mut collections = self.inner.collections.write();
-            if collections
-                .get(name)
-                .is_some_and(|current| Arc::ptr_eq(current, &collection))
-            {
-                collections.remove(name);
+    pub fn close_collection(&self, name: &str) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            let _name_guard = self.lock_collection_name(name).await;
+            let collection = { self.inner.collections.read().get(name).cloned() };
+            if let Some(collection) = collection {
+                collection.close().await?;
+                let mut collections = self.inner.collections.write();
+                if collections
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &collection))
+                {
+                    collections.remove(name);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Deletes a collection's metadata, cached instance, and storage prefix.
@@ -1012,74 +1036,83 @@ impl AndaDB {
     /// the prefix is listed: new mutations are rejected and operations that
     /// already passed admission are drained, so an old `Arc<Collection>`
     /// cannot recreate residual objects after deletion returns.
-    pub async fn delete_collection(&self, name: &str) -> Result<(), DBError> {
-        self.ensure_writable()?;
+    pub fn delete_collection(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            self.ensure_writable()?;
 
-        // The name is used to build the storage prefix below.
-        validate_field_name(name)?;
+            // The name is used to build the storage prefix below.
+            validate_field_name(name)?;
 
-        let _name_guard = self.lock_collection_name(name).await;
+            let _name_guard = self.lock_collection_name(name).await;
 
-        // Publish the tombstone before touching durable metadata. Open/create
-        // fast paths consult it before the registry, and a cancelled future
-        // leaves it in place for a later retry to take over.
-        self.inner
-            .dropping_collections
-            .write()
-            .insert(name.to_string());
-        let collection = { self.inner.collections.read().get(name).cloned() };
-        if let Some(collection) = &collection {
-            collection.begin_delete()?;
-        }
+            // Publish the tombstone before touching durable metadata. Open/create
+            // fast paths consult it before the registry, and a cancelled future
+            // leaves it in place for a later retry to take over.
+            self.inner
+                .dropping_collections
+                .write()
+                .insert(name.to_string());
+            let collection = { self.inner.collections.read().get(name).cloned() };
+            if let Some(collection) = &collection {
+                collection.begin_delete()?;
+            }
 
-        // Always persist the current no-name snapshot, including on a retry
-        // where an earlier cancelled call already removed it from memory but
-        // may not have completed the object-store PUT: the version bump
-        // below is claimed only by a PUT that succeeded, so the retry's
-        // flush writes again.
-        self.update_metadata(|metadata| {
-            metadata.collections.remove(name);
-        });
-        self.flush_metadata(unix_ms()).await?;
+            // Always persist the current no-name snapshot, including on a retry
+            // where an earlier cancelled call already removed it from memory but
+            // may not have completed the object-store PUT: the version bump
+            // below is claimed only by a PUT that succeeded, so the retry's
+            // flush writes again.
+            self.update_metadata(|metadata| {
+                metadata.collections.remove(name);
+            });
+            self.flush_metadata(unix_ms()).await?;
 
-        // Keep a registered handle reachable until its drain and prefix drop
-        // succeed. If this await is cancelled, both handle and tombstone stay
-        // available and no fresh writer can open over the same prefix.
-        let drop_result = match &collection {
-            Some(collection) => collection.drop_data().await,
-            None => {
-                let base_path = object_store::path::Path::from(self.name()).join(name);
-                let storage_config = { self.inner.metadata.read().config.storage.clone() };
-                match Storage::connect(base_path.to_string(), self.object_store(), storage_config)
+            // Keep a registered handle reachable until its drain and prefix drop
+            // succeed. If this await is cancelled, both handle and tombstone stay
+            // available and no fresh writer can open over the same prefix.
+            let drop_result = match &collection {
+                Some(collection) => collection.drop_data().await,
+                None => {
+                    let base_path = object_store::path::Path::from(self.name()).join(name);
+                    let storage_config = { self.inner.metadata.read().config.storage.clone() };
+                    match Storage::connect(
+                        base_path.to_string(),
+                        self.object_store(),
+                        storage_config,
+                    )
                     .await
+                    {
+                        Ok(storage) => storage.drop_data().await,
+                        Err(err) => Err(err),
+                    }
+                }
+            };
+
+            if let Err(err) = drop_result {
+                log::error!(
+                    action = "AndaDB::delete_collection",
+                    database = self.inner.name,
+                    collection = name;
+                    "Failed to drop collection data: {err:?}",
+                );
+                return Err(err);
+            }
+
+            if let Some(collection) = collection {
+                let mut collections = self.inner.collections.write();
+                if collections
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &collection))
                 {
-                    Ok(storage) => storage.drop_data().await,
-                    Err(err) => Err(err),
+                    collections.remove(name);
                 }
             }
-        };
-
-        if let Err(err) = drop_result {
-            log::error!(
-                action = "AndaDB::delete_collection",
-                database = self.inner.name,
-                collection = name;
-                "Failed to drop collection data: {err:?}",
-            );
-            return Err(err);
-        }
-
-        if let Some(collection) = collection {
-            let mut collections = self.inner.collections.write();
-            if collections
-                .get(name)
-                .is_some_and(|current| Arc::ptr_eq(current, &collection))
-            {
-                collections.remove(name);
-            }
-        }
-        self.inner.dropping_collections.write().remove(name);
-        Ok(())
+            self.inner.dropping_collections.write().remove(name);
+            Ok(())
+        })
     }
 
     async fn set_lock(&self, lock: ByteBufB64) -> Result<(), DBError> {

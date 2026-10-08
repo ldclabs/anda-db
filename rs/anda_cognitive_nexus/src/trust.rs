@@ -136,43 +136,45 @@ pub(crate) fn weight(
     Ok(selected.map(|(_, v)| v).unwrap_or(fallback))
 }
 
-async fn validate_references(
+fn validate_references(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
     configuration: &TrustConfiguration,
-) -> Result<(), KipError> {
-    configuration.validate()?;
-    let env = session.nexus.store.schema_environment(space).await?;
-    for rule in &configuration.rules {
-        for reference in std::iter::once(&rule.actor_ref).chain(rule.context_ref.iter()) {
-            let id = crate::ElementId::parse_kind(reference, anda_kip::ElementKind::Concept)?;
-            let row = session.nexus.store.get_element(id).await?;
-            if row.space() != space || id.to_string() != *reference {
-                return Err(KipError::not_found_or_not_visible(
-                    "trust context unavailable",
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        configuration.validate()?;
+        let env = session.nexus.store.schema_environment(space).await?;
+        for rule in &configuration.rules {
+            for reference in std::iter::once(&rule.actor_ref).chain(rule.context_ref.iter()) {
+                let id = crate::ElementId::parse_kind(reference, anda_kip::ElementKind::Concept)?;
+                let row = session.nexus.store.get_element(id).await?;
+                if row.space() != space || id.to_string() != *reference {
+                    return Err(KipError::not_found_or_not_visible(
+                        "trust context unavailable",
+                    ));
+                }
+                authority
+                    .authorize(
+                        Permission::Read,
+                        &ResourceContext::of_element(&row),
+                        &session.auth,
+                    )
+                    .into_result()?;
+            }
+            if let Some(predicate) = &rule.predicate_ref
+                && env
+                    .resolve_symbol(SymbolKind::PredicateType, predicate, Intent::Read)?
+                    .to_string()
+                    != *predicate
+            {
+                return Err(invalid(
+                    "trust predicates must use their exact schema references",
                 ));
             }
-            authority
-                .authorize(
-                    Permission::Read,
-                    &ResourceContext::of_element(&row),
-                    &session.auth,
-                )
-                .into_result()?;
         }
-        if let Some(predicate) = &rule.predicate_ref
-            && env
-                .resolve_symbol(SymbolKind::PredicateType, predicate, Intent::Read)?
-                .to_string()
-                != *predicate
-        {
-            return Err(invalid(
-                "trust predicates must use their exact schema references",
-            ));
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 impl Session {
@@ -207,124 +209,131 @@ impl Session {
     /// Commit the exact proposed configuration, provenance and Governance audit
     /// in one redo plan. ManageTrust remains necessary; no Create permission is
     /// implied or needed merely to record the native Governance audit.
-    pub async fn apply_trust_calibration(
+    pub fn apply_trust_calibration(
         &self,
         space: &str,
         expected: u64,
         proposal: ArtifactPin,
         operation_key: &str,
-    ) -> Result<Json, KipError> {
-        if operation_key.is_empty() || operation_key.len() > 256 {
-            return Err(invalid("bounded trust operation key required"));
-        }
-        self.governed(space, Permission::ManageTrust, async || {
-            let store = &self.nexus.store;
-            let authority = self.effective_authority(space).await?;
-            let (content, sources) = store
-                .authorized_artifact(space, &proposal.artifact_ref, &authority, &self.auth)
-                .await?;
-            if digest(&content)? != proposal.content_digest {
-                return Err(invalid("proposal digest mismatch"));
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            if operation_key.is_empty() || operation_key.len() > 256 {
+                return Err(invalid("bounded trust operation key required"));
             }
-            let proposed: TrustCalibrationProposal =
-                serde_json::from_value(content).map_err(|_| invalid("invalid trust proposal"))?;
-            if proposed.format != "nexus:trust-calibration-v1"
-                || proposed.space_id != space
-                || proposed.expected_version != expected
-                || proposed.evidence_refs.is_empty()
-                || proposed.evidence_refs.len() > 128
-                || proposed
-                    .uncertainty
-                    .as_object()
-                    .is_none_or(|v| v.is_empty())
-            {
-                return Err(invalid(
-                    "trust calibration needs scope, evidence and explicit uncertainty",
-                ));
-            }
-            validate_references(self, &authority, space, &proposed.configuration).await?;
-            let (method, _) = store
-                .authorized_artifact(space, &proposed.method.artifact_ref, &authority, &self.auth)
-                .await?;
-            if digest(&method)? != proposed.method.content_digest {
-                return Err(invalid("calibration method digest mismatch"));
-            }
-            let mut evidence = BTreeSet::new();
-            for reference in &proposed.evidence_refs {
-                if !evidence.insert(reference) || !sources.contains(reference) {
+            self.governed(space, Permission::ManageTrust, async || {
+                let store = &self.nexus.store;
+                let authority = self.effective_authority(space).await?;
+                let (content, sources) = store
+                    .authorized_artifact(space, &proposal.artifact_ref, &authority, &self.auth)
+                    .await?;
+                if digest(&content)? != proposal.content_digest {
+                    return Err(invalid("proposal digest mismatch"));
+                }
+                let proposed: TrustCalibrationProposal = serde_json::from_value(content)
+                    .map_err(|_| invalid("invalid trust proposal"))?;
+                if proposed.format != "nexus:trust-calibration-v1"
+                    || proposed.space_id != space
+                    || proposed.expected_version != expected
+                    || proposed.evidence_refs.is_empty()
+                    || proposed.evidence_refs.len() > 128
+                    || proposed
+                        .uncertainty
+                        .as_object()
+                        .is_none_or(|v| v.is_empty())
+                {
                     return Err(invalid(
-                        "proposal must inherit every independent evidence material reference",
+                        "trust calibration needs scope, evidence and explicit uncertainty",
                     ));
                 }
-                let row = store.get_element(reference.parse()?).await?;
-                let Element::Evidence(record) = &row else {
-                    return Err(invalid("calibration evidence must be Evidence"));
-                };
-                if row.space() != space
-                    || record.status == "corrected"
-                    || row.state() != crate::store::rows::state::ACTIVE
-                {
-                    return Err(invalid("calibration evidence is no longer eligible"));
-                }
-                authority
-                    .authorize(
-                        Permission::Read,
-                        &ResourceContext::of_element(&row),
+                validate_references(self, &authority, space, &proposed.configuration).await?;
+                let (method, _) = store
+                    .authorized_artifact(
+                        space,
+                        &proposed.method.artifact_ref,
+                        &authority,
                         &self.auth,
                     )
-                    .into_result()?;
-            }
-            let identity = json!({"operation":"apply_trust_calibration","key":operation_key});
-            let key = crate::attention::request_key(&self.auth.principal_id, &identity)?;
-            let request_digest = digest(&json!({"expected":expected,"proposal":proposal}))?;
-            if let Some(result) =
-                crate::attention::replay(store, space, &key, &request_digest).await?
-            {
-                return Ok(result);
-            }
-            let mut tx = Transaction::begin(
-                store,
-                space,
-                json!({"principal_id":self.auth.principal_id}),
-                false,
-                authority,
-                (*self.auth).clone(),
-            )
-            .await?;
-            let mut value = json!(proposed.configuration);
-            value["calibration"] = json!({
-                "proposal": proposal,
-                "method": proposed.method,
-                "evidence_refs": proposed.evidence_refs,
-            });
-            crate::attention::stage_control(store, &mut tx, "trust", expected, "trust", value)
+                    .await?;
+                if digest(&method)? != proposed.method.content_digest {
+                    return Err(invalid("calibration method digest mismatch"));
+                }
+                let mut evidence = BTreeSet::new();
+                for reference in &proposed.evidence_refs {
+                    if !evidence.insert(reference) || !sources.contains(reference) {
+                        return Err(invalid(
+                            "proposal must inherit every independent evidence material reference",
+                        ));
+                    }
+                    let row = store.get_element(reference.parse()?).await?;
+                    let Element::Evidence(record) = &row else {
+                        return Err(invalid("calibration evidence must be Evidence"));
+                    };
+                    if row.space() != space
+                        || record.status == "corrected"
+                        || row.state() != crate::store::rows::state::ACTIVE
+                    {
+                        return Err(invalid("calibration evidence is no longer eligible"));
+                    }
+                    authority
+                        .authorize(
+                            Permission::Read,
+                            &ResourceContext::of_element(&row),
+                            &self.auth,
+                        )
+                        .into_result()?;
+                }
+                let identity = json!({"operation":"apply_trust_calibration","key":operation_key});
+                let key = crate::attention::request_key(&self.auth.principal_id, &identity)?;
+                let request_digest = digest(&json!({"expected":expected,"proposal":proposal}))?;
+                if let Some(result) =
+                    crate::attention::replay(store, space, &key, &request_digest).await?
+                {
+                    return Ok(result);
+                }
+                let mut tx = Transaction::begin(
+                    store,
+                    space,
+                    json!({"principal_id":self.auth.principal_id}),
+                    false,
+                    authority,
+                    (*self.auth).clone(),
+                )
                 .await?;
-            tx.defer_governance_audit(crate::governance::store::MutationEntry {
-                at: tx.cx.at.clone(),
-                space_id: space.into(),
-                principal_id: self.auth.principal_id.clone(),
-                operation: "apply_trust_calibration",
-                resource: "trust".into(),
-                record: json!({
+                let mut value = json!(proposed.configuration);
+                value["calibration"] = json!({
                     "proposal": proposal,
                     "method": proposed.method,
-                    "before_version": expected,
-                    "after_version": expected+1,
-                }),
-            });
-            crate::attention::commit(
-                store,
-                tx,
-                key,
-                request_digest,
-                json!({
-                    "version": expected+1,
-                    "proposal": proposal,
-                    "audit_operation": "apply_trust_calibration",
-                }),
-            )
+                    "evidence_refs": proposed.evidence_refs,
+                });
+                crate::attention::stage_control(store, &mut tx, "trust", expected, "trust", value)
+                    .await?;
+                tx.defer_governance_audit(crate::governance::store::MutationEntry {
+                    at: tx.cx.at.clone(),
+                    space_id: space.into(),
+                    principal_id: self.auth.principal_id.clone(),
+                    operation: "apply_trust_calibration",
+                    resource: "trust".into(),
+                    record: json!({
+                        "proposal": proposal,
+                        "method": proposed.method,
+                        "before_version": expected,
+                        "after_version": expected+1,
+                    }),
+                });
+                crate::attention::commit(
+                    store,
+                    tx,
+                    key,
+                    request_digest,
+                    json!({
+                        "version": expected+1,
+                        "proposal": proposal,
+                        "audit_operation": "apply_trust_calibration",
+                    }),
+                )
+                .await
+            })
             .await
         })
-        .await
     }
 }

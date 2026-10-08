@@ -11,79 +11,81 @@ impl Collection {
     ///
     /// # Returns
     /// A new Collection instance or an error if creation fails
-    pub(crate) async fn create(
+    pub(crate) fn create(
         db: AndaDB,
         schema: Schema,
         config: CollectionConfig,
-    ) -> Result<Self, DBError> {
-        validate_field_name(config.name.as_str())?;
+    ) -> impl Future<Output = Result<Self, DBError>> + Send {
+        Box::pin(async move {
+            validate_field_name(config.name.as_str())?;
 
-        let base_path = Path::from(db.name()).join(config.name.as_str());
-        let db_metadata = db.metadata();
-        if db_metadata.collections.contains(&config.name) {
-            return Err(DBError::AlreadyExists {
-                name: config.name,
-                path: base_path.to_string(),
-                source: "".into(),
-                _id: 0,
-            });
-        }
+            let base_path = Path::from(db.name()).join(config.name.as_str());
+            let db_metadata = db.metadata();
+            if db_metadata.collections.contains(&config.name) {
+                return Err(DBError::AlreadyExists {
+                    name: config.name,
+                    path: base_path.to_string(),
+                    source: "".into(),
+                    _id: 0,
+                });
+            }
 
-        let storage = Storage::connect(
-            base_path.to_string(),
-            db.object_store(),
-            db_metadata.config.storage.clone(),
-        )
-        .await?;
-        let stats = CollectionStats {
-            version: 1,
-            ..Default::default()
-        };
-        let metadata = CollectionMetadata {
-            config: config.clone(),
-            schema: schema.clone(),
-            btree_indexes: BTreeMap::new(),
-            bm25_indexes: BTreeMap::new(),
-            hnsw_indexes: BTreeMap::new(),
-            stats,
-            extensions: BTreeMap::new(),
-        };
+            let storage = Storage::connect(
+                base_path.to_string(),
+                db.object_store(),
+                db_metadata.config.storage.clone(),
+            )
+            .await?;
+            let stats = CollectionStats {
+                version: 1,
+                ..Default::default()
+            };
+            let metadata = CollectionMetadata {
+                config: config.clone(),
+                schema: schema.clone(),
+                btree_indexes: BTreeMap::new(),
+                bm25_indexes: BTreeMap::new(),
+                hnsw_indexes: BTreeMap::new(),
+                stats,
+                extensions: BTreeMap::new(),
+            };
 
-        let metadata_version = storage.create(Self::METADATA_PATH, &metadata).await?;
-        let ids_data = Treemap::new().serialize::<Portable>();
-        let ids_version = match storage.create(Self::IDS_PATH, &ids_data).await {
-            Ok(ver) => ver,
-            Err(err) => {
-                // Remove the metadata object written above, otherwise the
-                // half-created collection blocks re-creation under this name.
+            let metadata_version = storage.create(Self::METADATA_PATH, &metadata).await?;
+            let ids_data = Treemap::new().serialize::<Portable>();
+            let ids_version = match storage.create(Self::IDS_PATH, &ids_data).await {
+                Ok(ver) => ver,
+                Err(err) => {
+                    // Remove the metadata object written above, otherwise the
+                    // half-created collection blocks re-creation under this name.
+                    let _ = storage.delete(Self::METADATA_PATH).await;
+                    return Err(err);
+                }
+            };
+
+            // Created successfully; publish the storage metadata. A failure here
+            // must not leave the two objects behind either: nothing registers the
+            // collection, and its name would then be blocked by `AlreadyExists`
+            // on every later create.
+            if let Err(err) = storage.store_metadata(0, unix_ms()).await {
+                let _ = storage.delete(Self::IDS_PATH).await;
                 let _ = storage.delete(Self::METADATA_PATH).await;
                 return Err(err);
             }
-        };
 
-        // Created successfully; publish the storage metadata. A failure here
-        // must not leave the two objects behind either: nothing registers the
-        // collection, and its name would then be blocked by `AlreadyExists`
-        // on every later create.
-        if let Err(err) = storage.store_metadata(0, unix_ms()).await {
-            let _ = storage.delete(Self::IDS_PATH).await;
-            let _ = storage.delete(Self::METADATA_PATH).await;
-            return Err(err);
-        }
-
-        Ok(Self::from_snapshot(
-            &db,
-            config.name,
-            storage,
-            CollectionSnapshot {
-                metadata,
-                metadata_version,
-                ids: Treemap::new(),
-                ids_version,
-                alloc_watermark: 0,
-            },
-            false,
-        ))
+            Ok(Self::from_snapshot(
+                &db,
+                config.name,
+                storage,
+                CollectionSnapshot {
+                    metadata,
+                    metadata_version,
+                    ids: Treemap::new(),
+                    ids_version,
+                    alloc_watermark: 0,
+                },
+                false,
+            ))
+        })
     }
 
     /// Opens an existing collection.
@@ -95,81 +97,84 @@ impl Collection {
     ///
     /// # Returns
     /// The opened Collection instance or an error if opening fails
-    pub(crate) async fn open<F>(
+    pub(crate) fn open<F>(
         db: AndaDB,
         name: String,
         schema: Option<Schema>,
         f: F,
-    ) -> Result<Self, DBError>
+    ) -> impl Future<Output = Result<Self, DBError>>
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        validate_field_name(name.as_str())?;
-        let base_path = Path::from(db.name()).join(name.as_str());
-        let db_metadata = db.metadata();
-        let storage = Storage::connect(
-            base_path.to_string(),
-            db.object_store(),
-            db_metadata.config.storage.clone(),
-        )
-        .await?;
-
-        let (metadata, metadata_version) = storage
-            .fetch::<CollectionMetadata>(Self::METADATA_PATH)
+        Box::pin(async move {
+            validate_field_name(name.as_str())?;
+            let base_path = Path::from(db.name()).join(name.as_str());
+            let db_metadata = db.metadata();
+            let storage = Storage::connect(
+                base_path.to_string(),
+                db.object_store(),
+                db_metadata.config.storage.clone(),
+            )
             .await?;
 
-        let (ids, ids_version) = storage.fetch_internal::<Vec<u8>>(Self::IDS_PATH).await?;
-        // The stored bitmap is kept as the collection's own: it already
-        // describes exactly the set materialized below.
-        let stored_ids =
-            Treemap::try_deserialize::<Portable>(&ids).ok_or_else(|| DBError::Generic {
-                name: name.clone(),
-                source: "Failed to deserialize ids".into(),
-            })?;
+            let (metadata, metadata_version) = storage
+                .fetch::<CollectionMetadata>(Self::METADATA_PATH)
+                .await?;
 
-        // The durable allocation watermark bounds the id window the repair
-        // scan below must probe. Collections created before the watermark
-        // existed load as 0; the metadata max keeps their bound intact.
-        let alloc_watermark = match storage.fetch::<u64>(Self::ALLOCATION_WATERMARK_PATH).await {
-            Ok((watermark, _)) => watermark,
-            Err(DBError::NotFound { .. }) => 0,
-            Err(err) => return Err(err),
-        };
-        let mut collection = Self::from_snapshot(
-            &db,
-            name,
-            storage,
-            CollectionSnapshot {
-                metadata,
-                metadata_version,
-                ids: stored_ids,
-                ids_version,
-                alloc_watermark,
-            },
-            true,
-        );
-        collection.load_indexes().await?;
+            let (ids, ids_version) = storage.fetch_internal::<Vec<u8>>(Self::IDS_PATH).await?;
+            // The stored bitmap is kept as the collection's own: it already
+            // describes exactly the set materialized below.
+            let stored_ids =
+                Treemap::try_deserialize::<Portable>(&ids).ok_or_else(|| DBError::Generic {
+                    name: name.clone(),
+                    source: "Failed to deserialize ids".into(),
+                })?;
 
-        if let Some(schema) = schema
-            && collection.try_upgrade_schema(schema).await?
-        {
-            // The callback may write documents with newly assigned field
-            // indexes. Persist that assignment first, so cancellation or a
-            // callback error cannot leave a new-schema document behind
-            // metadata that still describes the old schema.
-            collection.store_metadata_unclaimed().await?;
-        }
+            // The durable allocation watermark bounds the id window the repair
+            // scan below must probe. Collections created before the watermark
+            // existed load as 0; the metadata max keeps their bound intact.
+            let alloc_watermark = match storage.fetch::<u64>(Self::ALLOCATION_WATERMARK_PATH).await
+            {
+                Ok((watermark, _)) => watermark,
+                Err(DBError::NotFound { .. }) => 0,
+                Err(err) => return Err(err),
+            };
+            let mut collection = Self::from_snapshot(
+                &db,
+                name,
+                storage,
+                CollectionSnapshot {
+                    metadata,
+                    metadata_version,
+                    ids: stored_ids,
+                    ids_version,
+                    alloc_watermark,
+                },
+                true,
+            );
+            collection.load_indexes().await?;
 
-        // The callback installs custom index hooks and may add indexes. Run it
-        // before replay/repair so recovery derives values with the same
-        // application semantics as normal CRUD. Replaying once with default
-        // hooks would leave B-tree/BM25 phantom entries that a later replay
-        // with custom hooks cannot identify and remove.
-        f(&mut collection).await?;
+            if let Some(schema) = schema
+                && collection.try_upgrade_schema(schema).await?
+            {
+                // The callback may write documents with newly assigned field
+                // indexes. Persist that assignment first, so cancellation or a
+                // callback error cannot leave a new-schema document behind
+                // metadata that still describes the old schema.
+                collection.store_metadata_unclaimed().await?;
+            }
 
-        collection.ensure_recovered().await?;
+            // The callback installs custom index hooks and may add indexes. Run it
+            // before replay/repair so recovery derives values with the same
+            // application semantics as normal CRUD. Replaying once with default
+            // hooks would leave B-tree/BM25 phantom entries that a later replay
+            // with custom hooks cannot identify and remove.
+            f(&mut collection).await?;
 
-        Ok(collection)
+            collection.ensure_recovered().await?;
+
+            Ok(collection)
+        })
     }
 
     /// Sets the collection to read-only mode.
@@ -200,73 +205,75 @@ impl Collection {
     ///
     /// # Returns
     /// Ok(()) if successful, or an error if closing fails
-    pub async fn close(&self) -> Result<(), DBError> {
-        self.ensure_recovered().await?;
-        loop {
-            match self.lifecycle.load(Ordering::Acquire) {
-                LIFECYCLE_ACTIVE => {
-                    if self
-                        .lifecycle
-                        .compare_exchange(
-                            LIFECYCLE_ACTIVE,
-                            LIFECYCLE_CLOSING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        break;
+    pub fn close(&self) -> impl Future<Output = Result<(), DBError>> + Send {
+        Box::pin(async move {
+            self.ensure_recovered().await?;
+            loop {
+                match self.lifecycle.load(Ordering::Acquire) {
+                    LIFECYCLE_ACTIVE => {
+                        if self
+                            .lifecycle
+                            .compare_exchange(
+                                LIFECYCLE_ACTIVE,
+                                LIFECYCLE_CLOSING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        }
                     }
+                    LIFECYCLE_CLOSING => break,
+                    LIFECYCLE_CLOSED | LIFECYCLE_DELETED => return Ok(()),
+                    LIFECYCLE_DELETING => return Err(self.lifecycle_error()),
+                    _ => return Err(self.lifecycle_error()),
                 }
-                LIFECYCLE_CLOSING => break,
+            }
+            // Publish the user-visible read-only state as soon as admission
+            // closes. Existing operations are drained by the exclusive gate.
+            self.read_only.store(true, Ordering::Release);
+            let _operation_guard = self.operation_gate.clone().write_owned().await;
+            match self.lifecycle.load(Ordering::Acquire) {
                 LIFECYCLE_CLOSED | LIFECYCLE_DELETED => return Ok(()),
                 LIFECYCLE_DELETING => return Err(self.lifecycle_error()),
+                LIFECYCLE_CLOSING => {}
                 _ => return Err(self.lifecycle_error()),
             }
-        }
-        // Publish the user-visible read-only state as soon as admission
-        // closes. Existing operations are drained by the exclusive gate.
-        self.read_only.store(true, Ordering::Release);
-        let _operation_guard = self.operation_gate.clone().write_owned().await;
-        match self.lifecycle.load(Ordering::Acquire) {
-            LIFECYCLE_CLOSED | LIFECYCLE_DELETED => return Ok(()),
-            LIFECYCLE_DELETING => return Err(self.lifecycle_error()),
-            LIFECYCLE_CLOSING => {}
-            _ => return Err(self.lifecycle_error()),
-        }
 
-        let start = Instant::now();
-        let now_ms = unix_ms();
-        let rt = self
-            .guarded("Collection::close", self.flush_inner(now_ms))
-            .await;
-        let elapsed = start.elapsed();
-        match rt {
-            Ok(_) => {
-                self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
-                log::info!(
-                    action = "Collection::close",
-                    collection = self.name,
-                    elapsed = elapsed.as_millis();
-                    "Collection closed successfully in {elapsed:?}",
-                );
-                Ok(())
+            let start = Instant::now();
+            let now_ms = unix_ms();
+            let rt = self
+                .guarded("Collection::close", self.flush_inner(now_ms))
+                .await;
+            let elapsed = start.elapsed();
+            match rt {
+                Ok(_) => {
+                    self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
+                    log::info!(
+                        action = "Collection::close",
+                        collection = self.name,
+                        elapsed = elapsed.as_millis();
+                        "Collection closed successfully in {elapsed:?}",
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    // The failed flush may have completed some of its dependent
+                    // writes; the in-memory watermarks are no longer trustworthy.
+                    // Poison so a reopen loads a fresh generation from storage
+                    // instead of retrying with diverged state.
+                    self.poison("Collection::close");
+                    log::error!(
+                        action = "Collection::close",
+                        collection = self.name,
+                        elapsed = elapsed.as_millis();
+                        "Failed to close collection: {err:?}",
+                    );
+                    Err(err)
+                }
             }
-            Err(err) => {
-                // The failed flush may have completed some of its dependent
-                // writes; the in-memory watermarks are no longer trustworthy.
-                // Poison so a reopen loads a fresh generation from storage
-                // instead of retrying with diverged state.
-                self.poison("Collection::close");
-                log::error!(
-                    action = "Collection::close",
-                    collection = self.name,
-                    elapsed = elapsed.as_millis();
-                    "Failed to close collection: {err:?}",
-                );
-                Err(err)
-            }
-        }
+        })
     }
 
     /// Flushes all pending changes to storage.
@@ -281,27 +288,29 @@ impl Collection {
     /// recovery state in memory that must not reach storage — so a periodic
     /// flush is a no-op there rather than an error that would fail
     /// [`AndaDB::flush`] on every interval. `close` still flushes.
-    pub async fn flush(&self, now_ms: u64) -> Result<bool, DBError> {
-        self.ensure_recovered().await?;
-        // The write guard both serializes complete flushes and freezes all
-        // document/index mutations for the checkpoint transaction.
-        let _operation_guard = self.operation_gate.clone().write_owned().await;
-        if !self.is_active_handle() {
-            return Err(self.lifecycle_error());
-        }
-        if self.is_read_only() {
-            return Ok(false);
-        }
-        let rt = self
-            .guarded("Collection::flush", self.flush_inner(now_ms))
-            .await;
-        if rt.is_err() {
-            // A checkpoint is multiple dependent writes; after any failure the
-            // in-memory watermarks no longer describe what is durable. Treat
-            // it like a crash: reject further use and recover on reopen.
-            self.poison("Collection::flush");
-        }
-        rt
+    pub fn flush(&self, now_ms: u64) -> impl Future<Output = Result<bool, DBError>> + Send {
+        Box::pin(async move {
+            self.ensure_recovered().await?;
+            // The write guard both serializes complete flushes and freezes all
+            // document/index mutations for the checkpoint transaction.
+            let _operation_guard = self.operation_gate.clone().write_owned().await;
+            if !self.is_active_handle() {
+                return Err(self.lifecycle_error());
+            }
+            if self.is_read_only() {
+                return Ok(false);
+            }
+            let rt = self
+                .guarded("Collection::flush", self.flush_inner(now_ms))
+                .await;
+            if rt.is_err() {
+                // A checkpoint is multiple dependent writes; after any failure the
+                // in-memory watermarks no longer describe what is durable. Treat
+                // it like a crash: reject further use and recover on reopen.
+                self.poison("Collection::flush");
+            }
+            rt
+        })
     }
 
     /// A checkpoint is a sequence of dependent writes (collection metadata,

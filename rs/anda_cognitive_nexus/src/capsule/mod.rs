@@ -48,217 +48,219 @@ pub const FORMAT: &str = "KIP-Cognitive-Capsule";
 pub const DEFAULT_DEPTH: usize = 3;
 
 /// Builds a Capsule from a set of root elements.
-pub async fn export(
+pub fn export(
     cx: &mut Context<'_>,
     roots: Vec<ElementId>,
     options: &Map<String, Json>,
-) -> Result<Capsule, KipError> {
-    let depth = options
-        .get("provenance_depth")
-        .and_then(Json::as_u64)
-        .map(|d| d as usize)
-        .unwrap_or(DEFAULT_DEPTH);
-    // §40.3's vocabulary, spelled the way §40.3 spells it. An engine that
-    // invented its own words for the same three shapes would make a Capsule's
-    // own manifest unreadable to the destination that has to decide whether to
-    // trust it.
-    let closure = match options.get("closure").and_then(Json::as_str) {
-        None => Closure::Referential,
-        Some("referential") => Closure::Referential,
-        Some("closed") => Closure::Closed,
-        Some("selective") => Closure::Selective,
-        Some(other) => {
+) -> impl Future<Output = Result<Capsule, KipError>> + Send {
+    Box::pin(async move {
+        let depth = options
+            .get("provenance_depth")
+            .and_then(Json::as_u64)
+            .map(|d| d as usize)
+            .unwrap_or(DEFAULT_DEPTH);
+        // §40.3's vocabulary, spelled the way §40.3 spells it. An engine that
+        // invented its own words for the same three shapes would make a Capsule's
+        // own manifest unreadable to the destination that has to decide whether to
+        // trust it.
+        let closure = match options.get("closure").and_then(Json::as_str) {
+            None => Closure::Referential,
+            Some("referential") => Closure::Referential,
+            Some("closed") => Closure::Closed,
+            Some("selective") => Closure::Selective,
+            Some(other) => {
+                return Err(KipError::unsupported_capability(format!(
+                    "§40.3 declares a closure as \"closed\", \"referential\" or \"selective\"; \
+                     this Capsule asks for {other:?}"
+                )));
+            }
+        };
+        // A proof profile promises a signature, and this engine holds no signing
+        // keys. Emitting an unsigned Capsule under a profile that names one would
+        // put the claim in the manifest and nothing behind it (§37.8).
+        if let Some(profile) = options.get("proof_profile")
+            && !profile.is_null()
+        {
             return Err(KipError::unsupported_capability(format!(
-                "§40.3 declares a closure as \"closed\", \"referential\" or \"selective\"; \
-                 this Capsule asks for {other:?}"
+                "this engine signs nothing, so it cannot produce a Capsule under the proof profile \
+                 {profile}; an exported Capsule is unsigned and says so"
             )));
         }
-    };
-    // A proof profile promises a signature, and this engine holds no signing
-    // keys. Emitting an unsigned Capsule under a profile that names one would
-    // put the claim in the manifest and nothing behind it (§37.8).
-    if let Some(profile) = options.get("proof_profile")
-        && !profile.is_null()
-    {
-        return Err(KipError::unsupported_capability(format!(
-            "this engine signs nothing, so it cannot produce a Capsule under the proof profile \
-             {profile}; an exported Capsule is unsigned and says so"
-        )));
-    }
-    let include_schema = options
-        .get("include_schema")
-        .and_then(Json::as_bool)
-        .unwrap_or(true);
-    if options.get("include_blobs").and_then(Json::as_bool) == Some(true) {
-        return Err(KipError::unsupported_capability(
-            "this engine stores no blobs, so it cannot include them in a Capsule",
-        ));
-    }
-
-    let ids = match closure {
-        Closure::Selective => roots.iter().copied().collect::<BTreeSet<_>>(),
-        Closure::Referential | Closure::Closed => expand(cx, &roots, depth).await?,
-    };
-
-    let mut records = CapsuleRecords::default();
-    let mut schema_refs: BTreeSet<String> = BTreeSet::new();
-    let mut omitted = Vec::new();
-    let mut included = BTreeSet::new();
-    let mut source_control = Map::new();
-    for id in &ids {
-        let Some(_) = cx.load(*id).await? else {
-            continue;
-        };
-        // The redacted view, for the same reason SEARCH uses it: a field the
-        // caller may not read must not leave the Space in a Capsule either
-        // (§20.9). Elements it may not read at all were already dropped by
-        // `load`, which is what makes the manifest's `partial` honest.
-        // No fallback to the raw renderer: `load` caches a redacted view for
-        // every element it admits, so an absent one means the element was not
-        // admitted — and rendering it here would export exactly the fields the
-        // redaction removed.
-        let Some(rendered) = cx.cached_view(*id) else {
-            continue;
-        };
-        collect_schema_refs(&rendered, &mut schema_refs);
-        let mut rendered = rendered.as_ref().clone();
-        if let Some(object) = rendered.as_object_mut() {
-            object.remove("canonical_subject");
-            object.remove("canonical_object");
+        let include_schema = options
+            .get("include_schema")
+            .and_then(Json::as_bool)
+            .unwrap_or(true);
+        if options.get("include_blobs").and_then(Json::as_bool) == Some(true) {
+            return Err(KipError::unsupported_capability(
+                "this engine stores no blobs, so it cannot include them in a Capsule",
+            ));
         }
-        crate::projection::strength::strip(&mut rendered);
-        if let Some(governance) = rendered["governance"].as_object_mut() {
-            let extra: Map<String, Json> = governance
-                .iter()
-                .filter(|(k, _)| {
-                    !matches!(
+
+        let ids = match closure {
+            Closure::Selective => roots.iter().copied().collect::<BTreeSet<_>>(),
+            Closure::Referential | Closure::Closed => expand(cx, &roots, depth).await?,
+        };
+
+        let mut records = CapsuleRecords::default();
+        let mut schema_refs: BTreeSet<String> = BTreeSet::new();
+        let mut omitted = Vec::new();
+        let mut included = BTreeSet::new();
+        let mut source_control = Map::new();
+        for id in &ids {
+            let Some(_) = cx.load(*id).await? else {
+                continue;
+            };
+            // The redacted view, for the same reason SEARCH uses it: a field the
+            // caller may not read must not leave the Space in a Capsule either
+            // (§20.9). Elements it may not read at all were already dropped by
+            // `load`, which is what makes the manifest's `partial` honest.
+            // No fallback to the raw renderer: `load` caches a redacted view for
+            // every element it admits, so an absent one means the element was not
+            // admitted — and rendering it here would export exactly the fields the
+            // redaction removed.
+            let Some(rendered) = cx.cached_view(*id) else {
+                continue;
+            };
+            collect_schema_refs(&rendered, &mut schema_refs);
+            let mut rendered = rendered.as_ref().clone();
+            if let Some(object) = rendered.as_object_mut() {
+                object.remove("canonical_subject");
+                object.remove("canonical_object");
+            }
+            crate::projection::strength::strip(&mut rendered);
+            if let Some(governance) = rendered["governance"].as_object_mut() {
+                let extra: Map<String, Json> = governance
+                    .iter()
+                    .filter(|(k, _)| {
+                        !matches!(
+                            k.as_str(),
+                            "classification" | "authority_class" | "policy_ref"
+                        )
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                governance.retain(|k, _| {
+                    matches!(
                         k.as_str(),
                         "classification" | "authority_class" | "policy_ref"
                     )
-                })
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            governance.retain(|k, _| {
-                matches!(
-                    k.as_str(),
-                    "classification" | "authority_class" | "policy_ref"
-                )
-            });
-            if !extra.is_empty() {
-                source_control.insert(id.to_string(), Json::Object(extra));
+                });
+                if !extra.is_empty() {
+                    source_control.insert(id.to_string(), Json::Object(extra));
+                }
             }
-        }
-        if crate::schema::contracts::validate_value(
-            &serde_json::json!({"$ref":"urn:kip:2.0:schema:element"}),
-            &rendered,
-        )
-        .is_err()
-        {
-            if closure == Closure::Closed {
-                return Err(KipError::constraint_violation(
-                    "closed Capsule requires complete, visible canonical element fields",
-                ));
-            }
-            omitted.push(ExternalRef {
-                reference: id.to_string(),
-                kind: if rendered["_system"]["origin"]["redacted"] == true
-                    || rendered.get("_system").is_none()
-                {
-                    ExternalRefKind::Redacted
-                } else {
-                    ExternalRefKind::Unavailable
-                },
-                identity: Some(serde_json::json!({"id": id.to_string()})),
-            });
-            continue;
-        }
-        included.insert(*id);
-        records.0.push(rendered);
-    }
-
-    // §40.1: what the records reference but do not carry is *declared*, not
-    // dropped. A Capsule missing an edge and saying nothing imports as a graph
-    // the destination believes is whole — an Assertion whose Evidence is
-    // silently gone reads as an unsupported claim rather than a partial
-    // import.
-    let mut external_refs = omitted;
-    for id in &ids {
-        let Some(element) = cx.load(*id).await? else {
-            continue;
-        };
-        for referenced in element.references() {
-            if included.contains(&referenced) {
+            if crate::schema::contracts::validate_value(
+                &serde_json::json!({"$ref":"urn:kip:2.0:schema:element"}),
+                &rendered,
+            )
+            .is_err()
+            {
+                if closure == Closure::Closed {
+                    return Err(KipError::constraint_violation(
+                        "closed Capsule requires complete, visible canonical element fields",
+                    ));
+                }
+                omitted.push(ExternalRef {
+                    reference: id.to_string(),
+                    kind: if rendered["_system"]["origin"]["redacted"] == true
+                        || rendered.get("_system").is_none()
+                    {
+                        ExternalRefKind::Redacted
+                    } else {
+                        ExternalRefKind::Unavailable
+                    },
+                    identity: Some(serde_json::json!({"id": id.to_string()})),
+                });
                 continue;
             }
-            external_refs.push(ExternalRef {
-                reference: referenced.to_string(),
-                kind: ExternalRefKind::SourceElement,
-                identity: Some(serde_json::json!({"id": referenced.to_string()})),
-            });
+            included.insert(*id);
+            records.0.push(rendered);
         }
-    }
-    external_refs.sort_by(|a, b| a.reference.cmp(&b.reference));
-    external_refs.dedup_by(|a, b| a.reference == b.reference);
-    // A `closed` Capsule promises self-containment, so it fails rather than
-    // shipping the promise with a hole in it. §40.3 names the three shapes so
-    // a destination can tell them apart; one that claimed `closed` and carried
-    // ExternalRefs would make the word mean nothing.
-    if closure == Closure::Closed && !external_refs.is_empty() {
-        return Err(KipError::constraint_violation(format!(
-            "a \"closed\" Capsule carries everything it references, and this export would leave \
-             {} reference(s) outside it — the first is {}. Raise `provenance_depth`, widen the \
-             roots, or ask for a \"referential\" closure, which declares what it does not carry",
-            external_refs.len(),
-            external_refs[0].reference
-        )));
-    }
 
-    let space = cx.store.get_space(&cx.space).await?;
-    let payload = CapsulePayload {
-        manifest: CapsuleManifest {
-            kind: CapsuleKind::Snapshot,
-            roots: ids.iter().map(ToString::to_string).collect(),
-            base_seq: None,
-            target_seq: None,
-            closure: closure.as_str().into(),
-        },
-        source: CapsuleSource {
-            space_ref: Some(space.space_id.clone()),
-            snapshot_seq: Some(space.seq),
-        },
-        // §20.4: the exact refs travel with the records. A Capsule that
-        // exported local names would arrive meaning whatever the destination
-        // happens to call them.
-        schema: if include_schema {
-            schema_dependencies(cx, &schema_refs)
-        } else {
-            vec![]
-        },
-        records,
-        changes: None,
-        external_refs,
-        blobs: BTreeMap::new(),
-        handling: anda_kip::CapsuleHandling {
-            extra: if source_control.is_empty() {
-                Map::new()
-            } else {
-                Map::from_iter([("anda/source_control".into(), Json::Object(source_control))])
+        // §40.1: what the records reference but do not carry is *declared*, not
+        // dropped. A Capsule missing an edge and saying nothing imports as a graph
+        // the destination believes is whole — an Assertion whose Evidence is
+        // silently gone reads as an unsupported claim rather than a partial
+        // import.
+        let mut external_refs = omitted;
+        for id in &ids {
+            let Some(element) = cx.load(*id).await? else {
+                continue;
+            };
+            for referenced in element.references() {
+                if included.contains(&referenced) {
+                    continue;
+                }
+                external_refs.push(ExternalRef {
+                    reference: referenced.to_string(),
+                    kind: ExternalRefKind::SourceElement,
+                    identity: Some(serde_json::json!({"id": referenced.to_string()})),
+                });
+            }
+        }
+        external_refs.sort_by(|a, b| a.reference.cmp(&b.reference));
+        external_refs.dedup_by(|a, b| a.reference == b.reference);
+        // A `closed` Capsule promises self-containment, so it fails rather than
+        // shipping the promise with a hole in it. §40.3 names the three shapes so
+        // a destination can tell them apart; one that claimed `closed` and carried
+        // ExternalRefs would make the word mean nothing.
+        if closure == Closure::Closed && !external_refs.is_empty() {
+            return Err(KipError::constraint_violation(format!(
+                "a \"closed\" Capsule carries everything it references, and this export would leave \
+                 {} reference(s) outside it — the first is {}. Raise `provenance_depth`, widen the \
+                 roots, or ask for a \"referential\" closure, which declares what it does not carry",
+                external_refs.len(),
+                external_refs[0].reference
+            )));
+        }
+
+        let space = cx.store.get_space(&cx.space).await?;
+        let payload = CapsulePayload {
+            manifest: CapsuleManifest {
+                kind: CapsuleKind::Snapshot,
+                roots: ids.iter().map(ToString::to_string).collect(),
+                base_seq: None,
+                target_seq: None,
+                closure: closure.as_str().into(),
             },
-        },
-    };
+            source: CapsuleSource {
+                space_ref: Some(space.space_id.clone()),
+                snapshot_seq: Some(space.seq),
+            },
+            // §20.4: the exact refs travel with the records. A Capsule that
+            // exported local names would arrive meaning whatever the destination
+            // happens to call them.
+            schema: if include_schema {
+                schema_dependencies(cx, &schema_refs)
+            } else {
+                vec![]
+            },
+            records,
+            changes: None,
+            external_refs,
+            blobs: BTreeMap::new(),
+            handling: anda_kip::CapsuleHandling {
+                extra: if source_control.is_empty() {
+                    Map::new()
+                } else {
+                    Map::from_iter([("anda/source_control".into(), Json::Object(source_control))])
+                },
+            },
+        };
 
-    let digest = payload_digest(&payload)?;
-    Ok(Capsule::new(
-        payload,
-        CapsuleIntegrity {
-            digest_profile: "kip-jcs-safe-v1".into(),
-            content_digest: digest,
-            // No proofs: this engine signs nothing, and an empty proof list is
-            // an honest "unsigned" rather than a claim of provenance.
-            proofs: vec![],
-            covers: None,
-        },
-    ))
+        let digest = payload_digest(&payload)?;
+        Ok(Capsule::new(
+            payload,
+            CapsuleIntegrity {
+                digest_profile: "kip-jcs-safe-v1".into(),
+                content_digest: digest,
+                // No proofs: this engine signs nothing, and an empty proof list is
+                // an honest "unsigned" rather than a claim of provenance.
+                proofs: vec![],
+                covers: None,
+            },
+        ))
+    })
 }
 
 /// How much of the graph around the roots a Capsule carries (§40.3).
@@ -285,33 +287,35 @@ impl Closure {
 }
 
 /// Walks the referential closure out from the roots.
-async fn expand(
+fn expand(
     cx: &mut Context<'_>,
     roots: &[ElementId],
     depth: usize,
-) -> Result<BTreeSet<ElementId>, KipError> {
-    let mut seen: BTreeSet<ElementId> = roots.iter().copied().collect();
-    let mut frontier: Vec<ElementId> = roots.to_vec();
+) -> impl Future<Output = Result<BTreeSet<ElementId>, KipError>> + Send {
+    Box::pin(async move {
+        let mut seen: BTreeSet<ElementId> = roots.iter().copied().collect();
+        let mut frontier: Vec<ElementId> = roots.to_vec();
 
-    for _ in 0..depth {
-        let mut next = Vec::new();
-        for id in std::mem::take(&mut frontier) {
-            let Some(element) = cx.load(id).await? else {
-                continue;
-            };
-            for referenced in element.references() {
-                if seen.insert(referenced) {
-                    next.push(referenced);
+        for _ in 0..depth {
+            let mut next = Vec::new();
+            for id in std::mem::take(&mut frontier) {
+                let Some(element) = cx.load(id).await? else {
+                    continue;
+                };
+                for referenced in element.references() {
+                    if seen.insert(referenced) {
+                        next.push(referenced);
+                    }
                 }
             }
+            if next.is_empty() {
+                break;
+            }
+            cx.charge(next.len())?;
+            frontier = next;
         }
-        if next.is_empty() {
-            break;
-        }
-        cx.charge(next.len())?;
-        frontier = next;
-    }
-    Ok(seen)
+        Ok(seen)
+    })
 }
 
 fn collect_schema_refs(rendered: &Json, into: &mut BTreeSet<String>) {
@@ -533,7 +537,7 @@ fn map_draft_symbols(
 /// is written (§41.2), because a half-imported graph bound to types the
 /// destination cannot resolve is cognition with no recoverable meaning.
 /// `symbols` maps the source draft symbols the records use (§41.7).
-pub async fn import(
+pub fn import(
     nexus: &crate::CognitiveNexus,
     capsule: &Capsule,
     space_id: &str,
@@ -541,91 +545,93 @@ pub async fn import(
     auth: crate::governance::AuthContext,
     isolate: bool,
     symbols: &[SymbolMapping],
-) -> Result<ImportReport, KipError> {
-    capsule.validate_frame()?;
-    let mut report = ImportReport::default();
+) -> impl Future<Output = Result<ImportReport, KipError>> + Send {
+    Box::pin(async move {
+        capsule.validate_frame()?;
+        let mut report = ImportReport::default();
 
-    // Integrity first (§41.2: VERIFY → VALIDATE → PREVIEW → import). A
-    // modified artifact must not reach identity resolution: everything after
-    // this point trusts the record ids to mean what the digest covers.
-    check_digest_profile(&capsule.integrity.content_digest)?;
-    let digest = payload_digest(&capsule.payload)?;
-    if digest != capsule.integrity.content_digest {
-        return Err(KipError::new(
-            KipErrorCode::DigestMismatch,
-            format!(
-                "this Capsule declares the digest {} and its payload digests to {digest}; it was \
-                 modified after it was written, or written by an engine using a different \
-                 canonicalization",
-                capsule.integrity.content_digest
-            ),
-        ));
-    }
-
-    let env = nexus.store.schema_environment(space_id).await?;
-    for dependency in &capsule.payload.schema {
-        // The source's draft vocabulary is its own, whatever this Space's
-        // draft holds; the records using it are mapped below (§20.16).
-        if dependency.package == anda_kip::DRAFT_PACKAGE_ID {
-            continue;
-        }
-        let package_ref = format!("{}@{}", dependency.package, dependency.version);
-        let Some(artifact) = env.artifact(&package_ref) else {
-            // Refused, not downgraded: importing records whose types cannot be
-            // resolved would store cognition nobody can read back. Activating
-            // the package on the Capsule's say-so is exactly what §88 forbids.
-            return Err(KipError::new(
-                KipErrorCode::SchemaPackageUnavailable,
-                format!(
-                    "this Capsule's records are bound to {package_ref}, which is not in this \
-                     Space's Schema Environment; install and activate it first — an import \
-                     cannot activate schema on the artifact's own say-so"
-                ),
-            ));
-        };
-        let installed_digest = package_digest(artifact)?;
-        if let Some(declared) = &dependency.digest
-            && declared != &installed_digest
-        {
+        // Integrity first (§41.2: VERIFY → VALIDATE → PREVIEW → import). A
+        // modified artifact must not reach identity resolution: everything after
+        // this point trusts the record ids to mean what the digest covers.
+        check_digest_profile(&capsule.integrity.content_digest)?;
+        let digest = payload_digest(&capsule.payload)?;
+        if digest != capsule.integrity.content_digest {
             return Err(KipError::new(
                 KipErrorCode::DigestMismatch,
                 format!(
-                    "this Capsule was written against a {package_ref} whose digest was \
-                     {declared}, and this Space has {installed_digest}; the same version means the same \
-                     content, so one of them is not what it claims"
+                    "this Capsule declares the digest {} and its payload digests to {digest}; it was \
+                     modified after it was written, or written by an engine using a different \
+                     canonicalization",
+                    capsule.integrity.content_digest
                 ),
             ));
         }
-    }
 
-    let mapped = map_draft_symbols(&env, capsule, symbols)?;
-    let capsule = mapped.as_ref().unwrap_or(capsule);
+        let env = nexus.store.schema_environment(space_id).await?;
+        for dependency in &capsule.payload.schema {
+            // The source's draft vocabulary is its own, whatever this Space's
+            // draft holds; the records using it are mapped below (§20.16).
+            if dependency.package == anda_kip::DRAFT_PACKAGE_ID {
+                continue;
+            }
+            let package_ref = format!("{}@{}", dependency.package, dependency.version);
+            let Some(artifact) = env.artifact(&package_ref) else {
+                // Refused, not downgraded: importing records whose types cannot be
+                // resolved would store cognition nobody can read back. Activating
+                // the package on the Capsule's say-so is exactly what §88 forbids.
+                return Err(KipError::new(
+                    KipErrorCode::SchemaPackageUnavailable,
+                    format!(
+                        "this Capsule's records are bound to {package_ref}, which is not in this \
+                         Space's Schema Environment; install and activate it first — an import \
+                         cannot activate schema on the artifact's own say-so"
+                    ),
+                ));
+            };
+            let installed_digest = package_digest(artifact)?;
+            if let Some(declared) = &dependency.digest
+                && declared != &installed_digest
+            {
+                return Err(KipError::new(
+                    KipErrorCode::DigestMismatch,
+                    format!(
+                        "this Capsule was written against a {package_ref} whose digest was \
+                         {declared}, and this Space has {installed_digest}; the same version means the same \
+                         content, so one of them is not what it claims"
+                    ),
+                ));
+            }
+        }
 
-    if capsule.integrity.proofs.is_empty() {
+        let mapped = map_draft_symbols(&env, capsule, symbols)?;
+        let capsule = mapped.as_ref().unwrap_or(capsule);
+
+        if capsule.integrity.proofs.is_empty() {
+            report.warnings.push(
+                "this Capsule is unsigned: its stated source is a claim the destination cannot check"
+                    .to_string(),
+            );
+        }
+        // §39.5: destination control state governs imported records.
         report.warnings.push(
-            "this Capsule is unsigned: its stated source is a claim the destination cannot check"
+            "imported records carry no source trust or local standing; destination policies govern their use"
                 .to_string(),
         );
-    }
-    // §39.5: destination control state governs imported records.
-    report.warnings.push(
-        "imported records carry no source trust or local standing; destination policies govern their use"
-            .to_string(),
-    );
 
-    if dry_run {
-        return merge::preview(&nexus.store, &env, capsule, space_id, &digest, report).await;
-    }
-    merge::merge(
-        &nexus.store,
-        capsule,
-        space_id,
-        &digest,
-        report,
-        auth,
-        isolate,
-    )
-    .await
+        if dry_run {
+            return merge::preview(&nexus.store, &env, capsule, space_id, &digest, report).await;
+        }
+        merge::merge(
+            &nexus.store,
+            capsule,
+            space_id,
+            &digest,
+            report,
+            auth,
+            isolate,
+        )
+        .await
+    })
 }
 
 /// Parses a Capsule artifact.

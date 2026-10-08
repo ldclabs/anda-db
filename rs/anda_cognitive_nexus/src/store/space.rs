@@ -66,56 +66,61 @@ impl Store {
     ///
     /// Idempotent on purpose: opening a Nexus is a startup path that runs
     /// repeatedly, and a second open must not fail or reset the sequence.
-    pub async fn open_or_create_space(&self, draft: SpaceDraft) -> Result<SpaceRow, KipError> {
-        if let Some(existing) = self.find_space(&draft.space_id).await? {
-            self.ensure_control_history(&existing).await?;
-            return Ok(existing);
-        }
-        let mut owners = draft.owners;
-        if !draft.owner_principal.is_empty() && !owners.contains(&draft.owner_principal) {
-            owners.insert(0, draft.owner_principal.clone());
-        }
-        let row = SpaceRow {
-            _id: 0,
-            space_id: draft.space_id,
-            uri: draft.uri,
-            name: draft.name,
-            description: draft.description,
-            owner_principal: draft.owner_principal,
-            owners,
-            status: "active".to_string(),
-            default_policy_id: draft.default_policy_id,
-            trust_policy_id: String::new(),
-            default_classification: if draft.default_classification.is_empty() {
-                crate::governance::classification::DEFAULT.to_string()
-            } else {
-                draft.default_classification
-            },
-            audit_mode: "standard".to_string(),
-            created_at: time::now(),
-            // Sequence 0 is "nothing has happened here yet", so the first
-            // commit is sequence 1 and no element ever carries `space_seq: 0`.
-            seq: 0,
-            schema_environment_version: 0,
-            self_concept: String::new(),
-            policies: Json::Null,
-        };
-        let id = self.spaces().add_from(&row).await.map_err(db_error)?;
-        let row = SpaceRow { _id: id, ..row };
-        self.ensure_control_history(&row).await?;
-        self.governance
-            .record_mutation(MutationEntry {
-                operation: "create_space",
-                at: row.created_at.clone(),
-                space_id: row.space_id.clone(),
-                resource: row.space_id.clone(),
-                record: serde_json::to_value(&row).map_err(|err| {
-                    KipError::internal_error(format!("a MemorySpace failed to encode: {err}"))
-                })?,
-                ..Default::default()
-            })
-            .await?;
-        Ok(row)
+    pub fn open_or_create_space(
+        &self,
+        draft: SpaceDraft,
+    ) -> impl Future<Output = Result<SpaceRow, KipError>> + Send {
+        Box::pin(async move {
+            if let Some(existing) = self.find_space(&draft.space_id).await? {
+                self.ensure_control_history(&existing).await?;
+                return Ok(existing);
+            }
+            let mut owners = draft.owners;
+            if !draft.owner_principal.is_empty() && !owners.contains(&draft.owner_principal) {
+                owners.insert(0, draft.owner_principal.clone());
+            }
+            let row = SpaceRow {
+                _id: 0,
+                space_id: draft.space_id,
+                uri: draft.uri,
+                name: draft.name,
+                description: draft.description,
+                owner_principal: draft.owner_principal,
+                owners,
+                status: "active".to_string(),
+                default_policy_id: draft.default_policy_id,
+                trust_policy_id: String::new(),
+                default_classification: if draft.default_classification.is_empty() {
+                    crate::governance::classification::DEFAULT.to_string()
+                } else {
+                    draft.default_classification
+                },
+                audit_mode: "standard".to_string(),
+                created_at: time::now(),
+                // Sequence 0 is "nothing has happened here yet", so the first
+                // commit is sequence 1 and no element ever carries `space_seq: 0`.
+                seq: 0,
+                schema_environment_version: 0,
+                self_concept: String::new(),
+                policies: Json::Null,
+            };
+            let id = self.spaces().add_from(&row).await.map_err(db_error)?;
+            let row = SpaceRow { _id: id, ..row };
+            self.ensure_control_history(&row).await?;
+            self.governance
+                .record_mutation(MutationEntry {
+                    operation: "create_space",
+                    at: row.created_at.clone(),
+                    space_id: row.space_id.clone(),
+                    resource: row.space_id.clone(),
+                    record: serde_json::to_value(&row).map_err(|err| {
+                        KipError::internal_error(format!("a MemorySpace failed to encode: {err}"))
+                    })?,
+                    ..Default::default()
+                })
+                .await?;
+            Ok(row)
+        })
     }
 
     /// Looks a Space up by its id.
@@ -142,47 +147,52 @@ impl Store {
     ///
     /// A Space that already names an owner is left alone. This is a bootstrap,
     /// not a claim.
-    pub async fn adopt_unowned_spaces(&self, principal: &str) -> Result<usize, KipError> {
-        let spaces = self.spaces();
-        // Ranged over `space_id` rather than filtered on `owner_principal`:
-        // ownership is not an indexed column, and a Nexus holds few enough
-        // Spaces that enumerating them on open costs nothing worth an index.
-        let ids = spaces
-            .query_all_ids(anda_db::query::Filter::Field((
-                "space_id".to_string(),
-                anda_db::query::RangeQuery::Gt(Fv::Text(String::new())),
-            )))
-            .await
-            .map_err(db_error)?;
-        let mut adopted = 0;
-        for id in ids {
-            let row: SpaceRow = spaces.get_as(id).await.map_err(db_error)?;
-            if !row.owner_principal.is_empty() {
-                continue;
+    pub fn adopt_unowned_spaces(
+        &self,
+        principal: &str,
+    ) -> impl Future<Output = Result<usize, KipError>> + Send {
+        Box::pin(async move {
+            let spaces = self.spaces();
+            // Ranged over `space_id` rather than filtered on `owner_principal`:
+            // ownership is not an indexed column, and a Nexus holds few enough
+            // Spaces that enumerating them on open costs nothing worth an index.
+            let ids = spaces
+                .query_all_ids(anda_db::query::Filter::Field((
+                    "space_id".to_string(),
+                    anda_db::query::RangeQuery::Gt(Fv::Text(String::new())),
+                )))
+                .await
+                .map_err(db_error)?;
+            let mut adopted = 0;
+            for id in ids {
+                let row: SpaceRow = spaces.get_as(id).await.map_err(db_error)?;
+                if !row.owner_principal.is_empty() {
+                    continue;
+                }
+                let mut owners = row.owners.clone();
+                if !owners.iter().any(|owner| owner == principal) {
+                    owners.insert(0, principal.to_string());
+                }
+                self.put_space(&SpaceRow {
+                    owner_principal: principal.to_string(),
+                    owners,
+                    default_classification: if row.default_classification.is_empty() {
+                        crate::governance::classification::DEFAULT.to_string()
+                    } else {
+                        row.default_classification.clone()
+                    },
+                    status: if row.status.is_empty() {
+                        "active".to_string()
+                    } else {
+                        row.status.clone()
+                    },
+                    ..row
+                })
+                .await?;
+                adopted += 1;
             }
-            let mut owners = row.owners.clone();
-            if !owners.iter().any(|owner| owner == principal) {
-                owners.insert(0, principal.to_string());
-            }
-            self.put_space(&SpaceRow {
-                owner_principal: principal.to_string(),
-                owners,
-                default_classification: if row.default_classification.is_empty() {
-                    crate::governance::classification::DEFAULT.to_string()
-                } else {
-                    row.default_classification.clone()
-                },
-                status: if row.status.is_empty() {
-                    "active".to_string()
-                } else {
-                    row.status.clone()
-                },
-                ..row
-            })
-            .await?;
-            adopted += 1;
-        }
-        Ok(adopted)
+            Ok(adopted)
+        })
     }
 
     /// Writes a Space record back as given.
@@ -190,40 +200,42 @@ impl Store {
     /// The Governance members are the only thing that changes through here; the
     /// sequence advances through [`Store::begin_transaction`] instead, so a
     /// Governance edit can never move a Space's history coordinate.
-    pub async fn put_space(&self, row: &SpaceRow) -> Result<(), KipError> {
-        let old = self.get_space(&row.space_id).await?;
-        let mut row = row.clone();
-        let changed = authorization_config(&old) != authorization_config(&row);
-        if let Some(internal) = old.policies.as_object() {
-            if !row.policies.is_object() {
-                row.policies = serde_json::json!({});
-            }
-            for (key, value) in internal {
-                if key.starts_with("_kip_") {
-                    row.policies[key] = value.clone();
+    pub fn put_space(&self, row: &SpaceRow) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let old = self.get_space(&row.space_id).await?;
+            let mut row = row.clone();
+            let changed = authorization_config(&old) != authorization_config(&row);
+            if let Some(internal) = old.policies.as_object() {
+                if !row.policies.is_object() {
+                    row.policies = serde_json::json!({});
+                }
+                for (key, value) in internal {
+                    if key.starts_with("_kip_") {
+                        row.policies[key] = value.clone();
+                    }
                 }
             }
-        }
-        let spaces = self.spaces();
-        spaces
-            .update(row._id, super::full_row_fields(spaces.schema(), &row)?)
-            .await
-            .map_err(db_error)?;
-        let audit = self
-            .governance
-            .record_mutation(MutationEntry {
-                operation: "put_space",
-                space_id: row.space_id.clone(),
-                resource: row.space_id.clone(),
-                record: serde_json::to_value(&row)
-                    .map_err(|e| KipError::internal_error(e.to_string()))?,
-                ..Default::default()
-            })
-            .await?;
-        if changed {
-            self.governance.notify_audit(audit).await?;
-        }
-        Ok(())
+            let spaces = self.spaces();
+            spaces
+                .update(row._id, super::full_row_fields(spaces.schema(), &row)?)
+                .await
+                .map_err(db_error)?;
+            let audit = self
+                .governance
+                .record_mutation(MutationEntry {
+                    operation: "put_space",
+                    space_id: row.space_id.clone(),
+                    resource: row.space_id.clone(),
+                    record: serde_json::to_value(&row)
+                        .map_err(|e| KipError::internal_error(e.to_string()))?,
+                    ..Default::default()
+                })
+                .await?;
+            if changed {
+                self.governance.notify_audit(audit).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Looks a Space up, failing when it does not exist.
@@ -248,32 +260,40 @@ impl Store {
     /// Read-modify-write on the Space row. The engine serializes mutations
     /// behind one write lock, and `anda_db` allows one live writer process per
     /// database, so this is not a compare-and-swap loop.
-    pub async fn begin_transaction(
+    pub fn begin_transaction(
         &self,
         space_id: &str,
         origin: Json,
-    ) -> Result<WriteContext, KipError> {
-        let space = self.get_space(space_id).await?;
-        let cx = WriteContext::tentative(&space, origin)?;
-        self.advance_seq(&space, cx.seq).await?;
-        Ok(cx)
+    ) -> impl Future<Output = Result<WriteContext, KipError>> + Send {
+        Box::pin(async move {
+            let space = self.get_space(space_id).await?;
+            let cx = WriteContext::tentative(&space, origin)?;
+            self.advance_seq(&space, cx.seq).await?;
+            Ok(cx)
+        })
     }
 
     /// Moves a Space's sequence forward to `seq`, never back.
     ///
     /// A committed transaction takes its sequence here, inside the redo plan
     /// that writes its rows, so a run that never commits reserves nothing.
-    pub(crate) async fn advance_seq(&self, space: &SpaceRow, seq: u64) -> Result<(), KipError> {
-        if space.seq >= seq {
-            return Ok(());
-        }
-        let mut fields = BTreeMap::new();
-        fields.insert("seq".to_string(), Fv::U64(seq));
-        self.spaces()
-            .update(space._id, fields)
-            .await
-            .map_err(db_error)?;
-        Ok(())
+    pub(crate) fn advance_seq(
+        &self,
+        space: &SpaceRow,
+        seq: u64,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            if space.seq >= seq {
+                return Ok(());
+            }
+            let mut fields = BTreeMap::new();
+            fields.insert("seq".to_string(), Fv::U64(seq));
+            self.spaces()
+                .update(space._id, fields)
+                .await
+                .map_err(db_error)?;
+            Ok(())
+        })
     }
 
     /// Records a committed transaction in the journal.
@@ -281,37 +301,39 @@ impl Store {
     /// The journal is what makes a lost response recoverable: a caller that
     /// never saw its receipt looks the transaction up by its idempotency key
     /// and replays the stored result rather than writing again (§80.4).
-    pub async fn journal(
+    pub fn journal(
         &self,
         cx: &WriteContext,
         entry: JournalEntry,
-    ) -> Result<TransactionRow, KipError> {
-        if let Some(row) = self.find_transaction(&cx.tx_id).await? {
-            return Ok(row);
-        }
-        let (row, authorization_changed) = journal_row(cx, entry);
-        if authorization_changed {
-            let mut space = self.get_space(&cx.space).await?;
-            if !space.policies.is_object() {
-                space.policies = serde_json::json!({});
+    ) -> impl Future<Output = Result<TransactionRow, KipError>> + Send {
+        Box::pin(async move {
+            if let Some(row) = self.find_transaction(&cx.tx_id).await? {
+                return Ok(row);
             }
-            space.policies["_kip_authorization_version"] = Json::from(
-                cx.seq.max(
-                    space.policies["_kip_authorization_version"]
-                        .as_u64()
-                        .unwrap_or(0),
-                ),
-            );
-            self.spaces()
-                .update(
-                    space._id,
-                    super::full_row_fields(self.spaces().schema(), &space)?,
-                )
-                .await
-                .map_err(db_error)?;
-        }
-        let id = self.transactions().add_from(&row).await.map_err(db_error)?;
-        Ok(TransactionRow { _id: id, ..row })
+            let (row, authorization_changed) = journal_row(cx, entry);
+            if authorization_changed {
+                let mut space = self.get_space(&cx.space).await?;
+                if !space.policies.is_object() {
+                    space.policies = serde_json::json!({});
+                }
+                space.policies["_kip_authorization_version"] = Json::from(
+                    cx.seq.max(
+                        space.policies["_kip_authorization_version"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    ),
+                );
+                self.spaces()
+                    .update(
+                        space._id,
+                        super::full_row_fields(self.spaces().schema(), &space)?,
+                    )
+                    .await
+                    .map_err(db_error)?;
+            }
+            let id = self.transactions().add_from(&row).await.map_err(db_error)?;
+            Ok(TransactionRow { _id: id, ..row })
+        })
     }
 
     /// Looks a transaction up by its id.

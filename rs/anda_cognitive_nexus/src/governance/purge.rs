@@ -91,96 +91,98 @@ pub struct PurgeReport {
 }
 
 /// Stages erasure inside an existing KML transaction.
-pub async fn stage(
+pub fn stage(
     store: &Store,
     tx: &mut Transaction,
     id: ElementId,
     policy: ReferencePolicy,
-) -> Result<PurgeReport, KipError> {
-    let space_id = tx.cx.space.clone();
-    // `Transaction::load` is the one reader that also enforces the Space, so
-    // going through it here replaces a separate fetch and its own check.
-    let element = tx.load(id).await?.clone();
-    let resource = ResourceContext::of_element(&element);
-    tx.authorize_element(id, Permission::Read).await?;
-    // §88.11 lists purging critical Evidence among the operations a policy may
-    // require independent approval for, and this is where such an approval is
-    // consumed — bound to this element, and spent by using it.
-    let approved = super::approval::require(
-        store,
-        &space_id,
-        &resource,
-        tx.authority
-            .authorize(Permission::Purge, &resource, &tx.auth),
-        &tx.auth,
-    )
-    .await?;
+) -> impl Future<Output = Result<PurgeReport, KipError>> + Send {
+    Box::pin(async move {
+        let space_id = tx.cx.space.clone();
+        // `Transaction::load` is the one reader that also enforces the Space, so
+        // going through it here replaces a separate fetch and its own check.
+        let element = tx.load(id).await?.clone();
+        let resource = ResourceContext::of_element(&element);
+        tx.authorize_element(id, Permission::Read).await?;
+        // §88.11 lists purging critical Evidence among the operations a policy may
+        // require independent approval for, and this is where such an approval is
+        // consumed — bound to this element, and spent by using it.
+        let approved = super::approval::require(
+            store,
+            &space_id,
+            &resource,
+            tx.authority
+                .authorize(Permission::Purge, &resource, &tx.auth),
+            &tx.auth,
+        )
+        .await?;
 
-    // §60.3: a legal hold is exactly the thing purge must not walk past, and it
-    // is checked before anything else destructive is decided.
-    if has_legal_hold(&element) {
-        return Err(KipError::legal_hold_conflict(format!(
-            "{id} is under a legal hold; lifting the hold is a separate Governance decision \
-             under its own permission"
-        )));
-    }
-
-    let referrers = referrers_of(store, &space_id, id).await?;
-    let mut targets = vec![id];
-    match policy {
-        ReferencePolicy::DenyIfReferenced if !referrers.is_empty() => {
-            // Names how many, not which: the referring elements may be ones
-            // this caller cannot read, and a purge refusal must not become a
-            // way to enumerate them (§103).
-            return Err(KipError::purge_denied(format!(
-                "{} element(s) still reference {id}. Erasing a referenced element leaves a \
-                 history that points at nothing; choose REFERENCE POLICY \
-                 \"tombstone_reference\" to keep the identity stub, or \"authorized_cascade\" to \
-                 erase the dependents too",
-                referrers.len()
+        // §60.3: a legal hold is exactly the thing purge must not walk past, and it
+        // is checked before anything else destructive is decided.
+        if has_legal_hold(&element) {
+            return Err(KipError::legal_hold_conflict(format!(
+                "{id} is under a legal hold; lifting the hold is a separate Governance decision \
+                 under its own permission"
             )));
         }
-        ReferencePolicy::AuthorizedCascade => {
-            for referrer in &referrers {
-                let element = store.get_element(*referrer).await?;
-                if has_legal_hold(&element) {
-                    return Err(KipError::legal_hold_conflict(format!(
-                        "{referrer} depends on {id} and is under a legal hold, so this cascade \
-                         cannot complete"
-                    )));
-                }
-                tx.authorize_element(*referrer, Permission::Purge).await?;
+
+        let referrers = referrers_of(store, &space_id, id).await?;
+        let mut targets = vec![id];
+        match policy {
+            ReferencePolicy::DenyIfReferenced if !referrers.is_empty() => {
+                // Names how many, not which: the referring elements may be ones
+                // this caller cannot read, and a purge refusal must not become a
+                // way to enumerate them (§103).
+                return Err(KipError::purge_denied(format!(
+                    "{} element(s) still reference {id}. Erasing a referenced element leaves a \
+                     history that points at nothing; choose REFERENCE POLICY \
+                     \"tombstone_reference\" to keep the identity stub, or \"authorized_cascade\" to \
+                     erase the dependents too",
+                    referrers.len()
+                )));
             }
-            targets.extend(referrers.iter().copied());
+            ReferencePolicy::AuthorizedCascade => {
+                for referrer in &referrers {
+                    let element = store.get_element(*referrer).await?;
+                    if has_legal_hold(&element) {
+                        return Err(KipError::legal_hold_conflict(format!(
+                            "{referrer} depends on {id} and is under a legal hold, so this cascade \
+                             cannot complete"
+                        )));
+                    }
+                    tx.authorize_element(*referrer, Permission::Purge).await?;
+                }
+                targets.extend(referrers.iter().copied());
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    approved.defer(tx);
-    let mut report = PurgeReport::default();
-    for target in targets {
-        let element = tx.load(target).await?.clone();
-        let digest = crate::store::schema::content_digest(&crate::view::render(&element));
-        report.versions_destroyed += tx.stage_purge(target, stub(element, &digest)).await?;
-        report.purged.push(target.to_string());
+        approved.defer(tx);
+        let mut report = PurgeReport::default();
+        for target in targets {
+            let element = tx.load(target).await?.clone();
+            let digest = crate::store::schema::content_digest(&crate::view::render(&element));
+            report.versions_destroyed += tx.stage_purge(target, stub(element, &digest)).await?;
+            report.purged.push(target.to_string());
 
-        tx.defer_governance_audit(MutationEntry {
-            operation: "purge",
-            at: tx.cx.at.clone(),
-            space_id: space_id.to_string(),
-            resource: target.to_string(),
-            principal_id: tx.auth.principal_id.clone(),
-            // The receipt §19.3 permits: enough to audit the erasure, and
-            // nothing of what was erased.
-            record: serde_json::json!({
-                "element": target.to_string(),
-                "content_digest": digest,
-                "reference_policy": policy.as_str(),
-                "tx_id": tx.cx.tx_id,
-            }),
-        });
-    }
-    Ok(report)
+            tx.defer_governance_audit(MutationEntry {
+                operation: "purge",
+                at: tx.cx.at.clone(),
+                space_id: space_id.to_string(),
+                resource: target.to_string(),
+                principal_id: tx.auth.principal_id.clone(),
+                // The receipt §19.3 permits: enough to audit the erasure, and
+                // nothing of what was erased.
+                record: serde_json::json!({
+                    "element": target.to_string(),
+                    "content_digest": digest,
+                    "reference_policy": policy.as_str(),
+                    "tx_id": tx.cx.tx_id,
+                }),
+            });
+        }
+        Ok(report)
+    })
 }
 
 /// What one payload purge did.
@@ -209,97 +211,99 @@ pub struct PayloadPurgeReport {
 /// readable through `AS OF`. It is scrubbed rather than destroyed: the record's
 /// own history is not payload, and destroying it would erase the lifecycle this
 /// operation promises to keep.
-pub async fn stage_payload(
+pub fn stage_payload(
     store: &Store,
     tx: &mut Transaction,
     id: ElementId,
-) -> Result<PayloadPurgeReport, KipError> {
-    let space_id = tx.cx.space.clone();
-    let element = tx.load(id).await?.clone();
-    let Element::Evidence(row) = &element else {
-        // §60.6: other kinds have no payload to purge. Refusing beats
-        // succeeding vacuously — a sweep that reported success over a set of
-        // Concepts would read as "the bytes are gone" when nothing was there.
-        return Err(KipError::constraint_violation(format!(
-            "{id} is a {} and has no payload; PURGE PAYLOAD targets Evidence",
-            element.kind()
-        )));
-    };
+) -> impl Future<Output = Result<PayloadPurgeReport, KipError>> + Send {
+    Box::pin(async move {
+        let space_id = tx.cx.space.clone();
+        let element = tx.load(id).await?.clone();
+        let Element::Evidence(row) = &element else {
+            // §60.6: other kinds have no payload to purge. Refusing beats
+            // succeeding vacuously — a sweep that reported success over a set of
+            // Concepts would read as "the bytes are gone" when nothing was there.
+            return Err(KipError::constraint_violation(format!(
+                "{id} is a {} and has no payload; PURGE PAYLOAD targets Evidence",
+                element.kind()
+            )));
+        };
 
-    let resource = ResourceContext::of_element(&element);
-    tx.authorize_element(id, Permission::Read).await?;
-    // Payload purge asks for the same `purge` authority element purge asks for
-    // (§60.6). A policy that wants to scope the two apart does it through the
-    // approval requirement below, which is element-scoped.
-    let approved = super::approval::require(
-        store,
-        &space_id,
-        &resource,
-        tx.authority
-            .authorize(Permission::Purge, &resource, &tx.auth),
-        &tx.auth,
-    )
-    .await?;
+        let resource = ResourceContext::of_element(&element);
+        tx.authorize_element(id, Permission::Read).await?;
+        // Payload purge asks for the same `purge` authority element purge asks for
+        // (§60.6). A policy that wants to scope the two apart does it through the
+        // approval requirement below, which is element-scoped.
+        let approved = super::approval::require(
+            store,
+            &space_id,
+            &resource,
+            tx.authority
+                .authorize(Permission::Purge, &resource, &tx.auth),
+            &tx.auth,
+        )
+        .await?;
 
-    // §60.6: a legal hold blocks payload purge exactly as it blocks element
-    // purge. The bytes are the thing a hold most often exists to preserve.
-    if has_legal_hold(&element) {
-        return Err(KipError::legal_hold_conflict(format!(
-            "{id} is under a legal hold; lifting the hold is a separate Governance decision \
-             under its own permission"
-        )));
-    }
+        // §60.6: a legal hold blocks payload purge exactly as it blocks element
+        // purge. The bytes are the thing a hold most often exists to preserve.
+        if has_legal_hold(&element) {
+            return Err(KipError::legal_hold_conflict(format!(
+                "{id} is under a legal hold; lifting the hold is a separate Governance decision \
+                 under its own permission"
+            )));
+        }
 
-    if row.payload_mode == crate::store::rows::PAYLOAD_PURGED {
-        // Purging an already-purged payload yields `no_effect` (§60.6): no
-        // version burned, no change record, no audit entry for an erasure that
-        // did not happen.
-        return Ok(PayloadPurgeReport::default());
-    }
+        if row.payload_mode == crate::store::rows::PAYLOAD_PURGED {
+            // Purging an already-purged payload yields `no_effect` (§60.6): no
+            // version burned, no change record, no audit entry for an erasure that
+            // did not happen.
+            return Ok(PayloadPurgeReport::default());
+        }
 
-    if row.content_digest.is_empty() {
-        // §60.6 promises the surviving record keeps its `content_digest`, and
-        // corroboration grouping (§23) goes on using it. A record that never
-        // carried one loses that for good at this instant — the engine mints no
-        // digest at `CREATE EVIDENCE`, and after this the bytes it would have
-        // covered are gone. Said out loud rather than papered over with an
-        // engine-invented digest: two engines would have to agree on the exact
-        // bytes for such a digest to mean anything, and a caller minimizing
-        // data should digest before discarding.
-        tx.warn(format!(
-            "{id} carries no content_digest, so its payload purge leaves nothing to verify \
-             the destroyed bytes against"
-        ));
-    }
+        if row.content_digest.is_empty() {
+            // §60.6 promises the surviving record keeps its `content_digest`, and
+            // corroboration grouping (§23) goes on using it. A record that never
+            // carried one loses that for good at this instant — the engine mints no
+            // digest at `CREATE EVIDENCE`, and after this the bytes it would have
+            // covered are gone. Said out loud rather than papered over with an
+            // engine-invented digest: two engines would have to agree on the exact
+            // bytes for such a digest to mean anything, and a caller minimizing
+            // data should digest before discarding.
+            tx.warn(format!(
+                "{id} carries no content_digest, so its payload purge leaves nothing to verify \
+                 the destroyed bytes against"
+            ));
+        }
 
-    approved.defer(tx);
-    let versions_scrubbed = tx.stage_payload_purge(id).await?;
-    if let Element::Evidence(row) = tx.load(id).await? {
-        crate::store::rows::erase_payload(row);
-    }
-    tx.mark_changed(id, anda_kip::ChangeOp::PayloadPurge);
+        approved.defer(tx);
+        let versions_scrubbed = tx.stage_payload_purge(id).await?;
+        if let Element::Evidence(row) = tx.load(id).await? {
+            crate::store::rows::erase_payload(row);
+        }
+        tx.mark_changed(id, anda_kip::ChangeOp::PayloadPurge);
 
-    tx.defer_governance_audit(MutationEntry {
-        operation: "purge_payload",
-        at: tx.cx.at.clone(),
-        space_id: space_id.to_string(),
-        resource: id.to_string(),
-        principal_id: tx.auth.principal_id.clone(),
-        // The receipt §19.3 permits: enough to audit the erasure, and nothing
-        // of what was erased. The digest was already public — it is what the
-        // surviving record keeps — so naming it here discloses nothing new and
-        // lets an auditor tie the entry to the Evidence it names.
-        record: serde_json::json!({
-            "element": id.to_string(),
-            "content_digest": row.content_digest,
-            "versions_scrubbed": versions_scrubbed,
-            "tx_id": tx.cx.tx_id,
-        }),
-    });
+        tx.defer_governance_audit(MutationEntry {
+            operation: "purge_payload",
+            at: tx.cx.at.clone(),
+            space_id: space_id.to_string(),
+            resource: id.to_string(),
+            principal_id: tx.auth.principal_id.clone(),
+            // The receipt §19.3 permits: enough to audit the erasure, and nothing
+            // of what was erased. The digest was already public — it is what the
+            // surviving record keeps — so naming it here discloses nothing new and
+            // lets an auditor tie the entry to the Evidence it names.
+            record: serde_json::json!({
+                "element": id.to_string(),
+                "content_digest": row.content_digest,
+                "versions_scrubbed": versions_scrubbed,
+                "tx_id": tx.cx.tx_id,
+            }),
+        });
 
-    Ok(PayloadPurgeReport {
-        erased: true,
-        versions_scrubbed,
+        Ok(PayloadPurgeReport {
+            erased: true,
+            versions_scrubbed,
+        })
     })
 }
 

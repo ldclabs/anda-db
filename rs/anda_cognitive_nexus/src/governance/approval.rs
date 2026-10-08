@@ -57,50 +57,52 @@ pub fn subject_digest(
 /// Any other decision passes through untouched: this consumes approvals, it
 /// never manufactures authority. A caller that was denied outright is still
 /// denied however many approvals it collects.
-pub async fn resolve(
+pub fn resolve(
     store: &Store,
     space_id: &str,
     resource: &ResourceContext,
     decision: Authorization,
     auth: &AuthContext,
-) -> Result<Authorization, KipError> {
-    if decision.decision != Decision::RequireApproval {
-        return Ok(decision);
-    }
-    let digest = subject_digest(space_id, decision.permission, resource);
-    let granted = store
-        .governance
-        .granted_approvals(space_id, &digest)
-        .await?;
+) -> impl Future<Output = Result<Authorization, KipError>> + Send {
+    Box::pin(async move {
+        if decision.decision != Decision::RequireApproval {
+            return Ok(decision);
+        }
+        let digest = subject_digest(space_id, decision.permission, resource);
+        let granted = store
+            .governance
+            .granted_approvals(space_id, &digest)
+            .await?;
 
-    let approvers = granted
-        .iter()
-        .flat_map(|row| row.approver_ids.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .len();
-    if (approvers as u64) < decision.obligations.approvals_required {
-        return Ok(Authorization {
+        let approvers = granted
+            .iter()
+            .flat_map(|row| row.approver_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if (approvers as u64) < decision.obligations.approvals_required {
+            return Ok(Authorization {
+                reason: format!(
+                    "{} of {} independent approval(s) recorded for this operation",
+                    approvers, decision.obligations.approvals_required
+                ),
+                ..decision
+            });
+        }
+
+        let used: Vec<String> = granted
+            .iter()
+            .map(|row| super::store::approval_id(row._id))
+            .collect();
+        let _ = auth;
+        Ok(Authorization {
+            decision: Decision::AllowWithConstraints,
             reason: format!(
-                "{} of {} independent approval(s) recorded for this operation",
-                approvers, decision.obligations.approvals_required
+                "{} is approved by {} independent Principal(s)",
+                decision.permission, approvers
             ),
+            authorities_used: [decision.authorities_used, used].concat(),
             ..decision
-        });
-    }
-
-    let used: Vec<String> = granted
-        .iter()
-        .map(|row| super::store::approval_id(row._id))
-        .collect();
-    let _ = auth;
-    Ok(Authorization {
-        decision: Decision::AllowWithConstraints,
-        reason: format!(
-            "{} is approved by {} independent Principal(s)",
-            decision.permission, approvers
-        ),
-        authorities_used: [decision.authorities_used, used].concat(),
-        ..decision
+        })
     })
 }
 
@@ -156,11 +158,13 @@ impl Approved {
     }
 
     /// Spends the approvals, after the authorized operation succeeded.
-    pub async fn spend(self, store: &Store) -> Result<(), KipError> {
-        for id in self.approvals {
-            store.governance.consume_approval(id).await?;
-        }
-        Ok(())
+    pub fn spend(self, store: &Store) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            for id in self.approvals {
+                store.governance.consume_approval(id).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Hands the obligation to a transaction, which spends it at commit.
@@ -173,14 +177,16 @@ impl Approved {
 }
 
 /// Resolves a decision and requires it to permit, in one step.
-pub async fn require(
+pub fn require(
     store: &Store,
     space_id: &str,
     resource: &ResourceContext,
     decision: Authorization,
     auth: &AuthContext,
-) -> Result<Approved, KipError> {
-    Approved::require(resolve(store, space_id, resource, decision, auth).await?)
+) -> impl Future<Output = Result<Approved, KipError>> + Send {
+    Box::pin(
+        async move { Approved::require(resolve(store, space_id, resource, decision, auth).await?) },
+    )
 }
 
 #[cfg(test)]

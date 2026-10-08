@@ -159,32 +159,35 @@ macro_rules! collections {
 
         impl Store {
             /// Opens — creating if absent — every collection the engine needs.
-            pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
-                $(
-                    let $field = Slot::new(
-                        db.open_or_create_collection(
-                            versioned(<$row>::schema().map_err(schema_error)?, $name),
-                            collection_config($name, $description),
-                            $init,
-                        )
-                        .await
-                        .map_err(db_error)?,
-                    );
-                )*
-                let governance = crate::governance::store::GovernanceStore::open(db.clone()).await?;
-                let opened = Self {
-                    db,
-                    governance,
-                    evaluation_rules: crate::evaluation::EvaluationRules::default(),
-                    host_capabilities: Arc::new(parking_lot::RwLock::new(Default::default())),
-                    issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
-                    search_scopes: Arc::new(parking_lot::Mutex::new(Default::default())),
-                    search_corpora: Arc::new(parking_lot::Mutex::new(Default::default())),
-                    $($field,)*
-                    environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
-                };
-                opened.attach_control_notifications();
-                Ok(opened)
+            pub fn open(db: Arc<AndaDB>) -> impl Future<Output = Result<Self, KipError>> + Send {
+                Box::pin(async move {
+                    $(
+                        let $field = Slot::new(
+                            db.open_or_create_collection(
+                                versioned(<$row>::schema().map_err(schema_error)?, $name),
+                                collection_config($name, $description),
+                                $init,
+                            )
+                            .await
+                            .map_err(db_error)?,
+                        );
+                    )*
+                    let governance =
+                        crate::governance::store::GovernanceStore::open(db.clone()).await?;
+                    let opened = Self {
+                        db,
+                        governance,
+                        evaluation_rules: crate::evaluation::EvaluationRules::default(),
+                        host_capabilities: Arc::new(parking_lot::RwLock::new(Default::default())),
+                        issued_cursors: Arc::new(parking_lot::Mutex::new(Default::default())),
+                        search_scopes: Arc::new(parking_lot::Mutex::new(Default::default())),
+                        search_corpora: Arc::new(parking_lot::Mutex::new(Default::default())),
+                        $($field,)*
+                        environments: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+                    };
+                    opened.attach_control_notifications();
+                    Ok(opened)
+                })
             }
 
             /// Reloads every collection handle from storage.
@@ -193,11 +196,13 @@ macro_rules! collections {
             /// healthy handle costs a reload and changes no state. Each setup closure
             /// runs again, reinstalling the sparse index hooks and jieba
             /// tokenizer before the freshly loaded handle recovers mutations.
-            pub async fn reopen(&self) -> Result<(), KipError> {
-                self.search_scopes.lock().clear();
-                self.search_corpora.lock().clear();
-                $(self.$field.set(self.reload($name, $init).await?);)*
-                self.governance.reopen().await
+            pub fn reopen(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+                Box::pin(async move {
+                    self.search_scopes.lock().clear();
+                    self.search_corpora.lock().clear();
+                    $(self.$field.set(self.reload($name, $init).await?);)*
+                    self.governance.reopen().await
+                })
             }
 
             /// Every collection handle, for the passes that touch all of them.
@@ -280,29 +285,34 @@ fn versioned(mut schema: anda_db_schema::Schema, name: &str) -> anda_db_schema::
 /// Rows written before the column existed carry none; building the index
 /// first would leave them out of every lookup through it. A row whose keys
 /// already agree is not rewritten, so this changes no content or version.
-async fn backfill_keys<R>(c: &mut Collection, column: &str) -> Result<(), DBError>
+fn backfill_keys<R>(
+    c: &mut Collection,
+    column: &str,
+) -> impl Future<Output = Result<(), DBError>> + Send
 where
     R: write::Row + serde::de::DeserializeOwned,
 {
-    if c.get_btree_index(&[column]).is_ok() {
-        return Ok(());
-    }
-    for id in c.ids() {
-        let mut row: R = c.get_as(id).await?;
-        let before = serde_json::to_value(&row).ok();
-        row.refresh_index_keys();
-        if serde_json::to_value(&row).ok() != before {
-            let mut document = Document::try_from(c.schema(), &row)?;
-            let mut fields = BTreeMap::new();
-            for name in ["input_keys", "output_keys", "record_keys"] {
-                if let Some(value) = document.remove_field(name) {
-                    fields.insert(name.to_string(), value);
-                }
-            }
-            c.update(id, fields).await?;
+    Box::pin(async move {
+        if c.get_btree_index(&[column]).is_ok() {
+            return Ok(());
         }
-    }
-    Ok(())
+        for id in c.ids() {
+            let mut row: R = c.get_as(id).await?;
+            let before = serde_json::to_value(&row).ok();
+            row.refresh_index_keys();
+            if serde_json::to_value(&row).ok() != before {
+                let mut document = Document::try_from(c.schema(), &row)?;
+                let mut fields = BTreeMap::new();
+                for name in ["input_keys", "output_keys", "record_keys"] {
+                    if let Some(value) = document.remove_field(name) {
+                        fields.insert(name.to_string(), value);
+                    }
+                }
+                c.update(id, fields).await?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Used only for Core elements and the transaction journal. These fields use
@@ -675,15 +685,17 @@ impl Store {
     }
 
     /// Reopens only when something is actually poisoned.
-    pub async fn reopen_if_poisoned(&self) -> Result<(), KipError> {
-        if self.has_poisoned_handle() {
-            self.reopen().await?;
-        }
-        self.recover_commits().await?;
-        if self.governance.control_recovery_needed() {
-            self.governance.recover_control_delivery().await?;
-        }
-        Ok(())
+    pub fn reopen_if_poisoned(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            if self.has_poisoned_handle() {
+                self.reopen().await?;
+            }
+            self.recover_commits().await?;
+            if self.governance.control_recovery_needed() {
+                self.governance.recover_control_delivery().await?;
+            }
+            Ok(())
+        })
     }
 
     /// Flushes every collection, making the transaction's writes durable.

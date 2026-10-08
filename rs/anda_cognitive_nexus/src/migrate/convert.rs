@@ -109,122 +109,125 @@ async fn mutate_handles(
 }
 
 /// Loads everything staged, if anything is outstanding.
-pub(crate) async fn load(nexus: &CognitiveNexus) -> Result<(), KipError> {
-    let Some(staging) = stage::open(&nexus.store.db).await? else {
-        return Ok(());
-    };
-    if stage::is_complete(&staging).await? {
-        repair_completed_commitments(nexus, &staging).await?;
-        return repair_durable_expiry(nexus, &staging).await;
-    }
-
-    let concepts = stage::rows(&staging, LegacyKind::Concept).await?;
-    let propositions = stage::rows(&staging, LegacyKind::Proposition).await?;
-    if concepts.is_empty() && propositions.is_empty() {
-        stage::mark_complete(&staging, json!({"concepts": 0, "propositions": 0})).await?;
-        return Ok(());
-    }
-
-    log::warn!(
-        action = "migrate::load",
-        concepts = concepts.len(),
-        propositions = propositions.len();
-        "loading {} staged KIP 1.x concept(s) and {} proposition row(s) into KIP 2.0",
-        concepts.len(),
-        propositions.len(),
-    );
-
-    // Freeze before installing anything. Resolving against a partially migrated
-    // environment on retry must not change an immutable Package's contents.
-    let frozen = if let Some(frozen) = staging.get_extension_as::<FrozenPlan>("migration_plan_v1") {
-        frozen
-    } else {
-        let mut vocabulary = if let Some(vocabulary) =
-            staging.get_extension_as::<Vocabulary>("migration_vocabulary_v2")
-        {
-            vocabulary
-        } else {
-            let mut vocabulary = Vocabulary::scan(&concepts, &propositions);
-            // Hand every name the Space can already resolve to whoever declares it, so
-            // a 1.x `Person` becomes the host's `Person` rather than a second symbol
-            // spelled the same way. What is left has no owner and is declared below.
-            vocabulary.resolve(&nexus.store.schema_environment(DEFAULT_SPACE).await?);
-            vocabulary.resolve_legacy_endpoints(
-                &nexus.store.schema_environment(DEFAULT_SPACE).await?,
-                &concepts,
-                &propositions,
-            );
-            // The actor every migrated Assertion is attributed to needs a type, and no
-            // type in the cognitive-memory profile means "the engine that imported
-            // this". Generating one keeps the attribution honest without bending
-            // `Person`, which the profile is explicit is never a Principal (§88.1).
-            vocabulary
-                .concept_types
-                .insert(MIGRATION_ACTOR_TYPE.to_string());
-            vocabulary
+pub(crate) fn load(nexus: &CognitiveNexus) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let Some(staging) = stage::open(&nexus.store.db).await? else {
+            return Ok(());
         };
-        vocabulary.freeze_refs();
-        let frozen = FrozenPlan {
-            package: vocabulary.artifact()?,
-            vocabulary,
-        };
-        staging
-            .save_extension_from("migration_plan_v1".to_string(), &frozen)
-            .await
-            .map_err(internal)?;
-        frozen
-    };
-    let vocabulary = frozen.vocabulary;
-    activate_legacy_package(nexus, &vocabulary, &frozen.package).await?;
-
-    let actor = ensure_actor(nexus, &vocabulary).await?;
-    let concept_ids = load_concepts(nexus, &concepts, &vocabulary).await?;
-    let speakers = unambiguous_speakers(&concepts, &concept_ids);
-    let claims = load_propositions(
-        nexus,
-        &propositions,
-        &vocabulary,
-        &concept_ids,
-        &actor,
-        &speakers,
-        &durable_relations(&concepts, &propositions),
-    )
-    .await?;
-    for row in &concepts {
-        let metadata = super::values::lifecycle(&row.doc["metadata"], durable_concept(row));
-        if super::values::archive(&metadata, &crate::time::now()) {
-            run(
-                nexus,
-                "TRANSITION :id TO \"archived\"",
-                Map::from_iter([("id".into(), json!(concept_ids[&row.legacy_id]))]),
-            )
-            .await?;
+        if stage::is_complete(&staging).await? {
+            repair_completed_commitments(nexus, &staging).await?;
+            return repair_durable_expiry(nexus, &staging).await;
         }
-    }
 
-    stage::mark_complete(
-        &staging,
-        json!({
-            "concepts": concept_ids.len(),
-            "proposition_rows": propositions.len(),
-            "assertions": claims,
-            "package": vocabulary.package_ref(),
-            "actor": actor,
-        }),
-    )
-    .await?;
-    repair_completed_commitments(nexus, &staging).await?;
-    repair_durable_expiry(nexus, &staging).await?;
-    log::warn!(
-        action = "migrate::load",
-        concepts = concept_ids.len(),
-        assertions = claims;
-        "KIP 1.x migration complete: {} concept(s), {claims} assertion(s). \
-         The 1.x rows are kept in {}.",
-        concept_ids.len(),
-        stage::LEGACY_STAGING,
-    );
-    Ok(())
+        let concepts = stage::rows(&staging, LegacyKind::Concept).await?;
+        let propositions = stage::rows(&staging, LegacyKind::Proposition).await?;
+        if concepts.is_empty() && propositions.is_empty() {
+            stage::mark_complete(&staging, json!({"concepts": 0, "propositions": 0})).await?;
+            return Ok(());
+        }
+
+        log::warn!(
+            action = "migrate::load",
+            concepts = concepts.len(),
+            propositions = propositions.len();
+            "loading {} staged KIP 1.x concept(s) and {} proposition row(s) into KIP 2.0",
+            concepts.len(),
+            propositions.len(),
+        );
+
+        // Freeze before installing anything. Resolving against a partially migrated
+        // environment on retry must not change an immutable Package's contents.
+        let frozen =
+            if let Some(frozen) = staging.get_extension_as::<FrozenPlan>("migration_plan_v1") {
+                frozen
+            } else {
+                let mut vocabulary = if let Some(vocabulary) =
+                    staging.get_extension_as::<Vocabulary>("migration_vocabulary_v2")
+                {
+                    vocabulary
+                } else {
+                    let mut vocabulary = Vocabulary::scan(&concepts, &propositions);
+                    // Hand every name the Space can already resolve to whoever declares it, so
+                    // a 1.x `Person` becomes the host's `Person` rather than a second symbol
+                    // spelled the same way. What is left has no owner and is declared below.
+                    vocabulary.resolve(&nexus.store.schema_environment(DEFAULT_SPACE).await?);
+                    vocabulary.resolve_legacy_endpoints(
+                        &nexus.store.schema_environment(DEFAULT_SPACE).await?,
+                        &concepts,
+                        &propositions,
+                    );
+                    // The actor every migrated Assertion is attributed to needs a type, and no
+                    // type in the cognitive-memory profile means "the engine that imported
+                    // this". Generating one keeps the attribution honest without bending
+                    // `Person`, which the profile is explicit is never a Principal (§88.1).
+                    vocabulary
+                        .concept_types
+                        .insert(MIGRATION_ACTOR_TYPE.to_string());
+                    vocabulary
+                };
+                vocabulary.freeze_refs();
+                let frozen = FrozenPlan {
+                    package: vocabulary.artifact()?,
+                    vocabulary,
+                };
+                staging
+                    .save_extension_from("migration_plan_v1".to_string(), &frozen)
+                    .await
+                    .map_err(internal)?;
+                frozen
+            };
+        let vocabulary = frozen.vocabulary;
+        activate_legacy_package(nexus, &vocabulary, &frozen.package).await?;
+
+        let actor = ensure_actor(nexus, &vocabulary).await?;
+        let concept_ids = load_concepts(nexus, &concepts, &vocabulary).await?;
+        let speakers = unambiguous_speakers(&concepts, &concept_ids);
+        let claims = load_propositions(
+            nexus,
+            &propositions,
+            &vocabulary,
+            &concept_ids,
+            &actor,
+            &speakers,
+            &durable_relations(&concepts, &propositions),
+        )
+        .await?;
+        for row in &concepts {
+            let metadata = super::values::lifecycle(&row.doc["metadata"], durable_concept(row));
+            if super::values::archive(&metadata, &crate::time::now()) {
+                run(
+                    nexus,
+                    "TRANSITION :id TO \"archived\"",
+                    Map::from_iter([("id".into(), json!(concept_ids[&row.legacy_id]))]),
+                )
+                .await?;
+            }
+        }
+
+        stage::mark_complete(
+            &staging,
+            json!({
+                "concepts": concept_ids.len(),
+                "proposition_rows": propositions.len(),
+                "assertions": claims,
+                "package": vocabulary.package_ref(),
+                "actor": actor,
+            }),
+        )
+        .await?;
+        repair_completed_commitments(nexus, &staging).await?;
+        repair_durable_expiry(nexus, &staging).await?;
+        log::warn!(
+            action = "migrate::load",
+            concepts = concept_ids.len(),
+            assertions = claims;
+            "KIP 1.x migration complete: {} concept(s), {claims} assertion(s). \
+             The 1.x rows are kept in {}.",
+            concept_ids.len(),
+            stage::LEGACY_STAGING,
+        );
+        Ok(())
+    })
 }
 
 /// Fix the old completed -> blocked mapping without replacing later edits.
@@ -321,112 +324,116 @@ fn durable_relations(concepts: &[LegacyRow], propositions: &[LegacyRow]) -> BTre
 /// was imported, or lapsed later and swept, which the sweep records on the
 /// element — because reviving an element archived for any other reason is
 /// what `release` refuses to do. The durable marker makes this one scan.
-async fn repair_durable_expiry(
+fn repair_durable_expiry(
     nexus: &CognitiveNexus,
     staging: &std::sync::Arc<anda_db::collection::Collection>,
-) -> Result<(), KipError> {
-    const MARKER: &str = "durable_expiry_repaired_v1";
-    if staging.get_extension_as::<bool>(MARKER) == Some(true) {
-        return Ok(());
-    }
-    let concepts = stage::rows(staging, LegacyKind::Concept).await?;
-    let propositions = stage::rows(staging, LegacyKind::Proposition).await?;
-    let mut repaired = (0usize, 0usize);
-    for row in concepts.iter().filter(|row| durable_concept(row)) {
-        let key = concept_key(row.legacy_id);
-        let outcome = repair_expiry(
-            nexus,
-            anda_kip::ElementKind::Concept,
-            &key,
-            &row.doc["metadata"],
-        )
-        .await?;
-        repaired.0 += usize::from(outcome.0);
-        repaired.1 += usize::from(outcome.1);
-    }
-    let durable = durable_relations(&concepts, &propositions);
-    for row in propositions
-        .iter()
-        .filter(|row| durable.contains(&row.legacy_id))
-    {
-        for predicate in row.doc["predicates"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Json::as_str)
-        {
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        const MARKER: &str = "durable_expiry_repaired_v1";
+        if staging.get_extension_as::<bool>(MARKER) == Some(true) {
+            return Ok(());
+        }
+        let concepts = stage::rows(staging, LegacyKind::Concept).await?;
+        let propositions = stage::rows(staging, LegacyKind::Proposition).await?;
+        let mut repaired = (0usize, 0usize);
+        for row in concepts.iter().filter(|row| durable_concept(row)) {
+            let key = concept_key(row.legacy_id);
             let outcome = repair_expiry(
                 nexus,
-                anda_kip::ElementKind::Assertion,
-                &proposition_key(row.legacy_id, predicate),
-                super::values::metadata(&row.doc["properties"][predicate]),
+                anda_kip::ElementKind::Concept,
+                &key,
+                &row.doc["metadata"],
             )
             .await?;
             repaired.0 += usize::from(outcome.0);
             repaired.1 += usize::from(outcome.1);
         }
-    }
-    staging
-        .save_extension_from(MARKER.to_string(), &true)
-        .await
-        .map_err(internal)?;
-    if repaired != (0, 0) {
-        log::warn!(
-            action = "migrate::repair_durable_expiry",
-            cleared = repaired.0,
-            restored = repaired.1;
-            "cleared a stamped KIP 1.x TTL from {} durable record(s); restored {}",
-            repaired.0,
-            repaired.1,
-        );
-    }
-    Ok(())
+        let durable = durable_relations(&concepts, &propositions);
+        for row in propositions
+            .iter()
+            .filter(|row| durable.contains(&row.legacy_id))
+        {
+            for predicate in row.doc["predicates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Json::as_str)
+            {
+                let outcome = repair_expiry(
+                    nexus,
+                    anda_kip::ElementKind::Assertion,
+                    &proposition_key(row.legacy_id, predicate),
+                    super::values::metadata(&row.doc["properties"][predicate]),
+                )
+                .await?;
+                repaired.0 += usize::from(outcome.0);
+                repaired.1 += usize::from(outcome.1);
+            }
+        }
+        staging
+            .save_extension_from(MARKER.to_string(), &true)
+            .await
+            .map_err(internal)?;
+        if repaired != (0, 0) {
+            log::warn!(
+                action = "migrate::repair_durable_expiry",
+                cleared = repaired.0,
+                restored = repaired.1;
+                "cleared a stamped KIP 1.x TTL from {} durable record(s); restored {}",
+                repaired.0,
+                repaired.1,
+            );
+        }
+        Ok(())
+    })
 }
 
 /// Repairs one migrated element; reports (retention cleared, archive reversed).
-async fn repair_expiry(
+fn repair_expiry(
     nexus: &CognitiveNexus,
     kind: anda_kip::ElementKind,
     client_key: &str,
     metadata: &Json,
-) -> Result<(bool, bool), KipError> {
-    let stamped = super::values::retention(metadata);
-    let lifecycle = super::values::lifecycle(metadata, true);
-    let kept = super::values::retention(&lifecycle);
-    if stamped == kept {
-        return Ok((false, false));
-    }
-    let Some(id) = nexus
-        .store
-        .find_by_client_key(DEFAULT_SPACE, kind, client_key)
-        .await?
-    else {
-        return Ok((false, false));
-    };
-    let element = nexus.store.get_element(id).await?;
-    let members = |retention: &Json| retention.as_object().cloned().unwrap_or_default();
-    let cleared = members(element.retention()) == members(&kept);
-    if !cleared && element.retention() != &stamped {
-        return Ok((false, false));
-    }
-    let lapsed_at_import = super::values::timestamp(&metadata["expires_at"])
-        .is_some_and(|at| at.as_str() <= element.envelope().created_at.as_str());
-    let swept = element.governance()["retention_lapsed"] == "expired";
-    let restore = element.state() == crate::store::rows::state::ARCHIVED
-        && (lapsed_at_import || swept)
-        && !super::values::archive(&lifecycle, &crate::time::now());
-    if !cleared {
-        let mut parameters = Map::from_iter([("id".into(), json!(id.to_string()))]);
-        let retention = render_assignments(&kept, "r", &mut parameters);
-        run(nexus, &format!("SET RETENTION :id {retention}"), parameters).await?;
-    }
-    if restore {
-        nexus
-            .system_session()
-            .restore_migrated(DEFAULT_SPACE, id)
-            .await?;
-    }
-    Ok((!cleared, restore))
+) -> impl Future<Output = Result<(bool, bool), KipError>> + Send {
+    Box::pin(async move {
+        let stamped = super::values::retention(metadata);
+        let lifecycle = super::values::lifecycle(metadata, true);
+        let kept = super::values::retention(&lifecycle);
+        if stamped == kept {
+            return Ok((false, false));
+        }
+        let Some(id) = nexus
+            .store
+            .find_by_client_key(DEFAULT_SPACE, kind, client_key)
+            .await?
+        else {
+            return Ok((false, false));
+        };
+        let element = nexus.store.get_element(id).await?;
+        let members = |retention: &Json| retention.as_object().cloned().unwrap_or_default();
+        let cleared = members(element.retention()) == members(&kept);
+        if !cleared && element.retention() != &stamped {
+            return Ok((false, false));
+        }
+        let lapsed_at_import = super::values::timestamp(&metadata["expires_at"])
+            .is_some_and(|at| at.as_str() <= element.envelope().created_at.as_str());
+        let swept = element.governance()["retention_lapsed"] == "expired";
+        let restore = element.state() == crate::store::rows::state::ARCHIVED
+            && (lapsed_at_import || swept)
+            && !super::values::archive(&lifecycle, &crate::time::now());
+        if !cleared {
+            let mut parameters = Map::from_iter([("id".into(), json!(id.to_string()))]);
+            let retention = render_assignments(&kept, "r", &mut parameters);
+            run(nexus, &format!("SET RETENTION :id {retention}"), parameters).await?;
+        }
+        if restore {
+            nexus
+                .system_session()
+                .restore_migrated(DEFAULT_SPACE, id)
+                .await?;
+        }
+        Ok((!cleared, restore))
+    })
 }
 
 /// Installs the generated package and adds it to the Space's active lock.
@@ -435,31 +442,33 @@ async fn repair_expiry(
 /// profile is usually already active, and activating only the legacy package
 /// would deactivate the vocabulary everything written since is resolved
 /// against.
-async fn activate_legacy_package(
+fn activate_legacy_package(
     nexus: &CognitiveNexus,
     vocabulary: &Vocabulary,
     artifact: &Json,
-) -> Result<(), KipError> {
-    if vocabulary.is_empty() {
-        return Ok(());
-    }
-    let package = crate::schema::SchemaPackage::parse(&artifact.to_string())?;
-    let package_ref = nexus.install_package(&package, "kip-1.x-migration").await?;
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        if vocabulary.is_empty() {
+            return Ok(());
+        }
+        let package = crate::schema::SchemaPackage::parse(&artifact.to_string())?;
+        let package_ref = nexus.install_package(&package, "kip-1.x-migration").await?;
 
-    let mut lock = nexus
-        .store
-        .schema_environment(DEFAULT_SPACE)
-        .await?
-        .lock
-        .clone();
-    lock.packages.insert(
-        package_ref.package_id.clone(),
-        package_ref.version.to_string(),
-    );
-    lock.states
-        .insert(package_ref.package_id, crate::schema::PackageState::Active);
-    nexus.activate_if_changed(DEFAULT_SPACE, lock).await?;
-    Ok(())
+        let mut lock = nexus
+            .store
+            .schema_environment(DEFAULT_SPACE)
+            .await?
+            .lock
+            .clone();
+        lock.packages.insert(
+            package_ref.package_id.clone(),
+            package_ref.version.to_string(),
+        );
+        lock.states
+            .insert(package_ref.package_id, crate::schema::PackageState::Active);
+        nexus.activate_if_changed(DEFAULT_SPACE, lock).await?;
+        Ok(())
+    })
 }
 
 /// Finds or creates the Concept migrated Assertions are attributed to.
@@ -555,117 +564,120 @@ fn unambiguous_speakers(
 }
 
 /// Creates every staged Concept that is not already there.
-async fn load_concepts(
+fn load_concepts(
     nexus: &CognitiveNexus,
     rows: &[LegacyRow],
     vocabulary: &Vocabulary,
-) -> Result<BTreeMap<u64, String>, KipError> {
-    let environment = nexus.store.schema_environment(DEFAULT_SPACE).await?;
-    let mnemonic = environment
-        .resolve_symbol(
-            crate::schema::SymbolKind::Facet,
-            "MnemonicState",
-            crate::schema::Intent::Write,
-        )
-        .ok()
-        .map(|s| s.to_string());
-    let mut ids = BTreeMap::new();
-    let mut pending: Vec<&LegacyRow> = Vec::new();
-    for row in rows {
-        match find_by_client_key(nexus, &concept_key(row.legacy_id)).await? {
-            Some(id) => {
-                ids.insert(row.legacy_id, id);
+) -> impl Future<Output = Result<BTreeMap<u64, String>, KipError>> + Send {
+    Box::pin(async move {
+        let environment = nexus.store.schema_environment(DEFAULT_SPACE).await?;
+        let mnemonic = environment
+            .resolve_symbol(
+                crate::schema::SymbolKind::Facet,
+                "MnemonicState",
+                crate::schema::Intent::Write,
+            )
+            .ok()
+            .map(|s| s.to_string());
+        let mut ids = BTreeMap::new();
+        let mut pending: Vec<&LegacyRow> = Vec::new();
+        for row in rows {
+            match find_by_client_key(nexus, &concept_key(row.legacy_id)).await? {
+                Some(id) => {
+                    ids.insert(row.legacy_id, id);
+                }
+                None => pending.push(row),
             }
-            None => pending.push(row),
         }
-    }
 
-    for chunk in pending.chunks(BATCH) {
-        let mut clauses = Vec::new();
-        let mut parameters = Map::new();
-        for (index, row) in chunk.iter().enumerate() {
-            let handle = format!("c{index}");
-            let type_name = row
-                .doc
-                .get("type")
-                .and_then(Json::as_str)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| {
+        for chunk in pending.chunks(BATCH) {
+            let mut clauses = Vec::new();
+            let mut parameters = Map::new();
+            for (index, row) in chunk.iter().enumerate() {
+                let handle = format!("c{index}");
+                let type_name = row
+                    .doc
+                    .get("type")
+                    .and_then(Json::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        internal(format!(
+                            "1.x Concept {} has no type; it cannot be given a schema_ref",
+                            row.legacy_id
+                        ))
+                    })?;
+                let symbol = vocabulary.concept_ref(type_name).ok_or_else(|| {
                     internal(format!(
-                        "1.x Concept {} has no type; it cannot be given a schema_ref",
-                        row.legacy_id
+                        "1.x type {type_name:?} is missing from the generated package"
                     ))
                 })?;
-            let symbol = vocabulary.concept_ref(type_name).ok_or_else(|| {
-                internal(format!(
-                    "1.x type {type_name:?} is missing from the generated package"
-                ))
-            })?;
-            let name = row.doc.get("name").and_then(Json::as_str).unwrap_or("");
+                let name = row.doc.get("name").and_then(Json::as_str).unwrap_or("");
 
-            parameters.insert(format!("t{index}"), json!(symbol));
-            parameters.insert(format!("n{index}"), json!(name));
-            parameters.insert(format!("k{index}"), json!(concept_key(row.legacy_id)));
-            let attributes = render_assignments(
-                &super::values::attributes(row, &symbol, &environment)?,
-                &format!("a{index}"),
-                &mut parameters,
-            );
-            // 1.x identity was `(type, name)`, and 2.0's equivalent is a `key`
-            // scoped to the type (§7.3, guide §9). Carrying it over is what
-            // keeps a host's own `UPSERT ... MATCH {type, key}` resolving the
-            // migrated Concept instead of minting a second one beside it.
-            //
-            // `name` stays too, because in 2.0 it is a display label and a 1.x
-            // name was both — dropping it would lose what the old system
-            // actually showed people.
-            parameters.insert(
-                format!("r{index}"),
-                super::values::retention(&super::values::lifecycle(
-                    &row.doc["metadata"],
-                    super::values::durable(type_name),
-                )),
-            );
-            parameters.insert(format!("raw{index}"), row.doc.clone());
-            let identity = if name.is_empty() {
-                format!(" SET FIELDS {{ retention: :r{index} }}")
-            } else {
-                parameters.insert(format!("i{index}"), json!(name));
-                format!(" SET FIELDS {{ key: :i{index}, retention: :r{index} }}")
-            };
-            let mut facets = format!(
-                " SET FACET \"{}/LegacyRecord\" {{ record: :raw{index} }}",
-                vocabulary.package_ref()
-            );
-            if let Some(symbol) = &mnemonic
-                && let Some(state) = super::values::mnemonic(&row.doc["metadata"])
-            {
-                let assignments = render_assignments(&state, &format!("m{index}"), &mut parameters);
-                facets.push_str(&format!(
-                    " SET FACET {} {assignments}",
-                    anda_kip::quote_str(symbol)
+                parameters.insert(format!("t{index}"), json!(symbol));
+                parameters.insert(format!("n{index}"), json!(name));
+                parameters.insert(format!("k{index}"), json!(concept_key(row.legacy_id)));
+                let attributes = render_assignments(
+                    &super::values::attributes(row, &symbol, &environment)?,
+                    &format!("a{index}"),
+                    &mut parameters,
+                );
+                // 1.x identity was `(type, name)`, and 2.0's equivalent is a `key`
+                // scoped to the type (§7.3, guide §9). Carrying it over is what
+                // keeps a host's own `UPSERT ... MATCH {type, key}` resolving the
+                // migrated Concept instead of minting a second one beside it.
+                //
+                // `name` stays too, because in 2.0 it is a display label and a 1.x
+                // name was both — dropping it would lose what the old system
+                // actually showed people.
+                parameters.insert(
+                    format!("r{index}"),
+                    super::values::retention(&super::values::lifecycle(
+                        &row.doc["metadata"],
+                        super::values::durable(type_name),
+                    )),
+                );
+                parameters.insert(format!("raw{index}"), row.doc.clone());
+                let identity = if name.is_empty() {
+                    format!(" SET FIELDS {{ retention: :r{index} }}")
+                } else {
+                    parameters.insert(format!("i{index}"), json!(name));
+                    format!(" SET FIELDS {{ key: :i{index}, retention: :r{index} }}")
+                };
+                let mut facets = format!(
+                    " SET FACET \"{}/LegacyRecord\" {{ record: :raw{index} }}",
+                    vocabulary.package_ref()
+                );
+                if let Some(symbol) = &mnemonic
+                    && let Some(state) = super::values::mnemonic(&row.doc["metadata"])
+                {
+                    let assignments =
+                        render_assignments(&state, &format!("m{index}"), &mut parameters);
+                    facets.push_str(&format!(
+                        " SET FACET {} {assignments}",
+                        anda_kip::quote_str(symbol)
+                    ));
+                }
+                clauses.push(format!(
+                    "CREATE CONCEPT ?{handle} {{ TYPE :t{index} NAME :n{index} \
+                     CLIENT KEY :k{index}{identity} SET ATTRIBUTES {attributes}{facets} }}"
                 ));
             }
-            clauses.push(format!(
-                "CREATE CONCEPT ?{handle} {{ TYPE :t{index} NAME :n{index} \
-                 CLIENT KEY :k{index}{identity} SET ATTRIBUTES {attributes}{facets} }}"
-            ));
+            let handles = mutate_handles(
+                nexus,
+                &format!("MUTATE {{\n{}\n}}", clauses.join("\n")),
+                parameters,
+            )
+            .await?;
+            for (index, row) in chunk.iter().enumerate() {
+                let handle = format!("c{index}");
+                let id = handles
+                    .get(&handle)
+                    .ok_or_else(|| internal(format!("handle {handle} missing from the receipt")))?;
+                ids.insert(row.legacy_id, id.clone());
+            }
         }
-        let handles = mutate_handles(
-            nexus,
-            &format!("MUTATE {{\n{}\n}}", clauses.join("\n")),
-            parameters,
-        )
-        .await?;
-        for (index, row) in chunk.iter().enumerate() {
-            let handle = format!("c{index}");
-            let id = handles
-                .get(&handle)
-                .ok_or_else(|| internal(format!("handle {handle} missing from the receipt")))?;
-            ids.insert(row.legacy_id, id.clone());
-        }
-    }
-    Ok(ids)
+        Ok(ids)
+    })
 }
 
 /// The attributes a migrated Concept carries.

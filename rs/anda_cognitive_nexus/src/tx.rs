@@ -160,20 +160,22 @@ impl Transaction {
     ///
     /// The sequence it would produce is only reserved when it commits a
     /// change; see [`WriteContext::tentative`].
-    pub async fn begin(
+    pub fn begin(
         store: &Store,
         space_id: &str,
         origin: Json,
         dry_run: bool,
         authority: EffectiveAuthority,
         auth: AuthContext,
-    ) -> Result<Self, KipError> {
-        let space = store.get_space(space_id).await?;
-        let env = store
-            .schema_environment_at(space_id, space.schema_environment_version)
-            .await?;
-        let cx = WriteContext::tentative(&space, origin)?;
-        Ok(Self::at_context(store, cx, env, dry_run, authority, auth))
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            let space = store.get_space(space_id).await?;
+            let env = store
+                .schema_environment_at(space_id, space.schema_environment_version)
+                .await?;
+            let cx = WriteContext::tentative(&space, origin)?;
+            Ok(Self::at_context(store, cx, env, dry_run, authority, auth))
+        })
     }
 
     fn at_context(
@@ -222,22 +224,24 @@ impl Transaction {
         }
     }
 
-    pub(crate) async fn inspection(
+    pub(crate) fn inspection(
         store: &Store,
         space: &str,
         authority: EffectiveAuthority,
         auth: AuthContext,
-    ) -> Result<Self, KipError> {
-        let env = store.schema_environment(space).await?;
-        let seq = store.get_space(space).await?.seq;
-        let cx = WriteContext {
-            space: space.into(),
-            tx_id: String::new(),
-            seq: seq.saturating_add(1),
-            at: crate::time::now(),
-            origin: Json::Null,
-        };
-        Ok(Self::at_context(store, cx, env, true, authority, auth))
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            let env = store.schema_environment(space).await?;
+            let seq = store.get_space(space).await?.seq;
+            let cx = WriteContext {
+                space: space.into(),
+                tx_id: String::new(),
+                seq: seq.saturating_add(1),
+                at: crate::time::now(),
+                origin: Json::Null,
+            };
+            Ok(Self::at_context(store, cx, env, true, authority, auth))
+        })
     }
 
     /// Whether this transaction formed the element, before its first commit.
@@ -277,19 +281,21 @@ impl Transaction {
     /// A handle may be declared exactly once (§53.2): two clauses binding `?x`
     /// leave every reference to it ambiguous, and picking either one would be
     /// a guess.
-    pub async fn declare(
+    pub fn declare(
         &mut self,
         handle: &str,
         kind: ElementKind,
-    ) -> Result<ElementId, KipError> {
-        if self.handles.contains_key(handle) {
-            return Err(KipError::duplicate_local_handle(format!(
-                "?{handle} is declared more than once in this mutation block"
-            )));
-        }
-        let id = self.mint_shell(kind).await?;
-        self.handles.insert(handle.to_string(), id);
-        Ok(id)
+    ) -> impl Future<Output = Result<ElementId, KipError>> + Send {
+        Box::pin(async move {
+            if self.handles.contains_key(handle) {
+                return Err(KipError::duplicate_local_handle(format!(
+                    "?{handle} is declared more than once in this mutation block"
+                )));
+            }
+            let id = self.mint_shell(kind).await?;
+            self.handles.insert(handle.to_string(), id);
+            Ok(id)
+        })
     }
 
     /// Claims one explicit position in an ordered structural field.
@@ -389,37 +395,53 @@ impl Transaction {
     }
 
     /// Mints an element with no handle — an anonymous `ENSURE PROPOSITION`.
-    pub async fn mint(&mut self, kind: ElementKind) -> Result<ElementId, KipError> {
-        self.mint_shell(kind).await
+    pub fn mint(
+        &mut self,
+        kind: ElementKind,
+    ) -> impl Future<Output = Result<ElementId, KipError>> + Send {
+        Box::pin(async move { self.mint_shell(kind).await })
     }
 
-    async fn mint_shell(&mut self, kind: ElementKind) -> Result<ElementId, KipError> {
-        let ordinal = self.shells.len();
-        let id = match kind {
-            ElementKind::Concept => self.insert_shell(ConceptRow::default()).await?,
-            ElementKind::Proposition => {
-                // `tuple_key` is unique-indexed, so two default shells would
-                // collide on the empty string before either had a real tuple.
-                self.insert_shell(PropositionRow {
-                    tuple_key: format!("pending:{}:{}:{ordinal}", self.cx.tx_id, self.shell_tag),
-                    ..Default::default()
-                })
-                .await?
-            }
-            ElementKind::Assertion => self.insert_shell(AssertionRow::default()).await?,
-            ElementKind::Evidence => self.insert_shell(EvidenceRow::default()).await?,
-            ElementKind::Activity => self.insert_shell(ActivityRow::default()).await?,
-        };
-        self.shells.push(id);
-        Ok(id)
+    fn mint_shell(
+        &mut self,
+        kind: ElementKind,
+    ) -> impl Future<Output = Result<ElementId, KipError>> + Send {
+        Box::pin(async move {
+            let ordinal = self.shells.len();
+            let id = match kind {
+                ElementKind::Concept => self.insert_shell(ConceptRow::default()).await?,
+                ElementKind::Proposition => {
+                    // `tuple_key` is unique-indexed, so two default shells would
+                    // collide on the empty string before either had a real tuple.
+                    self.insert_shell(PropositionRow {
+                        tuple_key: format!(
+                            "pending:{}:{}:{ordinal}",
+                            self.cx.tx_id, self.shell_tag
+                        ),
+                        ..Default::default()
+                    })
+                    .await?
+                }
+                ElementKind::Assertion => self.insert_shell(AssertionRow::default()).await?,
+                ElementKind::Evidence => self.insert_shell(EvidenceRow::default()).await?,
+                ElementKind::Activity => self.insert_shell(ActivityRow::default()).await?,
+            };
+            self.shells.push(id);
+            Ok(id)
+        })
     }
 
-    async fn insert_shell<R: Row>(&self, mut row: R) -> Result<ElementId, KipError> {
-        // `pending` is the marker that makes crash recovery possible: nothing
-        // reads it, and anything still wearing it belongs to no committed
-        // transaction.
-        *row.envelope_mut().state = state::PENDING.to_string();
-        self.store.insert(&self.cx, &mut row).await
+    fn insert_shell<R: Row>(
+        &self,
+        mut row: R,
+    ) -> impl Future<Output = Result<ElementId, KipError>> + Send {
+        Box::pin(async move {
+            // `pending` is the marker that makes crash recovery possible: nothing
+            // reads it, and anything still wearing it belongs to no committed
+            // transaction.
+            *row.envelope_mut().state = state::PENDING.to_string();
+            self.store.insert(&self.cx, &mut row).await
+        })
     }
 
     /// Binds a handle to an element that already has an id.
@@ -495,17 +517,23 @@ impl Transaction {
     /// Returns how many versions the commit will destroy, read here rather than
     /// again at commit so the number a purge receipt reports is the number of
     /// rows actually erased.
-    pub async fn stage_purge(&mut self, id: ElementId, row: Element) -> Result<usize, KipError> {
-        self.load(id).await?;
-        let versions = self.store.version_ids(&self.cx.space, id).await?;
-        let staged = self.staged.get_mut(&id).expect("loaded above");
-        staged.row = row;
-        staged.changed = true;
-        staged.op = ChangeOp::Purge;
-        staged.keep_origin = true;
-        let destroyed = versions.len();
-        self.purges.insert(id, versions);
-        Ok(destroyed)
+    pub fn stage_purge(
+        &mut self,
+        id: ElementId,
+        row: Element,
+    ) -> impl Future<Output = Result<usize, KipError>> + Send {
+        Box::pin(async move {
+            self.load(id).await?;
+            let versions = self.store.version_ids(&self.cx.space, id).await?;
+            let staged = self.staged.get_mut(&id).expect("loaded above");
+            staged.row = row;
+            staged.changed = true;
+            staged.op = ChangeOp::Purge;
+            staged.keep_origin = true;
+            let destroyed = versions.len();
+            self.purges.insert(id, versions);
+            Ok(destroyed)
+        })
     }
 
     /// Stages a payload purge and defers scrubbing its recorded versions.
@@ -518,12 +546,17 @@ impl Transaction {
     /// Scrubbed, not destroyed: an Evidence record survives a payload purge, so
     /// its lifecycle history survives with it. Only the payload columns go
     /// (§60.6).
-    pub async fn stage_payload_purge(&mut self, id: ElementId) -> Result<usize, KipError> {
-        self.load(id).await?;
-        let versions = self.store.version_ids(&self.cx.space, id).await?;
-        let scrubbed = versions.len();
-        self.payload_purges.insert(id, versions);
-        Ok(scrubbed)
+    pub fn stage_payload_purge(
+        &mut self,
+        id: ElementId,
+    ) -> impl Future<Output = Result<usize, KipError>> + Send {
+        Box::pin(async move {
+            self.load(id).await?;
+            let versions = self.store.version_ids(&self.cx.space, id).await?;
+            let scrubbed = versions.len();
+            self.payload_purges.insert(id, versions);
+            Ok(scrubbed)
+        })
     }
 
     /// Defers spending an approval until this transaction commits successfully.
@@ -550,25 +583,27 @@ impl Transaction {
     ///
     /// An element this same transaction is staging needs no lookup: a
     /// transaction writes into one Space, so anything it mints is in it.
-    async fn check_reference_closure(&self) -> Result<(), KipError> {
-        // Each referenced element is read once, however many rows cite it.
-        let mut referenced: BTreeMap<ElementId, ElementId> = BTreeMap::new();
-        for (id, staged) in &self.staged {
-            if !staged.changed {
-                continue;
-            }
-            for target in staged.row.references() {
-                if !self.staged.contains_key(&target) {
-                    referenced.entry(target).or_insert(*id);
+    fn check_reference_closure(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            // Each referenced element is read once, however many rows cite it.
+            let mut referenced: BTreeMap<ElementId, ElementId> = BTreeMap::new();
+            for (id, staged) in &self.staged {
+                if !staged.changed {
+                    continue;
+                }
+                for target in staged.row.references() {
+                    if !self.staged.contains_key(&target) {
+                        referenced.entry(target).or_insert(*id);
+                    }
                 }
             }
-        }
-        for (target, from) in referenced {
-            self.store
-                .check_same_space(&self.cx.space, from, target)
-                .await?;
-        }
-        Ok(())
+            for (target, from) in referenced {
+                self.store
+                    .check_same_space(&self.cx.space, from, target)
+                    .await?;
+            }
+            Ok(())
+        })
     }
 
     /// Rejects a staged Concept claiming a logical key another Concept of the
@@ -586,46 +621,48 @@ impl Transaction {
     /// earlier version of the same package is the same population, as is one
     /// typed by a draft symbol since promoted into it (§20.16). An empty key
     /// stores "no logical key" and claims nothing.
-    async fn check_concept_key_identity(&self) -> Result<(), KipError> {
-        let mut claimed: Vec<(String, &str)> = Vec::new();
-        for (id, staged) in &self.staged {
-            let Element::Concept(row) = &staged.row else {
-                continue;
-            };
-            if !staged.changed || row.key.is_empty() {
-                continue;
+    fn check_concept_key_identity(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let mut claimed: Vec<(String, &str)> = Vec::new();
+            for (id, staged) in &self.staged {
+                let Element::Concept(row) = &staged.row else {
+                    continue;
+                };
+                if !staged.changed || row.key.is_empty() {
+                    continue;
+                }
+                let claim = (
+                    self.env
+                        .lineage(crate::schema::SymbolKind::ConceptType, &row.schema_ref),
+                    row.key.as_str(),
+                );
+                let conflict = |holder: &str| {
+                    KipError::new(
+                        KipErrorCode::IdentityConflict,
+                        format!(
+                            "the key {:?} already identifies {holder} of type {}; a logical key is \
+                             identity within its type, not a label two Concepts may share",
+                            row.key, row.schema_ref
+                        ),
+                    )
+                };
+                if claimed.contains(&claim) {
+                    return Err(conflict("another Concept in this transaction"));
+                }
+                claimed.push(claim);
+                if let Some(found) = self
+                    .store
+                    .find_concept_by_key(&self.cx.space, &self.env, Some(&row.schema_ref), &row.key)
+                    .await?
+                    && found._id != id.seq
+                {
+                    return Err(conflict(
+                        &ElementId::new(ElementKind::Concept, found._id).to_string(),
+                    ));
+                }
             }
-            let claim = (
-                self.env
-                    .lineage(crate::schema::SymbolKind::ConceptType, &row.schema_ref),
-                row.key.as_str(),
-            );
-            let conflict = |holder: &str| {
-                KipError::new(
-                    KipErrorCode::IdentityConflict,
-                    format!(
-                        "the key {:?} already identifies {holder} of type {}; a logical key is \
-                         identity within its type, not a label two Concepts may share",
-                        row.key, row.schema_ref
-                    ),
-                )
-            };
-            if claimed.contains(&claim) {
-                return Err(conflict("another Concept in this transaction"));
-            }
-            claimed.push(claim);
-            if let Some(found) = self
-                .store
-                .find_concept_by_key(&self.cx.space, &self.env, Some(&row.schema_ref), &row.key)
-                .await?
-                && found._id != id.seq
-            {
-                return Err(conflict(
-                    &ElementId::new(ElementKind::Concept, found._id).to_string(),
-                ));
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Loads an existing element for modification, or returns the staged copy.
@@ -633,27 +670,32 @@ impl Transaction {
     /// Read-your-writes inside the transaction (§32.6): a clause that reads an
     /// element another clause already changed sees the change, because both are
     /// the same staged row.
-    pub async fn load(&mut self, id: ElementId) -> Result<&mut Element, KipError> {
-        if !self.staged.contains_key(&id) {
-            let row = self.store.get_element(id).await?;
-            if row.space() != self.cx.space {
-                return Err(KipError::not_found_or_not_visible(format!(
-                    "{id} lives in another MemorySpace"
-                )));
+    pub fn load(
+        &mut self,
+        id: ElementId,
+    ) -> impl Future<Output = Result<&mut Element, KipError>> + Send {
+        Box::pin(async move {
+            if !self.staged.contains_key(&id) {
+                let row = self.store.get_element(id).await?;
+                if row.space() != self.cx.space {
+                    return Err(KipError::not_found_or_not_visible(format!(
+                        "{id} lives in another MemorySpace"
+                    )));
+                }
+                self.staged.insert(
+                    id,
+                    Staged {
+                        before: Some(row.clone()),
+                        row,
+                        is_new: false,
+                        changed: false,
+                        op: ChangeOp::Update,
+                        keep_origin: false,
+                    },
+                );
             }
-            self.staged.insert(
-                id,
-                Staged {
-                    before: Some(row.clone()),
-                    row,
-                    is_new: false,
-                    changed: false,
-                    op: ChangeOp::Update,
-                    keep_origin: false,
-                },
-            );
-        }
-        Ok(&mut self.staged.get_mut(&id).expect("just inserted").row)
+            Ok(&mut self.staged.get_mut(&id).expect("just inserted").row)
+        })
     }
 
     /// Authorizes one permission over an element this transaction will touch.
@@ -668,18 +710,20 @@ impl Transaction {
     /// what matters is the state the caller is acting on — an element this
     /// transaction has already edited is still governed by the classification it
     /// had when the transaction started.
-    pub async fn authorize_element(
+    pub fn authorize_element(
         &mut self,
         id: ElementId,
         permission: Permission,
-    ) -> Result<(), KipError> {
-        // `of_element` returns owned strings, so the borrow of `self` ends with
-        // this statement and no clone of the row is needed to release it.
-        let resource = ResourceContext::of_element(self.load(id).await?);
-        self.authority
-            .authorize(permission, &resource, &self.auth)
-            .into_result()
-            .map(|_| ())
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            // `of_element` returns owned strings, so the borrow of `self` ends with
+            // this statement and no clone of the row is needed to release it.
+            let resource = ResourceContext::of_element(self.load(id).await?);
+            self.authority
+                .authorize(permission, &resource, &self.auth)
+                .into_result()
+                .map(|_| ())
+        })
     }
 
     /// Authorizes one permission over an element that does not exist yet.
@@ -780,46 +824,49 @@ impl Transaction {
     /// exceed anything; the lineage is what
     /// [`elevate_authority`](crate::governance::element::elevate_authority)
     /// reads when somebody asks to raise it.
-    async fn propagate_governance(&mut self) -> Result<(), KipError> {
-        let sources = self.material_inputs();
-        for (id, inputs) in sources {
-            let Some(staged) = self.staged.get(&id) else {
-                continue;
-            };
-            if !staged.is_new {
-                continue;
-            }
-            let inherited = self.join_classification(&inputs).await?;
-            let Some(staged) = self.staged.get(&id) else {
-                continue;
-            };
-            let own = staged.row.classification().to_string();
-            let default = self.authority.default_classification().to_string();
-            let effective = if own.is_empty() { &default } else { &own };
-            let raised = crate::governance::classification::join(effective, &inherited).to_string();
+    fn propagate_governance(&mut self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let sources = self.material_inputs();
+            for (id, inputs) in sources {
+                let Some(staged) = self.staged.get(&id) else {
+                    continue;
+                };
+                if !staged.is_new {
+                    continue;
+                }
+                let inherited = self.join_classification(&inputs).await?;
+                let Some(staged) = self.staged.get(&id) else {
+                    continue;
+                };
+                let own = staged.row.classification().to_string();
+                let default = self.authority.default_classification().to_string();
+                let effective = if own.is_empty() { &default } else { &own };
+                let raised =
+                    crate::governance::classification::join(effective, &inherited).to_string();
 
-            let Some(staged) = self.staged.get_mut(&id) else {
-                continue;
-            };
-            let envelope = staged.row.governance_mut();
-            let mut block = envelope
-                .as_object()
-                .cloned()
-                .unwrap_or_else(serde_json::Map::new);
-            if raised != default {
-                block.insert("classification".to_string(), Json::from(raised.as_str()));
+                let Some(staged) = self.staged.get_mut(&id) else {
+                    continue;
+                };
+                let envelope = staged.row.governance_mut();
+                let mut block = envelope
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_else(serde_json::Map::new);
+                if raised != default {
+                    block.insert("classification".to_string(), Json::from(raised.as_str()));
+                }
+                if !inputs.is_empty() {
+                    block.insert(
+                        crate::governance::element::LINEAGE_KEY.to_string(),
+                        Json::Array(inputs.iter().map(|id| Json::from(id.to_string())).collect()),
+                    );
+                }
+                if !block.is_empty() {
+                    *envelope = Json::Object(block);
+                }
             }
-            if !inputs.is_empty() {
-                block.insert(
-                    crate::governance::element::LINEAGE_KEY.to_string(),
-                    Json::Array(inputs.iter().map(|id| Json::from(id.to_string())).collect()),
-                );
-            }
-            if !block.is_empty() {
-                *envelope = Json::Object(block);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The material inputs of every new element this transaction stages (§31.2).
@@ -894,25 +941,30 @@ impl Transaction {
     ///
     /// An input that is not there at all is read as the Space default rather
     /// than as unclassified: §31.1 forbids letting absence mean `public`.
-    async fn join_classification(&self, inputs: &[ElementId]) -> Result<String, KipError> {
-        let default = self.authority.default_classification().to_string();
-        let mut joined = default.clone();
-        for input in inputs {
-            let label = match self.staged.get(input) {
-                Some(staged) => staged.row.classification().to_string(),
-                None => match self.store.get_element(*input).await {
-                    Ok(element) => element.classification().to_string(),
-                    Err(_) => String::new(),
-                },
-            };
-            let label = if label.is_empty() {
-                default.clone()
-            } else {
-                label
-            };
-            joined = crate::governance::classification::join(&joined, &label).to_string();
-        }
-        Ok(joined)
+    fn join_classification(
+        &self,
+        inputs: &[ElementId],
+    ) -> impl Future<Output = Result<String, KipError>> + Send {
+        Box::pin(async move {
+            let default = self.authority.default_classification().to_string();
+            let mut joined = default.clone();
+            for input in inputs {
+                let label = match self.staged.get(input) {
+                    Some(staged) => staged.row.classification().to_string(),
+                    None => match self.store.get_element(*input).await {
+                        Ok(element) => element.classification().to_string(),
+                        Err(_) => String::new(),
+                    },
+                };
+                let label = if label.is_empty() {
+                    default.clone()
+                } else {
+                    label
+                };
+                joined = crate::governance::classification::join(&joined, &label).to_string();
+            }
+            Ok(joined)
+        })
     }
 
     /// Marks a staged element as actually changed.
@@ -939,352 +991,361 @@ impl Transaction {
     /// does not spoil it; `EXPECT VERSION 0 OF <plane>` therefore passes
     /// exactly when the plane has never been written (§35.2). A mismatch names
     /// the plane in `details.plane`.
-    pub async fn expect_versions(
+    pub fn expect_versions(
         &mut self,
         id: ElementId,
         guards: &[Guard],
-    ) -> Result<(), KipError> {
-        if guards.is_empty() {
-            return Ok(());
-        }
-        self.load(id).await?;
-        let staged = self.staged.get(&id).expect("loaded above");
-        let (version, planes) = match &staged.before {
-            Some(before) => (before.version(), before.plane_versions()),
-            None => (0, PlaneVersions::default()),
-        };
-        for guard in guards {
-            self.guarded
-                .entry(id)
-                .or_default()
-                .insert(guard.plane.name());
-            let actual = guard.plane.counter(version, &planes);
-            if actual == guard.version {
-                continue;
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            if guards.is_empty() {
+                return Ok(());
             }
-            return Err(match &guard.plane {
-                PlaneKey::Element => KipError::version_conflict(format!(
-                    "{id} is at version {actual}, not the expected {}",
-                    guard.version
-                )),
-                plane => KipError::version_conflict_on_plane(
-                    &plane.name(),
-                    format!(
-                        "{id}'s {} plane is at version {actual}, not the expected {}",
-                        plane.name(),
+            self.load(id).await?;
+            let staged = self.staged.get(&id).expect("loaded above");
+            let (version, planes) = match &staged.before {
+                Some(before) => (before.version(), before.plane_versions()),
+                None => (0, PlaneVersions::default()),
+            };
+            for guard in guards {
+                self.guarded
+                    .entry(id)
+                    .or_default()
+                    .insert(guard.plane.name());
+                let actual = guard.plane.counter(version, &planes);
+                if actual == guard.version {
+                    continue;
+                }
+                return Err(match &guard.plane {
+                    PlaneKey::Element => KipError::version_conflict(format!(
+                        "{id} is at version {actual}, not the expected {}",
                         guard.version
+                    )),
+                    plane => KipError::version_conflict_on_plane(
+                        &plane.name(),
+                        format!(
+                            "{id}'s {} plane is at version {actual}, not the expected {}",
+                            plane.name(),
+                            guard.version
+                        ),
                     ),
-                ),
-            });
-        }
-        Ok(())
+                });
+            }
+            Ok(())
+        })
     }
 
     /// Commits everything staged, or reports what a dry run would have done.
     ///
     /// A dry run never establishes a durable cognitive commit (§69.3), so it
     /// removes its own shells and journals nothing.
-    pub async fn commit(self, entry: JournalEntry) -> Result<Outcome, KipError> {
-        let store = self.store.clone();
-        let shells = self.shells.clone();
-        let mut redo_owned = false;
-        let result = Box::pin(self.commit_inner(entry, &mut redo_owned)).await;
-        if result.is_err() && !redo_owned {
-            for id in shells {
-                let _ = store.elements(id.kind).remove(id.seq).await;
+    pub fn commit(
+        self,
+        entry: JournalEntry,
+    ) -> impl Future<Output = Result<Outcome, KipError>> + Send {
+        Box::pin(async move {
+            let store = self.store.clone();
+            let shells = self.shells.clone();
+            let mut redo_owned = false;
+            let result = Box::pin(self.commit_inner(entry, &mut redo_owned)).await;
+            if result.is_err() && !redo_owned {
+                for id in shells {
+                    let _ = store.elements(id.kind).remove(id.seq).await;
+                }
             }
-        }
-        result
+            result
+        })
     }
 
-    async fn commit_inner(
+    fn commit_inner(
         mut self,
         entry: JournalEntry,
         redo_owned: &mut bool,
-    ) -> Result<Outcome, KipError> {
-        // A failure here leaves no redo intent, so `commit` removes the shells.
-        Box::pin(self.validate_core_schema()).await?;
-        self.propagate_governance().await?;
-        self.check_reference_closure().await?;
-        self.check_concept_key_identity().await?;
-        self.capture_cognitive_contracts().await?;
-        self.validate_learning().await?;
-        self.validate_durable()?;
-        self.capture_erasure_edges().await?;
-        self.validate_erasure().await?;
-        if self.dry_run {
-            let changes: Vec<Json> = self
-                .prepared_changes()
+    ) -> impl Future<Output = Result<Outcome, KipError>> + Send {
+        Box::pin(async move {
+            // A failure here leaves no redo intent, so `commit` removes the shells.
+            Box::pin(self.validate_core_schema()).await?;
+            self.propagate_governance().await?;
+            self.check_reference_closure().await?;
+            self.check_concept_key_identity().await?;
+            self.capture_cognitive_contracts().await?;
+            self.validate_learning().await?;
+            self.validate_durable()?;
+            self.capture_erasure_edges().await?;
+            self.validate_erasure().await?;
+            if self.dry_run {
+                let changes: Vec<Json> = self
+                    .prepared_changes()
+                    .into_iter()
+                    .map(|(_, prepared)| entry_json(&prepared.entry))
+                    .collect();
+                let change_summary = summarize(&changes);
+                self.discard_shells().await;
+                let receipt = Receipt {
+                    status: ReceiptStatus::NoEffect,
+                    tx_id: Some(no_effect_tx_id(&self.cx, "")),
+                    space_id: Some(self.cx.space.clone()),
+                    snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
+                    space_seq: None,
+                    committed_at: None,
+                    transaction_class: Some("cognitive".into()),
+                    request_digest: None,
+                    semantic_plan_digest: None,
+                    result_digest: None,
+                    schema_environment_version: Some(self.env.version),
+                    change_summary: Some(change_summary),
+                    proofs: vec![],
+                    receipt_digest: None,
+                    origin: Some(self.receipt_origin()),
+                    extensions: None,
+                };
+                return Ok(Outcome {
+                    receipt,
+                    handles: self.handles,
+                    changes,
+                    warnings: self.warnings,
+                });
+            }
+
+            // Nothing this transaction touched keeps its shell state, and the
+            // version rule is applied here so that a clause touching one element
+            // five times still produces one increment.
+            let identity_changed = self
+                .staged
+                .values()
+                .any(|s| s.changed && s.op == ChangeOp::Merge)
+                || self.identity_changed;
+            let mut space_effect = None;
+            if identity_changed {
+                let mut space = self.store.get_space(&self.cx.space).await?;
+                let mut versions = space.policies["_kip_identity_changes"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                versions.push(Json::from(self.cx.seq));
+                if !space.policies.is_object() {
+                    space.policies = serde_json::json!({});
+                }
+                space.policies["_kip_identity_changes"] = Json::Array(versions);
+                space_effect = Some(space);
+            }
+            for (id, staged) in &self.staged {
+                if staged.changed
+                    && staged.op == ChangeOp::Merge
+                    && let Element::Concept(row) = &staged.row
+                {
+                    let key = format!("identity:{}:{id}", self.cx.tx_id);
+                    let value = serde_json::json!({
+                        "decision_id": key,
+                        "source": id.to_string(),
+                        "target": row.merged_into,
+                        "actor": self.auth.principal_id,
+                        "basis_seq": self.cx.seq - 1,
+                        "resolution_version": self.cx.seq,
+                        "status": "active",
+                    });
+                    self.control_effects.push(ControlRecordRow {
+                        _id: 0,
+                        record_id: key.clone(),
+                        space: self.cx.space.clone(),
+                        key,
+                        seq: self.cx.seq,
+                        version: 1,
+                        kind: "identity".into(),
+                        value,
+                        origin: self.cx.origin.clone(),
+                    });
+                }
+            }
+            let prepared = self.prepared_changes();
+            let mut changes = Vec::with_capacity(prepared.len());
+            let mut written = 0usize;
+            let mut writes = Vec::new();
+            for (id, prepared) in prepared {
+                let staged = self.staged.remove(&id).expect("prepared from staged");
+                let mut row = staged.row;
+                row.set_plane_versions(&prepared.planes);
+                let row = self.prepare_write(
+                    id,
+                    row,
+                    prepared.entry.new_version,
+                    staged.is_new,
+                    staged.keep_origin,
+                );
+                writes.push((row, prepared.entry.op.as_str().to_string()));
+                changes.push(entry_json(&prepared.entry));
+                written += 1;
+            }
+            self.staged.clear();
+
+            // A shell nobody staged is a handle that was declared and never
+            // filled in — a planning bug rather than data, so it is removed
+            // instead of committed half-formed.
+            self.discard_unstaged_shells(&changes).await;
+
+            let status = if written == 0 && self.control_effects.is_empty() {
+                ReceiptStatus::NoEffect
+            } else {
+                ReceiptStatus::Committed
+            };
+            let transaction_class = if written == 0
+                && self.control_effects.iter().any(|c| {
+                    matches!(
+                        c.kind.as_str(),
+                        "schema" | "identity" | "policy" | "trust" | "authorization"
+                    )
+                }) {
+                "governance"
+            } else if written == 0 && !self.control_effects.is_empty() {
+                "service"
+            } else {
+                "cognitive"
+            };
+            // The response body, journalled rather than only returned: it is what
+            // a resend under the same idempotency key replays, and a journal that
+            // recorded the key but not the answer would let a caller find its
+            // transaction and still not learn what it bound (§34, §33).
+            let mut result = result_body(&self.handles, &changes);
+            if let Some(runtime) = self.runtime_result.take() {
+                result["runtime"] = runtime;
+            }
+            if !self.control_effects.is_empty() {
+                result["control_changes"] = Json::Array(
+                    self.control_effects
+                        .iter()
+                        .filter(|c| {
+                            matches!(
+                                c.kind.as_str(),
+                                "schema"
+                                    | "identity"
+                                    | "policy"
+                                    | "trust"
+                                    | "authorization"
+                                    | "recording"
+                            )
+                        })
+                        .map(|c| serde_json::json!({"kind":c.kind,"version":self.cx.seq.to_string()}))
+                        .collect(),
+                );
+            }
+            let audits = std::mem::take(&mut self.governance_audit)
                 .into_iter()
-                .map(|(_, prepared)| entry_json(&prepared.entry))
+                .map(|entry| crate::governance::rows::GovernanceAuditRow {
+                    entry_class: "mutation".into(),
+                    at: self.cx.at.clone(),
+                    space_id: entry.space_id,
+                    principal_id: entry.principal_id,
+                    operation: entry.operation.into(),
+                    resource: entry.resource,
+                    decision: entry.operation.into(),
+                    record: entry.record,
+                    ..Default::default()
+                })
                 .collect();
-            let change_summary = summarize(&changes);
-            self.discard_shells().await;
+            crate::attention::validate_commit_leases(
+                &self.store,
+                &self.cx.space,
+                &self.auth.principal_id,
+                &self.attention_leases,
+            )
+            .await?;
+            let control_replacements = self.artifact_erasure_replacements().await?;
+            let committed = status == ReceiptStatus::Committed;
+            if committed {
+                // The sequence is taken here, at commit, rather than when the
+                // transaction opened: a dry run, a refused plan and a no-op take
+                // none (§32.8, §69.3). Every Session path that stamps one runs
+                // under the Nexus write lock, so the head has not moved since
+                // `begin` unless a host edited the control plane around it.
+                let head = self.store.get_space(&self.cx.space).await?.seq;
+                if head.checked_add(1) != Some(self.cx.seq) {
+                    // Only an unguarded host control-plane edit can get here; the
+                    // plan names a coordinate somebody else took, so it is refused
+                    // whole and the same request may simply run again.
+                    return Err(KipError::new(
+                        KipErrorCode::SerializationConflict,
+                        format!(
+                            "{} advanced to sequence {head} while transaction {} was open",
+                            self.cx.space, self.cx.tx_id
+                        ),
+                    ));
+                }
+            } else {
+                // A no-op names no coordinate, so its id must not be the one the
+                // next commit will take.
+                self.cx.tx_id = no_effect_tx_id(&self.cx, &entry.idempotency_key);
+                space_effect = None;
+            }
+            let plan = crate::store::control::CommitPlan {
+                cx: self.cx.clone(),
+                journal: JournalEntry {
+                    status: receipt_status_name(status).to_string(),
+                    transaction_class: transaction_class.into(),
+                    schema_environment_version: self.env.version,
+                    changes: changes.clone(),
+                    result,
+                    origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
+                    ..entry
+                },
+                control_replacements,
+                writes,
+                controls: std::mem::take(&mut self.control_effects),
+                space: space_effect,
+                purge_versions: self.purges.values().flatten().copied().collect(),
+                scrub_versions: self.payload_purges.values().flatten().copied().collect(),
+                audits,
+                approvals: std::mem::take(&mut self.approval_decisions)
+                    .into_iter()
+                    .flat_map(Approved::into_ids)
+                    .collect(),
+            };
+            // A no-op is journalled only when something must be able to find it
+            // again — a resend under its key (§34.3) — or it settles approvals
+            // and audit. Otherwise nothing durable happens at all.
+            let journalled = if committed || plan.has_durable_effect() {
+                Some(self.store.commit_plan(plan, redo_owned).await?)
+            } else {
+                self.discard_shells().await;
+                None
+            };
+
+            // §32.8: a transaction that changed nothing reports no cognitive
+            // sequence, however the journal records that it ran.
             let receipt = Receipt {
-                status: ReceiptStatus::NoEffect,
-                tx_id: Some(no_effect_tx_id(&self.cx, "")),
+                status,
+                tx_id: Some(self.cx.tx_id.clone()),
                 space_id: Some(self.cx.space.clone()),
                 snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
-                space_seq: None,
-                committed_at: None,
-                transaction_class: Some("cognitive".into()),
-                request_digest: None,
-                semantic_plan_digest: None,
-                result_digest: None,
+                space_seq: committed.then_some(self.cx.seq),
+                committed_at: committed.then(|| self.cx.at.clone()),
+                transaction_class: Some(
+                    journalled
+                        .as_ref()
+                        .map_or(transaction_class, |row| row.transaction_class.as_str())
+                        .to_string(),
+                ),
+                request_digest: journalled
+                    .as_ref()
+                    .and_then(|row| none_if_empty(row.request_digest.clone())),
+                semantic_plan_digest: journalled
+                    .as_ref()
+                    .and_then(|row| none_if_empty(row.semantic_plan_digest.clone())),
+                result_digest: journalled
+                    .as_ref()
+                    .and_then(|row| none_if_empty(row.result_digest.clone())),
                 schema_environment_version: Some(self.env.version),
-                change_summary: Some(change_summary),
+                change_summary: Some(summarize(&changes)),
                 proofs: vec![],
                 receipt_digest: None,
                 origin: Some(self.receipt_origin()),
                 extensions: None,
             };
-            return Ok(Outcome {
+
+            Ok(Outcome {
                 receipt,
                 handles: self.handles,
                 changes,
                 warnings: self.warnings,
-            });
-        }
-
-        // Nothing this transaction touched keeps its shell state, and the
-        // version rule is applied here so that a clause touching one element
-        // five times still produces one increment.
-        let identity_changed = self
-            .staged
-            .values()
-            .any(|s| s.changed && s.op == ChangeOp::Merge)
-            || self.identity_changed;
-        let mut space_effect = None;
-        if identity_changed {
-            let mut space = self.store.get_space(&self.cx.space).await?;
-            let mut versions = space.policies["_kip_identity_changes"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            versions.push(Json::from(self.cx.seq));
-            if !space.policies.is_object() {
-                space.policies = serde_json::json!({});
-            }
-            space.policies["_kip_identity_changes"] = Json::Array(versions);
-            space_effect = Some(space);
-        }
-        for (id, staged) in &self.staged {
-            if staged.changed
-                && staged.op == ChangeOp::Merge
-                && let Element::Concept(row) = &staged.row
-            {
-                let key = format!("identity:{}:{id}", self.cx.tx_id);
-                let value = serde_json::json!({
-                    "decision_id": key,
-                    "source": id.to_string(),
-                    "target": row.merged_into,
-                    "actor": self.auth.principal_id,
-                    "basis_seq": self.cx.seq - 1,
-                    "resolution_version": self.cx.seq,
-                    "status": "active",
-                });
-                self.control_effects.push(ControlRecordRow {
-                    _id: 0,
-                    record_id: key.clone(),
-                    space: self.cx.space.clone(),
-                    key,
-                    seq: self.cx.seq,
-                    version: 1,
-                    kind: "identity".into(),
-                    value,
-                    origin: self.cx.origin.clone(),
-                });
-            }
-        }
-        let prepared = self.prepared_changes();
-        let mut changes = Vec::with_capacity(prepared.len());
-        let mut written = 0usize;
-        let mut writes = Vec::new();
-        for (id, prepared) in prepared {
-            let staged = self.staged.remove(&id).expect("prepared from staged");
-            let mut row = staged.row;
-            row.set_plane_versions(&prepared.planes);
-            let row = self.prepare_write(
-                id,
-                row,
-                prepared.entry.new_version,
-                staged.is_new,
-                staged.keep_origin,
-            );
-            writes.push((row, prepared.entry.op.as_str().to_string()));
-            changes.push(entry_json(&prepared.entry));
-            written += 1;
-        }
-        self.staged.clear();
-
-        // A shell nobody staged is a handle that was declared and never
-        // filled in — a planning bug rather than data, so it is removed
-        // instead of committed half-formed.
-        self.discard_unstaged_shells(&changes).await;
-
-        let status = if written == 0 && self.control_effects.is_empty() {
-            ReceiptStatus::NoEffect
-        } else {
-            ReceiptStatus::Committed
-        };
-        let transaction_class = if written == 0
-            && self.control_effects.iter().any(|c| {
-                matches!(
-                    c.kind.as_str(),
-                    "schema" | "identity" | "policy" | "trust" | "authorization"
-                )
-            }) {
-            "governance"
-        } else if written == 0 && !self.control_effects.is_empty() {
-            "service"
-        } else {
-            "cognitive"
-        };
-        // The response body, journalled rather than only returned: it is what
-        // a resend under the same idempotency key replays, and a journal that
-        // recorded the key but not the answer would let a caller find its
-        // transaction and still not learn what it bound (§34, §33).
-        let mut result = result_body(&self.handles, &changes);
-        if let Some(runtime) = self.runtime_result.take() {
-            result["runtime"] = runtime;
-        }
-        if !self.control_effects.is_empty() {
-            result["control_changes"] = Json::Array(
-                self.control_effects
-                    .iter()
-                    .filter(|c| {
-                        matches!(
-                            c.kind.as_str(),
-                            "schema"
-                                | "identity"
-                                | "policy"
-                                | "trust"
-                                | "authorization"
-                                | "recording"
-                        )
-                    })
-                    .map(|c| serde_json::json!({"kind":c.kind,"version":self.cx.seq.to_string()}))
-                    .collect(),
-            );
-        }
-        let audits = std::mem::take(&mut self.governance_audit)
-            .into_iter()
-            .map(|entry| crate::governance::rows::GovernanceAuditRow {
-                entry_class: "mutation".into(),
-                at: self.cx.at.clone(),
-                space_id: entry.space_id,
-                principal_id: entry.principal_id,
-                operation: entry.operation.into(),
-                resource: entry.resource,
-                decision: entry.operation.into(),
-                record: entry.record,
-                ..Default::default()
             })
-            .collect();
-        crate::attention::validate_commit_leases(
-            &self.store,
-            &self.cx.space,
-            &self.auth.principal_id,
-            &self.attention_leases,
-        )
-        .await?;
-        let control_replacements = self.artifact_erasure_replacements().await?;
-        let committed = status == ReceiptStatus::Committed;
-        if committed {
-            // The sequence is taken here, at commit, rather than when the
-            // transaction opened: a dry run, a refused plan and a no-op take
-            // none (§32.8, §69.3). Every Session path that stamps one runs
-            // under the Nexus write lock, so the head has not moved since
-            // `begin` unless a host edited the control plane around it.
-            let head = self.store.get_space(&self.cx.space).await?.seq;
-            if head.checked_add(1) != Some(self.cx.seq) {
-                // Only an unguarded host control-plane edit can get here; the
-                // plan names a coordinate somebody else took, so it is refused
-                // whole and the same request may simply run again.
-                return Err(KipError::new(
-                    KipErrorCode::SerializationConflict,
-                    format!(
-                        "{} advanced to sequence {head} while transaction {} was open",
-                        self.cx.space, self.cx.tx_id
-                    ),
-                ));
-            }
-        } else {
-            // A no-op names no coordinate, so its id must not be the one the
-            // next commit will take.
-            self.cx.tx_id = no_effect_tx_id(&self.cx, &entry.idempotency_key);
-            space_effect = None;
-        }
-        let plan = crate::store::control::CommitPlan {
-            cx: self.cx.clone(),
-            journal: JournalEntry {
-                status: receipt_status_name(status).to_string(),
-                transaction_class: transaction_class.into(),
-                schema_environment_version: self.env.version,
-                changes: changes.clone(),
-                result,
-                origin: serde_json::to_value(self.receipt_origin()).unwrap_or(Json::Null),
-                ..entry
-            },
-            control_replacements,
-            writes,
-            controls: std::mem::take(&mut self.control_effects),
-            space: space_effect,
-            purge_versions: self.purges.values().flatten().copied().collect(),
-            scrub_versions: self.payload_purges.values().flatten().copied().collect(),
-            audits,
-            approvals: std::mem::take(&mut self.approval_decisions)
-                .into_iter()
-                .flat_map(Approved::into_ids)
-                .collect(),
-        };
-        // A no-op is journalled only when something must be able to find it
-        // again — a resend under its key (§34.3) — or it settles approvals
-        // and audit. Otherwise nothing durable happens at all.
-        let journalled = if committed || plan.has_durable_effect() {
-            Some(self.store.commit_plan(plan, redo_owned).await?)
-        } else {
-            self.discard_shells().await;
-            None
-        };
-
-        // §32.8: a transaction that changed nothing reports no cognitive
-        // sequence, however the journal records that it ran.
-        let receipt = Receipt {
-            status,
-            tx_id: Some(self.cx.tx_id.clone()),
-            space_id: Some(self.cx.space.clone()),
-            snapshot_seq: Some(self.cx.seq.saturating_sub(1)),
-            space_seq: committed.then_some(self.cx.seq),
-            committed_at: committed.then(|| self.cx.at.clone()),
-            transaction_class: Some(
-                journalled
-                    .as_ref()
-                    .map_or(transaction_class, |row| row.transaction_class.as_str())
-                    .to_string(),
-            ),
-            request_digest: journalled
-                .as_ref()
-                .and_then(|row| none_if_empty(row.request_digest.clone())),
-            semantic_plan_digest: journalled
-                .as_ref()
-                .and_then(|row| none_if_empty(row.semantic_plan_digest.clone())),
-            result_digest: journalled
-                .as_ref()
-                .and_then(|row| none_if_empty(row.result_digest.clone())),
-            schema_environment_version: Some(self.env.version),
-            change_summary: Some(summarize(&changes)),
-            proofs: vec![],
-            receipt_digest: None,
-            origin: Some(self.receipt_origin()),
-            extensions: None,
-        };
-
-        Ok(Outcome {
-            receipt,
-            handles: self.handles,
-            changes,
-            warnings: self.warnings,
         })
     }
 
@@ -1302,105 +1363,107 @@ impl Transaction {
         }));
     }
 
-    async fn capture_cognitive_contracts(&mut self) -> Result<(), KipError> {
-        for staged in self
-            .staged
-            .values_mut()
-            .filter(|s| s.changed && s.op != ChangeOp::Purge)
-        {
-            let referenced: BTreeSet<String> = staged
-                .row
-                .references()
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect();
-            // One entry per distinct resolution the element carries: every
-            // clause that named the same reference records its own binding,
-            // and attaching all of them to each citing element grows the audit
-            // quadratically with the statement.
-            let mut seen = BTreeSet::new();
-            let bindings: Vec<Json> = self
-                .reference_bindings
-                .iter()
-                .filter(|binding| {
-                    binding["resolved"]
-                        .as_str()
-                        .is_some_and(|id| referenced.contains(id))
-                        && seen.insert((
-                            binding["supplied"].as_str().unwrap_or_default().to_string(),
-                            binding["resolved"].as_str().unwrap_or_default().to_string(),
-                        ))
-                })
-                .cloned()
-                .collect();
-            if !bindings.is_empty() {
-                let origin = staged.row.envelope_mut().origin;
-                if !origin.is_object() {
-                    *origin = serde_json::json!({});
-                }
-                if !origin["_kip_runtime"].is_object() {
-                    origin["_kip_runtime"] = serde_json::json!({});
-                }
-                origin["_kip_runtime"]["input_references"] = Json::Array(bindings);
-            }
-        }
-        let pending: Vec<_> = self
-            .staged
-            .iter()
-            .filter(|(_, s)| s.changed)
-            .map(|(id, s)| (*id, s.row.clone(), s.before.clone()))
-            .collect();
-        for (id, element, before) in pending {
-            if element.state() == state::PURGED {
-                continue;
-            }
-            let view = crate::view::render(&element);
-            let old_view = before.as_ref().map(crate::view::render);
-            crate::schema::contracts::validate_record_with_intent(
-                &self.env,
-                &view,
-                old_view.as_ref(),
-                if self.cx.origin.get("import").is_some() {
-                    crate::schema::Intent::Read
-                } else {
-                    crate::schema::Intent::Write
-                },
-            )?;
-            self.validate_revalidation(&element).await?;
-            let Element::Activity(activity) = element else {
-                continue;
-            };
-            if !matches!(
-                activity.status.as_str(),
-                "completed" | "failed" | "cancelled"
-            ) {
-                continue;
-            }
-            if matches!(before, Some(Element::Activity(ref row)) if matches!(row.status.as_str(), "completed" | "failed" | "cancelled"))
+    fn capture_cognitive_contracts(&mut self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            for staged in self
+                .staged
+                .values_mut()
+                .filter(|s| s.changed && s.op != ChangeOp::Purge)
             {
-                continue;
-            }
-            let contract = activity
-                .facets
-                .iter()
-                .find(|(name, _)| name.ends_with("/DependencyBasis"))
-                .map(|(_, value)| value);
-            let mut inputs = Map::new();
-            if let Some(contract) = contract {
-                let seq = contract["basis_seq"].as_u64().ok_or_else(|| {
-                    KipError::constraint_violation("DependencyBasis needs basis_seq")
-                })?;
-                if seq > self.cx.seq.saturating_sub(1) {
-                    return Err(KipError::constraint_violation(
-                        "DependencyBasis cannot name a future snapshot",
-                    ));
+                let referenced: BTreeSet<String> = staged
+                    .row
+                    .references()
+                    .into_iter()
+                    .map(|id| id.to_string())
+                    .collect();
+                // One entry per distinct resolution the element carries: every
+                // clause that named the same reference records its own binding,
+                // and attaching all of them to each citing element grows the audit
+                // quadratically with the statement.
+                let mut seen = BTreeSet::new();
+                let bindings: Vec<Json> = self
+                    .reference_bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding["resolved"]
+                            .as_str()
+                            .is_some_and(|id| referenced.contains(id))
+                            && seen.insert((
+                                binding["supplied"].as_str().unwrap_or_default().to_string(),
+                                binding["resolved"].as_str().unwrap_or_default().to_string(),
+                            ))
+                    })
+                    .cloned()
+                    .collect();
+                if !bindings.is_empty() {
+                    let origin = staged.row.envelope_mut().origin;
+                    if !origin.is_object() {
+                        *origin = serde_json::json!({});
+                    }
+                    if !origin["_kip_runtime"].is_object() {
+                        origin["_kip_runtime"] = serde_json::json!({});
+                    }
+                    origin["_kip_runtime"]["input_references"] = Json::Array(bindings);
                 }
-                for group in contract["groups"].as_array().into_iter().flatten() {
-                    for pin in group["pins"].as_array().into_iter().flatten() {
-                        let source = pin["id"].as_str().unwrap_or("").parse::<ElementId>()?;
-                        let expected = pin["version"].as_u64().unwrap_or(0);
-                        let retained =
-                            if let Some(staged) = self.staged.get(&source).filter(|s| s.is_new) {
+            }
+            let pending: Vec<_> = self
+                .staged
+                .iter()
+                .filter(|(_, s)| s.changed)
+                .map(|(id, s)| (*id, s.row.clone(), s.before.clone()))
+                .collect();
+            for (id, element, before) in pending {
+                if element.state() == state::PURGED {
+                    continue;
+                }
+                let view = crate::view::render(&element);
+                let old_view = before.as_ref().map(crate::view::render);
+                crate::schema::contracts::validate_record_with_intent(
+                    &self.env,
+                    &view,
+                    old_view.as_ref(),
+                    if self.cx.origin.get("import").is_some() {
+                        crate::schema::Intent::Read
+                    } else {
+                        crate::schema::Intent::Write
+                    },
+                )?;
+                self.validate_revalidation(&element).await?;
+                let Element::Activity(activity) = element else {
+                    continue;
+                };
+                if !matches!(
+                    activity.status.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) {
+                    continue;
+                }
+                if matches!(before, Some(Element::Activity(ref row)) if matches!(row.status.as_str(), "completed" | "failed" | "cancelled"))
+                {
+                    continue;
+                }
+                let contract = activity
+                    .facets
+                    .iter()
+                    .find(|(name, _)| name.ends_with("/DependencyBasis"))
+                    .map(|(_, value)| value);
+                let mut inputs = Map::new();
+                if let Some(contract) = contract {
+                    let seq = contract["basis_seq"].as_u64().ok_or_else(|| {
+                        KipError::constraint_violation("DependencyBasis needs basis_seq")
+                    })?;
+                    if seq > self.cx.seq.saturating_sub(1) {
+                        return Err(KipError::constraint_violation(
+                            "DependencyBasis cannot name a future snapshot",
+                        ));
+                    }
+                    for group in contract["groups"].as_array().into_iter().flatten() {
+                        for pin in group["pins"].as_array().into_iter().flatten() {
+                            let source = pin["id"].as_str().unwrap_or("").parse::<ElementId>()?;
+                            let expected = pin["version"].as_u64().unwrap_or(0);
+                            let retained = if let Some(staged) =
+                                self.staged.get(&source).filter(|s| s.is_new)
+                            {
                                 let mut value = crate::view::render(&staged.row);
                                 value["_system"]["version"] = Json::from(1);
                                 value["_system"]["plane_versions"] =
@@ -1425,87 +1488,90 @@ impl Transaction {
                                     .into_result()?;
                                 crate::view::render(&row)
                             };
-                        if retained["_system"]["version"].as_u64() != Some(expected) {
-                            return Err(KipError::version_conflict(
-                                "DependencyBasis must pin the version actually read",
-                            ));
-                        }
-                        if let Some(pins) = pin["planes"].as_object() {
-                            for (plane, version) in pins {
-                                if crate::schema::contracts::pinned_plane(
-                                    &retained["_system"]["plane_versions"],
-                                    plane,
-                                ) != version.as_u64()
-                                {
-                                    return Err(KipError::version_conflict(
-                                        "DependencyBasis plane pin does not match retained input",
-                                    ));
+                            if retained["_system"]["version"].as_u64() != Some(expected) {
+                                return Err(KipError::version_conflict(
+                                    "DependencyBasis must pin the version actually read",
+                                ));
+                            }
+                            if let Some(pins) = pin["planes"].as_object() {
+                                for (plane, version) in pins {
+                                    if crate::schema::contracts::pinned_plane(
+                                        &retained["_system"]["plane_versions"],
+                                        plane,
+                                    ) != version.as_u64()
+                                    {
+                                        return Err(KipError::version_conflict(
+                                            "DependencyBasis plane pin does not match retained input",
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        if let Some(old) = inputs.insert(source.to_string(), Json::from(expected))
-                            && old != expected
-                        {
-                            return Err(KipError::constraint_violation(
-                                "conflicting DependencyBasis pins",
-                            ));
+                            if let Some(old) =
+                                inputs.insert(source.to_string(), Json::from(expected))
+                                && old != expected
+                            {
+                                return Err(KipError::constraint_violation(
+                                    "conflicting DependencyBasis pins",
+                                ));
+                            }
                         }
                     }
                 }
+                for reference in &activity.inputs {
+                    let Some(source) = element_reference(reference) else {
+                        continue;
+                    };
+                    if inputs.contains_key(&source.to_string()) {
+                        continue;
+                    }
+                    if contract.is_some() {
+                        return Err(KipError::constraint_violation(
+                            "derived Activity input is missing its read pin",
+                        ));
+                    }
+                    let version = if let Some(staged) = self.staged.get(&source) {
+                        staged.before.as_ref().map_or(1, Element::version)
+                    } else {
+                        self.store.get_element(source).await?.version()
+                    };
+                    inputs.insert(source.to_string(), Json::from(version));
+                }
+                let mut outputs = Map::new();
+                for reference in &activity.outputs {
+                    let Some(target) = element_reference(reference) else {
+                        continue;
+                    };
+                    if !activity.inputs.is_empty() {
+                        let output = self.final_element(target).await?;
+                        self.authority
+                            .authorize(
+                                Permission::Derive,
+                                &ResourceContext::of_element(&output),
+                                &self.auth,
+                            )
+                            .into_result()?;
+                    }
+                    let version =
+                        if let Some(staged) = self.staged.get(&target).filter(|s| s.changed) {
+                            prepare(target, staged).entry.new_version
+                        } else {
+                            self.store.get_element(target).await?.version()
+                        };
+                    outputs.insert(target.to_string(), Json::from(version));
+                }
+                if let Element::Activity(row) = &mut self.staged.get_mut(&id).unwrap().row {
+                    if !row.origin.is_object() {
+                        row.origin = serde_json::json!({});
+                    }
+                    if !row.origin["_kip_runtime"].is_object() {
+                        row.origin["_kip_runtime"] = serde_json::json!({});
+                    }
+                    row.origin["_kip_runtime"]["input_versions"] = Json::Object(inputs);
+                    row.origin["_kip_runtime"]["output_versions"] = Json::Object(outputs);
+                }
             }
-            for reference in &activity.inputs {
-                let Some(source) = element_reference(reference) else {
-                    continue;
-                };
-                if inputs.contains_key(&source.to_string()) {
-                    continue;
-                }
-                if contract.is_some() {
-                    return Err(KipError::constraint_violation(
-                        "derived Activity input is missing its read pin",
-                    ));
-                }
-                let version = if let Some(staged) = self.staged.get(&source) {
-                    staged.before.as_ref().map_or(1, Element::version)
-                } else {
-                    self.store.get_element(source).await?.version()
-                };
-                inputs.insert(source.to_string(), Json::from(version));
-            }
-            let mut outputs = Map::new();
-            for reference in &activity.outputs {
-                let Some(target) = element_reference(reference) else {
-                    continue;
-                };
-                if !activity.inputs.is_empty() {
-                    let output = self.final_element(target).await?;
-                    self.authority
-                        .authorize(
-                            Permission::Derive,
-                            &ResourceContext::of_element(&output),
-                            &self.auth,
-                        )
-                        .into_result()?;
-                }
-                let version = if let Some(staged) = self.staged.get(&target).filter(|s| s.changed) {
-                    prepare(target, staged).entry.new_version
-                } else {
-                    self.store.get_element(target).await?.version()
-                };
-                outputs.insert(target.to_string(), Json::from(version));
-            }
-            if let Element::Activity(row) = &mut self.staged.get_mut(&id).unwrap().row {
-                if !row.origin.is_object() {
-                    row.origin = serde_json::json!({});
-                }
-                if !row.origin["_kip_runtime"].is_object() {
-                    row.origin["_kip_runtime"] = serde_json::json!({});
-                }
-                row.origin["_kip_runtime"]["input_versions"] = Json::Object(inputs);
-                row.origin["_kip_runtime"]["output_versions"] = Json::Object(outputs);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Who this commit is attributed to (§33.2).
@@ -1522,8 +1588,10 @@ impl Transaction {
     /// Not a rollback in the durable sense — there is no log to unwind — but
     /// the only durable thing a failed statement wrote is its shells, and they
     /// were never visible.
-    pub async fn abort(mut self) {
-        self.discard_shells().await;
+    pub fn abort(mut self) -> impl Future<Output = ()> + Send {
+        Box::pin(async move {
+            self.discard_shells().await;
+        })
     }
 
     /// Writes one staged row, stamping the engine truth the transaction owns.
@@ -1582,24 +1650,28 @@ impl Transaction {
         }
     }
 
-    async fn discard_shells(&mut self) {
-        for id in std::mem::take(&mut self.shells) {
-            // Best effort: a shell that survives is inert and swept on open.
-            let _ = self.store.elements(id.kind).remove(id.seq).await;
-        }
-    }
-
-    async fn discard_unstaged_shells(&mut self, changes: &[Json]) {
-        let written: BTreeSet<String> = changes
-            .iter()
-            .filter_map(|change| change.get("id")?.as_str().map(str::to_string))
-            .collect();
-        let shells = std::mem::take(&mut self.shells);
-        for id in shells {
-            if !written.contains(&id.to_string()) {
+    fn discard_shells(&mut self) -> impl Future<Output = ()> + Send {
+        Box::pin(async move {
+            for id in std::mem::take(&mut self.shells) {
+                // Best effort: a shell that survives is inert and swept on open.
                 let _ = self.store.elements(id.kind).remove(id.seq).await;
             }
-        }
+        })
+    }
+
+    fn discard_unstaged_shells(&mut self, changes: &[Json]) -> impl Future<Output = ()> + Send {
+        Box::pin(async move {
+            let written: BTreeSet<String> = changes
+                .iter()
+                .filter_map(|change| change.get("id")?.as_str().map(str::to_string))
+                .collect();
+            let shells = std::mem::take(&mut self.shells);
+            for id in shells {
+                if !written.contains(&id.to_string()) {
+                    let _ = self.store.elements(id.kind).remove(id.seq).await;
+                }
+            }
+        })
     }
 
     /// The change entry and counters each changed element will commit with.
@@ -1859,29 +1931,31 @@ impl Store {
     /// A pending element belongs to no committed transaction: it was minted as
     /// a shell by a run that crashed before commit. Nothing ever read it, so
     /// removing it is the whole of the recovery.
-    pub async fn sweep_pending(&self) -> Result<usize, KipError> {
-        let mut removed = 0;
-        for kind in [
-            ElementKind::Concept,
-            ElementKind::Proposition,
-            ElementKind::Assertion,
-            ElementKind::Evidence,
-            ElementKind::Activity,
-        ] {
-            let collection = self.elements(kind);
-            let ids = collection
-                .query_all_ids(crate::store::eq_field(
-                    "state",
-                    anda_db_schema::Fv::Text(state::PENDING.to_string()),
-                ))
-                .await
-                .map_err(db_error)?;
-            for id in ids {
-                collection.remove(id).await.map_err(db_error)?;
-                removed += 1;
+    pub fn sweep_pending(&self) -> impl Future<Output = Result<usize, KipError>> + Send {
+        Box::pin(async move {
+            let mut removed = 0;
+            for kind in [
+                ElementKind::Concept,
+                ElementKind::Proposition,
+                ElementKind::Assertion,
+                ElementKind::Evidence,
+                ElementKind::Activity,
+            ] {
+                let collection = self.elements(kind);
+                let ids = collection
+                    .query_all_ids(crate::store::eq_field(
+                        "state",
+                        anda_db_schema::Fv::Text(state::PENDING.to_string()),
+                    ))
+                    .await
+                    .map_err(db_error)?;
+                for id in ids {
+                    collection.remove(id).await.map_err(db_error)?;
+                    removed += 1;
+                }
             }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     }
 }
 

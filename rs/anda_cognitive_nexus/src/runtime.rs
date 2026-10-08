@@ -192,223 +192,230 @@ impl TaskLease {
 }
 
 impl Session {
-    async fn check_dispatch(
+    fn check_dispatch(
         &self,
         space: &str,
         request: &anda_kip::cognitive::DispatchRequest,
-    ) -> Result<Json, KipError> {
-        let store = &self.nexus.store;
-        let authority = self.effective_authority(space).await?;
-        let task = store.get_element(request.task_ref.parse()?).await?;
-        let task_view = crate::view::render(&task);
-        let lease = TaskLease::read(facet(&task, "LeaseState")?)?;
-        let lease_expiry = crate::time::normalize(&lease.expires_at, "lease expires_at")?;
-        if task.space() != space
-            || task_view["attributes"]["status"] != "running"
-            || lease.owner != self.auth.principal_id
-            || lease.fencing_token != request.fencing_token
-            || lease_expiry <= crate::time::now()
-        {
-            return Err(KipError::version_conflict(
-                "dispatch requires the current unexpired lease fence",
-            ));
-        }
-        authority
-            .authorize(
-                Permission::Update,
-                &ResourceContext::of_element(&task),
-                &self.auth,
-            )
-            .into_result()?;
-        self.check_attention_attempt(space, &request.attempt_ref)
-            .await
-    }
-
-    pub(crate) async fn check_attention_attempt(
-        &self,
-        space: &str,
-        attempt_ref: &str,
-    ) -> Result<Json, KipError> {
-        let store = &self.nexus.store;
-        let authority = self.effective_authority(space).await?;
-        let activity = store.get_element(attempt_ref.parse()?).await?;
-        authority
-            .authorize(
-                Permission::Read,
-                &ResourceContext::of_element(&activity),
-                &self.auth,
-            )
-            .into_result()?;
-        if activity.envelope().origin.get("import").is_some()
-            || activity.space() != space
-            || activity.state() != state::ACTIVE
-        {
-            return Err(KipError::not_found_or_not_visible("attempt unavailable"));
-        }
-        let attempt = facet(&activity, "AttemptRecord")?;
-        store
-            .artifact_value(space, &attempt["selection_policy"])
-            .await?;
-        if let Some(trial_ref) = attempt["trial_ref"].as_str() {
-            let trial = store.get_element(trial_ref.parse()?).await?;
-            let trial = facet(&trial, "TrialRecord")?;
-            let key = format!(
-                "evaluation_policy/{}",
-                trial["evaluation_policy"]["id"].as_str().unwrap_or("")
-            );
-            let policy = store
-                .control_at(space, &key, u64::MAX)
-                .await?
-                .ok_or_else(|| KipError::not_authorized("current evaluation policy unavailable"))?;
-            let rules = policy.value["allowed_rules"].as_array();
-            let params = policy.value["allowed_parameters"].as_array();
-            if !rules.is_some_and(|r| r.contains(&trial["rule"]["content_digest"]))
-                || !params.is_some_and(|r| r.contains(&trial["parameters"]["content_digest"]))
-                || policy.value["observer_control_digest"]
-                    != trial["comparability"]["observer_control_digest"]
-                || trial["quota"].as_u64() < policy.value["minimum_independent_attempts"].as_u64()
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            let store = &self.nexus.store;
+            let authority = self.effective_authority(space).await?;
+            let task = store.get_element(request.task_ref.parse()?).await?;
+            let task_view = crate::view::render(&task);
+            let lease = TaskLease::read(facet(&task, "LeaseState")?)?;
+            let lease_expiry = crate::time::normalize(&lease.expires_at, "lease expires_at")?;
+            if task.space() != space
+                || task_view["attributes"]["status"] != "running"
+                || lease.owner != self.auth.principal_id
+                || lease.fencing_token != request.fencing_token
+                || lease_expiry <= crate::time::now()
             {
-                return Err(KipError::not_authorized(
-                    "current policy no longer authorizes trial dispatch",
-                ));
-            }
-        }
-        if attempt["preconditions_satisfied"] != "yes" {
-            return Err(KipError::constraint_violation(
-                "attempt preconditions are not satisfied",
-            ));
-        }
-        let decision = store
-            .get_element(attempt["decision_ref"].as_str().unwrap_or("").parse()?)
-            .await?;
-        authority
-            .authorize(
-                Permission::Read,
-                &ResourceContext::of_element(&decision),
-                &self.auth,
-            )
-            .into_result()?;
-        let record = facet(&decision, "DecisionRecord")?;
-        let mut settings = Map::new();
-        settings.insert(
-            "context_refs".into(),
-            record["basis"]["context_refs"].clone(),
-        );
-        settings.insert("purpose".into(), record["basis"]["purpose"].clone());
-        settings.insert("risk".into(), record["basis"]["risk"].clone());
-        let policy = store
-            .projection_policy_at(space, u64::MAX, &settings)
-            .await?;
-        let mut cx = Context::open(store, space, None, None, &authority, &self.auth).await?;
-        let basis = serde_json::to_value(cx.projection_basis(&policy, &cx.at, None)).unwrap();
-        for key in [
-            "schema_environment_version",
-            "identity_version",
-            "policy",
-            "trust_version",
-            "authorization_view",
-            "context_refs",
-            "purpose",
-            "risk",
-        ] {
-            if basis[key] != record["basis"][key] {
                 return Err(KipError::version_conflict(
-                    "action decision basis changed; re-plan before dispatch",
+                    "dispatch requires the current unexpired lease fence",
                 ));
             }
-        }
-        for reference in attempt["applied_revisions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let id = reference.as_str().unwrap_or("").parse()?;
-            let revision = store.get_element(id).await?;
-            let decision = authority
+            authority
                 .authorize(
-                    Permission::Read,
-                    &ResourceContext::of_element(&revision),
+                    Permission::Update,
+                    &ResourceContext::of_element(&task),
                     &self.auth,
                 )
                 .into_result()?;
-            if revision.envelope().governance["authority_class"] != "executable"
-                || (!decision.constraints.max_influence_authority.is_empty()
-                    && crate::governance::authority::rank(
-                        &decision.constraints.max_influence_authority,
-                    ) < crate::governance::authority::rank("executable"))
+            self.check_attention_attempt(space, &request.attempt_ref)
+                .await
+        })
+    }
+
+    pub(crate) fn check_attention_attempt(
+        &self,
+        space: &str,
+        attempt_ref: &str,
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            let store = &self.nexus.store;
+            let authority = self.effective_authority(space).await?;
+            let activity = store.get_element(attempt_ref.parse()?).await?;
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&activity),
+                    &self.auth,
+                )
+                .into_result()?;
+            if activity.envelope().origin.get("import").is_some()
+                || activity.space() != space
+                || activity.state() != state::ACTIVE
             {
-                return Err(KipError::not_authorized(
-                    "exact revision lacks executable authority in this scope",
-                ));
+                return Err(KipError::not_found_or_not_visible("attempt unavailable"));
             }
-            let family = revision
-                .structural()
-                .get(&format!("{PROFILE}revision_of"))
-                .and_then(Json::as_array)
-                .and_then(|r| r.first())
-                .and_then(crate::term::reference_text)
-                .ok_or_else(|| KipError::constraint_violation("revision family unavailable"))?;
-            let family = store.get_element(family.parse()?).await?;
-            if !family
-                .structural()
-                .get(&format!("{PROFILE}current_revision"))
-                .and_then(Json::as_array)
-                .is_some_and(|r| {
-                    r.iter()
-                        .any(|r| crate::term::reference_text(r) == reference.as_str())
-                })
-            {
-                return Err(KipError::version_conflict(
-                    "selected revision is no longer current",
-                ));
-            }
-            let at = cx.at.clone();
-            let validity = cx.dependency_validity(&revision, &policy, &at).await?;
-            if validity["action_eligible"] != true {
-                return Err(KipError::version_conflict(
-                    "revision dependency validity changed",
-                ));
-            }
-        }
-        let contract = facet(&decision, "DependencyBasis")?;
-        for group in contract["groups"].as_array().into_iter().flatten() {
-            if group["role"] == "context" {
-                continue;
-            }
-            let mut members = vec![];
-            for pin in group["pins"].as_array().into_iter().flatten() {
-                let source = store
-                    .get_element(pin["id"].as_str().unwrap_or("").parse()?)
-                    .await?;
-                let version_ok =
-                    if let Some(planes) = pin["planes"].as_object().filter(|p| !p.is_empty()) {
-                        planes.iter().all(|(key, expected)| {
-                            crate::schema::contracts::pinned_plane(
-                                &serde_json::to_value(source.plane_versions()).unwrap(),
-                                key,
-                            ) == expected.as_u64()
-                        })
-                    } else {
-                        pin["version"].as_u64() == Some(source.version())
-                    };
-                let at = cx.at.clone();
-                members.push(
-                    version_ok
-                        && cx.dependency_validity(&source, &policy, &at).await?["action_eligible"]
-                            == true,
+            let attempt = facet(&activity, "AttemptRecord")?;
+            store
+                .artifact_value(space, &attempt["selection_policy"])
+                .await?;
+            if let Some(trial_ref) = attempt["trial_ref"].as_str() {
+                let trial = store.get_element(trial_ref.parse()?).await?;
+                let trial = facet(&trial, "TrialRecord")?;
+                let key = format!(
+                    "evaluation_policy/{}",
+                    trial["evaluation_policy"]["id"].as_str().unwrap_or("")
                 );
+                let policy = store
+                    .control_at(space, &key, u64::MAX)
+                    .await?
+                    .ok_or_else(|| {
+                        KipError::not_authorized("current evaluation policy unavailable")
+                    })?;
+                let rules = policy.value["allowed_rules"].as_array();
+                let params = policy.value["allowed_parameters"].as_array();
+                if !rules.is_some_and(|r| r.contains(&trial["rule"]["content_digest"]))
+                    || !params.is_some_and(|r| r.contains(&trial["parameters"]["content_digest"]))
+                    || policy.value["observer_control_digest"]
+                        != trial["comparability"]["observer_control_digest"]
+                    || trial["quota"].as_u64()
+                        < policy.value["minimum_independent_attempts"].as_u64()
+                {
+                    return Err(KipError::not_authorized(
+                        "current policy no longer authorizes trial dispatch",
+                    ));
+                }
             }
-            if members.is_empty()
-                || (if group["role"] == "any_of" {
-                    !members.iter().any(|v| *v)
-                } else {
-                    !members.iter().all(|v| *v)
-                })
+            if attempt["preconditions_satisfied"] != "yes" {
+                return Err(KipError::constraint_violation(
+                    "attempt preconditions are not satisfied",
+                ));
+            }
+            let decision = store
+                .get_element(attempt["decision_ref"].as_str().unwrap_or("").parse()?)
+                .await?;
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&decision),
+                    &self.auth,
+                )
+                .into_result()?;
+            let record = facet(&decision, "DecisionRecord")?;
+            let mut settings = Map::new();
+            settings.insert(
+                "context_refs".into(),
+                record["basis"]["context_refs"].clone(),
+            );
+            settings.insert("purpose".into(), record["basis"]["purpose"].clone());
+            settings.insert("risk".into(), record["basis"]["risk"].clone());
+            let policy = store
+                .projection_policy_at(space, u64::MAX, &settings)
+                .await?;
+            let mut cx = Context::open(store, space, None, None, &authority, &self.auth).await?;
+            let basis = serde_json::to_value(cx.projection_basis(&policy, &cx.at, None)).unwrap();
+            for key in [
+                "schema_environment_version",
+                "identity_version",
+                "policy",
+                "trust_version",
+                "authorization_view",
+                "context_refs",
+                "purpose",
+                "risk",
+            ] {
+                if basis[key] != record["basis"][key] {
+                    return Err(KipError::version_conflict(
+                        "action decision basis changed; re-plan before dispatch",
+                    ));
+                }
+            }
+            for reference in attempt["applied_revisions"]
+                .as_array()
+                .into_iter()
+                .flatten()
             {
-                return Err(KipError::version_conflict("action prerequisite changed"));
+                let id = reference.as_str().unwrap_or("").parse()?;
+                let revision = store.get_element(id).await?;
+                let decision = authority
+                    .authorize(
+                        Permission::Read,
+                        &ResourceContext::of_element(&revision),
+                        &self.auth,
+                    )
+                    .into_result()?;
+                if revision.envelope().governance["authority_class"] != "executable"
+                    || (!decision.constraints.max_influence_authority.is_empty()
+                        && crate::governance::authority::rank(
+                            &decision.constraints.max_influence_authority,
+                        ) < crate::governance::authority::rank("executable"))
+                {
+                    return Err(KipError::not_authorized(
+                        "exact revision lacks executable authority in this scope",
+                    ));
+                }
+                let family = revision
+                    .structural()
+                    .get(&format!("{PROFILE}revision_of"))
+                    .and_then(Json::as_array)
+                    .and_then(|r| r.first())
+                    .and_then(crate::term::reference_text)
+                    .ok_or_else(|| KipError::constraint_violation("revision family unavailable"))?;
+                let family = store.get_element(family.parse()?).await?;
+                if !family
+                    .structural()
+                    .get(&format!("{PROFILE}current_revision"))
+                    .and_then(Json::as_array)
+                    .is_some_and(|r| {
+                        r.iter()
+                            .any(|r| crate::term::reference_text(r) == reference.as_str())
+                    })
+                {
+                    return Err(KipError::version_conflict(
+                        "selected revision is no longer current",
+                    ));
+                }
+                let at = cx.at.clone();
+                let validity = cx.dependency_validity(&revision, &policy, &at).await?;
+                if validity["action_eligible"] != true {
+                    return Err(KipError::version_conflict(
+                        "revision dependency validity changed",
+                    ));
+                }
             }
-        }
-        Ok(attempt.clone())
+            let contract = facet(&decision, "DependencyBasis")?;
+            for group in contract["groups"].as_array().into_iter().flatten() {
+                if group["role"] == "context" {
+                    continue;
+                }
+                let mut members = vec![];
+                for pin in group["pins"].as_array().into_iter().flatten() {
+                    let source = store
+                        .get_element(pin["id"].as_str().unwrap_or("").parse()?)
+                        .await?;
+                    let version_ok =
+                        if let Some(planes) = pin["planes"].as_object().filter(|p| !p.is_empty()) {
+                            planes.iter().all(|(key, expected)| {
+                                crate::schema::contracts::pinned_plane(
+                                    &serde_json::to_value(source.plane_versions()).unwrap(),
+                                    key,
+                                ) == expected.as_u64()
+                            })
+                        } else {
+                            pin["version"].as_u64() == Some(source.version())
+                        };
+                    let at = cx.at.clone();
+                    members.push(
+                        version_ok
+                            && cx.dependency_validity(&source, &policy, &at).await?["action_eligible"]
+                                == true,
+                    );
+                }
+                if members.is_empty()
+                    || (if group["role"] == "any_of" {
+                        !members.iter().any(|v| *v)
+                    } else {
+                        !members.iter().all(|v| *v)
+                    })
+                {
+                    return Err(KipError::version_conflict("action prerequisite changed"));
+                }
+            }
+            Ok(attempt.clone())
+        })
     }
 
     pub async fn enqueue_dispatch(
@@ -449,96 +456,100 @@ impl Session {
 
     /// Call immediately before external I/O. The returned key is the original
     /// attempt_id. A lost response does not authorize a fresh external attempt.
-    pub async fn begin_dispatch(
+    pub fn begin_dispatch(
         &self,
         space: &str,
         attempt_id: &str,
         expected: u64,
         fencing_token: u64,
-    ) -> Result<Json, KipError> {
-        self.governed(space, Permission::Maintain, async || {
-            let key = format!("dispatch/{attempt_id}");
-            let row = self
-                .nexus
-                .store
-                .control_at(space, &key, u64::MAX)
-                .await?
-                .ok_or_else(|| KipError::not_found_or_not_visible("dispatch intent unavailable"))?;
-            if row.version != expected {
-                return Err(KipError::version_conflict(
-                    "dispatch intent version changed",
-                ));
-            }
-            let mut request: anda_kip::cognitive::DispatchRequest =
-                serde_json::from_value(row.value["request"].clone())
-                    .map_err(|e| KipError::internal_error(e.to_string()))?;
-            let authority = self.effective_authority(space).await?;
-            let attempt = self
-                .nexus
-                .store
-                .get_element(request.attempt_ref.parse()?)
-                .await?;
-            authority
-                .authorize(
-                    Permission::Read,
-                    &ResourceContext::of_element(&attempt),
-                    &self.auth,
-                )
-                .into_result()?;
-            if row.value["state"] == "completed" {
-                return Ok(json!({
-                    "action": "done",
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            self.governed(space, Permission::Maintain, async || {
+                let key = format!("dispatch/{attempt_id}");
+                let row = self
+                    .nexus
+                    .store
+                    .control_at(space, &key, u64::MAX)
+                    .await?
+                    .ok_or_else(|| {
+                        KipError::not_found_or_not_visible("dispatch intent unavailable")
+                    })?;
+                if row.version != expected {
+                    return Err(KipError::version_conflict(
+                        "dispatch intent version changed",
+                    ));
+                }
+                let mut request: anda_kip::cognitive::DispatchRequest =
+                    serde_json::from_value(row.value["request"].clone())
+                        .map_err(|e| KipError::internal_error(e.to_string()))?;
+                let authority = self.effective_authority(space).await?;
+                let attempt = self
+                    .nexus
+                    .store
+                    .get_element(request.attempt_ref.parse()?)
+                    .await?;
+                authority
+                    .authorize(
+                        Permission::Read,
+                        &ResourceContext::of_element(&attempt),
+                        &self.auth,
+                    )
+                    .into_result()?;
+                if row.value["state"] == "completed" {
+                    return Ok(json!({
+                        "action": "done",
+                        "idempotency_key": attempt_id,
+                        "intent": row.value,
+                        "version": row.version,
+                    }));
+                }
+                if row.value["state"] == "outcome_unknown" {
+                    return Ok(json!({
+                        "action": "outcome_unknown",
+                        "idempotency_key": attempt_id,
+                        "version": row.version,
+                    }));
+                }
+                if fencing_token < request.fencing_token {
+                    return Err(KipError::version_conflict("stale dispatch fence"));
+                }
+                request.fencing_token = fencing_token;
+                self.check_dispatch(space, &request).await?;
+                let action = if row.value["state"] == "ready" || request.supports_idempotency {
+                    "dispatch"
+                } else if request.supports_outcome_lookup {
+                    "lookup"
+                } else {
+                    "outcome_unknown"
+                };
+                let mut value = row.value;
+                value["request"] = serde_json::to_value(&request).unwrap();
+                value["state"] = json!(if action == "outcome_unknown" {
+                    "outcome_unknown"
+                } else {
+                    "dispatching"
+                });
+                let saved = self
+                    .nexus
+                    .store
+                    .publish_control(
+                        space,
+                        &key,
+                        "dispatch",
+                        expected,
+                        value,
+                        json!({"principal_id":self.auth.principal_id}),
+                    )
+                    .await?;
+                Ok(json!({
+                    "action": action,
                     "idempotency_key": attempt_id,
-                    "intent": row.value,
-                    "version": row.version,
-                }));
-            }
-            if row.value["state"] == "outcome_unknown" {
-                return Ok(json!({
-                    "action": "outcome_unknown",
-                    "idempotency_key": attempt_id,
-                    "version": row.version,
-                }));
-            }
-            if fencing_token < request.fencing_token {
-                return Err(KipError::version_conflict("stale dispatch fence"));
-            }
-            request.fencing_token = fencing_token;
-            self.check_dispatch(space, &request).await?;
-            let action = if row.value["state"] == "ready" || request.supports_idempotency {
-                "dispatch"
-            } else if request.supports_outcome_lookup {
-                "lookup"
-            } else {
-                "outcome_unknown"
-            };
-            let mut value = row.value;
-            value["request"] = serde_json::to_value(&request).unwrap();
-            value["state"] = json!(if action == "outcome_unknown" {
-                "outcome_unknown"
-            } else {
-                "dispatching"
-            });
-            let saved = self
-                .nexus
-                .store
-                .publish_control(
-                    space,
-                    &key,
-                    "dispatch",
-                    expected,
-                    value,
-                    json!({"principal_id":self.auth.principal_id}),
-                )
-                .await?;
-            Ok(json!({
-                "action": action,
-                "idempotency_key": attempt_id,
-                "intent": saved.value,
-                "version": saved.version,
-            }))
+                    "intent": saved.value,
+                    "version": saved.version,
+                }))
+            })
+            .await
         })
-        .await
     }
 
     /// Reconcile with a recorded instrument observation; no external retry is
@@ -599,24 +610,26 @@ impl Session {
         })
         .await
     }
-    pub async fn change_page(
+    pub fn change_page(
         &self,
         space: &str,
         after: u64,
         limit: usize,
-    ) -> Result<Json, KipError> {
-        let _guard = self.nexus.read_guard().await?;
-        let authority = self.effective_authority(space).await?;
-        authority
-            .authorize(
-                Permission::ReadHistory,
-                &ResourceContext::default(),
-                &self.auth,
-            )
-            .into_result()?;
-        let mut cx =
-            Context::open(&self.nexus.store, space, None, None, &authority, &self.auth).await?;
-        crate::meta::history::change_page(&mut cx, after, limit).await
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            let _guard = self.nexus.read_guard().await?;
+            let authority = self.effective_authority(space).await?;
+            authority
+                .authorize(
+                    Permission::ReadHistory,
+                    &ResourceContext::default(),
+                    &self.auth,
+                )
+                .into_result()?;
+            let mut cx =
+                Context::open(&self.nexus.store, space, None, None, &authority, &self.auth).await?;
+            crate::meta::history::change_page(&mut cx, after, limit).await
+        })
     }
 
     /// Initial claim, renewal, or takeover after expiry. Expected version is

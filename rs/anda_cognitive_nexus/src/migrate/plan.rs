@@ -78,27 +78,31 @@ impl MigrationPlan {
 ///
 /// `Ok(None)` means there is no 1.x layout here — a fresh database, or one
 /// already migrated.
-pub async fn plan(db: &Arc<AndaDB>) -> Result<Option<MigrationPlan>, KipError> {
-    // A dry run after an interrupted migration should describe the work that
-    // is actually left, which by then lives in staging rather than under the
-    // 1.x names.
-    let rows = match stage::read_live_v1(db).await? {
-        Some(rows) => Some(rows),
-        None => match stage::open(db).await? {
-            Some(staging) if !stage::is_complete(&staging).await? => Some((
-                stage::rows(&staging, LegacyKind::Concept).await?,
-                stage::rows(&staging, LegacyKind::Proposition).await?,
-            )),
-            _ => None,
-        },
-    };
-    let Some((concepts, propositions)) = rows else {
-        return Ok(None);
-    };
-    if concepts.is_empty() && propositions.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(build(&concepts, &propositions)))
+pub fn plan(
+    db: &Arc<AndaDB>,
+) -> impl Future<Output = Result<Option<MigrationPlan>, KipError>> + Send {
+    Box::pin(async move {
+        // A dry run after an interrupted migration should describe the work that
+        // is actually left, which by then lives in staging rather than under the
+        // 1.x names.
+        let rows = match stage::read_live_v1(db).await? {
+            Some(rows) => Some(rows),
+            None => match stage::open(db).await? {
+                Some(staging) if !stage::is_complete(&staging).await? => Some((
+                    stage::rows(&staging, LegacyKind::Concept).await?,
+                    stage::rows(&staging, LegacyKind::Proposition).await?,
+                )),
+                _ => None,
+            },
+        };
+        let Some((concepts, propositions)) = rows else {
+            return Ok(None);
+        };
+        if concepts.is_empty() && propositions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(build(&concepts, &propositions)))
+    })
 }
 
 fn build(concepts: &[LegacyRow], propositions: &[LegacyRow]) -> MigrationPlan {

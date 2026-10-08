@@ -305,96 +305,100 @@ impl EffectiveAuthority {
     /// identity the control plane has never heard of has a configuration bug,
     /// and resolving it to "some caller with no Grants" would hide that bug
     /// behind a denial that looks like policy.
-    pub async fn resolve(
+    pub fn resolve(
         store: &Store,
         space_id: &str,
         auth: &AuthContext,
-    ) -> Result<Self, KipError> {
-        Self::resolve_at_depth(
-            store,
-            space_id,
-            &auth.principal_id,
-            &auth.delegation_chain,
-            0,
-        )
-        .await
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            Self::resolve_at_depth(
+                store,
+                space_id,
+                &auth.principal_id,
+                &auth.delegation_chain,
+                0,
+            )
+            .await
+        })
     }
 
-    async fn resolve_at_depth(
+    fn resolve_at_depth(
         store: &Store,
         space_id: &str,
         principal_id: &str,
         delegation_chain: &[String],
         depth: usize,
-    ) -> Result<Self, KipError> {
-        let governance = &store.governance;
-        let space = store.get_space(space_id).await?;
-        let principal = governance
-            .find_principal(principal_id)
-            .await?
-            .ok_or_else(|| {
-                KipError::unauthenticated(format!(
-                    "no Principal {principal_id:?} is registered in this Nexus"
-                ))
-            })?;
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            let governance = &store.governance;
+            let space = store.get_space(space_id).await?;
+            let principal = governance
+                .find_principal(principal_id)
+                .await?
+                .ok_or_else(|| {
+                    KipError::unauthenticated(format!(
+                        "no Principal {principal_id:?} is registered in this Nexus"
+                    ))
+                })?;
 
-        // A suspended or revoked Principal keeps its record and loses its
-        // authority. Returning an empty candidate set rather than an error
-        // means the refusal reads as "not permitted", which is what it is.
-        let live = principal.status == status::ACTIVE;
-        let groups = if live {
-            governance.groups_of(principal_id).await?
-        } else {
-            Vec::new()
-        };
-        let is_owner = live
-            && (space.owner_principal == principal_id
-                || space.owners.iter().any(|owner| owner == principal_id));
-
-        let mut candidates = Vec::new();
-        if live {
-            if delegation_chain.is_empty() {
-                for grant in governance
-                    .grants_for(space_id, principal_id, &groups)
-                    .await?
-                {
-                    candidates.push(candidate_of_grant(&grant)?);
-                }
-                for delegation in governance.delegations_to(space_id, principal_id).await? {
-                    if let Some(candidate) =
-                        resolve_delegation(store, space_id, &delegation, depth).await?
-                    {
-                        candidates.push(candidate);
-                    }
-                }
+            // A suspended or revoked Principal keeps its record and loses its
+            // authority. Returning an empty candidate set rather than an error
+            // means the refusal reads as "not permitted", which is what it is.
+            let live = principal.status == status::ACTIVE;
+            let groups = if live {
+                governance.groups_of(principal_id).await?
             } else {
-                candidates.extend(
-                    resolve_named_chain(store, space_id, principal_id, delegation_chain, depth)
-                        .await?,
-                );
+                Vec::new()
+            };
+            let is_owner = live
+                && (space.owner_principal == principal_id
+                    || space.owners.iter().any(|owner| owner == principal_id));
+
+            let mut candidates = Vec::new();
+            if live {
+                if delegation_chain.is_empty() {
+                    for grant in governance
+                        .grants_for(space_id, principal_id, &groups)
+                        .await?
+                    {
+                        candidates.push(candidate_of_grant(&grant)?);
+                    }
+                    for delegation in governance.delegations_to(space_id, principal_id).await? {
+                        if let Some(candidate) =
+                            resolve_delegation(store, space_id, &delegation, depth).await?
+                        {
+                            candidates.push(candidate);
+                        }
+                    }
+                } else {
+                    candidates.extend(
+                        resolve_named_chain(store, space_id, principal_id, delegation_chain, depth)
+                            .await?,
+                    );
+                }
             }
-        }
 
-        let policy = if space.default_policy_id.is_empty() {
-            None
-        } else {
-            governance.active_policy(&space.default_policy_id).await?
-        };
-        let bindings = if live {
-            governance.bindings_of(principal_id, space_id).await?
-        } else {
-            Vec::new()
-        };
+            let policy = if space.default_policy_id.is_empty() {
+                None
+            } else {
+                governance.active_policy(&space.default_policy_id).await?
+            };
+            let bindings = if live {
+                governance.bindings_of(principal_id, space_id).await?
+            } else {
+                Vec::new()
+            };
 
-        Ok(Self {
-            space,
-            principal,
-            groups,
-            is_owner,
-            statements: statements_of(policy.as_ref()),
-            policy,
-            bindings,
-            candidates,
+            Ok(Self {
+                space,
+                principal,
+                groups,
+                is_owner,
+                statements: statements_of(policy.as_ref()),
+                policy,
+                bindings,
+                candidates,
+            })
         })
     }
 
@@ -410,75 +414,78 @@ impl EffectiveAuthority {
     /// delegator, because reconstructing a whole historical chain would need
     /// the delegator's historical Grants recursively; the report says so rather
     /// than implying a precision it does not have.
-    pub async fn resolve_at(
+    pub fn resolve_at(
         store: &Store,
         space_id: &str,
         auth: &AuthContext,
         at: &str,
-    ) -> Result<Self, KipError> {
-        let governance = &store.governance;
-        let current_space = store.get_space(space_id).await?;
-        let space = governance.space_at(&current_space, at).await?;
-        let principal = governance
-            .principal_at(&auth.principal_id, at)
-            .await?
-            .ok_or_else(|| {
-                KipError::unauthenticated(format!(
-                    "no Principal {:?} existed at {at}",
-                    auth.principal_id
-                ))
-            })?;
-        let live = principal.status == status::ACTIVE;
-        let groups = if live {
-            governance.groups_of_at(&auth.principal_id, at).await?
-        } else {
-            Vec::new()
-        };
-        let is_owner = live
-            && (space.owner_principal == auth.principal_id
-                || space.owners.iter().any(|owner| owner == &auth.principal_id));
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            let governance = &store.governance;
+            let current_space = store.get_space(space_id).await?;
+            let space = governance.space_at(&current_space, at).await?;
+            let principal = governance
+                .principal_at(&auth.principal_id, at)
+                .await?
+                .ok_or_else(|| {
+                    KipError::unauthenticated(format!(
+                        "no Principal {:?} existed at {at}",
+                        auth.principal_id
+                    ))
+                })?;
+            let live = principal.status == status::ACTIVE;
+            let groups = if live {
+                governance.groups_of_at(&auth.principal_id, at).await?
+            } else {
+                Vec::new()
+            };
+            let is_owner = live
+                && (space.owner_principal == auth.principal_id
+                    || space.owners.iter().any(|owner| owner == &auth.principal_id));
 
-        let mut candidates = Vec::new();
-        if live {
-            for grant in governance
-                .grants_at(space_id, &auth.principal_id, &groups, at)
-                .await?
-            {
-                candidates.push(candidate_of_grant(&grant)?);
-            }
-            for delegation in governance
-                .delegations_at(space_id, &auth.principal_id, at)
-                .await?
-            {
-                if let Some(candidate) = resolve_delegation(store, space_id, &delegation, 0).await?
+            let mut candidates = Vec::new();
+            if live {
+                for grant in governance
+                    .grants_at(space_id, &auth.principal_id, &groups, at)
+                    .await?
                 {
-                    candidates.push(candidate);
+                    candidates.push(candidate_of_grant(&grant)?);
+                }
+                for delegation in governance
+                    .delegations_at(space_id, &auth.principal_id, at)
+                    .await?
+                {
+                    if let Some(candidate) =
+                        resolve_delegation(store, space_id, &delegation, 0).await?
+                    {
+                        candidates.push(candidate);
+                    }
                 }
             }
-        }
 
-        let policy = if space.default_policy_id.is_empty() {
-            None
-        } else {
-            governance.policy_at(&space.default_policy_id, at).await?
-        };
-        let bindings = if live {
-            governance
-                .bindings_at(&auth.principal_id, space_id, at)
-                .await?
-        } else {
-            Vec::new()
-        };
+            let policy = if space.default_policy_id.is_empty() {
+                None
+            } else {
+                governance.policy_at(&space.default_policy_id, at).await?
+            };
+            let bindings = if live {
+                governance
+                    .bindings_at(&auth.principal_id, space_id, at)
+                    .await?
+            } else {
+                Vec::new()
+            };
 
-        Ok(Self {
-            space,
-            principal,
-            groups,
-            is_owner,
-            statements: statements_of(policy.as_ref()),
-            policy,
-            bindings,
-            candidates,
+            Ok(Self {
+                space,
+                principal,
+                groups,
+                is_owner,
+                statements: statements_of(policy.as_ref()),
+                policy,
+                bindings,
+                candidates,
+            })
         })
     }
 
@@ -1037,57 +1044,59 @@ async fn resolve_delegation(
 /// caller as its delegate. A chain that does not link is not a narrower
 /// authority — it is two unrelated Delegations presented as one, which is how
 /// §28.5's amplification would be spelled if the linkage went unchecked.
-async fn resolve_named_chain(
+fn resolve_named_chain(
     store: &Store,
     space_id: &str,
     principal_id: &str,
     chain: &[String],
     depth: usize,
-) -> Result<Vec<Candidate>, KipError> {
-    let mut previous: Option<DelegationRow> = None;
-    let mut last: Option<DelegationRow> = None;
-    for id in chain {
-        let row_id = super::store::row_id_of(id).ok_or_else(|| {
-            KipError::not_authorized(format!("{id:?} is not a Delegation identifier"))
-        })?;
-        let row: DelegationRow = store
-            .governance
-            .delegation(row_id)
+) -> impl Future<Output = Result<Vec<Candidate>, KipError>> + Send {
+    Box::pin(async move {
+        let mut previous: Option<DelegationRow> = None;
+        let mut last: Option<DelegationRow> = None;
+        for id in chain {
+            let row_id = super::store::row_id_of(id).ok_or_else(|| {
+                KipError::not_authorized(format!("{id:?} is not a Delegation identifier"))
+            })?;
+            let row: DelegationRow = store
+                .governance
+                .delegation(row_id)
+                .await?
+                .ok_or_else(|| KipError::not_authorized(format!("no Delegation {id:?}")))?;
+            if row.status != status::ACTIVE || row.space_id != space_id {
+                return Err(KipError::not_authorized(format!(
+                    "Delegation {id:?} is not in force in this MemorySpace"
+                )));
+            }
+            if let Some(parent) = &previous {
+                if row.parent_delegation != delegation_id(parent._id) {
+                    return Err(KipError::not_authorized(format!(
+                        "Delegation {id:?} does not descend from the one before it"
+                    )));
+                }
+                if !parent.may_redelegate {
+                    return Err(KipError::not_authorized(format!(
+                        "Delegation {} does not permit re-delegation",
+                        delegation_id(parent._id)
+                    )));
+                }
+            }
+            previous = Some(row.clone());
+            last = Some(row);
+        }
+        let Some(last) = last else {
+            return Ok(Vec::new());
+        };
+        if last.delegate_principal != principal_id {
+            return Err(KipError::not_authorized(
+                "the named Delegation chain does not end at the acting Principal",
+            ));
+        }
+        Ok(resolve_delegation(store, space_id, &last, depth)
             .await?
-            .ok_or_else(|| KipError::not_authorized(format!("no Delegation {id:?}")))?;
-        if row.status != status::ACTIVE || row.space_id != space_id {
-            return Err(KipError::not_authorized(format!(
-                "Delegation {id:?} is not in force in this MemorySpace"
-            )));
-        }
-        if let Some(parent) = &previous {
-            if row.parent_delegation != delegation_id(parent._id) {
-                return Err(KipError::not_authorized(format!(
-                    "Delegation {id:?} does not descend from the one before it"
-                )));
-            }
-            if !parent.may_redelegate {
-                return Err(KipError::not_authorized(format!(
-                    "Delegation {} does not permit re-delegation",
-                    delegation_id(parent._id)
-                )));
-            }
-        }
-        previous = Some(row.clone());
-        last = Some(row);
-    }
-    let Some(last) = last else {
-        return Ok(Vec::new());
-    };
-    if last.delegate_principal != principal_id {
-        return Err(KipError::not_authorized(
-            "the named Delegation chain does not end at the acting Principal",
-        ));
-    }
-    Ok(resolve_delegation(store, space_id, &last, depth)
-        .await?
-        .into_iter()
-        .collect())
+            .into_iter()
+            .collect())
+    })
 }
 
 fn parse_or_default<T: Default + serde::de::DeserializeOwned>(value: &anda_kip::Json) -> T {

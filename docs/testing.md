@@ -91,7 +91,27 @@ cargo test -p anda_db --test format_compat -- --ignored generate
 git add rs/anda_db/tests/fixtures
 ```
 
-### 7. Coverage (dashboard, not a gate)
+### 7. Stack depth in debug builds
+
+A debug build keeps every awaited future in its caller's stack frame, so
+futures inlined into one another cost the sum of their sizes at every level of
+a call chain. Heavy async APIs (I/O, several steps or many awaits) therefore
+return their state machine boxed:
+`fn f(..) -> impl Future<Output = R> + Send { Box::pin(async move { .. }) }`.
+Helpers called once per row inside a loop stay `async fn`, since a box per row
+costs more than the stack it saves.
+
+- `rs/anda_cognitive_nexus/tests/stack_budget.rs` runs host flows (start,
+  per-caller provisioning, KIP writes and reads, reopening) on a 512 KiB
+  thread, a quarter of a spawned thread's default stack, and checks that the
+  host-facing futures are boxed.
+- `rs/anda_db/tests/boxed_futures.rs` checks the database and collection
+  futures.
+
+To see what a flow costs, run its test with `RUST_MIN_STACK` below the 2 MiB
+default; an overflow aborts the binary and names the thread.
+
+### 8. Coverage (dashboard, not a gate)
 
 ```bash
 make coverage        # summary in the terminal
@@ -132,3 +152,5 @@ tree. The alternative remains a benchmark, not another runtime strategy.
 - Parses untrusted input → fuzz coverage (layer 4).
 - Approximate/heuristic behaviour → a quantified metric with a floor
   (layer 5).
+- New I/O or multi-step async API → return it boxed and keep the stack
+  budget green (layer 7).

@@ -107,30 +107,34 @@ macro_rules! collections {
 
         impl GovernanceStore {
             /// Opens — creating if absent — every Governance collection.
-            pub async fn open(db: Arc<AndaDB>) -> Result<Self, KipError> {
-                $(
-                    let $field = Slot::new(
-                        db.open_or_create_collection(
-                            <$row>::schema().map_err(schema_error)?,
-                            config($name, $description),
-                            $init,
-                        )
-                        .await
-                        .map_err(db_error)?,
-                    );
-                )*
-                Ok(Self {
-                    db,
-                    notifications: Arc::new(parking_lot::RwLock::new(None)),
-                    control_dirty: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                    $($field,)*
+            pub fn open(db: Arc<AndaDB>) -> impl Future<Output = Result<Self, KipError>> + Send {
+                Box::pin(async move {
+                    $(
+                        let $field = Slot::new(
+                            db.open_or_create_collection(
+                                <$row>::schema().map_err(schema_error)?,
+                                config($name, $description),
+                                $init,
+                            )
+                            .await
+                            .map_err(db_error)?,
+                        );
+                    )*
+                    Ok(Self {
+                        db,
+                        notifications: Arc::new(parking_lot::RwLock::new(None)),
+                        control_dirty: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                        $($field,)*
+                    })
                 })
             }
 
             /// Reloads every handle from storage.
-            pub async fn reopen(&self) -> Result<(), KipError> {
-                $(self.$field.set(self.reload($name, $init).await?);)*
-                Ok(())
+            pub fn reopen(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+                Box::pin(async move {
+                    $(self.$field.set(self.reload($name, $init).await?);)*
+                    Ok(())
+                })
             }
 
             fn all(&self) -> impl Iterator<Item = Arc<Collection>> {
@@ -333,40 +337,45 @@ impl GovernanceStore {
     /// Idempotent because bootstrap runs on every open: the system Principal
     /// must survive a restart without being recreated, and recreating it would
     /// reset a deployment's own edits to it.
-    pub async fn ensure_principal(&self, draft: PrincipalDraft) -> Result<PrincipalRow, KipError> {
-        if let Some(existing) = self.find_principal(&draft.principal_id).await? {
-            return Ok(existing);
-        }
-        let now = time::now();
-        let row = PrincipalRow {
-            _id: 0,
-            principal_id: draft.principal_id,
-            principal_class: draft.principal_class,
-            status: status::ACTIVE.to_string(),
-            display_name: draft.display_name,
-            auth_provider: draft.auth_provider,
-            auth_subject: draft.auth_subject,
-            created_at: now.clone(),
-            updated_at: now,
-            revoked_at: String::new(),
-            version: 1,
-        };
-        let id = self
-            .principals
-            .get()
-            .add_from(&row)
-            .await
-            .map_err(db_error)?;
-        let row = PrincipalRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "create_principal",
-            at: row.created_at.clone(),
-            resource: row.principal_id.clone(),
-            record: json_of(&row)?,
-            ..Default::default()
+    pub fn ensure_principal(
+        &self,
+        draft: PrincipalDraft,
+    ) -> impl Future<Output = Result<PrincipalRow, KipError>> + Send {
+        Box::pin(async move {
+            if let Some(existing) = self.find_principal(&draft.principal_id).await? {
+                return Ok(existing);
+            }
+            let now = time::now();
+            let row = PrincipalRow {
+                _id: 0,
+                principal_id: draft.principal_id,
+                principal_class: draft.principal_class,
+                status: status::ACTIVE.to_string(),
+                display_name: draft.display_name,
+                auth_provider: draft.auth_provider,
+                auth_subject: draft.auth_subject,
+                created_at: now.clone(),
+                updated_at: now,
+                revoked_at: String::new(),
+                version: 1,
+            };
+            let id = self
+                .principals
+                .get()
+                .add_from(&row)
+                .await
+                .map_err(db_error)?;
+            let row = PrincipalRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "create_principal",
+                at: row.created_at.clone(),
+                resource: row.principal_id.clone(),
+                record: json_of(&row)?,
+                ..Default::default()
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Looks a Principal up by id.
@@ -478,35 +487,36 @@ impl GovernanceStore {
     ///
     /// Never a delete: a historical write by a later-revoked Principal stays
     /// attributable to it, and the origin stamp on that element is not rewritten.
-    pub async fn set_principal_status(
+    pub fn set_principal_status(
         &self,
         id: &str,
         new_status: &str,
         actor: &str,
-    ) -> Result<PrincipalRow, KipError> {
-        let mut row = self
-            .find_principal(id)
-            .await?
-            .ok_or_else(|| KipError::not_found_or_not_visible(format!("no Principal {id:?}")))?;
-        row.status = new_status.to_string();
-        row.updated_at = time::now();
-        row.revoked_at = if new_status == status::REVOKED {
-            row.updated_at.clone()
-        } else {
-            String::new()
-        };
-        row.version = row.version.saturating_add(1);
-        self.put(&self.principals.get(), row._id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "set_principal_status",
-            at: row.updated_at.clone(),
-            resource: row.principal_id.clone(),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
-            ..Default::default()
+    ) -> impl Future<Output = Result<PrincipalRow, KipError>> + Send {
+        Box::pin(async move {
+            let mut row = self.find_principal(id).await?.ok_or_else(|| {
+                KipError::not_found_or_not_visible(format!("no Principal {id:?}"))
+            })?;
+            row.status = new_status.to_string();
+            row.updated_at = time::now();
+            row.revoked_at = if new_status == status::REVOKED {
+                row.updated_at.clone()
+            } else {
+                String::new()
+            };
+            row.version = row.version.saturating_add(1);
+            self.put(&self.principals.get(), row._id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "set_principal_status",
+                at: row.updated_at.clone(),
+                resource: row.principal_id.clone(),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+                ..Default::default()
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     // -----------------------------------------------------------------------
@@ -514,51 +524,53 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Creates or replaces a Principal group's membership.
-    pub async fn put_group(
+    pub fn put_group(
         &self,
         draft: GroupDraft,
         actor: &str,
-    ) -> Result<PrincipalGroupRow, KipError> {
-        let now = time::now();
-        let existing = self.find_group(&draft.group_id).await?;
-        let row = match existing {
-            Some(previous) => PrincipalGroupRow {
-                name: draft.name,
-                description: draft.description,
-                members: draft.members,
-                updated_at: now,
-                version: previous.version.saturating_add(1),
-                ..previous
-            },
-            None => PrincipalGroupRow {
-                _id: 0,
-                group_id: draft.group_id,
-                name: draft.name,
-                description: draft.description,
-                members: draft.members,
-                status: status::ACTIVE.to_string(),
-                created_at: now.clone(),
-                updated_at: now,
-                version: 1,
-            },
-        };
-        let row = if row._id == 0 {
-            let id = self.groups.get().add_from(&row).await.map_err(db_error)?;
-            PrincipalGroupRow { _id: id, ..row }
-        } else {
-            self.put(&self.groups.get(), row._id, &row).await?;
-            row
-        };
-        self.record_mutation(MutationEntry {
-            operation: "put_group",
-            at: row.updated_at.clone(),
-            resource: row.group_id.clone(),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
-            ..Default::default()
+    ) -> impl Future<Output = Result<PrincipalGroupRow, KipError>> + Send {
+        Box::pin(async move {
+            let now = time::now();
+            let existing = self.find_group(&draft.group_id).await?;
+            let row = match existing {
+                Some(previous) => PrincipalGroupRow {
+                    name: draft.name,
+                    description: draft.description,
+                    members: draft.members,
+                    updated_at: now,
+                    version: previous.version.saturating_add(1),
+                    ..previous
+                },
+                None => PrincipalGroupRow {
+                    _id: 0,
+                    group_id: draft.group_id,
+                    name: draft.name,
+                    description: draft.description,
+                    members: draft.members,
+                    status: status::ACTIVE.to_string(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    version: 1,
+                },
+            };
+            let row = if row._id == 0 {
+                let id = self.groups.get().add_from(&row).await.map_err(db_error)?;
+                PrincipalGroupRow { _id: id, ..row }
+            } else {
+                self.put(&self.groups.get(), row._id, &row).await?;
+                row
+            };
+            self.record_mutation(MutationEntry {
+                operation: "put_group",
+                at: row.updated_at.clone(),
+                resource: row.group_id.clone(),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+                ..Default::default()
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Looks a group up by id.
@@ -589,37 +601,39 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Binds a Principal to a semantic actor.
-    pub async fn create_binding(
+    pub fn create_binding(
         &self,
         draft: ActorBindingDraft,
         actor: &str,
-    ) -> Result<ActorBindingRow, KipError> {
-        let now = time::now();
-        let row = ActorBindingRow {
-            _id: 0,
-            principal_id: draft.principal_id,
-            actor_key: actor_key(&draft.actor_key),
-            actor_ref: draft.actor_key,
-            binding_class: draft.binding_class,
-            assurance: draft.assurance,
-            scope: draft.scope,
-            status: status::ACTIVE.to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            revoked_at: String::new(),
-            version: 1,
-        };
-        let id = self.bindings.get().add_from(&row).await.map_err(db_error)?;
-        let row = ActorBindingRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "create_actor_binding",
-            resource: binding_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
-            ..Default::default()
+    ) -> impl Future<Output = Result<ActorBindingRow, KipError>> + Send {
+        Box::pin(async move {
+            let now = time::now();
+            let row = ActorBindingRow {
+                _id: 0,
+                principal_id: draft.principal_id,
+                actor_key: actor_key(&draft.actor_key),
+                actor_ref: draft.actor_key,
+                binding_class: draft.binding_class,
+                assurance: draft.assurance,
+                scope: draft.scope,
+                status: status::ACTIVE.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                revoked_at: String::new(),
+                version: 1,
+            };
+            let id = self.bindings.get().add_from(&row).await.map_err(db_error)?;
+            let row = ActorBindingRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "create_actor_binding",
+                resource: binding_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+                ..Default::default()
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     pub(crate) async fn binding(&self, id: u64) -> Result<ActorBindingRow, KipError> {
@@ -636,27 +650,33 @@ impl GovernanceStore {
     }
 
     /// Revokes an ActorBinding.
-    pub async fn revoke_binding(&self, id: u64, actor: &str) -> Result<(), KipError> {
-        let mut row: ActorBindingRow = self
-            .bindings
-            .get()
-            .get_as(id)
+    pub fn revoke_binding(
+        &self,
+        id: u64,
+        actor: &str,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let mut row: ActorBindingRow = self
+                .bindings
+                .get()
+                .get_as(id)
+                .await
+                .map_err(|_| KipError::not_found_or_not_visible("no such ActorBinding"))?;
+            row.status = status::REVOKED.to_string();
+            row.updated_at = time::now();
+            row.revoked_at = row.updated_at.clone();
+            row.version = row.version.saturating_add(1);
+            self.put(&self.bindings.get(), id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "revoke_actor_binding",
+                resource: binding_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+                ..Default::default()
+            })
             .await
-            .map_err(|_| KipError::not_found_or_not_visible("no such ActorBinding"))?;
-        row.status = status::REVOKED.to_string();
-        row.updated_at = time::now();
-        row.revoked_at = row.updated_at.clone();
-        row.version = row.version.saturating_add(1);
-        self.put(&self.bindings.get(), id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "revoke_actor_binding",
-            resource: binding_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
-            ..Default::default()
+            .map(|_| ())
         })
-        .await
-        .map(|_| ())
     }
 
     /// The active bindings a Principal holds in a Space.
@@ -689,63 +709,75 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Creates a Grant.
-    pub async fn create_grant(&self, draft: GrantDraft, actor: &str) -> Result<GrantRow, KipError> {
-        validate_condition_times(&draft.conditions)?;
-        let now = time::now();
-        let row = GrantRow {
-            _id: 0,
-            space_id: draft.space_id,
-            grantee_principal: draft.grantee_principal,
-            grantee_group: draft.grantee_group,
-            actions: draft.actions,
-            scope: json_of(&draft.scope)?,
-            conditions: json_of(&draft.conditions)?,
-            constraints: json_of(&draft.constraints)?,
-            delegation_allowed: draft.delegation_allowed,
-            status: status::ACTIVE.to_string(),
-            granted_by: actor.to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            revoked_at: String::new(),
-            version: 1,
-        };
-        let id = self.grants.get().add_from(&row).await.map_err(db_error)?;
-        let row = GrantRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "create_grant",
-            at: row.created_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: grant_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+    pub fn create_grant(
+        &self,
+        draft: GrantDraft,
+        actor: &str,
+    ) -> impl Future<Output = Result<GrantRow, KipError>> + Send {
+        Box::pin(async move {
+            validate_condition_times(&draft.conditions)?;
+            let now = time::now();
+            let row = GrantRow {
+                _id: 0,
+                space_id: draft.space_id,
+                grantee_principal: draft.grantee_principal,
+                grantee_group: draft.grantee_group,
+                actions: draft.actions,
+                scope: json_of(&draft.scope)?,
+                conditions: json_of(&draft.conditions)?,
+                constraints: json_of(&draft.constraints)?,
+                delegation_allowed: draft.delegation_allowed,
+                status: status::ACTIVE.to_string(),
+                granted_by: actor.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                revoked_at: String::new(),
+                version: 1,
+            };
+            let id = self.grants.get().add_from(&row).await.map_err(db_error)?;
+            let row = GrantRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "create_grant",
+                at: row.created_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: grant_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Revokes a Grant. Future operations lose it; past ones keep their audit.
-    pub async fn revoke_grant(&self, id: u64, actor: &str) -> Result<(), KipError> {
-        let mut row: GrantRow = self
-            .grants
-            .get()
-            .get_as(id)
+    pub fn revoke_grant(
+        &self,
+        id: u64,
+        actor: &str,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let mut row: GrantRow = self
+                .grants
+                .get()
+                .get_as(id)
+                .await
+                .map_err(|_| KipError::not_found_or_not_visible("no such Grant"))?;
+            row.status = status::REVOKED.to_string();
+            row.updated_at = time::now();
+            row.revoked_at = row.updated_at.clone();
+            row.version = row.version.saturating_add(1);
+            self.put(&self.grants.get(), id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "revoke_grant",
+                at: row.updated_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: grant_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
             .await
-            .map_err(|_| KipError::not_found_or_not_visible("no such Grant"))?;
-        row.status = status::REVOKED.to_string();
-        row.updated_at = time::now();
-        row.revoked_at = row.updated_at.clone();
-        row.version = row.version.saturating_add(1);
-        self.put(&self.grants.get(), id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "revoke_grant",
-            at: row.updated_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: grant_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+            .map(|_| ())
         })
-        .await
-        .map(|_| ())
     }
 
     /// Every active Grant that could apply to a Principal in a Space.
@@ -919,72 +951,80 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Creates a Delegation.
-    pub async fn create_delegation(
+    pub fn create_delegation(
         &self,
         draft: DelegationDraft,
         actor: &str,
-    ) -> Result<DelegationRow, KipError> {
-        validate_condition_times(&draft.conditions)?;
-        let now = time::now();
-        let row = DelegationRow {
-            _id: 0,
-            space_id: draft.space_id,
-            delegator_principal: draft.delegator_principal,
-            delegate_principal: draft.delegate_principal,
-            actions: draft.actions,
-            scope: json_of(&draft.scope)?,
-            conditions: json_of(&draft.conditions)?,
-            constraints: json_of(&draft.constraints)?,
-            parent_delegation: draft.parent_delegation,
-            may_redelegate: draft.may_redelegate,
-            status: status::ACTIVE.to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            revoked_at: String::new(),
-            version: 1,
-        };
-        let id = self
-            .delegations
-            .get()
-            .add_from(&row)
-            .await
-            .map_err(db_error)?;
-        let row = DelegationRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "create_delegation",
-            at: row.created_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: delegation_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+    ) -> impl Future<Output = Result<DelegationRow, KipError>> + Send {
+        Box::pin(async move {
+            validate_condition_times(&draft.conditions)?;
+            let now = time::now();
+            let row = DelegationRow {
+                _id: 0,
+                space_id: draft.space_id,
+                delegator_principal: draft.delegator_principal,
+                delegate_principal: draft.delegate_principal,
+                actions: draft.actions,
+                scope: json_of(&draft.scope)?,
+                conditions: json_of(&draft.conditions)?,
+                constraints: json_of(&draft.constraints)?,
+                parent_delegation: draft.parent_delegation,
+                may_redelegate: draft.may_redelegate,
+                status: status::ACTIVE.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                revoked_at: String::new(),
+                version: 1,
+            };
+            let id = self
+                .delegations
+                .get()
+                .add_from(&row)
+                .await
+                .map_err(db_error)?;
+            let row = DelegationRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "create_delegation",
+                at: row.created_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: delegation_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Revokes a Delegation.
-    pub async fn revoke_delegation(&self, id: u64, actor: &str) -> Result<(), KipError> {
-        let mut row: DelegationRow = self
-            .delegations
-            .get()
-            .get_as(id)
+    pub fn revoke_delegation(
+        &self,
+        id: u64,
+        actor: &str,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let mut row: DelegationRow = self
+                .delegations
+                .get()
+                .get_as(id)
+                .await
+                .map_err(|_| KipError::not_found_or_not_visible("no such Delegation"))?;
+            row.status = status::REVOKED.to_string();
+            row.updated_at = time::now();
+            row.revoked_at = row.updated_at.clone();
+            row.version = row.version.saturating_add(1);
+            self.put(&self.delegations.get(), id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "revoke_delegation",
+                at: row.updated_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: delegation_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
             .await
-            .map_err(|_| KipError::not_found_or_not_visible("no such Delegation"))?;
-        row.status = status::REVOKED.to_string();
-        row.updated_at = time::now();
-        row.revoked_at = row.updated_at.clone();
-        row.version = row.version.saturating_add(1);
-        self.put(&self.delegations.get(), id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "revoke_delegation",
-            at: row.updated_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: delegation_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+            .map(|_| ())
         })
-        .await
-        .map(|_| ())
     }
 
     /// Looks a Delegation up by row id.
@@ -1022,47 +1062,49 @@ impl GovernanceStore {
     ///
     /// Always a new row. A policy update that edited the previous version in
     /// place would retroactively change what every audit record citing it means.
-    pub async fn publish_policy(
+    pub fn publish_policy(
         &self,
         draft: PolicyDraft,
         actor: &str,
-    ) -> Result<GovernancePolicyRow, KipError> {
-        for statement in &draft.statements {
-            validate_condition_times(&statement.conditions)?;
-        }
-        let version = self
-            .active_policy(&draft.policy_id)
-            .await?
-            .map(|row| row.version.saturating_add(1))
-            .unwrap_or(1);
-        let statements = draft
-            .statements
-            .iter()
-            .map(json_of)
-            .collect::<Result<Vec<_>, _>>()?;
-        let row = GovernancePolicyRow {
-            _id: 0,
-            policy_ref: format!("{}@{version}", draft.policy_id),
-            policy_id: draft.policy_id,
-            version,
-            space_id: draft.space_id,
-            description: draft.description,
-            statements,
-            created_at: time::now(),
-            created_by: actor.to_string(),
-        };
-        let id = self.policies.get().add_from(&row).await.map_err(db_error)?;
-        let row = GovernancePolicyRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "publish_policy",
-            at: row.created_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: row.policy_ref.clone(),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+    ) -> impl Future<Output = Result<GovernancePolicyRow, KipError>> + Send {
+        Box::pin(async move {
+            for statement in &draft.statements {
+                validate_condition_times(&statement.conditions)?;
+            }
+            let version = self
+                .active_policy(&draft.policy_id)
+                .await?
+                .map(|row| row.version.saturating_add(1))
+                .unwrap_or(1);
+            let statements = draft
+                .statements
+                .iter()
+                .map(json_of)
+                .collect::<Result<Vec<_>, _>>()?;
+            let row = GovernancePolicyRow {
+                _id: 0,
+                policy_ref: format!("{}@{version}", draft.policy_id),
+                policy_id: draft.policy_id,
+                version,
+                space_id: draft.space_id,
+                description: draft.description,
+                statements,
+                created_at: time::now(),
+                created_by: actor.to_string(),
+            };
+            let id = self.policies.get().add_from(&row).await.map_err(db_error)?;
+            let row = GovernancePolicyRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "publish_policy",
+                at: row.created_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: row.policy_ref.clone(),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// The greatest version of a Policy.
@@ -1117,49 +1159,51 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Opens an approval request for one concrete operation.
-    pub async fn request_approval(
+    pub fn request_approval(
         &self,
         draft: ApprovalDraft,
         actor: &str,
-    ) -> Result<ApprovalRow, KipError> {
-        if !draft.expires_at.is_empty() {
-            time::normalize(&draft.expires_at, "approval.expires_at")?;
-        }
-        let now = time::now();
-        let row = ApprovalRow {
-            _id: 0,
-            space_id: draft.space_id,
-            operation: draft.operation,
-            resource: draft.resource,
-            subject_digest: draft.subject_digest,
-            required: draft.required.max(1),
-            approvals: Vec::new(),
-            approver_ids: Vec::new(),
-            allow_self_approval: draft.allow_self_approval,
-            status: "pending".to_string(),
-            requested_by: actor.to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            expires_at: draft.expires_at,
-            version: 1,
-        };
-        let id = self
-            .approvals
-            .get()
-            .add_from(&row)
-            .await
-            .map_err(db_error)?;
-        let row = ApprovalRow { _id: id, ..row };
-        self.record_mutation(MutationEntry {
-            operation: "request_approval",
-            at: row.created_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: approval_id(id),
-            principal_id: actor.to_string(),
-            record: json_of(&row)?,
+    ) -> impl Future<Output = Result<ApprovalRow, KipError>> + Send {
+        Box::pin(async move {
+            if !draft.expires_at.is_empty() {
+                time::normalize(&draft.expires_at, "approval.expires_at")?;
+            }
+            let now = time::now();
+            let row = ApprovalRow {
+                _id: 0,
+                space_id: draft.space_id,
+                operation: draft.operation,
+                resource: draft.resource,
+                subject_digest: draft.subject_digest,
+                required: draft.required.max(1),
+                approvals: Vec::new(),
+                approver_ids: Vec::new(),
+                allow_self_approval: draft.allow_self_approval,
+                status: "pending".to_string(),
+                requested_by: actor.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                expires_at: draft.expires_at,
+                version: 1,
+            };
+            let id = self
+                .approvals
+                .get()
+                .add_from(&row)
+                .await
+                .map_err(db_error)?;
+            let row = ApprovalRow { _id: id, ..row };
+            self.record_mutation(MutationEntry {
+                operation: "request_approval",
+                at: row.created_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: approval_id(id),
+                principal_id: actor.to_string(),
+                record: json_of(&row)?,
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Adds one Principal's approval.
@@ -1167,59 +1211,61 @@ impl GovernanceStore {
     /// Refuses a second approval from the same Principal, and — unless the
     /// request opted out — refuses the requester's own (§28.5). Both are the same
     /// rule: *independent* approvals, or the count means nothing.
-    pub async fn approve(
+    pub fn approve(
         &self,
         id: u64,
         approver: &str,
         note: &str,
-    ) -> Result<ApprovalRow, KipError> {
-        let mut row: ApprovalRow = self
-            .approvals
-            .get()
-            .get_as(id)
-            .await
-            .map_err(|_| KipError::not_found_or_not_visible("no such Approval"))?;
-        if row.status != "pending" {
-            return Err(KipError::requires_approval(format!(
-                "approval {} is {}, not pending",
-                approval_id(id),
-                row.status
-            )));
-        }
-        if row.approver_ids.iter().any(|p| p == approver) {
-            return Err(KipError::not_authorized(
-                "one Principal counts once: a second approval from the same identity would make \
-                 a two-of-N requirement satisfiable by one actor",
-            ));
-        }
-        if !row.allow_self_approval && row.requested_by == approver {
-            return Err(KipError::not_authorized(
-                "separation of duties: the Principal that requested this operation may not also \
-                 approve it",
-            ));
-        }
-        row.approvals.push(serde_json::json!({
-            "principal_id": approver,
-            "at": time::now(),
-            "note": note,
-        }));
-        row.approver_ids.push(approver.to_string());
-        if row.approver_ids.len() as u64 >= row.required {
-            row.status = "granted".to_string();
-        }
-        row.updated_at = time::now();
-        row.version = row.version.saturating_add(1);
-        self.put(&self.approvals.get(), id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "approve",
-            at: row.updated_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: approval_id(id),
-            principal_id: approver.to_string(),
-            record: json_of(&row)?,
+    ) -> impl Future<Output = Result<ApprovalRow, KipError>> + Send {
+        Box::pin(async move {
+            let mut row: ApprovalRow = self
+                .approvals
+                .get()
+                .get_as(id)
+                .await
+                .map_err(|_| KipError::not_found_or_not_visible("no such Approval"))?;
+            if row.status != "pending" {
+                return Err(KipError::requires_approval(format!(
+                    "approval {} is {}, not pending",
+                    approval_id(id),
+                    row.status
+                )));
+            }
+            if row.approver_ids.iter().any(|p| p == approver) {
+                return Err(KipError::not_authorized(
+                    "one Principal counts once: a second approval from the same identity would make \
+                     a two-of-N requirement satisfiable by one actor",
+                ));
+            }
+            if !row.allow_self_approval && row.requested_by == approver {
+                return Err(KipError::not_authorized(
+                    "separation of duties: the Principal that requested this operation may not also \
+                     approve it",
+                ));
+            }
+            row.approvals.push(serde_json::json!({
+                "principal_id": approver,
+                "at": time::now(),
+                "note": note,
+            }));
+            row.approver_ids.push(approver.to_string());
+            if row.approver_ids.len() as u64 >= row.required {
+                row.status = "granted".to_string();
+            }
+            row.updated_at = time::now();
+            row.version = row.version.saturating_add(1);
+            self.put(&self.approvals.get(), id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "approve",
+                at: row.updated_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: approval_id(id),
+                principal_id: approver.to_string(),
+                record: json_of(&row)?,
+            })
+            .await?;
+            Ok(row)
         })
-        .await?;
-        Ok(row)
     }
 
     /// Marks an approval as spent.
@@ -1227,27 +1273,29 @@ impl GovernanceStore {
     /// An approval authorizes one operation, not a standing licence: the same
     /// two signatures must not be usable twice. Re-running the operation needs
     /// a new approval, which is the whole point of requiring one.
-    pub async fn consume_approval(&self, id: u64) -> Result<(), KipError> {
-        let Some(mut row) = self.find_approval(id).await? else {
-            return Ok(());
-        };
-        if row.status == "consumed" {
-            return Ok(());
-        }
-        row.status = "consumed".to_string();
-        row.updated_at = time::now();
-        row.version = row.version.saturating_add(1);
-        self.put(&self.approvals.get(), id, &row).await?;
-        self.record_mutation(MutationEntry {
-            operation: "consume_approval",
-            at: row.updated_at.clone(),
-            space_id: row.space_id.clone(),
-            resource: approval_id(id),
-            principal_id: String::new(),
-            record: json_of(&row)?,
+    pub fn consume_approval(&self, id: u64) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let Some(mut row) = self.find_approval(id).await? else {
+                return Ok(());
+            };
+            if row.status == "consumed" {
+                return Ok(());
+            }
+            row.status = "consumed".to_string();
+            row.updated_at = time::now();
+            row.version = row.version.saturating_add(1);
+            self.put(&self.approvals.get(), id, &row).await?;
+            self.record_mutation(MutationEntry {
+                operation: "consume_approval",
+                at: row.updated_at.clone(),
+                space_id: row.space_id.clone(),
+                resource: approval_id(id),
+                principal_id: String::new(),
+                record: json_of(&row)?,
+            })
+            .await
+            .map(|_| ())
         })
-        .await
-        .map(|_| ())
     }
 
     /// The granted, unexpired approvals bound to one operation subject.
@@ -1284,219 +1332,138 @@ impl GovernanceStore {
     // -----------------------------------------------------------------------
 
     /// Appends one control-plane mutation to the audit log.
-    pub async fn record_mutation(&self, entry: MutationEntry) -> Result<u64, KipError> {
-        if !matches!(entry.operation, "create_space" | "put_space") {
-            self.control_dirty
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        let row = GovernanceAuditRow {
-            _id: 0,
-            entry_class: "mutation".to_string(),
-            at: if entry.at.is_empty() {
-                time::now()
-            } else {
-                entry.at
-            },
-            space_id: if entry.space_id.is_empty() {
-                ANY_SPACE.to_string()
-            } else {
-                entry.space_id
-            },
-            principal_id: entry.principal_id,
-            operation: entry.operation.to_string(),
-            resource: entry.resource,
-            decision: entry.operation.to_string(),
-            record: entry.record,
-            ..Default::default()
-        };
-        let id = self.audit.get().add_from(&row).await.map_err(db_error)?;
-        if !matches!(row.operation.as_str(), "create_space" | "put_space") {
-            self.notify_control(&GovernanceAuditRow { _id: id, ..row })
-                .await?;
-        }
-        Ok(id)
+    pub fn record_mutation(
+        &self,
+        entry: MutationEntry,
+    ) -> impl Future<Output = Result<u64, KipError>> + Send {
+        Box::pin(async move {
+            if !matches!(entry.operation, "create_space" | "put_space") {
+                self.control_dirty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            let row = GovernanceAuditRow {
+                _id: 0,
+                entry_class: "mutation".to_string(),
+                at: if entry.at.is_empty() {
+                    time::now()
+                } else {
+                    entry.at
+                },
+                space_id: if entry.space_id.is_empty() {
+                    ANY_SPACE.to_string()
+                } else {
+                    entry.space_id
+                },
+                principal_id: entry.principal_id,
+                operation: entry.operation.to_string(),
+                resource: entry.resource,
+                decision: entry.operation.to_string(),
+                record: entry.record,
+                ..Default::default()
+            };
+            let id = self.audit.get().add_from(&row).await.map_err(db_error)?;
+            if !matches!(row.operation.as_str(), "create_space" | "put_space") {
+                self.notify_control(&GovernanceAuditRow { _id: id, ..row })
+                    .await?;
+            }
+            Ok(id)
+        })
     }
 
     pub(crate) fn attach_notifications(&self, spaces: Slot, transactions: Slot, controls: Slot) {
         *self.notifications.write() = Some((spaces, transactions, controls));
     }
 
-    pub(crate) async fn notify_audit(&self, id: u64) -> Result<(), KipError> {
-        let row: GovernanceAuditRow = self.audit.get().get_as(id).await.map_err(db_error)?;
-        self.notify_control(&row).await
+    pub(crate) fn notify_audit(
+        &self,
+        id: u64,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let row: GovernanceAuditRow = self.audit.get().get_as(id).await.map_err(db_error)?;
+            self.notify_control(&row).await
+        })
     }
 
-    async fn notify_control(&self, audit: &GovernanceAuditRow) -> Result<(), KipError> {
-        let Some((spaces, transactions, controls)) = self.notifications.read().clone() else {
-            return Ok(());
-        };
-        let table = spaces.get();
-        let ids = if audit.space_id == ANY_SPACE {
-            table.ids()
-        } else {
-            table
-                .query_all_ids(eq_field("space_id", Fv::Text(audit.space_id.clone())))
-                .await
-                .map_err(db_error)?
-        };
-        for id in ids {
-            let mut space: crate::store::rows::SpaceRow =
-                table.get_as(id).await.map_err(db_error)?;
-            space.seq = space
-                .seq
-                .checked_add(1)
-                .filter(|n| *n <= anda_kip::MAX_SAFE_INTEGER)
-                .ok_or_else(|| KipError::constraint_violation("Space sequence exhausted"))?;
-            if !space.policies.is_object() {
-                space.policies = serde_json::json!({});
-            }
-            space.policies["_kip_authorization_version"] = Json::from(space.seq);
-            let row = crate::store::rows::TransactionRow {
-                _id: 0,
-                tx_id: format!("{}#{}", space.space_id, space.seq),
-                space: space.space_id.clone(),
-                seq: space.seq,
-                snapshot_seq: space.seq - 1,
-                committed_at: audit.at.clone(),
-                status: "committed".into(),
-                transaction_class: "governance".into(),
-                schema_environment_version: space.schema_environment_version,
-                result: serde_json::json!({
-                    "mutation_audit_id": audit._id,
-                    "control_changes": [{"kind":if audit.operation=="publish_policy" {"policy"} else {"authorization"},"version":space.seq.to_string()}],
-                }),
-                origin: serde_json::json!({"principal_id":audit.principal_id}),
-                ..Default::default()
+    fn notify_control(
+        &self,
+        audit: &GovernanceAuditRow,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let Some((spaces, transactions, controls)) = self.notifications.read().clone() else {
+                return Ok(());
             };
-            table
-                .update(id, crate::store::full_row_fields(table.schema(), &space)?)
-                .await
-                .map_err(db_error)?;
-            transactions.get().add_from(&row).await.map_err(db_error)?;
-            // Checkpoint only after the control change and all its data are durable.
-            self.flush(crate::tx::now_ms()).await?;
-            table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
-            transactions
-                .get()
-                .flush(crate::tx::now_ms())
-                .await
-                .map_err(db_error)?;
-            let rows = self.control_rows().await?;
-            self.checkpoint_control(
-                &controls.get(),
-                &space,
-                audit.operation == "control_recovery",
-                &rows,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn initialize_control_delivery(
-        &self,
-        space: &crate::store::rows::SpaceRow,
-    ) -> Result<(), KipError> {
-        let Some((_, _, controls)) = self.notifications.read().clone() else {
-            return Ok(());
-        };
-        let ids = controls
-            .get()
-            .query_all_ids(eq_fields(&[
-                ("space", Fv::Text(space.space_id.clone())),
-                ("key", Fv::Text("internal/governance".into())),
-            ]))
-            .await
-            .map_err(db_error)?;
-        if ids.is_empty() {
-            let rows = self.control_rows().await?;
-            self.checkpoint_control(&controls.get(), space, false, &rows)
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn control_recovery_needed(&self) -> bool {
-        self.control_dirty
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    async fn checkpoint_control(
-        &self,
-        table: &Collection,
-        space: &crate::store::rows::SpaceRow,
-        gap: bool,
-        rows: &ControlRows,
-    ) -> Result<(), KipError> {
-        let key = "internal/governance";
-        let ids = table
-            .query_all_ids(eq_fields(&[
-                ("space", Fv::Text(space.space_id.clone())),
-                ("key", Fv::Text(key.into())),
-            ]))
-            .await
-            .map_err(db_error)?;
-        let old = if let Some(id) = ids.first() {
-            Some(
+            let table = spaces.get();
+            let ids = if audit.space_id == ANY_SPACE {
+                table.ids()
+            } else {
                 table
-                    .get_as::<crate::store::rows::ControlRecordRow>(*id)
+                    .query_all_ids(eq_field("space_id", Fv::Text(audit.space_id.clone())))
                     .await
-                    .map_err(db_error)?,
-            )
-        } else {
-            None
-        };
-        let floor = if gap {
-            space.seq
-        } else {
-            old.as_ref()
-                .and_then(|r| r.value["coverage_floor"].as_u64())
-                .unwrap_or(space.seq)
-        };
-        let mut row = crate::store::rows::ControlRecordRow {
-            _id: 0,
-            record_id: format!("{}:{key}", space.space_id),
-            space: space.space_id.clone(),
-            key: key.into(),
-            seq: space.seq,
-            version: 1,
-            kind: "internal".into(),
-            value: serde_json::json!({
-                "fingerprint": control_fingerprint(rows, space)?,
-                "coverage_floor": floor,
-            }),
-            origin: Json::Null,
-        };
-        if let Some(old) = old {
-            row._id = old._id;
-            row.version = old.version + 1;
-            table
-                .update(
-                    row._id,
-                    crate::store::full_row_fields(table.schema(), &row)?,
+                    .map_err(db_error)?
+            };
+            for id in ids {
+                let mut space: crate::store::rows::SpaceRow =
+                    table.get_as(id).await.map_err(db_error)?;
+                space.seq = space
+                    .seq
+                    .checked_add(1)
+                    .filter(|n| *n <= anda_kip::MAX_SAFE_INTEGER)
+                    .ok_or_else(|| KipError::constraint_violation("Space sequence exhausted"))?;
+                if !space.policies.is_object() {
+                    space.policies = serde_json::json!({});
+                }
+                space.policies["_kip_authorization_version"] = Json::from(space.seq);
+                let row = crate::store::rows::TransactionRow {
+                    _id: 0,
+                    tx_id: format!("{}#{}", space.space_id, space.seq),
+                    space: space.space_id.clone(),
+                    seq: space.seq,
+                    snapshot_seq: space.seq - 1,
+                    committed_at: audit.at.clone(),
+                    status: "committed".into(),
+                    transaction_class: "governance".into(),
+                    schema_environment_version: space.schema_environment_version,
+                    result: serde_json::json!({
+                        "mutation_audit_id": audit._id,
+                        "control_changes": [{"kind":if audit.operation=="publish_policy" {"policy"} else {"authorization"},"version":space.seq.to_string()}],
+                    }),
+                    origin: serde_json::json!({"principal_id":audit.principal_id}),
+                    ..Default::default()
+                };
+                table
+                    .update(id, crate::store::full_row_fields(table.schema(), &space)?)
+                    .await
+                    .map_err(db_error)?;
+                transactions.get().add_from(&row).await.map_err(db_error)?;
+                // Checkpoint only after the control change and all its data are durable.
+                self.flush(crate::tx::now_ms()).await?;
+                table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
+                transactions
+                    .get()
+                    .flush(crate::tx::now_ms())
+                    .await
+                    .map_err(db_error)?;
+                let rows = self.control_rows().await?;
+                self.checkpoint_control(
+                    &controls.get(),
+                    &space,
+                    audit.operation == "control_recovery",
+                    &rows,
                 )
-                .await
-                .map_err(db_error)?;
-        } else {
-            table.add_from(&row).await.map_err(db_error)?;
-        }
-        table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
-        Ok(())
+                .await?;
+            }
+            Ok(())
+        })
     }
 
-    /// A lost control write cannot turn a journal gap into proof of silence.
-    /// Normal restarts retain the checkpoint; an incomplete write advances the
-    /// authorization epoch and establishes a new coverage floor.
-    pub(crate) async fn recover_control_delivery(&self) -> Result<(), KipError> {
-        let Some((spaces, _, controls)) = self.notifications.read().clone() else {
-            return Ok(());
-        };
-        // Read once for every Space: a delivery notice changes Space rows and
-        // the journal, never the control rows a fingerprint covers.
-        let rows = self.control_rows().await?;
-        for id in spaces.get().ids() {
-            let space: crate::store::rows::SpaceRow =
-                spaces.get().get_as(id).await.map_err(db_error)?;
+    pub(crate) fn initialize_control_delivery(
+        &self,
+        space: &crate::store::rows::SpaceRow,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let Some((_, _, controls)) = self.notifications.read().clone() else {
+                return Ok(());
+            };
             let ids = controls
                 .get()
                 .query_all_ids(eq_fields(&[
@@ -1505,10 +1472,39 @@ impl GovernanceStore {
                 ]))
                 .await
                 .map_err(db_error)?;
+            if ids.is_empty() {
+                let rows = self.control_rows().await?;
+                self.checkpoint_control(&controls.get(), space, false, &rows)
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn control_recovery_needed(&self) -> bool {
+        self.control_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn checkpoint_control(
+        &self,
+        table: &Collection,
+        space: &crate::store::rows::SpaceRow,
+        gap: bool,
+        rows: &ControlRows,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let key = "internal/governance";
+            let ids = table
+                .query_all_ids(eq_fields(&[
+                    ("space", Fv::Text(space.space_id.clone())),
+                    ("key", Fv::Text(key.into())),
+                ]))
+                .await
+                .map_err(db_error)?;
             let old = if let Some(id) = ids.first() {
                 Some(
-                    controls
-                        .get()
+                    table
                         .get_as::<crate::store::rows::ControlRecordRow>(*id)
                         .await
                         .map_err(db_error)?,
@@ -1516,70 +1512,152 @@ impl GovernanceStore {
             } else {
                 None
             };
-            if let Some(old) = old {
-                if old.value["fingerprint"].as_str()
-                    != Some(control_fingerprint(&rows, &space)?.as_str())
-                {
-                    let audit = GovernanceAuditRow {
-                        at: time::now(),
-                        space_id: space.space_id.clone(),
-                        principal_id: crate::governance::SYSTEM_PRINCIPAL.into(),
-                        operation: "control_recovery".into(),
-                        ..Default::default()
-                    };
-                    self.notify_control(&audit).await?;
-                }
+            let floor = if gap {
+                space.seq
             } else {
-                self.checkpoint_control(&controls.get(), &space, false, &rows)
-                    .await?;
+                old.as_ref()
+                    .and_then(|r| r.value["coverage_floor"].as_u64())
+                    .unwrap_or(space.seq)
+            };
+            let mut row = crate::store::rows::ControlRecordRow {
+                _id: 0,
+                record_id: format!("{}:{key}", space.space_id),
+                space: space.space_id.clone(),
+                key: key.into(),
+                seq: space.seq,
+                version: 1,
+                kind: "internal".into(),
+                value: serde_json::json!({
+                    "fingerprint": control_fingerprint(rows, space)?,
+                    "coverage_floor": floor,
+                }),
+                origin: Json::Null,
+            };
+            if let Some(old) = old {
+                row._id = old._id;
+                row.version = old.version + 1;
+                table
+                    .update(
+                        row._id,
+                        crate::store::full_row_fields(table.schema(), &row)?,
+                    )
+                    .await
+                    .map_err(db_error)?;
+            } else {
+                table.add_from(&row).await.map_err(db_error)?;
             }
-        }
-        self.control_dirty
-            .store(false, std::sync::atomic::Ordering::Release);
-        Ok(())
+            table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
+            Ok(())
+        })
+    }
+
+    /// A lost control write cannot turn a journal gap into proof of silence.
+    /// Normal restarts retain the checkpoint; an incomplete write advances the
+    /// authorization epoch and establishes a new coverage floor.
+    pub(crate) fn recover_control_delivery(
+        &self,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let Some((spaces, _, controls)) = self.notifications.read().clone() else {
+                return Ok(());
+            };
+            // Read once for every Space: a delivery notice changes Space rows and
+            // the journal, never the control rows a fingerprint covers.
+            let rows = self.control_rows().await?;
+            for id in spaces.get().ids() {
+                let space: crate::store::rows::SpaceRow =
+                    spaces.get().get_as(id).await.map_err(db_error)?;
+                let ids = controls
+                    .get()
+                    .query_all_ids(eq_fields(&[
+                        ("space", Fv::Text(space.space_id.clone())),
+                        ("key", Fv::Text("internal/governance".into())),
+                    ]))
+                    .await
+                    .map_err(db_error)?;
+                let old = if let Some(id) = ids.first() {
+                    Some(
+                        controls
+                            .get()
+                            .get_as::<crate::store::rows::ControlRecordRow>(*id)
+                            .await
+                            .map_err(db_error)?,
+                    )
+                } else {
+                    None
+                };
+                if let Some(old) = old {
+                    if old.value["fingerprint"].as_str()
+                        != Some(control_fingerprint(&rows, &space)?.as_str())
+                    {
+                        let audit = GovernanceAuditRow {
+                            at: time::now(),
+                            space_id: space.space_id.clone(),
+                            principal_id: crate::governance::SYSTEM_PRINCIPAL.into(),
+                            operation: "control_recovery".into(),
+                            ..Default::default()
+                        };
+                        self.notify_control(&audit).await?;
+                    }
+                } else {
+                    self.checkpoint_control(&controls.get(), &space, false, &rows)
+                        .await?;
+                }
+            }
+            self.control_dirty
+                .store(false, std::sync::atomic::Ordering::Release);
+            Ok(())
+        })
     }
 
     /// Appends one audit entry a commit plan carries, tagged with `token`.
     ///
     /// `replay` is a recovery pass, where the entry may already be durable and
     /// is appended only when no entry carries the token yet.
-    pub(crate) async fn replay_mutation(
+    pub(crate) fn replay_mutation(
         &self,
         mut row: GovernanceAuditRow,
         token: &str,
         replay: bool,
-    ) -> Result<(), KipError> {
-        if replay {
-            let ids = self
-                .audit
-                .get()
-                .query_all_ids(eq_field("resource", Fv::Text(row.resource.clone())))
-                .await
-                .map_err(db_error)?;
-            for id in ids {
-                let old: GovernanceAuditRow =
-                    self.audit.get().get_as(id).await.map_err(db_error)?;
-                if old.record.get("_kip_commit").and_then(Json::as_str) == Some(token) {
-                    return Ok(());
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            if replay {
+                let ids = self
+                    .audit
+                    .get()
+                    .query_all_ids(eq_field("resource", Fv::Text(row.resource.clone())))
+                    .await
+                    .map_err(db_error)?;
+                for id in ids {
+                    let old: GovernanceAuditRow =
+                        self.audit.get().get_as(id).await.map_err(db_error)?;
+                    if old.record.get("_kip_commit").and_then(Json::as_str) == Some(token) {
+                        return Ok(());
+                    }
                 }
             }
-        }
-        row.record["_kip_commit"] = Json::String(token.into());
-        self.audit.get().add_from(&row).await.map_err(db_error)?;
-        Ok(())
+            row.record["_kip_commit"] = Json::String(token.into());
+            self.audit.get().add_from(&row).await.map_err(db_error)?;
+            Ok(())
+        })
     }
 
     /// Appends one authorization decision to the audit log.
-    pub async fn record_decision(&self, row: GovernanceAuditRow) -> Result<u64, KipError> {
-        self.audit
-            .get()
-            .add_from(&GovernanceAuditRow {
-                _id: 0,
-                entry_class: "decision".to_string(),
-                ..row
-            })
-            .await
-            .map_err(db_error)
+    pub fn record_decision(
+        &self,
+        row: GovernanceAuditRow,
+    ) -> impl Future<Output = Result<u64, KipError>> + Send {
+        Box::pin(async move {
+            self.audit
+                .get()
+                .add_from(&GovernanceAuditRow {
+                    _id: 0,
+                    entry_class: "decision".to_string(),
+                    ..row
+                })
+                .await
+                .map_err(db_error)
+        })
     }
 
     /// Reads audit entries for a Space, newest first.
@@ -1626,15 +1704,17 @@ impl GovernanceStore {
         Ok(rows)
     }
 
-    async fn put<T: Serialize>(
+    fn put<T: Serialize + Sync>(
         &self,
         collection: &Collection,
         id: u64,
         row: &T,
-    ) -> Result<(), KipError> {
-        let fields = full_row_fields(collection.schema(), row)?;
-        collection.update(id, fields).await.map_err(db_error)?;
-        Ok(())
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let fields = full_row_fields(collection.schema(), row)?;
+            collection.update(id, fields).await.map_err(db_error)?;
+            Ok(())
+        })
     }
 }
 

@@ -42,7 +42,7 @@ fn standalone_define(statement: &KmlStatement) -> Option<&anda_kip::DefineComman
 }
 
 /// Runs one KML statement as a transaction.
-pub async fn execute(
+pub fn execute(
     store: &Store,
     space_id: &str,
     statement: &KmlStatement,
@@ -50,13 +50,15 @@ pub async fn execute(
     operation: &Operation,
     authority: &EffectiveAuthority,
     auth: &AuthContext,
-) -> Response {
-    let caller = Caller {
-        authority,
-        auth,
-        evaluation_time: None,
-    };
-    execute_as(store, space_id, statement, request, operation, caller).await
+) -> impl Future<Output = Response> + Send {
+    Box::pin(async move {
+        let caller = Caller {
+            authority,
+            auth,
+            evaluation_time: None,
+        };
+        execute_as(store, space_id, statement, request, operation, caller).await
+    })
 }
 
 /// Who runs one KML statement, and under what.
@@ -69,103 +71,106 @@ pub(crate) struct Caller<'a> {
 }
 
 /// [`execute`], for a Session that may carry a simulated evaluation time.
-pub(crate) async fn execute_as(
+pub(crate) fn execute_as(
     store: &Store,
     space_id: &str,
     statement: &KmlStatement,
     request: &Request,
     operation: &Operation,
     caller: Caller<'_>,
-) -> Response {
-    let Caller {
-        authority,
-        auth,
-        evaluation_time,
-    } = caller;
-    if evaluation_time.is_some()
-        && (!cfg!(feature = "simulation")
-            || auth.principal_id != crate::governance::SYSTEM_PRINCIPAL
-            || auth.auth_method != "engine"
-            || !auth.delegation_chain.is_empty())
-    {
-        return Response::from(KipError::not_authorized(
-            "simulated evaluation time requires an engine system session",
-        ));
-    }
-    if let Some(define) = standalone_define(statement) {
-        return define::execute(store, space_id, define, statement, request, operation, auth).await;
-    }
-    let dry_run = request.is_dry_run();
-    let origin = origin_of(request, auth);
-
-    let mut tx = match Transaction::begin(
-        store,
-        space_id,
-        origin,
-        dry_run,
-        authority.clone(),
-        auth.clone(),
-    )
-    .await
-    {
-        Ok(tx) => tx,
-        Err(err) => return Response::from(err),
-    };
-
-    tx.evaluation_time = evaluation_time.map(str::to_string);
-
-    // Ingested Evidence is minted before the plan runs, inside this same
-    // transaction, so a command can cite it as `:key` and an abort takes it
-    // with everything else (§71.1).
-    let ingested = match mint_ingested_evidence(store, &mut tx, request, operation).await {
-        Ok(bound) => bound,
-        Err(err) => {
-            tx.abort().await;
-            return Response::from(err);
+) -> impl Future<Output = Response> + Send {
+    Box::pin(async move {
+        let Caller {
+            authority,
+            auth,
+            evaluation_time,
+        } = caller;
+        if evaluation_time.is_some()
+            && (!cfg!(feature = "simulation")
+                || auth.principal_id != crate::governance::SYSTEM_PRINCIPAL
+                || auth.auth_method != "engine"
+                || !auth.delegation_chain.is_empty())
+        {
+            return Response::from(KipError::not_authorized(
+                "simulated evaluation time requires an engine system session",
+            ));
         }
-    };
-    let parameters = merge_parameters(request.parameters.as_ref(), ingested);
-
-    match plan(store, &mut tx, statement, parameters.as_ref(), operation).await {
-        Ok(()) => {}
-        Err(err) => {
-            // The only durable thing a failed statement wrote is its shells,
-            // and they were never visible to any reader.
-            tx.abort().await;
-            return Response::from(err);
+        if let Some(define) = standalone_define(statement) {
+            return define::execute(store, space_id, define, statement, request, operation, auth)
+                .await;
         }
-    }
+        let dry_run = request.is_dry_run();
+        let origin = origin_of(request, auth);
 
-    let key = idempotency_key(request, operation);
-    let entry = JournalEntry {
-        request_digest: if key.is_empty() {
-            String::new()
-        } else {
-            request_digest(statement, request, operation)
-        },
-        idempotency_key: scoped_idempotency_key(auth, &key),
-        ..Default::default()
-    };
-    let schema_environment_version = tx.env.version;
-    let provenance = access_provenance(statement, authority, auth);
-    match tx.commit(entry).await {
-        Ok(outcome) => {
-            let mut receipt = outcome.receipt.clone();
-            if let Some(provenance) = provenance {
-                receipt
-                    .extensions
-                    .get_or_insert_with(Map::new)
-                    .insert("governance".to_string(), provenance);
+        let mut tx = match Transaction::begin(
+            store,
+            space_id,
+            origin,
+            dry_run,
+            authority.clone(),
+            auth.clone(),
+        )
+        .await
+        {
+            Ok(tx) => tx,
+            Err(err) => return Response::from(err),
+        };
+
+        tx.evaluation_time = evaluation_time.map(str::to_string);
+
+        // Ingested Evidence is minted before the plan runs, inside this same
+        // transaction, so a command can cite it as `:key` and an abort takes it
+        // with everything else (§71.1).
+        let ingested = match mint_ingested_evidence(store, &mut tx, request, operation).await {
+            Ok(bound) => bound,
+            Err(err) => {
+                tx.abort().await;
+                return Response::from(err);
             }
-            // The digest covers the members §33.2 names, not the namespaced
-            // `extensions`, so it does not matter that the provenance was
-            // attached first — and a replay, which cannot rebuild the
-            // provenance, recovers the same digest.
-            let receipt = crate::tx::seal_receipt(receipt);
-            success(outcome, space_id, schema_environment_version, receipt)
+        };
+        let parameters = merge_parameters(request.parameters.as_ref(), ingested);
+
+        match plan(store, &mut tx, statement, parameters.as_ref(), operation).await {
+            Ok(()) => {}
+            Err(err) => {
+                // The only durable thing a failed statement wrote is its shells,
+                // and they were never visible to any reader.
+                tx.abort().await;
+                return Response::from(err);
+            }
         }
-        Err(err) => Response::from(err),
-    }
+
+        let key = idempotency_key(request, operation);
+        let entry = JournalEntry {
+            request_digest: if key.is_empty() {
+                String::new()
+            } else {
+                request_digest(statement, request, operation)
+            },
+            idempotency_key: scoped_idempotency_key(auth, &key),
+            ..Default::default()
+        };
+        let schema_environment_version = tx.env.version;
+        let provenance = access_provenance(statement, authority, auth);
+        match tx.commit(entry).await {
+            Ok(outcome) => {
+                let mut receipt = outcome.receipt.clone();
+                if let Some(provenance) = provenance {
+                    receipt
+                        .extensions
+                        .get_or_insert_with(Map::new)
+                        .insert("governance".to_string(), provenance);
+                }
+                // The digest covers the members §33.2 names, not the namespaced
+                // `extensions`, so it does not matter that the provenance was
+                // attached first — and a replay, which cannot rebuild the
+                // provenance, recovers the same digest.
+                let receipt = crate::tx::seal_receipt(receipt);
+                success(outcome, space_id, schema_environment_version, receipt)
+            }
+            Err(err) => Response::from(err),
+        }
+    })
 }
 
 /// The access-decision provenance a high-impact receipt carries (§33.1).
@@ -224,33 +229,36 @@ fn merge_parameters(
     Some(merged)
 }
 
-pub(crate) async fn plan(
+pub(crate) fn plan(
     store: &Store,
     tx: &mut Transaction,
     statement: &KmlStatement,
     parameters: Option<&Map<String, Json>>,
     operation: &Operation,
-) -> Result<(), KipError> {
-    for clause in &statement.clauses {
-        clauses::declare_handles(tx, clause).await?;
-    }
-    for clause in &statement.clauses {
-        clauses::declare_concept_type(tx, clause, parameters, operation.parameters.as_ref())?;
-    }
-    // Clause order carries no mutation semantics (§24), so this is a planning
-    // order rather than an execution order. See `clauses::plan_pass`.
-    for pass in 0..clauses::PLAN_PASSES {
-        if pass == 3 {
-            tx.freeze_handle_views();
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        for clause in &statement.clauses {
+            clauses::declare_handles(tx, clause).await?;
         }
         for clause in &statement.clauses {
-            if clauses::plan_pass(clause) != pass {
-                continue;
-            }
-            clauses::apply(store, tx, clause, parameters, operation.parameters.as_ref()).await?;
+            clauses::declare_concept_type(tx, clause, parameters, operation.parameters.as_ref())?;
         }
-    }
-    Ok(())
+        // Clause order carries no mutation semantics (§24), so this is a planning
+        // order rather than an execution order. See `clauses::plan_pass`.
+        for pass in 0..clauses::PLAN_PASSES {
+            if pass == 3 {
+                tx.freeze_handle_views();
+            }
+            for clause in &statement.clauses {
+                if clauses::plan_pass(clause) != pass {
+                    continue;
+                }
+                clauses::apply(store, tx, clause, parameters, operation.parameters.as_ref())
+                    .await?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Mints the Evidence a request's ingestion context carries (§71.1).
@@ -273,164 +281,166 @@ pub(crate) async fn plan(
 ///   mechanism — the command never spells the content.
 ///
 /// Returns the bindings to merge into the request parameters.
-async fn mint_ingested_evidence(
+fn mint_ingested_evidence(
     store: &Store,
     tx: &mut Transaction,
     request: &Request,
     operation: &Operation,
-) -> Result<Map<String, Json>, KipError> {
-    let Some(ingest) = &request.ingest else {
-        return Ok(Map::new());
-    };
-    ingest.validate()?;
-
-    let mut bound = Map::new();
-    let mut ingested_by_key = std::collections::BTreeMap::new();
-    for entry in &ingest.evidence {
-        // A request parameter of the same name would make it ambiguous which
-        // value the command cited, and the two cannot be reconciled: one is a
-        // caller-supplied value, the other is an element this request created.
-        //
-        // Both levels, because §74 merges them into one binding environment:
-        // checking only the request's would let an operation-level parameter
-        // shadow the ingested reference and leave the Evidence minted, unused
-        // and uncited.
-        let claimed = |parameters: Option<&Map<String, Json>>| {
-            parameters.is_some_and(|parameters| parameters.contains_key(&entry.key))
+) -> impl Future<Output = Result<Map<String, Json>, KipError>> + Send {
+    Box::pin(async move {
+        let Some(ingest) = &request.ingest else {
+            return Ok(Map::new());
         };
-        if claimed(request.parameters.as_ref()) || claimed(operation.parameters.as_ref()) {
-            return Err(KipError::invalid_request_envelope(format!(
-                "the ingest key {:?} is also a request parameter; a command citing :{} could \
-                 mean either",
-                entry.key, entry.key
-            )));
-        }
-        let (payload, artifact_sources) = if let Some(reference) = &entry.payload_artifact {
-            if entry.payload.is_some() {
-                return Err(KipError::invalid_request_envelope(
-                    "ingestion must declare exactly one payload source",
-                ));
+        ingest.validate()?;
+
+        let mut bound = Map::new();
+        let mut ingested_by_key = std::collections::BTreeMap::new();
+        for entry in &ingest.evidence {
+            // A request parameter of the same name would make it ambiguous which
+            // value the command cited, and the two cannot be reconciled: one is a
+            // caller-supplied value, the other is an element this request created.
+            //
+            // Both levels, because §74 merges them into one binding environment:
+            // checking only the request's would let an operation-level parameter
+            // shadow the ingested reference and leave the Evidence minted, unused
+            // and uncited.
+            let claimed = |parameters: Option<&Map<String, Json>>| {
+                parameters.is_some_and(|parameters| parameters.contains_key(&entry.key))
+            };
+            if claimed(request.parameters.as_ref()) || claimed(operation.parameters.as_ref()) {
+                return Err(KipError::invalid_request_envelope(format!(
+                    "the ingest key {:?} is also a request parameter; a command citing :{} could \
+                     mean either",
+                    entry.key, entry.key
+                )));
             }
-            if entry
-                .media_type
-                .as_deref()
-                .is_some_and(|v| v != "application/json")
-            {
-                return Err(KipError::unsupported_capability(
-                    "governed artifacts currently carry canonical application/json bytes",
-                ));
+            let (payload, artifact_sources) = if let Some(reference) = &entry.payload_artifact {
+                if entry.payload.is_some() {
+                    return Err(KipError::invalid_request_envelope(
+                        "ingestion must declare exactly one payload source",
+                    ));
+                }
+                if entry
+                    .media_type
+                    .as_deref()
+                    .is_some_and(|v| v != "application/json")
+                {
+                    return Err(KipError::unsupported_capability(
+                        "governed artifacts currently carry canonical application/json bytes",
+                    ));
+                }
+                store
+                    .authorized_artifact(&tx.cx.space, reference, &tx.authority, &tx.auth)
+                    .await?
+            } else {
+                (
+                    entry.payload.clone().ok_or_else(|| {
+                        KipError::invalid_request_envelope(
+                            "ingestion needs payload or payload_artifact",
+                        )
+                    })?,
+                    Vec::new(),
+                )
+            };
+
+            let client_key = entry.client_key.clone().unwrap_or_default();
+
+            let mut source_refs = match &entry.source_actor {
+                Some(actor) => vec![resolve_source_actor(store, tx, actor).await?],
+                None => Vec::new(),
+            };
+            for source in artifact_sources {
+                source_refs.push(serde_json::json!({"id":source}));
             }
-            store
-                .authorized_artifact(&tx.cx.space, reference, &tx.authority, &tx.auth)
-                .await?
-        } else {
-            (
-                entry.payload.clone().ok_or_else(|| {
-                    KipError::invalid_request_envelope(
-                        "ingestion needs payload or payload_artifact",
-                    )
-                })?,
-                Vec::new(),
-            )
-        };
-
-        let client_key = entry.client_key.clone().unwrap_or_default();
-
-        let mut source_refs = match &entry.source_actor {
-            Some(actor) => vec![resolve_source_actor(store, tx, actor).await?],
-            None => Vec::new(),
-        };
-        for source in artifact_sources {
-            source_refs.push(serde_json::json!({"id":source}));
-        }
-        let content_digest = if entry.payload_artifact.is_some() {
-            crate::schema::contracts::digest(&payload)?
-        } else {
-            String::new()
-        };
-        let observed_at = match &entry.observed_at {
-            Some(at) => crate::time::normalize(at, "ingest.observed_at")?,
-            None => tx.cx.at.clone(),
-        };
-        // §71.1: the entry's Facets are validated exactly as `SET FACET` on
-        // `CREATE EVIDENCE` would be — which is how instrumentation attaches
-        // an OutcomeRecord to an ingested outcome without re-typing anything,
-        // and how a member the Facet does not declare fails the whole request.
-        let facets = ingested_facets(tx, &entry.facets)?;
-        let media_type = entry.media_type.clone().unwrap_or_else(|| {
-            if entry.payload_artifact.is_some() {
-                "application/json".into()
+            let content_digest = if entry.payload_artifact.is_some() {
+                crate::schema::contracts::digest(&payload)?
             } else {
                 String::new()
-            }
-        });
-        let existing = match ingested_by_key.get(&client_key).copied() {
-            Some(id) => Some(id),
-            None => {
-                store
-                    .find_by_client_key(&tx.cx.space, ElementKind::Evidence, &client_key)
-                    .await?
-            }
-        };
-        if let Some(existing) = existing {
-            let old = tx.load(existing).await?;
-            let crate::store::Element::Evidence(old) = old else {
-                return Err(KipError::internal_error(
-                    "ingest key resolved to a non-Evidence element",
-                ));
             };
-            if old.evidence_class != entry.evidence_class
-                || old.payload_mode != "inline"
-                || anda_kip::canonical_json(&old.payload_inline)
-                    != anda_kip::canonical_json(&payload)
-                || old.source_refs != source_refs
-                || old.media_type != media_type
-                || entry.observed_at.is_some() && old.observed_at != observed_at
-                || !facets
-                    .iter()
-                    .all(|(name, value)| old.facets.get(name) == Some(value))
-            {
-                return Err(KipError::new(
-                    anda_kip::KipErrorCode::ClientKeyConflict,
-                    "ingest client_key already names a different observation; use a distinct message/ingestion identity",
-                ));
+            let observed_at = match &entry.observed_at {
+                Some(at) => crate::time::normalize(at, "ingest.observed_at")?,
+                None => tx.cx.at.clone(),
+            };
+            // §71.1: the entry's Facets are validated exactly as `SET FACET` on
+            // `CREATE EVIDENCE` would be — which is how instrumentation attaches
+            // an OutcomeRecord to an ingested outcome without re-typing anything,
+            // and how a member the Facet does not declare fails the whole request.
+            let facets = ingested_facets(tx, &entry.facets)?;
+            let media_type = entry.media_type.clone().unwrap_or_else(|| {
+                if entry.payload_artifact.is_some() {
+                    "application/json".into()
+                } else {
+                    String::new()
+                }
+            });
+            let existing = match ingested_by_key.get(&client_key).copied() {
+                Some(id) => Some(id),
+                None => {
+                    store
+                        .find_by_client_key(&tx.cx.space, ElementKind::Evidence, &client_key)
+                        .await?
+                }
+            };
+            if let Some(existing) = existing {
+                let old = tx.load(existing).await?;
+                let crate::store::Element::Evidence(old) = old else {
+                    return Err(KipError::internal_error(
+                        "ingest key resolved to a non-Evidence element",
+                    ));
+                };
+                if old.evidence_class != entry.evidence_class
+                    || old.payload_mode != "inline"
+                    || anda_kip::canonical_json(&old.payload_inline)
+                        != anda_kip::canonical_json(&payload)
+                    || old.source_refs != source_refs
+                    || old.media_type != media_type
+                    || entry.observed_at.is_some() && old.observed_at != observed_at
+                    || !facets
+                        .iter()
+                        .all(|(name, value)| old.facets.get(name) == Some(value))
+                {
+                    return Err(KipError::new(
+                        anda_kip::KipErrorCode::ClientKeyConflict,
+                        "ingest client_key already names a different observation; use a distinct message/ingestion identity",
+                    ));
+                }
+                bound.insert(
+                    entry.key.clone(),
+                    serde_json::json!({"id": existing.to_string()}),
+                );
+                continue;
             }
-            bound.insert(
-                entry.key.clone(),
-                serde_json::json!({"id": existing.to_string()}),
-            );
-            continue;
-        }
 
-        let id = tx.mint(ElementKind::Evidence).await?;
-        let row = crate::store::rows::EvidenceRow {
-            _id: id.seq,
-            evidence_class: entry.evidence_class.clone(),
-            payload_mode: "inline".to_string(),
-            payload_inline: payload,
-            content_digest,
-            media_type,
-            observed_at,
-            source_keys: source_refs.iter().map(clauses::endpoint_key).collect(),
-            source_refs,
-            status: "active".to_string(),
-            client_key: client_key.clone(),
-            facets,
-            ..Default::default()
-        };
-        let element = crate::store::Element::Evidence(Box::new(row));
-        tx.authorize_created(&element, crate::governance::Permission::Create)?;
-        // §29.8: writing into the consequence channel costs `record_outcome`,
-        // whichever path the Evidence arrives by — the envelope is not a way
-        // around the gate.
-        clauses::require_outcome_authority(tx, &element)?;
-        tx.stage_new(id, element, anda_kip::ChangeOp::Create);
-        if !client_key.is_empty() {
-            ingested_by_key.insert(client_key, id);
+            let id = tx.mint(ElementKind::Evidence).await?;
+            let row = crate::store::rows::EvidenceRow {
+                _id: id.seq,
+                evidence_class: entry.evidence_class.clone(),
+                payload_mode: "inline".to_string(),
+                payload_inline: payload,
+                content_digest,
+                media_type,
+                observed_at,
+                source_keys: source_refs.iter().map(clauses::endpoint_key).collect(),
+                source_refs,
+                status: "active".to_string(),
+                client_key: client_key.clone(),
+                facets,
+                ..Default::default()
+            };
+            let element = crate::store::Element::Evidence(Box::new(row));
+            tx.authorize_created(&element, crate::governance::Permission::Create)?;
+            // §29.8: writing into the consequence channel costs `record_outcome`,
+            // whichever path the Evidence arrives by — the envelope is not a way
+            // around the gate.
+            clauses::require_outcome_authority(tx, &element)?;
+            tx.stage_new(id, element, anda_kip::ChangeOp::Create);
+            if !client_key.is_empty() {
+                ingested_by_key.insert(client_key, id);
+            }
+            bound.insert(entry.key.clone(), serde_json::json!({"id": id.to_string()}));
         }
-        bound.insert(entry.key.clone(), serde_json::json!({"id": id.to_string()}));
-    }
-    Ok(bound)
+        Ok(bound)
+    })
 }
 
 /// Resolves and validates the Facets an ingest entry attaches (§71.1).

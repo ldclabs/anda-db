@@ -356,12 +356,14 @@ impl Store {
     /// The version-bumping [`Store::update`] is the right primitive for a
     /// standalone edit; this one is for a transaction commit, where the
     /// version was already decided once for the whole transaction (§44).
-    pub async fn put<R: Row>(&self, row: &R) -> Result<(), KipError> {
-        let collection = self.elements(R::KIND);
-        let id = row.id();
-        let fields = super::full_row_fields(collection.schema(), row)?;
-        collection.update(id, fields).await.map_err(db_error)?;
-        Ok(())
+    pub fn put<R: Row>(&self, row: &R) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let collection = self.elements(R::KIND);
+            let id = row.id();
+            let fields = super::full_row_fields(collection.schema(), row)?;
+            collection.update(id, fields).await.map_err(db_error)?;
+            Ok(())
+        })
     }
 
     /// Checks an `EXPECT VERSION` precondition (Spec §81).

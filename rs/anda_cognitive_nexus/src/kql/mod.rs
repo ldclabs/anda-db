@@ -161,65 +161,67 @@ pub(super) struct ElementPage {
 
 impl<'a> Context<'a> {
     /// Opens a query context.
-    pub async fn open(
+    pub fn open(
         store: &'a Store,
         space: &str,
         request: Option<&'a Map<String, Json>>,
         operation: Option<&'a Map<String, Json>>,
         authority: &'a EffectiveAuthority,
         auth: &'a AuthContext,
-    ) -> Result<Self, KipError> {
-        let space_row = store.get_space(space).await?;
-        Ok(Self {
-            env: store
-                .schema_environment_at(space, space_row.schema_environment_version)
-                .await?,
-            store,
-            space: space.to_string(),
-            request,
-            operation,
-            loaded: BTreeMap::new(),
-            views: BTreeMap::new(),
-            visibility: BTreeMap::new(),
-            attached: BTreeSet::new(),
-            audit_readable: BTreeMap::new(),
-            identity_reviews: None,
-            merge_classes: BTreeMap::new(),
-            dependency_pins: None,
-            policy: store
-                .projection_policy_at(space, u64::MAX, &Map::new())
-                .await?,
-            at: crate::time::now(),
-            evaluated_at: crate::time::now(),
-            projected: false,
-            as_of: None,
-            pinned_seq: space_row.seq,
-            traversal: String::new(),
-            authority,
-            auth,
-            read_origin: authority
-                .authorize(
-                    crate::governance::Permission::ReadRawOrigin,
-                    &crate::governance::ResourceContext::default(),
-                    auth,
-                )
-                .is_permitted(),
-            governed_limit: authority
-                .authorize(Permission::Read, &ResourceContext::default(), auth)
-                .constraints
-                .max_results
-                .map(|limit| limit as usize),
-            budget: MAX_CANDIDATES,
-            solution_budget: MAX_SOLUTIONS,
-            historical_ids: BTreeMap::new(),
-            dependency_cache: BTreeMap::new(),
-            ambient: Solutions::unit(),
-            next_internal_variable: 0,
-            element_page: None,
-            element_hints: Vec::new(),
-            existential: false,
-            belief_cache: BTreeMap::new(),
-            frame_cache: BTreeMap::new(),
+    ) -> impl Future<Output = Result<Self, KipError>> + Send {
+        Box::pin(async move {
+            let space_row = store.get_space(space).await?;
+            Ok(Self {
+                env: store
+                    .schema_environment_at(space, space_row.schema_environment_version)
+                    .await?,
+                store,
+                space: space.to_string(),
+                request,
+                operation,
+                loaded: BTreeMap::new(),
+                views: BTreeMap::new(),
+                visibility: BTreeMap::new(),
+                attached: BTreeSet::new(),
+                audit_readable: BTreeMap::new(),
+                identity_reviews: None,
+                merge_classes: BTreeMap::new(),
+                dependency_pins: None,
+                policy: store
+                    .projection_policy_at(space, u64::MAX, &Map::new())
+                    .await?,
+                at: crate::time::now(),
+                evaluated_at: crate::time::now(),
+                projected: false,
+                as_of: None,
+                pinned_seq: space_row.seq,
+                traversal: String::new(),
+                authority,
+                auth,
+                read_origin: authority
+                    .authorize(
+                        crate::governance::Permission::ReadRawOrigin,
+                        &crate::governance::ResourceContext::default(),
+                        auth,
+                    )
+                    .is_permitted(),
+                governed_limit: authority
+                    .authorize(Permission::Read, &ResourceContext::default(), auth)
+                    .constraints
+                    .max_results
+                    .map(|limit| limit as usize),
+                budget: MAX_CANDIDATES,
+                solution_budget: MAX_SOLUTIONS,
+                historical_ids: BTreeMap::new(),
+                dependency_cache: BTreeMap::new(),
+                ambient: Solutions::unit(),
+                next_internal_variable: 0,
+                element_page: None,
+                element_hints: Vec::new(),
+                existential: false,
+                belief_cache: BTreeMap::new(),
+                frame_cache: BTreeMap::new(),
+            })
         })
     }
 
@@ -705,25 +707,30 @@ impl<'a> Context<'a> {
     /// ?thing)` learns both ids from the tuple row without reading either
     /// element — and a later dot path, filter or sort key needs the view. This
     /// is where that debt is paid, once, before anything reads a field.
-    pub async fn warm(&mut self, solutions: &Solutions) -> Result<(), KipError> {
-        let ids: BTreeSet<ElementId> = solutions
-            .rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .filter_map(binding::Binding::element)
-            .filter(|id| !self.attached.contains(id))
-            .collect();
-        self.charge(
-            ids.iter()
-                .filter(|id| !self.loaded.contains_key(id))
-                .count(),
-        )?;
-        self.prefetch(&ids.iter().copied().collect::<Vec<_>>())
-            .await?;
-        for id in ids {
-            self.load(id).await?;
-        }
-        Ok(())
+    pub fn warm(
+        &mut self,
+        solutions: &Solutions,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let ids: BTreeSet<ElementId> = solutions
+                .rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .filter_map(binding::Binding::element)
+                .filter(|id| !self.attached.contains(id))
+                .collect();
+            self.charge(
+                ids.iter()
+                    .filter(|id| !self.loaded.contains_key(id))
+                    .count(),
+            )?;
+            self.prefetch(&ids.iter().copied().collect::<Vec<_>>())
+                .await?;
+            for id in ids {
+                self.load(id).await?;
+            }
+            Ok(())
+        })
     }
 
     pub fn work(&self) -> QueryWork {
@@ -845,103 +852,105 @@ impl<'a> Context<'a> {
     /// Both may not disagree: a request that pinned one coordinate and a
     /// command that named another would leave the answer's own `snapshot_seq`
     /// unable to say which one it means.
-    pub async fn bind_read(
+    pub fn bind_read(
         &mut self,
         as_of: Option<&anda_kip::AsOf>,
         request: &Request,
         cursor: Option<crate::store::history::PageCursor>,
-    ) -> Result<(), KipError> {
-        let from_token = match request
-            .read
-            .as_ref()
-            .and_then(|read| read.snapshot_token.as_ref())
-        {
-            Some(token) => {
-                Some(crate::store::history::Coordinate::from_token(token, &self.space)?.seq)
-            }
-            None => None,
-        };
-        let from_command = match as_of {
-            Some(as_of) => Some(self.resolve_as_of(as_of).await?),
-            None => None,
-        };
-        match (from_token, from_command) {
-            (Some(bound), Some(named)) if bound != named => {
-                return Err(KipError::invalid_request_envelope(format!(
-                    "this request is bound to snapshot {bound} and its command reads AS OF \
-                     {named}; one read answers at one coordinate"
-                )));
-            }
-            _ => {}
-        }
-        if from_token
-            .into_iter()
-            .chain(from_command)
-            .chain(cursor.as_ref().map(|c| c.snapshot_seq))
-            .any(|seq| seq > self.pinned_seq)
-        {
-            return Err(KipError::new(
-                anda_kip::KipErrorCode::HistoricalSnapshotUnavailable,
-                "read coordinate is ahead of the Space",
-            ));
-        }
-        // A continuation is pinned to the coordinate its own first page read
-        // at (§44.8). It does not ask for `read_history`: the caller is
-        // resuming a traversal it already began, over the same rows page one
-        // returned, so requiring a permission page one did not need would make
-        // paging a privilege rather than a mechanic.
-        //
-        // Reconstruction is only engaged when the Space has actually moved on.
-        // At the current coordinate the version log would rebuild exactly what
-        // the live indexes already hold, at the cost of scanning it.
-        let from_cursor = cursor.as_ref().and_then(|cursor| {
-            (cursor.snapshot_seq < self.pinned_seq).then_some(cursor.snapshot_seq)
-        });
-        if let Some(cursor) = cursor {
-            match from_command.or(from_token) {
-                Some(named) if named != cursor.snapshot_seq => {
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let from_token = match request
+                .read
+                .as_ref()
+                .and_then(|read| read.snapshot_token.as_ref())
+            {
+                Some(token) => {
+                    Some(crate::store::history::Coordinate::from_token(token, &self.space)?.seq)
+                }
+                None => None,
+            };
+            let from_command = match as_of {
+                Some(as_of) => Some(self.resolve_as_of(as_of).await?),
+                None => None,
+            };
+            match (from_token, from_command) {
+                (Some(bound), Some(named)) if bound != named => {
                     return Err(KipError::invalid_request_envelope(format!(
-                        "this cursor continues a traversal pinned to snapshot {}, and this read \
-                         names {named}; one traversal answers at one coordinate",
-                        cursor.snapshot_seq
+                        "this request is bound to snapshot {bound} and its command reads AS OF \
+                         {named}; one read answers at one coordinate"
                     )));
                 }
                 _ => {}
             }
-            self.pinned_seq = cursor.snapshot_seq;
-        }
-        self.as_of = from_command.or(from_token).or(from_cursor);
-        if let Some(seq) = self.as_of {
-            self.pinned_seq = seq;
-        }
-        // Answers memoized per read belong to one coordinate.
-        self.identity_reviews = None;
-        self.audit_readable.clear();
-        self.merge_classes.clear();
-        self.belief_cache.clear();
-        self.frame_cache.clear();
-        if let Some(seq) = self.as_of {
-            self.policy = self
-                .store
-                .projection_policy_at(&self.space, seq, &Map::new())
-                .await
-                .unwrap_or_else(|_| {
-                    let mut p = crate::projection::Policy::baseline();
-                    p.trust_version = "unavailable".into();
-                    p
-                });
-        }
-        // The Schema that was in force then is what a historical read resolves
-        // symbols through: reconstructing the past under today's schema would
-        // answer a question nobody asked (§20.9).
-        if let Some(seq) = self.as_of {
-            let version = self.store.schema_version_at(&self.space, seq).await?;
-            self.env = self
-                .store
-                .schema_environment_at(&self.space, version)
-                .await?;
-        }
-        Ok(())
+            if from_token
+                .into_iter()
+                .chain(from_command)
+                .chain(cursor.as_ref().map(|c| c.snapshot_seq))
+                .any(|seq| seq > self.pinned_seq)
+            {
+                return Err(KipError::new(
+                    anda_kip::KipErrorCode::HistoricalSnapshotUnavailable,
+                    "read coordinate is ahead of the Space",
+                ));
+            }
+            // A continuation is pinned to the coordinate its own first page read
+            // at (§44.8). It does not ask for `read_history`: the caller is
+            // resuming a traversal it already began, over the same rows page one
+            // returned, so requiring a permission page one did not need would make
+            // paging a privilege rather than a mechanic.
+            //
+            // Reconstruction is only engaged when the Space has actually moved on.
+            // At the current coordinate the version log would rebuild exactly what
+            // the live indexes already hold, at the cost of scanning it.
+            let from_cursor = cursor.as_ref().and_then(|cursor| {
+                (cursor.snapshot_seq < self.pinned_seq).then_some(cursor.snapshot_seq)
+            });
+            if let Some(cursor) = cursor {
+                match from_command.or(from_token) {
+                    Some(named) if named != cursor.snapshot_seq => {
+                        return Err(KipError::invalid_request_envelope(format!(
+                            "this cursor continues a traversal pinned to snapshot {}, and this read \
+                             names {named}; one traversal answers at one coordinate",
+                            cursor.snapshot_seq
+                        )));
+                    }
+                    _ => {}
+                }
+                self.pinned_seq = cursor.snapshot_seq;
+            }
+            self.as_of = from_command.or(from_token).or(from_cursor);
+            if let Some(seq) = self.as_of {
+                self.pinned_seq = seq;
+            }
+            // Answers memoized per read belong to one coordinate.
+            self.identity_reviews = None;
+            self.audit_readable.clear();
+            self.merge_classes.clear();
+            self.belief_cache.clear();
+            self.frame_cache.clear();
+            if let Some(seq) = self.as_of {
+                self.policy = self
+                    .store
+                    .projection_policy_at(&self.space, seq, &Map::new())
+                    .await
+                    .unwrap_or_else(|_| {
+                        let mut p = crate::projection::Policy::baseline();
+                        p.trust_version = "unavailable".into();
+                        p
+                    });
+            }
+            // The Schema that was in force then is what a historical read resolves
+            // symbols through: reconstructing the past under today's schema would
+            // answer a question nobody asked (§20.9).
+            if let Some(seq) = self.as_of {
+                let version = self.store.schema_version_at(&self.space, seq).await?;
+                self.env = self
+                    .store
+                    .schema_environment_at(&self.space, version)
+                    .await?;
+            }
+            Ok(())
+        })
     }
 
     /// Resolves an `AS OF` coordinate to a Space sequence.
@@ -1043,146 +1052,150 @@ impl<'a> Context<'a> {
         Box::pin(async move { self.apply_clause_inner(solutions, clause).await })
     }
 
-    async fn apply_clause_inner(
+    fn apply_clause_inner(
         &mut self,
         solutions: Solutions,
         clause: &WhereClause,
-    ) -> Result<Solutions, KipError> {
-        Ok(match clause {
-            WhereClause::Concept { variable, matcher } => {
-                let table = self
-                    .match_element_bound(ElementKind::Concept, variable, matcher, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Assertion { variable, matcher } => {
-                let table = self
-                    .match_element_bound(ElementKind::Assertion, variable, matcher, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Evidence { variable, matcher } => {
-                let table = self
-                    .match_element_bound(ElementKind::Evidence, variable, matcher, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Activity { variable, matcher } => {
-                let table = self
-                    .match_element_bound(ElementKind::Activity, variable, matcher, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Proposition { variable, matcher } => {
-                // The solutions so far are passed in so a traversal can start
-                // from what an earlier pattern already pinned: `?a CONCEPT
-                // {name: "A"} (?a, "leads_to"{1,3}, ?b)` should walk from A,
-                // not walk the whole Space and then throw most of it away in
-                // the join.
-                let table = self
-                    .match_proposition(variable.as_deref(), matcher, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Structural {
-                variable,
-                subject,
-                field,
-                object,
-            } => {
-                let table = self
-                    .match_structural(variable.as_deref(), subject, field, object, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Filter { expression } => {
-                let mut solutions = solutions;
-                // A filter may read a dot path off any bound element, so the
-                // views have to exist before it runs.
-                self.warm(&solutions).await?;
-                self.apply_filter(&mut solutions, expression)?;
-                solutions
-            }
-            WhereClause::Not(inner) => {
-                let columns = correlation_columns(inner, &solutions);
-                let mut memo = std::collections::HashMap::new();
-                let mut out = solutions.header();
-                for row in &solutions.rows {
-                    let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
-                    let incoming = solutions.with_rows(vec![row.clone()]);
-                    let exists = if let Some(found) = memo.get(&key) {
-                        *found
-                    } else {
-                        let previous = self.existential;
-                        self.existential = self.can_test_existence(inner);
-                        let result = self.solve_with(inner, incoming.clone()).await;
-                        self.existential = previous;
-                        let found = !self.join(incoming.clone(), result?)?.is_empty();
-                        memo.insert(key, found);
-                        found
-                    };
-                    if !exists {
-                        out = self.union(out, incoming)?;
-                    }
+    ) -> impl Future<Output = Result<Solutions, KipError>> + Send {
+        Box::pin(async move {
+            Ok(match clause {
+                WhereClause::Concept { variable, matcher } => {
+                    let table = self
+                        .match_element_bound(ElementKind::Concept, variable, matcher, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
                 }
-                out
-            }
-            WhereClause::Optional(inner) => {
-                let columns = correlation_columns(inner, &solutions);
-                let retained: BTreeSet<_> = columns.iter().map(|i| &solutions.vars[*i]).collect();
-                let mut memo = std::collections::HashMap::<Vec<String>, Solutions>::new();
-                let mut out = solutions.header();
-                for row in &solutions.rows {
-                    let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
-                    let incoming = solutions.with_rows(vec![row.clone()]);
-                    let table = if let Some(table) = memo.get(&key) {
-                        table.clone()
-                    } else {
-                        let mut table = self.solve_with(inner, incoming.clone()).await?;
-                        for index in (0..table.vars.len()).rev() {
-                            if solutions.vars.contains(&table.vars[index])
-                                && !retained.contains(&table.vars[index])
-                            {
-                                table.vars.remove(index);
-                                for row in &mut table.rows {
-                                    row.remove(index);
+                WhereClause::Assertion { variable, matcher } => {
+                    let table = self
+                        .match_element_bound(ElementKind::Assertion, variable, matcher, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Evidence { variable, matcher } => {
+                    let table = self
+                        .match_element_bound(ElementKind::Evidence, variable, matcher, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Activity { variable, matcher } => {
+                    let table = self
+                        .match_element_bound(ElementKind::Activity, variable, matcher, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Proposition { variable, matcher } => {
+                    // The solutions so far are passed in so a traversal can start
+                    // from what an earlier pattern already pinned: `?a CONCEPT
+                    // {name: "A"} (?a, "leads_to"{1,3}, ?b)` should walk from A,
+                    // not walk the whole Space and then throw most of it away in
+                    // the join.
+                    let table = self
+                        .match_proposition(variable.as_deref(), matcher, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Structural {
+                    variable,
+                    subject,
+                    field,
+                    object,
+                } => {
+                    let table = self
+                        .match_structural(variable.as_deref(), subject, field, object, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Filter { expression } => {
+                    let mut solutions = solutions;
+                    // A filter may read a dot path off any bound element, so the
+                    // views have to exist before it runs.
+                    self.warm(&solutions).await?;
+                    self.apply_filter(&mut solutions, expression)?;
+                    solutions
+                }
+                WhereClause::Not(inner) => {
+                    let columns = correlation_columns(inner, &solutions);
+                    let mut memo = std::collections::HashMap::new();
+                    let mut out = solutions.header();
+                    for row in &solutions.rows {
+                        let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
+                        let incoming = solutions.with_rows(vec![row.clone()]);
+                        let exists = if let Some(found) = memo.get(&key) {
+                            *found
+                        } else {
+                            let previous = self.existential;
+                            self.existential = self.can_test_existence(inner);
+                            let result = self.solve_with(inner, incoming.clone()).await;
+                            self.existential = previous;
+                            let found = !self.join(incoming.clone(), result?)?.is_empty();
+                            memo.insert(key, found);
+                            found
+                        };
+                        if !exists {
+                            out = self.union(out, incoming)?;
+                        }
+                    }
+                    out
+                }
+                WhereClause::Optional(inner) => {
+                    let columns = correlation_columns(inner, &solutions);
+                    let retained: BTreeSet<_> =
+                        columns.iter().map(|i| &solutions.vars[*i]).collect();
+                    let mut memo = std::collections::HashMap::<Vec<String>, Solutions>::new();
+                    let mut out = solutions.header();
+                    for row in &solutions.rows {
+                        let key: Vec<_> = columns.iter().map(|i| row[*i].identity_key()).collect();
+                        let incoming = solutions.with_rows(vec![row.clone()]);
+                        let table = if let Some(table) = memo.get(&key) {
+                            table.clone()
+                        } else {
+                            let mut table = self.solve_with(inner, incoming.clone()).await?;
+                            for index in (0..table.vars.len()).rev() {
+                                if solutions.vars.contains(&table.vars[index])
+                                    && !retained.contains(&table.vars[index])
+                                {
+                                    table.vars.remove(index);
+                                    for row in &mut table.rows {
+                                        row.remove(index);
+                                    }
                                 }
                             }
-                        }
-                        memo.insert(key, table.clone());
-                        table
-                    };
-                    let joined = incoming.left_join_bounded(table, &mut self.solution_budget)?;
-                    out = self.union(out, joined)?;
+                            memo.insert(key, table.clone());
+                            table
+                        };
+                        let joined =
+                            incoming.left_join_bounded(table, &mut self.solution_budget)?;
+                        out = self.union(out, joined)?;
+                    }
+                    out
                 }
-                out
-            }
-            WhereClause::Union(inner) => {
-                // An alternative branch with its own scope: its solutions are
-                // added to what came before rather than intersected with it,
-                // so a branch binding different variables widens the result
-                // instead of filtering the other side away.
-                let branch = self.solve_with(inner, self.ambient.clone()).await?;
-                self.union(solutions, branch)?
-            }
-            WhereClause::Belief { variable, target } => {
-                let table = self.match_belief(variable, target, &solutions).await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::BeliefSlot {
-                variable,
-                subject,
-                predicate,
-            } => {
-                let table = self
-                    .match_belief_slot(variable, subject, predicate, &solutions)
-                    .await?;
-                self.join(solutions, table)?
-            }
-            WhereClause::Search(pattern) => {
-                let table = self.match_search(pattern).await?;
-                self.join(solutions, table)?
-            }
+                WhereClause::Union(inner) => {
+                    // An alternative branch with its own scope: its solutions are
+                    // added to what came before rather than intersected with it,
+                    // so a branch binding different variables widens the result
+                    // instead of filtering the other side away.
+                    let branch = self.solve_with(inner, self.ambient.clone()).await?;
+                    self.union(solutions, branch)?
+                }
+                WhereClause::Belief { variable, target } => {
+                    let table = self.match_belief(variable, target, &solutions).await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::BeliefSlot {
+                    variable,
+                    subject,
+                    predicate,
+                } => {
+                    let table = self
+                        .match_belief_slot(variable, subject, predicate, &solutions)
+                        .await?;
+                    self.join(solutions, table)?
+                }
+                WhereClause::Search(pattern) => {
+                    let table = self.match_search(pattern).await?;
+                    self.join(solutions, table)?
+                }
+            })
         })
     }
 
@@ -1190,38 +1203,40 @@ impl<'a> Context<'a> {
     /// hits of the same retrieval as META `SEARCH`, against this query's
     /// snapshot, each bound as an element. A hit's view carries the transient
     /// `retrieval.score` / `retrieval.mode`; a miss proves nothing (§66.6).
-    async fn match_search(
+    fn match_search(
         &mut self,
         pattern: &anda_kip::SearchPattern,
-    ) -> Result<Solutions, KipError> {
-        if self.is_historical() {
-            return Err(KipError::new(
-                anda_kip::KipErrorCode::HistoricalSearchUnavailable,
-                "this engine keeps no historical index, so a Search Pattern under AS OF is \
-                 unavailable (historical_search)",
-            ));
-        }
-        let limit = crate::meta::describe::scalar_usize(self, &pattern.limit, "LIMIT")?;
-        let spec = crate::meta::inspect::SearchSpec {
-            target: pattern.target,
-            term: &pattern.term,
-            with_type: pattern.with_type.as_ref(),
-            with_predicate: pattern.with_predicate.as_ref(),
-            mode: pattern.mode.as_ref(),
-            threshold: pattern.threshold.as_ref(),
-        };
-        let (hits, cap) = crate::meta::inspect::rank(self, &spec, limit).await?;
-        let limit = cap.map_or(limit, |cap| cap.min(limit));
-        let mut rows = Vec::new();
-        for (score, id, _) in hits.into_iter().take(limit) {
-            if let Some(view) = self.views.get_mut(&id) {
-                let mut view = view.as_ref().clone();
-                view["retrieval"] = serde_json::json!({"score": score, "mode": "keyword"});
-                self.views.insert(id, Arc::new(view));
+    ) -> impl Future<Output = Result<Solutions, KipError>> + Send {
+        Box::pin(async move {
+            if self.is_historical() {
+                return Err(KipError::new(
+                    anda_kip::KipErrorCode::HistoricalSearchUnavailable,
+                    "this engine keeps no historical index, so a Search Pattern under AS OF is \
+                     unavailable (historical_search)",
+                ));
             }
-            rows.push(vec![binding::Binding::Element(id)]);
-        }
-        Ok(Solutions::table(vec![pattern.variable.clone()], rows))
+            let limit = crate::meta::describe::scalar_usize(self, &pattern.limit, "LIMIT")?;
+            let spec = crate::meta::inspect::SearchSpec {
+                target: pattern.target,
+                term: &pattern.term,
+                with_type: pattern.with_type.as_ref(),
+                with_predicate: pattern.with_predicate.as_ref(),
+                mode: pattern.mode.as_ref(),
+                threshold: pattern.threshold.as_ref(),
+            };
+            let (hits, cap) = crate::meta::inspect::rank(self, &spec, limit).await?;
+            let limit = cap.map_or(limit, |cap| cap.min(limit));
+            let mut rows = Vec::new();
+            for (score, id, _) in hits.into_iter().take(limit) {
+                if let Some(view) = self.views.get_mut(&id) {
+                    let mut view = view.as_ref().clone();
+                    view["retrieval"] = serde_json::json!({"score": score, "mode": "keyword"});
+                    self.views.insert(id, Arc::new(view));
+                }
+                rows.push(vec![binding::Binding::Element(id)]);
+            }
+            Ok(Solutions::table(vec![pattern.variable.clone()], rows))
+        })
     }
 }
 
@@ -1258,7 +1273,7 @@ fn correlation_columns(clauses: &[WhereClause], solutions: &Solutions) -> Vec<us
         .collect()
 }
 
-pub async fn execute(
+pub fn execute(
     store: &Store,
     space: &str,
     query: &KqlQuery,
@@ -1266,55 +1281,59 @@ pub async fn execute(
     operation: &Operation,
     authority: &EffectiveAuthority,
     auth: &AuthContext,
-) -> Response {
-    match run(store, space, query, request, operation, authority, auth).await {
-        Ok(Answer {
-            projected,
-            schema_environment_version,
-            epistemic_policy,
-            snapshot_seq,
-            valid_at,
-        }) => {
-            let result = Json::Array(projected.rows);
-            Response {
-                context: Some(ResponseContext {
-                    space_id: Some(space.to_string()),
-                    schema_environment_version: Some(schema_environment_version),
-                    compatibility_profile_used: None,
-                    extensions: None,
-                }),
-                next_cursor: projected.next_cursor.clone(),
-                results: vec![anda_kip::OperationResult {
-                    context: Some(ResultContext {
+) -> impl Future<Output = Response> + Send {
+    Box::pin(async move {
+        match run(store, space, query, request, operation, authority, auth).await {
+            Ok(Answer {
+                projected,
+                schema_environment_version,
+                epistemic_policy,
+                snapshot_seq,
+                valid_at,
+            }) => {
+                let result = Json::Array(projected.rows);
+                Response {
+                    context: Some(ResponseContext {
                         space_id: Some(space.to_string()),
-                        // §50: an answer that cannot say which coordinate it
-                        // read is an answer a caller cannot reproduce, and it
-                        // is the same field a page cursor pins.
-                        snapshot_seq: Some(snapshot_seq),
                         schema_environment_version: Some(schema_environment_version),
-                        // Spec §54: a belief reported without the policy it was
-                        // projected under is not auditable.
-                        epistemic_policy,
-                        // The world-time basis, when `FOR TIME` named one.
-                        // §48.3 makes it an axis independent of the snapshot:
-                        // reporting one without the other leaves a caller
-                        // unable to tell a stale answer from a deliberately
-                        // historical one.
-                        valid_at: valid_at.clone(),
-                        cursor: query.cursor.as_ref().and_then(|scalar| match scalar {
-                            Scalar::Literal(anda_kip::KipValue::String(text)) => Some(text.clone()),
-                            _ => None,
-                        }),
-                        ..Default::default()
+                        compatibility_profile_used: None,
+                        extensions: None,
                     }),
-                    next_cursor: projected.next_cursor,
-                    ..anda_kip::OperationResult::ok(result)
-                }],
-                ..Default::default()
+                    next_cursor: projected.next_cursor.clone(),
+                    results: vec![anda_kip::OperationResult {
+                        context: Some(ResultContext {
+                            space_id: Some(space.to_string()),
+                            // §50: an answer that cannot say which coordinate it
+                            // read is an answer a caller cannot reproduce, and it
+                            // is the same field a page cursor pins.
+                            snapshot_seq: Some(snapshot_seq),
+                            schema_environment_version: Some(schema_environment_version),
+                            // Spec §54: a belief reported without the policy it was
+                            // projected under is not auditable.
+                            epistemic_policy,
+                            // The world-time basis, when `FOR TIME` named one.
+                            // §48.3 makes it an axis independent of the snapshot:
+                            // reporting one without the other leaves a caller
+                            // unable to tell a stale answer from a deliberately
+                            // historical one.
+                            valid_at: valid_at.clone(),
+                            cursor: query.cursor.as_ref().and_then(|scalar| match scalar {
+                                Scalar::Literal(anda_kip::KipValue::String(text)) => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            }),
+                            ..Default::default()
+                        }),
+                        next_cursor: projected.next_cursor,
+                        ..anda_kip::OperationResult::ok(result)
+                    }],
+                    ..Default::default()
+                }
             }
+            Err(err) => Response::from(err),
         }
-        Err(err) => Response::from(err),
-    }
+    })
 }
 
 /// One KQL answer, with the coordinates and policies it was produced under.
@@ -1432,7 +1451,7 @@ async fn covering_count(
     }))
 }
 
-async fn run(
+fn run(
     store: &Store,
     space: &str,
     query: &KqlQuery,
@@ -1440,153 +1459,156 @@ async fn run(
     operation: &Operation,
     authority: &EffectiveAuthority,
     auth: &AuthContext,
-) -> Result<Answer, KipError> {
-    let mut cx = Context::open(
-        store,
-        space,
-        request.parameters.as_ref(),
-        operation.parameters.as_ref(),
-        authority,
-        auth,
-    )
-    .await?;
-    cx.traversal = crate::store::history::traversal_of(
-        query,
-        request.parameters.as_ref(),
-        operation.parameters.as_ref(),
-    );
-    // The cursor is read before the coordinate is bound, because it *is* one
-    // of the things that decides the coordinate.
-    let (cursor, seek) = match &query.cursor {
-        Some(scalar) => {
-            let (cursor, seek) = page_cursor(&cx, scalar, space)?;
-            (Some(cursor), seek)
-        }
-        None => (None, None),
-    };
-    cx.bind_read(query.as_of.as_ref(), request, cursor.clone())
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        let mut cx = Context::open(
+            store,
+            space,
+            request.parameters.as_ref(),
+            operation.parameters.as_ref(),
+            authority,
+            auth,
+        )
         .await?;
-    let environment_version = cx.env.version;
-
-    let settings = match &query.epistemic {
-        Some(block) => crate::projection::settings_of(block, |name| cx.param_ref(name))?,
-        None => Map::new(),
-    };
-    // Without settings the policy in force at this read's coordinate is the one
-    // `open` or `bind_read` already resolved; only a WITH EPISTEMIC block
-    // changes it, so only that pays for resolving it again.
-    if !settings.is_empty() {
-        cx.policy = match store
-            .projection_policy_at(space, cx.pinned_seq, &settings)
-            .await
-        {
-            Ok(policy) => policy,
-            Err(e) if e.code == anda_kip::KipErrorCode::HistoricalSnapshotUnavailable => {
-                let mut p = crate::projection::Policy::from_settings(&settings)?;
-                p.trust_version = "unavailable".into();
-                p
+        cx.traversal = crate::store::history::traversal_of(
+            query,
+            request.parameters.as_ref(),
+            operation.parameters.as_ref(),
+        );
+        // The cursor is read before the coordinate is bound, because it *is* one
+        // of the things that decides the coordinate.
+        let (cursor, seek) = match &query.cursor {
+            Some(scalar) => {
+                let (cursor, seek) = page_cursor(&cx, scalar, space)?;
+                (Some(cursor), seek)
             }
-            Err(e) => return Err(e),
+            None => (None, None),
         };
-    }
-    let mut policy = cx.policy.clone();
-    cx.resolve_projection_context(&mut policy).await?;
-    cx.policy = policy;
-    // `FOR TIME` names the world time a claim has to apply at, so a projection
-    // in the same query answers about that instant rather than about now.
-    if let Some(for_time) = &query.for_time {
-        let at = match for_time {
-            Scalar::Literal(literal) => Json::from(literal.clone()),
-            Scalar::Param(name) => cx.param_ref(name)?,
-        };
-        if let Json::String(at) = at {
-            cx.at = crate::time::normalize(&at, "FOR TIME")?;
-        }
-    }
+        cx.bind_read(query.as_of.as_ref(), request, cursor.clone())
+            .await?;
+        let environment_version = cx.env.version;
 
-    let visible = validation::validate_block(&mut cx, &query.where_clauses, &Default::default())?;
-    validation::validate_projection(&cx, query, &visible)?;
-    let limit = query
-        .limit
-        .as_ref()
-        .map(|value| scalar_usize(&cx, value, "LIMIT"))
-        .transpose()?;
-    let mut page_offset = cursor.as_ref().map(|cursor| cursor.offset);
-    if let Some(clause) = index_answerable(&cx, query) {
-        if cursor.is_none()
-            && let Some(projected) = covering_count(&mut cx, query, clause, limit).await?
-        {
-            return Ok(Answer {
-                projected,
-                schema_environment_version: environment_version,
-                epistemic_policy: None,
-                snapshot_seq: cx.pinned_seq,
-                valid_at: None,
-            });
-        }
-        if let Some(limit) = limit
-            && query
-                .find_clause
-                .expressions
-                .iter()
-                .all(|expr| matches!(expr, anda_kip::FindExpression::Variable(_)))
-            && cx.can_page_element(clause)
-        {
-            // After a remembered seek the window starts right after it, so
-            // this page's own offset is zero and the cursor reports the sum.
-            let offset_base = if seek.is_some() {
-                page_offset.take().unwrap_or(0)
-            } else {
-                0
+        let settings = match &query.epistemic {
+            Some(block) => crate::projection::settings_of(block, |name| cx.param_ref(name))?,
+            None => Map::new(),
+        };
+        // Without settings the policy in force at this read's coordinate is the one
+        // `open` or `bind_read` already resolved; only a WITH EPISTEMIC block
+        // changes it, so only that pays for resolving it again.
+        if !settings.is_empty() {
+            cx.policy = match store
+                .projection_policy_at(space, cx.pinned_seq, &settings)
+                .await
+            {
+                Ok(policy) => policy,
+                Err(e) if e.code == anda_kip::KipErrorCode::HistoricalSnapshotUnavailable => {
+                    let mut p = crate::projection::Policy::from_settings(&settings)?;
+                    p.trust_version = "unavailable".into();
+                    p
+                }
+                Err(e) => return Err(e),
             };
-            cx.element_page = Some(ElementPage {
-                window: page_offset
-                    .unwrap_or(0)
-                    .saturating_add(limit)
-                    .saturating_add(1),
-                seek,
-                offset_base,
-            });
         }
-    }
-    let mut solutions = cx.solve(&query.where_clauses).await?;
-    let mut valid_at = None;
-    if let Some(for_time) = &query.for_time {
-        let at = match &for_time {
-            Scalar::Literal(literal) => Json::from(literal.clone()),
-            Scalar::Param(name) => cx.param_ref(name)?,
-        };
-        let Json::String(at) = at else {
-            return Err(KipError::type_mismatch(
-                "FOR TIME takes an RFC 3339 timestamp",
-            ));
-        };
-        let at = crate::time::normalize(&at, "FOR TIME")?;
-        cx.warm(&solutions).await?;
-        restrict_to_valid_time(&mut cx, &mut solutions, &at);
-        valid_at = Some(at);
-    }
+        let mut policy = cx.policy.clone();
+        cx.resolve_projection_context(&mut policy).await?;
+        cx.policy = policy;
+        // `FOR TIME` names the world time a claim has to apply at, so a projection
+        // in the same query answers about that instant rather than about now.
+        if let Some(for_time) = &query.for_time {
+            let at = match for_time {
+                Scalar::Literal(literal) => Json::from(literal.clone()),
+                Scalar::Param(name) => cx.param_ref(name)?,
+            };
+            if let Json::String(at) = at {
+                cx.at = crate::time::normalize(&at, "FOR TIME")?;
+            }
+        }
 
-    // ORDER BY and the projection both read fields off bound elements. The
-    // governed cap is merged in by `project`, after this — every element that
-    // could tighten it has been admitted by then.
-    cx.warm(&solutions).await?;
-    let policy = cx.projected.then(|| cx.policy.identity());
-    let pinned_seq = cx.pinned_seq;
-    let projected = cx.project(
-        solutions,
-        &query.find_clause,
-        query.order_by.as_ref(),
-        limit,
-        page_offset,
-        pinned_seq,
-    )?;
-    Ok(Answer {
-        projected,
-        schema_environment_version: environment_version,
-        epistemic_policy: policy,
-        snapshot_seq: pinned_seq,
-        valid_at,
+        let visible =
+            validation::validate_block(&mut cx, &query.where_clauses, &Default::default())?;
+        validation::validate_projection(&cx, query, &visible)?;
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|value| scalar_usize(&cx, value, "LIMIT"))
+            .transpose()?;
+        let mut page_offset = cursor.as_ref().map(|cursor| cursor.offset);
+        if let Some(clause) = index_answerable(&cx, query) {
+            if cursor.is_none()
+                && let Some(projected) = covering_count(&mut cx, query, clause, limit).await?
+            {
+                return Ok(Answer {
+                    projected,
+                    schema_environment_version: environment_version,
+                    epistemic_policy: None,
+                    snapshot_seq: cx.pinned_seq,
+                    valid_at: None,
+                });
+            }
+            if let Some(limit) = limit
+                && query
+                    .find_clause
+                    .expressions
+                    .iter()
+                    .all(|expr| matches!(expr, anda_kip::FindExpression::Variable(_)))
+                && cx.can_page_element(clause)
+            {
+                // After a remembered seek the window starts right after it, so
+                // this page's own offset is zero and the cursor reports the sum.
+                let offset_base = if seek.is_some() {
+                    page_offset.take().unwrap_or(0)
+                } else {
+                    0
+                };
+                cx.element_page = Some(ElementPage {
+                    window: page_offset
+                        .unwrap_or(0)
+                        .saturating_add(limit)
+                        .saturating_add(1),
+                    seek,
+                    offset_base,
+                });
+            }
+        }
+        let mut solutions = cx.solve(&query.where_clauses).await?;
+        let mut valid_at = None;
+        if let Some(for_time) = &query.for_time {
+            let at = match &for_time {
+                Scalar::Literal(literal) => Json::from(literal.clone()),
+                Scalar::Param(name) => cx.param_ref(name)?,
+            };
+            let Json::String(at) = at else {
+                return Err(KipError::type_mismatch(
+                    "FOR TIME takes an RFC 3339 timestamp",
+                ));
+            };
+            let at = crate::time::normalize(&at, "FOR TIME")?;
+            cx.warm(&solutions).await?;
+            restrict_to_valid_time(&mut cx, &mut solutions, &at);
+            valid_at = Some(at);
+        }
+
+        // ORDER BY and the projection both read fields off bound elements. The
+        // governed cap is merged in by `project`, after this — every element that
+        // could tighten it has been admitted by then.
+        cx.warm(&solutions).await?;
+        let policy = cx.projected.then(|| cx.policy.identity());
+        let pinned_seq = cx.pinned_seq;
+        let projected = cx.project(
+            solutions,
+            &query.find_clause,
+            query.order_by.as_ref(),
+            limit,
+            page_offset,
+            pinned_seq,
+        )?;
+        Ok(Answer {
+            projected,
+            schema_environment_version: environment_version,
+            epistemic_policy: policy,
+            snapshot_seq: pinned_seq,
+            valid_at,
+        })
     })
 }
 

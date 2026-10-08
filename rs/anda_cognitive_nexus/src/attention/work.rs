@@ -1,112 +1,117 @@
 use super::*;
 
-pub(super) async fn load(
+pub(super) fn load(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
     reference: &str,
-) -> Result<WakeRecord, KipError> {
-    authority
-        .authorize(
-            Permission::Maintain,
-            &ResourceContext::default(),
-            &session.auth,
-        )
-        .into_result()?;
-    let row = session
-        .nexus
-        .store
-        .control_at(space, reference, u64::MAX)
-        .await?
-        .ok_or_else(|| KipError::not_found_or_not_visible("wake unavailable"))?;
-    if row.kind != "wake" {
-        return Err(invalid("not a wake record"));
-    }
-    let wake: WakeRecord =
-        serde_json::from_value(row.value).map_err(|_| invalid("corrupt wake record"))?;
-    if wake.wake_ref != reference
-        || wake.version != row.version
-        || !matches!(wake.format.as_str(), FORMAT | CONTINUATION)
-        || (wake.format == FORMAT && (wake.parent_ref.is_some() || wake.continuation_key.is_some()))
-        || (wake.format == CONTINUATION
-            && (wake.parent_ref.is_none() || wake.continuation_key.is_none()))
-    {
-        return Err(invalid("invalid wake identity/version"));
-    }
-    for reference in [&wake.fire.watch_ref, &wake.fire_activity_ref] {
-        let element = session.nexus.store.get_element(reference.parse()?).await?;
-        if element.space() != space || element.state() != crate::store::rows::state::ACTIVE {
-            return Err(KipError::not_found_or_not_visible(
-                "wake source unavailable",
-            ));
-        }
+) -> impl Future<Output = Result<WakeRecord, KipError>> + Send {
+    Box::pin(async move {
         authority
             .authorize(
-                Permission::Read,
-                &ResourceContext::of_element(&element),
+                Permission::Maintain,
+                &ResourceContext::default(),
                 &session.auth,
             )
             .into_result()?;
-        if !authority
-            .may_read(&element, &session.auth)
-            .is_some_and(|v| v.content && v.constraints.fields.is_empty())
-        {
-            return Err(KipError::not_found_or_not_visible(
-                "wake source is not fully visible",
-            ));
+        let row = session
+            .nexus
+            .store
+            .control_at(space, reference, u64::MAX)
+            .await?
+            .ok_or_else(|| KipError::not_found_or_not_visible("wake unavailable"))?;
+        if row.kind != "wake" {
+            return Err(invalid("not a wake record"));
         }
-    }
-    Ok(wake)
+        let wake: WakeRecord =
+            serde_json::from_value(row.value).map_err(|_| invalid("corrupt wake record"))?;
+        if wake.wake_ref != reference
+            || wake.version != row.version
+            || !matches!(wake.format.as_str(), FORMAT | CONTINUATION)
+            || (wake.format == FORMAT
+                && (wake.parent_ref.is_some() || wake.continuation_key.is_some()))
+            || (wake.format == CONTINUATION
+                && (wake.parent_ref.is_none() || wake.continuation_key.is_none()))
+        {
+            return Err(invalid("invalid wake identity/version"));
+        }
+        for reference in [&wake.fire.watch_ref, &wake.fire_activity_ref] {
+            let element = session.nexus.store.get_element(reference.parse()?).await?;
+            if element.space() != space || element.state() != crate::store::rows::state::ACTIVE {
+                return Err(KipError::not_found_or_not_visible(
+                    "wake source unavailable",
+                ));
+            }
+            authority
+                .authorize(
+                    Permission::Read,
+                    &ResourceContext::of_element(&element),
+                    &session.auth,
+                )
+                .into_result()?;
+            if !authority
+                .may_read(&element, &session.auth)
+                .is_some_and(|v| v.content && v.constraints.fields.is_empty())
+            {
+                return Err(KipError::not_found_or_not_visible(
+                    "wake source is not fully visible",
+                ));
+            }
+        }
+        Ok(wake)
+    })
 }
 
-async fn current(
+fn current(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
     wake: &WakeRecord,
-) -> Result<(), KipError> {
-    let store = &session.nexus.store;
-    let cfg = store
-        .control_at(space, CONFIG, u64::MAX)
-        .await?
-        .ok_or_else(|| conflict("binding_unavailable"))?;
-    if cfg.value
-        != json!(AttentionConfig {
-            scope: wake.scope.clone(),
-            pins: wake.pins.clone()
-        })
-    {
-        return Err(conflict("basis_changed"));
-    }
-    let watch = store.get_element(wake.fire.watch_ref.parse()?).await?;
-    let view = crate::view::render(&watch);
-    if view["attributes"]["status"] != "fired"
-        || view["facets"][format!("{PROFILE}WatchState")]["arm_generation"]
-            != wake.fire.arm_generation
-    {
-        return Err(conflict("generation_conflict"));
-    }
-    let checkpoint = store
-        .control_at(
-            space,
-            &checkpoint_key(&wake.fire.watch_ref, wake.fire.arm_generation),
-            u64::MAX,
-        )
-        .await?
-        .ok_or_else(|| conflict("history_gap"))?;
-    let checkpoint: WatchCheckpoint = serde_json::from_value(checkpoint.value)
-        .map_err(|_| invalid("corrupt Watch checkpoint"))?;
-    if checkpoint.format != "nexus:watch-checkpoint-v1"
-        || checkpoint.watch_ref != wake.fire.watch_ref
-        || checkpoint.arm_generation != wake.fire.arm_generation
-    {
-        return Err(invalid("unsupported or mismatched Watch checkpoint"));
-    }
-    let cx = Context::open(store, space, None, None, authority, &session.auth).await?;
-    if checkpoint.basis != basis(&cx) {
-        return Err(conflict("basis_changed"));
-    }
-    Ok(())
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let store = &session.nexus.store;
+        let cfg = store
+            .control_at(space, CONFIG, u64::MAX)
+            .await?
+            .ok_or_else(|| conflict("binding_unavailable"))?;
+        if cfg.value
+            != json!(AttentionConfig {
+                scope: wake.scope.clone(),
+                pins: wake.pins.clone()
+            })
+        {
+            return Err(conflict("basis_changed"));
+        }
+        let watch = store.get_element(wake.fire.watch_ref.parse()?).await?;
+        let view = crate::view::render(&watch);
+        if view["attributes"]["status"] != "fired"
+            || view["facets"][format!("{PROFILE}WatchState")]["arm_generation"]
+                != wake.fire.arm_generation
+        {
+            return Err(conflict("generation_conflict"));
+        }
+        let checkpoint = store
+            .control_at(
+                space,
+                &checkpoint_key(&wake.fire.watch_ref, wake.fire.arm_generation),
+                u64::MAX,
+            )
+            .await?
+            .ok_or_else(|| conflict("history_gap"))?;
+        let checkpoint: WatchCheckpoint = serde_json::from_value(checkpoint.value)
+            .map_err(|_| invalid("corrupt Watch checkpoint"))?;
+        if checkpoint.format != "nexus:watch-checkpoint-v1"
+            || checkpoint.watch_ref != wake.fire.watch_ref
+            || checkpoint.arm_generation != wake.fire.arm_generation
+        {
+            return Err(invalid("unsupported or mismatched Watch checkpoint"));
+        }
+        let cx = Context::open(store, space, None, None, authority, &session.auth).await?;
+        if checkpoint.basis != basis(&cx) {
+            return Err(conflict("basis_changed"));
+        }
+        Ok(())
+    })
 }
 
 fn live(session: &Session, wake: &WakeRecord, now: u64) -> Result<(), KipError> {
@@ -394,10 +399,16 @@ impl Session {
     }
 
     /// Read one protected work item; reading neither claims nor renews it.
-    pub async fn read_wake(&self, space: &str, reference: &str) -> Result<WakeRecord, KipError> {
-        let _guard = self.nexus.read_guard().await?;
-        let authority = self.effective_authority(space).await?;
-        load(self, &authority, space, reference).await
+    pub fn read_wake(
+        &self,
+        space: &str,
+        reference: &str,
+    ) -> impl Future<Output = Result<WakeRecord, KipError>> + Send {
+        Box::pin(async move {
+            let _guard = self.nexus.read_guard().await?;
+            let authority = self.effective_authority(space).await?;
+            load(self, &authority, space, reference).await
+        })
     }
 
     pub async fn claim_wake(
@@ -438,32 +449,34 @@ impl Session {
 
     /// Timed retries only. Arbitrary prose/on_change proof needs a registered
     /// condition verifier and is explicitly unavailable in this release.
-    pub async fn resume_wake(
+    pub fn resume_wake(
         &self,
         space: &str,
         reference: &str,
         expected: u64,
         fence: u64,
-    ) -> Result<Json, KipError> {
-        let verification = self
-            .verified_resume(space, reference, expected, fence)
-            .await?;
-        match verification {
-            Some((condition, pin)) => {
-                self.update_wake(
-                    space,
-                    reference,
-                    expected,
-                    fence,
-                    Action::ResumeVerified(&condition, &pin),
-                )
-                .await
-            }
-            None => {
-                self.update_wake(space, reference, expected, fence, Action::Resume)
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            let verification = self
+                .verified_resume(space, reference, expected, fence)
+                .await?;
+            match verification {
+                Some((condition, pin)) => {
+                    self.update_wake(
+                        space,
+                        reference,
+                        expected,
+                        fence,
+                        Action::ResumeVerified(&condition, &pin),
+                    )
                     .await
+                }
+                None => {
+                    self.update_wake(space, reference, expected, fence, Action::Resume)
+                        .await
+                }
             }
-        }
+        })
     }
 
     pub async fn cancel_wake(

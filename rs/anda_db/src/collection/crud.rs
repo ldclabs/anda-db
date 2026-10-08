@@ -22,12 +22,14 @@ impl Collection {
     /// - The document fails schema validation
     /// - Any index update fails
     /// - Storage operations fail
-    pub async fn add(&self, doc: Document) -> Result<DocumentId, DBError> {
-        let _operation_lease = self.mutation_lease().await?;
-        // Past this point a dropped future is treated as a crash: in-memory
-        // index/bitmap state may already diverge from storage, so the guard
-        // poisons the handle and recovery happens on reopen.
-        self.guarded("Collection::add", self.add_impl(doc)).await
+    pub fn add(&self, doc: Document) -> impl Future<Output = Result<DocumentId, DBError>> + Send {
+        Box::pin(async move {
+            let _operation_lease = self.mutation_lease().await?;
+            // Past this point a dropped future is treated as a crash: in-memory
+            // index/bitmap state may already diverge from storage, so the guard
+            // poisons the handle and recovery happens on reopen.
+            self.guarded("Collection::add", self.add_impl(doc)).await
+        })
     }
 
     /// Guarantees `id` is at or below the durable allocation watermark before
@@ -189,12 +191,14 @@ impl Collection {
     ///
     /// # Returns
     /// The ID of the newly added document, or an error if addition fails
-    pub async fn add_from<T>(&self, val: &T) -> Result<DocumentId, DBError>
+    pub fn add_from<T>(&self, val: &T) -> impl Future<Output = Result<DocumentId, DBError>>
     where
         T: Serialize,
     {
-        let doc = Document::try_from(self.schema(), val)?;
-        self.add(doc).await
+        Box::pin(async move {
+            let doc = Document::try_from(self.schema(), val)?;
+            self.add(doc).await
+        })
     }
 
     /// Updates an existing document with new field values.
@@ -233,14 +237,16 @@ impl Collection {
     /// - The updated document version not matching the stored version because of concurrent update
     /// - Any index update fails
     /// - Storage operations fail
-    pub async fn update(
+    pub fn update(
         &self,
         id: DocumentId,
         fields: BTreeMap<String, Fv>,
-    ) -> Result<Document, DBError> {
-        let _operation_lease = self.mutation_lease().await?;
-        self.guarded("Collection::update", self.update_impl(id, fields))
-            .await
+    ) -> impl Future<Output = Result<Document, DBError>> + Send {
+        Box::pin(async move {
+            let _operation_lease = self.mutation_lease().await?;
+            self.guarded("Collection::update", self.update_impl(id, fields))
+                .await
+        })
     }
 
     pub(super) async fn update_impl(
@@ -454,10 +460,15 @@ impl Collection {
     /// - The collection is in read-only mode
     /// - Any index update fails
     /// - Storage operations fail
-    pub async fn remove(&self, id: DocumentId) -> Result<Option<Document>, DBError> {
-        let _operation_lease = self.mutation_lease().await?;
-        self.guarded("Collection::remove", self.remove_impl(id))
-            .await
+    pub fn remove(
+        &self,
+        id: DocumentId,
+    ) -> impl Future<Output = Result<Option<Document>, DBError>> + Send {
+        Box::pin(async move {
+            let _operation_lease = self.mutation_lease().await?;
+            self.guarded("Collection::remove", self.remove_impl(id))
+                .await
+        })
     }
 
     pub(super) async fn remove_impl(&self, id: DocumentId) -> Result<Option<Document>, DBError> {

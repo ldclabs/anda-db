@@ -87,6 +87,14 @@ dependencies and existing feature conventions when editing workspace crates.
   collection handles for concurrent tasks; `DBConfig::lock` is not a writer
   lease. Await mutations, flushes, and closes to completion; cancellation can
   poison a handle, requiring reopen/recovery through the database.
+- Return heavy async work boxed. A debug build keeps each awaited future in its
+  caller's frame, so inlined futures add up along a call chain and once took a
+  host past a 2 MiB thread stack. Write an I/O or multi-step API as
+  `fn f(..) -> impl Future<Output = R> + Send { Box::pin(async move { .. }) }`
+  (drop `+ Send` only where a generic callback decides it), keep helpers called
+  per row in a loop as `async fn`, and keep
+  `rs/anda_cognitive_nexus/tests/stack_budget.rs` green. See
+  [testing guidance](docs/testing.md).
 - Install tokenizers and deterministic index hooks at the start of each fresh
   open callback, before recovery-triggering operations. Active cached handles
   skip callbacks. Use `db.close_collection(name)` before reopening to change

@@ -74,8 +74,9 @@ struct InnerStorage {
     metadata: StorageMetadata,
     /// Optional cache for frequently accessed small objects.
     cache: Option<Cache<Path, Arc<CachedObject>>>,
-    /// Per-path-hash generations stored alongside cache values.
-    cache_write_seqs: [AtomicU64; CACHE_WRITE_SEQ_STRIPES],
+    /// Per-path-hash generations stored alongside cache values. Heap-allocated:
+    /// 32 KiB built inline would sit on the stack of every caller of `new`.
+    cache_write_seqs: Box<[AtomicU64]>,
 }
 
 /// Only large owned codec buffers cross a blocking-task boundary. No storage
@@ -527,7 +528,9 @@ impl Storage {
                 metadata_save_lock: tokio::sync::Mutex::new(()),
                 metadata,
                 cache,
-                cache_write_seqs: std::array::from_fn(|_| AtomicU64::new(0)),
+                cache_write_seqs: (0..CACHE_WRITE_SEQ_STRIPES)
+                    .map(|_| AtomicU64::new(0))
+                    .collect(),
             }),
         })
     }

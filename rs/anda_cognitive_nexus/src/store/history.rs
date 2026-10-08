@@ -95,22 +95,33 @@ impl Store {
     /// Rows are removed rather than scrubbed, unlike the element itself: a
     /// version entry has no identity anything refers to, so there is nothing
     /// for a stub to keep resolvable.
-    pub async fn purge_versions(&self, space_id: &str, id: ElementId) -> Result<usize, KipError> {
-        let ids = self.version_ids(space_id, id).await?;
-        self.remove_versions(&ids).await?;
-        Ok(ids.len())
+    pub fn purge_versions(
+        &self,
+        space_id: &str,
+        id: ElementId,
+    ) -> impl Future<Output = Result<usize, KipError>> + Send {
+        Box::pin(async move {
+            let ids = self.version_ids(space_id, id).await?;
+            self.remove_versions(&ids).await?;
+            Ok(ids.len())
+        })
     }
 
     /// Destroys exactly the version rows a staged purge counted.
     ///
     /// Takes the ids rather than re-deriving them, so the number a purge
     /// receipt reports and the rows it erases cannot come apart.
-    pub async fn remove_versions(&self, ids: &[u64]) -> Result<(), KipError> {
-        let collection = self.element_versions();
-        for row_id in ids {
-            collection.remove(*row_id).await.map_err(db_error)?;
-        }
-        Ok(())
+    pub fn remove_versions(
+        &self,
+        ids: &[u64],
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let collection = self.element_versions();
+            for row_id in ids {
+                collection.remove(*row_id).await.map_err(db_error)?;
+            }
+            Ok(())
+        })
     }
 
     /// Strips the Evidence payload out of recorded versions, keeping the rows.
@@ -131,30 +142,35 @@ impl Store {
     /// destroyed. That is the one outcome a data-minimization instrument must
     /// never produce, so the failure is loud and the transaction does not
     /// commit.
-    pub async fn scrub_payload_versions(&self, ids: &[u64]) -> Result<(), KipError> {
-        let collection = self.element_versions();
-        for row_id in ids {
-            let mut version: ElementVersionRow =
-                collection.get_as(*row_id).await.map_err(db_error)?;
-            // Decoded and re-encoded through the row type so the columns a
-            // payload purge clears are named in exactly one place — the same
-            // place the current row is cleared from.
-            let mut evidence: EvidenceRow =
-                serde_json::from_value(version.row.clone()).map_err(|err| {
-                    KipError::internal_error(format!(
-                        "version {row_id} of {} does not decode as Evidence, so its payload \
-                         cannot be erased: {err}",
-                        version.element
-                    ))
+    pub fn scrub_payload_versions(
+        &self,
+        ids: &[u64],
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let collection = self.element_versions();
+            for row_id in ids {
+                let mut version: ElementVersionRow =
+                    collection.get_as(*row_id).await.map_err(db_error)?;
+                // Decoded and re-encoded through the row type so the columns a
+                // payload purge clears are named in exactly one place — the same
+                // place the current row is cleared from.
+                let mut evidence: EvidenceRow = serde_json::from_value(version.row.clone())
+                    .map_err(|err| {
+                        KipError::internal_error(format!(
+                            "version {row_id} of {} does not decode as Evidence, so its payload \
+                             cannot be erased: {err}",
+                            version.element
+                        ))
+                    })?;
+                erase_payload(&mut evidence);
+                version.row = serde_json::to_value(&evidence).map_err(|err| {
+                    KipError::internal_error(format!("an element version failed to encode: {err}"))
                 })?;
-            erase_payload(&mut evidence);
-            version.row = serde_json::to_value(&evidence).map_err(|err| {
-                KipError::internal_error(format!("an element version failed to encode: {err}"))
-            })?;
-            let fields = super::full_row_fields(collection.schema(), &version)?;
-            collection.update(*row_id, fields).await.map_err(db_error)?;
-        }
-        Ok(())
+                let fields = super::full_row_fields(collection.schema(), &version)?;
+                collection.update(*row_id, fields).await.map_err(db_error)?;
+            }
+            Ok(())
+        })
     }
 
     /// Every version row of one element.

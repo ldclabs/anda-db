@@ -49,25 +49,27 @@ use crate::tx::{Guard, Transaction};
 /// Phase 1 of two-phase planning (§23): every handle must exist before any
 /// clause runs, because a clause may reference a handle a later clause
 /// declares.
-pub async fn declare_handles(
+pub fn declare_handles(
     tx: &mut Transaction,
     clause: &MutationClause,
-) -> Result<(), KipError> {
-    let (handle, kind) = match clause {
-        MutationClause::CreateConcept(c) => (Some(c.handle.as_str()), ElementKind::Concept),
-        MutationClause::UpsertConcept(_) => return Ok(()),
-        MutationClause::CreateEvidence(c) => (Some(c.handle.as_str()), ElementKind::Evidence),
-        MutationClause::CreateAssertion(c) => (Some(c.handle.as_str()), ElementKind::Assertion),
-        MutationClause::CreateActivity(c) => (Some(c.handle.as_str()), ElementKind::Activity),
-        // `ENSURE` may resolve to an existing tuple, so its id cannot be
-        // minted up front; it is bound in phase 2.
-        MutationClause::EnsureProposition(_) => return Ok(()),
-        _ => return Ok(()),
-    };
-    if let Some(handle) = handle {
-        tx.declare(handle, kind).await?;
-    }
-    Ok(())
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (handle, kind) = match clause {
+            MutationClause::CreateConcept(c) => (Some(c.handle.as_str()), ElementKind::Concept),
+            MutationClause::UpsertConcept(_) => return Ok(()),
+            MutationClause::CreateEvidence(c) => (Some(c.handle.as_str()), ElementKind::Evidence),
+            MutationClause::CreateAssertion(c) => (Some(c.handle.as_str()), ElementKind::Assertion),
+            MutationClause::CreateActivity(c) => (Some(c.handle.as_str()), ElementKind::Activity),
+            // `ENSURE` may resolve to an existing tuple, so its id cannot be
+            // minted up front; it is bound in phase 2.
+            MutationClause::EnsureProposition(_) => return Ok(()),
+            _ => return Ok(()),
+        };
+        if let Some(handle) = handle {
+            tx.declare(handle, kind).await?;
+        }
+        Ok(())
+    })
 }
 
 /// Seed all declared Concept types before validating cyclic structural edges.
@@ -124,40 +126,52 @@ pub fn plan_pass(clause: &MutationClause) -> u8 {
 pub const PLAN_PASSES: u8 = 4;
 
 /// Interprets one clause against a plan with every handle already bound.
-pub async fn apply(
+pub fn apply(
     store: &Store,
     tx: &mut Transaction,
     clause: &MutationClause,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    match clause {
-        MutationClause::CreateConcept(c) => create_concept(store, tx, c, request, operation).await,
-        MutationClause::UpsertConcept(c) => upsert_concept(store, tx, c, request, operation).await,
-        MutationClause::EnsureProposition(c) => {
-            ensure_proposition(store, tx, c, request, operation).await
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        match clause {
+            MutationClause::CreateConcept(c) => {
+                create_concept(store, tx, c, request, operation).await
+            }
+            MutationClause::UpsertConcept(c) => {
+                upsert_concept(store, tx, c, request, operation).await
+            }
+            MutationClause::EnsureProposition(c) => {
+                ensure_proposition(store, tx, c, request, operation).await
+            }
+            MutationClause::CreateEvidence(c) => {
+                create_record(store, tx, c, ElementKind::Evidence, request, operation).await
+            }
+            MutationClause::CreateAssertion(c) => {
+                create_record(store, tx, c, ElementKind::Assertion, request, operation).await
+            }
+            MutationClause::CreateActivity(c) => {
+                create_record(store, tx, c, ElementKind::Activity, request, operation).await
+            }
+            // Routed before any plan runs (`kml::execute`); the parser never puts
+            // it beside another clause.
+            MutationClause::Define(_) => Err(KipError::invalid_syntax(
+                "DEFINE is a standalone operation, never a clause of MUTATE (§20.16)",
+            )),
+            MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
+            MutationClause::Transition(c) => transition(store, tx, c, request, operation).await,
+            MutationClause::SetRetention(c) => {
+                set_retention(store, tx, c, request, operation).await
+            }
+            MutationClause::MergeConcept(c) => {
+                merge_concept(store, tx, c, request, operation).await
+            }
+            MutationClause::Purge(c) => purge(store, tx, c, request, operation).await,
+            MutationClause::PurgePayload(c) => {
+                purge_payload(store, tx, c, request, operation).await
+            }
         }
-        MutationClause::CreateEvidence(c) => {
-            create_record(store, tx, c, ElementKind::Evidence, request, operation).await
-        }
-        MutationClause::CreateAssertion(c) => {
-            create_record(store, tx, c, ElementKind::Assertion, request, operation).await
-        }
-        MutationClause::CreateActivity(c) => {
-            create_record(store, tx, c, ElementKind::Activity, request, operation).await
-        }
-        // Routed before any plan runs (`kml::execute`); the parser never puts
-        // it beside another clause.
-        MutationClause::Define(_) => Err(KipError::invalid_syntax(
-            "DEFINE is a standalone operation, never a clause of MUTATE (§20.16)",
-        )),
-        MutationClause::Update(c) => update_elements(store, tx, c, request, operation).await,
-        MutationClause::Transition(c) => transition(store, tx, c, request, operation).await,
-        MutationClause::SetRetention(c) => set_retention(store, tx, c, request, operation).await,
-        MutationClause::MergeConcept(c) => merge_concept(store, tx, c, request, operation).await,
-        MutationClause::Purge(c) => purge(store, tx, c, request, operation).await,
-        MutationClause::PurgePayload(c) => purge_payload(store, tx, c, request, operation).await,
-    }
+    })
 }
 
 /// The substitution scope one clause evaluates its right-hand sides in.
@@ -470,219 +484,225 @@ pub(crate) fn read_index(value: &Json) -> Result<usize, KipError> {
     }
 }
 
-async fn create_concept(
+fn create_concept(
     store: &Store,
     tx: &mut Transaction,
     clause: &ConceptCreate,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let id = b.handle(&clause.handle)?;
-    let type_name = clause
-        .r#type
-        .as_ref()
-        .map(|symbol| symbol_name(&b, symbol))
-        .transpose()?
-        .ok_or_else(|| {
-            KipError::schema_symbol_not_found(
-                "CREATE CONCEPT needs a TYPE: a Concept's type is schema-defined, and this engine \
-                 will not invent one",
-            )
-        })?;
-
-    let attributes = clause
-        .set_attributes
-        .as_ref()
-        .map(|a| assignments_to_json(&b, a, None))
-        .transpose()?
-        .unwrap_or_default();
-    let name = clause
-        .name
-        .as_ref()
-        .map(|scalar| b.scalar_str(scalar, "NAME"))
-        .transpose()?
-        .unwrap_or_default();
-    let client_key = clause
-        .client_key
-        .as_ref()
-        .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
-        .transpose()?
-        .unwrap_or_default();
-    let existing = find_client_key(store, tx, ElementKind::Concept, &client_key).await?;
-    let b = bindings(tx, request, operation);
-    let mut fields = Fields::new(
-        clause
-            .set_fields
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let b = bindings(tx, request, operation);
+        let id = b.handle(&clause.handle)?;
+        let type_name = clause
+            .r#type
             .as_ref()
-            .map(|f| assignments_to_json(&b, f, None))
+            .map(|symbol| symbol_name(&b, symbol))
             .transpose()?
-            .unwrap_or_default(),
-    )?;
-    let key = fields.text("key")?;
-    let canonical_id = fields.text("canonical_id")?;
-    // §5.4, and the same gate `UPDATE ... SET FIELDS` runs: binding a
-    // cross-system identity is its own authority, not a side effect of `create`.
-    if !canonical_id.is_empty() {
-        tx.require(Permission::BindCanonicalIdentity)?;
-    }
-    let aliases = fields
-        .array("aliases")?
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect();
-    let retention = fields.json("retention");
-    require_retention_authority(tx, &retention)?;
-    let extra_name = fields.text("name")?;
-    fields.rest("Concept")?;
+            .ok_or_else(|| {
+                KipError::schema_symbol_not_found(
+                    "CREATE CONCEPT needs a TYPE: a Concept's type is schema-defined, and this engine \
+                     will not invent one",
+                )
+            })?;
 
-    // Kind only here: the Concept's type symbol is resolved a few lines down by
-    // `prepare_concept`, which re-checks these Facets against it. Naming the
-    // type twice would mean resolving it twice and could disagree with itself.
-    let facets = apply_facets(
-        tx,
-        &b,
-        &clause.set_facets,
-        &crate::schema::EndpointFacts::Element {
-            kind: ElementKind::Concept,
-            schema_ref: None,
-        },
-        None,
-    )
-    .await?;
-    // A Concept has no Core structural fields; every one is Profile-defined.
-    let mut structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?;
-    // §11.3: a new write resolves references through whatever merges the Space
-    // has already declared.
-    structural.canonicalize(tx).await?;
-    let structural = structural.profile;
+        let attributes = clause
+            .set_attributes
+            .as_ref()
+            .map(|a| assignments_to_json(&b, a, None))
+            .transpose()?
+            .unwrap_or_default();
+        let name = clause
+            .name
+            .as_ref()
+            .map(|scalar| b.scalar_str(scalar, "NAME"))
+            .transpose()?
+            .unwrap_or_default();
+        let client_key = clause
+            .client_key
+            .as_ref()
+            .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
+            .transpose()?
+            .unwrap_or_default();
+        let existing = find_client_key(store, tx, ElementKind::Concept, &client_key).await?;
+        let b = bindings(tx, request, operation);
+        let mut fields = Fields::new(
+            clause
+                .set_fields
+                .as_ref()
+                .map(|f| assignments_to_json(&b, f, None))
+                .transpose()?
+                .unwrap_or_default(),
+        )?;
+        let key = fields.text("key")?;
+        let canonical_id = fields.text("canonical_id")?;
+        // §5.4, and the same gate `UPDATE ... SET FIELDS` runs: binding a
+        // cross-system identity is its own authority, not a side effect of `create`.
+        if !canonical_id.is_empty() {
+            tx.require(Permission::BindCanonicalIdentity)?;
+        }
+        let aliases = fields
+            .array("aliases")?
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        let retention = fields.json("retention");
+        require_retention_authority(tx, &retention)?;
+        let extra_name = fields.text("name")?;
+        fields.rest("Concept")?;
 
-    let (symbol, validation) =
-        tx.env
-            .prepare_concept(&type_name, &attributes, &facets, Intent::Write)?;
-    validation.into_result()?;
+        // Kind only here: the Concept's type symbol is resolved a few lines down by
+        // `prepare_concept`, which re-checks these Facets against it. Naming the
+        // type twice would mean resolving it twice and could disagree with itself.
+        let facets = apply_facets(
+            tx,
+            &b,
+            &clause.set_facets,
+            &crate::schema::EndpointFacts::Element {
+                kind: ElementKind::Concept,
+                schema_ref: None,
+            },
+            None,
+        )
+        .await?;
+        // A Concept has no Core structural fields; every one is Profile-defined.
+        let mut structural = collect_structural(tx, &b, clause.set_structural.as_ref(), &[])?;
+        // §11.3: a new write resolves references through whatever merges the Space
+        // has already declared.
+        structural.canonicalize(tx).await?;
+        let structural = structural.profile;
 
-    let row = ConceptRow {
-        _id: id.seq,
-        schema_ref: symbol.to_string(),
-        key,
-        name: if name.is_empty() { extra_name } else { name },
-        canonical_id,
-        aliases,
-        attributes,
-        facets,
-        structural,
-        client_key,
-        expires_at: expires_at(&retention)?,
-        retention,
-        ..Default::default()
-    };
-    let element = Element::Concept(Box::new(row));
-    if client_key_retry(tx, existing, &clause.handle, &element).await? {
-        return Ok(());
-    }
-    tx.authorize_created(&element, Permission::Create)?;
-    tx.stage_new(id, element, ChangeOp::Create);
-    check_structural(store, tx, id).await
+        let (symbol, validation) =
+            tx.env
+                .prepare_concept(&type_name, &attributes, &facets, Intent::Write)?;
+        validation.into_result()?;
+
+        let row = ConceptRow {
+            _id: id.seq,
+            schema_ref: symbol.to_string(),
+            key,
+            name: if name.is_empty() { extra_name } else { name },
+            canonical_id,
+            aliases,
+            attributes,
+            facets,
+            structural,
+            client_key,
+            expires_at: expires_at(&retention)?,
+            retention,
+            ..Default::default()
+        };
+        let element = Element::Concept(Box::new(row));
+        if client_key_retry(tx, existing, &clause.handle, &element).await? {
+            return Ok(());
+        }
+        tx.authorize_created(&element, Permission::Create)?;
+        tx.stage_new(id, element, ChangeOp::Create);
+        check_structural(store, tx, id).await
+    })
 }
 
-async fn create_record(
+fn create_record(
     store: &Store,
     tx: &mut Transaction,
     clause: &RecordCreate,
     kind: ElementKind,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let id = b.handle(&clause.handle)?;
-    let client_key = clause
-        .client_key
-        .as_ref()
-        .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
-        .transpose()?
-        .unwrap_or_default();
-    let existing = find_client_key(store, tx, kind, &client_key).await?;
-    let b = bindings(tx, request, operation);
-    let mut fields = Fields::new(
-        clause
-            .set_fields
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let b = bindings(tx, request, operation);
+        let id = b.handle(&clause.handle)?;
+        let client_key = clause
+            .client_key
             .as_ref()
-            .map(|f| assignments_to_json(&b, f, None))
+            .map(|scalar| b.scalar_str(scalar, "CLIENT KEY"))
             .transpose()?
-            .unwrap_or_default(),
-    )?;
-    // A record is not a Concept and has no type to name.
-    let facets = apply_facets(
-        tx,
-        &b,
-        &clause.set_facets,
-        &crate::schema::EndpointFacts::Element {
-            kind,
-            schema_ref: None,
-        },
-        None,
-    )
-    .await?;
-    let mut structural =
-        collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
-    let retention = fields.json("retention");
-    require_retention_authority(tx, &retention)?;
-    // §11.3: a new write resolves references through whatever merges the Space
-    // has already declared. Doing this for tuple endpoints alone would leave a
-    // merge decorative everywhere else — new Assertions would keep piling up
-    // under a Concept the Space said was the same as another one.
-    structural.canonicalize(tx).await?;
+            .unwrap_or_default();
+        let existing = find_client_key(store, tx, kind, &client_key).await?;
+        let b = bindings(tx, request, operation);
+        let mut fields = Fields::new(
+            clause
+                .set_fields
+                .as_ref()
+                .map(|f| assignments_to_json(&b, f, None))
+                .transpose()?
+                .unwrap_or_default(),
+        )?;
+        // A record is not a Concept and has no type to name.
+        let facets = apply_facets(
+            tx,
+            &b,
+            &clause.set_facets,
+            &crate::schema::EndpointFacts::Element {
+                kind,
+                schema_ref: None,
+            },
+            None,
+        )
+        .await?;
+        let mut structural =
+            collect_structural(tx, &b, clause.set_structural.as_ref(), core_fields(kind))?;
+        let retention = fields.json("retention");
+        require_retention_authority(tx, &retention)?;
+        // §11.3: a new write resolves references through whatever merges the Space
+        // has already declared. Doing this for tuple endpoints alone would leave a
+        // merge decorative everywhere else — new Assertions would keep piling up
+        // under a Concept the Space said was the same as another one.
+        structural.canonicalize(tx).await?;
 
-    let draft = Draft {
-        id,
-        client_key,
-        facets,
-        retention,
-    };
-    let row = match kind {
-        ElementKind::Evidence => evidence_row(draft, &mut fields, &mut structural)?,
-        ElementKind::Assertion => assertion_row(tx, draft, &mut fields, &mut structural).await?,
-        ElementKind::Activity => activity_row(draft, &mut fields, &mut structural)?,
-        other => {
-            return Err(KipError::internal_error(format!(
-                "{other} has no record-create form"
-            )));
+        let draft = Draft {
+            id,
+            client_key,
+            facets,
+            retention,
+        };
+        let row = match kind {
+            ElementKind::Evidence => evidence_row(draft, &mut fields, &mut structural)?,
+            ElementKind::Assertion => {
+                assertion_row(tx, draft, &mut fields, &mut structural).await?
+            }
+            ElementKind::Activity => activity_row(draft, &mut fields, &mut structural)?,
+            other => {
+                return Err(KipError::internal_error(format!(
+                    "{other} has no record-create form"
+                )));
+            }
+        };
+        fields.rest(&kind.to_string())?;
+        // §52.1: a key that already names an element either proves this is a retry
+        // — same creation, so nothing is written and the handle points at what the
+        // first attempt made — or names different work, which is a conflict.
+        if client_key_retry(tx, existing, &clause.handle, &row).await? {
+            return Ok(());
         }
-    };
-    fields.rest(&kind.to_string())?;
-    // §52.1: a key that already names an element either proves this is a retry
-    // — same creation, so nothing is written and the handle points at what the
-    // first attempt made — or names different work, which is a conflict.
-    if client_key_retry(tx, existing, &clause.handle, &row).await? {
-        return Ok(());
-    }
-    // §17, §18: which epistemic-mutation permission this needs depends on whom
-    // the claim is attributed to, and that is only knowable here. `assert` is
-    // the floor for writing any commitment; recording somebody else's claim or
-    // speaking as an actor each add their own on top of it.
-    if let Element::Assertion(row) = &row {
-        tx.authorize_created(&row_element(row), Permission::Assert)?;
-        let extra = attribution_permission(tx, &row.asserted_by_key);
-        if extra != Permission::Assert {
-            tx.authorize_created(&row_element(row), extra)?;
+        // §17, §18: which epistemic-mutation permission this needs depends on whom
+        // the claim is attributed to, and that is only knowable here. `assert` is
+        // the floor for writing any commitment; recording somebody else's claim or
+        // speaking as an actor each add their own on top of it.
+        if let Element::Assertion(row) = &row {
+            tx.authorize_created(&row_element(row), Permission::Assert)?;
+            let extra = attribution_permission(tx, &row.asserted_by_key);
+            if extra != Permission::Assert {
+                tx.authorize_created(&row_element(row), extra)?;
+            }
+            // The binding this write exercised, for the Receipt's `origin`
+            // (§33.2): the one covering the actor, when the caller holds one.
+            if let Some(binding) = tx
+                .authority
+                .bindings
+                .iter()
+                .find(|binding| binding.actor_key == row.asserted_by_key)
+            {
+                tx.note_binding(format!("kip:binding:{}", binding._id));
+            }
+        } else {
+            tx.authorize_created(&row, Permission::Create)?;
         }
-        // The binding this write exercised, for the Receipt's `origin`
-        // (§33.2): the one covering the actor, when the caller holds one.
-        if let Some(binding) = tx
-            .authority
-            .bindings
-            .iter()
-            .find(|binding| binding.actor_key == row.asserted_by_key)
-        {
-            tx.note_binding(format!("kip:binding:{}", binding._id));
-        }
-    } else {
-        tx.authorize_created(&row, Permission::Create)?;
-    }
-    require_outcome_authority(tx, &row)?;
-    tx.stage_new(id, row, ChangeOp::Create);
-    check_structural(store, tx, id).await
+        require_outcome_authority(tx, &row)?;
+        tx.stage_new(id, row, ChangeOp::Create);
+        check_structural(store, tx, id).await
+    })
 }
 
 /// What every record clause settles before its kind-specific row is built.
@@ -1009,64 +1029,66 @@ fn attribution_permission(tx: &Transaction, actor_key: &str) -> Permission {
 /// version log is deferred until commit, after every clause and every purge
 /// target has passed validation; a statement that later refuses therefore
 /// erases nothing.
-async fn purge(
+fn purge(
     store: &Store,
     tx: &mut Transaction,
     clause: &anda_kip::PurgeStatement,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, policy, guards) = {
-        let b = bindings(tx, request, operation);
-        let policy = clause
-            .reference_policy
-            .as_ref()
-            .map(|scalar| b.scalar_str(scalar, "REFERENCE POLICY"))
-            .transpose()?;
-        let targets = select::targets(
-            store,
-            tx,
-            &select::Selection {
-                what: "PURGE",
-                permission: Permission::Purge,
-                target: &clause.target,
-                where_clauses: clause.where_clauses.as_ref(),
-                limit: clause.limit.as_ref(),
-            },
-            &b,
-        )
-        .await?;
-        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-        (
-            targets,
-            crate::governance::purge::ReferencePolicy::parse(policy.as_deref())?,
-            guards,
-        )
-    };
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (targets, policy, guards) = {
+            let b = bindings(tx, request, operation);
+            let policy = clause
+                .reference_policy
+                .as_ref()
+                .map(|scalar| b.scalar_str(scalar, "REFERENCE POLICY"))
+                .transpose()?;
+            let targets = select::targets(
+                store,
+                tx,
+                &select::Selection {
+                    what: "PURGE",
+                    permission: Permission::Purge,
+                    target: &clause.target,
+                    where_clauses: clause.where_clauses.as_ref(),
+                    limit: clause.limit.as_ref(),
+                },
+                &b,
+            )
+            .await?;
+            let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+            (
+                targets,
+                crate::governance::purge::ReferencePolicy::parse(policy.as_deref())?,
+                guards,
+            )
+        };
 
-    let ids = targets.authorized(tx).await?;
-    for id in &ids {
-        tx.expect_versions(*id, &guards).await?;
-    }
-    if tx.dry_run {
-        // A preview must compute the effect without performing it, and there is
-        // no such thing as a reversible erasure to perform and undo.
+        let ids = targets.authorized(tx).await?;
         for id in &ids {
+            tx.expect_versions(*id, &guards).await?;
+        }
+        if tx.dry_run {
+            // A preview must compute the effect without performing it, and there is
+            // no such thing as a reversible erasure to perform and undo.
+            for id in &ids {
+                tx.warn(format!(
+                    "PURGE would erase {id} and every recorded version of it"
+                ));
+            }
+            return Ok(());
+        }
+        for id in ids {
+            let report = crate::governance::purge::stage(store, tx, id, policy).await?;
             tx.warn(format!(
-                "PURGE would erase {id} and every recorded version of it"
+                "purge of {id} staged with {} identity stub(s) and {} historical version(s) scheduled for destruction",
+                report.purged.len(),
+                report.versions_destroyed,
             ));
         }
-        return Ok(());
-    }
-    for id in ids {
-        let report = crate::governance::purge::stage(store, tx, id, policy).await?;
-        tx.warn(format!(
-            "purge of {id} staged with {} identity stub(s) and {} historical version(s) scheduled for destruction",
-            report.purged.len(),
-            report.versions_destroyed,
-        ));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `PURGE PAYLOAD` — Evidence bytes only (§60.6).
@@ -1076,62 +1098,64 @@ async fn purge(
 /// or its provenance role. That is why this asks for no `REFERENCE POLICY` and
 /// never consults the target's referrers — the element survives, so nothing
 /// can be left pointing at nothing.
-async fn purge_payload(
+fn purge_payload(
     store: &Store,
     tx: &mut Transaction,
     clause: &anda_kip::PurgePayloadStatement,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, guards) = {
-        let b = bindings(tx, request, operation);
-        let targets = select::targets(
-            store,
-            tx,
-            &select::Selection {
-                what: "PURGE PAYLOAD",
-                permission: Permission::Purge,
-                target: &clause.target,
-                where_clauses: clause.where_clauses.as_ref(),
-                limit: clause.limit.as_ref(),
-            },
-            &b,
-        )
-        .await?;
-        (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
-    };
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (targets, guards) = {
+            let b = bindings(tx, request, operation);
+            let targets = select::targets(
+                store,
+                tx,
+                &select::Selection {
+                    what: "PURGE PAYLOAD",
+                    permission: Permission::Purge,
+                    target: &clause.target,
+                    where_clauses: clause.where_clauses.as_ref(),
+                    limit: clause.limit.as_ref(),
+                },
+                &b,
+            )
+            .await?;
+            (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
+        };
 
-    let ids = targets.authorized(tx).await?;
-    for id in &ids {
-        tx.expect_versions(*id, &guards).await?;
-    }
-    if tx.dry_run {
-        // A preview must compute the effect without performing it, and there
-        // is no such thing as a reversible byte destruction to perform and
-        // undo.
+        let ids = targets.authorized(tx).await?;
         for id in &ids {
+            tx.expect_versions(*id, &guards).await?;
+        }
+        if tx.dry_run {
+            // A preview must compute the effect without performing it, and there
+            // is no such thing as a reversible byte destruction to perform and
+            // undo.
+            for id in &ids {
+                tx.warn(format!(
+                    "PURGE PAYLOAD would destroy the payload bytes of {id}, keeping the record, its \
+                     digest and its citations"
+                ));
+            }
+            return Ok(());
+        }
+        for id in ids {
+            let report = crate::governance::purge::stage_payload(store, tx, id).await?;
+            if !report.erased {
+                // §60.6: purging an already-purged payload is a `no_effect`, and
+                // saying so beats a silent success that reads as "erased again".
+                tx.warn(format!("the payload of {id} was already purged"));
+                continue;
+            }
             tx.warn(format!(
-                "PURGE PAYLOAD would destroy the payload bytes of {id}, keeping the record, its \
-                 digest and its citations"
+                "payload purge of {id} destroyed its bytes and scrubbed {} recorded version(s); the \
+                 record, its digest and its citations survive",
+                report.versions_scrubbed,
             ));
         }
-        return Ok(());
-    }
-    for id in ids {
-        let report = crate::governance::purge::stage_payload(store, tx, id).await?;
-        if !report.erased {
-            // §60.6: purging an already-purged payload is a `no_effect`, and
-            // saying so beats a silent success that reads as "erased again".
-            tx.warn(format!("the payload of {id} was already purged"));
-            continue;
-        }
-        tx.warn(format!(
-            "payload purge of {id} destroyed its bytes and scrubbed {} recorded version(s); the \
-             record, its digest and its citations survive",
-            report.versions_scrubbed,
-        ));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Refuses a retention block written by a caller who may not set one.
@@ -1181,295 +1205,299 @@ fn require_legal_hold_authority(
     tx.require(Permission::LegalHold)
 }
 
-async fn ensure_proposition(
+fn ensure_proposition(
     store: &Store,
     tx: &mut Transaction,
     clause: &EnsureProposition,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let subject = b.term(&clause.subject)?;
-    let object = b.term(&clause.object)?;
-    let predicate = match &clause.predicate {
-        anda_kip::PredAtom::Literal(name) => name.clone(),
-        anda_kip::PredAtom::Param(name) => match b.param(name)? {
-            Json::String(text) => text,
-            other => {
-                return Err(KipError::type_mismatch(format!(
-                    "the parameter :{name} must carry a predicate symbol, got {other}"
-                )));
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let b = bindings(tx, request, operation);
+        let subject = b.term(&clause.subject)?;
+        let object = b.term(&clause.object)?;
+        let predicate = match &clause.predicate {
+            anda_kip::PredAtom::Literal(name) => name.clone(),
+            anda_kip::PredAtom::Param(name) => match b.param(name)? {
+                Json::String(text) => text,
+                other => {
+                    return Err(KipError::type_mismatch(format!(
+                        "the parameter :{name} must carry a predicate symbol, got {other}"
+                    )));
+                }
+            },
+            anda_kip::PredAtom::Variable(_) => {
+                return Err(KipError::invalid_syntax(
+                    "ENSURE PROPOSITION needs an exact predicate; a variable predicate is a read form",
+                ));
             }
-        },
-        anda_kip::PredAtom::Variable(_) => {
-            return Err(KipError::invalid_syntax(
-                "ENSURE PROPOSITION needs an exact predicate; a variable predicate is a read form",
-            ));
+        };
+
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+        // `b` borrows `tx`, and resolving endpoint facts needs it mutably.
+        let _ = b;
+
+        // §11.3: a new write canonicalizes a merged reference to the surviving
+        // Concept. Without this a merge would be decorative — every later claim
+        // about the merged-away Concept would accumulate on the identity the merge
+        // said was the same one, and the two would never meet again.
+        let subject = canonicalize(tx, subject).await?;
+        let object = canonicalize(tx, object).await?;
+
+        let subject_facts = facts_for(store, tx, &subject).await?;
+        let object_facts = facts_for(store, tx, &object).await?;
+        let (symbol, validation) =
+            tx.env
+                .prepare_proposition(&predicate, &subject_facts, &object_facts, Intent::Write)?;
+        validation.into_result()?;
+
+        // §12.3, §20.14: identity compares the predicate's lineage, so the same
+        // tuple written under a later version of the package resolves to the
+        // Proposition the Space already holds; the stored `predicate_ref` stays
+        // the exact reference resolved now. After a promotion (§20.16) a tuple
+        // written under the draft keeps the key it was stored under, so it is
+        // looked up under each lineage and a new one takes the first.
+        let keys = tuple_keys(
+            &tx.env,
+            &tx.cx.space,
+            &subject,
+            &symbol.to_string(),
+            &object,
+        );
+
+        // Resolve-or-create: one Space keeps one canonical Proposition per
+        // semantic tuple (§12.4), so an existing tuple is bound rather than
+        // duplicated — and binding it changes nothing, because the tuple is
+        // immutable (§12.5).
+        let mut existing = keys.iter().find_map(|key| tx.staged_proposition(key));
+        for key in &keys {
+            if existing.is_some() {
+                break;
+            }
+            existing = store
+                .find_proposition(key)
+                .await?
+                .map(|row| ElementId::new(ElementKind::Proposition, row._id));
         }
-    };
-
-    let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-    // `b` borrows `tx`, and resolving endpoint facts needs it mutably.
-    let _ = b;
-
-    // §11.3: a new write canonicalizes a merged reference to the surviving
-    // Concept. Without this a merge would be decorative — every later claim
-    // about the merged-away Concept would accumulate on the identity the merge
-    // said was the same one, and the two would never meet again.
-    let subject = canonicalize(tx, subject).await?;
-    let object = canonicalize(tx, object).await?;
-
-    let subject_facts = facts_for(store, tx, &subject).await?;
-    let object_facts = facts_for(store, tx, &object).await?;
-    let (symbol, validation) =
-        tx.env
-            .prepare_proposition(&predicate, &subject_facts, &object_facts, Intent::Write)?;
-    validation.into_result()?;
-
-    // §12.3, §20.14: identity compares the predicate's lineage, so the same
-    // tuple written under a later version of the package resolves to the
-    // Proposition the Space already holds; the stored `predicate_ref` stays
-    // the exact reference resolved now. After a promotion (§20.16) a tuple
-    // written under the draft keeps the key it was stored under, so it is
-    // looked up under each lineage and a new one takes the first.
-    let keys = tuple_keys(
-        &tx.env,
-        &tx.cx.space,
-        &subject,
-        &symbol.to_string(),
-        &object,
-    );
-
-    // Resolve-or-create: one Space keeps one canonical Proposition per
-    // semantic tuple (§12.4), so an existing tuple is bound rather than
-    // duplicated — and binding it changes nothing, because the tuple is
-    // immutable (§12.5).
-    let mut existing = keys.iter().find_map(|key| tx.staged_proposition(key));
-    for key in &keys {
-        if existing.is_some() {
-            break;
+        if let Some(id) = existing {
+            tx.expect_versions(id, &guards).await?;
+            if let Some(handle) = &clause.handle {
+                tx.bind_existing(handle, id)?;
+            }
+            return Ok(());
         }
-        existing = store
-            .find_proposition(key)
-            .await?
-            .map(|row| ElementId::new(ElementKind::Proposition, row._id));
-    }
-    if let Some(id) = existing {
-        tx.expect_versions(id, &guards).await?;
+
+        // §35.2: the bare `EXPECT VERSION 0` is the create-only guard, and it is
+        // satisfied precisely because nothing was found above; a plane guard at
+        // 0 says the plane has never been written, which is also true here.
+        check_guards_absent(&guards, "this tuple does not exist yet")?;
+
+        let id = tx.mint(ElementKind::Proposition).await?;
         if let Some(handle) = &clause.handle {
             tx.bind_existing(handle, id)?;
         }
-        return Ok(());
-    }
-
-    // §35.2: the bare `EXPECT VERSION 0` is the create-only guard, and it is
-    // satisfied precisely because nothing was found above; a plane guard at
-    // 0 says the plane has never been written, which is also true here.
-    check_guards_absent(&guards, "this tuple does not exist yet")?;
-
-    let id = tx.mint(ElementKind::Proposition).await?;
-    if let Some(handle) = &clause.handle {
-        tx.bind_existing(handle, id)?;
-    }
-    let row = PropositionRow {
-        _id: id.seq,
-        subject: subject.to_json(),
-        subject_key: subject.key(),
-        predicate_ref: symbol.to_string(),
-        object: object.to_json(),
-        object_key: object.key(),
-        tuple_key: keys.into_iter().next().unwrap_or_default(),
-        ..Default::default()
-    };
-    let element = Element::Proposition(Box::new(row));
-    tx.authorize_created(&element, Permission::Create)?;
-    tx.stage_new(id, element, ChangeOp::Create);
-    Ok(())
+        let row = PropositionRow {
+            _id: id.seq,
+            subject: subject.to_json(),
+            subject_key: subject.key(),
+            predicate_ref: symbol.to_string(),
+            object: object.to_json(),
+            object_key: object.key(),
+            tuple_key: keys.into_iter().next().unwrap_or_default(),
+            ..Default::default()
+        };
+        let element = Element::Proposition(Box::new(row));
+        tx.authorize_created(&element, Permission::Create)?;
+        tx.stage_new(id, element, ChangeOp::Create);
+        Ok(())
+    })
 }
 
-async fn upsert_concept(
+fn upsert_concept(
     store: &Store,
     tx: &mut Transaction,
     clause: &ConceptUpsert,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let b = bindings(tx, request, operation);
-    let matcher = clause.r#match.as_ref().ok_or_else(|| {
-        KipError::identity_selector_required(
-            "UPSERT CONCEPT needs a MATCH block carrying `id` or `key`",
-        )
-    })?;
-
-    // Spec §54.2, §7.2: name-only upsert is forbidden. A name is mutable grounding
-    // state that may be duplicated, so resolving identity through it would
-    // merge two different Concepts that happen to share a label.
-    let selector = match matcher
-        .get("id")
-        .map(|value| ("id", value))
-        .or_else(|| matcher.get("key").map(|value| ("key", value)))
-    {
-        Some(selector) => selector,
-        // Its own code, because the two refusals mean different things to a
-        // caller: `name` was offered as identity and is not one, versus no
-        // identity was offered at all. `ts/kip-do` answers the same two.
-        None if matcher.contains_key("name") => {
-            return Err(KipError::new(
-                KipErrorCode::NameIdentityForbidden,
-                "a Concept name is mutable grounding state and several Concepts may share one, \
-                 so it cannot identify an upsert target; use {key: …} or {id: …}",
-            ));
-        }
-        None => {
-            return Err(KipError::identity_selector_required(
-                "UPSERT CONCEPT resolves identity through `id` or `key` only",
-            ));
-        }
-    };
-
-    let selector_value = match_text(&b, selector.1, selector.0)?;
-
-    // MATCH is an `object_pattern` — the same production a KQL Concept pattern
-    // uses — so `type` here is what it is there: schema-resolution sugar for an
-    // exact `schema_ref` (§43.1). It carries identity weight in both halves of
-    // an upsert. On a resolve it is part of the address, because key uniqueness
-    // is scoped to `(space_id, schema_ref, key)` (§7.3). On a create it is the
-    // only place the new Concept's type can come from, and `schema_ref` is
-    // fixed at creation — so a Concept minted without one stays untyped
-    // forever, which §10.1 does not admit as a state a Concept can be in.
-    let declared_type = matcher
-        .get("type")
-        .map(|value| match_text(&b, value, "type"))
-        .transpose()?
-        .map(|name| {
-            tx.env
-                .resolve_symbol(SymbolKind::ConceptType, &name, Intent::Write)
-        })
-        .transpose()?
-        .map(|symbol| symbol.to_string());
-
-    let existing = match selector.0 {
-        "id" => {
-            let id: ElementId = selector_value.parse()?;
-            // The kind is spelled in the id the caller wrote, so saying so
-            // reveals nothing they did not already state.
-            if id.kind != ElementKind::Concept {
-                return Err(KipError::structural_reference_invalid(format!(
-                    "{id} names a {:?}, and UPSERT CONCEPT resolves Concepts",
-                    id.kind
-                )));
-            }
-            match store.find_concept(id).await {
-                // A declared type is part of the pattern, so an element of
-                // another type is simply not a match. Reported as no match
-                // rather than as a type mismatch, which would let an id probe
-                // map the Space by reading the difference (§86.4) — and an
-                // upsert by id may not create, so this still fails loudly.
-                Ok(row) => match &declared_type {
-                    Some(declared)
-                        if !tx.env.same_lineage(
-                            SymbolKind::ConceptType,
-                            &row.schema_ref,
-                            declared,
-                        ) =>
-                    {
-                        None
-                    }
-                    _ => Some(id),
-                },
-                // Only absence is "no match". A poisoned collection or a row
-                // that will not decode is the engine failing, and reporting it
-                // as absence would send the caller to fix a command that is
-                // not what went wrong.
-                Err(err) if err.code == KipErrorCode::NotFoundOrNotVisible => None,
-                Err(err) => return Err(err),
-            }
-        }
-        _ => store
-            .find_concept_by_key(
-                &tx.cx.space,
-                &tx.env,
-                declared_type.as_deref(),
-                &selector_value,
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let b = bindings(tx, request, operation);
+        let matcher = clause.r#match.as_ref().ok_or_else(|| {
+            KipError::identity_selector_required(
+                "UPSERT CONCEPT needs a MATCH block carrying `id` or `key`",
             )
-            .await?
-            .map(|row| ElementId::new(ElementKind::Concept, row._id)),
-    };
+        })?;
 
-    if let Some(id) = existing
-        && matcher.keys().any(|key| key != "type" && key != selector.0)
-    {
-        let mut cx = crate::kql::Context::open(
+        // Spec §54.2, §7.2: name-only upsert is forbidden. A name is mutable grounding
+        // state that may be duplicated, so resolving identity through it would
+        // merge two different Concepts that happen to share a label.
+        let selector = match matcher
+            .get("id")
+            .map(|value| ("id", value))
+            .or_else(|| matcher.get("key").map(|value| ("key", value)))
+        {
+            Some(selector) => selector,
+            // Its own code, because the two refusals mean different things to a
+            // caller: `name` was offered as identity and is not one, versus no
+            // identity was offered at all. `ts/kip-do` answers the same two.
+            None if matcher.contains_key("name") => {
+                return Err(KipError::new(
+                    KipErrorCode::NameIdentityForbidden,
+                    "a Concept name is mutable grounding state and several Concepts may share one, \
+                     so it cannot identify an upsert target; use {key: …} or {id: …}",
+                ));
+            }
+            None => {
+                return Err(KipError::identity_selector_required(
+                    "UPSERT CONCEPT resolves identity through `id` or `key` only",
+                ));
+            }
+        };
+
+        let selector_value = match_text(&b, selector.1, selector.0)?;
+
+        // MATCH is an `object_pattern` — the same production a KQL Concept pattern
+        // uses — so `type` here is what it is there: schema-resolution sugar for an
+        // exact `schema_ref` (§43.1). It carries identity weight in both halves of
+        // an upsert. On a resolve it is part of the address, because key uniqueness
+        // is scoped to `(space_id, schema_ref, key)` (§7.3). On a create it is the
+        // only place the new Concept's type can come from, and `schema_ref` is
+        // fixed at creation — so a Concept minted without one stays untyped
+        // forever, which §10.1 does not admit as a state a Concept can be in.
+        let declared_type = matcher
+            .get("type")
+            .map(|value| match_text(&b, value, "type"))
+            .transpose()?
+            .map(|name| {
+                tx.env
+                    .resolve_symbol(SymbolKind::ConceptType, &name, Intent::Write)
+            })
+            .transpose()?
+            .map(|symbol| symbol.to_string());
+
+        let existing = match selector.0 {
+            "id" => {
+                let id: ElementId = selector_value.parse()?;
+                // The kind is spelled in the id the caller wrote, so saying so
+                // reveals nothing they did not already state.
+                if id.kind != ElementKind::Concept {
+                    return Err(KipError::structural_reference_invalid(format!(
+                        "{id} names a {:?}, and UPSERT CONCEPT resolves Concepts",
+                        id.kind
+                    )));
+                }
+                match store.find_concept(id).await {
+                    // A declared type is part of the pattern, so an element of
+                    // another type is simply not a match. Reported as no match
+                    // rather than as a type mismatch, which would let an id probe
+                    // map the Space by reading the difference (§86.4) — and an
+                    // upsert by id may not create, so this still fails loudly.
+                    Ok(row) => match &declared_type {
+                        Some(declared)
+                            if !tx.env.same_lineage(
+                                SymbolKind::ConceptType,
+                                &row.schema_ref,
+                                declared,
+                            ) =>
+                        {
+                            None
+                        }
+                        _ => Some(id),
+                    },
+                    // Only absence is "no match". A poisoned collection or a row
+                    // that will not decode is the engine failing, and reporting it
+                    // as absence would send the caller to fix a command that is
+                    // not what went wrong.
+                    Err(err) if err.code == KipErrorCode::NotFoundOrNotVisible => None,
+                    Err(err) => return Err(err),
+                }
+            }
+            _ => store
+                .find_concept_by_key(
+                    &tx.cx.space,
+                    &tx.env,
+                    declared_type.as_deref(),
+                    &selector_value,
+                )
+                .await?
+                .map(|row| ElementId::new(ElementKind::Concept, row._id)),
+        };
+
+        if let Some(id) = existing
+            && matcher.keys().any(|key| key != "type" && key != selector.0)
+        {
+            let mut cx = crate::kql::Context::open(
+                store,
+                &tx.cx.space,
+                request,
+                operation,
+                &tx.authority,
+                &tx.auth,
+            )
+            .await?;
+            let loaded = cx.load(id).await?;
+            if loaded.is_none()
+                || !cx.matches_element_view(ElementKind::Concept, &cx.view_of(id), matcher)?
+            {
+                return Err(KipError::not_found_or_not_visible(
+                    "no accessible Concept satisfies the complete UPSERT selector",
+                ));
+            }
+        }
+
+        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+        let id = match existing {
+            Some(id) => {
+                tx.expect_versions(id, &guards).await?;
+                id
+            }
+            None => {
+                check_guards_absent(&guards, "no Concept matches this selector")?;
+                if selector.0 == "id" {
+                    return Err(KipError::not_found_or_not_visible(format!(
+                        "{selector_value} does not exist, and an UPSERT by id cannot mint an id the \
+                         caller chose"
+                    )));
+                }
+                let declared = declared_type.ok_or_else(|| {
+                    KipError::schema_symbol_not_found(
+                        "UPSERT CONCEPT creates only through MATCH {type: ..., key: ...}: a Concept's \
+                         type is schema-defined and fixed at creation, so a Concept minted without \
+                         one could never be given a type afterwards",
+                    )
+                })?;
+                let id = tx.mint(ElementKind::Concept).await?;
+                let row = ConceptRow {
+                    _id: id.seq,
+                    schema_ref: declared,
+                    key: selector_value.clone(),
+                    ..Default::default()
+                };
+                let element = Element::Concept(Box::new(row));
+                tx.authorize_created(&element, Permission::Create)?;
+                tx.stage_new(id, element, ChangeOp::Create);
+                id
+            }
+        };
+        tx.bind_existing(&clause.handle, id)?;
+        // An upsert that resolved to an existing Concept is changing it, and the
+        // caller may hold `create` without holding `update` — which is exactly the
+        // case an upsert makes hard to see from the command alone.
+        if existing.is_some() {
+            tx.authorize_element(id, Permission::Update).await?;
+        }
+
+        apply_concept_assignments(
             store,
-            &tx.cx.space,
+            tx,
+            clause,
+            id,
+            existing.is_none(),
             request,
             operation,
-            &tx.authority,
-            &tx.auth,
         )
-        .await?;
-        let loaded = cx.load(id).await?;
-        if loaded.is_none()
-            || !cx.matches_element_view(ElementKind::Concept, &cx.view_of(id), matcher)?
-        {
-            return Err(KipError::not_found_or_not_visible(
-                "no accessible Concept satisfies the complete UPSERT selector",
-            ));
-        }
-    }
-
-    let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-    let id = match existing {
-        Some(id) => {
-            tx.expect_versions(id, &guards).await?;
-            id
-        }
-        None => {
-            check_guards_absent(&guards, "no Concept matches this selector")?;
-            if selector.0 == "id" {
-                return Err(KipError::not_found_or_not_visible(format!(
-                    "{selector_value} does not exist, and an UPSERT by id cannot mint an id the \
-                     caller chose"
-                )));
-            }
-            let declared = declared_type.ok_or_else(|| {
-                KipError::schema_symbol_not_found(
-                    "UPSERT CONCEPT creates only through MATCH {type: ..., key: ...}: a Concept's \
-                     type is schema-defined and fixed at creation, so a Concept minted without \
-                     one could never be given a type afterwards",
-                )
-            })?;
-            let id = tx.mint(ElementKind::Concept).await?;
-            let row = ConceptRow {
-                _id: id.seq,
-                schema_ref: declared,
-                key: selector_value.clone(),
-                ..Default::default()
-            };
-            let element = Element::Concept(Box::new(row));
-            tx.authorize_created(&element, Permission::Create)?;
-            tx.stage_new(id, element, ChangeOp::Create);
-            id
-        }
-    };
-    tx.bind_existing(&clause.handle, id)?;
-    // An upsert that resolved to an existing Concept is changing it, and the
-    // caller may hold `create` without holding `update` — which is exactly the
-    // case an upsert makes hard to see from the command alone.
-    if existing.is_some() {
-        tx.authorize_element(id, Permission::Update).await?;
-    }
-
-    apply_concept_assignments(
-        store,
-        tx,
-        clause,
-        id,
-        existing.is_none(),
-        request,
-        operation,
-    )
-    .await
+        .await
+    })
 }
 
 /// Reads one `MATCH` member as a string.
@@ -1504,7 +1532,7 @@ fn match_text(b: &Bindings<'_>, value: &MatchValue, what: &str) -> Result<String
 /// state" is how `UNSET FACET` came to be accepted, parsed, and silently
 /// dropped: a caller cannot tell a mutation that did nothing from one that was
 /// never implemented.
-async fn apply_concept_assignments(
+fn apply_concept_assignments(
     store: &Store,
     tx: &mut Transaction,
     clause: &ConceptUpsert,
@@ -1512,53 +1540,55 @@ async fn apply_concept_assignments(
     created: bool,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let mut actions: Vec<UpdateAction> = Vec::new();
-    if let Some(fields) = &clause.set_fields {
-        actions.push(UpdateAction::SetFields(fields.clone()));
-    }
-    if let Some(attributes) = &clause.set_attributes {
-        actions.push(UpdateAction::SetAttributes(attributes.clone()));
-    }
-    if let Some(unset) = &clause.unset_attributes {
-        actions.push(UpdateAction::UnsetAttributes(unset.clone()));
-    }
-    for facet in &clause.set_facets {
-        actions.push(UpdateAction::SetFacet(facet.clone()));
-    }
-    for facet in &clause.unset_facets {
-        actions.push(UpdateAction::UnsetFacet(facet.clone()));
-    }
-    if let Some(edges) = &clause.set_structural {
-        actions.push(UpdateAction::SetStructural(edges.clone()));
-    }
-    if let Some(removals) = &clause.unset_structural {
-        actions.push(UpdateAction::UnsetStructural(removals.clone()));
-    }
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let mut actions: Vec<UpdateAction> = Vec::new();
+        if let Some(fields) = &clause.set_fields {
+            actions.push(UpdateAction::SetFields(fields.clone()));
+        }
+        if let Some(attributes) = &clause.set_attributes {
+            actions.push(UpdateAction::SetAttributes(attributes.clone()));
+        }
+        if let Some(unset) = &clause.unset_attributes {
+            actions.push(UpdateAction::UnsetAttributes(unset.clone()));
+        }
+        for facet in &clause.set_facets {
+            actions.push(UpdateAction::SetFacet(facet.clone()));
+        }
+        for facet in &clause.unset_facets {
+            actions.push(UpdateAction::UnsetFacet(facet.clone()));
+        }
+        if let Some(edges) = &clause.set_structural {
+            actions.push(UpdateAction::SetStructural(edges.clone()));
+        }
+        if let Some(removals) = &clause.unset_structural {
+            actions.push(UpdateAction::UnsetStructural(removals.clone()));
+        }
 
-    // An UPSERT has no update expressions — the parser rejects `?var` reads
-    // outside UPDATE — but the appliers still take the view, so the same
-    // function serves both.
-    let view = crate::view::render(tx.load(id).await?);
-    for action in &actions {
-        update::apply_action(tx, id, action, &view, request, operation).await?;
-    }
-    // The insert half is a create, and a create leaves a Concept its type
-    // accepts or it does not happen (§36) — `CREATE CONCEPT` has always been
-    // held to that, and an upsert that mints one is not a quieter way in.
-    if created || update::touches_attributes(&actions) {
-        update::check_attributes(tx, id, &view).await?;
-    }
-    if update::touches_structural(&actions) {
-        check_structural(store, tx, id).await?;
-    }
+        // An UPSERT has no update expressions — the parser rejects `?var` reads
+        // outside UPDATE — but the appliers still take the view, so the same
+        // function serves both.
+        let view = crate::view::render(tx.load(id).await?);
+        for action in &actions {
+            update::apply_action(tx, id, action, &view, request, operation).await?;
+        }
+        // The insert half is a create, and a create leaves a Concept its type
+        // accepts or it does not happen (§36) — `CREATE CONCEPT` has always been
+        // held to that, and an upsert that mints one is not a quieter way in.
+        if created || update::touches_attributes(&actions) {
+            update::check_attributes(tx, id, &view).await?;
+        }
+        if update::touches_structural(&actions) {
+            check_structural(store, tx, id).await?;
+        }
 
-    // A no-effect final state changes nothing: no version bump, no change
-    // record, no receipt claiming a transition that did not happen (§32.8).
-    if crate::view::render(tx.load(id).await?) != view {
-        tx.mark_changed(id, ChangeOp::Update);
-    }
-    Ok(())
+        // A no-effect final state changes nothing: no version bump, no change
+        // record, no receipt claiming a transition that did not happen (§32.8).
+        if crate::view::render(tx.load(id).await?) != view {
+            tx.mark_changed(id, ChangeOp::Update);
+        }
+        Ok(())
+    })
 }
 
 /// `UPDATE` — mutable state on already-existing elements.
@@ -1566,53 +1596,55 @@ async fn apply_concept_assignments(
 /// UPDATE never creates (§52.4): a selection block that matches nothing leaves
 /// the transaction with nothing to do, which is a `no_effect`, not an error and
 /// certainly not an insert.
-async fn update_elements(
+fn update_elements(
     store: &Store,
     tx: &mut Transaction,
     clause: &UpdateStatement,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, guards) = {
-        let b = bindings(tx, request, operation);
-        let targets = select::targets(
-            store,
-            tx,
-            &select::Selection {
-                what: "UPDATE",
-                permission: Permission::Update,
-                target: &clause.target,
-                where_clauses: clause.where_clauses.as_ref(),
-                limit: clause.limit.as_ref(),
-            },
-            &b,
-        )
-        .await?;
-        (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
-    };
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (targets, guards) = {
+            let b = bindings(tx, request, operation);
+            let targets = select::targets(
+                store,
+                tx,
+                &select::Selection {
+                    what: "UPDATE",
+                    permission: Permission::Update,
+                    target: &clause.target,
+                    where_clauses: clause.where_clauses.as_ref(),
+                    limit: clause.limit.as_ref(),
+                },
+                &b,
+            )
+            .await?;
+            (targets, resolve_guards(tx, &b, &clause.expect_versions)?)
+        };
 
-    for id in targets.authorized(tx).await? {
-        tx.expect_versions(id, &guards).await?;
+        for id in targets.authorized(tx).await? {
+            tx.expect_versions(id, &guards).await?;
 
-        // Every action of one UPDATE reads the element as it was when the
-        // statement began: two actions on the same Facet member must not
-        // compound, or the second would silently operate on what the first
-        // just wrote for reasons the author cannot see in the text.
-        let view = crate::view::render(tx.load(id).await?);
-        for action in &clause.actions {
-            update::apply_action(tx, id, action, &view, request, operation).await?;
+            // Every action of one UPDATE reads the element as it was when the
+            // statement began: two actions on the same Facet member must not
+            // compound, or the second would silently operate on what the first
+            // just wrote for reasons the author cannot see in the text.
+            let view = crate::view::render(tx.load(id).await?);
+            for action in &clause.actions {
+                update::apply_action(tx, id, action, &view, request, operation).await?;
+            }
+            if update::touches_attributes(&clause.actions) {
+                update::check_attributes(tx, id, &view).await?;
+            }
+            if update::touches_structural(&clause.actions) {
+                check_structural(store, tx, id).await?;
+            }
+            if crate::view::render(tx.load(id).await?) != view {
+                tx.mark_changed(id, ChangeOp::Update);
+            }
         }
-        if update::touches_attributes(&clause.actions) {
-            update::check_attributes(tx, id, &view).await?;
-        }
-        if update::touches_structural(&clause.actions) {
-            check_structural(store, tx, id).await?;
-        }
-        if crate::view::render(tx.load(id).await?) != view {
-            tx.mark_changed(id, ChangeOp::Update);
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `TRANSITION <target> TO "<state>" [BY <ref>] [SET FIELDS {...}]
@@ -1632,92 +1664,96 @@ async fn update_elements(
 /// unclassified, so the same rules are applied at execution, and every target
 /// is authorized individually with the permission the bound state names —
 /// which is the check that decides in either case.
-async fn transition(
+fn transition(
     store: &Store,
     tx: &mut Transaction,
     clause: &Transition,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, guards, state, by, set_fields) = {
-        let b = bindings(tx, request, operation);
-        let state = b.scalar_str(&clause.to, "TRANSITION ... TO")?;
-        if clause.state().is_none() {
-            // The three rules the parser applies to a literal state, applied
-            // here to a bound one (§52.5).
-            check_registry(&state, "TRANSITION ... TO", transition_state::ALL)?;
-            let names_replacement = transition_state::WITH_BY.contains(&state.as_str());
-            if clause.by.is_some() != names_replacement {
-                return Err(KipError::invalid_syntax(if names_replacement {
-                    format!(
-                        "TRANSITION ... TO {state:?} names the replacing element with BY (§52.5)"
-                    )
-                } else {
-                    format!(
-                        "TRANSITION ... TO {state:?} takes no BY: only superseded and corrected \
-                         name a replacement (§52.5)"
-                    )
-                }));
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (targets, guards, state, by, set_fields) = {
+            let b = bindings(tx, request, operation);
+            let state = b.scalar_str(&clause.to, "TRANSITION ... TO")?;
+            if clause.state().is_none() {
+                // The three rules the parser applies to a literal state, applied
+                // here to a bound one (§52.5).
+                check_registry(&state, "TRANSITION ... TO", transition_state::ALL)?;
+                let names_replacement = transition_state::WITH_BY.contains(&state.as_str());
+                if clause.by.is_some() != names_replacement {
+                    return Err(KipError::invalid_syntax(if names_replacement {
+                        format!(
+                            "TRANSITION ... TO {state:?} names the replacing element with BY (§52.5)"
+                        )
+                    } else {
+                        format!(
+                            "TRANSITION ... TO {state:?} takes no BY: only superseded and corrected \
+                             name a replacement (§52.5)"
+                        )
+                    }));
+                }
+                if clause.finalizes() && !transition_state::ACTIVITY.contains(&state.as_str()) {
+                    return Err(KipError::invalid_syntax(format!(
+                        "SET FIELDS and SET STRUCTURAL finalize an Activity; TRANSITION ... TO \
+                         {state:?} carries neither (§52.5)"
+                    )));
+                }
             }
-            if clause.finalizes() && !transition_state::ACTIVITY.contains(&state.as_str()) {
-                return Err(KipError::invalid_syntax(format!(
-                    "SET FIELDS and SET STRUCTURAL finalize an Activity; TRANSITION ... TO \
-                     {state:?} carries neither (§52.5)"
-                )));
-            }
-        }
-        let permission = element_permission(&state).ok_or_else(|| {
-            KipError::constraint_violation(format!("{state:?} is not a lifecycle state (§52.5)"))
-        })?;
-        let targets = select::targets(
-            store,
-            tx,
-            &select::Selection {
-                what: "TRANSITION",
-                permission,
-                target: &clause.target,
-                where_clauses: clause.where_clauses.as_ref(),
-                limit: clause.limit.as_ref(),
-            },
-            &b,
-        )
-        .await?;
-        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-        let by = match &clause.by {
-            Some(reference) => Some(b.element_ref(reference)?),
-            None => None,
+            let permission = element_permission(&state).ok_or_else(|| {
+                KipError::constraint_violation(format!(
+                    "{state:?} is not a lifecycle state (§52.5)"
+                ))
+            })?;
+            let targets = select::targets(
+                store,
+                tx,
+                &select::Selection {
+                    what: "TRANSITION",
+                    permission,
+                    target: &clause.target,
+                    where_clauses: clause.where_clauses.as_ref(),
+                    limit: clause.limit.as_ref(),
+                },
+                &b,
+            )
+            .await?;
+            let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+            let by = match &clause.by {
+                Some(reference) => Some(b.element_ref(reference)?),
+                None => None,
+            };
+            let set_fields = clause
+                .set_fields
+                .as_ref()
+                .map(|fields| assignments_to_json(&b, fields, None))
+                .transpose()?;
+            (targets, guards, state, by, set_fields)
         };
-        let set_fields = clause
-            .set_fields
-            .as_ref()
-            .map(|fields| assignments_to_json(&b, fields, None))
-            .transpose()?;
-        (targets, guards, state, by, set_fields)
-    };
-    // Correcting Evidence writes the new record as well as linking it, so it
-    // costs `create` on top of the per-element `maintain` (§57.2).
-    if state == transition_state::CORRECTED {
-        tx.require(Permission::Create)?;
-    }
+        // Correcting Evidence writes the new record as well as linking it, so it
+        // costs `create` on top of the per-element `maintain` (§57.2).
+        if state == transition_state::CORRECTED {
+            tx.require(Permission::Create)?;
+        }
 
-    for id in targets.authorized(tx).await? {
-        tx.expect_versions(id, &guards).await?;
-        move_element(
-            store,
-            tx,
-            &LifecycleMove {
-                id,
-                state: &state,
-                by,
-                set_fields: set_fields.as_ref(),
-                set_structural: clause.set_structural.as_ref(),
-                request,
-                operation,
-            },
-        )
-        .await?;
-    }
-    Ok(())
+        for id in targets.authorized(tx).await? {
+            tx.expect_versions(id, &guards).await?;
+            move_element(
+                store,
+                tx,
+                &LifecycleMove {
+                    id,
+                    state: &state,
+                    by,
+                    set_fields: set_fields.as_ref(),
+                    set_structural: clause.set_structural.as_ref(),
+                    request,
+                    operation,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    })
 }
 
 /// The permission each target of a `TRANSITION` is authorized with (§52.5).
@@ -1757,52 +1793,56 @@ fn refuse_move(id: ElementId, kind: ElementKind, from: &str, to: &str) -> KipErr
     )
 }
 
-async fn move_element(
+fn move_element(
     store: &Store,
     tx: &mut Transaction,
     mv: &LifecycleMove<'_>,
-) -> Result<(), KipError> {
-    use transition_state as ts;
-    let (kind, mut current, mut engine_state) = {
-        let element = tx.load(mv.id).await?;
-        (
-            element.kind(),
-            planes::lifecycle_state(element),
-            element.state().to_string(),
-        )
-    };
-    // Formation has semantic state active; empty/pending is only the private
-    // shell marker until the first commit. Normalize the validation view,
-    // leaving the stored marker and every committed/Activity state untouched.
-    if kind == ElementKind::Concept
-        && tx.is_new_element(mv.id)
-        && (engine_state.is_empty() || engine_state == state::PENDING)
-    {
-        current = state::ACTIVE.to_string();
-        engine_state = state::ACTIVE.to_string();
-    }
-    let fits = match mv.state {
-        ts::RETRACTED | ts::SUPERSEDED => kind == ElementKind::Assertion,
-        ts::CORRECTED => kind == ElementKind::Evidence,
-        ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => kind == ElementKind::Activity,
-        ts::ARCHIVED | ts::TOMBSTONED => true,
-        _ => false,
-    };
-    if !fits {
-        return Err(refuse_move(mv.id, kind, &current, mv.state));
-    }
-    match mv.state {
-        ts::ARCHIVED | ts::TOMBSTONED => {
-            shelve(tx, mv.id, kind, mv.state, &current, &engine_state).await
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        use transition_state as ts;
+        let (kind, mut current, mut engine_state) = {
+            let element = tx.load(mv.id).await?;
+            (
+                element.kind(),
+                planes::lifecycle_state(element),
+                element.state().to_string(),
+            )
+        };
+        // Formation has semantic state active; empty/pending is only the private
+        // shell marker until the first commit. Normalize the validation view,
+        // leaving the stored marker and every committed/Activity state untouched.
+        if kind == ElementKind::Concept
+            && tx.is_new_element(mv.id)
+            && (engine_state.is_empty() || engine_state == state::PENDING)
+        {
+            current = state::ACTIVE.to_string();
+            engine_state = state::ACTIVE.to_string();
         }
-        ts::RETRACTED => retract(tx, mv.id, kind, &current).await,
-        ts::SUPERSEDED => supersede(tx, mv.id, kind, &current, mv.by).await,
-        ts::CORRECTED => correct(tx, mv.id, kind, &current, mv.by).await,
-        ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => {
-            move_activity(store, tx, mv, kind, &current, &engine_state).await
+        let fits = match mv.state {
+            ts::RETRACTED | ts::SUPERSEDED => kind == ElementKind::Assertion,
+            ts::CORRECTED => kind == ElementKind::Evidence,
+            ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => {
+                kind == ElementKind::Activity
+            }
+            ts::ARCHIVED | ts::TOMBSTONED => true,
+            _ => false,
+        };
+        if !fits {
+            return Err(refuse_move(mv.id, kind, &current, mv.state));
         }
-        _ => Err(refuse_move(mv.id, kind, &current, mv.state)),
-    }
+        match mv.state {
+            ts::ARCHIVED | ts::TOMBSTONED => {
+                shelve(tx, mv.id, kind, mv.state, &current, &engine_state).await
+            }
+            ts::RETRACTED => retract(tx, mv.id, kind, &current).await,
+            ts::SUPERSEDED => supersede(tx, mv.id, kind, &current, mv.by).await,
+            ts::CORRECTED => correct(tx, mv.id, kind, &current, mv.by).await,
+            ts::RUNNING | ts::COMPLETED | ts::FAILED | ts::CANCELLED => {
+                move_activity(store, tx, mv, kind, &current, &engine_state).await
+            }
+            _ => Err(refuse_move(mv.id, kind, &current, mv.state)),
+        }
+    })
 }
 
 /// `archived` and `tombstoned` (§60): out of ordinary recall, history kept.
@@ -2064,122 +2104,126 @@ async fn correct(
 
 /// An Activity's status moves (§16): forward from `pending`, and a finished
 /// Activity's provenance is immutable (§16.6).
-async fn move_activity(
+fn move_activity(
     store: &Store,
     tx: &mut Transaction,
     mv: &LifecycleMove<'_>,
     kind: ElementKind,
     current: &str,
     engine_state: &str,
-) -> Result<(), KipError> {
-    use transition_state as ts;
-    if current == mv.state {
-        return Ok(());
-    }
-    if is_terminal(current) {
-        return Err(KipError::activity_terminal(format!(
-            "{} is already {current:?}; a finished Activity's provenance is immutable",
-            mv.id
-        )));
-    }
-    if engine_state != state::ACTIVE {
-        return Err(refuse_move(mv.id, kind, current, mv.state));
-    }
-    let legal = match mv.state {
-        ts::RUNNING => current == "pending",
-        _ => current == "pending" || current == ts::RUNNING,
-    };
-    if !legal {
-        return Err(refuse_move(mv.id, kind, current, mv.state));
-    }
-    finalize_activity(store, tx, mv).await?;
-    tx.mark_changed(mv.id, ChangeOp::Lifecycle);
-    Ok(())
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        use transition_state as ts;
+        if current == mv.state {
+            return Ok(());
+        }
+        if is_terminal(current) {
+            return Err(KipError::activity_terminal(format!(
+                "{} is already {current:?}; a finished Activity's provenance is immutable",
+                mv.id
+            )));
+        }
+        if engine_state != state::ACTIVE {
+            return Err(refuse_move(mv.id, kind, current, mv.state));
+        }
+        let legal = match mv.state {
+            ts::RUNNING => current == "pending",
+            _ => current == "pending" || current == ts::RUNNING,
+        };
+        if !legal {
+            return Err(refuse_move(mv.id, kind, current, mv.state));
+        }
+        finalize_activity(store, tx, mv).await?;
+        tx.mark_changed(mv.id, ChangeOp::Lifecycle);
+        Ok(())
+    })
 }
 
-async fn finalize_activity(
+fn finalize_activity(
     store: &Store,
     tx: &mut Transaction,
     mv: &LifecycleMove<'_>,
-) -> Result<(), KipError> {
-    let id = mv.id;
-    let mut fields = Fields::new(mv.set_fields.cloned().unwrap_or_default())?;
-    let started = fields.timestamp("started_at")?;
-    let ended = fields.timestamp("ended_at")?;
-    let parameters_digest = fields.text("parameters_digest")?;
-    fields.rest("Activity")?;
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let id = mv.id;
+        let mut fields = Fields::new(mv.set_fields.cloned().unwrap_or_default())?;
+        let started = fields.timestamp("started_at")?;
+        let ended = fields.timestamp("ended_at")?;
+        let parameters_digest = fields.text("parameters_digest")?;
+        fields.rest("Activity")?;
 
-    let structural = match mv.set_structural {
-        Some(edges) => {
-            let mut structural = {
-                let b = bindings(tx, mv.request, mv.operation);
-                collect_structural(tx, &b, Some(edges), core_fields(ElementKind::Activity))?
-            };
-            // §11.3: a reference added now resolves through whatever merges
-            // the Space has already declared.
-            structural.canonicalize(tx).await?;
-            Some(structural)
+        let structural = match mv.set_structural {
+            Some(edges) => {
+                let mut structural = {
+                    let b = bindings(tx, mv.request, mv.operation);
+                    collect_structural(tx, &b, Some(edges), core_fields(ElementKind::Activity))?
+                };
+                // §11.3: a reference added now resolves through whatever merges
+                // the Space has already declared.
+                structural.canonicalize(tx).await?;
+                Some(structural)
+            }
+            None => None,
+        };
+
+        let at = tx.cx.at.clone();
+        let row = row_mut::<ActivityRow>(tx, id).await?;
+        if !started.is_empty() {
+            row.started_at = started;
         }
-        None => None,
-    };
-
-    let at = tx.cx.at.clone();
-    let row = row_mut::<ActivityRow>(tx, id).await?;
-    if !started.is_empty() {
-        row.started_at = started;
-    }
-    if !parameters_digest.is_empty() {
-        row.parameters_digest = parameters_digest;
-    }
-    if let Some(mut structural) = structural {
-        // Finalized topology is added to what the Activity already recorded:
-        // an output named twice is one output, and a reference the Activity
-        // already carries is not moved.
-        for (field, refs) in [
-            ("inputs", &mut row.inputs),
-            ("outputs", &mut row.outputs),
-            ("associated_actors", &mut row.associated_actors),
-        ] {
-            for (value, _) in structural.take(field) {
-                let key = endpoint_key(&value);
-                if !refs.iter().any(|held| endpoint_key(held) == key) {
-                    refs.push(value);
+        if !parameters_digest.is_empty() {
+            row.parameters_digest = parameters_digest;
+        }
+        if let Some(mut structural) = structural {
+            // Finalized topology is added to what the Activity already recorded:
+            // an output named twice is one output, and a reference the Activity
+            // already carries is not moved.
+            for (field, refs) in [
+                ("inputs", &mut row.inputs),
+                ("outputs", &mut row.outputs),
+                ("associated_actors", &mut row.associated_actors),
+            ] {
+                for (value, _) in structural.take(field) {
+                    let key = endpoint_key(&value);
+                    if !refs.iter().any(|held| endpoint_key(held) == key) {
+                        refs.push(value);
+                    }
+                }
+            }
+            row.input_keys = row.inputs.iter().map(endpoint_key).collect();
+            row.output_keys = row.outputs.iter().map(endpoint_key).collect();
+            for (field, refs) in structural.profile {
+                let Json::Array(items) = refs else {
+                    continue;
+                };
+                let entry = row
+                    .structural
+                    .entry(field.clone())
+                    .or_insert_with(|| Json::Array(Vec::new()));
+                if let Json::Array(held) = entry {
+                    for item in items {
+                        update::place_reference(held, item, None, false, &field)?;
+                    }
                 }
             }
         }
-        row.input_keys = row.inputs.iter().map(endpoint_key).collect();
-        row.output_keys = row.outputs.iter().map(endpoint_key).collect();
-        for (field, refs) in structural.profile {
-            let Json::Array(items) = refs else {
-                continue;
-            };
-            let entry = row
-                .structural
-                .entry(field.clone())
-                .or_insert_with(|| Json::Array(Vec::new()));
-            if let Json::Array(held) = entry {
-                for item in items {
-                    update::place_reference(held, item, None, false, &field)?;
-                }
-            }
-        }
-    }
 
-    row.status = mv.state.to_string();
-    if !ended.is_empty() {
-        row.ended_at = ended;
-    } else if is_terminal(mv.state) && row.ended_at.is_empty() {
-        // Terminal outputs freeze with the end time, so a transition that
-        // forgot to give one still records when the freeze happened. Only when
-        // the Activity has none: an `ended_at` the caller already recorded is
-        // an observed instant, and replacing it with the commit time would
-        // lose the observation to a clock the caller never asked about.
-        row.ended_at = at;
-    }
-    if mv.set_structural.is_some() {
-        check_structural(store, tx, id).await?;
-    }
-    Ok(())
+        row.status = mv.state.to_string();
+        if !ended.is_empty() {
+            row.ended_at = ended;
+        } else if is_terminal(mv.state) && row.ended_at.is_empty() {
+            // Terminal outputs freeze with the end time, so a transition that
+            // forgot to give one still records when the freeze happened. Only when
+            // the Activity has none: an `ended_at` the caller already recorded is
+            // an observed instant, and replacing it with the commit time would
+            // lose the observation to a clock the caller never asked about.
+            row.ended_at = at;
+        }
+        if mv.set_structural.is_some() {
+            check_structural(store, tx, id).await?;
+        }
+        Ok(())
+    })
 }
 
 /// Refuses to record a withdrawal the caller has no standing to make (§14.1,
@@ -2279,54 +2323,56 @@ fn check_guards_absent(guards: &[Guard], why: &str) -> Result<(), KipError> {
     Ok(())
 }
 
-async fn set_retention(
+fn set_retention(
     store: &Store,
     tx: &mut Transaction,
     clause: &SetRetention,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (targets, values, guards) = {
-        let b = bindings(tx, request, operation);
-        let targets = select::targets(
-            store,
-            tx,
-            &select::Selection {
-                what: "SET RETENTION",
-                permission: Permission::ManageRetention,
-                target: &clause.target,
-                where_clauses: clause.where_clauses.as_ref(),
-                limit: clause.limit.as_ref(),
-            },
-            &b,
-        )
-        .await?;
-        let values = assignments_to_json(&b, &clause.values, None)?;
-        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-        (targets, values, guards)
-    };
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (targets, values, guards) = {
+            let b = bindings(tx, request, operation);
+            let targets = select::targets(
+                store,
+                tx,
+                &select::Selection {
+                    what: "SET RETENTION",
+                    permission: Permission::ManageRetention,
+                    target: &clause.target,
+                    where_clauses: clause.where_clauses.as_ref(),
+                    limit: clause.limit.as_ref(),
+                },
+                &b,
+            )
+            .await?;
+            let values = assignments_to_json(&b, &clause.values, None)?;
+            let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+            (targets, values, guards)
+        };
 
-    // Spec §19: retention is storage lifecycle. `expires_at` here is when the
-    // *record* stops being retained, never when the claim stops applying —
-    // that is `valid_time.until`, on an Assertion, and nothing here touches it.
-    let retention = Json::Object(values);
-    check_retention(&retention)?;
-    let expires = expires_at(&retention)?;
-    for id in targets.authorized(tx).await? {
-        tx.expect_versions(id, &guards).await?;
-        let current = tx.load(id).await?.retention().clone();
-        // The hold gate needs what is recorded, not only what was written: the
-        // block replaces rather than patches, so omitting `legal_hold` lifts one.
-        require_legal_hold_authority(tx, &current, &retention)?;
-        if current == retention {
-            continue;
+        // Spec §19: retention is storage lifecycle. `expires_at` here is when the
+        // *record* stops being retained, never when the claim stops applying —
+        // that is `valid_time.until`, on an Assertion, and nothing here touches it.
+        let retention = Json::Object(values);
+        check_retention(&retention)?;
+        let expires = expires_at(&retention)?;
+        for id in targets.authorized(tx).await? {
+            tx.expect_versions(id, &guards).await?;
+            let current = tx.load(id).await?.retention().clone();
+            // The hold gate needs what is recorded, not only what was written: the
+            // block replaces rather than patches, so omitting `legal_hold` lifts one.
+            require_legal_hold_authority(tx, &current, &retention)?;
+            if current == retention {
+                continue;
+            }
+            let (slot, slot_expires) = tx.load(id).await?.retention_mut();
+            *slot = retention.clone();
+            *slot_expires = expires.clone();
+            tx.mark_changed(id, ChangeOp::Retention);
         }
-        let (slot, slot_expires) = tx.load(id).await?.retention_mut();
-        *slot = retention.clone();
-        *slot_expires = expires.clone();
-        tx.mark_changed(id, ChangeOp::Retention);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `MERGE CONCEPT ?source INTO ?target` — non-destructive identity
@@ -2337,108 +2383,110 @@ async fn set_retention(
 /// ordinary recall. That is the whole merge, and the restraint is the point:
 /// copying the source's state onto the target would invent claims nobody made,
 /// and rewriting the references would erase what the memory used to say.
-async fn merge_concept(
+fn merge_concept(
     store: &Store,
     tx: &mut Transaction,
     clause: &MergeConcept,
     request: Option<&Map<String, Json>>,
     operation: Option<&Map<String, Json>>,
-) -> Result<(), KipError> {
-    let (source, target, guards) = {
-        let b = bindings(tx, request, operation);
-        // MERGE takes no LIMIT: its operands are named, and the block only
-        // guards them (§52.7). Each side must therefore resolve to exactly one
-        // Concept — a pattern that binds several is selecting an identity by
-        // description, which is what merge exists to stop people doing.
-        let source = one_operand(
-            store,
-            tx,
-            "MERGE CONCEPT source",
-            Permission::MergeIdentity,
-            &clause.source,
-            clause.where_clauses.as_ref(),
-            &b,
-        )
-        .await?;
-        let target = one_operand(
-            store,
-            tx,
-            "MERGE CONCEPT target",
-            Permission::MergeIdentity,
-            &clause.into,
-            clause.where_clauses.as_ref(),
-            &b,
-        )
-        .await?;
-        let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
-        (source, target, guards)
-    };
-    let source = source.authorized(tx).await?.into_iter().next().unwrap();
-    let target = target.authorized(tx).await?.into_iter().next().unwrap();
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        let (source, target, guards) = {
+            let b = bindings(tx, request, operation);
+            // MERGE takes no LIMIT: its operands are named, and the block only
+            // guards them (§52.7). Each side must therefore resolve to exactly one
+            // Concept — a pattern that binds several is selecting an identity by
+            // description, which is what merge exists to stop people doing.
+            let source = one_operand(
+                store,
+                tx,
+                "MERGE CONCEPT source",
+                Permission::MergeIdentity,
+                &clause.source,
+                clause.where_clauses.as_ref(),
+                &b,
+            )
+            .await?;
+            let target = one_operand(
+                store,
+                tx,
+                "MERGE CONCEPT target",
+                Permission::MergeIdentity,
+                &clause.into,
+                clause.where_clauses.as_ref(),
+                &b,
+            )
+            .await?;
+            let guards = resolve_guards(tx, &b, &clause.expect_versions)?;
+            (source, target, guards)
+        };
+        let source = source.authorized(tx).await?.into_iter().next().unwrap();
+        let target = target.authorized(tx).await?.into_iter().next().unwrap();
 
-    if source.kind != ElementKind::Concept || target.kind != ElementKind::Concept {
-        return Err(KipError::structural_reference_invalid(
-            "MERGE CONCEPT consolidates Concepts; other element kinds have no merged identity",
-        ));
-    }
-    // The guards apply to the source, the Concept whose identity the statement
-    // moves.
-    tx.expect_versions(source, &guards).await?;
+        if source.kind != ElementKind::Concept || target.kind != ElementKind::Concept {
+            return Err(KipError::structural_reference_invalid(
+                "MERGE CONCEPT consolidates Concepts; other element kinds have no merged identity",
+            ));
+        }
+        // The guards apply to the source, the Concept whose identity the statement
+        // moves.
+        tx.expect_versions(source, &guards).await?;
 
-    // Identity compatibility is schema-lineage identity, not the display name
-    // or the exact package version. Authorization above also enforces Space.
-    let source_type = match tx.load(source).await? {
-        Element::Concept(row) => row.schema_ref.clone(),
-        _ => unreachable!(),
-    };
-    let target_type = match tx.load(target).await? {
-        Element::Concept(row) => row.schema_ref.clone(),
-        _ => unreachable!(),
-    };
-    if !tx
-        .env
-        .same_lineage(SymbolKind::ConceptType, &source_type, &target_type)
-    {
-        return Err(KipError::new(
-            KipErrorCode::IdentityMergeConflict,
-            "MERGE CONCEPT endpoints have incompatible Concept Type lineages",
-        ));
-    }
-    if source == target {
-        return Ok(());
-    }
-    let chain = canonical_chain(tx, target).await?;
-    if chain.contains(&source) {
-        return Err(KipError::new(
-            KipErrorCode::IdentityMergeConflict,
-            "MERGE CONCEPT would create an identity cycle",
-        ));
-    }
-    let canonical_target = *chain.last().unwrap_or(&target);
-    let source_chain = canonical_chain(tx, source).await?;
-    if source_chain.len() > 1 && source_chain.last() == Some(&canonical_target) {
-        return Ok(());
-    }
-    let Element::Concept(row) = tx.load(source).await? else {
-        unreachable!()
-    };
-    if !row.merged_into.is_empty() {
-        return Err(KipError::new(
-            KipErrorCode::IdentityMergeConflict,
-            format!("{source} is already merged into an incompatible canonical target"),
-        ));
-    }
-    row.merged_into = target.to_string();
-    // Merged, not archived: the two say different things. Archived means "out
-    // of ordinary recall"; merged additionally means "this identity is now
-    // that one", which is what a reader needs in order to follow the pointer.
-    row.state = state::MERGED.to_string();
-    tx.mark_changed(source, ChangeOp::Merge);
-    Ok(())
+        // Identity compatibility is schema-lineage identity, not the display name
+        // or the exact package version. Authorization above also enforces Space.
+        let source_type = match tx.load(source).await? {
+            Element::Concept(row) => row.schema_ref.clone(),
+            _ => unreachable!(),
+        };
+        let target_type = match tx.load(target).await? {
+            Element::Concept(row) => row.schema_ref.clone(),
+            _ => unreachable!(),
+        };
+        if !tx
+            .env
+            .same_lineage(SymbolKind::ConceptType, &source_type, &target_type)
+        {
+            return Err(KipError::new(
+                KipErrorCode::IdentityMergeConflict,
+                "MERGE CONCEPT endpoints have incompatible Concept Type lineages",
+            ));
+        }
+        if source == target {
+            return Ok(());
+        }
+        let chain = canonical_chain(tx, target).await?;
+        if chain.contains(&source) {
+            return Err(KipError::new(
+                KipErrorCode::IdentityMergeConflict,
+                "MERGE CONCEPT would create an identity cycle",
+            ));
+        }
+        let canonical_target = *chain.last().unwrap_or(&target);
+        let source_chain = canonical_chain(tx, source).await?;
+        if source_chain.len() > 1 && source_chain.last() == Some(&canonical_target) {
+            return Ok(());
+        }
+        let Element::Concept(row) = tx.load(source).await? else {
+            unreachable!()
+        };
+        if !row.merged_into.is_empty() {
+            return Err(KipError::new(
+                KipErrorCode::IdentityMergeConflict,
+                format!("{source} is already merged into an incompatible canonical target"),
+            ));
+        }
+        row.merged_into = target.to_string();
+        // Merged, not archived: the two say different things. Archived means "out
+        // of ordinary recall"; merged additionally means "this identity is now
+        // that one", which is what a reader needs in order to follow the pointer.
+        row.state = state::MERGED.to_string();
+        tx.mark_changed(source, ChangeOp::Merge);
+        Ok(())
+    })
 }
 
 /// Resolves one operand of a statement that acts on exactly one element.
-async fn one_operand(
+fn one_operand(
     store: &Store,
     tx: &Transaction,
     what: &str,
@@ -2446,30 +2494,32 @@ async fn one_operand(
     target: &anda_kip::ElementRef,
     where_clauses: Option<&Vec<anda_kip::WhereClause>>,
     b: &Bindings<'_>,
-) -> Result<Targets, KipError> {
-    let targets: Targets = select::targets(
-        store,
-        tx,
-        &select::Selection {
-            what,
-            permission,
-            target,
-            where_clauses,
-            limit: None,
-        },
-        b,
-    )
-    .await?;
-    match targets.len() {
-        0 => Err(KipError::not_found_or_not_visible(format!(
-            "the {what} block does not select a visible Concept",
-        ))),
-        1 => Ok(targets),
-        n => Err(KipError::new(
-            KipErrorCode::IdentityMergeConflict,
-            format!("the {what} block binds {n} elements; it must name exactly one"),
-        )),
-    }
+) -> impl Future<Output = Result<Targets, KipError>> + Send {
+    Box::pin(async move {
+        let targets: Targets = select::targets(
+            store,
+            tx,
+            &select::Selection {
+                what,
+                permission,
+                target,
+                where_clauses,
+                limit: None,
+            },
+            b,
+        )
+        .await?;
+        match targets.len() {
+            0 => Err(KipError::not_found_or_not_visible(format!(
+                "the {what} block does not select a visible Concept",
+            ))),
+            1 => Ok(targets),
+            n => Err(KipError::new(
+                KipErrorCode::IdentityMergeConflict,
+                format!("the {what} block binds {n} elements; it must name exactly one"),
+            )),
+        }
+    })
 }
 
 /// Follows a merged Concept's forwarding pointer to the identity that survived.

@@ -45,7 +45,7 @@ use crate::governance::{AuthContext, EffectiveAuthority};
 use crate::store::Store;
 
 /// Runs one META command.
-pub async fn execute(
+pub fn execute(
     store: &Store,
     space: &str,
     command: &MetaCommand,
@@ -53,112 +53,115 @@ pub async fn execute(
     operation: &Operation,
     authority: &EffectiveAuthority,
     auth: &AuthContext,
-) -> Response {
-    let mut cx = match crate::kql::Context::open(
-        store,
-        space,
-        request.parameters.as_ref(),
-        operation.parameters.as_ref(),
-        authority,
-        auth,
-    )
-    .await
-    {
-        Ok(cx) => cx,
-        Err(err) => return Response::from(err),
-    };
-    cx.traversal = crate::store::history::traversal_of(
-        command,
-        request.parameters.as_ref(),
-        operation.parameters.as_ref(),
-    );
-    if let Err(error) = bind_meta_read(&mut cx, command, request).await {
-        return Response::from(error);
-    }
-    let environment_version = cx.env.version;
+) -> impl Future<Output = Response> + Send {
+    Box::pin(async move {
+        let mut cx = match crate::kql::Context::open(
+            store,
+            space,
+            request.parameters.as_ref(),
+            operation.parameters.as_ref(),
+            authority,
+            auth,
+        )
+        .await
+        {
+            Ok(cx) => cx,
+            Err(err) => return Response::from(err),
+        };
+        cx.traversal = crate::store::history::traversal_of(
+            command,
+            request.parameters.as_ref(),
+            operation.parameters.as_ref(),
+        );
+        if let Err(error) = bind_meta_read(&mut cx, command, request).await {
+            return Response::from(error);
+        }
+        let environment_version = cx.env.version;
 
-    match run(&mut cx, command).await {
-        Ok(Answer {
-            result,
-            next_cursor,
-            warnings,
-        }) => Response {
-            context: Some(ResponseContext {
-                space_id: Some(space.to_string()),
-                schema_environment_version: Some(environment_version),
-                compatibility_profile_used: None,
-                extensions: None,
-            }),
-            next_cursor: next_cursor.clone(),
-            results: vec![anda_kip::OperationResult {
-                context: Some(ResultContext {
-                    space_id: Some(space.to_string()),
-                    schema_environment_version: Some(environment_version),
-                    ..Default::default()
-                }),
+        match run(&mut cx, command).await {
+            Ok(Answer {
+                result,
                 next_cursor,
                 warnings,
-                ..anda_kip::OperationResult::ok(result)
-            }],
-            ..Default::default()
-        },
-        Err(err) => Response::from(err),
-    }
+            }) => Response {
+                context: Some(ResponseContext {
+                    space_id: Some(space.to_string()),
+                    schema_environment_version: Some(environment_version),
+                    compatibility_profile_used: None,
+                    extensions: None,
+                }),
+                next_cursor: next_cursor.clone(),
+                results: vec![anda_kip::OperationResult {
+                    context: Some(ResultContext {
+                        space_id: Some(space.to_string()),
+                        schema_environment_version: Some(environment_version),
+                        ..Default::default()
+                    }),
+                    next_cursor,
+                    warnings,
+                    ..anda_kip::OperationResult::ok(result)
+                }],
+                ..Default::default()
+            },
+            Err(err) => Response::from(err),
+        }
+    })
 }
 
 /// META histories preserve their first page's coordinate. Catalogs and the
 /// live search index expire instead of silently continuing over changed state.
-async fn bind_meta_read(
+fn bind_meta_read(
     cx: &mut crate::kql::Context<'_>,
     command: &MetaCommand,
     request: &Request,
-) -> Result<(), KipError> {
-    use crate::store::history::CursorFamily;
-    use anda_kip::HistoryCommand;
-    match command {
-        MetaCommand::History(history) => {
-            let scalar = match history {
-                HistoryCommand::Element { cursor, .. } | HistoryCommand::Space { cursor, .. } => {
-                    cursor.as_ref()
+) -> impl Future<Output = Result<(), KipError>> + Send {
+    Box::pin(async move {
+        use crate::store::history::CursorFamily;
+        use anda_kip::HistoryCommand;
+        match command {
+            MetaCommand::History(history) => {
+                let scalar = match history {
+                    HistoryCommand::Element { cursor, .. }
+                    | HistoryCommand::Space { cursor, .. } => cursor.as_ref(),
+                };
+                let cursor = scalar
+                    .map(|s| read_cursor(cx, s, CursorFamily::History))
+                    .transpose()?;
+                cx.bind_read(None, request, cursor).await
+            }
+            MetaCommand::List(list) => {
+                if let Some(scalar) = &list.cursor {
+                    let cursor = read_cursor(cx, scalar, CursorFamily::List)?;
+                    if cursor.snapshot_seq != cx.pinned_seq {
+                        return Err(KipError::cursor_expired(
+                            "list",
+                            "catalog changed; start a new traversal",
+                        ));
+                    }
                 }
-            };
-            let cursor = scalar
-                .map(|s| read_cursor(cx, s, CursorFamily::History))
-                .transpose()?;
-            cx.bind_read(None, request, cursor).await
-        }
-        MetaCommand::List(list) => {
-            if let Some(scalar) = &list.cursor {
-                let cursor = read_cursor(cx, scalar, CursorFamily::List)?;
-                if cursor.snapshot_seq != cx.pinned_seq {
-                    return Err(KipError::cursor_expired(
-                        "list",
-                        "catalog changed; start a new traversal",
+                if request
+                    .read
+                    .as_ref()
+                    .is_some_and(|r| r.snapshot_token.is_some())
+                {
+                    return Err(KipError::unsupported_capability(
+                        "LIST does not support snapshot_token reads",
                     ));
                 }
+                Ok(())
             }
-            if request
+            _ if request
                 .read
                 .as_ref()
-                .is_some_and(|r| r.snapshot_token.is_some())
+                .is_some_and(|r| r.snapshot_token.is_some()) =>
             {
-                return Err(KipError::unsupported_capability(
-                    "LIST does not support snapshot_token reads",
-                ));
+                Err(KipError::unsupported_capability(
+                    "this META command does not support snapshot_token reads",
+                ))
             }
-            Ok(())
+            _ => Ok(()),
         }
-        _ if request
-            .read
-            .as_ref()
-            .is_some_and(|r| r.snapshot_token.is_some()) =>
-        {
-            Err(KipError::unsupported_capability(
-                "this META command does not support snapshot_token reads",
-            ))
-        }
-        _ => Ok(()),
-    }
+    })
 }
 
 /// Reads a `CURSOR` slot as the opaque token this engine issues.
@@ -225,18 +228,23 @@ impl Answer {
     }
 }
 
-async fn run(cx: &mut crate::kql::Context<'_>, command: &MetaCommand) -> Result<Answer, KipError> {
-    match command {
-        MetaCommand::Describe(target) => describe::run(cx, target).await,
-        MetaCommand::List(list) => describe::list(cx, list).await,
-        MetaCommand::Search(search) => inspect::search(cx, search).await,
-        MetaCommand::Validate(validate) => inspect::validate(cx, validate),
-        MetaCommand::Preview(preview) => inspect::preview(cx, preview).await,
-        MetaCommand::Verify { target, value } => inspect::verify(cx, *target, value).await,
-        MetaCommand::History(history) => history::history(cx, history).await,
-        MetaCommand::Changes(changes) => history::changes(cx, changes).await,
-        MetaCommand::ExportCapsule(command) => inspect::export_capsule(cx, command).await,
-    }
+fn run(
+    cx: &mut crate::kql::Context<'_>,
+    command: &MetaCommand,
+) -> impl Future<Output = Result<Answer, KipError>> + Send {
+    Box::pin(async move {
+        match command {
+            MetaCommand::Describe(target) => describe::run(cx, target).await,
+            MetaCommand::List(list) => describe::list(cx, list).await,
+            MetaCommand::Search(search) => inspect::search(cx, search).await,
+            MetaCommand::Validate(validate) => inspect::validate(cx, validate),
+            MetaCommand::Preview(preview) => inspect::preview(cx, preview).await,
+            MetaCommand::Verify { target, value } => inspect::verify(cx, *target, value).await,
+            MetaCommand::History(history) => history::history(cx, history).await,
+            MetaCommand::Changes(changes) => history::changes(cx, changes).await,
+            MetaCommand::ExportCapsule(command) => inspect::export_capsule(cx, command).await,
+        }
+    })
 }
 
 /// What this engine can and cannot do, as data (§67).

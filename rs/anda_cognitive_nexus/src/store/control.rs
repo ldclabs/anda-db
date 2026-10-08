@@ -37,32 +37,34 @@ impl CommitPlan {
 }
 
 impl Store {
-    pub async fn control_at(
+    pub fn control_at(
         &self,
         space: &str,
         key: &str,
         seq: u64,
-    ) -> Result<Option<ControlRecordRow>, KipError> {
-        let table = self.control_records();
-        let ids = table
-            .query_all_ids(eq_fields(&[
-                ("space", Fv::Text(space.into())),
-                ("key", Fv::Text(key.into())),
-            ]))
-            .await
-            .map_err(db_error)?;
-        let mut found: Option<ControlRecordRow> = None;
-        for id in ids {
-            let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
-            if row.seq <= seq
-                && found
-                    .as_ref()
-                    .is_none_or(|old| (row.seq, row.version) > (old.seq, old.version))
-            {
-                found = Some(row);
+    ) -> impl Future<Output = Result<Option<ControlRecordRow>, KipError>> + Send {
+        Box::pin(async move {
+            let table = self.control_records();
+            let ids = table
+                .query_all_ids(eq_fields(&[
+                    ("space", Fv::Text(space.into())),
+                    ("key", Fv::Text(key.into())),
+                ]))
+                .await
+                .map_err(db_error)?;
+            let mut found: Option<ControlRecordRow> = None;
+            for id in ids {
+                let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
+                if row.seq <= seq
+                    && found
+                        .as_ref()
+                        .is_none_or(|old| (row.seq, row.version) > (old.seq, old.version))
+                {
+                    found = Some(row);
+                }
             }
-        }
-        Ok(found)
+            Ok(found)
+        })
     }
 
     /// The elements an identity withdrawal left under review at a coordinate
@@ -70,54 +72,61 @@ impl Store {
     ///
     /// One ranged read of the review keys, so a read asks once instead of
     /// once per element — reviews are rare, and most Spaces have none.
-    pub async fn identity_reviews(
+    pub fn identity_reviews(
         &self,
         space: &str,
         seq: u64,
-    ) -> Result<std::collections::BTreeSet<String>, KipError> {
-        const PREFIX: &str = "identity_review/";
-        let table = self.control_records();
-        let ids = table
-            .query_all_ids(anda_db::query::Filter::And(vec![
-                Box::new(super::eq_field("space", Fv::Text(space.into()))),
-                Box::new(anda_db::query::Filter::Field((
-                    "key".into(),
-                    anda_db::query::RangeQuery::Between(
-                        Fv::Text(PREFIX.into()),
-                        Fv::Text(format!("{PREFIX}\u{10FFFF}")),
-                    ),
-                ))),
-                Box::new(anda_db::query::Filter::Field((
-                    "seq".into(),
-                    anda_db::query::RangeQuery::Le(Fv::U64(seq)),
-                ))),
-            ]))
-            .await
-            .map_err(db_error)?;
-        let mut reviews = std::collections::BTreeSet::new();
-        for id in ids {
-            let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
-            if let Some(element) = row.key.strip_prefix(PREFIX) {
-                reviews.insert(element.to_string());
+    ) -> impl Future<Output = Result<std::collections::BTreeSet<String>, KipError>> + Send {
+        Box::pin(async move {
+            const PREFIX: &str = "identity_review/";
+            let table = self.control_records();
+            let ids = table
+                .query_all_ids(anda_db::query::Filter::And(vec![
+                    Box::new(super::eq_field("space", Fv::Text(space.into()))),
+                    Box::new(anda_db::query::Filter::Field((
+                        "key".into(),
+                        anda_db::query::RangeQuery::Between(
+                            Fv::Text(PREFIX.into()),
+                            Fv::Text(format!("{PREFIX}\u{10FFFF}")),
+                        ),
+                    ))),
+                    Box::new(anda_db::query::Filter::Field((
+                        "seq".into(),
+                        anda_db::query::RangeQuery::Le(Fv::U64(seq)),
+                    ))),
+                ]))
+                .await
+                .map_err(db_error)?;
+            let mut reviews = std::collections::BTreeSet::new();
+            for id in ids {
+                let row: ControlRecordRow = table.get_as(id).await.map_err(db_error)?;
+                if let Some(element) = row.key.strip_prefix(PREFIX) {
+                    reviews.insert(element.to_string());
+                }
             }
-        }
-        Ok(reviews)
+            Ok(reviews)
+        })
     }
 
-    pub async fn put_control(&self, row: &ControlRecordRow) -> Result<(), KipError> {
-        let table = self.control_records();
-        if table
-            .query_all_ids(super::eq_field(
-                "record_id",
-                Fv::Text(row.record_id.clone()),
-            ))
-            .await
-            .map_err(db_error)?
-            .is_empty()
-        {
-            table.add_from(row).await.map_err(db_error)?;
-        }
-        Ok(())
+    pub fn put_control(
+        &self,
+        row: &ControlRecordRow,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let table = self.control_records();
+            if table
+                .query_all_ids(super::eq_field(
+                    "record_id",
+                    Fv::Text(row.record_id.clone()),
+                ))
+                .await
+                .map_err(db_error)?
+                .is_empty()
+            {
+                table.add_from(row).await.map_err(db_error)?;
+            }
+            Ok(())
+        })
     }
 
     /// Persist exactly one logical transaction, including its control effects.
@@ -126,42 +135,44 @@ impl Store {
     /// be stored fails before anything durable happens rather than as a redo
     /// intent recovery could never finish. `owned` turns true once the intent
     /// row exists: from then on recovery, not the caller, owns the shells.
-    pub async fn commit_plan(
+    pub fn commit_plan(
         &self,
         plan: CommitPlan,
         owned: &mut bool,
-    ) -> Result<TransactionRow, KipError> {
-        self.preflight(&plan)?;
-        // Reserved element ids must survive before a redo intent can name them.
-        self.flush(crate::tx::now_ms()).await?;
-        // Stored as JSON text: one value, however many rows the plan carries,
-        // so the field's structural budget never bounds a transaction.
-        let text =
-            serde_json::to_string(&plan).map_err(|e| KipError::internal_error(e.to_string()))?;
-        let id = self
-            .commit_log()
-            .add_from(&CommitLogRow {
-                _id: 0,
-                tx_id: plan.cx.tx_id.clone(),
-                plan: Json::String(text),
-            })
-            .await
-            .map_err(db_error)?;
-        *owned = true;
-        self.commit_log()
-            .flush(crate::tx::now_ms())
-            .await
-            .map_err(db_error)?;
-        self.apply_commit(&plan, false).await?;
-        self.flush(crate::tx::now_ms()).await?;
-        self.commit_log().remove(id).await.map_err(db_error)?;
-        self.commit_log()
-            .flush(crate::tx::now_ms())
-            .await
-            .map_err(db_error)?;
-        self.find_transaction(&plan.cx.tx_id)
-            .await?
-            .ok_or_else(|| KipError::internal_error("committed journal missing"))
+    ) -> impl Future<Output = Result<TransactionRow, KipError>> + Send {
+        Box::pin(async move {
+            self.preflight(&plan)?;
+            // Reserved element ids must survive before a redo intent can name them.
+            self.flush(crate::tx::now_ms()).await?;
+            // Stored as JSON text: one value, however many rows the plan carries,
+            // so the field's structural budget never bounds a transaction.
+            let text = serde_json::to_string(&plan)
+                .map_err(|e| KipError::internal_error(e.to_string()))?;
+            let id = self
+                .commit_log()
+                .add_from(&CommitLogRow {
+                    _id: 0,
+                    tx_id: plan.cx.tx_id.clone(),
+                    plan: Json::String(text),
+                })
+                .await
+                .map_err(db_error)?;
+            *owned = true;
+            self.commit_log()
+                .flush(crate::tx::now_ms())
+                .await
+                .map_err(db_error)?;
+            self.apply_commit(&plan, false).await?;
+            self.flush(crate::tx::now_ms()).await?;
+            self.commit_log().remove(id).await.map_err(db_error)?;
+            self.commit_log()
+                .flush(crate::tx::now_ms())
+                .await
+                .map_err(db_error)?;
+            self.find_transaction(&plan.cx.tx_id)
+                .await?
+                .ok_or_else(|| KipError::internal_error("committed journal missing"))
+        })
     }
 
     /// Checks every row `apply_commit` would write against its collection's
@@ -218,118 +229,126 @@ impl Store {
         )
     }
 
-    pub async fn recover_commits(&self) -> Result<(), KipError> {
-        let table = self.commit_log();
-        let ids = table.ids();
-        for id in ids {
-            let row: CommitLogRow = table.get_as(id).await.map_err(db_error)?;
-            // Written as JSON text; an intent from before that is the object.
-            let plan: CommitPlan = match row.plan {
-                Json::String(text) => serde_json::from_str(&text),
-                value => serde_json::from_value(value),
+    pub fn recover_commits(&self) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            let table = self.commit_log();
+            let ids = table.ids();
+            for id in ids {
+                let row: CommitLogRow = table.get_as(id).await.map_err(db_error)?;
+                // Written as JSON text; an intent from before that is the object.
+                let plan: CommitPlan = match row.plan {
+                    Json::String(text) => serde_json::from_str(&text),
+                    value => serde_json::from_value(value),
+                }
+                .map_err(|e| KipError::internal_error(format!("invalid commit log: {e}")))?;
+                self.apply_commit(&plan, true).await?;
+                self.flush(crate::tx::now_ms()).await?;
+                table.remove(id).await.map_err(db_error)?;
+                table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
             }
-            .map_err(|e| KipError::internal_error(format!("invalid commit log: {e}")))?;
-            self.apply_commit(&plan, true).await?;
-            self.flush(crate::tx::now_ms()).await?;
-            table.remove(id).await.map_err(db_error)?;
-            table.flush(crate::tx::now_ms()).await.map_err(db_error)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Applies a plan's after-images. `replay` is a recovery pass, where any
     /// effect may already be durable and each one is written only if absent.
-    async fn apply_commit(&self, plan: &CommitPlan, replay: bool) -> Result<(), KipError> {
-        self.remove_versions(&plan.purge_versions).await?;
-        self.scrub_payload_versions(&plan.scrub_versions).await?;
-        for (element, op) in &plan.writes {
-            macro_rules! put {
-                ($row:expr) => {{
-                    self.put($row.as_ref()).await?;
-                    self.record_version(
-                        &plan.cx,
-                        element.id(),
-                        element.version(),
-                        op,
-                        $row.as_ref(),
-                        replay,
-                    )
-                    .await?;
-                }};
-            }
-            match element {
-                Element::Concept(row) => put!(row),
-                Element::Proposition(row) => put!(row),
-                Element::Assertion(row) => put!(row),
-                Element::Evidence(row) => put!(row),
-                Element::Activity(row) => put!(row),
-            }
-        }
-        // §66.8, §60.7: an erased element's exposure entries go with it.
-        for (element, op) in &plan.writes {
-            if op == "purge" {
-                self.remove_exposures(&element.id().to_string()).await?;
-            }
-        }
-        let committed = plan.journal.status == "committed";
-        if let Some(row) = &plan.space {
-            // Raw write: the plan already owns the audit and notification.
-            let mut row = row.clone();
-            let current = self.get_space(&row.space_id).await?;
-            row.seq = row.seq.max(current.seq);
-            if committed {
-                row.seq = row.seq.max(plan.cx.seq);
-            }
-            let epoch = current.policies["_kip_authorization_version"]
-                .as_u64()
-                .unwrap_or(0)
-                .max(
-                    row.policies["_kip_authorization_version"]
-                        .as_u64()
-                        .unwrap_or(0),
-                );
-            if epoch > 0 {
-                if !row.policies.is_object() {
-                    row.policies = serde_json::json!({});
+    fn apply_commit(
+        &self,
+        plan: &CommitPlan,
+        replay: bool,
+    ) -> impl Future<Output = Result<(), KipError>> + Send {
+        Box::pin(async move {
+            self.remove_versions(&plan.purge_versions).await?;
+            self.scrub_payload_versions(&plan.scrub_versions).await?;
+            for (element, op) in &plan.writes {
+                macro_rules! put {
+                    ($row:expr) => {{
+                        self.put($row.as_ref()).await?;
+                        self.record_version(
+                            &plan.cx,
+                            element.id(),
+                            element.version(),
+                            op,
+                            $row.as_ref(),
+                            replay,
+                        )
+                        .await?;
+                    }};
                 }
-                row.policies["_kip_authorization_version"] = serde_json::json!(epoch);
+                match element {
+                    Element::Concept(row) => put!(row),
+                    Element::Proposition(row) => put!(row),
+                    Element::Assertion(row) => put!(row),
+                    Element::Evidence(row) => put!(row),
+                    Element::Activity(row) => put!(row),
+                }
             }
-            self.spaces()
-                .update(
-                    row._id,
-                    super::full_row_fields(self.spaces().schema(), &row)?,
-                )
-                .await
-                .map_err(db_error)?;
-        }
-        if committed {
-            // The commit takes its sequence with its rows (§32.8): a plan from
-            // before this took it at `begin` already, and moving forward is
-            // idempotent.
-            let space = self.get_space(&plan.cx.space).await?;
-            self.advance_seq(&space, plan.cx.seq).await?;
-        }
-        for row in &plan.controls {
-            self.put_control(row).await?;
-        }
-        for row in &plan.control_replacements {
-            self.control_records()
-                .update(
-                    row._id,
-                    super::full_row_fields(self.control_records().schema(), row)?,
-                )
-                .await
-                .map_err(db_error)?;
-        }
-        for (index, row) in plan.audits.iter().enumerate() {
-            self.governance
-                .replay_mutation(row.clone(), &format!("{}:{index}", plan.cx.tx_id), replay)
-                .await?;
-        }
-        for id in &plan.approvals {
-            self.governance.consume_approval(*id).await?;
-        }
-        self.journal(&plan.cx, plan.journal.clone()).await?;
-        Ok(())
+            // §66.8, §60.7: an erased element's exposure entries go with it.
+            for (element, op) in &plan.writes {
+                if op == "purge" {
+                    self.remove_exposures(&element.id().to_string()).await?;
+                }
+            }
+            let committed = plan.journal.status == "committed";
+            if let Some(row) = &plan.space {
+                // Raw write: the plan already owns the audit and notification.
+                let mut row = row.clone();
+                let current = self.get_space(&row.space_id).await?;
+                row.seq = row.seq.max(current.seq);
+                if committed {
+                    row.seq = row.seq.max(plan.cx.seq);
+                }
+                let epoch = current.policies["_kip_authorization_version"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .max(
+                        row.policies["_kip_authorization_version"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    );
+                if epoch > 0 {
+                    if !row.policies.is_object() {
+                        row.policies = serde_json::json!({});
+                    }
+                    row.policies["_kip_authorization_version"] = serde_json::json!(epoch);
+                }
+                self.spaces()
+                    .update(
+                        row._id,
+                        super::full_row_fields(self.spaces().schema(), &row)?,
+                    )
+                    .await
+                    .map_err(db_error)?;
+            }
+            if committed {
+                // The commit takes its sequence with its rows (§32.8): a plan from
+                // before this took it at `begin` already, and moving forward is
+                // idempotent.
+                let space = self.get_space(&plan.cx.space).await?;
+                self.advance_seq(&space, plan.cx.seq).await?;
+            }
+            for row in &plan.controls {
+                self.put_control(row).await?;
+            }
+            for row in &plan.control_replacements {
+                self.control_records()
+                    .update(
+                        row._id,
+                        super::full_row_fields(self.control_records().schema(), row)?,
+                    )
+                    .await
+                    .map_err(db_error)?;
+            }
+            for (index, row) in plan.audits.iter().enumerate() {
+                self.governance
+                    .replay_mutation(row.clone(), &format!("{}:{index}", plan.cx.tx_id), replay)
+                    .await?;
+            }
+            for id in &plan.approvals {
+                self.governance.consume_approval(*id).await?;
+            }
+            self.journal(&plan.cx, plan.journal.clone()).await?;
+            Ok(())
+        })
     }
 }

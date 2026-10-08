@@ -35,35 +35,37 @@ fn due(row: &crate::store::rows::ConceptRow) -> Result<Option<String>, KipError>
         .transpose()
 }
 
-async fn authorize(
+fn authorize(
     session: &Session,
     authority: &EffectiveAuthority,
     space: &str,
     reference: &str,
-) -> Result<Element, KipError> {
-    let element = session.nexus.store.get_element(reference.parse()?).await?;
-    if element.space() != space {
-        return Err(KipError::not_found_or_not_visible("Watch unavailable"));
-    }
-    watch_values(&element)?;
-    if !authority
-        .may_read(&element, &session.auth)
-        .is_some_and(|v| v.content && v.constraints.fields.is_empty())
-    {
-        return Err(KipError::not_found_or_not_visible(
-            "Watch condition is not fully visible",
-        ));
-    }
-    for permission in [Permission::Read, Permission::Update] {
-        authority
-            .authorize(
-                permission,
-                &ResourceContext::of_element(&element),
-                &session.auth,
-            )
-            .into_result()?;
-    }
-    Ok(element)
+) -> impl Future<Output = Result<Element, KipError>> + Send {
+    Box::pin(async move {
+        let element = session.nexus.store.get_element(reference.parse()?).await?;
+        if element.space() != space {
+            return Err(KipError::not_found_or_not_visible("Watch unavailable"));
+        }
+        watch_values(&element)?;
+        if !authority
+            .may_read(&element, &session.auth)
+            .is_some_and(|v| v.content && v.constraints.fields.is_empty())
+        {
+            return Err(KipError::not_found_or_not_visible(
+                "Watch condition is not fully visible",
+            ));
+        }
+        for permission in [Permission::Read, Permission::Update] {
+            authority
+                .authorize(
+                    permission,
+                    &ResourceContext::of_element(&element),
+                    &session.auth,
+                )
+                .into_result()?;
+        }
+        Ok(element)
+    })
 }
 
 /// The protected record of one Watch firing.
@@ -229,20 +231,22 @@ impl Session {
         .await
     }
 
-    pub async fn advance_watch(
+    pub fn advance_watch(
         &self,
         space: &str,
         watch_ref: &str,
         expected: u64,
         generation: u64,
         limit: usize,
-    ) -> Result<Json, KipError> {
-        self.advance_watch_with(space, watch_ref, expected, generation, limit, |_, _| {
-            Err(KipError::unsupported_capability(
-                "text Watch requires a registered host evaluator",
-            ))
+    ) -> impl Future<Output = Result<Json, KipError>> + Send {
+        Box::pin(async move {
+            self.advance_watch_with(space, watch_ref, expected, generation, limit, |_, _| {
+                Err(KipError::unsupported_capability(
+                    "text Watch requires a registered host evaluator",
+                ))
+            })
+            .await
         })
-        .await
     }
 
     /// Synchronous host evaluator. Text/mixed conditions additionally require a
@@ -763,67 +767,69 @@ impl Session {
     }
 }
 
-pub(super) async fn match_change(
+pub(super) fn match_change(
     store: &Store,
     space: &str,
     condition: &Json,
     envelope: &Json,
     change: &Json,
-) -> Result<bool, KipError> {
-    if condition
-        .get("element")
-        .is_some_and(|id| id != &change["id"])
-    {
-        return Ok(false);
-    }
-    if condition["ops"]
-        .as_array()
-        .is_some_and(|ops| !ops.contains(&change["op"]))
-    {
-        return Ok(false);
-    }
-    if let Some(paths) = condition["touched"].as_array()
-        && !change["touched"]
-            .as_array()
-            .is_some_and(|p| p.iter().any(|p| paths.contains(p)))
-    {
-        return Ok(false);
-    }
-    if condition.get("type").is_some() || condition.get("slot").is_some() {
-        let target = change["id"].as_str().unwrap_or("").parse()?;
-        let seq = envelope["space_seq"]
-            .as_u64()
-            .ok_or_else(|| invalid("missing change sequence"))?;
-        let retained = store
-            .element_at(space, target, seq)
-            .await?
-            .ok_or_else(|| conflict("history_gap"))?;
-        let view = crate::view::render(&retained);
+) -> impl Future<Output = Result<bool, KipError>> + Send {
+    Box::pin(async move {
         if condition
-            .get("type")
-            .is_some_and(|t| t != &view["schema_ref"])
+            .get("element")
+            .is_some_and(|id| id != &change["id"])
         {
             return Ok(false);
         }
-        if let Some(slot) = condition.get("slot") {
-            let p = if let Element::Assertion(a) = retained {
-                store
-                    .element_at(space, a.proposition_id.parse()?, seq)
-                    .await?
-                    .map(|r| crate::view::render(&r))
-                    .ok_or_else(|| conflict("history_gap"))?
-            } else {
-                view
-            };
-            if p["subject"]
-                .as_str()
-                .or_else(|| p["subject"]["id"].as_str())
-                != slot["subject"].as_str()
-                || p["predicate_ref"] != slot["predicate"]
+        if condition["ops"]
+            .as_array()
+            .is_some_and(|ops| !ops.contains(&change["op"]))
+        {
+            return Ok(false);
+        }
+        if let Some(paths) = condition["touched"].as_array()
+            && !change["touched"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|p| paths.contains(p)))
+        {
+            return Ok(false);
+        }
+        if condition.get("type").is_some() || condition.get("slot").is_some() {
+            let target = change["id"].as_str().unwrap_or("").parse()?;
+            let seq = envelope["space_seq"]
+                .as_u64()
+                .ok_or_else(|| invalid("missing change sequence"))?;
+            let retained = store
+                .element_at(space, target, seq)
+                .await?
+                .ok_or_else(|| conflict("history_gap"))?;
+            let view = crate::view::render(&retained);
+            if condition
+                .get("type")
+                .is_some_and(|t| t != &view["schema_ref"])
             {
                 return Ok(false);
             }
+            if let Some(slot) = condition.get("slot") {
+                let p = if let Element::Assertion(a) = retained {
+                    store
+                        .element_at(space, a.proposition_id.parse()?, seq)
+                        .await?
+                        .map(|r| crate::view::render(&r))
+                        .ok_or_else(|| conflict("history_gap"))?
+                } else {
+                    view
+                };
+                if p["subject"]
+                    .as_str()
+                    .or_else(|| p["subject"]["id"].as_str())
+                    != slot["subject"].as_str()
+                    || p["predicate_ref"] != slot["predicate"]
+                {
+                    return Ok(false);
+                }
+            }
         }
-    }
-    Ok(true)
+        Ok(true)
+    })
 }

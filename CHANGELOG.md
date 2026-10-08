@@ -2,6 +2,29 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_db 0.14.2 / anda_cognitive_nexus 0.14.4] — 2026-10-08
+
+### Fixes
+
+- `anda_db`, `anda_cognitive_nexus`: a debug build no longer needs about a
+  megabyte of stack to open a Nexus or run one KIP command. A debug build keeps
+  every awaited future in its caller's stack frame, and the heavy database,
+  Nexus, transaction and Governance futures were inlined into one another, so
+  each level of a call chain paid for all of them again. Opening a Nexus took
+  about 0.9 MiB, a KIP write about 1 MiB, and a host that adds its own layers
+  (an agent tool writing into a per-caller Space) overflowed the 2 MiB stack of
+  a spawned thread. Those APIs now return their state machine boxed, which
+  brings the same flows to 170–270 KiB; the whole Nexus test suite runs on
+  384 KiB threads. Their signatures change from `async fn` to
+  `fn … -> impl Future<Output = …> + Send` (without `+ Send` where a generic
+  callback decides it), so callers that `.await` them are unaffected. Helpers
+  called once per row stay unboxed.
+- `anda_db`: a storage handle keeps its 4096 cache-generation counters on the
+  heap instead of building the 32 KiB array on the caller's stack.
+- `anda_cognitive_nexus` requires `anda_db` 0.14.2. A new `stack_budget` test
+  runs host flows on a 512 KiB thread, and `anda_db`'s `boxed_futures` test
+  checks that its heavy futures stay boxed.
+
 ## [anda_cognitive_nexus 0.14.3] — 2026-09-30
 
 ### Fixes

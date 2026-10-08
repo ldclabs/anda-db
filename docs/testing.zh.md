@@ -55,7 +55,17 @@ cargo test -p anda_db --test format_compat -- --ignored generate
 git add rs/anda_db/tests/fixtures
 ```
 
-### 7. 代码覆盖率（质量参考，非唯一准入限制）
+### 7. Debug 构建下的栈深度
+
+Debug 构建会把每个被 await 的 future 留在调用方的栈帧里，因此层层内联的 future 会在调用链的每一层把各自的大小累加起来。I/O、多步骤或包含大量 await 的重型异步 API 因此返回装箱后的状态机：
+`fn f(..) -> impl Future<Output = R> + Send { Box::pin(async move { .. }) }`。在循环中按行调用的辅助函数仍保持 `async fn`，因为每行一次装箱的开销大于它节省的栈。
+
+- `rs/anda_cognitive_nexus/tests/stack_budget.rs` 在 512 KiB（新线程默认栈的四分之一）的线程上运行宿主流程（启动、按调用方开通、KIP 写入与读取、重新打开），并检查面向宿主的 future 均已装箱。
+- `rs/anda_db/tests/boxed_futures.rs` 检查数据库与集合的 future。
+
+要了解某个流程的栈开销，可在低于默认 2 MiB 的 `RUST_MIN_STACK` 下运行其测试；溢出会中止测试程序并给出线程名。
+
+### 8. 代码覆盖率（质量参考，非唯一准入限制）
 
 ```bash
 make coverage        # 终端摘要
@@ -85,3 +95,4 @@ cargo bench -p anda_db_schema --bench values
 - 新增语义明确的数据结构 → 参考模型属性测试（第 3 层）。
 - 解析不可信外部输入 → Fuzzing 模糊测试（第 4 层）。
 - 近似/启发式算法变更 → 设定明确量化基线指标（第 5 层）。
+- 新增 I/O 或多步骤异步 API → 返回装箱的 future，并保持栈预算测试通过（第 7 层）。
