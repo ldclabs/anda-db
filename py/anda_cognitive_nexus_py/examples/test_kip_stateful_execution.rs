@@ -31,7 +31,7 @@ static RECORD_A_PREFERENCE: &str = r#"
             SET FIELDS {
                 evidence_class: "user_statement",
                 payload: "I prefer dark mode.",
-                observed_at: "2026-08-16T09:00:00Z"
+                observed_at: "2026-08-16T09:00:00.000Z"
             }
         }
         ASSERT ?a (?alice, "prefers", ?dark) {
@@ -64,6 +64,11 @@ async fn main() {
     let path = std::path::Path::new(&store_location);
     if path.is_file() {
         panic!("store_location exists but is a file, not a directory: {store_location}");
+    }
+    // Start empty: the restart check below counts exactly this run's claims,
+    // and a previous run's database would still hold its own.
+    if path.exists() {
+        std::fs::remove_dir_all(path).expect("Failed to clear store_location directory");
     }
     std::fs::create_dir_all(path).expect("Failed to create store_location directory");
 

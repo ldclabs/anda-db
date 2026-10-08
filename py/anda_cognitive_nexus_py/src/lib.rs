@@ -14,7 +14,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyLong, PyString, PyTuple};
 use serde::{Deserialize, Serialize};
-use serde_pyobject::to_pyobject;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -621,10 +620,45 @@ impl TryFrom<&str> for StoreLocationType {
 }
 
 /// Converts a JSON value into a Python object.
+///
+/// Written out by hand: a serde-driven converter encodes a JSON `null` through
+/// `serialize_unit`, which arrives in Python as the empty tuple `()`. A caller
+/// would read `()` where KIP says `null`, and handing that value back — a
+/// Capsule to import, a parameter — turns it into `[]`, which changes what a
+/// Capsule digest covers. `null` is `None`, both ways.
 fn json_object(py: Python<'_>, value: &Json) -> PyResult<PyObject> {
-    to_pyobject(py, value)
-        .map(|obj| -> PyObject { obj.into() })
-        .map_err(|e| PyRuntimeError::new_err(format!("JSON conversion error: {}", e)))
+    Ok(match value {
+        Json::Null => py.None(),
+        Json::Bool(v) => v.to_object(py),
+        Json::Number(n) => {
+            if let Some(v) = n.as_u64() {
+                v.to_object(py)
+            } else if let Some(v) = n.as_i64() {
+                v.to_object(py)
+            } else {
+                n.as_f64()
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!("JSON number {n} has no Python form"))
+                    })?
+                    .to_object(py)
+            }
+        }
+        Json::String(v) => v.to_object(py),
+        Json::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(json_object(py, item)?)?;
+            }
+            list.to_object(py)
+        }
+        Json::Object(members) => {
+            let dict = PyDict::new(py);
+            for (key, item) in members {
+                dict.set_item(key, json_object(py, item)?)?;
+            }
+            dict.to_object(py)
+        }
+    })
 }
 
 /// Converts a KIP response envelope into a Python object.
@@ -632,11 +666,12 @@ fn json_object(py: Python<'_>, value: &Json) -> PyResult<PyObject> {
 /// The whole envelope crosses, not just the result: `status`, the per-operation
 /// `results[]`, the `receipt` a write committed under, the `snapshot` a read ran
 /// at and any `warnings` are what a caller needs to tell a served answer from a
-/// partial one (§81).
+/// partial one (§81). It crosses as its JSON form, the same shape an HTTP
+/// client of `anda_cognitive_nexus_server` reads.
 fn response_object(py: Python<'_>, response: &Response) -> PyResult<PyObject> {
-    to_pyobject(py, response)
-        .map(|obj| obj.into())
-        .map_err(|e| PyRuntimeError::new_err(format!("Response conversion error: {}", e)))
+    let value = serde_json::to_value(response)
+        .map_err(|e| PyRuntimeError::new_err(format!("Response conversion error: {}", e)))?;
+    json_object(py, &value)
 }
 
 /// Builds the `{"type", "response"}` dict the single-command entry points
@@ -998,7 +1033,7 @@ mod tests {
                 SET FIELDS {
                     evidence_class: "user_statement",
                     payload: "I prefer dark mode.",
-                    observed_at: "2026-09-07T00:00:00Z",
+                    observed_at: "2026-09-07T00:00:00.000Z",
                     content_digest: "sha256:202ae77786db17a262130d6b033af5fe53f18716053d94549c28e1b7b991e642"
                 }
             }
@@ -1243,7 +1278,7 @@ mod tests {
                     "evidence_class": "user_statement",
                     "payload": "I prefer dark mode.",
                     "media_type": "text/plain",
-                    "observed_at": "2026-08-14T01:00:00Z"
+                    "observed_at": "2026-08-14T01:00:00.000Z"
                 }]
             },
             "operations": [
@@ -1435,6 +1470,16 @@ mod tests {
             "{read:#?}"
         );
 
+        // Both endpoints of the exported claim arrived, once each.
+        let people = r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#;
+        let imported = run(destination.as_ref(), people)
+            .first_result()
+            .and_then(|r| r.as_array().cloned());
+        assert_eq!(
+            imported,
+            Some(vec![Json::from("Alice"), Json::from("Dark mode")])
+        );
+
         // Re-importing the same artifact resolves every record back to the
         // element the first import created, so it is not a second copy.
         block_on(import_capsule_json(
@@ -1444,14 +1489,11 @@ mod tests {
             false,
         ))
         .expect("a re-import succeeds");
-        let again = run(
-            destination.as_ref(),
-            r#"FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }"#,
-        );
+        let again = run(destination.as_ref(), people);
         assert_eq!(
             again.first_result().and_then(|r| r.as_array().cloned()),
-            Some(vec![Json::from("Alice")]),
-            "a re-import duplicated the Concept: {again:#?}"
+            imported,
+            "a re-import duplicated a Concept: {again:#?}"
         );
     }
 

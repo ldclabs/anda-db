@@ -19,6 +19,18 @@ def operation_error(response):
     return results[0].get("error") if results else None
 
 
+def json_values(value):
+    """Every leaf of a JSON-shaped value; a tuple is a leaf, since JSON has none."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from json_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from json_values(item)
+    else:
+        yield value
+
+
 @pytest.mark.asyncio
 async def test_create_success():
     db_config = AndaDbConfig(
@@ -302,7 +314,7 @@ async def test_execute_request_carries_space_ingest_and_a_sequence():
                 "evidence_class": "user_statement",
                 "payload": "I prefer dark mode.",
                 "media_type": "text/plain",
-                "observed_at": "2026-08-14T01:00:00Z",
+                "observed_at": "2026-08-14T01:00:00.000Z",
             }]
         },
         "operations": [
@@ -427,6 +439,11 @@ async def test_import_capsule_carries_cognition_into_another_nexus():
     exported = await source.execute_kip('EXPORT CAPSULE ?a WHERE { ?a ASSERTION {} }')
     assert exported["response"]["status"] == "succeeded", exported["response"]
     capsule = exported["response"]["results"][0]["result"]
+    # A JSON null crosses as None. It used to arrive as the empty tuple (),
+    # and handing the Capsule back turned it into [], which broke its digest.
+    leaves = list(json_values(capsule))
+    assert None in leaves
+    assert not any(isinstance(leaf, tuple) for leaf in leaves)
 
     destination = await PyAndaDB.create(
         AndaDbConfig(StoreLocationType.InMem, "", "test_db_capsule_dst")
@@ -526,7 +543,10 @@ async def test_import_capsule_can_quarantine_instead_of_recalling():
     read = 'FIND(?c.name) WHERE { ?c CONCEPT {type: "Person"} }'
     # The ordinary import is in recall; the isolated one is held out of it, so
     # the two destinations must not answer the same read the same way.
-    assert (await recalled.execute_kip(read))["response"]["results"][0]["result"] == ["Alice"]
+    assert (await recalled.execute_kip(read))["response"]["results"][0]["result"] == [
+        "Alice",
+        "Dark mode",
+    ]
     assert (await quarantined.execute_kip(read))["response"]["results"][0]["result"] == []
 
 

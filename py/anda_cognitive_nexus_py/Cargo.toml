@@ -14,7 +14,6 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.20", features = ["extension-module", "serde"] }
 pyo3-asyncio = { version = "0.20", default-features = false, features = ["tokio-runtime"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde-pyobject = { version = "0.2" }
 
 # Anda
 anda_cognitive_nexus = { version = "0.14", path = "../../rs/anda_cognitive_nexus" }
