@@ -2,7 +2,7 @@
 
 All notable changes to this workspace are documented in this file.
 
-## [anda_db 0.14.2 / anda_cognitive_nexus 0.14.4] — 2026-10-08
+## [anda_kip 0.14.1 / anda_db 0.14.2 / anda_cognitive_nexus 0.14.4] — 2026-10-08
 
 ### Fixes
 
@@ -22,9 +22,17 @@ All notable changes to this workspace are documented in this file.
   unaffected. Helpers called once per row stay unboxed.
 - `anda_db`: a storage handle keeps its 4096 cache-generation counters on the
   heap instead of building the 32 KiB array on the caller's stack.
-- `anda_cognitive_nexus` requires `anda_db` 0.14.2. A new `stack_budget` test
-  runs host flows on a 512 KiB thread, and `anda_db`'s `boxed_futures` test
-  checks that its heavy futures stay boxed.
+- A new `stack_budget` test runs host flows on a 512 KiB thread, and
+  `anda_db`'s `boxed_futures` test checks that its heavy futures stay boxed.
+
+### Dependencies
+
+- `zstd-safe` 8 (`anda_db`), `jsonschema` 0.58 (`anda_kip`,
+  `anda_cognitive_nexus`) and `tantivy-jieba` 0.21 with `jieba-rs` 0.11
+  (`anda_db_tfs`). `anda_kip::schema_validator` now returns a `jsonschema`
+  0.58 `Validator`, so `anda_kip` moves to 0.14.1 and `anda_cognitive_nexus`,
+  which keeps that `Validator`, requires it. Jieba's dictionary is unchanged
+  and it segments as 0.10 did, so existing BM25 indexes stay valid.
 
 ## [anda_cognitive_nexus 0.14.3] — 2026-09-30
 

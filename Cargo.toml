@@ -68,7 +68,7 @@ chrono = { version = "0.4", default-features = false }
 futures = { version = "0.3", default-features = false, features = [
   "async-await",
 ] }
-jsonschema = { version = "0.57", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 cbor2 = "1"
@@ -93,14 +93,14 @@ log = { version = "0.4", default-features = false, features = [
 ] }
 tantivy = { version = "0.26", default-features = false }
 tantivy-tokenizer-api = { version = "0.7", default-features = false }
-tantivy-jieba = { version = "0.20", default-features = false }
+tantivy-jieba = { version = "0.21", default-features = false }
 structured-logger = { version = "1", default-features = false }
 smallvec = { version = "1.15", default-features = false }
 criterion = { version = "0.8", default-features = false }
 ic_auth_types = { version = "0.10", default-features = false }
 object_store = { version = "0.14", default-features = false }
 moka = { version = "0.12", default-features = false, features = ["future"] }
-zstd-safe = { version = "7", default-features = false, features = [
+zstd-safe = { version = "8", default-features = false, features = [
   "experimental",
 ] }
 async-compression = { version = "0.4", default-features = false, features = [
