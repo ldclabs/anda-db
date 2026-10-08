@@ -83,7 +83,7 @@ pub const MIGRATION_KEY_PREFIX: &str = "kip:migrate:v1:";
 /// Runs before `Store::open`, because after it the 2.0 collections exist under
 /// the names the 1.x ones occupy.
 pub(crate) fn prepare(db: &Arc<AndaDB>) -> impl Future<Output = Result<(), KipError>> + Send {
-    Box::pin(async move { stage::prepare(db).await })
+    stage::prepare(db)
 }
 
 /// Loads staged 1.x rows into the 2.0 graph, if any are outstanding.
@@ -96,7 +96,7 @@ pub(crate) fn prepare(db: &Arc<AndaDB>) -> impl Future<Output = Result<(), KipEr
 pub(crate) fn load(
     nexus: &crate::CognitiveNexus,
 ) -> impl Future<Output = Result<(), KipError>> + Send {
-    Box::pin(async move { convert::load(nexus).await })
+    convert::load(nexus)
 }
 
 /// Keeps the migration's generated vocabulary active across a host's own

@@ -108,8 +108,10 @@ costs more than the stack it saves.
 - `rs/anda_db/tests/boxed_futures.rs` checks the database and collection
   futures.
 
-To see what a flow costs, run its test with `RUST_MIN_STACK` below the 2 MiB
-default; an overflow aborts the binary and names the thread.
+To see what a flow costs, build its test first (`cargo test --no-run`), then
+run it with `RUST_MIN_STACK` below the 2 MiB default; an overflow aborts the
+binary and names the thread. rustc sizes its own thread from the same
+variable, so a build under a small value crashes the compiler instead.
 
 ### 8. Coverage (dashboard, not a gate)
 

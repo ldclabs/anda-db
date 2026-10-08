@@ -310,16 +310,13 @@ impl EffectiveAuthority {
         space_id: &str,
         auth: &AuthContext,
     ) -> impl Future<Output = Result<Self, KipError>> + Send {
-        Box::pin(async move {
-            Self::resolve_at_depth(
-                store,
-                space_id,
-                &auth.principal_id,
-                &auth.delegation_chain,
-                0,
-            )
-            .await
-        })
+        Self::resolve_at_depth(
+            store,
+            space_id,
+            &auth.principal_id,
+            &auth.delegation_chain,
+            0,
+        )
     }
 
     fn resolve_at_depth(
@@ -995,13 +992,13 @@ async fn resolve_delegation(
         }));
     }
 
-    let parent = Box::pin(EffectiveAuthority::resolve_at_depth(
+    let parent = EffectiveAuthority::resolve_at_depth(
         store,
         space_id,
         &delegation.delegator_principal,
         &[],
         depth + 1,
-    ))
+    )
     .await?;
 
     // §31: the delegated actions are what the delegator can actually confer

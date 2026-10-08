@@ -63,7 +63,7 @@ Debug 构建会把每个被 await 的 future 留在调用方的栈帧里，因�
 - `rs/anda_cognitive_nexus/tests/stack_budget.rs` 在 512 KiB（新线程默认栈的四分之一）的线程上运行宿主流程（启动、按调用方开通、KIP 写入与读取、重新打开），并检查面向宿主的 future 均已装箱。
 - `rs/anda_db/tests/boxed_futures.rs` 检查数据库与集合的 future。
 
-要了解某个流程的栈开销，可在低于默认 2 MiB 的 `RUST_MIN_STACK` 下运行其测试；溢出会中止测试程序并给出线程名。
+要了解某个流程的栈开销，先构建测试（`cargo test --no-run`），再在低于默认 2 MiB 的 `RUST_MIN_STACK` 下运行；溢出会中止测试程序并给出线程名。rustc 也按这个变量设置自身线程的栈，在较小的值下编译会让编译器先崩溃。
 
 ### 8. 代码覆盖率（质量参考，非唯一准入限制）
 

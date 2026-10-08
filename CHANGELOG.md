@@ -17,8 +17,9 @@ All notable changes to this workspace are documented in this file.
   brings the same flows to 170–270 KiB; the whole Nexus test suite runs on
   384 KiB threads. Their signatures change from `async fn` to
   `fn … -> impl Future<Output = …> + Send` (without `+ Send` where a generic
-  callback decides it), so callers that `.await` them are unaffected. Helpers
-  called once per row stay unboxed.
+  parameter decides it: an open callback, or the value `Collection::add_from`
+  and `save_extension_from` borrow), so callers that `.await` them are
+  unaffected. Helpers called once per row stay unboxed.
 - `anda_db`: a storage handle keeps its 4096 cache-generation counters on the
   heap instead of building the 32 KiB array on the caller's stack.
 - `anda_cognitive_nexus` requires `anda_db` 0.14.2. A new `stack_budget` test

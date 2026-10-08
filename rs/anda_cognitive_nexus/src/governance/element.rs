@@ -774,18 +774,15 @@ pub fn archive_expired(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> impl Future<Output = Result<(), KipError>> + Send {
-    Box::pin(async move {
-        expire(
-            store,
-            space_id,
-            id,
-            state::ARCHIVED,
-            Permission::Archive,
-            authority,
-            auth,
-        )
-        .await
-    })
+    expire(
+        store,
+        space_id,
+        id,
+        state::ARCHIVED,
+        Permission::Archive,
+        authority,
+        auth,
+    )
 }
 
 /// Tombstones one element whose retention has lapsed (§19.1).
@@ -796,18 +793,15 @@ pub fn tombstone_expired(
     authority: &EffectiveAuthority,
     auth: &AuthContext,
 ) -> impl Future<Output = Result<(), KipError>> + Send {
-    Box::pin(async move {
-        expire(
-            store,
-            space_id,
-            id,
-            state::TOMBSTONED,
-            Permission::Tombstone,
-            authority,
-            auth,
-        )
-        .await
-    })
+    expire(
+        store,
+        space_id,
+        id,
+        state::TOMBSTONED,
+        Permission::Tombstone,
+        authority,
+        auth,
+    )
 }
 
 /// The shared body of the retention sweep's two actions.

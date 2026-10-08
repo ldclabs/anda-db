@@ -871,7 +871,7 @@ impl AndaDB {
     where
         F: AsyncFnOnce(&mut Collection) -> Result<(), DBError>,
     {
-        Box::pin(async move { self.open_collection_with_schema(name, None, f).await })
+        self.open_collection_with_schema(name, None, f)
     }
 
     /// Opens an existing collection, upgrading its schema if the provided schema

@@ -1049,14 +1049,6 @@ impl<'a> Context<'a> {
         solutions: Solutions,
         clause: &'s WhereClause,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Solutions, KipError>> + Send + 's>> {
-        Box::pin(async move { self.apply_clause_inner(solutions, clause).await })
-    }
-
-    fn apply_clause_inner(
-        &mut self,
-        solutions: Solutions,
-        clause: &WhereClause,
-    ) -> impl Future<Output = Result<Solutions, KipError>> + Send {
         Box::pin(async move {
             Ok(match clause {
                 WhereClause::Concept { variable, matcher } => {

@@ -399,7 +399,7 @@ impl Transaction {
         &mut self,
         kind: ElementKind,
     ) -> impl Future<Output = Result<ElementId, KipError>> + Send {
-        Box::pin(async move { self.mint_shell(kind).await })
+        self.mint_shell(kind)
     }
 
     fn mint_shell(
@@ -1046,7 +1046,7 @@ impl Transaction {
             let store = self.store.clone();
             let shells = self.shells.clone();
             let mut redo_owned = false;
-            let result = Box::pin(self.commit_inner(entry, &mut redo_owned)).await;
+            let result = self.commit_inner(entry, &mut redo_owned).await;
             if result.is_err() && !redo_owned {
                 for id in shells {
                     let _ = store.elements(id.kind).remove(id.seq).await;
@@ -1063,7 +1063,7 @@ impl Transaction {
     ) -> impl Future<Output = Result<Outcome, KipError>> + Send {
         Box::pin(async move {
             // A failure here leaves no redo intent, so `commit` removes the shells.
-            Box::pin(self.validate_core_schema()).await?;
+            self.validate_core_schema().await?;
             self.propagate_governance().await?;
             self.check_reference_closure().await?;
             self.check_concept_key_identity().await?;

@@ -91,8 +91,10 @@ dependencies and existing feature conventions when editing workspace crates.
   caller's frame, so inlined futures add up along a call chain and once took a
   host past a 2 MiB thread stack. Write an I/O or multi-step API as
   `fn f(..) -> impl Future<Output = R> + Send { Box::pin(async move { .. }) }`
-  (drop `+ Send` only where a generic callback decides it), keep helpers called
-  per row in a loop as `async fn`, and keep
+  (drop `+ Send` only where a generic parameter decides it: a callback, or a
+  borrowed `&T` that would otherwise need `T: Sync`). A wrapper that only
+  forwards returns the callee's boxed future as is. Keep helpers called per row
+  in a loop as `async fn`, and keep
   `rs/anda_cognitive_nexus/tests/stack_budget.rs` green. See
   [testing guidance](docs/testing.md).
 - Install tokenizers and deterministic index hooks at the start of each fresh

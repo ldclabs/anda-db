@@ -440,7 +440,7 @@ pub(crate) async fn rows(
 pub(crate) fn is_complete(
     staging: &Arc<anda_db::collection::Collection>,
 ) -> impl Future<Output = Result<bool, KipError>> + Send {
-    Box::pin(async move { has_marker(staging, kind::MARKER).await })
+    has_marker(staging, kind::MARKER)
 }
 
 fn has_marker(

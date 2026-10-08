@@ -190,7 +190,7 @@ impl CognitiveNexus {
     /// Idempotent: a completed migration is a no-op, and an interrupted one
     /// resumes from where it stopped.
     pub fn finish_migration(&self) -> impl Future<Output = Result<(), KipError>> + Send {
-        Box::pin(async move { crate::migrate::load(self).await })
+        crate::migrate::load(self)
     }
 
     /// Wraps an already-open store, for a caller that has one.
@@ -564,9 +564,7 @@ impl Session {
         &self,
         space_id: &str,
     ) -> impl Future<Output = Result<EffectiveAuthority, KipError>> + Send {
-        Box::pin(async move {
-            EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth).await
-        })
+        EffectiveAuthority::resolve(&self.nexus.store, space_id, &self.auth)
     }
 
     /// Reads the Governance audit for a Space (§29).
@@ -1353,10 +1351,7 @@ impl Session {
         capsule: &anda_kip::Capsule,
         isolate: bool,
     ) -> impl Future<Output = Result<crate::capsule::ImportReport, KipError>> + Send {
-        Box::pin(async move {
-            self.import_capsule_mapped(space_id, capsule, isolate, &[])
-                .await
-        })
+        self.import_capsule_mapped(space_id, capsule, isolate, &[])
     }
 
     /// [`Self::import_capsule`], mapping the source draft symbols the
@@ -1831,7 +1826,7 @@ impl Session {
         space: &str,
         auth: &AuthContext,
     ) -> impl Future<Output = Result<EffectiveAuthority, KipError>> + Send {
-        Box::pin(async move { EffectiveAuthority::resolve(&self.nexus.store, space, auth).await })
+        EffectiveAuthority::resolve(&self.nexus.store, space, auth)
     }
 
     /// Requires every permission a command asks for, at Space scope.
