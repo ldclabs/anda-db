@@ -245,6 +245,43 @@ mod tests {
         assert!(json["parameters"]["properties"].get("execution").is_none());
     }
 
+    /// Anthropic rejects `oneOf`, `anyOf` and `allOf` at the top level of a
+    /// tool schema, and strict modes reject them anywhere. `command` against
+    /// `operations` is enforced when the request is parsed instead.
+    #[test]
+    fn the_function_definitions_use_no_schema_combinators() {
+        fn assert_free(path: &str, value: &Json) {
+            match value {
+                Json::Object(map) => {
+                    for key in ["oneOf", "anyOf", "allOf"] {
+                        assert!(!map.contains_key(key), "{path} contains {key}");
+                    }
+                    for (name, child) in map {
+                        assert_free(&format!("{path}.{name}"), child);
+                    }
+                }
+                Json::Array(items) => {
+                    for (i, child) in items.iter().enumerate() {
+                        assert_free(&format!("{path}[{i}]"), child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for json in [
+            &*KIP_FUNCTION_DEFINITION,
+            &*KIP_READONLY_FUNCTION_DEFINITION,
+        ] {
+            let name = json["name"].as_str().unwrap();
+            assert_free(name, &json["parameters"]);
+            // A batch still accepts bare command strings beside full operations.
+            assert_eq!(
+                json["parameters"]["properties"]["operations"]["items"]["type"],
+                serde_json::json!(["string", "object"])
+            );
+        }
+    }
+
     #[test]
     fn the_bundled_prompts_teach_the_v2_distinctions() {
         for (name, text) in [

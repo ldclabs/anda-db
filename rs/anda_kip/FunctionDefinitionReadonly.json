@@ -10,34 +10,31 @@
       },
       "operations": {
         "type": "array",
-        "description": "Several read-only KIP commands in one round-trip. Each is evaluated independently and per-operation errors are returned inline.",
+        "description": "Several read-only KIP commands in one round-trip. Mutually exclusive with command. Each is evaluated independently and per-operation errors are returned inline.",
         "items": {
-          "oneOf": [
-            {
-              "type": "string"
+          "type": [
+            "string",
+            "object"
+          ],
+          "description": "A complete read-only KIP command, or an object that gives it an op_id and its own parameters.",
+          "properties": {
+            "op_id": {
+              "type": "string",
+              "description": "A request-local name so this operation's result can be correlated in the response."
             },
-            {
+            "command": {
+              "type": "string",
+              "description": "A complete read-only KIP command."
+            },
+            "parameters": {
               "type": "object",
-              "properties": {
-                "op_id": {
-                  "type": "string",
-                  "description": "A request-local name so this operation's result can be correlated in the response."
-                },
-                "command": {
-                  "type": "string",
-                  "description": "A complete read-only KIP command."
-                },
-                "parameters": {
-                  "type": "object",
-                  "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
-                }
-              },
-              "required": [
-                "command"
-              ],
-              "additionalProperties": false
+              "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
             }
-          ]
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
         }
       },
       "read": {
@@ -60,18 +57,6 @@
         "description": "Validate the command(s) without executing them."
       }
     },
-    "oneOf": [
-      {
-        "required": [
-          "command"
-        ]
-      },
-      {
-        "required": [
-          "operations"
-        ]
-      }
-    ],
     "additionalProperties": false
   }
 }

@@ -136,6 +136,19 @@ embedding model, scheduler, evaluator, or executor. For Watch/wake/dispatch and
 learning integration, read the [Brain host contracts](docs/anda-brain-nexus-contracts.zh.md).
 For old stores, follow the [KIP 1.x migration guide](docs/kip-v1-migration.md).
 
+`rs/anda_kip/FunctionDefinition.json` and `FunctionDefinitionReadonly.json` are
+the model-facing `execute_kip` tool definitions that Anda Engine and Brain hand
+to model providers. Never use `oneOf`, `anyOf` or `allOf` in them or in any
+other model-facing schema: Anthropic rejects them at the top level of a tool's
+`input_schema` and fails the whole request with a 400 (a top-level `oneOf` once
+broke every Brain pass on Claude), and strict modes reject them anywhere. Use a
+type list (`"type": ["string", "object"]`, `["string", "null"]`) for
+alternatives, enforce cross-field rules such as "exactly one of `command` or
+`operations`" when parsing, and state them in the descriptions;
+`the_function_definitions_use_no_schema_combinators` guards both files. The
+protocol validation schemas under `rs/anda_kip/schemas/` are never sent to a
+model and may use them.
+
 ## Build and validation
 
 Run commands from the repository root unless stated otherwise. Choose checks

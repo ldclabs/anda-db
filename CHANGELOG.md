@@ -2,6 +2,19 @@
 
 All notable changes to this workspace are documented in this file.
 
+## [anda_kip 0.14.2] — 2026-10-09
+
+### Fixes
+
+- `anda_kip`: the bundled `execute_kip` and `execute_kip_readonly` tool
+  definitions no longer use schema combinators. Their top-level `oneOf`
+  (exactly one of `command` and `operations`) made Anthropic reject every
+  request that offered the tool with a 400, so every Brain Formation, Recall and
+  Maintenance pass on a Claude model failed. The rule now lives in the
+  descriptions and in request parsing, which already enforced it, and each
+  `operations` item is one schema of `"type": ["string", "object"]` instead of a
+  `oneOf`. A test keeps both definitions free of `oneOf`, `anyOf` and `allOf`.
+
 ## [anda_kip 0.14.1 / anda_db 0.14.2 / anda_cognitive_nexus 0.14.4] — 2026-10-08
 
 ### Fixes

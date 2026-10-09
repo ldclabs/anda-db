@@ -10,34 +10,31 @@
       },
       "operations": {
         "type": "array",
-        "description": "Several KIP commands in one round-trip. This is a batch, not a transaction: set execution.mode to atomic if the whole set must commit or abort together. Several mutations that belong to one cognitive transition should instead be written as one MUTATE { ... } command.",
+        "description": "Several KIP commands in one round-trip. Mutually exclusive with command. This is a batch, not a transaction: set execution.mode to atomic if the whole set must commit or abort together. Several mutations that belong to one cognitive transition should instead be written as one MUTATE { ... } command.",
         "items": {
-          "oneOf": [
-            {
-              "type": "string"
+          "type": [
+            "string",
+            "object"
+          ],
+          "description": "A complete KIP command, or an object that gives it an op_id and its own parameters.",
+          "properties": {
+            "op_id": {
+              "type": "string",
+              "description": "A request-local name so this operation's result can be correlated in the response."
             },
-            {
+            "command": {
+              "type": "string",
+              "description": "A complete KIP command."
+            },
+            "parameters": {
               "type": "object",
-              "properties": {
-                "op_id": {
-                  "type": "string",
-                  "description": "A request-local name so this operation's result can be correlated in the response."
-                },
-                "command": {
-                  "type": "string",
-                  "description": "A complete KIP command."
-                },
-                "parameters": {
-                  "type": "object",
-                  "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
-                }
-              },
-              "required": [
-                "command"
-              ],
-              "additionalProperties": false
+              "description": "Parameters scoped to this operation. They override shared parameters with the same keys."
             }
-          ]
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
         }
       },
       "execution": {
@@ -80,18 +77,6 @@
         "description": "Validate and plan without committing. A dry run never establishes durable cognitive state."
       }
     },
-    "oneOf": [
-      {
-        "required": [
-          "command"
-        ]
-      },
-      {
-        "required": [
-          "operations"
-        ]
-      }
-    ],
     "additionalProperties": false
   }
 }
